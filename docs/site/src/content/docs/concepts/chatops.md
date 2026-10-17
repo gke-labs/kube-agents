@@ -134,7 +134,7 @@ Under the unsupported `spec.mode: next` toggle, the A2A gateway takes chat in pl
 On Slack:
 
 - **A direct message.** Every message is a turn, with or without a mention. Each top-level message starts a conversation of its own in the thread under it, and the gateway posts its replies in that thread. A message typed in that thread is the same conversation: a follow-up while its task runs, and a new task with the earlier ones in context after it ends.
-- **A channel.** A top-level message is a turn only when it mentions the bot. It starts a conversation in the thread under that message, and every reply to it posts in that thread. A reply in the thread is a turn when it mentions the bot. Without a mention, it is a turn only while the thread's conversation is live: a task the gateway started in the thread is still running, or the thread's last task started or ended in the last 30 minutes (the gateway's `A2A_IDLE_TTL`). After that, mention the bot again. A thread someone else started becomes live the same way, once a mention in it starts a task.
+- **A channel.** A top-level message is a turn only when it mentions the bot. It starts a conversation in the thread under that message, and every reply to it posts in that thread. A reply in the thread is a turn when it mentions the bot. Without a mention, it is a turn only while the thread's conversation is live: a task the gateway started in the thread is still running, or the thread's last task started or ended in the last 30 minutes (the gateway's `A2A_IDLE_TTL`). After that, mention the bot again. A thread someone else started becomes live the same way, once a mention in it starts a task. A thread under one of the bot's own posts, such as an alert or another post it makes in the home channel, is different: every reply in it is a turn, with or without a mention, for as long as the thread exists.
 - A message that is only a mention, an edit, another bot's message, or a message from a member of another workspace in a Slack Connect channel is not a turn and gets no reply.
 
 On Google Chat:
@@ -142,7 +142,7 @@ On Google Chat:
 - **A direct message.** Every message is a turn. Top-level messages share one conversation, and the gateway answers them top-level. A message typed in a thread is a conversation of its own, answered in that thread; the next message typed there joins it.
 - **A space.** Chat sends the app only the messages that mention it. In a space with threads, each thread is its own conversation. In a space without threads, and in a group chat, the whole space is one conversation.
 
-A sender the allowlist does not admit gets one notice, once per sender until the gateway restarts, and nothing else. On Slack it reads `⛔ I can't verify who you are on slack (id U0123ABCD), so I can't take asks from you yet — an admin has to add you to the allowed users list (or correct their principal map entry).` On Google Chat it names `gchat`, the sender's email and `the allowed users list`. The fix is in Troubleshooting, [for Slack](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#5-slack-bot-doesnt-answer) and [for Google Chat](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops).
+A sender the allowlist does not admit gets one notice, once per sender until the gateway restarts, and nothing else. The exception is a Slack reply under one of the bot's own posts that doesn't mention the bot: that is dropped with only an info-level log line and no notice, since the sender was likely talking to someone else. A mention gets them the notice. On Slack it reads `⛔ I can't verify who you are on slack (id U0123ABCD), so I can't take asks from you yet — an admin has to add you to the allowed users list (or correct their principal map entry).` On Google Chat it names `gchat`, the sender's email and `the allowed users list`. The fix is in Troubleshooting, [for Slack](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#5-slack-bot-doesnt-answer) and [for Google Chat](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#6-tracing-where-a-chat-message-stops).
 
 ### What carries over from default mode
 
@@ -154,7 +154,7 @@ A sender the allowlist does not admit gets one notice, once per sender until the
 | The home channel ([Google Chat](#home-channel), [Slack](#home-channel-1)): proactive alerts and scheduled reports | Posted by the gateway to the home channel on the `PlatformAgent`: `spec.integration.googleChat.homeChannel` on Google Chat, `spec.integration.slack.homeChannel` (a channel ID) on Slack. |
 | A board card's progress and report post into the thread                                                           | A card the agent files while answering posts each progress note as a message of its own, and its report, into the conversation you asked in; a file the card produced is not attached.    |
 | A message sent while the agent works interrupts its turn                                                          | It is queued as a follow-up to the running task.                                                                                                                                          |
-| An unlisted Slack sender is ignored silently                                                                      | An unlisted sender gets one notice.                                                                                                                                                       |
+| An unlisted Slack sender is ignored silently                                                                      | An unlisted sender gets one notice (not for an unmentioned reply under the bot's own post).                                                                                               |
 | Several Slack workspaces from one install                                                                         | One workspace.                                                                                                                                                                            |
 
 ### What a task looks like
@@ -251,6 +251,55 @@ A governance watchdog's findings live on its ledger issue and the remediation pu
 With `KAGE_SLACK_UX` on, Slack gets a card built from the open ledger issue. Its headline carries one number, how many findings of the most severe level the issue lists ("Security & RBAC Posture Audit: 2 critical findings"), and up to ten critical findings are listed under it, each led by its severity and tagged "new" when it was not there on the last run; with none critical listed, the headline counts the most severe level listed and lists the top two. A line under them counts the rest by severity ("5 more (1 major, 4 minor) are in the ledger issue."), and another names any clusters the run could not check, since a silent gap reads as clean. Then come a "Look at the first one" button and a button that opens the issue. Clicking "Look at the first one" starts a turn for you in the card's thread, as if you had typed the button's label; the buttons give way to a line naming who chose, only the first click counts, and a click from someone the agent does not answer changes nothing. A clean run closes its ledger, so its card is one line: "Security & RBAC Posture Audit: clean. Ledger closed." A run with no findings that left the ledger open because it could not check everything is posted as the report's own line in bold with the link, since the issue does not show this run's counts (a ledger that a coverage gap opened shows this run's gaps, but no findings). Nothing else is posted in the card's thread: the ledger issue holds the rest. The headline is posted as text where Slack refuses the buttons or the message, and also where the report was truncated, too little time is left, or the buttons cannot be posted at all. A reply in the thread is answered with the full report in context either way.
 
 An audit that could not write its ledger, most often because no GitOps repository is registered, posts one line instead of its report: the first sentence of the report's "What's wrong" section, as the agent wrote it. Under `spec.mode: next` the card and that line go through the A2A gateway, which lays out the same card; the failed audit's report folds under its line, since a reply in the thread does not bring the report back there.
+
+### Daily alert ceiling
+
+Each cluster-event alert and each drift alert spends one unit of a daily budget. When a bucket is spent, the alert does not go to chat, and no triage turn starts. The budget is fleet-wide: one count serves all the clusters that the install watches. It resets at 00:00 UTC. A value of `0` removes the cap for that bucket.
+
+| Bucket        | What it counts                                            | Default | `install.env` key            |
+| ------------- | --------------------------------------------------------- | ------- | ---------------------------- |
+| `Critical`    | Critical cluster events                                   | `10`    | `ALERT_DAILY_LIMIT_CRITICAL` |
+| `Warning`     | Warning cluster events                                    | `5`     | `ALERT_DAILY_LIMIT_WARNING`  |
+| `Info`        | Nothing today: the severity gate drops Info events        | `5`     | `ALERT_DAILY_LIMIT_INFO`     |
+| `GitOpsDrift` | Drift alerts for cluster changes that people make by hand | `20`    | `ALERT_DAILY_LIMIT_DRIFT`    |
+
+[`agents/platform/docs/session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#daily-alert-ceiling) gives the reasons for these defaults and for each bucket.
+
+Set a ceiling in one of these places:
+
+- The `ALERT_DAILY_LIMIT_*` keys in `install.env`. An empty key keeps the default. `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full` apply these keys. The other modes of `upgrade.sh` use the values that the release recorded. But each `upgrade.sh` run examines the keys, and a value that is not a whole number stops the run.
+- The chart value `platformAgent.deployment.alertDailyLimits`, with the keys `critical`, `warning`, `info` and `drift`.
+- The Terraform variable `alert_daily_limits` in `terraform/examples/full-install`, with the same keys.
+- An `ALERT_DAILY_LIMIT_*` entry in the `PlatformAgent` CR's `spec.deployment.env`, on an install that no chart manages.
+
+Each of the first three routes renders the keys that are set into `spec.deployment.env`. Helm replaces the full `spec.deployment.env` list on the CR at each apply that changes the list that the chart renders. This includes the apply that sets the first key, an apply that changes a value, and the apply that removes the last key. Entries that you added to the CR by hand are then lost. Before you set a key, move a ceiling to its key, and move another name to the chart value `platformAgent.deployment.env` (`extra_helm_values` on the Terraform install).
+
+A change to a ceiling restarts the agent pod and the credential-proxy pod. A re-tag with `upgrade.sh --upgrade-mode=operator` or `harness` to a release whose chart does not declare `alertDailyLimits` needs `--drop-undeclared-values`. The ceilings then go back to the defaults.
+
+#### Reading what the ceiling held back
+
+Suppression is silent in chat. No message says that a bucket is spent. To see the counts, read `/v1/alert-quota` from the agent pod:
+
+```bash
+kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- \
+  sh -c 'curl -s -H "Authorization: Bearer $SESSION_KV_API_KEY" \
+    http://127.0.0.1:8699/v1/alert-quota'
+```
+
+Add `?day=YYYY-MM-DD` to the URL for an earlier day. The reply gives `limit`, `sent` and `suppressed` for each bucket that has a cap. `suppressed` counts each offer that the ceiling refused. The event watcher offers a refused workload again on its next sighting, so one workload can add many offers to `suppressed`. The event watcher also counts these refusals in the `k8s_event_watcher_events_quota_suppressed_total` metric.
+
+The daily recap has the line "N alerts from M workloads withheld by the daily ceiling and never reached chat". N counts each pod and reason one time, so it can be lower than `suppressed`. M counts the workloads that sent those alerts. The pods of one Deployment are one workload. N is one count for the `Critical` and `Warning` buckets together. The recap runs at 21:00 UTC on weekdays, and each recap covers the time since the previous recap. Thus the recap period is not the UTC day of `/v1/alert-quota`, and the Monday recap covers the weekend. Drift refusals never appear in the recap. The `GitOpsDrift` row of `/v1/alert-quota` and the session server log show them. The drift detector does not offer a refused record again, so that alert is lost from chat.
+
+The recap line "N alerts failed to post to chat" is a different problem. It means that chat refused the post, or did not confirm it. Some of these alerts can be in the channel. A higher ceiling does not change this count. Look in the session server log for the cause.
+
+#### Sizing a bucket
+
+The counter is fleet-wide, so the demand on it increases with the number of clusters. Size each bucket from a week of data. A bucket with a value of `0` counts nothing, and `/v1/alert-quota` does not show it. To measure that bucket, first set a high cap on it for the week.
+
+1. For each of 7 days, read `sent` and `suppressed` for the bucket from `/v1/alert-quota?day=YYYY-MM-DD`. For `Critical` and `Warning`, `suppressed` counts repeat offers, so the sum can be higher than the real demand. For `GitOpsDrift`, `suppressed` has no repeat offers. The recap's withheld line cannot give a count for one bucket or for one UTC day.
+2. Add the `sent` and the `suppressed` counts, and divide the sum by the number of clusters. The result is the demand for each cluster.
+3. Set the bucket to that demand multiplied by the number of clusters that you will run. Do not set it higher than the number of alerts each day that the on-call can act on.
+4. If the demand is higher than that number, reduce the inflow: fix the workloads that alert most. Do not raise the bucket.
 
 ## First-run onboarding
 

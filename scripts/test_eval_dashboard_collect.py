@@ -1371,7 +1371,9 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # canary (#2013, seated 2026-09-29) is held out in the presubmit file;
         # only a roster line counts. pdb-remediation-pr took its roster line on
         # 2026-10-14 (#2016), which covered remediation again.
-        self.assertEqual(cov["uncovered"], ["fleet-audits"])
+        # upgrades-lagging-master-probe, upgrades' only roster case, was
+        # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades.
+        self.assertEqual(cov["uncovered"], ["fleet-audits", "upgrades"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):

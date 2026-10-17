@@ -162,8 +162,9 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`
-against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
+nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git

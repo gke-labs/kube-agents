@@ -19,6 +19,7 @@ from kanban_children_settled import (
     record_worker_child,
     refuse_idle_dependency_block,
     require_children_settled,
+    require_steps_settled,
 )
 
 # The board shape from the 2026-08-27 capture (issue #1010): build
@@ -37,7 +38,7 @@ RECEIPT = (
 # own table is deliberately absent: the module creates it on first write, and
 # a board that predates the patch must read as "no children" (fail-open).
 BOARD_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER);
+CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, current_run_id INTEGER, assignee TEXT);
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id TEXT NOT NULL,
     child_id  TEXT NOT NULL,
@@ -498,6 +499,203 @@ class TestTheDependencyBlock(Fixture):
         self.assertFalse(self.conn.in_transaction)
 
 
+STEP_CARD = "t_bb95580d"
+
+
+class TestTheStepGate(unittest.TestCase):
+    """#2935's card: the cluster was created, the install failed, and the
+    worker closed the card ``done``. Steps declared on the card hold it."""
+
+    SCHEMA = """
+    CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT, body TEXT, assignee TEXT);
+    CREATE TABLE task_comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+        author TEXT NOT NULL, body TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    """
+
+    def setUp(self):
+        self.path = str(Path(tempfile.mkdtemp()) / "kanban.db")
+        self.conn = sqlite3.connect(self.path)
+        self.addCleanup(self.conn.close)
+        self.conn.executescript(self.SCHEMA)
+        self.clock = 1_000
+
+    def card(self, body="", task_id=STEP_CARD):
+        self.conn.execute(
+            "INSERT INTO tasks (id, status, result, body, assignee) VALUES (?, 'running', NULL, ?, 'platform')",
+            (task_id, body),
+        )
+        self.conn.commit()
+
+    def comment(self, body, task_id=STEP_CARD, at=None, author="platform"):
+        self.clock += 1
+        self.conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, author, body, self.clock if at is None else at),
+        )
+        self.conn.commit()
+
+    def gate(self, result="Created the cluster; Substrate install failed.", task_id=STEP_CARD):
+        return require_steps_settled(task_id, lambda: sqlite3.connect(self.path), result)
+
+    def stored_result(self):
+        return self.conn.execute("SELECT result FROM tasks WHERE id = ?", (STEP_CARD,)).fetchone()[0]
+
+    def test_the_incident_is_refused_and_names_the_failed_step(self):
+        self.card("Provision a cluster with Agent Substrate.\nstep cluster: planned\nstep substrate: planned")
+        self.comment("step cluster: done")
+        self.comment("step substrate: failed - helm has no credentials")
+        refused = self.gate()
+        self.assertIn("kanban_complete refused", refused)
+        self.assertIn("substrate (failed)", refused)
+        self.assertNotIn("cluster (", refused)
+        self.assertIn('kanban_block(kind="needs_input")', refused)
+
+    def test_a_refusal_preserves_the_submitted_result(self):
+        self.card("step substrate: planned")
+        self.gate(result="the report")
+        self.assertEqual("the report", self.stored_result())
+
+    def test_every_step_done_completes(self):
+        self.card("step cluster: planned\nstep substrate: planned")
+        self.comment("step cluster: done")
+        self.comment("step substrate: done")
+        self.assertIsNone(self.gate())
+
+    def test_a_card_with_no_steps_completes_as_before(self):
+        self.card("Investigate why checkout-gateway is crashlooping. The next step: done by Friday.")
+        self.comment("Looked at the logs; it is OOMKilled.")
+        self.assertIsNone(self.gate())
+
+    def test_a_step_the_creator_declared_holds_the_card_though_the_worker_never_mentions_it(self):
+        self.card("step substrate: planned")
+        self.comment("Cluster created; finishing up.")
+        self.assertIn("substrate (planned)", self.gate())
+
+    def test_a_step_only_the_worker_declared_holds_the_card_too(self):
+        self.card("Provision a cluster.")
+        self.comment("step cluster: planned")
+        self.assertIn("cluster (planned)", self.gate())
+
+    def test_the_latest_line_wins_in_both_directions(self):
+        self.card("step cluster: planned")
+        self.comment("step cluster: done")
+        self.comment("step cluster: failed - the node pool was deleted under us")
+        self.assertIn("cluster (failed)", self.gate())
+        self.comment("step cluster: done")
+        self.assertIsNone(self.gate())
+
+    def test_a_same_second_tie_keeps_write_order(self):
+        self.card("step cluster: planned")
+        self.comment("step cluster: done", at=5_000)
+        self.comment("step cluster: failed", at=5_000)
+        self.assertIn("cluster (failed)", self.gate())
+
+    def test_there_is_no_skipped(self):
+        self.card("step substrate: planned")
+        self.comment("step substrate: skipped - not needed after all")
+        self.assertIn("substrate (planned)", self.gate())
+
+    def test_spelling_is_forgiving_but_keys_are_slugs(self):
+        self.card("- Step Cluster: Planned\n> step substrate : planned")
+        self.comment("STEP cluster: DONE\nstep substrate: done")
+        self.assertIsNone(self.gate())
+        self.assertEqual({}, kcs.card_steps(self.conn, "nope"))
+        self.card("step a sentence: planned", task_id="t_prose")
+        self.assertEqual({}, kcs.card_steps(self.conn, "t_prose"))
+        self.card("step x_y: planned\nstep /etc/passwd: planned", task_id="t_not_slugs")
+        self.assertEqual({}, kcs.card_steps(self.conn, "t_not_slugs"))
+
+    def test_prose_that_mentions_a_step_is_not_a_plan(self):
+        self.card(
+            "Step 1: Planned maintenance window is Sunday.\n"
+            "Step two: failed pods are restarted by the controller.\n"
+            "The next step: done by Friday."
+        )
+        self.assertEqual({}, kcs.card_steps(self.conn, STEP_CARD))
+        self.assertIsNone(self.gate())
+
+    def test_a_hedged_status_is_not_done_and_a_reason_is_allowed(self):
+        self.card("step substrate: planned\nstep cluster: planned\nstep pool: planned")
+        self.comment("step substrate: done-ish except helm failed")
+        self.comment("1. step cluster: done (PR #12)\n2) step pool: done - labels set")
+        self.assertEqual(
+            {"substrate": "planned", "cluster": "done", "pool": "done"}, kcs.card_steps(self.conn, STEP_CARD)
+        )
+
+    def test_the_refusal_is_not_rationed(self):
+        self.card("step substrate: planned")
+        self.assertIsNotNone(self.gate())
+        self.assertIsNotNone(self.gate())
+
+    def test_only_the_assignees_comments_count(self):
+        # The front door relays a thread reply verbatim on a needs_input card.
+        self.card("step substrate: planned")
+        self.comment("step substrate: failed - helm has no credentials")
+        self.comment("step substrate: done", author="default")
+        self.comment("step extra: planned", author="default")
+        self.assertEqual({"substrate": "failed"}, kcs.card_steps(self.conn, STEP_CARD))
+        self.assertIn("substrate (failed)", self.gate())
+
+    def test_closing_punctuation_and_a_comma_reason_still_record_the_status(self):
+        self.card("step a: planned.\nstep b: planned\nstep c: planned\nstep d: planned")
+        self.comment("step a: done.\r\nstep b: done, see PR #12\nstep c: done; labels set\nstep d: done!")
+        self.assertEqual({"a": "done", "b": "done", "c": "done", "d": "done"}, kcs.card_steps(self.conn, STEP_CARD))
+        self.card("step e: done-ish\nstep f: planned-ish.", task_id="t_hedge")
+        self.assertEqual({}, kcs.card_steps(self.conn, "t_hedge"))
+
+    def test_markdown_a_model_writes_still_records_the_status(self):
+        self.card("- [ ] step a: planned\n- [ ] step b: planned\nstep c: planned\nstep d: planned\nstep e: planned")
+        self.comment("- [x] step a: done\n**step b: done**\nstep `c`: done\nstep d: `done`\nstep e: done \u2705")
+        self.assertEqual(
+            {"a": "done", "b": "done", "c": "done", "d": "done", "e": "done"}, kcs.card_steps(self.conn, STEP_CARD)
+        )
+
+    def test_the_refusal_gives_the_exact_line_and_writing_it_clears_the_step(self):
+        self.card("step substrate: planned")
+        refused = self.gate()
+        self.assertIn('kanban_comment(body="step substrate: done")', refused)
+        self.comment("step substrate: done")
+        self.assertIsNone(self.gate())
+
+    def test_a_step_the_requester_dropped_is_recorded_by_the_worker_and_closes(self):
+        self.card("step cluster: planned\nstep substrate: planned")
+        self.comment("step cluster: done")
+        refused = self.gate()
+        self.assertIn("dropped at the requester's request", refused)
+        self.comment("skip Substrate, the cluster is enough", author="default")
+        self.assertIsNotNone(self.gate())
+        self.comment("step substrate: done - dropped at the requester's request")
+        self.assertIsNone(self.gate())
+
+    def test_another_cards_steps_do_not_count(self):
+        self.card("Provision a cluster.")
+        self.card("step other: planned", task_id="t_other")
+        self.comment("step other: failed", task_id="t_other")
+        self.assertIsNone(self.gate())
+
+    def test_a_long_plan_is_named_with_a_count(self):
+        self.card("\n".join(f"step s{i}: planned" for i in range(kcs.MAX_LISTED_STEPS + 3)))
+        self.assertIn("and 3 more", self.gate())
+
+    def test_fails_open(self):
+        bare = str(Path(tempfile.mkdtemp()) / "bare.db")
+        sqlite3.connect(bare).close()
+        self.assertIsNone(require_steps_settled(STEP_CARD, lambda: sqlite3.connect(bare), "r"))
+
+        def broken():
+            raise sqlite3.OperationalError("database is locked")
+
+        self.assertIsNone(require_steps_settled(STEP_CARD, broken, "r"))
+        self.assertIsNone(require_steps_settled("", broken, "r"))
+
+    def test_a_refusal_that_cannot_save_the_result_is_not_issued(self):
+        self.card("step substrate: planned")
+        ro = lambda: sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        self.assertIsNone(require_steps_settled(STEP_CARD, ro, "the report"))
+
+
 class TestTheApplier(unittest.TestCase):
     """Drive apply_kanban_children_settled against a fixture tree."""
 
@@ -554,6 +752,13 @@ class TestTheApplier(unittest.TestCase):
         self.assertLess(
             out.index("_require_children_settled"), out.index("_require_result")
         )
+
+    def test_the_step_gate_runs_after_the_children_gate_and_before_the_result_gate(self):
+        self.applier.apply(self.tmp)
+        out = self.patched()
+        self.assertIn("_require_steps_settled(\n        tid, _kanban_children_connect, result", out)
+        self.assertLess(out.index("_require_children_settled("), out.index("_require_steps_settled("))
+        self.assertLess(out.index("_require_steps_settled("), out.index("_require_result"))
 
     def test_the_dependency_gate_runs_just_before_block_task(self):
         self.applier.apply(self.tmp)

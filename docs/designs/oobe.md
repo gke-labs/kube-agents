@@ -178,8 +178,8 @@ that stays unreadable therefore keeps the job ticking without effect until it ca
 
 `oobe.py` reads no repository list: it starts the four audits on every install. An audit on an
 install with no GitOps repository runs without a forge: it keeps its findings in the report store
-and posts a chat summary, with no ledger issue and no pull request (the `fleet-audit` skill's "No
-forge configured"). The installer's "GitOps repository connection skipped" line says so too.
+and, when the run changed something, posts a chat summary, with no ledger issue and no pull request
+(the `fleet-audit` skill's "No forge configured"). The installer's "GitOps repository connection skipped" line says the same.
 
 A `managed_repos` value the audits cannot use (one that does not parse, or names a forge type the
 image does not serve), or one that cannot be read at all, is not checked here either. Each audit's

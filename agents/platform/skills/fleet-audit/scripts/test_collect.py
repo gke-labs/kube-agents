@@ -4216,6 +4216,26 @@ class TestCollectCluster(unittest.TestCase):
         self.assertIn("PROVISIONING", not_running[0]["error"])
         self.assertIsNone(error)
 
+
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster in a swept project is neither audited nor recorded.
+        collect.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(collect.declared_scope.set, None, None)
+        listing = json.dumps(
+            [
+                {"name": "ka-today", "location": "us-central1", "status": "RUNNING"},
+                {"name": "lane-b", "location": "us-central1", "status": "RUNNING"},
+                {"name": "lane-b", "location": "us-east1", "status": "RUNNING"},
+            ]
+        )
+        with mock.patch("sys.stderr"):
+            clusters, not_running, error = collect.enumerate_clusters(
+                "acme", run=lambda argv, **kw: collect.Run(argv, 0, listing, "", 0.0)
+            )
+        self.assertEqual([c["target"] for c in clusters], ["acme/us-central1/ka-today", "acme/us-east1/lane-b"])
+        self.assertEqual((not_running, error), ([], None))
+
     def test_autopilot_downgrades_no_requests_and_no_memory_limit(self):
         cluster = {**self.CLUSTER, "autopilot": True}
         calls = []
@@ -8271,6 +8291,8 @@ class TestIsAiWorkload(unittest.TestCase):
             "GEMINI_API_KEY",
             "COHERE_API_KEY",
             "MISTRAL_API_KEY",
+            # LiteLLM's hosted_vllm handler: the gateway's only key under openai_compatible.
+            "HOSTED_VLLM_API_KEY",
             "HF_TOKEN",
             "HUGGING_FACE_HUB_TOKEN",
             "REPLICATE_API_TOKEN",
@@ -12771,11 +12793,11 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
 
     def test_main_hands_the_flags_to_the_resolver(self):
-        # The wiring the SOP relies on: the two flags main parses reach the
+        # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
         with mock.patch.object(collect.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            collect.main(["compliance-audit", "--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            collect.main(["compliance-audit", "--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
 
     def test_a_declared_scope_with_nothing_readable_sweeps_nothing_and_lists_nothing(self):
         # `--scope-unread` alone (what collector_args carries when no declared

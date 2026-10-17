@@ -193,7 +193,7 @@ class FakeFleet:
 def args(**overrides):
     """The scheduled run's arguments: `--full` unless the test narrows the run
     with --cluster or --since, or says otherwise."""
-    base = {"project": None, "scope_projects": PROJECT, "scope_unread": None, "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "probe_lock": False, "manifest_file": None, "after_upgrade": False}
+    base = {"project": None, "scope_projects": PROJECT, "scope_unread": None, "scope_exclude_clusters": None, "cluster": None, "since": None, "ledger": None, "guards": None, "output": None, "report": None, "no_report": False, "dry_run": False, "reset_ledger": False, "probe_lock": False, "manifest_file": None, "after_upgrade": False}
     base.update(overrides)
     base.setdefault("full", base["cluster"] is None and base["since"] is None and bool(base["scope_projects"]))
     if "full" in overrides:
@@ -3542,10 +3542,30 @@ class LedgerAndGuardsTest(unittest.TestCase):
         self.assertFalse((self.home / ur.LEDGER_FILENAME).exists())
         self.assertFalse((self.home / ur.REPORTS_SUBDIR).exists())
 
+    def test_a_cluster_the_scope_excludes_is_dropped_from_the_listing(self):
+        # #3081: spec.scope.exclude.clusters bounds every fleet read, so an
+        # excluded cluster is never selected for review.
+        ur.declared_scope.set("acme", None, "acme/us-central1/lane-b")
+        self.addCleanup(ur.declared_scope.set, None, None)
+        listing = [{"name": "ka-today", "location": "us-central1"}, {"name": "lane-b", "location": "us-central1"}]
+        with mock.patch("sys.stderr"):
+            clusters, error = ur.enumerate_clusters("acme", run=lambda argv, **kw: run_of(0, json.dumps(listing)))
+        self.assertEqual([c["name"] for c in clusters], ["ka-today"])
+        self.assertIsNone(error)
+
+    def test_a_forced_cluster_the_scope_excludes_is_refused_not_reported_unlisted(self):
+        # #3081: not "named by --cluster but not listed in its project", which
+        # would be untrue: the listing returned it and the run dropped it.
+        with self.assertRaises(argparse.ArgumentTypeError) as caught:
+            ur.validate_args(args(scope_projects=PROJECT, scope_exclude_clusters=f"{PROJECT}/us-central1-a/lane-b",
+                                  cluster=[f"{PROJECT}/us-central1-a/lane-b"], full=False))
+        self.addCleanup(ur.declared_scope.set, None, None)
+        self.assertEqual(str(caught.exception), ur.FORCED_EXCLUDED_TEXT.format(cluster=f"{PROJECT}/us-central1-a/lane-b"))
+
     def test_main_hands_the_scope_flags_to_the_resolver_and_help_names_them(self):
         with mock.patch.object(ur.declared_scope, "set", side_effect=SystemExit(0)) as handed, self.assertRaises(SystemExit):
-            ur.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied"])
-        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied")
+            ur.main(["--scope-projects", "ops-mgmt,payments-prod", "--scope-unread", "payments-staging=denied", "--scope-exclude-clusters", "ops-mgmt/us-central1/lane-b"])
+        handed.assert_called_once_with("ops-mgmt,payments-prod", "payments-staging=denied", "ops-mgmt/us-central1/lane-b")
         proc = subprocess.run([sys.executable, ur.__file__, "--help"], capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)

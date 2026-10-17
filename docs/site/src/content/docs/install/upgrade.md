@@ -8,12 +8,9 @@ Terraform composition and the same Helm chart at a newer revision, re-rendering 
 the configuration it already has. A release copy of the script carries the version it upgrades to,
 so the ordinary upgrade names no version at all.
 
-An install whose GitHub forge is a GitHub Enterprise Server does not use `upgrade.sh`: it
-regenerates `terraform.tfvars` from `install.env`, which has no keys for the instance, and it can
-run from a checkout or a temporary copy of the engine that does not hold `ghes.auto.tfvars`. Move
-the checkout to the new release (change a pinned `image_tag` in `terraform.tfvars` to it), apply
-`charts/kube-agents/crds/`, and run `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply` in
-`terraform/examples/full-install`, with the forge kept in `ghes.auto.tfvars`: see
+An install whose GitHub forge is a GitHub Enterprise Server uses `upgrade.sh` too: it renders the
+forge from `GITOPS_FORGE=github`, `GITOPS_HOST` and `GITOPS_CA_SECRET` in `install.env`. An install
+made with the Terraform + Helm method is upgraded with that method: see
 [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#upgrade-switch-and-teardown).
 
 This site describes `main`, not a release. It changes each time a docs change merges to `main`. For
@@ -130,6 +127,7 @@ Each path is a `jq` path on `values.json`.
 | `GITHUB_APP_ID`                                  | `.githubMinter.appId`                                                                 |                                                                                                                                                                                                                                                                               |
 | `KMS_KEYRING`, `KMS_KEY`                         | `.githubMinter.kms.keyring`, `.githubMinter.kms.key`                                  |                                                                                                                                                                                                                                                                               |
 | GitLab keys                                      | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `gitlab`, set `GITOPS_FORGE=gitlab`. Copy the forge's `host` to `GITOPS_HOST`, `credentialsRef.name` to `GITLAB_TOKEN_SECRET` and `caBundleRef.name` to `GITOPS_CA_SECRET`, and the repository's `repository` to `GITOPS_REPO`.                  |
+| GitHub Enterprise Server keys                    | `.platformAgent.integration.forges[0]`, `.platformAgent.integration.repositories[0]`  | If the forge's `provider` is `github` and it has a `host`, set `GITOPS_FORGE=github`. Copy the forge's `host` to `GITOPS_HOST`, `caBundleRef.name` to `GITOPS_CA_SECRET` and `namespace` to `GITOPS_ORG`, and the repository's `repository` to `GITOPS_REPO`.                 |
 | `ENABLE_GVISOR`                                  | `.platformAgent.deployment.availability.runtimeClassName`                             | `gvisor` means `true`. Always write the key: the upgrade's default is `false`, not the installer's `true`.                                                                                                                                                                    |
 | `MEMORY`                                         | `.platformAgent.harness.memory.provider`                                              | `kube_agents_memory` is `hindsight`, `multiuser_memory` is `file` and `none` is `off`.                                                                                                                                                                                        |
 | `USER_PROFILE_ENABLED`                           | `.platformAgent.harness.memory.userProfileEnabled`                                    |                                                                                                                                                                                                                                                                               |
@@ -175,6 +173,7 @@ rebuilt file has more cases:
 - Without the GitHub App keys, a full upgrade stops while the token minter runs, and prints the
   lines to set. See [When an upgrade is refused](#when-an-upgrade-is-refused).
 - Without the GitLab keys, the `PlatformAgent` loses its GitLab repository.
+- Without the GitHub Enterprise Server keys, the `PlatformAgent` names its repository on github.com, and the agent loses its repositories on the instance.
 - Without `MODEL_PROVIDER=vertex_ai`, the upgrade deletes the LiteLLM service account and its
   Vertex AI grant.
 - Without a drift or stockout `TF_VAR_` name that the install changed, the upgrade replaces that
@@ -243,16 +242,58 @@ Before a move across several releases:
 ### Breaking changes in recent releases
 
 The release notes list pull request titles only. A `!` before the colon marks a breaking change.
-0.10.0 and 0.11.0 have none.
+0.10.0 and 0.11.0 have no `!` changes. The table also lists changes with no `!` that turn on something new for an existing install.
 
-| Release | Change                                                      | What an existing install meets                                                                                                                                                                                                                                                                                                                                       |
-| ------- | ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0.9.0   | #2264: the drift detector is on by default                  | If `install.env` does not set `ENABLE_DRIFT_DETECTOR`, a full upgrade creates a Log Router sink, a Pub/Sub topic and a subscription, and starts the detector. To keep it off, write `ENABLE_DRIFT_DETECTOR=false`. In a project where another install has the drift resources, the upgrade stops until you write that line or set the `TF_VAR_drift_pubsub_*` names. |
-| 0.9.0   | #2350: the scoped service account pool is keyed per project | The upgrade turns off a pool armed under the old per-cluster field. See [the scoped service account pool](/kube-agents/reference/security-and-iam/#the-scoped-service-account-pool).                                                                                                                                                                                 |
-| 0.8.0   | #2065: the `litellm` Service is renamed `inference-gateway` | Model calls can fail for a short time during the upgrade. See the chart README's [upgrade note](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#upgrade-notes-inference-gateway-service-rename).                                                                                                                                      |
-| 0.8.0   | #2070: forges and repositories in `spec.integration`        | The operator refuses some repository spellings that worked before. See the upgrade notes under [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration).                                                                                                                                                                                       |
-| 0.8.0   | #2010, #2042: the A2A bus reserves more consumers           | `spec.mode: next` only. If 0.7.0 or earlier created the TASKS stream, the provision Job can stop the upgrade. Do what its message says.                                                                                                                                                                                                                              |
-| 0.8.0   | #1756: the upgrade follows the release-pinned contract      | The upgrade refuses an install with only `k8s-operator/scripts/vars.sh`. See [When an upgrade is refused](#when-an-upgrade-is-refused).                                                                                                                                                                                                                              |
+| Release | Change                                                      | What an existing install meets                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0.12.0  | #2891: the credential proxy requests 1Gi of memory          | The operator refuses a `credentialProxy.resources` that sets `limits.memory` under 1Gi without `requests.memory`. Set the request with the limit, or raise the limit. See [`spec.deployment`](/kube-agents/operator/platformagent-crd/#specdeployment).                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 0.12.0  | #2862: the drift export covers the scope's other projects   | The drift export also creates sinks in other projects of the scope. See [Multi-project](/kube-agents/deploy/multi-project/) for which projects, the permission the apply needs, and how to leave a project out.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| 0.9.0   | #2264: the drift detector is on by default                  | If `install.env` does not set `ENABLE_DRIFT_DETECTOR`, a full upgrade creates a Log Router sink, a Pub/Sub topic and a subscription, and starts the detector. The sink exports the GKE admin-activity audit records of every cluster in the project. The subscription keeps unacknowledged records for up to 31 days. To keep it off, write `ENABLE_DRIFT_DETECTOR=false`. In a project where another install has the drift resources, the upgrade stops until you write that line or set the `TF_VAR_drift_pubsub_*` names.                                                                                                                                      |
+| 0.9.0   | #2350: the scoped service account pool is keyed per project | The upgrade turns off a pool armed under the old per-cluster field. See [the scoped service account pool](/kube-agents/reference/security-and-iam/#the-scoped-service-account-pool).                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 0.9.0   | #2706: the Slack UX is on by default                        | Slack users see new reactions, buttons and cards. See [Reactions](/kube-agents/concepts/chatops/#reactions) and [Buttons](/kube-agents/concepts/chatops/#buttons). The buttons use the Slack app's Interactivity setting. An app made from `hermes slack manifest` has it on. On an app made by hand, turn on Interactivity: Socket Mode needs no request URL. If a button does not work, a typed reply still works. To keep the old behaviour, see below. Under `spec.mode: next`, 0.9.0 also moves Slack to the A2A gateway, and `KAGE_SLACK_UX` does not turn off the gateway's reactions and buttons. See [Slack app setup](/kube-agents/install/slack-app/). |
+| 0.8.0   | #2065: the `litellm` Service is renamed `inference-gateway` | Model calls can fail for a short time during the upgrade. See the chart README's [upgrade note](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#upgrade-notes-inference-gateway-service-rename).                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| 0.8.0   | #2070: forges and repositories in `spec.integration`        | The operator refuses some repository spellings that worked before. See the upgrade notes under [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 0.8.0   | #2010, #2042: the A2A bus reserves more consumers           | `spec.mode: next` only. If 0.7.0 or earlier created the TASKS stream, the provision Job can stop the upgrade. Do what its message says.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 0.8.0   | #1756: the upgrade follows the release-pinned contract      | The upgrade refuses an install with only `k8s-operator/scripts/vars.sh`. See [When an upgrade is refused](#when-an-upgrade-is-refused).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+
+To keep the Slack UX off across upgrades, add `KAGE_SLACK_UX=false` to the chart's
+`platformAgent.deployment.env` list. `install.env` has no key for it. On an install made with
+`install.sh`, put the list in a `TF_VAR_extra_helm_values` line in `install.env`. A full-mode
+`install.sh` or `upgrade.sh` run applies the line:
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={deployment={env=[{name="KAGE_SLACK_UX",value="false"}]}}}'
+```
+
+`install.env` holds one such line, so put every extra value in it. If the line already has a
+`platformAgent` key, put `deployment={env=[...]}` inside that key. A second `platformAgent` key
+replaces the first one, with no error. If the line already has a `platformAgent.deployment.env`
+list, add the entry to that list, because Helm replaces a list as a whole. See
+[Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) for how the line works.
+
+## Switching `spec.mode`
+
+`next` is an unsupported development stack. To move a running install between `today` and
+`next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
+`install.sh`. The operator and harness modes re-apply the values the release recorded, so they do
+not switch. Preview a full upgrade with `upgrade.sh --plan` first; a run that switches says so
+before it applies.
+
+- **Slack.** With Slack on and Google Chat off, `next` hands Slack to the A2A gateway. Before the
+  switch, check the three Slack settings the run refuses (see
+  [When an upgrade is refused](#when-an-upgrade-is-refused)). After it, edit the Slack app as
+  [Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
+  describes.
+- **Switching back** to `today` is the same `install.env` edit the other way. Put the Slack app's
+  slash commands back too, as that section says.
+- **A mode set on the PlatformAgent by hand** (`kubectl patch`, as 0.9.0 needed) survives upgrades,
+  because Helm sees no change in a value the release already renders. When `install.env` names a
+  mode and the CR carries the other one, the run says so and leaves the CR as it is. To bring them
+  together, patch `spec.mode` on the CR to the mode you want, or apply once with
+  `PLATFORM_AGENT_MODE` set to the mode the CR carries and then again with the one you want.
+
+What a switch changes inside the install is in the design document,
+[`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md).
 
 ## Upgrade modes
 
@@ -293,6 +334,9 @@ to run.
   commit, or a release the script does not itself carry. It is not part of upgrading to a published
   release. Mutable refs such as `latest`, `main` and `HEAD` are rejected, so the scripts and the
   container images always name the same revision.
+  A commit on `main` carries the chart's unstamped placeholder version, `0.1.0`, so
+  `helm history` and the plan show the chart moving from your release to `kube-agents-0.1.0`.
+  That is the placeholder, not a downgrade: only the release pipeline stamps the version.
 - `--keep-image-tag` upgrades everything except the images, leaving them on the tag the install
   already serves. It refuses `--image-tag`, because the two ask for opposite things — and since a
   release copy already carries a version, it refuses this flag as well. Run it from a checkout,

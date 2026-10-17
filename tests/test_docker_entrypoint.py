@@ -981,6 +981,18 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template_dir.mkdir()
             shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
             (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
             profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
             profile.mkdir(parents=True)
             scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
@@ -1023,12 +1035,74 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template["context_file_max_chars"],
             "a cluster profile from before the context-file cap was pinned did not take it",
         )
-        self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
+        self.assertEqual(
+            persona,
+            "persona\n\n---\n\n## Target Cluster Identity\n\n- project: p\n- cluster: c\n- location: us-central1\n",
+            "the persona copy and identity stamp beside the repair stopped running",
+        )
         self.assertIn("config backfill", proc.stdout)
         # The shipped template's remote servers go through the credential proxy,
         # so the repair syncs their whole argv and says so.
         self.assertIn("MCP relay repair", proc.stdout)
         self.assertNotIn("WARN", proc.stderr)
+
+    def test_the_shipped_cluster_loop_stamps_target_cluster_identity_into_soul_md(self):
+        """When the real cluster SOUL.md template is synced onto a cluster profile,
+        the startup loop stamps the target cluster identity from config.yaml."""
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        script = "set -e\n"
+        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+            script += _extract_shell_function(name) + "\n"
+        script += block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shutil.copy(_REPO / "agents" / "cluster" / "SOUL.md", template_dir / "SOUL.md")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            profile.mkdir(parents=True)
+            scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(scaffolded, sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            persona = (profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("## Target Cluster Identity", persona)
+        self.assertIn(f"- project: {self._IDENTITY['project']}", persona)
+        self.assertIn(f"- cluster: {self._IDENTITY['cluster']}", persona)
+        self.assertIn(f"- location: {self._IDENTITY['location']}", persona)
+        self.assertEqual(persona.count("## Target Cluster Identity"), 1)
 
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):
         """The call sites, read off the source: the cluster loop and the front-door fill.

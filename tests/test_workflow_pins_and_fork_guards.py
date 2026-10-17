@@ -1,7 +1,9 @@
-"""Every third-party action is SHA-pinned and every credentialed auto-triggered workflow is fork-guarded.
+"""Every third-party action is SHA-pinned, every credentialed auto-triggered workflow is fork-guarded,
+and every Docker Hub pull goes through mirror.gcr.io.
 
-AGENTS.md ("Pull Request Hygiene") states two rules for `.github/workflows/` and
-`.agents/rules/github_actions.md` gives each its form and its exemptions:
+AGENTS.md ("Pull Request Hygiene") states two rules for `.github/workflows/`;
+`.agents/rules/github_actions.md` gives each its form and its exemptions and adds
+a third:
 
   - a third-party `uses:` names a 40-character commit SHA with the version in a
     trailing comment (`uses: actions/checkout@3d3c42e... # v7.0.1`), because a
@@ -14,6 +16,14 @@ AGENTS.md ("Pull Request Hygiene") states two rules for `.github/workflows/` and
     fails there on every sync. A `workflow_call`- or `workflow_dispatch`-only
     workflow needs no guard, and `docs-deploy.yml` is unguarded on purpose so a
     fork can publish its own Pages site.
+  - a Docker Hub image is pulled through `mirror.gcr.io`, because Docker Hub's
+    anonymous limit is per source IP and GitHub-hosted runners share theirs:
+    a `docker/setup-buildx-action` step takes its builder image from the
+    mirror (`driver-opts: image=mirror.gcr.io/moby/buildkit:...`) and reads
+    `.github/buildkitd.toml` so the builder resolves `docker.io` there, and a
+    job `container:`, a
+    `services:` image or a `docker://` action never names Docker Hub, whether
+    as `docker.io/...` or as a bare `python:3.14-slim` / `semgrep/semgrep:...`.
 
 What already checks part of this: `tests/conformance/test_C_enforcement.py`
 (C4) asserts every third-party `uses:` ends in a 40-hex SHA, and
@@ -21,8 +31,8 @@ What already checks part of this: `tests/conformance/test_C_enforcement.py`
 the `if:` of every `workflow_run` job. `actionlint.yml` checks syntax only. This
 file adds what neither covers: the version comment beside the SHA, a digest on a
 `docker://` ref, the fork guard on every job of every auto-triggered credentialed
-workflow whatever its trigger, and a currency check on the allowlist of
-workflows unguarded by design.
+workflow whatever its trigger, a currency check on the allowlist of
+workflows unguarded by design, and the mirror rule, which nothing else checks.
 
 The `docker://` rule is this file's reading of "pin to an immutable reference",
 not a clause of the rule file: an image has no commit SHA, and `@sha256:<digest>`
@@ -63,6 +73,7 @@ from __future__ import annotations
 import re
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,6 +143,44 @@ _USES_KEY = "uses"
 _IF_KEY = "if"
 _ON_KEY = "on"
 
+# The mirror rule (.agents/rules/github_actions.md, "Pull Docker Hub images
+# through mirror.gcr.io"). A setup-buildx step's builder image is pulled by the
+# runner's daemon before the builder exists, so it is named on the mirror
+# directly; the builder's own docker.io pulls go through the shared config.
+# Every setup-buildx step carries both: whether a job builds is not something
+# a `uses:` prefix can tell (a `run: docker buildx build` builds too).
+_BUILDX_ACTION_PREFIX = "docker/setup-buildx-action@"
+_WITH_KEY = "with"
+_DRIVER_OPTS_KEY = "driver-opts"
+_BUILDKITD_CONFIG_KEY = "buildkitd-config"
+_BUILDKITD_CONFIG_PATH = ".github/buildkitd.toml"
+_MIRROR_HOST = "mirror.gcr.io"
+_BUILDER_IMAGE_OPT = f"image={_MIRROR_HOST}/moby/buildkit"
+_CONTAINER_KEY = "container"
+_SERVICES_KEY = "services"
+_IMAGE_KEY = "image"
+# Hosts that name Docker Hub explicitly, compared lower-cased with any `:port`
+# removed. A
+# reference whose first path segment is not a host at all (`python:3.14-slim`,
+# `semgrep/semgrep:1.155.0`) names it implicitly: a registry host carries a dot
+# or a port, or is localhost.
+_DOCKER_HUB_HOSTS = {
+    "docker.io",
+    "index.docker.io",
+    "registry-1.docker.io",
+    "registry.hub.docker.com",
+}
+_LOCALHOST = "localhost"
+_PORT_SEPARATOR = ":"
+_REGISTRY_HOST_MARKERS = (".", _PORT_SEPARATOR)
+_EXPRESSION_OPEN = "${{"
+# The shared buildkitd config, parsed as buildkitd parses it: the docker.io
+# registry table's mirrors list.
+_BUILDKITD_CONFIG_FILE = REPO_ROOT / _BUILDKITD_CONFIG_PATH
+_REGISTRY_TABLE = "registry"
+_DOCKER_HUB_REGISTRY = "docker.io"
+_MIRRORS_KEY = "mirrors"
+
 # Floors for the real-tree test, so an empty or partial walk fails. Each sits
 # at roughly two thirds of what the tree carries as this file lands, so a
 # workflow removed in ordinary cleanup does not trip it while a walk that lost
@@ -139,6 +188,10 @@ _ON_KEY = "on"
 # a deliberate removal ever reaches one; raise them as the tree grows.
 _MIN_WORKFLOWS = 30
 _MIN_THIRD_PARTY_USES = 100
+# The mirror walk's floors: the tree carries four setup-buildx steps and one job
+# container as this lands, so three and one.
+_MIN_BUILDX_STEPS = 3
+_MIN_IMAGE_REFS = 1
 
 
 @dataclass
@@ -354,6 +407,133 @@ def check_allowlist(directory: Path) -> list[str]:
         elif not in_scope[name]:
             problems.append(f"{name}: allowlisted ({reason}) but every job is guarded")
     return problems
+
+
+@dataclass
+class MirrorReport:
+    violations: list[str] = field(default_factory=list)
+    workflows: int = 0
+    buildx_steps: int = 0
+    # Job containers, service images and docker:// actions examined.
+    image_refs: int = 0
+
+
+def _is_docker_hub_ref(ref: str) -> bool:
+    """Whether an image reference resolves to Docker Hub, named or implied."""
+    ref = ref.removeprefix(_DOCKER_REF_PREFIX)
+    host, has_path, _ = ref.partition("/")
+    if not has_path:
+        return True
+    if host.rsplit(_PORT_SEPARATOR, 1)[0].lower() in _DOCKER_HUB_HOSTS:
+        return True
+    return host != _LOCALHOST and not any(marker in host for marker in _REGISTRY_HOST_MARKERS)
+
+
+def _image_ref(node: object) -> str | None:
+    """The image named by a `container:` or a service entry, in either of its forms."""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, dict) and isinstance(node.get(_IMAGE_KEY), str):
+        return node[_IMAGE_KEY]
+    return None
+
+
+def _image_refs(doc: dict) -> list[tuple[str, str, str]]:
+    """Every runner-daemon image pull as (job name, where it is named, ref)."""
+    refs: list[tuple[str, str, str]] = []
+    for job_name, job in _jobs(doc).items():
+        container = _image_ref(job.get(_CONTAINER_KEY))
+        if container is not None:
+            refs.append((job_name, _CONTAINER_KEY, container))
+        services = job.get(_SERVICES_KEY)
+        if isinstance(services, dict):
+            for service_name, service in services.items():
+                ref = _image_ref(service)
+                if ref is not None:
+                    refs.append((job_name, f"{_SERVICES_KEY}.{service_name}", ref))
+        steps = job.get(_STEPS_KEY)
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if isinstance(step, dict) and isinstance(step.get(_USES_KEY), str):
+                if step[_USES_KEY].startswith(_DOCKER_REF_PREFIX):
+                    refs.append((job_name, _USES_KEY, step[_USES_KEY]))
+    return refs
+
+
+def _buildx_problems(job: dict) -> list[str]:
+    """Why each setup-buildx step in the job breaks the mirror rule; one entry per problem."""
+    steps = job.get(_STEPS_KEY)
+    if not isinstance(steps, list):
+        return []
+    problems: list[str] = []
+    for step in steps:
+        # Lower-cased: GitHub resolves an action's owner and repository case-insensitively.
+        if not isinstance(step, dict) or not str(step.get(_USES_KEY, "")).lower().startswith(_BUILDX_ACTION_PREFIX):
+            continue
+        with_ = step.get(_WITH_KEY) if isinstance(step.get(_WITH_KEY), dict) else {}
+        if _BUILDER_IMAGE_OPT not in str(with_.get(_DRIVER_OPTS_KEY, "")):
+            problems.append(f"setup-buildx step has no `{_DRIVER_OPTS_KEY}: {_BUILDER_IMAGE_OPT}:<tag>`")
+        if with_.get(_BUILDKITD_CONFIG_KEY) != _BUILDKITD_CONFIG_PATH:
+            problems.append(f"setup-buildx step has no `{_BUILDKITD_CONFIG_KEY}: {_BUILDKITD_CONFIG_PATH}`")
+    return problems
+
+
+def _count_buildx_steps(job: dict) -> int:
+    steps = job.get(_STEPS_KEY)
+    if not isinstance(steps, list):
+        return 0
+    return sum(
+        1
+        for step in steps
+        if isinstance(step, dict) and str(step.get(_USES_KEY, "")).lower().startswith(_BUILDX_ACTION_PREFIX)
+    )
+
+
+def check_mirror(directory: Path) -> MirrorReport:
+    """Every Docker Hub pull under `directory` goes through the mirror."""
+    report = MirrorReport()
+    for path in _workflow_files(directory):
+        report.workflows += 1
+        _, doc = _load(path)
+        if doc is None:
+            report.violations.append(f"{path.name}: not a YAML mapping, cannot check image pulls")
+            continue
+        for job_name, job in _jobs(doc).items():
+            report.buildx_steps += _count_buildx_steps(job)
+            for problem in _buildx_problems(job):
+                report.violations.append(f"{path.name}: job {job_name!r}: {problem}")
+        for job_name, where, ref in _image_refs(doc):
+            report.image_refs += 1
+            if _EXPRESSION_OPEN in ref:
+                # An image chosen at run time cannot be judged here; it fails
+                # rather than skips, so the author names it literally.
+                report.violations.append(f"{path.name}: job {job_name!r} {where} {ref!r} is not a literal reference")
+            elif _is_docker_hub_ref(ref):
+                report.violations.append(
+                    f"{path.name}: job {job_name!r} {where} {ref!r} pulls from Docker Hub; name it on {_MIRROR_HOST}"
+                )
+    return report
+
+
+def check_buildkitd_config(path: Path) -> list[str]:
+    """The shared buildkitd config exists and mirrors docker.io to the mirror."""
+    if not path.is_file():
+        return [f"{path}: missing; every setup-buildx step reads it"]
+    try:
+        config = tomllib.loads(path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        return [f"{path}: not valid TOML: {exc}"]
+    registry = config.get(_REGISTRY_TABLE)
+    table = registry.get(_DOCKER_HUB_REGISTRY) if isinstance(registry, dict) else None
+    mirrors = table.get(_MIRRORS_KEY) if isinstance(table, dict) else None
+    # A list, as buildkitd decodes it: a string would make the daemon refuse
+    # the file, and `in` on a string is a substring test.
+    if not isinstance(mirrors, list) or _MIRROR_HOST not in mirrors:
+        return [
+            f'{path}: `[{_REGISTRY_TABLE}."{_DOCKER_HUB_REGISTRY}"]` has no `{_MIRRORS_KEY}` list naming {_MIRROR_HOST}'
+        ]
+    return []
 
 
 # --- fixtures ---------------------------------------------------------------
@@ -629,6 +809,102 @@ jobs:
 """
 
 
+_PINNED_BUILDX = "docker/setup-buildx-action@" + "b" * 40 + " # v4.4.1"
+_PINNED_BUILD_PUSH = "docker/build-push-action@" + "c" * 40 + " # v7.4.0"
+# A setup-buildx step as the rule wants it: the builder image and the config.
+_MIRROR_BUILDX_WITH = f"""
+        with:
+          buildkitd-config: {_BUILDKITD_CONFIG_PATH}
+          driver-opts: {_BUILDER_IMAGE_OPT}:buildx-stable-1"""
+
+MIRRORED_WORKFLOW = f"""
+name: mirrored
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: {_MIRROR_HOST}/semgrep/semgrep:1.0.0@sha256:{"d" * 64}
+    services:
+      db:
+        image: ghcr.io/example/db:1
+    steps:
+      - uses: {_PINNED_CHECKOUT}
+      - uses: {_PINNED_BUILDX}{_MIRROR_BUILDX_WITH}
+      - uses: {_PINNED_BUILD_PUSH}
+        with:
+          push: false
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: {_PINNED_BUILDX}{_MIRROR_BUILDX_WITH}
+      - run: docker buildx imagetools inspect ghcr.io/example/app:1
+"""
+
+BUILDX_WITHOUT_DRIVER_OPTS_WORKFLOW = f"""
+name: no-driver-opts
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: {_PINNED_BUILDX}
+        with:
+          buildkitd-config: {_BUILDKITD_CONFIG_PATH}
+      - uses: {_PINNED_BUILD_PUSH}
+"""
+
+# The action owner capitalised, which GitHub resolves to the same action.
+CAPITALISED_BUILDX_WORKFLOW = f"""
+name: capitalised
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: Docker/setup-buildx-action@{"b" * 40} # v4.4.1
+"""
+
+# No build-push step: the config is owed whatever the job goes on to do.
+BUILDX_WITHOUT_CONFIG_WORKFLOW = f"""
+name: no-config
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: {_PINNED_BUILDX}
+        with:
+          driver-opts: {_BUILDER_IMAGE_OPT}:buildx-stable-1
+      - run: docker buildx build .
+"""
+
+HUB_IMAGES_WORKFLOW = f"""
+name: hub-images
+on: pull_request
+jobs:
+  bare:
+    runs-on: ubuntu-latest
+    container: python:3.14-slim
+    steps:
+      - run: python --version
+  named:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/semgrep/semgrep:1.0.0@sha256:{"d" * 64}
+    services:
+      cache:
+        image: redis:7
+    steps:
+      - uses: docker://alpine:3@sha256:{"e" * 64}
+  dynamic:
+    runs-on: ubuntu-latest
+    container: ${{{{ matrix.image }}}}
+    steps:
+      - run: true
+"""
+
+
 def _write_workflows(directory: Path, **workflows: str) -> None:
     for stem, body in workflows.items():
         (directory / f"{stem}.yml").write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
@@ -833,6 +1109,82 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(_triggers(yaml.safe_load('"on": push\njobs: {}')), {"push"})
         self.assertEqual(_triggers(yaml.safe_load("jobs: {}")), set())
 
+    def test_mirrored_workflow_has_no_mirror_violations(self) -> None:
+        _write_workflows(self.dir, mirrored=MIRRORED_WORKFLOW)
+        report = check_mirror(self.dir)
+        self.assertEqual(report.violations, [])
+        self.assertEqual(report.buildx_steps, 2, "both setup-buildx steps are examined")
+        self.assertEqual(report.image_refs, 2, "the container and the service are examined")
+
+    def test_buildx_step_without_mirrored_builder_image_is_a_violation(self) -> None:
+        _write_workflows(self.dir, nodriver=BUILDX_WITHOUT_DRIVER_OPTS_WORKFLOW)
+        violations = check_mirror(self.dir).violations
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn("nodriver.yml", violations[0])
+        self.assertIn(_DRIVER_OPTS_KEY, violations[0])
+
+    def test_capitalised_action_owner_is_still_a_buildx_step(self) -> None:
+        _write_workflows(self.dir, cap=CAPITALISED_BUILDX_WORKFLOW)
+        report = check_mirror(self.dir)
+        self.assertEqual(report.buildx_steps, 1)
+        self.assertEqual(len(report.violations), 2, report.violations)
+
+    def test_buildx_step_without_buildkitd_config_is_a_violation(self) -> None:
+        _write_workflows(self.dir, noconfig=BUILDX_WITHOUT_CONFIG_WORKFLOW)
+        violations = check_mirror(self.dir).violations
+        self.assertEqual(len(violations), 1, violations)
+        self.assertIn(_BUILDKITD_CONFIG_PATH, violations[0])
+
+    def test_docker_hub_images_are_violations_in_every_form(self) -> None:
+        _write_workflows(self.dir, hub=HUB_IMAGES_WORKFLOW)
+        report = check_mirror(self.dir)
+        self.assertEqual(report.image_refs, 5)
+        self.assertEqual(len(report.violations), 5, report.violations)
+        joined = "\n".join(report.violations)
+        self.assertIn("'python:3.14-slim'", joined)
+        self.assertIn("docker.io/semgrep/semgrep", joined)
+        self.assertIn("services.cache 'redis:7'", joined)
+        self.assertIn("docker://alpine:3", joined)
+        self.assertIn("not a literal reference", joined)
+
+    def test_docker_hub_reference_forms(self) -> None:
+        for ref in (
+            "python:3",
+            "semgrep/semgrep:1@sha256:x",
+            "docker.io/library/python",
+            "index.docker.io/x/y",
+            "registry.hub.docker.com/semgrep/semgrep:1",
+            "docker.io:443/library/python",
+            "Docker.io/library/python",
+        ):
+            self.assertTrue(_is_docker_hub_ref(ref), ref)
+        for ref in ("mirror.gcr.io/library/python:3", "ghcr.io/x/y", "localhost/x", "registry:5000/x", "gcr.io/x/y"):
+            self.assertFalse(_is_docker_hub_ref(ref), ref)
+
+    def test_buildkitd_config_check(self) -> None:
+        config = self.dir / "buildkitd.toml"
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "missing file is a problem")
+        config.write_text('[registry."docker.io"]\n  mirrors = ["example.com"]\n', encoding="utf-8")
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "another mirror is a problem")
+        config.write_text(f'# [registry."docker.io"]\nmirrors = ["{_MIRROR_HOST}"]\n', encoding="utf-8")
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "a commented-out header mirrors nothing")
+        config.write_text(f'[registry."docker.io"]\n  mirrors = "{_MIRROR_HOST}"\n', encoding="utf-8")
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "a string is not the list buildkitd decodes")
+        config.write_text('registry = "x"\n', encoding="utf-8")
+        self.assertEqual(len(check_buildkitd_config(config)), 1, "a non-table registry key is a problem, not a crash")
+        config.write_text("[registry\n", encoding="utf-8")
+        problems = check_buildkitd_config(config)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("not valid TOML", problems[0])
+        config.write_text(f'[registry."docker.io"]\n  mirrors = ["{_MIRROR_HOST}"]\n', encoding="utf-8")
+        self.assertEqual(check_buildkitd_config(config), [])
+        config.write_text(
+            f'[registry."docker.io"]\n  # a comment\n  http = false\n'
+            f'  mirrors = ["other.example", \'{_MIRROR_HOST}\']\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(check_buildkitd_config(config), [], "other keys, a comment and a second mirror are fine")
+
 
 class RealTreeTests(unittest.TestCase):
     def test_workflows_directory_exists(self) -> None:
@@ -864,6 +1216,23 @@ class RealTreeTests(unittest.TestCase):
 
     def test_allowlist_is_current(self) -> None:
         self.assertEqual(check_allowlist(WORKFLOWS_DIR), [])
+
+    def test_every_docker_hub_pull_goes_through_the_mirror(self) -> None:
+        report = check_mirror(WORKFLOWS_DIR)
+        self.assertEqual(
+            report.violations,
+            [],
+            f"Pull Docker Hub images through {_MIRROR_HOST} (.agents/rules/github_actions.md):\n  "
+            + "\n  ".join(report.violations),
+        )
+        self.assertGreaterEqual(report.workflows, _MIN_WORKFLOWS, "the walk examined too few workflows")
+        self.assertGreaterEqual(
+            report.buildx_steps, _MIN_BUILDX_STEPS, "the walk examined too few setup-buildx steps"
+        )
+        self.assertGreaterEqual(report.image_refs, _MIN_IMAGE_REFS, "the walk examined too few job containers")
+
+    def test_buildkitd_config_mirrors_docker_hub(self) -> None:
+        self.assertEqual(check_buildkitd_config(_BUILDKITD_CONFIG_FILE), [])
 
 
 if __name__ == "__main__":

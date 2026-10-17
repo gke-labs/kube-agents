@@ -56,6 +56,8 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
+YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
@@ -154,6 +156,18 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
 KNOWN_UNREGISTERED = {
+    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
+    # as the stack cases below: a `stack:` case runs alone on lock-infra
+    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
+    # chain is already at or past the 480m deadline on cost hints alone.
+    "gitops-drift-deleted-policy-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
+    "gitops-drift-load-bearing-change-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
@@ -170,6 +184,16 @@ KNOWN_UNREGISTERED = {
         "#2755: stack case held out of the nightly until runner Compute "
         "permission, a scheduled plant sweep and infra-lock room land"
     ),
+    # The chat-route twin of the case above (#2386): it plants the same stack
+    # and is held out of the nightly for the same #2755 preconditions. It is a
+    # regression guard (main already passes it, 3 of 3 on a dev install), run
+    # by hand on a dev install until then. The entry goes when
+    # the case joins hack/eval/nightly-cases.txt, with the 900s audit-band
+    # unit_cost_hint.
+    "networking-chat-request-runs-collector": (
+        "#2755: stack case held out of the nightly until runner Compute "
+        "permission, a scheduled plant sweep and infra-lock room land"
+    ),
     # It grades what a chat channel received, and every CI install deploys with
     # GOOGLE_CHAT_ENABLED and SLACK_ENABLED false (hack/ci-deploy.sh), so the
     # relay posts nowhere there and the case can only fail. Run by hand against
@@ -177,6 +201,14 @@ KNOWN_UNREGISTERED = {
     # entry goes when an eval lane has a chat platform.
     "chat-relay-posts-report-as-written": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
+    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
+    # it. No eval lane deploys either, so it runs by hand with the recipe in
+    # its header. The entry goes when a lane deploys both.
+    "ghes-pdb-remediation-pr": (
+        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
+        "run by hand with the recipe in the case header"
     ),
 }
 
@@ -193,6 +225,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "scope-excluded-cluster-not-listed": (
+        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
+        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
+        "cluster exclusion and the case cannot patch the CR for a run"
+    ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
         "every pool project (fleet re-apply); no pool project has a rule opening a "
@@ -238,6 +275,11 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "fleet-cost-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
         "service account can read, declared in the install's spec.scope.projects (or an "
@@ -254,6 +296,11 @@ FIXTURE_NOT_READY = {
     "gce-startup-script-failure": (
         "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
         "(fleet re-apply); no pool project runs a VM whose startup script fails"
+    ),
+    "gce-chat-request-runs-collector": (
+        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
+        "(fleet re-apply), as gce-startup-script-failure does; until then it runs by "
+        "hand on a dev install with the VM planted"
     ),
     "obtainability-major-pdb-auto-pr": (
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
@@ -336,6 +383,19 @@ KNOWN_NO_DOMAIN = {
         "image; it reads no fleet and no domains.yaml row describes skill or "
         "sandbox integrity"
     ),
+    "alert-config-terraform-promql-probe": (
+        "a skill-guidance probe: a Terraform alert policy written from the "
+        "gke-alert-configuration skill, graded on its PromQL condition, metric "
+        "and label; it reads no fleet and no domains.yaml row describes "
+        "alert authoring"
+    ),
+    "observability-trace-latency-brokered": (
+        "the agent's own observability skill: its trace latency helper run to "
+        "completion through the credential broker's relay, graded on the report "
+        "and on the route the worker took (no access token fetched or pasted); "
+        "it reads the install's own traces, not a fleet, and no domains.yaml "
+        "row describes the agent observing itself"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
@@ -377,7 +437,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "any_of_patterns",
         "forbidden_patterns",
+        "required_patterns",
     ),
+    # The parsed manifest's fields and selector are the assertion; `kind` alone
+    # only names what to look for.
+    "report_manifest": ("fields", "selects", "excludes"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
@@ -496,9 +560,42 @@ class CaseError(Exception):
     """A case file that could not be read at all."""
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses a key written twice in one mapping.
+
+    devops-bench loads a task with ruamel's safe loader, which raises on a
+    repeated key, while yaml.safe_load keeps the last value. With safe_load
+    here, a task.yaml the runner cannot load at all would pass this validator.
+    A key that overrides one brought in by a merge key (`<<: *anchor`) is not a
+    repeat; both loaders accept it.
+    """
+
+
+def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> Any:
+    # The mapping's own keys only, before construct_mapping flattens merged
+    # pairs into node.value, where an override would look like a repeat. Keys
+    # are compared as written (resolved tag and text), never constructed here:
+    # constructing one before construct_mapping normalises it can raise on a
+    # key both other loaders accept. A composite key is left to them.
+    seen: set[tuple[str, str]] = set()
+    for key_node, _ in node.value:
+        if key_node.tag == YAML_MERGE_TAG or not isinstance(key_node, yaml.ScalarNode):
+            continue
+        key = (key_node.tag, key_node.value)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark, f"found duplicate key {key_node.value!r}", key_node.start_mark
+            )
+        seen.add(key)
+    return loader.construct_mapping(node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
 def _load_yaml(path: pathlib.Path) -> Any:
     try:
-        return yaml.safe_load(path.read_text(encoding="utf-8"))
+        return yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader subclass
     except (OSError, yaml.YAMLError) as exc:
         raise CaseError(f"{path}: could not be parsed as YAML: {exc}") from exc
 
