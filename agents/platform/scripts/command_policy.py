@@ -1259,16 +1259,19 @@ def _gcloud_prefix_write(argv: list[str]) -> bool:
 
     When no entry in GCLOUD_READ_COMMANDS agrees with them (neither a prefix
     of them nor extending them), no flag or word after them can make the
-    command a read, with one exception: a help flag anywhere after them can
+    command a read, with one exception: a help flag anywhere in the argv can
     make it a synopsis request the help escape allows (`clusters upgrade c
-    --node-pool=p --image-type=t --help`). Whether that help flag stands as a
-    flag or as another flag's value cannot be read past the unknown flag, so
-    any help token keeps the answer open, and the retry is invited.
+    --node-pool=p --image-type=t --help`). Before the unknown flag the walk
+    reads it with each flag's arity; past it, whether a help token stands as a
+    flag or as another flag's value cannot be read, so any help token keeps
+    the answer open, and the retry is invited.
     """
     words, index = _gcloud_words_before_unknown_flag(argv)
     if not words:
         return False
-    if any(token.partition("=")[0] in _GCLOUD_HELP_FLAGS for token in argv[index:]):
+    if _gcloud_asks_for_help(argv[:index]) or any(
+        token.partition("=")[0] in _GCLOUD_HELP_FLAGS for token in argv[index:]
+    ):
         return False
     return not any(
         tuple(words[:min(len(command), len(words))]) == command[:min(len(command), len(words))]

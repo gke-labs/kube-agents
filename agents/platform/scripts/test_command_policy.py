@@ -2064,15 +2064,20 @@ class NoRetryInvitationForAWriteTest(unittest.TestCase):
                     retry = [a for a in argv if not a.startswith("--new")] + ["--help"]
                     self.assertTrue(evaluate(retry).allowed, f"the offered retry {retry} is refused")
 
-    def test_a_help_flag_after_a_second_unknown_flag_keeps_the_retry(self):
+    def test_a_help_flag_beside_two_unknown_flags_keeps_the_retry(self):
         # The SOP's own shape: confirm a remediation flag with --help. The
         # reading drops one unknown flag and stops at the next, so only the
-        # prefix check judges it, and --help can still make it a synopsis.
-        argv = ["gcloud", "container", "clusters", "upgrade", "c", "--node-pool=pool", "--image-type=t", "--help"]
-        decision = evaluate(argv)
-        self.assertFalse(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
-        self.assertIn("Re-run without the flag", decision.message)
-        self.assertTrue(evaluate(["gcloud", "container", "clusters", "upgrade", "c", "--help"]).allowed)
+        # prefix check judges it, and --help can still make it a synopsis
+        # wherever it sits: before, between or after the two flags.
+        head = ["gcloud", "container", "clusters", "upgrade", "c"]
+        flags = ["--node-pool=pool", "--image-type=t"]
+        for at in range(len(flags) + 1):
+            argv = head + flags[:at] + ["--help"] + flags[at:]
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.message.startswith(command_policy._UNREADABLE_WRITE_LEAD))
+                self.assertIn("Re-run without the flag", decision.message)
+        self.assertTrue(evaluate(head + ["--help"]).allowed)
 
     def test_the_unreadable_variant_names_no_positional(self):
         # On a two-word surface the third word is the caller's positional; the
