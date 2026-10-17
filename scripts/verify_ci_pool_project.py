@@ -43,6 +43,11 @@ _AUDIT_REPORT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scri
 # The name the audit module is registered under when loaded by path; unregistered
 # in sys.modules, so it cannot shadow or be shadowed by an installed package.
 _AUDIT_REPORT_MODULE_NAME = "kube_agents_audit_report"
+# The audit's collector, whose `workload_declarations` is the index that keys a
+# repository's workload manifests; the workload-declaration check hands it the
+# seeded file rather than copying its rule.
+_COLLECT = _ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "collect.py"
+_COLLECT_MODULE_NAME = "kube_agents_fleet_collect"
 # Every name the declared-intent check reads off the loaded module. Read once
 # at load, so a rename upstream is a loader failure (the check unverified with
 # the AttributeError named) and never a verdict on a repository's note.
@@ -115,6 +120,7 @@ CHECK_GITHUB_REPO_AND_APP = "github_repo_and_app"
 # hourly pool-state scan run it (docs/ci-health.md, "The pool-state scan").
 CHECK_GITOPS_DEFAULT_BRANCH = "gitops_default_branch"
 CHECK_GITOPS_DECLARATION = "gitops_declaration"
+CHECK_GITOPS_WORKLOAD_MANIFEST = "gitops_workload_manifest"
 CHECK_LEDGER_READ_CREDENTIAL = "ledger_read_credential"
 CHECK_TOKEN_MINTER = "token_minter"
 # The KMS half of the minter check alone: the key, its versions, its shape,
@@ -134,6 +140,7 @@ CHECK_IDS = (
     CHECK_GITHUB_REPO_AND_APP,
     CHECK_GITOPS_DEFAULT_BRANCH,
     CHECK_GITOPS_DECLARATION,
+    CHECK_GITOPS_WORKLOAD_MANIFEST,
     CHECK_LEDGER_READ_CREDENTIAL,
     CHECK_TOKEN_MINTER,
     CHECK_TOKEN_MINTER_KMS,
@@ -156,6 +163,7 @@ CHECK_DISPLAY_NAMES = {
     CHECK_GITHUB_REPO_AND_APP: "GitOps Repo & GitHub App Installation",
     CHECK_GITOPS_DEFAULT_BRANCH: "GitOps Repo Default Branch",
     CHECK_GITOPS_DECLARATION: "GitOps Declared-Intent Note",
+    CHECK_GITOPS_WORKLOAD_MANIFEST: "GitOps Workload Declaration",
     CHECK_LEDGER_READ_CREDENTIAL: "Ledger Read Credential",
     CHECK_TOKEN_MINTER: "Token Minter KMS & GSA",
     CHECK_TOKEN_MINTER_KMS: "Token Minter KMS & GSA",
@@ -164,7 +172,7 @@ CHECK_DISPLAY_NAMES = {
 # these is selected, so a run without it -- the pool-state scan, or a hand
 # run of the minter or ledger checks, which read GitHub over urllib and KMS
 # over gcloud -- is not stopped at the door for a tool no selected check uses.
-GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION})
+GITHUB_CHECKS = frozenset({CHECK_GITHUB_REPO_AND_APP, CHECK_GITOPS_DECLARATION, CHECK_GITOPS_WORKLOAD_MANIFEST})
 # The default-branch read is `gh` too, and is left out of GITHUB_CHECKS on
 # purpose: the pool-state scan selects it, and a toolchain blocker would turn
 # a job without a GitHub credential into "not checked" on all of the scan's
@@ -177,8 +185,8 @@ GCP_CHECKS = frozenset(CHECK_IDS) - {CHECK_CODEBASE_MAPPING, CHECK_GITOPS_DEFAUL
 # What the hourly pool-state scan runs: every read-only check on the project.
 # Not the fleet fixtures (the seeded-fleet scan already runs those), not the
 # GitHub-reading checks that need a credential the health bot must not hold
-# (an org member's `gh` for github_repo_and_app and gitops_declaration, the
-# ledger App's key for ledger_read_credential), not the minter's signing half
+# (an org member's `gh` for github_repo_and_app, gitops_declaration and
+# gitops_workload_manifest, the ledger App's key for ledger_read_credential), not the minter's signing half
 # (token_minter; the scan runs token_minter_kms), not the mapping (that is
 # about the checkout, not the project), and not the warm-cache check, whose
 # read is in another project the bot holds nothing on. The GitOps
@@ -444,6 +452,77 @@ GITOPS_INTENT_NOTE_DECLARATIONS = (
     ("compliance-audit", {"check": "default-sa-automount", "namespace": "seeded-token", "object": "Deployment/token-reader"}),
     ("security-patch-orchestrator", {"check": "no-notifications", "namespace": "", "object": "Cluster/seeded-c"}),
     ("fleet-wide-cost-analysis", {"check": "overrequest", "namespace": "seeded-headroom", "object": "Deployment/burst-ingest"}),
+)
+# checkout-gateway's declaration, which provisioning seeds beside the note
+# (GITOPS_WORKLOAD_MANIFEST_* in scripts/provision_ci_pool_project.sh). The
+# remediation cases propose a PodDisruptionBudget beside it; in a repository
+# without it the agent finds nothing to fix and refuses the pull request. The
+# path is the one the fleet audit's workload_declarations reads a cluster off
+# (clusters/<cluster>/...), the tie #2228's cases wait for. The script's
+# content, byte for byte, pinned by a test as the note is.
+GITOPS_WORKLOAD_MANIFEST_PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+GITOPS_WORKLOAD_MANIFEST_MESSAGE = "Declare seeded-a's checkout-gateway Deployment in seeded-reliability"
+GITOPS_WORKLOAD_MANIFEST_CONTENT = """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: checkout-gateway
+  namespace: seeded-reliability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: checkout-gateway
+  template:
+    metadata:
+      labels:
+        app: checkout-gateway
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: checkout-gateway
+      containers:
+        - name: gateway
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi"""
+# The key the audit's index (collect.py workload_declarations) must hold for
+# the seeded file: cluster off the path's second segment, then kind, namespace
+# and name. Presence alone is not the check: a file at the path that declares
+# another object leaves the finding manual and the cases red with a presence
+# check green, so the body is handed to that index and the key looked up.
+GITOPS_WORKLOAD_MANIFEST_KEY = (GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1], "Deployment", "seeded-reliability", "checkout-gateway")
+# The index refuses an object two files declare (`declaration_for` returns
+# None on more than one path), so every YAML under the seeded cluster's tree is
+# handed to it with the seeded file, read from the repository's tree listing.
+# A pool repository holds a handful of files; the cap keeps a repository nobody
+# sized from turning the check into a crawl, and is reported when it bites.
+GITOPS_WORKLOAD_MANIFEST_TREE = "/".join(GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[:2])
+GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP = 25
+GITOPS_YAML_SUFFIXES = (".yaml", ".yml")
+# How _workload_manifest_problem names a duplicate declaration; the check
+# reads it to print the remedy for the siblings rather than for the seed.
+DUPLICATE_DECLARATION_PREFIX = "more than one file declares it ("
+# The cases that fail on a project whose repository lacks the declaration:
+# the roster case, and the #2228 case parked on this fixture. (The other
+# #2228 case, obtainability-refusal-direct-mutation, is nightly and only
+# loses its pull-request arm: its inline-proposal arm passes without the file.)
+GITOPS_WORKLOAD_MANIFEST_CASES = (
+    "pdb-remediation-pr",
+    "obtainability-major-pdb-auto-pr",
 )
 
 # Mirrors terraform/modules/github-minter/main.tf: the key is ASYMMETRIC_SIGN /
@@ -2515,6 +2594,16 @@ def gitops_note_seed_command(repo_slug: str, sha: str = "") -> str:
     )
 
 
+def gitops_manifest_seed_command(repo_slug: str, sha: str = "") -> str:
+    """The `gh api` call that writes checkout-gateway's declaration, replacing it when `sha` names the copy there."""
+    replace = f"-f sha={sha} " if sha else ""
+    return (
+        f"gh api -X PUT repos/{repo_slug}/contents/{GITOPS_WORKLOAD_MANIFEST_PATH} "
+        f"-f message=\"{GITOPS_WORKLOAD_MANIFEST_MESSAGE}\" {replace}"
+        f"-f content=\"$(printf '%s\\n' '{GITOPS_WORKLOAD_MANIFEST_CONTENT}' | base64 | tr -d '\\n')\""
+    )
+
+
 def _gitops_repo_slug(project_id: str) -> str:
     """The GitOps repository a pool project owns, `gke-agentic/<project>-infra`, as hack/ci-deploy.sh maps it."""
     return f"{GITOPS_REPO_ORG}/{project_id}{GITOPS_REPO_SUFFIX}"
@@ -2809,6 +2898,205 @@ def check_gitops_declaration(project_id: str) -> CheckResult:
         f"{' and '.join(GITOPS_INTENT_NOTE_CASES)} fail on this project. Add `knowledge/` to that file's "
         f"`paths`, or move the note under one of them.",
     )
+
+
+def check_gitops_workload_manifest(project_id: str) -> CheckResult:
+    """Verify the GitOps repository declares checkout-gateway where the remediation cases expect it.
+
+    The same reader and the same verdicts as check_gitops_declaration: a
+    refusal or a transient leaves the check unverified, a 404 fails it with
+    the seed command (naming both of its readings), and a body at the path
+    that does not declare the Deployment fails it with the replace command.
+    """
+    name = CHECK_DISPLAY_NAMES[CHECK_GITOPS_WORKLOAD_MANIFEST]
+    repo_slug = _gitops_repo_slug(project_id)
+    path = GITOPS_WORKLOAD_MANIFEST_PATH
+    cases = " and ".join(GITOPS_WORKLOAD_MANIFEST_CASES)
+
+    def unread(what: str, reason: str) -> CheckResult:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {what} in {repo_slug} could not be read: {reason}")], read=False)
+
+    def failed(what: str, err: str) -> CheckResult:
+        return CheckResult(name, False, f"Could not read {what} in {repo_slug}: {err}")
+
+    def absent() -> CheckResult:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} has no {path}, or this token cannot read the repository "
+            f"(gh answers 404 to both; the github_repo_and_app check, run alongside or with --checks, says which). If the repository is "
+            f"readable, {cases} find no manifest to propose a budget beside and fail on this project until it "
+            f"is seeded: {gitops_manifest_seed_command(repo_slug)}",
+        )
+
+    state, out = _gitops_path_state(repo_slug, path)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(path, out)
+    if state == GITHUB_PATH_ABSENT:
+        return absent()
+    if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+        return failed(path, out)
+    try:
+        payload = _load_json(out)
+        sha = str(payload.get("sha") or "")
+        if payload.get("encoding") == GITHUB_CONTENT_ENCODING_NONE:
+            state, body = _gitops_path_state(repo_slug, path, raw=True)
+            if state == GITHUB_PATH_UNREAD:
+                return unread(f"{path} (over the contents API's inline limit, read raw)", body)
+            if state == GITHUB_PATH_ABSENT:
+                return absent()
+            if state in (GITHUB_PATH_FAILED, GITHUB_PATH_UNDECODABLE):
+                return failed(f"{path} (over the contents API's inline limit, read raw)", body)
+        else:
+            # Decoded as the index reads the file (`errors="replace"`), so a
+            # stray byte is the index's verdict below, not a failure here.
+            body = base64.b64decode(payload.get("content") or "").decode("utf-8", errors="replace")
+    except Exception as exc:
+        return CheckResult(name, False, f"Could not parse the contents of {path} in {repo_slug}: {exc}")
+    # The index, not a copy of its rule: the file goes into a scratch tree at
+    # its own path, beside every other YAML the repository holds under the
+    # seeded cluster's tree, and collect.py's workload_declarations says
+    # whether it keys the Deployment there once (dict documents, the Config
+    # Connector skip, and the one-file-per-object rule declaration_for
+    # enforces). A collector that cannot load here is a machine fault, unread
+    # as the note check's parser is; a raise on the file is the file's.
+    try:
+        collect = _load_collect()
+    except Exception as exc:
+        return CheckResult(
+            name,
+            True,
+            "Not checked",
+            warnings=[Unread(f"Not checked: could not load the audit's collector to index {path}: {type(exc).__name__}: {exc}")],
+            read=False,
+        )
+    state, siblings = _gitops_cluster_tree_yaml(repo_slug, path)
+    if state == GITHUB_PATH_UNREAD:
+        return unread(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
+    if state != GITHUB_PATH_PRESENT:
+        return failed(f"the repository tree under {GITOPS_WORKLOAD_MANIFEST_TREE}/", siblings)
+    try:
+        problem = _workload_manifest_problem(body, collect, siblings)
+    except OSError as exc:
+        return CheckResult(name, True, "Not checked", warnings=[Unread(f"Not checked: {path} (no writable temporary directory to hand it to the audit's index): {type(exc).__name__}: {exc}")], read=False)
+    if problem.startswith(DUPLICATE_DECLARATION_PREFIX):
+        # The seeded file is right; another file under the tree declares the
+        # same object, and the index resolves neither. Replacing the seed
+        # changes nothing: the other file has to go.
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} declares Deployment/checkout-gateway in seeded-reliability more than once under "
+            f"{GITOPS_WORKLOAD_MANIFEST_TREE}/ ({problem}), so the audit's index resolves none of them and {cases} fail on this "
+            f"project. Remove every declaration but {path}.",
+        )
+    if problem:
+        return CheckResult(
+            name,
+            False,
+            f"{repo_slug} carries {path} but the audit's index does not key Deployment/checkout-gateway in seeded-reliability from it "
+            f"({problem}), so {cases} fail on this project. "
+            f"Replace it: {gitops_manifest_seed_command(repo_slug, sha)}",
+        )
+    return CheckResult(name, True, f"{repo_slug} declares Deployment/checkout-gateway at {path}, where the audit's index keys it")
+
+
+def _load_collect():
+    """The fleet-audit collector as a module, with the index this check queries.
+
+    collect.py appends its own directory to sys.path for `fleet_scope_args`
+    at import, so loading it by path is enough; PyYAML is imported here as
+    the index imports it lazily, so a machine without it fails at one place.
+    """
+    import importlib.util
+
+    import yaml  # noqa: F401  (workload_declarations' dependency, proven present here)
+
+    spec = importlib.util.spec_from_file_location(_COLLECT_MODULE_NAME, _COLLECT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {_COLLECT}")
+    module = importlib.util.module_from_spec(spec)
+    with contextlib.redirect_stderr(io.StringIO()):
+        spec.loader.exec_module(module)
+    getattr(module, "workload_declarations")
+    return module
+
+
+def _gitops_cluster_tree_yaml(repo_slug: str, seeded_path: str) -> tuple[str, dict[str, str] | str]:
+    """(GITHUB_PATH_*, {path: body} for every other YAML under the seeded cluster's tree, or the reason).
+
+    One listing of the repository's tree, then one raw read per sibling. A
+    sibling that cannot be read makes the whole answer unread or failed as
+    that read was: the index's one-file rule cannot be judged without it.
+    """
+    rc, out, err = run_cmd(["gh", "api", f"repos/{repo_slug}/git/trees/HEAD?recursive=1"])
+    if rc != 0:
+        reason = _unread_reason(err or "")
+        if reason is not None or _GH_TRANSPORT_LINE.search(err or ""):
+            return GITHUB_PATH_UNREAD, reason or (err or "").strip()
+        return GITHUB_PATH_FAILED, (err or "").strip()
+    try:
+        listing = _load_json(out)
+        entries = listing.get("tree") or []
+    except Exception as exc:
+        return GITHUB_PATH_FAILED, f"could not parse the tree listing: {exc}"
+    if listing.get("truncated"):
+        # The API cut the listing; the entries under the tree may be the
+        # ones missing, so the one-file rule cannot be judged from it.
+        return GITHUB_PATH_UNREAD, "the tree listing is truncated by the API, so the one-file rule cannot be judged"
+    prefix = GITOPS_WORKLOAD_MANIFEST_TREE + "/"
+    wanted = sorted(
+        str(e.get("path"))
+        for e in entries
+        if isinstance(e, dict) and e.get("type") == "blob" and str(e.get("path") or "").startswith(prefix)
+        and str(e.get("path") or "").endswith(GITOPS_YAML_SUFFIXES) and e.get("path") != seeded_path
+    )
+    if len(wanted) > GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP:
+        return GITHUB_PATH_UNREAD, f"{len(wanted)} YAML files under {prefix}, over the {GITOPS_WORKLOAD_MANIFEST_SIBLING_CAP} this check reads"
+    siblings: dict[str, str] = {}
+    for sibling in wanted:
+        state, text = _gitops_path_state(repo_slug, sibling, raw=True)
+        if state == GITHUB_PATH_ABSENT:
+            # Gone between the listing and the read: the index would not see it either.
+            continue
+        if state == GITHUB_PATH_UNDECODABLE:
+            # The index reads it with replacement characters and keys what
+            # parses; this reader cannot, so the rule is unjudged, not failed.
+            return GITHUB_PATH_UNREAD, f"{sibling}: {text}"
+        if state != GITHUB_PATH_PRESENT:
+            return (GITHUB_PATH_UNREAD if state == GITHUB_PATH_UNREAD else GITHUB_PATH_FAILED), f"{sibling}: {text or state}"
+        siblings[sibling] = text
+    return GITHUB_PATH_PRESENT, siblings
+
+
+def _workload_manifest_problem(body: str, collect, siblings: dict[str, str] | None = None) -> str:
+    """Why the audit's index would not key GITOPS_WORKLOAD_MANIFEST_KEY from `body` at its path, once, or "" when it does.
+
+    `siblings` are the repository's other YAML files under the seeded
+    cluster's tree, written beside the body so the index's one-file-per-object
+    rule is judged as the audit judges it. Raises OSError when the scratch
+    tree cannot be written. A raise from the index itself (PyYAML's safe
+    constructors raise KeyError, AttributeError or ValueError on a tagged
+    scalar, outside the YAMLError the index catches) is the file's verdict,
+    not a traceback.
+    """
+    with tempfile.TemporaryDirectory() as scratch:
+        tree = Path(scratch)
+        for rel, text in {GITOPS_WORKLOAD_MANIFEST_PATH: body, **(siblings or {})}.items():
+            target = tree / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                index = collect.workload_declarations(tree)
+        except Exception as exc:
+            return f"the index raises on it ({type(exc).__name__}: {exc})"
+    paths = index.get(GITOPS_WORKLOAD_MANIFEST_KEY)
+    if not paths:
+        return "no document in it is keyed as " + "/".join(GITOPS_WORKLOAD_MANIFEST_KEY)
+    if len(paths) > 1:
+        return DUPLICATE_DECLARATION_PREFIX + ", ".join(sorted(paths)) + ")"
+    return ""
 
 
 def check_github_repo_and_app(
@@ -3847,6 +4135,7 @@ def run_checks(
     run(CHECK_GITHUB_REPO_AND_APP, lambda: check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
     run(CHECK_GITOPS_DEFAULT_BRANCH, lambda: check_gitops_default_branch(project_id))
     run(CHECK_GITOPS_DECLARATION, lambda: check_gitops_declaration(project_id))
+    run(CHECK_GITOPS_WORKLOAD_MANIFEST, lambda: check_gitops_workload_manifest(project_id))
     run(CHECK_LEDGER_READ_CREDENTIAL, lambda: check_ledger_read_credential(project_id))
     if CHECK_TOKEN_MINTER in wanted:
         run(CHECK_TOKEN_MINTER, lambda: check_token_minter(project_id, app_id, location))

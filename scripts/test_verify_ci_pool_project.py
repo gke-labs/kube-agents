@@ -3,8 +3,10 @@
 
 import argparse
 import base64
+import builtins
 import inspect
 import io
+import fnmatch
 import json
 import os
 import pathlib
@@ -2084,6 +2086,186 @@ class GitopsDeclarationNoteTest(unittest.TestCase):
         self.assertIn(f"readonly GITOPS_INTENT_NOTE_CONTENT='{checker.GITOPS_INTENT_NOTE_CONTENT}'", script)
         # The content the verifier expects is one the audit's parser joins.
         self.assertIsNone(checker._note_declaration_problem(checker.GITOPS_INTENT_NOTE_CONTENT + "\n", "gke-agentic/x-infra"))
+
+
+class GitopsWorkloadManifestTest(unittest.TestCase):
+    _PATH = "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml"
+    _REPO = "gke-agentic/kube-agents-evals-3-infra"
+
+    @staticmethod
+    def _contents(body: str, sha: str = "abc") -> str:
+        return json.dumps({"sha": sha, "path": GitopsWorkloadManifestTest._PATH, "content": base64.b64encode(body.encode()).decode()})
+
+    # The tree listing a pool repository answers: the seeded file alone under
+    # clusters/seeded-a/, beside the note and the README.
+    _TREE_ALONE = _ok(json.dumps({"tree": [
+        {"path": "README.md", "type": "blob"},
+        {"path": "knowledge/notification-relay-no-pdb.md", "type": "blob"},
+        {"path": "clusters", "type": "tree"},
+        {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+    ]}))
+
+    def _check(self, *answers, project="kube-agents-evals-3"):
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = list(answers)
+            result = checker.check_gitops_workload_manifest(project)
+        return result, run
+
+    def test_a_repository_with_the_declaration_passes_on_the_read_and_the_tree_listing(self):
+        result, run = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), self._TREE_ALONE)
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        self.assertEqual(2, run.call_count)
+        self.assertIn(f"repos/{self._REPO}/contents/{self._PATH}", " ".join(run.call_args_list[0].args[0]))
+        self.assertIn(f"repos/{self._REPO}/git/trees/HEAD?recursive=1", " ".join(run.call_args_list[1].args[0]))
+
+    def test_a_second_file_declaring_the_object_fails_as_the_index_refuses_it(self):
+        # declaration_for returns None on more than one path, so the finding
+        # stays manual; the parked case's header names this as a requirement.
+        tree = _ok(json.dumps({"tree": [
+            {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/apps/checkout-gateway-copy.yaml", "type": "blob"},
+            {"path": "clusters/seeded-b/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/README.md", "type": "blob"},
+        ]}))
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result, run = self._check(_ok(self._contents(good, sha="dup")), tree, _ok(good))
+        self.assertFalse(result.passed)
+        self.assertIn("more than one file declares it", result.message)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", result.message)
+        # The seed is right and a PUT over it repairs nothing: the remedy names the other file.
+        self.assertNotIn("-f sha=dup", result.message)
+        self.assertIn("Remove every declaration but clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", result.message)
+        # Only seeded-a's YAML is read: the seeded-b copy is another cluster's tree and the README is not YAML.
+        self.assertEqual(3, run.call_count)
+        self.assertIn("clusters/seeded-a/apps/checkout-gateway-copy.yaml", " ".join(run.call_args_list[2].args[0]))
+        # A sibling that declares something else leaves the one declaration keyed.
+        other = good.replace("name: checkout-gateway", "name: checkout-frontend")
+        result, _ = self._check(_ok(self._contents(good)), tree, _ok(other))
+        self.assertTrue(result.passed, result.message)
+
+    def test_a_truncated_tree_listing_leaves_the_check_unread(self):
+        truncated = _ok(json.dumps({"tree": [], "truncated": True}))
+        result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), truncated)
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("truncated", result.warnings[0])
+
+    def test_a_sibling_gone_since_the_listing_is_skipped_and_an_undecodable_one_is_unread(self):
+        tree = _ok(json.dumps({"tree": [
+            {"path": "clusters/seeded-a/seeded-reliability/checkout-gateway.yaml", "type": "blob"},
+            {"path": "clusters/seeded-a/apps/old.yaml", "type": "blob"},
+        ]}))
+        good = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"
+        result, _ = self._check(_ok(self._contents(good)), tree, _fail("gh: Not Found (HTTP 404)"))
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual([], result.warnings)
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [_ok(self._contents(good)), tree, UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")]
+            result = checker.check_gitops_workload_manifest("kube-agents-evals-3")
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("clusters/seeded-a/apps/old.yaml", result.warnings[0])
+
+    def test_a_tree_listing_that_cannot_be_read_leaves_the_check_unread(self):
+        result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), _fail("gh: HTTP 502"))
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertIn("repository tree under clusters/seeded-a/", result.warnings[0])
+
+    def test_an_absent_declaration_fails_and_names_the_seed_command_and_the_cases(self):
+        result, _ = self._check(_fail("gh: Not Found (HTTP 404)"))
+        self.assertFalse(result.passed)
+        self.assertIn(f"has no {self._PATH}, or this token cannot read the repository", result.message)
+        self.assertIn("pdb-remediation-pr", result.message)
+        self.assertIn(f"gh api -X PUT repos/{self._REPO}/contents/{self._PATH} ", result.message)
+        self.assertNotIn("-f sha=", result.message)
+        self.assertIn("kind: Deployment", result.message)
+
+    def test_a_file_at_the_path_that_declares_something_else_fails_with_the_replace_command(self):
+        other = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("name: checkout-gateway", "name: notification-relay")
+        result, _ = self._check(_ok(self._contents(other, sha="deadbeef")), self._TREE_ALONE)
+        self.assertFalse(result.passed)
+        self.assertIn("the audit's index does not key Deployment/checkout-gateway in seeded-reliability", result.message)
+        self.assertIn("-f sha=deadbeef", result.message)
+
+    def test_the_verdict_is_the_audit_index_s_not_a_copy_of_its_rule(self):
+        # A Config Connector apiVersion with the right kind, name and namespace:
+        # collect.py's workload_declarations skips it (KCC_API_GROUP_SUFFIX), so
+        # the finding stays manual; a copy of the keying rule would pass it.
+        kcc = checker.GITOPS_WORKLOAD_MANIFEST_CONTENT.replace("apiVersion: apps/v1", "apiVersion: compute.cnrm.cloud.google.com/v1beta1")
+        result, _ = self._check(_ok(self._contents(kcc, sha="c0ffee")), self._TREE_ALONE)
+        self.assertFalse(result.passed)
+        self.assertIn("-f sha=c0ffee", result.message)
+        # A list document, and a document with no namespace, are not keyed either.
+        for body in ("- a\n- b\n", "kind: Deployment\nmetadata:\n  name: checkout-gateway\n"):
+            with self.subTest(body):
+                result, _ = self._check(_ok(self._contents(body)), self._TREE_ALONE)
+                self.assertFalse(result.passed)
+
+    def test_a_transient_is_not_checked_and_any_other_error_fails(self):
+        result, _ = self._check(_fail("gh: HTTP 502"))
+        self.assertTrue(result.passed)
+        self.assertFalse(result.read)
+        result, _ = self._check(_fail("gh: HTTP 409 Git Repository is empty"))
+        self.assertFalse(result.passed)
+        self.assertIn("Could not read", result.message)
+
+    def test_a_tagged_scalar_the_constructor_raises_on_fails_with_the_replace_command(self):
+        # PyYAML's safe constructors raise KeyError / ValueError, not
+        # YAMLError, on these; the verdict is the file's, not a traceback.
+        for body in ("kind: !!bool maybe\n", "kind: Deployment\nmetadata:\n  name: !!int abc\n"):
+            with self.subTest(body):
+                result, _ = self._check(_ok(self._contents(body, sha="f00d")), self._TREE_ALONE)
+                self.assertFalse(result.passed)
+                self.assertIn("the index raises on it", result.message)
+                self.assertIn("-f sha=f00d", result.message)
+
+    def test_without_pyyaml_the_check_is_not_checked(self):
+        real_import = builtins.__import__
+
+        def no_yaml(name, *args, **kwargs):
+            if name == "yaml":
+                raise ImportError("No module named 'yaml'")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", side_effect=no_yaml):
+            result, _ = self._check(_ok(self._contents(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n")), self._TREE_ALONE)
+        self.assertTrue(result.passed)
+        self.assertIs(result.read, False)
+        self.assertEqual(checker.report_status(result), checker.REPORT_STATUS_UNCHECKED)
+        self.assertIn("collector", result.warnings[0])
+
+    def test_a_body_over_the_inline_limit_is_read_raw(self):
+        meta = json.dumps({"sha": "abc", "encoding": "none", "content": "", "size": 2_000_000})
+        result, run = self._check(_ok(meta), _ok(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT + "\n"), self._TREE_ALONE)
+        self.assertTrue(result.passed, result.message)
+        self.assertEqual(3, run.call_count)
+        self.assertIn("-H", run.call_args_list[1].args[0])
+
+    def test_the_declaration_the_verifier_names_is_the_one_provisioning_seeds(self):
+        # One file, defined twice: the script seeds it, the verifier reads it
+        # back and prints it as the repair. They drift apart unless pinned.
+        script = (pathlib.Path(__file__).resolve().parent / "provision_ci_pool_project.sh").read_text()
+        for name, value in (
+            ("GITOPS_WORKLOAD_MANIFEST_PATH", checker.GITOPS_WORKLOAD_MANIFEST_PATH),
+            ("GITOPS_WORKLOAD_MANIFEST_MESSAGE", checker.GITOPS_WORKLOAD_MANIFEST_MESSAGE),
+        ):
+            self.assertIn(f'{name}="{value}"', script, name)
+        self.assertIn(f"readonly GITOPS_WORKLOAD_MANIFEST_CONTENT='{checker.GITOPS_WORKLOAD_MANIFEST_CONTENT}'", script)
+        # The content the verifier expects is one its own read accepts, and it
+        # says nothing about the budget: a word about it reads as declared
+        # intent and silences the finding the cases grade.
+        self.assertEqual("", checker._workload_manifest_problem(checker.GITOPS_WORKLOAD_MANIFEST_CONTENT, checker._load_collect()))
+        self.assertNotIn("PodDisruptionBudget", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
+        self.assertNotIn("#", checker.GITOPS_WORKLOAD_MANIFEST_CONTENT)
+
+    def test_the_path_is_the_one_the_parked_cases_and_the_audit_index_read(self):
+        # obtainability-major-pdb-auto-pr and obtainability-refusal-direct-mutation
+        # keep this glob unchanged across the pull request; the audit's
+        # workload_declarations keys the cluster off path segment 2.
+        self.assertTrue(fnmatch.fnmatch(checker.GITOPS_WORKLOAD_MANIFEST_PATH, "clusters/*seeded-a/seeded-reliability/checkout-gateway.yaml"))
+        self.assertEqual("seeded-a", checker.GITOPS_WORKLOAD_MANIFEST_PATH.split("/")[1])
 
 
 class GithubAppInstallationTest(unittest.TestCase):
@@ -4507,6 +4689,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
+             mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
@@ -4531,6 +4714,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
              mock.patch.object(checker, "check_gitops_default_branch", return_value=checker.CheckResult("b", True)), \
              mock.patch.object(checker, "check_gitops_declaration", return_value=checker.CheckResult("n", True)), \
+             mock.patch.object(checker, "check_gitops_workload_manifest", return_value=checker.CheckResult("w", True)), \
              mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
@@ -4549,7 +4733,7 @@ class ChecksSelectionTest(unittest.TestCase):
     def _mocks(self):
         return {
             name: mock.patch.object(checker, name, return_value=checker.CheckResult(name, True))
-            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_ledger_read_credential", "check_warm_cache_readers")
+            for name in ("check_codebase_mapping", "check_gke_and_state", "check_seeded_fleet_fixtures", "check_github_repo_and_app", "check_gitops_default_branch", "check_gitops_declaration", "check_gitops_workload_manifest", "check_ledger_read_credential", "check_warm_cache_readers")
         }
 
     def test_parse_checks_orders_and_refuses_unknown_ids(self):
@@ -4593,13 +4777,13 @@ class ChecksSelectionTest(unittest.TestCase):
              mock.patch.object(checker, "check_artifact_registry", return_value=checker.CheckResult("a", True)) as ar, \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)) as minter, \
              mocks["check_codebase_mapping"] as mapping, mocks["check_gke_and_state"] as gke, mocks["check_seeded_fleet_fixtures"] as fleet, \
-             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_ledger_read_credential"] as ledger, \
+             mocks["check_github_repo_and_app"] as app, mocks["check_gitops_default_branch"] as branch, mocks["check_gitops_declaration"] as note, mocks["check_gitops_workload_manifest"] as manifest, mocks["check_ledger_read_credential"] as ledger, \
              mocks["check_warm_cache_readers"] as warm, mock.patch.object(checker, "run_cmd", side_effect=AssertionError("a check ran a real command")):
             results = checker.run_checks("kube-agents-evals-3", checks=list(checker.POOL_STATE_CHECKS))
             self.assertEqual(warm.call_count, 0, "the warm-cache check is not in the scan's set")
             branch.assert_called_once_with("kube-agents-evals-3")
             self.assertEqual([r.check_id for r in results], list(checker.POOL_STATE_CHECKS))
-            for never in (mapping, fleet, app, note, ledger):
+            for never in (mapping, fleet, app, note, manifest, ledger):
                 never.assert_not_called()
             minter.assert_called_once_with("kube-agents-evals-3", checker.DEFAULT_GITHUB_APP_ID, "us-central1", probe_app=False)
             everything = checker.run_checks("kube-agents-evals-3")
@@ -4639,7 +4823,7 @@ class ChecksSelectionTest(unittest.TestCase):
         # KMS over gcloud, and the default-branch check, which the scan selects,
         # files its own unread when gh or its credential is missing so the GCP
         # checks run.
-        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION})
+        self.assertEqual(checker.GITHUB_CHECKS, {checker.CHECK_GITHUB_REPO_AND_APP, checker.CHECK_GITOPS_DECLARATION, checker.CHECK_GITOPS_WORKLOAD_MANIFEST})
         self.assertIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.POOL_STATE_CHECKS)
         self.assertNotIn(checker.CHECK_GITOPS_DEFAULT_BRANCH, checker.GCP_CHECKS)
 
