@@ -261,11 +261,26 @@ def test_no_delivered_report_fails(install: Install) -> None:
     assert "nothing was delivered" in result.reason
 
 
-def test_the_link_count_reads_the_ledger_line(install: Install) -> None:
+def test_the_link_count_checks_the_product_s_link_against_the_run_s_message(install: Install) -> None:
     install.run("compliance-audit", ARMED, "failed", None)
-    _doc(install.out / "compliance-audit", "z", "See https://github.com/k/k/issues/5\nLedger: https://github.com/o/r/issues/3",
+    _doc(install.out / "compliance-audit", "z",
+         "- Ledger (see also upstream https://github.com/k/k/issues/5): https://github.com/o/r/issues/3",
          ARMED + timedelta(minutes=6))
-    install.deliver(f"their {oobe_late.NOT_POSTED}: `compliance-audit` (findings: https://github.com/k/k/issues/5).")
+    install.deliver(f"their {oobe_late.NOT_POSTED}: `compliance-audit` (findings: https://github.com/o/r/issues/3).")
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert "(1 with their ledger link)" in result.reason
+    # A link the run's message never carried is not its ledger.
+    install.deliver(f"their {oobe_late.NOT_POSTED}: `compliance-audit` (findings: https://github.com/o/r/issues/30).",
+                    at=install.opened + timedelta(minutes=2))
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert "(0 with their ledger link)" in result.reason
+
+
+def test_the_prompt_links_in_a_saved_run_are_not_its_ledger(install: Install) -> None:
+    install.run("compliance-audit", ARMED, "failed", None)
+    install.deliver(f"their {oobe_late.NOT_POSTED}: `compliance-audit` (findings: https://github.com/o/r/issues/99).")
     result = _verify()
     assert result.status == "pass", result.reason
     assert "(0 with their ledger link)" in result.reason

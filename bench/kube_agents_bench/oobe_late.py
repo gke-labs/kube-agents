@@ -53,7 +53,6 @@ SILENT = ("suppressed", "suppressed_acked", None)
 OUTPUT_SLACK_SECONDS = 300
 HEADING = "## Response"
 LEDGER = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
-LEDGER_WORD = "ledger"
 out = {"applied_at": None, "opened_at": None, "fired": [], "runs": {}, "report": None, "error": None}
 
 def ts(value):
@@ -95,16 +94,15 @@ if out["applied_at"] and not out["error"] and os.path.exists(db):
                 # for the last run that tried to post.
                 # Judged by when it ended, so a run already going at the arm counts, as the stage counts it.
                 if ts(finished or claimed) >= armed and outcome not in SILENT:
-                    last = {"claimed_at": claimed, "finished_at": finished, "delivery_outcome": outcome, "ledger": None}
+                    last = {"claimed_at": claimed, "finished_at": finished, "delivery_outcome": outcome, "links": []}
             if last is not None:
                 # The run's own document, as bootstrap_delivery._ledger_url reads it.
                 end = ts(last["finished_at"] or last["claimed_at"]) + OUTPUT_SLACK_SECONDS
                 docs = newest(os.path.join(out_dir, audit), ts(last["claimed_at"]), end)
+                # Every whole issue link in the run's own message: the product picks which one is the
+                # ledger, and the grade checks its pick against these rather than choosing again.
                 if docs:
-                    text = response(docs[0])
-                    named = [l for l in text.splitlines() if LEDGER_WORD in l.lower() and LEDGER.search(l)]
-                    match = LEDGER.search(named[0] if named else text)
-                    last["ledger"] = match.group(0) if match else None
+                    last["links"] = LEDGER.findall(response(docs[0]))
                 out["runs"][audit] = last
     except (sqlite3.Error, ValueError, TypeError, OSError) as exc:
         out["error"] = "%s: %s" % (db, exc)
@@ -174,7 +172,7 @@ def grade(read: dict[str, Any]) -> tuple[VerificationStatus, str]:
     if unnamed:
         return "fail", f"the report sent on the first message leaves out audits whose summaries were never posted: it does not name {', '.join(unnamed)} as not posted"
     links = set(LEDGER_LINK_RE.findall(after))
-    linked = [a for a in failed if runs[a].get("ledger") in links]
+    linked = [a for a in failed if links & set(runs[a].get("links") or [])]
     return "pass", (
         f"the report sent on the first message carries the {len(failed)} summaries that never reached the chat"
         f" ({len(linked)} with their ledger link)"
