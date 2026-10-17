@@ -11764,5 +11764,100 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do", self.text)
 
 
+class SapAiCoreInstallerTest(unittest.TestCase):
+    """The SAP AI Core paths install.sh owns: a credential flag that install.env
+    would undo, the credential prompt's default and its retry, and a service key
+    file that is empty or not a service key. The generator's own checks are in
+    test_installer_common.py."""
+
+    _SAP_KEYS = ("AICORE_SERVICE_KEY", "AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET",
+                 "AICORE_AUTH_URL", "AICORE_BASE_URL", "AICORE_RESOURCE_GROUP")
+
+    def _run(self, body, install_env=None, env=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text(install_env or "")
+            overrides = {"KUBE_AGENTS_INSTALL_ENV": str(env_file), "TMPDIR_UNDER_TEST": tmp}
+            full_env = get_isolated_test_env(overrides=overrides)
+            for key in self._SAP_KEYS + ("MODEL_PROVIDER",):
+                full_env.pop(key, None)
+            full_env.update(env or {})
+            setup = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}" >/dev/null 2>&1\n'
+                f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                "PARAM_NON_INTERACTIVE=true\n"
+                f"{body}\n"
+            )
+            return subprocess.run(["bash", "-c", setup], capture_output=True, text=True,
+                                  env=full_env, cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL)
+
+    def test_client_credential_flags_over_a_recorded_service_key_are_refused(self):
+        # The next upgrade.sh would render the recorded key again and drop the
+        # credentials the flags applied, so the run stops and says how to switch.
+        proc = self._run(
+            'PARAM_AICORE_DISCRETE_FROM_FLAG=true; rc=0; refuse_sap_ai_core_flags_against_install_env || rc=$?; echo "rc=$rc"',
+            install_env="AICORE_SERVICE_KEY='{\"clientid\":\"old\"}'\n",
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("Remove AICORE_SERVICE_KEY from", proc.stdout + proc.stderr)
+
+    def test_a_service_key_file_over_recorded_client_credentials_is_refused(self):
+        proc = self._run(
+            'PARAM_AICORE_SERVICE_KEY_FILE=/x; AICORE_SERVICE_KEY=\'{"clientid":"new"}\'; '
+            'rc=0; refuse_sap_ai_core_flags_against_install_env || rc=$?; echo "rc=$rc"',
+            install_env="AICORE_CLIENT_ID=sb-client\nAICORE_CLIENT_SECRET=s\n",
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("--aicore-service-key-file would replace the client credentials", proc.stdout + proc.stderr)
+
+    def test_a_different_service_key_file_over_a_recorded_key_is_refused_and_the_same_one_is_not(self):
+        body = ('PARAM_AICORE_SERVICE_KEY_FILE=/x; AICORE_SERVICE_KEY=\'{"clientid":"%s"}\'; '
+                'rc=0; refuse_sap_ai_core_flags_against_install_env || rc=$?; echo "rc=$rc"')
+        recorded = "AICORE_SERVICE_KEY='{\n  \"clientid\": \"same\"\n}'\n"
+        self.assertIn("rc=1", self._run(body % "other", install_env=recorded).stdout)
+        # The same key, recorded multi-line and given compacted, is not a change.
+        self.assertIn("rc=0", self._run(body % "same", install_env=recorded).stdout)
+
+    def test_flags_switch_freely_when_install_env_records_no_sap_credential(self):
+        # PERSIST_SECRETS_ON_DISK=false: the file records nothing and the live
+        # Secret is the home, so the generator's by-part recovery honours the switch.
+        proc = self._run(
+            'PARAM_AICORE_DISCRETE_FROM_FLAG=true; rc=0; refuse_sap_ai_core_flags_against_install_env || rc=$?; echo "rc=$rc"',
+            install_env="MODEL_PROVIDER=sap\n",
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_the_prompt_keeps_the_credentials_of_a_sap_install_whose_secrets_are_off_disk(self):
+        # Nothing in the environment, MODEL_PROVIDER=sap: "keep" is the default,
+        # so the run carries on and the generator recovers from the Secret.
+        proc = self._run(
+            'rc=0; prompt_sap_ai_core_credentials || rc=$?; echo "rc=$rc choice-left-key=[${AICORE_SERVICE_KEY:-}]"',
+            env={"MODEL_PROVIDER": "sap"},
+        )
+        self.assertIn("rc=0 choice-left-key=[]", proc.stdout, proc.stderr)
+        self.assertNotIn("Cannot read", proc.stdout + proc.stderr)
+
+    def test_the_prompt_does_not_end_the_run_when_no_key_file_is_given(self):
+        # A first install with no credentials anywhere and no TTY: the file
+        # prompt auto-answers empty, which falls through to the caller's warning.
+        proc = self._run('rc=0; prompt_sap_ai_core_credentials || rc=$?; echo "rc=$rc"')
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Cannot read", proc.stdout + proc.stderr)
+
+    def test_an_empty_or_invalid_key_file_is_refused_and_leaves_the_held_key(self):
+        for name, contents, message in (
+            ("empty.json", "  \n", "is empty"),
+            ("list.json", "[]", "is not an SAP AI Core service key"),
+        ):
+            with self.subTest(name=name):
+                proc = self._run(
+                    f'AICORE_SERVICE_KEY=\'{{"clientid":"held"}}\'; printf "%s" "{contents}" > "$TMPDIR_UNDER_TEST/{name}"; '
+                    f'rc=0; read_sap_ai_core_service_key_file "$TMPDIR_UNDER_TEST/{name}" || rc=$?; '
+                    'echo "rc=$rc key=$AICORE_SERVICE_KEY"'
+                )
+                self.assertIn('rc=1 key={"clientid":"held"}', proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stdout + proc.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

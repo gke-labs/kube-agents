@@ -240,6 +240,15 @@ class InstallerCommonTest(unittest.TestCase):
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     # And the mode, refused on a value outside the CRD's enum.
                     "PLATFORM_AGENT_MODE": "",
+                    # And the SAP AI Core keys, which the generator writes to
+                    # the tfvars whenever they are set: a developer who sourced
+                    # an SAP install.env must not see them in every case.
+                    "AICORE_SERVICE_KEY": "",
+                    "AICORE_CLIENT_ID": "",
+                    "AICORE_CLIENT_SECRET": "",
+                    "AICORE_AUTH_URL": "",
+                    "AICORE_BASE_URL": "",
+                    "AICORE_RESOURCE_GROUP": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -2336,6 +2345,178 @@ class InstallerCommonTest(unittest.TestCase):
             # SESSION_KV_* recover too: an adoption re-install must keep the
             # live salt or every chat identity re-pseudonymises.
             self.assertIn('session_kv_salt    = "recovered-key"', content)
+            # Another provider never asks the Secret for the SAP AI Core keys.
+            self.assertNotIn("aicore_", content)
+
+    # ── SAP AI Core: the keys reach the tfvars, and recover by part ─────────
+
+    _SAP_DISCRETE = {
+        "MODEL_PROVIDER": "sap",
+        "AICORE_CLIENT_ID": "sb-client",
+        "AICORE_CLIENT_SECRET": "client-secret-value",
+        "AICORE_AUTH_URL": "https://tenant.authentication.eu10.hana.ondemand.com",
+        "AICORE_BASE_URL": "https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com",
+    }
+
+    @staticmethod
+    def _sap_secret_kubectl(live_keys):
+        """A kubectl whose live Secret holds `live_keys`, each as "live-<KEY>",
+        and every other key as absent; a case can then tell which keys the
+        generator asked for and which it got."""
+        held = " ".join(live_keys)
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+            '  *"get secret platform-agent-secrets"*)\n'
+            '    for a in "$@"; do case "$a" in jsonpath=*) k="${a#jsonpath=\\{.data.}"; k="${k%\\}}" ;; esac; done\n'
+            f'    case " {held} " in *" $k "*) printf "live-%s" "$k" | base64 ;; esac; exit 0 ;;\n'
+            "esac\n"
+            "exit 1\n"
+        )
+
+    def _sap_tfvars(self, env, kubectl_script=None, want_rc=0):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"; echo "tfvar=$TF_VAR_aicore_client_id"',
+                env={"API_SERVER_KEY": "k", "PERSIST_SECRETS_ON_DISK": "true", **env},
+                kubectl_script=kubectl_script,
+            )
+            self.assertIn(f"rc={want_rc}", proc.stdout, proc.stderr)
+            content = dest.read_text() if dest.exists() else ""
+            return content, proc.stdout + proc.stderr
+
+    def test_tfvars_records_the_sap_ai_core_keys_that_are_set(self):
+        content, output = self._sap_tfvars(self._SAP_DISCRETE)
+        self.assertIn('model_provider     = "sap"', content)
+        self.assertIn('aicore_client_id = "sb-client"', content)
+        self.assertIn('aicore_client_secret = "client-secret-value"', content)
+        self.assertIn('aicore_auth_url = "https://tenant.authentication.eu10.hana.ondemand.com"', content)
+        self.assertIn('aicore_base_url = "https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com"', content)
+        # Unset keys stay out: an empty aicore_service_key would be a source
+        # LiteLLM reads before the discrete values.
+        self.assertNotIn("aicore_service_key", content)
+        self.assertNotIn("aicore_resource_group", content)
+        # The TF_VAR_ channel PERSIST_SECRETS_ON_DISK=false relies on.
+        self.assertIn("tfvar=sb-client", output)
+
+    def test_a_sap_install_that_names_nothing_recovers_its_live_keys(self):
+        live = ("AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_AUTH_URL", "AICORE_BASE_URL",
+                "AICORE_RESOURCE_GROUP")
+        content, _ = self._sap_tfvars({"MODEL_PROVIDER": "sap"}, self._sap_secret_kubectl(live))
+        for key in live:
+            self.assertIn(f'{key.lower()} = "live-{key}"', content)
+        self.assertNotIn("aicore_service_key", content)
+
+    def test_naming_only_a_resource_group_keeps_the_live_credentials(self):
+        # --aicore-resource-group on a re-run: the credentials must survive,
+        # because the apply rewrites the Secret from what is recovered here.
+        live = ("AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_AUTH_URL", "AICORE_BASE_URL")
+        content, _ = self._sap_tfvars(
+            {"MODEL_PROVIDER": "sap", "AICORE_RESOURCE_GROUP": "team-a"}, self._sap_secret_kubectl(live))
+        self.assertIn('aicore_resource_group = "team-a"', content)
+        for key in live:
+            self.assertIn(f'{key.lower()} = "live-{key}"', content)
+
+    def test_rotating_the_client_secret_keeps_the_other_live_values(self):
+        live = ("AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_AUTH_URL", "AICORE_BASE_URL",
+                "AICORE_RESOURCE_GROUP")
+        content, _ = self._sap_tfvars(
+            {"MODEL_PROVIDER": "sap", "AICORE_CLIENT_SECRET": "rotated"}, self._sap_secret_kubectl(live))
+        self.assertIn('aicore_client_secret = "rotated"', content)
+        for key in ("AICORE_CLIENT_ID", "AICORE_AUTH_URL", "AICORE_BASE_URL", "AICORE_RESOURCE_GROUP"):
+            self.assertIn(f'{key.lower()} = "live-{key}"', content)
+
+    def test_a_new_service_key_keeps_the_live_resource_group_and_drops_the_discrete_values(self):
+        live = ("AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_AUTH_URL", "AICORE_BASE_URL",
+                "AICORE_RESOURCE_GROUP")
+        content, _ = self._sap_tfvars(
+            {"MODEL_PROVIDER": "sap", "AICORE_SERVICE_KEY": '{"clientid":"new"}'}, self._sap_secret_kubectl(live))
+        self.assertIn('aicore_resource_group = "live-AICORE_RESOURCE_GROUP"', content)
+        for key in ("AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_AUTH_URL", "AICORE_BASE_URL"):
+            self.assertNotIn(key.lower(), content)
+
+    def test_naming_the_discrete_values_does_not_bring_back_a_live_service_key(self):
+        # An operator moving from a service key to the discrete values: the live
+        # AICORE_SERVICE_KEY must not come back, because LiteLLM reads it first.
+        content, output = self._sap_tfvars(
+            self._SAP_DISCRETE, self._sap_secret_kubectl(("AICORE_SERVICE_KEY", "OPENAI_API_KEY")))
+        self.assertNotIn("aicore_service_key", content)
+        self.assertIn('aicore_client_id = "sb-client"', content)
+        # The non-SAP credentials still recover as before (the harness seeds
+        # GEMINI_API_KEY, so OpenAI is the one left for the Secret to answer).
+        self.assertIn('openai_api_key    = "live-OPENAI_API_KEY"', content)
+
+    def test_both_sap_ai_core_credential_shapes_are_refused(self):
+        content, output = self._sap_tfvars(
+            {**self._SAP_DISCRETE, "AICORE_SERVICE_KEY": '{"clientid":"x"}'}, want_rc=1)
+        self.assertIn("LiteLLM reads the service key and ignores the others", output)
+        self.assertEqual(content, "")
+
+    def test_the_generator_compacts_a_multi_line_service_key(self):
+        # upgrade.sh, uninstall.sh and the menu reach the generator without
+        # install.sh's interview, straight from an install.env that may hold
+        # the key as the cockpit gave it.
+        content, _ = self._sap_tfvars(
+            {"MODEL_PROVIDER": "sap", "AICORE_SERVICE_KEY": '{\n  "clientid": "sb-client"\n}\n'})
+        self.assertIn('aicore_service_key = "{\\"clientid\\":\\"sb-client\\"}"', content)
+
+    def test_sap_ai_core_service_key_is_compacted_to_one_line(self):
+        multi_line = '{\n  "clientid": "sb-client",\n  "clientsecret": "s",\n  "url": "https://t.example"\n}\n'
+        proc = self._run(
+            'normalize_sap_ai_core_service_key; echo "rc=$?"; printf "key=%s\\n" "$AICORE_SERVICE_KEY"',
+            env={"AICORE_SERVICE_KEY": multi_line},
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn('key={"clientid":"sb-client","clientsecret":"s","url":"https://t.example"}', proc.stdout)
+
+    def test_sap_ai_core_service_key_that_is_not_json_is_refused(self):
+        proc = self._run(
+            'rc=0; normalize_sap_ai_core_service_key || rc=$?; echo "rc=$rc"',
+            env={"AICORE_SERVICE_KEY": "clientid=sb-client"},
+        )
+        self.assertIn("rc=1", proc.stdout)
+        self.assertIn("AICORE_SERVICE_KEY is not an SAP AI Core service key", proc.stderr + proc.stdout)
+
+    def test_sap_ai_core_service_key_must_be_one_object_with_a_clientid(self):
+        # JSON that is not a service key is refused before any apply: LiteLLM
+        # would otherwise fail on it at the first model call, and two documents
+        # would compact to two lines and break terraform.tfvars after all.
+        refused = ["{}", "[]", "null", "42", '"text"', '{"clientid":"a"}\n{"clientid":"b"}']
+        for value in refused:
+            with self.subTest(value=value):
+                proc = self._run(
+                    'rc=0; normalize_sap_ai_core_service_key || rc=$?; echo "rc=$rc"',
+                    env={"AICORE_SERVICE_KEY": value},
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+        # LiteLLM also reads a clientid nested under "credentials" (the VCAP form).
+        proc = self._run(
+            'normalize_sap_ai_core_service_key; echo "rc=$?"; printf "key=%s\\n" "$AICORE_SERVICE_KEY"',
+            env={"AICORE_SERVICE_KEY": '{\n "credentials": {"clientid": "sb-client"}\n}'},
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn('key={"credentials":{"clientid":"sb-client"}}', proc.stdout)
+
+    def test_another_provider_ignores_a_stray_sap_ai_core_key(self):
+        # A non-sap install is never asked to parse AICORE_* (uninstall.sh and
+        # upgrade.sh must not stop on a stray value), and never renders them.
+        content, output = self._sap_tfvars({"AICORE_SERVICE_KEY": "not json", "AICORE_CLIENT_ID": "sb-client"})
+        self.assertNotIn("aicore_", content)
+        self.assertIn("tfvar=\n", output + "\n")
+
+    def test_sap_ai_core_credentials_need_a_service_key_or_all_four_values(self):
+        cases = [
+            ({"AICORE_SERVICE_KEY": '{"clientid":"sb-client"}'}, "0"),
+            (dict(list(self._SAP_DISCRETE.items())[1:]), "0"),
+            ({**dict(list(self._SAP_DISCRETE.items())[1:]), "AICORE_BASE_URL": ""}, "1"),
+            ({}, "1"),
+        ]
+        for env, want in cases:
+            with self.subTest(env=sorted(k for k, v in env.items() if v)):
+                proc = self._run('rc=0; has_sap_ai_core_credentials || rc=$?; echo "rc=$rc"', env=env)
+                self.assertIn(f"rc={want}", proc.stdout, proc.stderr)
 
     # ── the adoption fetch: which control-plane endpoint it writes ───────────
 
@@ -2951,7 +3132,7 @@ class InstallDefaultsFileTest(unittest.TestCase):
         proc = subprocess.run(
             ["bash", "-c",
              f'set -u; source "{self._INSTALLER_COMMON}"; '
-             'for p in gemini openai anthropic vertex_ai; do '
+             'for p in gemini openai anthropic vertex_ai sap; do '
              'echo "$p=$(default_model_for_provider "$p")"; done'],
             capture_output=True, text=True, cwd=str(_REPO_ROOT),
         )

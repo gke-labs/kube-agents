@@ -215,9 +215,14 @@ The agent's baked default model endpoint is
 `http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base` and its provider overlays. `litellm.modelProvider`
-(gemini/anthropic/openai/vertex_ai/openai_compatible) picks which provider `model-default` routes to
+(gemini/anthropic/openai/vertex_ai/openai_compatible/sap) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity, and `openai_compatible`, whose key is optional (both below); `litellm.modelDefaultName`
+uses Workload Identity, `openai_compatible`, whose key is optional (both below), and `sap`, which
+reads SAP AI Core OAuth2 client credentials (`AICORE_SERVICE_KEY`, or `AICORE_CLIENT_ID`,
+`AICORE_CLIENT_SECRET`, `AICORE_AUTH_URL` and `AICORE_BASE_URL`, plus an optional
+`AICORE_RESOURCE_GROUP`) from the same Secret
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#sap-ai-core));
+`sap` is chart-only and has no kustomize overlay; `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget

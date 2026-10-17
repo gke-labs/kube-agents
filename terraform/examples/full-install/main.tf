@@ -189,6 +189,12 @@ locals {
       ANTHROPIC_API_KEY       = var.anthropic_api_key
       GEMINI_API_KEY          = var.gemini_api_key
       OPENAI_API_KEY          = var.openai_api_key
+      AICORE_SERVICE_KEY      = var.aicore_service_key
+      AICORE_CLIENT_ID        = var.aicore_client_id
+      AICORE_CLIENT_SECRET    = var.aicore_client_secret
+      AICORE_AUTH_URL         = var.aicore_auth_url
+      AICORE_BASE_URL         = var.aicore_base_url
+      AICORE_RESOURCE_GROUP   = var.aicore_resource_group
       # Read by the gateway for openai_compatible only, and sent to that
       # server alone.
       OPENAI_COMPATIBLE_API_KEY = var.openai_compatible_api_key
@@ -337,6 +343,35 @@ check "slack_tokens_present" {
   assert {
     condition     = !var.enable_slack || (var.slack_bot_token != "" && var.slack_app_token != "")
     error_message = "enable_slack is true but slack_bot_token and/or slack_app_token is empty. The agent pod will start and Slack will stay silent until both tokens are set in the credentials Secret."
+  }
+}
+
+# A warning rather than a precondition, on the same terms as a missing API key
+# for the other providers: the gateway starts, and every model call fails until
+# the credentials are in the Secret. Either half is enough; LiteLLM prefers the
+# service key when both are given.
+check "sap_ai_core_credentials_present" {
+  assert {
+    condition = var.model_provider != "sap" || var.aicore_service_key != "" || (
+      var.aicore_client_id != "" && var.aicore_client_secret != "" &&
+      var.aicore_auth_url != "" && var.aicore_base_url != ""
+    )
+    error_message = "model_provider is \"sap\" but neither aicore_service_key nor all four of aicore_client_id, aicore_client_secret, aicore_auth_url and aicore_base_url is set. The gateway will start and every model call will fail until they are in the credentials Secret."
+  }
+}
+
+# A warning, because the gateway still works: LiteLLM reads the service key and
+# ignores the discrete values beside it. What it costs is credentials the
+# operator named and the gateway never uses, with nothing else saying so. The
+# installer refuses this before it writes terraform.tfvars; a hand-driven
+# apply gets this.
+check "sap_ai_core_one_credential_shape" {
+  assert {
+    condition = var.model_provider != "sap" || var.aicore_service_key == "" || (
+      var.aicore_client_id == "" && var.aicore_client_secret == "" &&
+      var.aicore_auth_url == "" && var.aicore_base_url == ""
+    )
+    error_message = "model_provider is \"sap\" and both aicore_service_key and one or more of aicore_client_id, aicore_client_secret, aicore_auth_url, aicore_base_url are set. LiteLLM reads the service key and ignores the others; unset one shape."
   }
 }
 

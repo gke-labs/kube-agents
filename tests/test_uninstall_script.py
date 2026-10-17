@@ -1164,6 +1164,18 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')
         self.assertNotEqual(pool_at, -1, "uninstall.sh must blank the SCOPED_SA_POOL_* keys")
         self.assertLess(pool_at, call_at)
+        # And SAP AI Core: the generator refuses a malformed service key and a
+        # sap install holding both shapes, and on a sap install an empty key is
+        # one it recovers, so the provider is reset as well as the six blanked.
+        sap_at = text.find(
+            'export AICORE_SERVICE_KEY="" AICORE_CLIENT_ID="" AICORE_CLIENT_SECRET="" '
+            'AICORE_AUTH_URL="" AICORE_BASE_URL="" AICORE_RESOURCE_GROUP=""'
+        )
+        self.assertNotEqual(sap_at, -1, "uninstall.sh must blank the AICORE_* keys")
+        self.assertLess(sap_at, call_at)
+        provider_at = text.find('if [ "${MODEL_PROVIDER:-}" = "sap" ]; then\n    export MODEL_PROVIDER=""')
+        self.assertNotEqual(provider_at, -1, "uninstall.sh must render the default provider for a sap install")
+        self.assertLess(provider_at, call_at)
         # And the daily alert ceilings: the generator refuses a value that is
         # not a whole number, and a teardown must not stop on it. The names
         # come from the generator's own list, so a key added there and not

@@ -938,6 +938,17 @@ main() {
   if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ]; then
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
+  # SAP AI Core, likewise: the generator refuses a service key that is not one
+  # JSON object and a sap install holding both credential shapes, and blanking
+  # the six alone is not enough, because on a sap install an empty key is one
+  # it recovers from the live Secret. So a sap install renders the default
+  # provider here: sap owns no GCP resource, the destroy removes everything in
+  # state whichever provider the tfvars name, and the credentials go with the
+  # Secret. A vertex_ai install keeps its provider.
+  export AICORE_SERVICE_KEY="" AICORE_CLIENT_ID="" AICORE_CLIENT_SECRET="" AICORE_AUTH_URL="" AICORE_BASE_URL="" AICORE_RESOURCE_GROUP=""
+  if [ "${MODEL_PROVIDER:-}" = "sap" ]; then
+    export MODEL_PROVIDER=""
+  fi
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

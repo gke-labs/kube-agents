@@ -2,8 +2,9 @@
 
 Claude Opus 5 answers `temperature`, `top_p` and `top_k` with a 400, and a
 caller can send them without knowing which model the gateway routes to. The chart renders LiteLLM's per-deployment `additional_drop_params` under
-every `model_list` alias when the model is Claude: `anthropic`, or `vertex_ai`
-with a `claude-` model name. Every other provider and model renders no such
+every `model_list` alias when the model is Claude: `anthropic`, `vertex_ai`
+with a `claude-` model name, or `sap` with an `anthropic--` one (the `sap`
+cases are in `test_litellm_sap_provider.py`). Every other provider and model renders no such
 key, which keeps a Gemini or OpenAI install's ConfigMap and rollout checksum
 unchanged. The render cases need `helm` and skip without it, as
 `test_litellm_max_tokens.py`'s do.

@@ -5,10 +5,10 @@
 {{- end }}
 {{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
        a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
+{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
 {{- /* openai_compatible has no default model, so it is allowed beside the table rather than in it. */}}
 {{- if and (not (hasKey $defaultModels $provider)) (ne $provider "openai_compatible") }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible — a typo here would otherwise fail only at runtime" $provider) }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}
 {{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml }}
 {{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
@@ -318,6 +318,25 @@ spec:
                   name: {{ .Values.platformAgent.credentials.secretName | quote }}
                   key: OPENAI_API_KEY
                   optional: true
+            {{- if eq $provider "sap" }}
+            {{- /*
+              SAP AI Core authenticates with OAuth2 client credentials, not a
+              static key: LiteLLM's sap provider exchanges these at the token
+              URL for a short-lived bearer token and refreshes it before it
+              expires. Either AICORE_SERVICE_KEY or the four discrete values;
+              LiteLLM reads the first source that has any value and does not
+              merge them. Rendered only for this provider so every other
+              install's Deployment, and its rollout, is unchanged.
+            */}}
+            {{- range list "AICORE_SERVICE_KEY" "AICORE_CLIENT_ID" "AICORE_CLIENT_SECRET" "AICORE_AUTH_URL" "AICORE_BASE_URL" "AICORE_RESOURCE_GROUP" }}
+            - name: {{ . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.platformAgent.credentials.secretName | quote }}
+                  key: {{ . }}
+                  optional: true
+            {{- end }}
+            {{- end }}
             {{- end }}
             {{- if $redactionEnabled }}
             - name: KUBE_AGENTS_REDACTION_CONFIG

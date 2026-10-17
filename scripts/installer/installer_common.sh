@@ -87,6 +87,25 @@ readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 readonly GITHUB_MINTER_DEPLOYMENT="github-token-minter"
 readonly GITHUB_APP_CREDENTIALS_SECRET="github-app-credentials"
 
+# ─── SAP AI Core (MODEL_PROVIDER=sap) ─────────────────────────────────────────
+# The credentials under the names LiteLLM's sap provider reads from its
+# environment. All of them travel in the platform-agent-secrets Secret, the URLs
+# and resource group included: one path is what lets an upgrade recover them
+# from the live Secret and PERSIST_SECRETS_ON_DISK=false keep them off disk, the
+# same as an API key. There are two credential shapes, the service key JSON or
+# the four discrete values, and LiteLLM takes the first source that has any
+# value without merging the two; the resource group applies to either.
+readonly SAP_AI_CORE_DISCRETE_KEYS="AICORE_CLIENT_ID AICORE_CLIENT_SECRET AICORE_AUTH_URL AICORE_BASE_URL"
+readonly SAP_AI_CORE_CREDENTIAL_KEYS="AICORE_SERVICE_KEY ${SAP_AI_CORE_DISCRETE_KEYS} AICORE_RESOURCE_GROUP"
+# What LiteLLM uses when AICORE_RESOURCE_GROUP is unset; named for the prompts
+# that show it, not passed on.
+# shellcheck disable=SC2034  # read by install.sh
+readonly SAP_AI_CORE_DEFAULT_RESOURCE_GROUP="default"
+# The jq program normalize_sap_ai_core_service_key runs under -s: exactly one
+# object carrying a clientid at the top level or under "credentials", emitted
+# compact; anything else is an error and an empty result.
+readonly SAP_AI_CORE_SERVICE_KEY_FILTER='if length == 1 and (.[0] | type) == "object" and (.[0] | has("clientid") or ((.credentials | type) == "object" and (.credentials | has("clientid")))) then .[0] else error("not an SAP AI Core service key") end'
+
 # ─── Scope cap ─────────────────────────────────────
 # The bounds the PlatformAgent puts on spec.scope.maxProjects (SCOPE_MAX_PROJECTS),
 # and its default, which the live-scope check reads an absent key as.
@@ -442,12 +461,13 @@ default_model_for_provider() {
     anthropic) echo "$DEFAULT_MODEL_ANTHROPIC" ;;
     # No default: the model is whatever the server serves.
     openai_compatible) echo "" ;;
+    sap) echo "$DEFAULT_MODEL_SAP" ;;
     *) echo "$DEFAULT_MODEL_GEMINI" ;;
   esac
 }
 
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible)$ ]]
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible|sap)$ ]]
 }
 
 # An OpenAI-compatible base URL → "<host> <port>", the host lowercased and an
@@ -740,6 +760,56 @@ validate_openai_compatible_inputs() {
     print_error "OPENAI_COMPATIBLE_CA_SECRET_NAME='${ca_bundle_name}' is not a valid Kubernetes Secret name."
     return 1
   fi
+}
+
+# Whether this run names any of the four discrete SAP AI Core values. Returns 0
+# when it does.
+sap_ai_core_discrete_named() {
+  local key
+  for key in $SAP_AI_CORE_DISCRETE_KEYS; do
+    [ -z "${!key:-}" ] || return 0
+  done
+  return 1
+}
+
+# Whether this run has enough to authenticate to SAP AI Core: a service key, or
+# all four of the discrete values. Returns 0 when it does. The resource group is
+# optional either way (LiteLLM falls back to "default").
+has_sap_ai_core_credentials() {
+  [ -n "${AICORE_SERVICE_KEY:-}" ] && return 0
+  [ -n "${AICORE_CLIENT_ID:-}" ] && [ -n "${AICORE_CLIENT_SECRET:-}" ] \
+    && [ -n "${AICORE_AUTH_URL:-}" ] && [ -n "${AICORE_BASE_URL:-}" ]
+}
+
+# Refuse a run that holds both SAP AI Core credential shapes, and say which key
+# to drop. LiteLLM reads the service key and silently ignores the discrete
+# values beside it, so carrying both would apply credentials the operator did
+# not mean to use. Returns non-zero after reporting. Caller defines print_error.
+refuse_both_sap_ai_core_credential_shapes() {
+  [ -n "${AICORE_SERVICE_KEY:-}" ] && sap_ai_core_discrete_named || return 0
+  print_error "Both AICORE_SERVICE_KEY and one or more of ${SAP_AI_CORE_DISCRETE_KEYS// /, } are set. LiteLLM reads the service key and ignores the others, so keep one shape: remove AICORE_SERVICE_KEY to use the client credentials, or the four discrete values to use the service key, from ${INSTALL_ENV_FILE:-install.env} or, where that file does not record them, from the live '${PLATFORM_AGENT_SECRET}' Secret."
+  return 1
+}
+
+# Rewrite AICORE_SERVICE_KEY as single-line JSON, or report why not and return
+# non-zero. A service key is downloaded from the SAP BTP cockpit as indented,
+# multi-line JSON, and terraform.tfvars cannot carry a raw newline inside a
+# quoted string, so the generator would write a file Terraform refuses to parse.
+# The check is that the value is one JSON object carrying a clientid, at the top
+# level or under "credentials" (the two places LiteLLM looks), not merely JSON:
+# `{}`, a list, or a key pasted twice is refused here, before any apply, rather
+# than failing inside LiteLLM at the first model call, and two documents would
+# otherwise compact to two lines and break the tfvars after all. An unset key
+# is left alone. jq is already a prerequisite of every front door. Caller
+# defines print_error.
+normalize_sap_ai_core_service_key() {
+  [ -n "${AICORE_SERVICE_KEY:-}" ] || return 0
+  local compacted
+  if ! compacted="$(printf '%s' "$AICORE_SERVICE_KEY" | jq -cs "$SAP_AI_CORE_SERVICE_KEY_FILTER" 2>/dev/null)" || [ -z "$compacted" ]; then
+    print_error "AICORE_SERVICE_KEY is not an SAP AI Core service key: it must be one JSON object with a clientid. Paste the service key exactly as the SAP BTP cockpit gives it, or set AICORE_CLIENT_ID, AICORE_CLIENT_SECRET, AICORE_AUTH_URL and AICORE_BASE_URL instead."
+    return 1
+  fi
+  export AICORE_SERVICE_KEY="$compacted"
 }
 
 # MODEL_MAX_TOKENS: a whole number of output tokens, 0 meaning none. Digits
@@ -4051,17 +4121,31 @@ write_tfvars_from_state() {
   local secret_key secret_val
   local expected_ctx
   expected_ctx="$(gke_context_name)"
+  # The SAP AI Core keys, on a sap install only, recovered by part rather than
+  # as one set: a run that rotates the client secret or names a resource group
+  # must not lose the rest, and the apply rewrites the Secret from what is
+  # recovered here. The resource group belongs to either shape and always
+  # recovers. The service key recovers only when this run names none of the
+  # four discrete values, and the discrete values only when it names no service
+  # key, so a live value of the shape the operator is leaving cannot come back
+  # and shadow the one being named (LiteLLM reads the service key first).
+  local recover_keys="API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT"
+  if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "sap" ]; then
+    recover_keys="$recover_keys AICORE_RESOURCE_GROUP"
+    sap_ai_core_discrete_named || recover_keys="$recover_keys AICORE_SERVICE_KEY"
+    [ -n "${AICORE_SERVICE_KEY:-}" ] || recover_keys="$recover_keys $SAP_AI_CORE_DISCRETE_KEYS"
+  fi
   if command -v kubectl >/dev/null 2>&1 &&
     [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
-    for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY OPENAI_COMPATIBLE_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
+    for secret_key in $recover_keys; do
       [ -z "${!secret_key:-}" ] || continue
       # Every stage exits 0 on its own (|| true inside the substitution):
       # install.sh runs an inherited ERR trap (set -E), and a failing kubectl
       # here — no cluster yet, stale context — must be a silent no-op, not a
       # trap-and-abort the outer || can never see. --request-timeout bounds
       # the other stale-context failure mode: a context whose cluster was
-      # just destroyed black-holes TCP instead of refusing, and eight keys
-      # times a hung connect stalls the install for minutes.
+      # just destroyed black-holes TCP instead of refusing, and a hung connect
+      # per key stalls the install for minutes.
       secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
         --context "$expected_ctx" \
         --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
@@ -4071,6 +4155,20 @@ write_tfvars_from_state() {
         print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
       fi
     done
+  fi
+
+  # Here rather than only in install.sh's interview, because every front door
+  # passes through this function: upgrade.sh and the menu's Save & Apply read
+  # AICORE_SERVICE_KEY straight from install.env, where a key pasted from the
+  # SAP BTP cockpit is multi-line, and a raw newline in a quoted string is a
+  # terraform.tfvars Terraform refuses to parse. After recovery, so the refusal
+  # of two credential shapes sees what the apply would write. On a sap install
+  # only: another provider never renders the keys (below), so a stray value in
+  # its install.env is not this run's to refuse. uninstall.sh renders the
+  # default provider for the same reason.
+  if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "sap" ]; then
+    normalize_sap_ai_core_service_key || return 1
+    refuse_both_sap_ai_core_credential_shapes || return 1
   fi
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
@@ -4488,6 +4586,16 @@ write_tfvars_from_state() {
       if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "openai_compatible" ]; then
         echo "openai_compatible_api_key = $(hcl_str "${OPENAI_COMPATIBLE_API_KEY:-}")"
       fi
+      # Only the keys that are set, and only on a sap install, so an install on
+      # another provider writes the same file it always did, whatever a stray
+      # AICORE_* in its environment holds.
+      local sap_key
+      if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "sap" ]; then
+        for sap_key in $SAP_AI_CORE_CREDENTIAL_KEYS; do
+          [ -n "${!sap_key:-}" ] || continue
+          echo "$(printf '%s' "$sap_key" | tr '[:upper:]' '[:lower:]') = $(hcl_str "${!sap_key}")"
+        done
+      fi
       if [ -n "${SESSION_KV_API_KEY:-}" ] || [ -n "${SESSION_KV_SALT:-}" ]; then
         echo "# Recovered from the live Secret: an adoption re-install must keep the"
         echo "# salt, or every chat identity re-pseudonymises."
@@ -4638,6 +4746,12 @@ write_tfvars_from_state() {
   export TF_VAR_openai_api_key="${OPENAI_API_KEY:-}"
   export TF_VAR_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
   export TF_VAR_openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
+  local sap_tf_key sap_tf_value
+  for sap_tf_key in $SAP_AI_CORE_CREDENTIAL_KEYS; do
+    sap_tf_value=""
+    [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" != "sap" ] || sap_tf_value="${!sap_tf_key:-}"
+    export "TF_VAR_$(printf '%s' "$sap_tf_key" | tr '[:upper:]' '[:lower:]')=${sap_tf_value}"
+  done
   export TF_VAR_slack_bot_token="${SLACK_BOT_TOKEN:-}"
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"

@@ -302,7 +302,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai` or `openai_compatible`),
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible` or
+   `sap`),
    where the model credential comes from, and, if the operator wants GitOps pull requests, the
    forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
@@ -329,7 +330,11 @@ An agent given that prompt, or reading this file on its own, follows these steps
    the operator export `GEMINI_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in the shell before
    starting, so the key stays out of the command line and the agent's transcript; `vertex_ai` needs
    no key, and `gemini` can instead read one from the Secret Manager secret
-   `DEFAULT_GEMINI_API_KEY_SECRET_NAME` names in `install.defaults.env`. Without a key, the
+   `DEFAULT_GEMINI_API_KEY_SECRET_NAME` names in `install.defaults.env`. For `sap`, have the
+   operator save the SAP AI Core service key JSON to a file and pass
+   `--aicore-service-key-file=PATH`, or export `AICORE_CLIENT_ID`, `AICORE_CLIENT_SECRET`,
+   `AICORE_AUTH_URL` and `AICORE_BASE_URL` (one shape, not both), so the client secret stays off
+   the command line too. Without a key, the
    installer only warns, and the agent it installs cannot call a model. `openai_compatible` has no
    defaults: confirm the model name the server serves (`--model-default-name`), its base URL
    (`--openai-compatible-api-base`), and either the server pod's port for an in-cluster Service

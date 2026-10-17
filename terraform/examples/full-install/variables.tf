@@ -329,13 +329,13 @@ variable "third_party_image_registry" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, vertex_ai, or openai_compatible). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; openai_compatible is any server speaking the OpenAI chat-completions API (vLLM, TGI, an internal gateway), set with model_default_name and the openai_compatible_* variables."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, vertex_ai, openai_compatible, or sap). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; openai_compatible is any server speaking the OpenAI chat-completions API (vLLM, TGI, an internal gateway), set with model_default_name and the openai_compatible_* variables; sap (SAP AI Core) takes the aicore_* variables."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "openai_compatible"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, or openai_compatible."
+    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "openai_compatible", "sap"], var.model_provider)
+    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, openai_compatible, or sap."
   }
 }
 
@@ -518,6 +518,49 @@ variable "openai_compatible_api_key" {
   description = "The openai_compatible server's API key, stored as OPENAI_COMPATIBLE_API_KEY (optional; omitted from the Secret when empty). The gateway sends it to that server only."
   type        = string
   sensitive   = true
+  default     = ""
+}
+
+# SAP AI Core (model_provider = "sap"). Each lands in the credentials Secret
+# under its LiteLLM environment name (AICORE_*), the URLs and resource group
+# included, so the installer recovers all of them from one place on upgrade.
+# Give aicore_service_key, or the client id, client secret, auth URL and base
+# URL: LiteLLM reads the first source with any value and does not merge them.
+variable "aicore_service_key" {
+  description = "AICORE_SERVICE_KEY: the SAP AI Core service key JSON from the SAP BTP cockpit, carrying the client id, client secret, auth URL and AI API URL (model_provider = \"sap\"; optional; omitted from the Secret when empty)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "aicore_client_id" {
+  description = "AICORE_CLIENT_ID: SAP AI Core OAuth2 client id, the alternative to aicore_service_key (model_provider = \"sap\"; optional; omitted from the Secret when empty)"
+  type        = string
+  default     = ""
+}
+
+variable "aicore_client_secret" {
+  description = "AICORE_CLIENT_SECRET: SAP AI Core OAuth2 client secret, the alternative to aicore_service_key (model_provider = \"sap\"; optional; omitted from the Secret when empty)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "aicore_auth_url" {
+  description = "AICORE_AUTH_URL: the SAP AI Core OAuth2 token URL (https://<subdomain>.authentication.<region>.hana.ondemand.com); LiteLLM appends /oauth/token when it is missing (model_provider = \"sap\"; optional; omitted from the Secret when empty)"
+  type        = string
+  default     = ""
+}
+
+variable "aicore_base_url" {
+  description = "AICORE_BASE_URL: the SAP AI Core AI API URL (https://api.ai.prod.<region>.<hyperscaler>.ml.hana.ondemand.com); LiteLLM appends /v2 when it is missing (model_provider = \"sap\"; optional; omitted from the Secret when empty)"
+  type        = string
+  default     = ""
+}
+
+variable "aicore_resource_group" {
+  description = "AICORE_RESOURCE_GROUP: the SAP AI Core resource group holding the orchestration deployment. Empty leaves LiteLLM's own default, \"default\" (model_provider = \"sap\"; optional; omitted from the Secret when empty)"
+  type        = string
   default     = ""
 }
 
