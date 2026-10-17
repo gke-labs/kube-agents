@@ -34,8 +34,19 @@ class InjectionTest(unittest.TestCase):
         shutil.copy(ROSTER_SOURCE, self.data_dir / "scripts" / "agent_roster.py")
         self.profiles = self.data_dir / "profiles"
         self.profiles.mkdir()
-        self._env = mock.patch.dict("os.environ", {"HERMES_HOME": str(self.data_dir)})
+        # The roster reads the host cluster env and the scope render; point the
+        # render at a missing file and drop the host names so a developer shell
+        # (or a real /etc/kube-agents/scope.json) cannot leak into the block.
+        self._env = mock.patch.dict(
+            "os.environ",
+            {
+                "HERMES_HOME": str(self.data_dir),
+                "KUBEAGENTS_SCOPE_FILE": str(self.data_dir / "absent-scope.json"),
+            },
+        )
         self._env.start()
+        for name in ("GKE_CLUSTER_NAME", "GKE_PROJECT_ID", "GCP_PROJECT_ID", "GKE_LOCATION"):
+            os.environ.pop(name, None)
         # The module handle is cached for the process; a stale one from another
         # test would silently read the wrong tree.
         plugin._roster_module = None
@@ -134,7 +145,64 @@ class InjectionTest(unittest.TestCase):
     def test_a_populated_fleet_keeps_the_footer(self):
         self._profile("default")
         self._profile("platform", "Fleet work.")
-        self.assertIn("verbatim as the `assignee`", plugin.handle_pre_llm_call()["context"])
+        context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("verbatim as the `assignee`", context)
+        # No host env, no host section, so no sentence pointing at one.
+        self.assertNotIn("Host Cluster `assignee`", context)
+
+    def test_injects_host_and_fleet_scope_identity(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        self._profile(
+            "cluster-kube-agents-demo-platform-agent-host-us-central1",
+            "Read-only diagnostics for one GKE cluster.",
+        )
+        (
+            self.profiles
+            / "cluster-kube-agents-demo-platform-agent-host-us-central1"
+            / "config.yaml"
+        ).write_text(
+            "cluster_identity:\n"
+            "  cluster: platform-agent-host\n"
+            "  location: us-central1\n"
+            "  project: kube-agents-demo\n"
+        )
+        scope_file = self.data_dir / "scope.json"
+        scope_file.write_text('{"present": true, "projects": ["gca-gke-2025"]}\n')
+        env = {
+            "GKE_CLUSTER_NAME": "platform-agent-host",
+            "GKE_PROJECT_ID": "kube-agents-demo",
+            "GKE_LOCATION": "us-central1",
+            "KUBEAGENTS_SCOPE_FILE": str(scope_file),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            context = plugin.handle_pre_llm_call()["context"]
+
+        self.assertIn('Host Cluster Identity ("this cluster" / "this host cluster"):', context)
+        self.assertIn(
+            "assignee=cluster-kube-agents-demo-platform-agent-host-us-central1",
+            context,
+        )
+        self.assertIn("- GCP projects in scope (2): gca-gke-2025, kube-agents-demo", context)
+        self.assertIn("Host Cluster `assignee`", context)
+
+    def test_reloads_roster_module_when_script_mtime_changes(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        first = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("- platform: Fleet work.", first)
+
+        script_path = self.data_dir / "scripts" / "agent_roster.py"
+        script_path.write_text(
+            'EMPTY_ROSTER = "EMPTY"\n'
+            'def render(base=None):\n'
+            '    return "- custom-reloaded: Reloaded from updated script."\n'
+        )
+        stat = script_path.stat()
+        os.utime(script_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+        second = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("- custom-reloaded: Reloaded from updated script.", second)
 
     @unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits this test relies on")
     def test_an_unreadable_profiles_dir_injects_nothing(self):
