@@ -49,7 +49,7 @@ from datetime import datetime
 arm_state, late_state, marker, db, out_dir, oobe_dir, title, sentinel, audits = (
     sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9:])
 SQLITE_BUSY_TIMEOUT = 10
-SILENT = ("suppressed", None)
+SILENT = ("suppressed", "suppressed_acked", None)
 OUTPUT_SLACK_SECONDS = 300
 HEADING = "## Response"
 LEDGER = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
@@ -93,7 +93,8 @@ if out["applied_at"] and not out["error"] and os.path.exists(db):
                 " WHERE job_id = ? AND status = 'completed' ORDER BY claimed_at", (audit,)):
                 # A run that posted nothing on purpose (suppressed, or no outcome) does not stand in
                 # for the last run that tried to post.
-                if ts(claimed) >= armed and outcome not in SILENT:
+                # Judged by when it ended, so a run already going at the arm counts, as the stage counts it.
+                if ts(finished or claimed) >= armed and outcome not in SILENT:
                     last = {"claimed_at": claimed, "finished_at": finished, "delivery_outcome": outcome, "ledger": None}
             if last is not None:
                 # The run's own document, as bootstrap_delivery._ledger_url reads it.

@@ -1891,6 +1891,23 @@ class FirstRunAuditsTest(unittest.TestCase):
                            oobe.STATE_DONE: True})
         self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/12)", note)
 
+    def test_a_run_going_at_the_mark_counts_by_its_finish(self):
+        now = time.time()
+        # Claimed before the mark, finished after it: the stage took it as the audit's answer.
+        self._run("compliance-audit", now - 960, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 930},
+                           oobe.STATE_DONE: True})
+        self.assertIn("which have run: `compliance-audit`.", note)
+        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
+    def test_a_suppressed_acked_run_is_silent(self):
+        now = time.time()
+        self._run("compliance-audit", now - 1200, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 600, "suppressed_acked")
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 1300},
+                           oobe.STATE_DONE: True})
+        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
     def test_a_mark_that_is_not_a_number_reads_as_no_mark(self):
         now = time.time()
         self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)

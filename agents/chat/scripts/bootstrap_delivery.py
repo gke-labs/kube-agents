@@ -249,8 +249,8 @@ LEDGER_URL_RE = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
 LEDGER_WORD = "ledger"
 # The parts a managed ledger issue's URL must have (_managed_issue).
 MANAGED_ISSUE_RE = re.compile(r"https://(?P<host>[A-Za-z0-9.-]+)/(?P<repo>[\w.-]+/[\w.-]+)/issues/\d+")
-# A run that posted nothing on purpose: the scheduler's suppressed outcome, or none recorded.
-SILENT_OUTCOMES = ("suppressed", None)
+# A run that posted nothing on purpose: the scheduler's suppressed outcomes, or none recorded.
+SILENT_OUTCOMES = ("suppressed", "suppressed_acked", None)
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -676,7 +676,11 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     # A mark that is not a number reads as no mark: this runs after the claim, and a raise here
     # would lose the report.
     since = {a: m if isinstance(m, (int, float)) else 0 for a, m in marks.items()}
-    finished = [a for a in fired if any(claimed >= since.get(a, 0) for claimed, _, _ in runs.get(a, ()))]
+    # Judged by when the run ended: a scheduled run already going when the stage marked the audit
+    # is the stage's answer, though it was claimed before the mark.
+    finished = [
+        a for a in fired if any((ended or claimed) >= since.get(a, 0) for claimed, ended, _ in runs.get(a, ()))
+    ]
     if not state.get(oobe.STATE_DONE):
         note = AUDITS_RUNNING_NOTE
     elif fired and finished == fired:
