@@ -200,9 +200,10 @@ readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
 # stack, the verifier and the state writes around the run.
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
-# applied: oobe-first-run-audits' own_wait plus its chain_wait
-# (bench/tf/prebuilt/oobe-first-run-audits/main.tf).
-readonly STATE_LOCK_HOLD_SECONDS=7200
+# applied: oobe-late-first-message's own_wait, chain_wait and delivery_wait
+# (bench/tf/prebuilt/oobe-late-first-message/main.tf), the longest of the cases
+# on one.
+readonly STATE_LOCK_HOLD_SECONDS=9600
 # How long a stack-bearing unit that found its state lock busy waits, with the
 # infra lock given back, before it queues for the infra lock again.
 readonly STATE_LOCK_RETRY_SECONDS=30
@@ -1085,7 +1086,8 @@ fi
 # build, then state closed; nothing deleted), and it is called twice: here,
 # once the lease is known and before any unit, for every stream; and in
 # run_one_unit, under the task lock and before devops-bench, for that unit's
-# stream alone -- so repetitions 2 and 3 start as repetition 1 did, and a
+# stream alone (and for each declared stream of a case resets_declared_streams
+# names) -- so repetitions 2 and 3 start as repetition 1 did, and a
 # sibling lane's stream, which has its own label, is never touched. Every
 # repetition then opens a fresh ledger, one closed issue per repetition in a
 # repository that exists to be written to; the agent's leftover pull requests
@@ -1364,7 +1366,8 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
 # run's, not the ledger's, so the ledger reset above cannot clear it; this
 # does, per unit, from the same place the ledger reset runs (under the task
 # lock and the stream lock, before devops-bench) and just before it, for
-# that unit's stream alone. Not at lease time: the per-unit release covers a
+# that unit's stream alone (or each declared stream, for a case
+# resets_declared_streams names). Not at lease time: the per-unit release covers a
 # note an earlier lease left as well.
 #
 # A unit that ended on its delegation ceiling may have left a worker that is
@@ -2777,9 +2780,12 @@ unit_cost_hint() {
     # the previous repetition's audits to finish (wait_platform_runs), then the
     # stack waits for the stage to run the four one after another (1-15 min
     # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it launches first in each
-    # repetition round.
+    # nightly of 2026-10-09; near the top of the list, so it launches early in
+    # each repetition round.
     oobe-first-run-audits) echo 3000 ;;
+    # The same chain, then the delivery of a report on the late first message
+    # (up to its delivery_wait, 600s). Off the infra lock with it. Unmeasured on CI.
+    oobe-late-first-message) echo 3600 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -2950,7 +2956,18 @@ unit_delegation_timeout() {
 # stack's cluster_name output cannot move another unit's current-context.
 infra_lock_exempt() { # <task-name>
   case "$1" in
-    oobe-first-run-audits) return 0 ;;
+    oobe-first-run-audits | oobe-late-first-message) return 0 ;;
+  esac
+  return 1
+}
+# A case that grades what its declared audit streams post, not one stream's
+# ledger, so each of those streams starts from a closed ledger, as the graded
+# stream of an audit case does: an audit with an open ledger and nothing new
+# is silent and posts no summary. oobe-late-first-message grades the summaries
+# its four first-run audits fail to deliver.
+resets_declared_streams() { # <task-name>
+  case "$1" in
+    oobe-late-first-message) return 0 ;;
   esac
   return 1
 }
@@ -2961,7 +2978,7 @@ infra_lock_exempt() { # <task-name>
 # from the others, so this lock does.
 unit_state_lock() { # <task-name>
   case "$1" in
-    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
+    oobe-first-run-audits | oobe-late-first-message | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
   esac
 }
 TASK_NAMES=()
@@ -3482,6 +3499,12 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   if [ -n "${audit_id}" ]; then
     release_inflight_note "${name} rep ${rep}" "${audit_id}"
     reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"
+  fi
+  if resets_declared_streams "${name}"; then
+    for s in ${streams}; do
+      release_inflight_note "${name} rep ${rep}" "${s}"
+      reset_audit_ledgers "${name} rep ${rep}" "${s}"
+    done
   fi
   # The repository this unit's agent writes to, emptied of every agent pull
   # request and every branch but the default and read back, so repetitions

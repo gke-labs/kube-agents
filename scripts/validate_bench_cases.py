@@ -489,6 +489,9 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
     # claimed since the stage marked it is the whole assertion.
     "oobe_audits_started": (),
+    # This repository, agent-disk-reading. No field: whether the report delivered on a late first
+    # message carries every audit summary that failed to deliver is the whole assertion.
+    "oobe_late_report": (),
     # This repository, agent-pod-reading: the states of findings-queue rows a
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
