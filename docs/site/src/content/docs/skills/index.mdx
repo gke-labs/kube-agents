@@ -115,6 +115,7 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 
 | Skill | Description |
 | ----- | ----------- |
+| [`gke-load-bearing-change`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-load-bearing-change/SKILL.md) | Establish whether an out-of-band change to a live object is load-bearing — whether the state the manifests declare would still run if the change were undone — before recommending a revert. Read-only. For drift triage, emergency hotfixes found in a cluster, and any decision between a declared state and a live one. |
 | [`gke-observability`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-observability/SKILL.md) | Workflows for setting up and auditing observability (logging, monitoring, tracing) on GKE. |
 | [`gke-reliability`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-reliability/SKILL.md) | Workflows for ensuring high availability and reliability of GKE workloads. |
 | [`gke-stall-detection`](https://github.com/gke-labs/kube-agents/blob/main/agents/cluster/skills/gke-stall-detection/SKILL.md) | Read-only detection of controllers that stopped making progress without erroring — observedGeneration lag, stuck progress conditions, repeating warning events, and references to objects that do not exist — in one namespace or one kind. |

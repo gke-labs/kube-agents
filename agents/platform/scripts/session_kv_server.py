@@ -2027,6 +2027,14 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     one that should win. That is a decision the reader makes, not a defect the
     agent diagnoses, so the report's job is to establish what changed, whether
     it still stands, and what each answer would cost.
+
+    The body names `gke-load-bearing-change` outright for the reason
+    `_stall_task_body` names its skill: the Cluster Agent reaches this text as a
+    verbatim presentation template and follows its format faithfully, and a
+    skill is not picked up by ambient relevance while it is doing that. What the
+    skill carries is the step a report can skip while looking complete —
+    establishing whether the state git declares still runs before proposing that
+    the change be undone.
     """
     resource_path = _drift_resource_path(payload)
     cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
@@ -2069,13 +2077,21 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
         f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
         f"use it.\n\n"
+        f"**Run the `gke-load-bearing-change` skill before you propose undoing the change.** Reading the live "
+        f"object tells you whether the change still stands. It does not tell you whether the state git declares "
+        f"would run if you put it back — and a change that is the only reason this object's workload is up is "
+        f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
+        f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
+        f"whichever way it comes out belongs in the report.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
         f"delivers one line to the person waiting for it.\n\n"
         f"**Done when:** the report says what the live object looks like now compared with what the change did; "
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
-        f"either reverting it to the declared state or codifying it in git, with the consequence of each. "
+        f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
+        f"revert's consequence being whether the state git declares would still run, read off this cluster or "
+        f"reported as not established. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
