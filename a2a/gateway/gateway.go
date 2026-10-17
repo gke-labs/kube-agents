@@ -746,7 +746,11 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// the list talking to a colleague under an alert would otherwise get
 		// a public refusal in a thread the channel is reading. Nor is it
 		// counted as notified, so their first real ask still gets the notice.
-		notified := msg.Unaddressed
+		//
+		// Nor for a shortcut: the conversation is a thread under someone
+		// else's message, and the adapter tells the clicker privately
+		// (InboundMessage.Shortcut).
+		notified := msg.Unaddressed || msg.Shortcut
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
@@ -758,9 +762,7 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 			g.mu.Unlock()
 		}
 		if !notified {
-			g.post(msg.Conversation, "⛔ I can't verify who you are on "+backend+
-				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
-				unverifiedRemedyFor(backend)+".")
+			g.post(msg.Conversation, unverifiedNotice(backend, msg.AuthorID))
 		}
 		// After the notice, and whether or not one was posted: an adapter
 		// whose caller is a program has to learn about the drop it is not

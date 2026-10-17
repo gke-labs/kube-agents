@@ -84,6 +84,13 @@ type InboundMessage struct {
 	// sender's such message is dropped without the public refusal notice,
 	// since they asked the bot nothing. False on every other path.
 	Unaddressed bool
+	// Shortcut marks a message a member sent by using the "ask about this"
+	// message shortcut on someone's message: the conversation is the thread
+	// under that message, MessageID names it, and Text quotes it. A sender
+	// the gateway cannot verify gets no refusal in that thread, which the
+	// channel reads; the adapter tells them privately. False on every other
+	// path, and on every backend but Slack.
+	Shortcut bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
