@@ -1118,3 +1118,21 @@
 # its own on the host cluster, so it too serializes on the infra lock. Priced
 # at that case's 1450s hint until it has a record.
 ./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# The front door's reply to a blocked card declares the one next step on a
+# last line of its own, `[next: <label>]`, which Slack draws as a button
+# (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
+# planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
+# turn and no worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-failure-reply-declares-next-step/task.yaml
+
+# A card's answer with one obvious next step declares it on a last line of
+# its own, `[next: <label>]`, which Slack draws as a button (the report-format
+# stanza in deploy/docker/patches/kanban_report_format.py). Read-only against
+# the crashloop-workload fixture; one card, nothing changed.
+./tasks/chat-answer-declares-next-step/task.yaml
+
+# Mock 03's shape: an answer whose offer is about a workload the user did
+# not ask about declares no next step (the report-format stanza). Read-only
+# against the no-pdb-workload and crashloop-workload fixtures; one card.
+./tasks/chat-answer-tangent-offer-declares-no-step/task.yaml
