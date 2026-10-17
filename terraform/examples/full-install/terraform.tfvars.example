@@ -174,11 +174,6 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Comma-separate several to serve more than one Slack workspace.
 # slack_bot_token         = "xoxb-..."
 # slack_app_token         = "xapp-..."
-# Or if Slack tokens are kept in external Secrets rather than the shared credentials Secret:
-# slack_bot_token_secret_name = "my-slack-secret"
-# slack_bot_token_secret_key  = "SLACK_BOT_TOKEN"
-# slack_app_token_secret_name = "my-slack-secret"
-# slack_app_token_secret_key  = "SLACK_APP_TOKEN"
 # slack_allowed_users     = ["U01234567"]
 # slack_home_channel      = "C01234567"
 # slack_home_channel_name = "#kube-agents"

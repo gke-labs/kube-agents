@@ -7922,22 +7922,21 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
 
     # ── what upgrade.sh renders afterwards ──────────────────────────────────
 
-    def _upgrade_render(self, install_env, extra_env=None, kubectl_script=None):
+    def _upgrade_render(self, install_env, extra_env=None):
         """upgrade.sh's half: load_install_env, then write_tfvars_from_state,
         through test_installer_common's hermetic harness, with a live Secret
         holding both Slack tokens on this install's own kube context."""
         bot_b64 = base64.b64encode(b"xoxb-live").decode()
         app_b64 = base64.b64encode(b"xapp-live").decode()
-        if kubectl_script is None:
-            kubectl_script = (
-                "#!/usr/bin/env bash\n"
-                'case "$*" in\n'
-                '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-                f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
-                f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
-                "  *) exit 1 ;;\n"
-                "esac\n"
-            )
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_BOT_TOKEN}}"*) printf "%s" "{bot_b64}" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.SLACK_APP_TOKEN}}"*) printf "%s" "{app_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
         dest = install_env.parent / "terraform.tfvars"
         env = {"API_SERVER_KEY": "k", "SLACK_ENABLED": "", "SLACK_BOT_TOKEN": "", "SLACK_APP_TOKEN": "",
                "PERSIST_SECRETS_ON_DISK": ""}
@@ -7945,9 +7944,9 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         proc = _installer_common_tests.InstallerCommonTest._run(
             self,
             f'load_install_env "{install_env}"; write_tfvars_from_state "{dest}"; '
-            'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token] TFVAR_BOT_SEC=[${TF_VAR_slack_bot_token_secret_name:-}]"',
+            'echo "rc=$? TFVAR_BOT=[$TF_VAR_slack_bot_token]"',
             env=env,
-            kubectl_script=kubectl_script,
+            kubectl_script=kubectl_stub,
         )
         self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
         return dest.read_text(), proc.stdout
@@ -8000,248 +7999,6 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
             self.assertNotIn("slack_bot_token", tfvars)
             self.assertIn("TFVAR_BOT=[xoxb-live]", stdout)
             self.assertNotIn("xoxb-live", path.read_text())
-
-    def test_upgrade_recovers_slack_secret_refs_from_live_cr(self):
-        """When the live PlatformAgent CR references an external Secret for Slack tokens,
-        write_tfvars_from_state recovers them and emits them into terraform.tfvars."""
-        kubectl_stub = (
-            "#!/usr/bin/env bash\n"
-            'case "$*" in\n'
-            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            '  *"get platformagents"*) cat << \'EOF\'\n'
-            '{"items": [{"spec": {"integration": {"slack": {\n'
-            '  "botTokenSecretRef": {"name": "custom-bot-secret", "key": "custom-bot-key"},\n'
-            '  "appTokenSecretRef": {"name": "custom-app-secret", "key": "custom-app-key"}\n'
-            '}}}}]}\n'
-            'EOF\n'
-            ";;\n"
-            "  *) exit 1 ;;\n"
-            "esac\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\n")
-            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
-            self.assertIn('slack_bot_token_secret_name = "custom-bot-secret"', tfvars)
-            self.assertIn('slack_bot_token_secret_key  = "custom-bot-key"', tfvars)
-            self.assertIn('slack_app_token_secret_name = "custom-app-secret"', tfvars)
-            self.assertIn('slack_app_token_secret_key  = "custom-app-key"', tfvars)
-            self.assertIn("TFVAR_BOT_SEC=[custom-bot-secret]", stdout)
-
-    def test_upgrade_does_not_recover_slack_secret_refs_when_pointing_to_shared_secret(self):
-        """When the live PlatformAgent CR references the default shared Secret, no external
-        Secret ref is emitted into terraform.tfvars."""
-        kubectl_stub = (
-            "#!/usr/bin/env bash\n"
-            'case "$*" in\n'
-            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            '  *"get platformagents"*) cat << \'EOF\'\n'
-            '{"items": [{"spec": {"integration": {"slack": {\n'
-            '  "botTokenSecretRef": {"name": "platform-agent-secrets", "key": "SLACK_BOT_TOKEN"},\n'
-            '  "appTokenSecretRef": {"name": "platform-agent-secrets", "key": "SLACK_APP_TOKEN"}\n'
-            '}}}}]}\n'
-            'EOF\n'
-            ";;\n"
-            "  *) exit 1 ;;\n"
-            "esac\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\n")
-            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
-            self.assertNotIn("slack_bot_token_secret_name", tfvars)
-            self.assertNotIn("slack_app_token_secret_name", tfvars)
-            self.assertIn("TFVAR_BOT_SEC=[]", stdout)
-
-    def test_upgrade_explicit_default_secret_ref_does_not_recover_external_cr_ref(self):
-        """An explicit default/platform-agent-secrets setting in install.env overrides
-        live CR recovery back to the shared credentials Secret."""
-        kubectl_stub = (
-            "#!/usr/bin/env bash\n"
-            'case "$*" in\n'
-            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            '  *"get platformagents"*) cat << \'EOF\'\n'
-            '{"items": [{"spec": {"integration": {"slack": {\n'
-            '  "botTokenSecretRef": {"name": "custom-bot-secret", "key": "custom-bot-key"},\n'
-            '  "appTokenSecretRef": {"name": "custom-app-secret", "key": "custom-app-key"}\n'
-            '}}}}]}\n'
-            'EOF\n'
-            ";;\n"
-            "  *) exit 1 ;;\n"
-            "esac\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\nSLACK_BOT_TOKEN_SECRET=default\nSLACK_APP_TOKEN_SECRET=default\n")
-            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
-            self.assertNotIn("slack_bot_token_secret_name", tfvars)
-            self.assertNotIn("slack_app_token_secret_name", tfvars)
-            self.assertIn("TFVAR_BOT_SEC=[]", stdout)
-
-    def test_upgrade_recovered_cr_secret_with_canonical_key_clears_file_key(self):
-        """When the live CR carries an external Secret with a canonical key, an orphaned
-        SLACK_BOT_TOKEN_KEY in install.env is cleared rather than paired with the CR's Secret name."""
-        kubectl_stub = (
-            "#!/usr/bin/env bash\n"
-            'case "$*" in\n'
-            '  *"config current-context"*|*"config get-contexts"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
-            '  *"get platformagents"*) cat << \'EOF\'\n'
-            '{"items": [{"spec": {"integration": {"slack": {\n'
-            '  "botTokenSecretRef": {"name": "my-slack-secret", "key": "SLACK_BOT_TOKEN"},\n'
-            '  "appTokenSecretRef": {"name": "my-app-secret", "key": "SLACK_APP_TOKEN"}\n'
-            '}}}}]}\n'
-            'EOF\n'
-            ";;\n"
-            "  *) exit 1 ;;\n"
-            "esac\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\nSLACK_BOT_TOKEN_KEY=FOO\nSLACK_APP_TOKEN_KEY=BAR\n")
-            tfvars, stdout = self._upgrade_render(path, kubectl_script=kubectl_stub)
-            self.assertIn('slack_bot_token_secret_name = "my-slack-secret"', tfvars)
-            self.assertNotIn("slack_bot_token_secret_key", tfvars)
-            self.assertIn('slack_app_token_secret_name = "my-app-secret"', tfvars)
-            self.assertNotIn("slack_app_token_secret_key", tfvars)
-
-    def test_slack_secret_refs_on_cr_rejects_delimiter_injection(self):
-        """A '|', newline, '.', '..', or invalid character in a Slack Secret ref field fails validation and emits nothing."""
-        for bad_key in ["a|b", "SLACK_BOT_TOKEN\n", "my-key\r", "bad key", ".", "..", "..ca"]:
-            script = (
-                f'cr_json=\'{{"items": [{{"spec": {{"integration": {{"slack": {{\n'
-                f'  "botTokenSecretRef": {{"name": "my-secret", "key": {json.dumps(bad_key)}}},\n'
-                f'  "appTokenSecretRef": {{"name": "app-secret", "key": "valid-key"}}\n'
-                f'}}}}}}]}}\'\n'
-                f'slack_secret_refs_on_cr "$cr_json"\n'
-            )
-            proc = subprocess.run(
-                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nsource "{_INSTALLER_COMMON}"\n{script}'],
-                capture_output=True, text=True, cwd=str(_REPO_ROOT),
-                env=get_isolated_test_env(),
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(proc.stdout, "", f"Expected empty output for bad_key={bad_key!r}, got: {proc.stdout!r}")
-
-    def test_slack_secret_ref_validation_and_sentinel_handling(self):
-        """slack_secret_ref_is_external and write_tfvars_from_state reject mis-cased sentinels, invalid names, and invalid keys (#3275)."""
-        script = (
-            'validate_k8s_secret_name "Default" && echo "Default valid" || echo "Default invalid"\n'
-            'validate_k8s_secret_name "Platform-Agent-Secrets" && echo "PAS valid" || echo "PAS invalid"\n'
-            'validate_k8s_secret_name "valid-secret-name" && echo "valid-secret-name valid" || echo "valid-secret-name invalid"\n'
-            'validate_k8s_secret_key "." && echo ". valid" || echo ". invalid"\n'
-            'validate_k8s_secret_key ".." && echo ".. valid" || echo ".. invalid"\n'
-            'validate_k8s_secret_key "..ca" && echo "..ca valid" || echo "..ca invalid"\n'
-            'validate_k8s_secret_key "bad key" && echo "bad key valid" || echo "bad key invalid"\n'
-            'validate_k8s_secret_key "a|b" && echo "a|b valid" || echo "a|b invalid"\n'
-            'validate_k8s_secret_key "valid.key-name_123" && echo "valid.key valid" || echo "valid.key invalid"\n'
-            'slack_secret_ref_is_external "Default" && echo "ext Default" || echo "not ext Default"\n'
-            'slack_secret_ref_is_external "default" && echo "ext default" || echo "not ext default"\n'
-            'slack_secret_ref_is_external "platform-agent-secrets" && echo "ext pas" || echo "not ext pas"\n'
-            'slack_secret_ref_is_external "my-secret" && echo "ext my-secret" || echo "not ext my-secret"\n'
-        )
-        proc = subprocess.run(
-            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nsource "{_INSTALLER_COMMON}"\n{script}'],
-            capture_output=True, text=True, cwd=str(_REPO_ROOT),
-            env=get_isolated_test_env(),
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("Default invalid", proc.stdout)
-        self.assertIn("PAS invalid", proc.stdout)
-        self.assertIn("valid-secret-name valid", proc.stdout)
-        self.assertIn(". invalid", proc.stdout)
-        self.assertIn(".. invalid", proc.stdout)
-        self.assertIn("..ca invalid", proc.stdout)
-        self.assertIn("bad key invalid", proc.stdout)
-        self.assertIn("a|b invalid", proc.stdout)
-        self.assertIn("valid.key valid", proc.stdout)
-        self.assertIn("not ext Default", proc.stdout)
-        self.assertIn("not ext default", proc.stdout)
-        self.assertIn("not ext pas", proc.stdout)
-        self.assertIn("ext my-secret", proc.stdout)
-
-    def test_write_tfvars_from_state_refuses_invalid_slack_secret_name(self):
-        """write_tfvars_from_state rejects non-DNS-1123 secret names in SLACK_BOT_TOKEN_SECRET."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._file(tmp, self._COORDINATES + "SLACK_ENABLED=true\nSLACK_BOT_TOKEN_SECRET=Default\n")
-            dest = path.parent / "terraform.tfvars"
-            proc = _installer_common_tests.InstallerCommonTest._run(
-                self,
-                f'load_install_env "{path}"; write_tfvars_from_state "{dest}"',
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("SLACK_BOT_TOKEN_SECRET is set to 'Default'", proc.stderr)
-
-    def test_write_tfvars_from_state_refuses_invalid_slack_secret_key(self):
-        """write_tfvars_from_state rejects keys matching '.', starting with '..', or with whitespace in SLACK_BOT_TOKEN_KEY (#3275)."""
-        for bad_key in ["bad key", "..", ".", "..token"]:
-            with tempfile.TemporaryDirectory() as tmp:
-                path = self._file(
-                    tmp,
-                    self._COORDINATES
-                    + f'API_SERVER_KEY=test-key\nSLACK_ENABLED=true\nSLACK_BOT_TOKEN_SECRET=my-slack-secret\nSLACK_BOT_TOKEN_KEY="{bad_key}"\n',
-                )
-                dest = path.parent / "terraform.tfvars"
-                proc = _installer_common_tests.InstallerCommonTest._run(
-                    self,
-                    f'load_install_env "{path}"; write_tfvars_from_state "{dest}"',
-                    env={"API_SERVER_KEY": "test-key"},
-                )
-                self.assertNotEqual(proc.returncode, 0, f"Expected non-zero exit for key={bad_key!r}")
-                self.assertIn(f"SLACK_BOT_TOKEN_KEY is set to '{bad_key}'", proc.stderr)
-                self.assertIn("is not a valid Kubernetes Secret data key", proc.stderr)
-
-    def test_write_tfvars_from_state_permits_stale_slack_refs_when_slack_disabled(self):
-        """write_tfvars_from_state does not reject invalid or stale Slack Secret refs when SLACK_ENABLED is false (#3275)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._file(
-                tmp,
-                self._COORDINATES
-                + 'API_SERVER_KEY=test-key\nSLACK_ENABLED=false\nSLACK_BOT_TOKEN_SECRET=Default\nSLACK_BOT_TOKEN_KEY="bad key"\n',
-            )
-            dest = path.parent / "terraform.tfvars"
-            proc = _installer_common_tests.InstallerCommonTest._run(
-                self,
-                f'load_install_env "{path}"; write_tfvars_from_state "{dest}"',
-                env={"API_SERVER_KEY": "test-key"},
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_write_tfvars_from_state_blanks_token_when_secret_name_is_external(self):
-        """When an external Secret ref is set, inline tokens are blanked in tfvars and TF_VAR exports to prevent conflict warnings (#3275)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._file(
-                tmp,
-                self._COORDINATES
-                + "API_SERVER_KEY=test-key\nSLACK_ENABLED=true\nPERSIST_SECRETS_ON_DISK=true\nSLACK_BOT_TOKEN=xoxb-stale\nSLACK_BOT_TOKEN_SECRET=my-slack-secret\n",
-            )
-            dest = path.parent / "terraform.tfvars"
-            proc = _installer_common_tests.InstallerCommonTest._run(
-                self,
-                f'load_install_env "{path}"; write_tfvars_from_state "{dest}"; echo "EXPORTED_TF_VAR_BOT=[${{TF_VAR_slack_bot_token:-}}]"',
-                env={"API_SERVER_KEY": "test-key"},
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            tfvars = dest.read_text(encoding="utf-8")
-            self.assertIn('slack_bot_token_secret_name = "my-slack-secret"', tfvars)
-            self.assertIn('slack_bot_token         = ""', tfvars)
-            self.assertIn("EXPORTED_TF_VAR_BOT=[]", proc.stdout)
-
-    def test_bootstrap_install_env_file_records_slack_secret_refs(self):
-        """A first install records SLACK_BOT_TOKEN_SECRET and SLACK_APP_TOKEN_SECRET into install.env (#3275)."""
-        with tempfile.TemporaryDirectory() as tmp:
-            dest = pathlib.Path(tmp) / "new.install.env"
-            script = (
-                f'export SLACK_ENABLED=true SLACK_BOT_TOKEN_SECRET=my-slack-secret SLACK_BOT_TOKEN_KEY=BOT_KEY '
-                f'SLACK_APP_TOKEN_SECRET=my-slack-secret SLACK_APP_TOKEN_KEY=APP_KEY\n'
-                f'bootstrap_install_env_file "{dest}" v1.0.0 >/dev/null\n'
-                f'cat "{dest}"'
-            )
-            proc = subprocess.run(
-                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nsource "{_INSTALLER_COMMON}"\n{script}'],
-                capture_output=True, text=True, cwd=str(_REPO_ROOT),
-                env=get_isolated_test_env(),
-            )
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertRegex(proc.stdout, re.compile(r"^SLACK_BOT_TOKEN_SECRET=my-slack-secret$", re.MULTILINE))
-            self.assertRegex(proc.stdout, re.compile(r"^SLACK_BOT_TOKEN_KEY=BOT_KEY$", re.MULTILINE))
-            self.assertRegex(proc.stdout, re.compile(r"^SLACK_APP_TOKEN_SECRET=my-slack-secret$", re.MULTILINE))
-            self.assertRegex(proc.stdout, re.compile(r"^SLACK_APP_TOKEN_KEY=APP_KEY$", re.MULTILINE))
 
 
 class TfvarsTempFileIsCleanedUpTest(unittest.TestCase):
@@ -10930,7 +10687,7 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
         self._install_env = pathlib.Path(tmp.name) / "install.env"
         self._install_env.write_text("")
 
-    def _run_deferred_check(self, bot="", app="", enabled="true", before="", bot_sec="", app_sec=""):
+    def _run_deferred_check(self, bot="", app="", enabled="true", before=""):
         """Execute require_slack_tokens_after_recovery on a given recovery.
 
         The variables are assigned after the source rather than exported into
@@ -10943,8 +10700,6 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
             f"SLACK_ENABLED={shlex.quote(enabled)}\n"
             f"SLACK_BOT_TOKEN={shlex.quote(bot)}\n"
             f"SLACK_APP_TOKEN={shlex.quote(app)}\n"
-            f"SLACK_BOT_TOKEN_SECRET={shlex.quote(bot_sec)}\n"
-            f"SLACK_APP_TOKEN_SECRET={shlex.quote(app_sec)}\n"
             'PARAM_NON_INTERACTIVE="true"\n'
             f"{before}\n"
             "require_slack_tokens_after_recovery\n"
@@ -10966,34 +10721,22 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("REACHED_THE_APPLY", proc.stdout)
         combined = proc.stdout + proc.stderr
-        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_SECRET)", combined)
-        self.assertIn("--slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)", combined)
+        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN)", combined)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", combined)
 
     def test_the_deferred_check_refuses_on_one_token_and_names_only_it(self):
         """Half a recovery is still a relay that cannot open a socket."""
         proc = self._run_deferred_check(bot="xoxb-recovered")
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         combined = proc.stdout + proc.stderr
-        self.assertIn("--slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)", combined)
-        self.assertNotIn("--slack-bot-token (SLACK_BOT_TOKEN", combined)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", combined)
+        self.assertNotIn("--slack-bot-token (SLACK_BOT_TOKEN)", combined)
 
     def test_a_recovery_that_found_both_tokens_proceeds(self):
         """The unattended PERSIST_SECRETS_ON_DISK=false re-run this unblocks."""
         proc = self._run_deferred_check(bot="xoxb-recovered", app="xapp-recovered")
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
         self.assertIn("REACHED_THE_APPLY", proc.stdout)
-
-    def test_external_secret_refs_satisfy_the_deferred_check(self):
-        """When Slack tokens are stored in external Secrets, require_slack_tokens_after_recovery proceeds."""
-        proc = self._run_deferred_check(bot_sec="custom-slack-secret", app_sec="custom-slack-secret")
-        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
-        self.assertIn("REACHED_THE_APPLY", proc.stdout)
-
-    def test_default_sentinel_secret_ref_still_refuses_without_tokens(self):
-        """Specifying 'default' or the shared Secret name requires actual tokens."""
-        proc = self._run_deferred_check(bot_sec="default", app_sec="platform-agent-secrets")
-        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("REACHED_THE_APPLY", proc.stdout)
 
     def test_an_install_without_slack_is_never_asked_for_tokens(self):
         proc = self._run_deferred_check(enabled="false")
@@ -11020,8 +10763,8 @@ class SlackRequiresTokensNonInteractivelyTest(unittest.TestCase):
 
     def test_the_guard_names_both_tokens(self):
         text = _INSTALL_SH.read_text()
-        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_SECRET)", text)
-        self.assertIn("--slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)", text)
+        self.assertIn("--slack-bot-token (SLACK_BOT_TOKEN)", text)
+        self.assertIn("--slack-app-token (SLACK_APP_TOKEN)", text)
 
     def test_an_interactive_run_without_tokens_is_still_refused_after_recovery(self):
         """Even with a TTY, missing tokens after recovery cannot reach apply.

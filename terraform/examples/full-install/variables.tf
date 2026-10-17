@@ -563,44 +563,10 @@ variable "slack_bot_token" {
   default     = ""
 }
 
-variable "slack_bot_token_secret_name" {
-  description = "Name of a Secret containing the SLACK_BOT_TOKEN, if stored outside the shared credentials Secret. Empty uses credentials.secretName."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.slack_bot_token_secret_name != "platform-agent-secrets"
-    error_message = "slack_bot_token_secret_name is for external Secrets only; to use the shared credentials Secret ('platform-agent-secrets'), leave it empty."
-  }
-}
-
-variable "slack_bot_token_secret_key" {
-  description = "Key within slack_bot_token_secret_name containing the SLACK_BOT_TOKEN. Empty uses 'SLACK_BOT_TOKEN'."
-  type        = string
-  default     = ""
-}
-
 variable "slack_app_token" {
   description = "SLACK_APP_TOKEN (xapp-...) stored in the credentials Secret. Only used when enable_slack is true."
   type        = string
   sensitive   = true
-  default     = ""
-}
-
-variable "slack_app_token_secret_name" {
-  description = "Name of a Secret containing the SLACK_APP_TOKEN, if stored outside the shared credentials Secret. Empty uses credentials.secretName."
-  type        = string
-  default     = ""
-
-  validation {
-    condition     = var.slack_app_token_secret_name != "platform-agent-secrets"
-    error_message = "slack_app_token_secret_name is for external Secrets only; to use the shared credentials Secret ('platform-agent-secrets'), leave it empty."
-  }
-}
-
-variable "slack_app_token_secret_key" {
-  description = "Key within slack_app_token_secret_name containing the SLACK_APP_TOKEN. Empty uses 'SLACK_APP_TOKEN'."
-  type        = string
   default     = ""
 }
 

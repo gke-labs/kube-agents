@@ -1178,12 +1178,6 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         alert_at = text.find(alert_export)
         self.assertNotEqual(alert_at, -1, f"uninstall.sh must blank every ALERT_DAILY_LIMIT_* key: {alert_export}")
         self.assertLess(alert_at, call_at)
-        # And the Slack Secret refs: the generator refuses invalid names or keys,
-        # and a teardown must not stop on a typo or stale ref in install.env.
-        slack_export = 'export SLACK_BOT_TOKEN_SECRET="" SLACK_BOT_TOKEN_KEY="" SLACK_APP_TOKEN_SECRET="" SLACK_APP_TOKEN_KEY=""'
-        slack_at = text.find(slack_export)
-        self.assertNotEqual(slack_at, -1, f"uninstall.sh must blank the SLACK_*_TOKEN_* keys: {slack_export}")
-        self.assertLess(slack_at, call_at)
 
 
 class UninstallSummaryDisclosureTest(unittest.TestCase):

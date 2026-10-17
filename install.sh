@@ -168,7 +168,7 @@ on_error() {
   # `bash`; both read as the script by name.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
-    ""|main|bash) source_file="$INSTALL_SCRIPT_NAME" ;;
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
@@ -2785,10 +2785,6 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SLACK_ENABLED "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   write_secret_env_var "$tmp" SLACK_BOT_TOKEN "${SLACK_BOT_TOKEN:-}"
   write_secret_env_var "$tmp" SLACK_APP_TOKEN "${SLACK_APP_TOKEN:-}"
-  write_env_var "$tmp" SLACK_BOT_TOKEN_SECRET "${SLACK_BOT_TOKEN_SECRET:-}"
-  write_env_var "$tmp" SLACK_BOT_TOKEN_KEY "${SLACK_BOT_TOKEN_KEY:-}"
-  write_env_var "$tmp" SLACK_APP_TOKEN_SECRET "${SLACK_APP_TOKEN_SECRET:-}"
-  write_env_var "$tmp" SLACK_APP_TOKEN_KEY "${SLACK_APP_TOKEN_KEY:-}"
   write_env_var "$tmp" SLACK_ALLOWED_USERS "${SLACK_ALLOWED_USERS:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL "${SLACK_HOME_CHANNEL:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL_NAME "${SLACK_HOME_CHANNEL_NAME:-}"
@@ -6013,15 +6009,11 @@ run_menu_system() {
 require_slack_tokens_after_recovery() {
   is_truthy "${SLACK_ENABLED:-}" || return 0
   local slack_missing=""
-  if [ -z "${SLACK_BOT_TOKEN:-}" ] && ! slack_secret_ref_is_external "${SLACK_BOT_TOKEN_SECRET:-}"; then
-    slack_missing="${slack_missing} --slack-bot-token (SLACK_BOT_TOKEN or SLACK_BOT_TOKEN_SECRET)"
-  fi
-  if [ -z "${SLACK_APP_TOKEN:-}" ] && ! slack_secret_ref_is_external "${SLACK_APP_TOKEN_SECRET:-}"; then
-    slack_missing="${slack_missing} --slack-app-token (SLACK_APP_TOKEN or SLACK_APP_TOKEN_SECRET)"
-  fi
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || slack_missing="${slack_missing} --slack-bot-token (SLACK_BOT_TOKEN)"
+  [ -n "${SLACK_APP_TOKEN:-}" ] || slack_missing="${slack_missing} --slack-app-token (SLACK_APP_TOKEN)"
   if [ -n "$slack_missing" ]; then
-    print_error "--enable-slack needs a bot token and an app token (or external Secret references). Missing:${slack_missing}."
-    print_info "They are not in ${INSTALL_ENV_FILE} (PERSIST_SECRETS_ON_DISK=false keeps them out) and the live '${PLATFORM_AGENT_SECRET}' Secret does not carry them either. Pass them as flags, set external Secret references in ${INSTALL_ENV_FILE}, answer both prompts on an interactive run, or drop --enable-slack."
+    print_error "--enable-slack needs a bot token and an app token. Missing:${slack_missing}."
+    print_info "They are not in ${INSTALL_ENV_FILE} (PERSIST_SECRETS_ON_DISK=false keeps them out) and the live '${PLATFORM_AGENT_SECRET}' Secret does not carry them either. Pass them as flags, answer both prompts on an interactive run, or drop --enable-slack."
     exit 1
   fi
 }
@@ -7466,10 +7458,6 @@ main() {
   export SLACK_ENABLED="$slack_enabled"
   export SLACK_BOT_TOKEN="$slack_bot_token"
   export SLACK_APP_TOKEN="$slack_app_token"
-  export SLACK_BOT_TOKEN_SECRET="${SLACK_BOT_TOKEN_SECRET:-}"
-  export SLACK_BOT_TOKEN_KEY="${SLACK_BOT_TOKEN_KEY:-}"
-  export SLACK_APP_TOKEN_SECRET="${SLACK_APP_TOKEN_SECRET:-}"
-  export SLACK_APP_TOKEN_KEY="${SLACK_APP_TOKEN_KEY:-}"
   export SLACK_ALLOWED_USERS="$slack_allowed_users"
   export SLACK_HOME_CHANNEL="$slack_home_channel"
   export SLACK_HOME_CHANNEL_NAME="$slack_home_channel_name"

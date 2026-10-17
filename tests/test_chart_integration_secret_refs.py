@@ -71,6 +71,10 @@ class SchemaDeclaresIntegrationSecretRefsTest(unittest.TestCase):
             self.assertIn("key", ref["properties"])
             self.assertEqual(ref["properties"]["name"].get("type"), "string")
             self.assertEqual(ref["properties"]["key"].get("type"), "string")
+            self.assertEqual(ref["properties"]["name"].get("maxLength"), 253)
+            self.assertEqual(ref["properties"]["key"].get("maxLength"), 253)
+            self.assertIn("pattern", ref["properties"]["name"])
+            self.assertIn("pattern", ref["properties"]["key"])
 
     def test_teams_schema_declares_secret_refs(self):
         teams = self.integ["teams"]["properties"]
@@ -85,6 +89,10 @@ class SchemaDeclaresIntegrationSecretRefsTest(unittest.TestCase):
             self.assertIn("key", ref["properties"])
             self.assertEqual(ref["properties"]["name"].get("type"), "string")
             self.assertEqual(ref["properties"]["key"].get("type"), "string")
+            self.assertEqual(ref["properties"]["name"].get("maxLength"), 253)
+            self.assertEqual(ref["properties"]["key"].get("maxLength"), 253)
+            self.assertIn("pattern", ref["properties"]["name"])
+            self.assertIn("pattern", ref["properties"]["key"])
 
 
 @unittest.skipUnless(_HELM, "helm binary is required for template render tests")
@@ -156,6 +164,22 @@ class RenderIntegrationSecretRefsTest(unittest.TestCase):
         self.assertEqual(teams["appIdSecretRef"]["key"], "MY_APP_ID")
         self.assertEqual(teams["appPasswordSecretRef"]["name"], "my-teams-secret")
         self.assertEqual(teams["appPasswordSecretRef"]["key"], "MY_APP_PASSWORD")
+
+    def test_invalid_secret_name_refused_by_schema(self):
+        res = _render(
+            "--set", "platformAgent.integration.slack.enabled=true",
+            "--set", "platformAgent.integration.slack.botTokenSecretRef.name=INVALID_NAME",
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match pattern", res.stderr)
+
+    def test_invalid_secret_key_refused_by_schema(self):
+        res = _render(
+            "--set", "platformAgent.integration.slack.enabled=true",
+            "--set", "platformAgent.integration.slack.botTokenSecretRef.key=bad key with spaces",
+        )
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("does not match pattern", res.stderr)
 
 
 class ValuesDocumentationTest(unittest.TestCase):
