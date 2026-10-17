@@ -22,10 +22,13 @@ it posted against each thread it posted into, in the ``incidents`` table that
 
 The audit's ``finish`` leaves the report it rendered in
 ``chat_report_<audit>.json`` in the run's scratch directory on the shell sandbox
-(``audit_report.py``, ``chat_report_path_for``). This passes when every row
-stored for the job's threads since the run was fired is that report, exactly.
-A row holding anything else (the model's final message with its working notes,
-or the notice that the run did not finish) fails, and so does a run that left no
+(``audit_report.py``, ``chat_report_path_for``). This passes when the row
+stored for the job's threads since the run was fired is that report. The
+``incidents`` table keeps one row per thread, the latest post, so what is graded
+is the scheduled delivery, the last post of the run: a mid-run
+``report_to_chat`` post before it is replaced in the table and is not graded. A
+row holding anything else (the model's final message with its working notes, or
+the notice that the run did not finish) fails, and so does a run that left no
 report from ``finish``.
 
 A silent run, a run that never ended, and an install with no chat platform are

@@ -3034,13 +3034,18 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
     walks `managed_repos` runs `start` and `finish` once per repository within
     one run, so a record whose last step is within `INFLIGHT_TTL_SECONDS` and
     that holds no finished report for `repo` is this run's; otherwise this
-    `start` opens a new run, as does one that finds no finished part (a run
-    that never reached `finish`).
+    `start` opens a new run, as does one that finds `repo` pending in a record
+    with no finished part (a run that never finished it).
     """
     record = _current_chat_record(audit_id, repo, now)
-    # A record with no finished part was left by a run that never reached
-    # `finish`, so adopting it would carry that run's stamps into this one.
-    if not any(part.get(CHAT_REPORT_TEXT_KEY) for part in record[CHAT_REPORT_PARTS_KEY]):
+    # A record with no finished part that already holds `repo` pending was
+    # left by a run that never finished it, and adopting it would carry that
+    # run's stamps into this one. One pending only for other repositories is
+    # this run's earlier repository, which the relay must still name.
+    parts = record[CHAT_REPORT_PARTS_KEY]
+    if not any(part.get(CHAT_REPORT_TEXT_KEY) for part in parts) and any(
+        part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts
+    ):
         record = _new_chat_record(audit_id, now)
     if not any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in record[CHAT_REPORT_PARTS_KEY]):
         record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: None})

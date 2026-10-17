@@ -233,7 +233,10 @@ plugin recognises by its exact opening and the job's name
 (`adapter.SCHEDULER_FAILURE_PREFIXES`, pinned against the scheduler at image
 build) and flags; the relay posts that line as written, as on main, and marks
 the record on disk posted, so a later run cannot post an earlier run's report
-as its own. Otherwise a record with no finished repository, one already posted,
+as its own. The flag is read off the text, which the model can also write, so
+when the record's last step is at or after the delivering run's start (its
+`running` row in the profile's `cron/executions.db`, read-only) and it holds a
+finished part, the run reached `finish` and its report is posted instead. Otherwise a record with no finished repository, one already posted,
 or one whose last step is older than two hours means the run did not reach
 `finish`, and the relay posts a one-line notice that the job did not finish in
 place of the final message. A read of the file

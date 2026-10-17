@@ -311,7 +311,7 @@ route that delivered but stored nothing fails, and one whose send registered no 
 `audit_chat_report_posted`, in its own module (`bench/kube_agents_bench/audit_chat_report.py`), reads
 the `audit-chat-report` stack's state file, what the Session KV server stored for the fired audit
 job's threads since the fire, and the chat report the run's `finish` left on the shell sandbox, and
-passes when every stored post is that report exactly; a run that left no report from `finish`,
+passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
 whose record predates the fire, or that did not finish every repository it started fails, and a
 silent run or one that never ended is an error.
 

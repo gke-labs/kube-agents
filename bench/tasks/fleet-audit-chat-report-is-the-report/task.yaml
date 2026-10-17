@@ -13,7 +13,9 @@
 # run, made non-silent by moving the stream's stored memory aside, and waits for
 # it to end. The verifier (kube_agents_bench/audit_chat_report.py) reads what the
 # relay stored for the job's thread, which is what the channel received, and
-# passes when every post is exactly the report the run's `finish` rendered. An
+# passes when the scheduled delivery, the thread's stored post, is the report the
+# run's `finish` rendered (the table keeps the latest post per thread, so a
+# mid-run `report_to_chat` is not graded). An
 # image that posts the final message fails: its `finish` renders no chat report,
 # and the post is the model's text.
 #

@@ -376,6 +376,19 @@ def main() -> None:
         "the adapter flags the blocked-config line",
     )
 
+    # 12. On the failure leg the relay reads the delivering run's start from
+    # the scheduler's ledger: the job's `running` row and its `started_at`.
+    # A rename makes the read find nothing, and the failure line is posted.
+    import re
+
+    import cron.executions as executions
+
+    table = re.search(r"CREATE TABLE IF NOT EXISTS executions \((.*?)\)\s*\"\"\"", inspect.getsource(executions), re.S)
+    columns = table.group(1) if table else ""
+    check(re.search(r"^\s*job_id TEXT", columns, re.M) is not None, "the run ledger still has job_id")
+    check(re.search(r"^\s*started_at TEXT", columns, re.M) is not None, "the run ledger still has started_at")
+    check("'running'" in columns, "the run ledger's status set still has 'running'")
+
     print("\nverify_chat_relay: all checks passed")
 
 

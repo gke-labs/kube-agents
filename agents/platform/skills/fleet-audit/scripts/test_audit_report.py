@@ -25985,6 +25985,12 @@ class TestChatReport(HarnessTestCase):
         self.assertEqual(fresh["started_at"], (NOW + timedelta(minutes=10)).timestamp())
         self.assertEqual(self.entries(), [("acme/a", None)])
 
+    def test_a_live_runs_pending_first_repository_is_kept(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(minutes=10))
+        audit_report.append_chat_report(AUDIT, "acme/b", "report B", NOW + timedelta(minutes=20))
+        self.assertEqual(self.entries(), [("acme/a", None), ("acme/b", "report B")])
+
     def test_the_age_limit_counts_from_the_last_step(self):
         step = timedelta(seconds=audit_report.INFLIGHT_TTL_SECONDS - 60)
         audit_report.open_chat_report(AUDIT, "acme/a", NOW)

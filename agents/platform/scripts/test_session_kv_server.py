@@ -3599,6 +3599,37 @@ class TestAuditChatReport(unittest.TestCase):
         _, sent = self.post()
         self.assertEqual(sent, [self.notice()])
 
+    def test_a_failure_shaped_message_from_a_run_that_finished_posts_its_report(self):
+        # The model's own last message can open like the failure line; a run
+        # that wrote its record after it started reached `finish`.
+        self.leave([self.REPORT])
+        with patch.object(session_kv_server, "_delivering_run_start", return_value=time.time() - 60):
+            _, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(sent, [self.REPORT])
+
+    def test_a_record_from_before_this_run_started_still_gets_the_failure_line(self):
+        self.leave([self.REPORT], updated=time.time() - 600)
+        with patch.object(session_kv_server, "_delivering_run_start", return_value=time.time() - 60):
+            _, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(sent, [self.FAILURE])
+
+    def test_the_delivering_run_start_reads_only_running_rows(self):
+        import gitops_workspace
+        import sqlite3
+        from datetime import datetime, timezone
+
+        cron = os.path.join(self.scratch, "profiles", "platform", "cron")
+        os.makedirs(cron)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', ?)",
+                         (datetime(2026, 10, 16, 6, 20, tzinfo=timezone.utc).isoformat(),))
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'claimed', ?)",
+                         (datetime(2026, 10, 16, 7, 0, tzinfo=timezone.utc).isoformat(),))
+        with patch.object(gitops_workspace, "agent_home", return_value=self.scratch):
+            started = session_kv_server._delivering_run_start("platform", "compliance-audit")
+        self.assertEqual(started, datetime(2026, 10, 16, 6, 20, tzinfo=timezone.utc).timestamp())
+
     def test_the_flag_without_the_scheduler_leg_changes_nothing(self):
         self.leave([])
         _, sent = self.post(report=self.FAILURE, failure=True, scheduler=False)

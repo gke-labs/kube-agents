@@ -211,6 +211,10 @@ CHAT_REPORT_UPDATED_KEY = "updated_at"
 CHAT_REPORT_PARTS_KEY = "parts"
 CHAT_REPORT_REPO_KEY = "repo"
 CHAT_REPORT_TEXT_KEY = "text"
+# The scheduler's run ledger under a profile home, and the status its row holds
+# from the run's start until after its delivery.
+RUN_LEDGER = ("cron", "executions.db")
+RUN_LEDGER_RUNNING = "running"
 # Above the relay's own report ceiling, so a long report is clipped with its
 # notice by `_truncate_report`; a record past it posts the unreadable notice.
 CHAT_REPORT_MAX_BYTES = 1024 * 1024
@@ -3335,6 +3339,67 @@ def _is_shipped_audit_job(job_id: str) -> bool:
     return _roster_runs_fleet_audit(store, job_id)
 
 
+def _delivering_run_start(profile: str, job_id: str) -> float | None:
+    """When the run now delivering `job_id` started, from the scheduler's ledger; None when unknown.
+
+    The scheduler keeps the run's row `running` until after its delivery and
+    allows one live run per job. `claimed` rows are left out: a tick writes one
+    at submit and may lose the claim. Read-only, and any failure is None.
+    """
+    from gitops_workspace import agent_home
+
+    base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+    path = os.path.join(base, *RUN_LEDGER)
+    if not os.path.exists(path):
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT started_at FROM executions WHERE job_id = ? AND status = ?",
+                (job_id, RUN_LEDGER_RUNNING),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: run ledger unreadable: {exc}")
+        return None
+    starts = []
+    for (started,) in rows:
+        try:
+            stamp = datetime.fromisoformat(str(started)).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(stamp):
+            starts.append(stamp)
+    return max(starts) if starts else None
+
+
+def _record_written_by_this_run(profile: str, job_id: str) -> bool:
+    """Whether the delivering run finished a repository into the record on disk.
+
+    True when the record holds a finished part and its last step is at or after
+    the run's start in the scheduler's ledger. Unknown (no ledger row, no
+    record) is False, and the failure line is posted as on main.
+    """
+    started = _delivering_run_start(profile, job_id)
+    if started is None:
+        return False
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return False
+    if not record:
+        return False
+    try:
+        updated = float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        return False
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    finished = any(
+        isinstance(part, dict) and str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip()
+        for part in (parts if isinstance(parts, list) else [])
+    )
+    return finished and math.isfinite(updated) and updated >= started
+
+
 def _record_run(job_id: str) -> str:
     """The run id of the chat record on disk for `job_id`, or "" when there is none to read."""
     try:
@@ -3687,13 +3752,16 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     from_scheduler = SCHEDULER_LEG_KEY in request_data
     failure_run = ""
     if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
-        if request_data.get(SCHEDULER_FAILURE_KEY) is True:
+        if request_data.get(SCHEDULER_FAILURE_KEY) is True and not _record_written_by_this_run(profile, job_id):
             # The scheduler's line for a failed run, posted as written, as on
-            # main: it says why the run failed, and the record on disk may be
-            # an earlier run's. Marking that record posted keeps a later run
-            # that never reached `start` from posting it as its own.
+            # main: it says why the run failed, and the record on disk is an
+            # earlier run's. Marking that record posted keeps a later run that
+            # never reached `start` from posting it as its own.
             failure_run = _record_run(job_id)
         else:
+            # The flag is read off the text, which the model can also write:
+            # a run that wrote its own record reached `finish`, so its report
+            # is posted whatever its last message says.
             report, audit_run = audit_chat_report(profile, job_id, title)
     report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
