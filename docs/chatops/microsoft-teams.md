@@ -1,25 +1,26 @@
 # Microsoft Teams ChatOps Integration Guide
 
-This guide walks through configuring and deploying the **Microsoft Teams ChatOps** integration for the `kube-agents` PlatformAgent operator and gateway.
+This guide covers configuring the **Microsoft Teams Bot Framework relay** (`spec.integration.teams`) for the `kube-agents` PlatformAgent operator and gateway.
 
 ---
 
-## Overview
+## Overview & Current Scope
 
-The Microsoft Teams integration allows cluster operators, SREs, and developers to interact with PlatformAgents directly from Microsoft Teams channels, group chats, or direct messages.
+The Microsoft Teams integration connects the gateway (`agents/platform/scripts/teams_relay_patch.py` and `agents/chat/plugins/platforms/teams/`) to the credential broker (`TeamsRelay` in `agents/platform/scripts/credential_proxy.py`).
 
-### Architecture Highlights
+### What Ships Today vs. Current Limitations
 
-- **Deterministic Gateway & Credential Isolation**: The agent harness runs in an isolated container without ambient Microsoft credentials. The `credential-proxy` sidecar handles Microsoft Entra ID token acquisition, OAuth lifecycle caching, and webhook activity queues.
-- **Single-Tenant Enterprise Lock-Down**: Optional verification of `TEAMS_TENANT_ID` ensures incoming activities are strictly rejected if they originate from outside your organization's Microsoft Entra ID tenant.
-- **User Authorization**: Granular allowlisting via `allowedUsers` (supporting Entra ID Object IDs and UserPrincipalName emails) or tenant-wide access via `allowAllUsers: true`.
-- **Microsoft Adaptive Cards v1.5**: Rich interactive card responses with action buttons (e.g. `/remediate`, `/audit`, status checks) and automatic fallback to Markdown for standard text.
+- **Outbound Bot Framework Relay (Shipped)**: The `credential-proxy` sidecar holds `TEAMS_APP_ID` and `TEAMS_APP_PASSWORD`, exchanges them for Microsoft Entra OAuth 2.0 `client_credentials` tokens (`https://api.botframework.com/.default`), caches the token in memory, and forwards outbound activity posts through `POST /v1/chat/teams/api`.
+- **Outbound Egress & Method Guards (Shipped)**: `/v1/chat/teams/api` permits only `POST v3/conversations/<id>/activities` (and activity reply subpaths, excluding `/activities/history`) to official Bot Framework hosts (`smba.trafficmanager.net` and `*.botframework.com`). Service URLs containing query strings (`?`) or fragments (`#`) are rejected, and HTTP `3xx` redirects are refused so the bot's Bearer token is never forwarded off-host.
+- **Microsoft Adaptive Cards v1.5 (Shipped)**: Outbound messages convert Markdown headings, bullet lists, and fenced code blocks into Adaptive Card v1.5 attachments when `adaptiveCards: true` (default), or send plain text when `adaptiveCards: false`.
+- **In-Pod Event Queue & Authorization Scaffolding (Shipped)**: The credential broker exposes `/v1/chat/teams/events`, `/v1/chat/teams/events/ack`, and `/v1/chat/teams/events/nack`, both the broker and `TeamsRelayAdapter` enforce single-tenant isolation (`TEAMS_TENANT_ID` against `channelData.tenant.id` or `conversation.tenantId`), and only `TeamsRelayAdapter` in the gateway enforces the user allowlist (`TEAMS_ALLOWED_USERS` / `TEAMS_ALLOW_ALL_USERS`), so the broker queues an activity from any sender in the tenant. List users by Entra ID Object ID (`from.aadObjectId`) or Bot Framework user ID (`from.id`), the identifiers an inbound Teams activity carries. The adapter also compares `from.userPrincipalName` / `from.email`, but a Bot Framework activity does not carry those fields and nothing in the harness adds them, so a UPN or email entry matches no one. Display names are never matched.
+- **External Inbound Webhook Ingress (Not Yet Shipped)**: The operator does not yet deploy an in-cluster Bot Framework JWT-verifying webhook receiver, and the credential broker's `CREDENTIAL_PROXY_ALLOWED_CALLERS` allowlist and `NetworkPolicy` (`reconcileCredentialProxyNetworkPolicy`) admit `TCP/8765` connections only from the gateway pod (`CALLER_ROLE_CHAT`) and shell-sandbox pod (`CALLER_ROLE_SANDBOX`). Because no external forwarder ServiceAccount or NetworkPolicy ingress rule is provisioned yet, `/v1/chat/teams/events` is currently reachable only from inside the gateway pod. In addition, proactive alerts and scheduled cron reports are delivered only to Google Chat and Slack.
 
 ---
 
 ## Step 1: Register Microsoft Entra ID App & Azure Bot
 
-1. Navigate to the [Azure Portal](https://portal.azure.com/) -> **Azure Active Directory (Entra ID)** -> **App registrations**.
+1. Navigate to the [Azure Portal](https://portal.azure.com/) -> **Microsoft Entra ID** -> **App registrations**.
 2. Click **New registration**:
    - **Name**: `kube-agents-kage` (or your preferred agent name).
    - **Supported account types**: Select _Accounts in this organizational directory only (Single tenant)_ or _Multitenant_.
@@ -29,7 +30,6 @@ The Microsoft Teams integration allows cluster operators, SREs, and developers t
    - Bot handle: `kube-agents-bot`
    - App Type: _Single Tenant_ or _MultiTenant_
    - Microsoft App ID: Use the client ID created above.
-   - **Messaging endpoint**: `https://<YOUR_INGRESS_DOMAIN>/api/v1/teams/events`
 6. In the Azure Bot blade, navigate to **Channels** and add **Microsoft Teams**.
 
 ---
@@ -66,9 +66,7 @@ platformAgent:
       enabled: true
       tenantId: "11111111-1111-1111-1111-111111111111"
       allowedUsers:
-        - "alice@example.com"
-        - "bob@example.com"
-        - "22222222-2222-2222-2222-222222222222"
+        - "22222222-2222-2222-2222-222222222222" # Entra ID Object ID (from.aadObjectId)
       allowAllUsers: false
       homeChannel: "19:abc123conversationid@thread.v2"
       serviceUrl: "https://smba.trafficmanager.net/teams/"
@@ -97,7 +95,7 @@ spec:
         key: TEAMS_APP_PASSWORD
       tenantId: "11111111-1111-1111-1111-111111111111"
       allowedUsers:
-        - "admin@example.com"
+        - "22222222-2222-2222-2222-222222222222"
       allowAllUsers: false
       homeChannel: "19:teamchannelid@thread.v2"
       serviceUrl: "https://smba.trafficmanager.net/teams/"
@@ -106,24 +104,10 @@ spec:
 
 ---
 
-## Step 4: Create and Sideload Teams App Manifest
+## Step 4: Teams App Manifest Template
 
-1. Download the template from [`docs/samples/teams-manifest.json`](../samples/teams-manifest.json).
-2. Replace `${TEAMS_APP_ID}` with your Microsoft Application (Client) ID.
-3. Create a ZIP package containing:
-   - `manifest.json`
-   - `color.png` (192x192 icon)
-   - `outline.png` (32x32 transparent icon)
-4. In Microsoft Teams, navigate to **Apps** -> **Manage your apps** -> **Upload an app** (or use Microsoft Teams Developer Portal).
-5. Install the app to your team or start a direct conversation with `@Kage`.
+A reference Microsoft Teams app manifest template is included at [`docs/samples/teams-manifest.json`](../samples/teams-manifest.json):
 
----
-
-## Interactive ChatOps Commands
-
-Once installed, you can interact with the agent:
-
-- `@Kage /audit fleet` — Trigger a fleet-wide cgroup and GCE/GKE configuration audit.
-- `@Kage /remediate <finding-id>` — Review and execute automated remediation workflows with Interactive Adaptive Cards.
-- `@Kage status` — Check agent health, cluster connectivity, and queue state.
-- `@Kage help` — List available toolsets and ChatOps capabilities.
+1. Replace `${TEAMS_APP_ID}` with your Microsoft Application (Client) ID.
+2. Package `manifest.json` together with your `color.png` (192x192) and `outline.png` (32x32) icons into a ZIP archive.
+3. In Microsoft Teams, navigate to **Apps** -> **Manage your apps** -> **Upload an app** to install the bot into the target team or conversation so the bot is authorized to post outbound activities to that `conversation.id`.
