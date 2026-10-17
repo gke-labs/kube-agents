@@ -22,7 +22,8 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   `platformAgent.credentials.secretName`, default `platform-agent-secrets`),
   holding `API_SERVER_KEY` plus your model-provider key (`ANTHROPIC_API_KEY`,
   `GEMINI_API_KEY`, or `OPENAI_API_KEY` — `vertex_ai` needs none, it authenticates
-  with Workload Identity) and optional `SLACK_BOT_TOKEN` /
+  with Workload Identity, and for `openai_compatible` the
+  `OPENAI_COMPATIBLE_API_KEY` is optional) and optional `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN`. For dev installs the chart can create it from values
   (`platformAgent.credentials.create=true` + `platformAgent.credentials.data`).
 
@@ -214,9 +215,9 @@ The agent's baked default model endpoint is
 `http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base` and its provider overlays. `litellm.modelProvider`
-(gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
+(gemini/anthropic/openai/vertex_ai/openai_compatible) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity (below); `litellm.modelDefaultName`
+uses Workload Identity, and `openai_compatible`, whose key is optional (both below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
@@ -288,6 +289,63 @@ resolves to that GSA:
 `model_provider = "vertex_ai"` — the second `kube-agents-iam` module
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
+
+#### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
+
+`openai_compatible` routes `model-default` to any server that speaks the OpenAI
+chat-completions API (vLLM, TGI, an internal gateway), self-hosted or private.
+All model traffic still goes through the gateway, so the agent and Hindsight
+are unchanged. Nothing has a default: `litellm.modelDefaultName` (the model name
+the server serves) and `litellm.openaiCompatible.apiBase` (its base URL,
+including `/v1`) are required, and the render fails without them. Set
+`litellm.maxTokens` for a server with a small context window.
+
+- **Key.** Optional. Put it in the credentials Secret as
+  `OPENAI_COMPATIBLE_API_KEY`; the gateway sends it as the bearer token. The
+  provider renders through LiteLLM's `hosted_vllm` handler, which reads only
+  that key (as `HOSTED_VLLM_API_KEY`), rather than `openai/`, which falls back
+  to `OPENAI_API_KEY` when the key is unset. For this provider the gateway
+  reads none of `GEMINI_API_KEY`, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`, so
+  no SaaS key can reach this server. It also uses the model cost map bundled
+  in its image (`LITELLM_LOCAL_MODEL_COST_MAP`) instead of fetching it from
+  GitHub at startup.
+- **Private CA.** `litellm.openaiCompatible.caBundleSecretRef` (`name`, and `key`,
+  default `ca.crt`) names a Secret in the release namespace holding the PEM
+  bundle that signs the server's certificate. It is mounted read-only at
+  `/etc/litellm/openai-compatible-ca/` and set as `ssl_verify` on this
+  provider's model entries only, so it replaces the public roots for this
+  endpoint and no other.
+- **Egress.** The gateway's `litellm-policy` gets one rule derived from
+  `apiBase`:
+  - An in-cluster Service (`<svc>`, `<svc>.<ns>.svc`, or
+    `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` is the release namespace,
+    and a two-label host such as `openrouter.ai` is a hostname, not
+    `<svc>.<ns>`; write an in-cluster Service as `<svc>.<ns>.svc`) opens that
+    namespace on `litellm.openaiCompatible.targetPort`, the server pod's port,
+    which is then required. The policy matches after the Service
+    translates the address, so the Service port in the URL opens nothing. A
+    server in another namespace must also admit the gateway in its own policy.
+  - Anything else with `litellm.openaiCompatible.egressCIDRs` set opens those
+    CIDRs on the URL's port (443 or 80 by scheme when the URL names none). Each
+    entry must be no broader than /12 (IPv4) or /48 (IPv6) and must not overlap
+    link-local space or the metadata server's addresses.
+  - A public endpoint on port 443 needs no rule: the policy's existing 443 rule
+    reaches public addresses. A hostname that resolves to a private address
+    needs `egressCIDRs`, since that rule excepts private ranges.
+  - Any other endpoint (a private or IPv6 address, or a hostname on another
+    port) fails the render until `egressCIDRs` is set, because a
+    NetworkPolicy cannot name a DNS name.
+
+  The chart renders the rule in the static `litellm-policy` and, for the
+  operator's copy, stamps it on the `PlatformAgent` as the
+  `kubeagents.x-k8s.io/litellm-upstream-egress` annotation (below).
+
+```bash
+--set litellm.modelProvider=openai_compatible \
+--set litellm.modelDefaultName=<served-model-name> \
+--set litellm.openaiCompatible.apiBase=http://vllm.models.svc.cluster.local:8000/v1 \
+--set litellm.openaiCompatible.targetPort=8000
+```
 
 #### Upgrade notes: inference-gateway Service rename
 
@@ -632,14 +690,20 @@ reads, such as `prevent-deletion`, `enable-litellm-network-policy`, and
 The Terraform composition uses the same route for one annotation the operator
 does not read, `network-policy-enforcement: absent-accepted`, the record of an
 install that chose to proceed onto a cluster enforcing no NetworkPolicy.
-Two of those the chart also stamps from values: `litellm.networkPolicy=false`
-stamps `enable-litellm-network-policy: "false"`, and a non-empty
-`telemetry.collectorNamespace` stamps `otlp-collector-namespace`. When the
+Three of those the chart also stamps from values: `litellm.networkPolicy=false`
+stamps `enable-litellm-network-policy: "false"`, a non-empty
+`telemetry.collectorNamespace` stamps `otlp-collector-namespace`, and
+`litellm.modelProvider=openai_compatible` stamps `litellm-upstream-egress`
+with the egress rule derived from `litellm.openaiCompatible`, as compact JSON:
+`{"namespace":"<ns>","port":<targetPort>}` for an in-cluster Service, or
+`{"cidrs":["<cidr>",...],"port":<port>}` (not stamped for a public port-443
+endpoint, which needs no rule). When the
 chart stamps a key, the value wins because it drives the rest of the release
 too, and an entry in `platformAgent.annotations` that disagrees with it fails
 the render instead of being overwritten. When the chart does not stamp the key
 — `litellm.networkPolicy` left `true`, `telemetry.collectorNamespace` left
-empty — the entry passes through, which is how the permanent opt-out above is
+empty, a provider other than `openai_compatible` or a public port-443
+endpoint — the entry passes through, which is how the permanent opt-out above is
 set from values. The one check the render still applies is that, with
 `litellm.otel=true`, an `otlp-collector-namespace` entry names a namespace (a
 lowercase RFC 1123 label): the operator would otherwise ignore it or open OTLP

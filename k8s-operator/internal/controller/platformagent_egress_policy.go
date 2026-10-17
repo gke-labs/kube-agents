@@ -399,8 +399,9 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// in the broker Pod and the minter call is the broker's egress, not the
 	// agent's; gemma-server and standalone-replay, because buildAgentConfig pins
 	// the agent's model base_url to LiteLLM unconditionally, so those backends
-	// are LiteLLM's egress. The gateway policy names all three anyway; narrowing
-	// it is the work that turns this field into a control.
+	// are LiteLLM's egress (litellm-policy admits a model server only through
+	// AnnotationLiteLLMUpstreamEgress). <name>-gateway-netpol names all three
+	// anyway; narrowing it is the work that turns this field into a control.
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{tcpPort(8888)},
 		To: []networkingv1.NetworkPolicyPeer{{
