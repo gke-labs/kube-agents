@@ -1118,3 +1118,8 @@
 # its own on the host cluster, so it too serializes on the infra lock. Priced
 # at that case's 1450s hint until it has a record.
 ./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# gke-cluster-autoscaler skill probe: on GKE 1.36.3-gke.1244000 or later a
+# zonal stockout cools down only its own zone, so the healthy zones keep
+# provisioning the preferred tier. deployer: noop, transcript-only.
+./tasks/autoscaler-zonal-stockout-cooldown-scope-probe/task.yaml
