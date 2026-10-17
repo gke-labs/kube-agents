@@ -56,6 +56,10 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
+	// defaultGatewayWait matches the agent container's startup probe budget
+	// (agentAPIProbe(10, 90) in platformagent_manifests.go): past it the
+	// kubelet restarts that container, and the start being waited on is gone.
+	defaultGatewayWait = 15 * time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -93,6 +97,8 @@ type flags struct {
 	dryRun           bool
 	metricsAddr      string
 	snapshotInterval time.Duration
+	gatewayURL       string
+	gatewayWait      time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -135,6 +141,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.dryRun, "dry-run", false, "Print inject payloads to stdout without calling the daemon.")
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "Prometheus /metrics + /healthz listener address (host:port). Empty = disabled.")
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
+	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
+	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -195,6 +203,12 @@ func (f *flags) validate() error {
 	}
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
+	}
+	if f.gatewayURL != "" && f.gatewayWait <= 0 {
+		return errors.New("--gateway-wait must be > 0 when --gateway-url is set")
+	}
+	if strings.HasSuffix(f.gatewayURL, "/") {
+		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
 	}
 	// Cluster sources are additive, not exclusive: --profiles-dir contributes
 	// every Cluster Agent profile, and --in-cluster / --kubeconfig contributes
@@ -844,6 +858,13 @@ func realMain(argv []string) error {
 			log.Printf("metrics server: %v", err)
 		}
 	}()
+
+	if f.gatewayURL != "" && !f.dryRun {
+		waitForGateway(ctx, f.gatewayURL, f.gatewayWait, gatewayProbeInterval)
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
 
 	clusters, err := buildWatchSet(ctx, f, m)
 	if err != nil {
