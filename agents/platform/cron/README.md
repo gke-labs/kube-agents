@@ -596,7 +596,7 @@ rule outlives the memory of why:
   Platform Agent marks the job due for the next tick instead of running the SOP
   itself. The one run that does happen in a session (#1876, #1887): a card that
   delegates exactly one stream per its SOP is run by that worker through
-  `audit_report.py start … finish` (`skills/fleet-audit/SKILL.md`, "Running a
+  `audit_report.py start … finish` (`skills/fleet-audit/references/on-demand.md`, "Running a
   stream on demand"); several streams still queue.
   Such a run holds no per-job lock, so `start` keeps its own guard: an
   in-flight note per stream on the sandbox pod's own volume, at
