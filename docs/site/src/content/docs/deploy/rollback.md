@@ -85,7 +85,8 @@ The scripts of `0.7.0` and earlier do not take the flag.
 
 Where `N-1`'s script takes `--allow-breaking-downgrade`, it reads the commits between the tag the
 install runs and `N-1`, and stops when one of them is marked as a breaking change: a `type!:`
-subject or a `BREAKING CHANGE:` footer. It names each such commit. Read what each one changed, then
+subject or a `BREAKING CHANGE:` footer. Each mode reads the tag of what it moves: the operator mode
+the operator's, the harness mode the agent's, and the full mode both. It names each such commit. Read what each one changed, then
 add the flag to the operator and harness commands, or to a full-mode run, to roll back anyway. The
 check is in the script that runs, which in a rollback is `N-1`'s, so a release from before the flag
 rolls back without it.

@@ -79,6 +79,13 @@ readonly DOWNGRADE_HISTORY_DIR_TEMPLATE="kube-agents-history.XXXXXX"
 # message carries, so a multi-line body stays one record. Written in git's
 # `%xNN` form for the format and as the byte itself for `read -d`.
 readonly COMMIT_RECORD_SEPARATOR_HEX="1e"
+# Where the downgrade check reads the installed tags: the agent and operator
+# containers. The Deployment names default to installer_common.sh's, which the
+# check cannot rely on, since it reads them before or without that file.
+readonly DOWNGRADE_AGENT_DEPLOYMENT_DEFAULT="platform-agent-gateway"
+readonly DOWNGRADE_AGENT_CONTAINER="platform-agent"
+readonly DOWNGRADE_OPERATOR_DEPLOYMENT_DEFAULT="kube-agents-controller-manager"
+readonly DOWNGRADE_OPERATOR_CONTAINER="manager"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
@@ -1254,6 +1261,40 @@ breaking_commits_between() {
   done <<<"$log"
 }
 
+# Prints the tag a Deployment's named container runs, or nothing when it cannot
+# be read or carries no tag (an untagged image, or a registry port's colon).
+deployment_image_tag() {
+  local namespace="$1" deployment="$2" container="$3" image=""
+  image="$(trap - ERR; kubectl get deployment "$deployment" -n "$namespace" \
+    -o jsonpath="{.spec.template.spec.containers[?(@.name==\"${container}\")].image}" 2>/dev/null)" || return 0
+  case "${image##*:}" in
+    "$image"|*/*) return 0 ;;
+  esac
+  printf '%s\n' "${image##*:}"
+}
+
+# Checks the move to $3 against the tag of each component the mode moves: the
+# operator in operator mode, the agent in harness mode, both in full mode. The
+# two run different tags between the steps of a mode-by-mode move, so reading
+# only the agent would let an operator-mode rollback through unchecked.
+check_downgrade_for_mode() {
+  local namespace="$1" mode="$2" target="$3" repo_dir="$4"
+  local agent_deployment="${PLATFORM_AGENT_DEPLOYMENT:-$DOWNGRADE_AGENT_DEPLOYMENT_DEFAULT}"
+  local operator_deployment="${KUBE_AGENTS_OPERATOR_DEPLOYMENT:-$DOWNGRADE_OPERATOR_DEPLOYMENT_DEFAULT}"
+  local agent_tag=""
+  if [ "$mode" != "operator" ]; then
+    agent_tag="$(deployment_image_tag "$namespace" "$agent_deployment" "$DOWNGRADE_AGENT_CONTAINER")"
+    check_downgrade "$repo_dir" "$target" "$agent_tag" "deployment/${agent_deployment}"
+  fi
+  if [ "$mode" != "harness" ]; then
+    local operator_tag=""
+    operator_tag="$(deployment_image_tag "$namespace" "$operator_deployment" "$DOWNGRADE_OPERATOR_CONTAINER")"
+    if [ "$mode" = "operator" ] || [ "$operator_tag" != "$agent_tag" ]; then
+      check_downgrade "$repo_dir" "$target" "$operator_tag" "deployment/${operator_deployment}"
+    fi
+  fi
+}
+
 # Refuses a move that leaves behind a commit marked as a breaking change, naming
 # each one. A move is forward only when the installed commit is an ancestor of
 # the target; any other move between related commits leaves behind what the
@@ -1263,13 +1304,15 @@ breaking_commits_between() {
 # is marked, --allow-breaking-downgrade was given, or this is a --plan, which
 # reports the same finding as a warning.
 check_downgrade() {
-  local repo_dir="$1" target="$2" installed="$3"
+  local repo_dir="$1" target="$2" installed="$3" component="${4:-the install}"
   local known_downgrade="false" history_dir="" target_commit="" installed_commit="" blocking="" count="" line=""
-  if [ -z "$installed" ] || [ "$installed" = "$target" ]; then
+  if [ -z "$installed" ]; then
+    print_warning "Could not read the tag ${component} runs, so the downgrade check is skipped for it."
     return 0
   fi
+  [ "$installed" != "$target" ] || return 0
   if ! validate_immutable_ref "$installed" >/dev/null; then
-    print_info "The install runs image tag '${installed}', which names no release or commit, so the downgrade check is skipped."
+    print_info "${component} runs image tag '${installed}', which names no release or commit, so the downgrade check is skipped for it."
     return 0
   fi
   if is_ga_version "$target" && is_ga_version "$installed"; then
@@ -1979,9 +2022,8 @@ main() {
   fi
 
   # Before the Secret backfills, the first step that writes to the cluster.
-  # Guarded: an older target tree's installer_common.sh may not define it.
-  if [ "$target_named_by_run" = "true" ] && declare -F running_image_tag >/dev/null; then
-    check_downgrade "$repo_dir" "$PARAM_IMAGE_TAG" "$(running_image_tag "$target_namespace")"
+  if [ "$target_named_by_run" = "true" ]; then
+    check_downgrade_for_mode "$target_namespace" "$PARAM_UPGRADE_MODE" "$PARAM_IMAGE_TAG" "$repo_dir"
   fi
 
   if [ "$PARAM_PLAN" = "true" ]; then

@@ -3980,6 +3980,60 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, out)
         self.assertIn("the downgrade check is skipped", out)
 
+    def test_an_unreadable_installed_tag_warns_and_continues(self):
+        proc, out = self._check("0.2.0", "")
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("Could not read the tag the install runs, so the downgrade check is skipped", out)
+
+    def _check_mode(self, mode, target, agent, operator):
+        """check_downgrade_for_mode against a stub kubectl that serves each Deployment's image."""
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$3" in\n'
+            f'  platform-agent-gateway) echo "ghcr.io/x/platform-agent:{agent}" ;;\n'
+            f'  kube-agents-controller-manager) echo "ghcr.io/x/k8s-operator:{operator}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        kubectl.chmod(0o755)
+        setup = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+            f'KUBE_AGENTS_REPO_URL={shlex.quote(str(self.repo))}\n'
+            f'check_downgrade_for_mode ns {mode} {shlex.quote(target)} {shlex.quote(str(self.repo))}\n'
+            'echo CONTINUED\n'
+        )
+        proc = subprocess.run(
+            ["bash", "-c", setup], capture_output=True, text=True, cwd=str(self.tmp),
+            env=get_isolated_test_env(overrides={"TMPDIR": str(self.scratch)}, bin_dir=str(bin_dir)),
+        )
+        return proc, proc.stdout + proc.stderr
+
+    def test_operator_mode_checks_the_operator_tag_not_the_agent_tag(self):
+        # Between the steps of a mode-by-mode upgrade the agent is still on the
+        # target while the operator has moved past the marked commit.
+        proc, out = self._check_mode("operator", "0.2.0", agent="0.2.0", operator="0.3.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("bang"), out)
+        proc, out = self._check_mode("operator", "0.2.0", agent="0.3.0", operator="0.2.0")
+        self.assertEqual(proc.returncode, 0, out)
+
+    def test_harness_mode_checks_the_agent_tag_not_the_operator_tag(self):
+        proc, out = self._check_mode("harness", "0.2.0", agent="0.3.0", operator="0.2.0")
+        self.assertEqual(proc.returncode, 1, out)
+        proc, out = self._check_mode("harness", "0.2.0", agent="0.2.0", operator="0.3.0")
+        self.assertEqual(proc.returncode, 0, out)
+
+    def test_full_mode_checks_both_and_reads_a_shared_tag_once(self):
+        proc, out = self._check_mode("full", "0.2.0", agent="0.2.0", operator="0.4.0")
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertIn(self._short("footer"), out)
+        proc, out = self._check_mode("full", "0.1.0", agent="0.2.0", operator="0.2.0")
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertEqual(out.count("no commit it leaves behind"), 1, out)
+
     def test_an_installed_tag_that_names_no_release_skips_the_check(self):
         proc, out = self._check("0.2.0", "latest")
         self.assertEqual(proc.returncode, 0, out)
@@ -4042,7 +4096,7 @@ class DowngradeCheckWiringTest(unittest.TestCase):
 
     def test_it_runs_before_the_first_write_to_the_cluster(self):
         main = self.text[self.text.index("main() {"):]
-        call = main.index('check_downgrade "$repo_dir" "$PARAM_IMAGE_TAG" "$(running_image_tag "$target_namespace")"')
+        call = main.index('check_downgrade_for_mode "$target_namespace" "$PARAM_UPGRADE_MODE" "$PARAM_IMAGE_TAG" "$repo_dir"')
         self.assertLess(main.index('PARAM_IMAGE_TAG="$(running_image_tag "$target_namespace")"'), call)
         self.assertLess(call, main.index('backfill_session_kv_keys "$target_namespace"'))
         self.assertLess(call, main.index('ensure_clean_helm_release "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace"'))
@@ -4054,7 +4108,7 @@ class DowngradeCheckWiringTest(unittest.TestCase):
         named = main.index('[ -z "$PARAM_IMAGE_TAG" ] || target_named_by_run="true"')
         self.assertLess(named, main.index('PARAM_IMAGE_TAG="$(tf_state_image_tag)"'))
         self.assertLess(named, main.index('PARAM_IMAGE_TAG="$(running_image_tag "$target_namespace")"'))
-        self.assertIn('if [ "$target_named_by_run" = "true" ] && declare -F running_image_tag', main)
+        self.assertIn('if [ "$target_named_by_run" = "true" ]; then\n    check_downgrade_for_mode', main)
 
     def test_the_flag_is_parsed_and_documented(self):
         proc = subprocess.run(
