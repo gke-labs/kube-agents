@@ -21,8 +21,9 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 - A Secret with the agent's credentials in the release namespace (name from
   `platformAgent.credentials.secretName`, default `platform-agent-secrets`),
   holding `API_SERVER_KEY` plus your model-provider key (`ANTHROPIC_API_KEY`,
-  `GEMINI_API_KEY`, or `OPENAI_API_KEY` — `vertex_ai` needs none, it authenticates
-  with Workload Identity, and for `openai_compatible` the
+  `GEMINI_API_KEY`, or `OPENAI_API_KEY` — `vertex_ai` needs none by default,
+  since it authenticates with Workload Identity unless
+  `litellm.vertex.credentialsSecretRef` is set, and for `openai_compatible` the
   `OPENAI_COMPATIBLE_API_KEY` is optional) and optional `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN`. For dev installs the chart can create it from values
   (`platformAgent.credentials.create=true` + `platformAgent.credentials.data`).
@@ -217,16 +218,25 @@ LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base` and its provider overlays. `litellm.modelProvider`
 (gemini/anthropic/openai/vertex_ai/openai_compatible) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity, and `openai_compatible`, whose key is optional (both below); `litellm.modelDefaultName`
+uses Workload Identity by default (or a service-account key Secret when
+`litellm.vertex.credentialsSecretRef` is set), and `openai_compatible`, whose key is optional (both below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. On a Claude model the gateway
+needs — a request's own `max_tokens` still wins (on non-adaptive Claude models
+with `reasoningEffort` set to `low`/`medium`/`high`, LiteLLM sets
+`thinking.budget_tokens` to `1024`/`2048`/`4096` and Anthropic requires
+`maxTokens > budget_tokens`). On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
 and only a Claude model gets the prompt-caching breakpoints
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching)).
-Set `litellm.enabled=false`
+`litellm.reasoningEffort`, `litellm.fallback` and `litellm.dropParams` (all off
+by default) set a reasoning effort on every alias, add a fallback alias at
+another effort with `router_settings.fallbacks` to it, and drop parameters the
+provider refuses; `litellm.vertex.credentialsSecretRef` and `projectSecretRef`
+read a Vertex service-account key and project from a Secret. The site's
+inference-gateway page has the rendered shapes. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
@@ -264,9 +274,11 @@ owns what the image redacts in the files on the agent's volume.
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 
-Vertex AI has no API key. The gateway calls
+Vertex AI has no API key by default. The gateway calls
 `projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
-as a Google Service Account reached through Workload Identity. `projectId`
+as a Google Service Account reached through Workload Identity by default (or a
+service-account key Secret when `litellm.vertex.credentialsSecretRef` is set).
+`projectId`
 defaults to `platformAgent.harness.projectId`; `location` defaults to `global`
 rather than the harness location, since a model is only callable from a
 location that serves it. Set a region for a data-residency requirement or a
