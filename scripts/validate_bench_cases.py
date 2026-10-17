@@ -427,7 +427,12 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # The parsed manifest's fields and selector are the assertion; `kind` alone
     # only names what to look for.
     "report_manifest": ("fields", "selects", "excludes"),
-    "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    "ledger_issue_contains": (
+        "required_phrases",
+        "forbidden_phrases",
+        "any_of_phrases",
+        "every_finding_named",
+    ),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
