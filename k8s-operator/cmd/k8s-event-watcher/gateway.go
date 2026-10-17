@@ -63,7 +63,8 @@ func waitForGateway(ctx context.Context, gatewayURL string, limit, interval time
 			log.Printf("k8s-event-watcher: ALERT gateway URL %q is not usable (%v); watching events without waiting", gatewayURL, err)
 			return false
 		}
-		if resp, err := client.Do(req); err == nil {
+		resp, probeErr := client.Do(req)
+		if probeErr == nil {
 			_ = resp.Body.Close()
 			log.Printf("k8s-event-watcher: agent gateway at %s answered; watching events", gatewayURL)
 			return true
@@ -71,11 +72,14 @@ func waitForGateway(ctx context.Context, gatewayURL string, limit, interval time
 		if time.Now().After(deadline) {
 			// This sidecar cannot tell a leader-election standby, which runs
 			// no gateway, from a gateway that failed, so the line names both.
-			log.Printf("k8s-event-watcher: ALERT the agent gateway at %s did not answer within %s; watching events anyway, and triage for events offered before it answers will not start. On a leader-election standby, which runs no gateway, this line is printed on every start; otherwise the agent container did not start", gatewayURL, limit)
+			log.Printf("k8s-event-watcher: ALERT the agent gateway at %s did not answer within %s (last probe: %v); watching events anyway, and triage for events offered before it answers will not start. On a leader-election standby, which runs no gateway, this line is printed on every start; otherwise the agent container did not start", gatewayURL, limit, probeErr)
 			return false
 		}
 		if time.Since(lastLog) >= gatewayWaitLogEvery {
-			log.Printf("k8s-event-watcher: still waiting for the agent gateway at %s", gatewayURL)
+			// The probe's own error, so a URL that can never work (a TLS
+			// mismatch, a name that does not resolve) reads differently from
+			// a gateway that is still booting.
+			log.Printf("k8s-event-watcher: still waiting for the agent gateway at %s (last probe: %v)", gatewayURL, probeErr)
 			lastLog = time.Now()
 		}
 		select {

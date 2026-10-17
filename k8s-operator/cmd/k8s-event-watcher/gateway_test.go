@@ -120,6 +120,7 @@ func TestWaitForGateway_WaitsUntilTheGatewayBinds(t *testing.T) {
 }
 
 func TestWaitForGateway_GivesUpAtTheLimit(t *testing.T) {
+	logs := captureLog(t)
 	url, _ := refusingURL(t)
 	start := time.Now()
 	if waitForGateway(context.Background(), url, 50*time.Millisecond, 10*time.Millisecond) {
@@ -127,6 +128,11 @@ func TestWaitForGateway_GivesUpAtTheLimit(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("waitForGateway took %s past a 50ms limit", elapsed)
+	}
+	// The ALERT carries the probe's error, so the reason the gateway did not
+	// answer is in the log rather than left to the reader.
+	if got := logs.String(); !strings.Contains(got, "last probe:") || !strings.Contains(got, "connection refused") {
+		t.Errorf("ALERT line does not carry the probe error:\n%s", got)
 	}
 }
 
