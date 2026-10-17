@@ -174,6 +174,18 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         applied_both = {**applied_slack_only, "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "true"}
         self._assert_today(self._run(self._env(mode="next"), applied_both))
 
+    def test_a_standalone_run_ignores_what_the_shell_exports(self):
+        # install.sh's bootstrap drops an inherited PLATFORM_AGENT_MODE too.
+        exported = {"PLATFORM_AGENT_MODE": "next", "GOOGLE_CHAT_ENABLED": "false"}
+        self._assert_today(self._run(self._env(mode=None), exported))
+        self._assert_today(self._run(self._env(mode="next", gchat=True), exported))
+
+    def test_the_home_channel_is_trimmed_not_rewritten(self):
+        out = self._run(self._env(mode="next", home=f'"  {self._NEXT_HOME} "'))
+        self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME},", out)
+        out = self._run(self._env(mode="next", home='"C012 C013"'))
+        self.assertIn("Invite the app to the home channel C012 C013,", out)
+
     def test_an_install_env_without_a_mode_is_today(self):
         # Such a file predates the key. Reading it as the install default would
         # turn every old install into next once that default changes.

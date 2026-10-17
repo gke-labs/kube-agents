@@ -39,6 +39,12 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh" "$@"
 
+# A standalone run takes these from install.env alone, as install.sh's own
+# bootstrap does: an exported value the file does not assign would otherwise
+# decide which checklist prints.
+if [ -z "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ] && [ -f "$(install_env_file_for_state)" ]; then
+  unset PLATFORM_AGENT_MODE GOOGLE_CHAT_ENABLED SLACK_HOME_CHANNEL
+fi
 load_state
 
 # install.sh passes what its run applied, which load_state's install.env would
@@ -54,7 +60,8 @@ fi
 print_a2a_gateway_steps() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local home="${SLACK_HOME_CHANNEL:-}"
-  home="${home//[[:space:]]/}"
+  home="${home#"${home%%[![:space:]]*}"}"
+  home="${home%"${home##*[![:space:]]}"}"
   echo -e "[ ] 1. Check the Slack app against the spec.mode next manifest:"
   echo -e "       ${SLACK_NEXT_APP_DOC}"
   echo -e "       Socket Mode on, the scopes and message events it lists, and ${C_YELLOW}no slash commands${C_RESET}:"
