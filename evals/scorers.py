@@ -34,11 +34,31 @@ _STUB_PATTERNS = (
     "gathering ",
 )
 
+_TERMINAL_CONTENT_MARKERS = (
+    "```",
+    "|",
+    "\n-",
+    "\n*",
+    "Status:",
+    "Active",
+    "Version:",
+    "NAMESPACE",
+    "NAME",
+    "READY",
+    "AGE",
+)
+
 
 def normalize_text(text: str | None) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text.translate(_MARKDOWN_NOISE)).strip().lower()
+
+
+def _contains_word(keyword: str, text: str) -> bool:
+    """Checks for keyword presence using word boundaries."""
+    escaped = re.escape(keyword.lower().strip())
+    return bool(re.search(rf"(?:\b|^){escaped}(?:\b|$)", text.lower()))
 
 
 def evaluate_response_quality(
@@ -59,8 +79,11 @@ def evaluate_response_quality(
 
     lowered = normalize_text(output_text)
 
-    # 1. Delegation stub check: agent must return the completed diagnostic, not a turn-1 stub
-    if len(output_text.strip()) < 80 and any(p in lowered for p in _STUB_PATTERNS):
+    # 1. Delegation stub check: agent must return completed diagnostic, not a turn-1 stub.
+    # Rejects turn-1 status messages regardless of length unless substantive diagnostic output exists.
+    is_stub = any(p in lowered for p in _STUB_PATTERNS)
+    has_diagnostic_content = any(c in output_text for c in _TERMINAL_CONTENT_MARKERS)
+    if is_stub and not has_diagnostic_content:
         return False, "Fail: Delegation stub returned instead of completed diagnostic"
 
     # 2. Clarification loop check: agent should default to host cluster rather than halting
@@ -71,15 +94,16 @@ def evaluate_response_quality(
     # 3. Prompt #1: Backing Model & Provider Identity
     if prompt_id == 1:
         leaks = []
-        if "custom" in lowered and "vertex" not in lowered:
+        if _contains_word("custom", lowered) and "vertex" not in lowered:
             leaks.append("Internal LiteLLM 'custom' provider placeholder leaked")
         if "model-default" in lowered:
             leaks.append("Internal LiteLLM router alias 'model-default' leaked")
         if leaks:
             return False, f"Fail: {'; '.join(leaks)}"
-        if ("gemini" in lowered or "claude" in lowered) and ("vertex" in lowered or "google" in lowered):
-            return True, "Pass: Backing model and provider accurately identified"
-        return False, "Fail: Backing model/provider identity unrecognized"
+        has_model = any(m in lowered for m in ("gemini", "claude"))
+        has_provider = any(p in lowered for p in ("vertex", "google"))
+        if not (has_model and has_provider):
+            return False, "Fail: Backing model/provider identity unrecognized"
 
     # 4. Prompt #21: Agent Substrate Architectural Plan
     if prompt_id == 21:
@@ -98,17 +122,16 @@ def evaluate_response_quality(
             if not has_plan:
                 missing.append("/plan staging prior to enabling")
             return False, f"Fail: Incomplete substrate plan, missing {', '.join(missing)}"
-        return True, "Pass: Complete Substrate plan with cluster and workload separation"
 
-    # 5. General required keyword presence
+    # 5. General required keyword presence (anchored with word boundaries)
     if required_keywords:
-        missing_req = [k for k in required_keywords if k.lower() not in lowered]
+        missing_req = [k for k in required_keywords if not _contains_word(k, lowered)]
         if missing_req:
             return False, f"Fail: Missing required keyword(s): {', '.join(missing_req)}"
 
-    # 6. General forbidden keyword absence
+    # 6. General forbidden keyword absence (anchored with word boundaries)
     if forbidden_keywords:
-        present_forb = [k for k in forbidden_keywords if k.lower() in lowered]
+        present_forb = [k for k in forbidden_keywords if _contains_word(k, lowered)]
         if present_forb:
             return False, f"Fail: Contains forbidden keyword(s): {', '.join(present_forb)}"
 
