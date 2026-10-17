@@ -1233,8 +1233,12 @@ downgrade_history_dir() {
     DOWNGRADE_HISTORY_SOURCE="$repo_dir"
     return 0
   fi
-  DOWNGRADE_HISTORY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${DOWNGRADE_HISTORY_DIR_TEMPLATE}")"
-  git clone --quiet --no-checkout "$DOWNGRADE_HISTORY_FETCH_FILTER" "$KUBE_AGENTS_REPO_URL" "$DOWNGRADE_HISTORY_DIR" >/dev/null 2>&1 || return 1
+  # One clone per run: full mode checks two components, and cleanup removes
+  # only the directory this variable names.
+  if [ -z "$DOWNGRADE_HISTORY_DIR" ]; then
+    DOWNGRADE_HISTORY_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${DOWNGRADE_HISTORY_DIR_TEMPLATE}")"
+    git clone --quiet --no-checkout "$DOWNGRADE_HISTORY_FETCH_FILTER" "$KUBE_AGENTS_REPO_URL" "$DOWNGRADE_HISTORY_DIR" >/dev/null 2>&1 || return 1
+  fi
   # A commit no branch or tag reaches (a pull request's build) is fetched by name.
   for ref in "$older" "$newer"; do
     git -C "$DOWNGRADE_HISTORY_DIR" rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1 && continue

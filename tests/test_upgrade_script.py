@@ -3985,7 +3985,7 @@ class DowngradeCheckTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, out)
         self.assertIn("Could not read the tag the install runs, so the downgrade check is skipped", out)
 
-    def _check_mode(self, mode, target, agent, operator):
+    def _check_mode(self, mode, target, agent, operator, repo_dir=None, extra=""):
         """check_downgrade_for_mode against a stub kubectl that serves each Deployment's image."""
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir(exist_ok=True)
@@ -4002,7 +4002,8 @@ class DowngradeCheckTest(unittest.TestCase):
         setup = (
             f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
             f'KUBE_AGENTS_REPO_URL={shlex.quote(str(self.repo))}\n'
-            f'check_downgrade_for_mode ns {mode} {shlex.quote(target)} {shlex.quote(str(self.repo))}\n'
+            f'check_downgrade_for_mode ns {mode} {shlex.quote(target)} {shlex.quote(str(repo_dir or self.repo))}\n'
+            f'{extra}'
             'echo CONTINUED\n'
         )
         proc = subprocess.run(
@@ -4033,6 +4034,20 @@ class DowngradeCheckTest(unittest.TestCase):
         proc, out = self._check_mode("full", "0.1.0", agent="0.2.0", operator="0.2.0")
         self.assertEqual(proc.returncode, 0, out)
         self.assertEqual(out.count("no commit it leaves behind"), 1, out)
+
+    def test_full_mode_without_local_history_clones_once_and_cleans_up(self):
+        proc, out = self._check_mode(
+            "full", "0.1.0", agent="0.2.0", operator="0.3.0", repo_dir=self.no_history,
+            extra=f'echo "CLONES=$(ls {shlex.quote(str(self.scratch))} | wc -l | tr -d " ")"\n',
+        )
+        self.assertEqual(proc.returncode, 1, out)
+        proc, out = self._check_mode(
+            "full", self.sha["init"], agent=self.sha["clean"], operator="0.2.0", repo_dir=self.no_history,
+            extra=f'echo "CLONES=$(ls {shlex.quote(str(self.scratch))} | wc -l | tr -d " ")"\n',
+        )
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("CLONES=1", out)
+        self.assertEqual(list(self.scratch.iterdir()), [], "a commit-only clone is left behind")
 
     def test_an_installed_tag_that_names_no_release_skips_the_check(self):
         proc, out = self._check("0.2.0", "latest")
