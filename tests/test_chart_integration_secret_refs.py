@@ -75,6 +75,8 @@ class SchemaDeclaresIntegrationSecretRefsTest(unittest.TestCase):
             self.assertEqual(ref["properties"]["key"].get("maxLength"), 253)
             self.assertIn("pattern", ref["properties"]["name"])
             self.assertIn("pattern", ref["properties"]["key"])
+            self.assertIn("not", ref["properties"]["key"])
+            self.assertEqual(ref["properties"]["key"]["not"].get("pattern"), r"^\.$|^\.\.")
 
     def test_teams_schema_declares_secret_refs(self):
         teams = self.integ["teams"]["properties"]
@@ -93,6 +95,8 @@ class SchemaDeclaresIntegrationSecretRefsTest(unittest.TestCase):
             self.assertEqual(ref["properties"]["key"].get("maxLength"), 253)
             self.assertIn("pattern", ref["properties"]["name"])
             self.assertIn("pattern", ref["properties"]["key"])
+            self.assertIn("not", ref["properties"]["key"])
+            self.assertEqual(ref["properties"]["key"]["not"].get("pattern"), r"^\.$|^\.\.")
 
 
 @unittest.skipUnless(_HELM, "helm binary is required for template render tests")
@@ -180,6 +184,14 @@ class RenderIntegrationSecretRefsTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("does not match pattern", res.stderr)
+
+        for invalid_key in (".", "..", "..token"):
+            res = _render(
+                "--set", "platformAgent.integration.slack.enabled=true",
+                f"--set=platformAgent.integration.slack.botTokenSecretRef.key={invalid_key}",
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("'not' failed", res.stderr)
 
 
 class ValuesDocumentationTest(unittest.TestCase):

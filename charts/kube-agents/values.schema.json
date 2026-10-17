@@ -1044,7 +1044,10 @@
                     "key": {
                       "type": "string",
                       "maxLength": 253,
-                      "pattern": "^$|^[-._a-zA-Z0-9]+$"
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
                     }
                   }
                 },
@@ -1060,7 +1063,10 @@
                     "key": {
                       "type": "string",
                       "maxLength": 253,
-                      "pattern": "^$|^[-._a-zA-Z0-9]+$"
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
                     }
                   }
                 },
@@ -1097,7 +1103,10 @@
                     "key": {
                       "type": "string",
                       "maxLength": 253,
-                      "pattern": "^$|^[-._a-zA-Z0-9]+$"
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
                     }
                   }
                 },
@@ -1113,7 +1122,10 @@
                     "key": {
                       "type": "string",
                       "maxLength": 253,
-                      "pattern": "^$|^[-._a-zA-Z0-9]+$"
+                      "pattern": "^$|^[-._a-zA-Z0-9]+$",
+                      "not": {
+                        "pattern": "^\\.$|^\\.\\."
+                      }
                     }
                   }
                 },
