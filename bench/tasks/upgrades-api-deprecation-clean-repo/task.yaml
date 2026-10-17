@@ -82,6 +82,8 @@ verification_spec:
   # command as an argv: a run counts when api_deprecation_scan.py is the
   # command word or follows python3, and not when the segment has -h or
   # --help, follows python3 -c, or only mentions the script (echo, grep, cat).
+  # The word pattern asks for the floor flag the scan exits 2 without, so a
+  # run that can only print a usage error does not count.
   - name: the-deprecation-scan-ran
     role: objective
     mode: assert
@@ -89,6 +91,7 @@ verification_spec:
       type: worker_commands
       required_runs:
         - script: api_deprecation_scan.py
+          word_patterns: ["^--(versions|current-version)(=.*)?$"]
   - name: the-section-gives-a-verdict
     role: objective
     mode: assert
