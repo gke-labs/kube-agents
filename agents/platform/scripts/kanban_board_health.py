@@ -199,6 +199,29 @@ BLOCKED_EVENTS_SQL = """
      WHERE kind = 'blocked'
      ORDER BY created_at, id
 """
+BLOCKED_CHILDREN_SQL = """
+    SELECT l.parent_id, c.id, c.title, c.assignee
+      FROM task_links l
+      JOIN tasks c ON c.id = l.child_id
+     WHERE c.status = 'todo'
+     ORDER BY c.id
+"""
+# A completed triage card whose report promised that a GitOps Pull Request is
+# being opened automatically (`_triage_authorize_clauses(True)`) must have its
+# linked child card in `task_links`. If the front-door turn ended between Call 1
+# and Call 2, the reader sees a report telling them not to reply `apply` while
+# no follow-up card exists to open the Pull Request.
+MISSING_PR_CHILD_SQL = """
+    SELECT t.id, t.title
+      FROM tasks t
+     WHERE t.status = 'done'
+       AND t.title LIKE 'Triage %'
+       AND t.result LIKE '%is being opened automatically%'
+       AND NOT EXISTS (
+           SELECT 1 FROM task_links l WHERE l.parent_id = t.id
+       )
+     ORDER BY t.id
+"""
 
 
 def agent_home() -> Path:
@@ -255,7 +278,7 @@ def read_only_connection(db: Path) -> sqlite3.Connection:
 
 
 def blocked_context(conn: sqlite3.Connection) -> dict:
-    """kind, reason, title and assignee per blocked card, or {} on an unmigrated board."""
+    """kind, reason, title, assignee and waiting todo children per blocked card, or {} on an unmigrated board."""
     try:
         tasks = {
             row["id"]: {"title": row["title"] or "", "assignee": row["assignee"] or "", "kind": row["block_kind"], "reason": ""}
@@ -273,6 +296,17 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
                 tasks[row["task_id"]]["reason"] = str(payload.get("reason") or tasks[row["task_id"]]["reason"])
                 if payload.get("kind"):
                     tasks[row["task_id"]]["kind"] = payload["kind"]
+        try:
+            for row in conn.execute(BLOCKED_CHILDREN_SQL):
+                if row["parent_id"] not in tasks:
+                    continue
+                tasks[row["parent_id"]].setdefault("waiting_children", []).append({
+                    "id": row["id"],
+                    "title": row["title"] or "",
+                    "assignee": row["assignee"] or "?",
+                })
+        except sqlite3.OperationalError:
+            pass
     except sqlite3.OperationalError:
         return {}
     return tasks
@@ -308,11 +342,17 @@ def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home:
         head += f": {title}"
     if reason:
         head += f' — "{reason}"'
-    return [
+    lines = [
         head,
         f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=task_id)}",
         f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=task_id)}",
     ]
+    for child in info.get("waiting_children") or ():
+        child_head = f"    holding todo child: {child['id']} ({child.get('assignee') or '?'})"
+        if child.get("title"):
+            child_head += f": {child['title']}"
+        lines.append(child_head)
+    return lines
 
 
 def invariant_violations(conn: sqlite3.Connection) -> list:
@@ -328,6 +368,14 @@ def invariant_violations(conn: sqlite3.Connection) -> list:
             f"  ghost claim: task {row['id']} is '{row['status']}' but still holds "
             f"claim_lock={row['claim_lock']!r}"
         )
+    try:
+        for row in conn.execute(MISSING_PR_CHILD_SQL):
+            lines.append(
+                f"  missing follow-up child: task {row['id']} ({row['title']!r}) promised "
+                "an automatic Pull Request but has no linked child in task_links"
+            )
+    except sqlite3.OperationalError:
+        pass
     return lines
 
 

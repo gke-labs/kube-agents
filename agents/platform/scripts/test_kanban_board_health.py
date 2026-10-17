@@ -42,7 +42,8 @@ CREATE TABLE tasks (
     created_at INTEGER,
     claim_lock TEXT,
     current_run_id INTEGER,
-    block_kind TEXT
+    block_kind TEXT,
+    result TEXT
 );
 CREATE TABLE task_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,6 +58,10 @@ CREATE TABLE task_events (
     payload TEXT,
     created_at INTEGER
 );
+CREATE TABLE task_links (
+    parent_id TEXT NOT NULL,
+    child_id TEXT NOT NULL
+);
 """
 
 STUCK_PAYLOAD = json.dumps([{
@@ -67,16 +72,16 @@ STUCK_PAYLOAD = json.dumps([{
 }])
 
 
-def make_board(tmp: Path, tasks=(), runs=(), events=()):
+def make_board(tmp: Path, tasks=(), runs=(), events=(), links=()):
     db = tmp / "kanban.db"
     conn = sqlite3.connect(db)
     conn.executescript(SCHEMA)
     for row in tasks:
         conn.execute(
-            "INSERT INTO tasks (id,title,status,assignee,created_at,claim_lock,current_run_id,block_kind)"
-            " VALUES (:id,:title,:status,:assignee,:created_at,:claim_lock,:current_run_id,:block_kind)",
+            "INSERT INTO tasks (id,title,status,assignee,created_at,claim_lock,current_run_id,block_kind,result)"
+            " VALUES (:id,:title,:status,:assignee,:created_at,:claim_lock,:current_run_id,:block_kind,:result)",
             {"title": "t", "assignee": "platform", "created_at": 1000,
-             "claim_lock": None, "current_run_id": None, "block_kind": None, **row},
+             "claim_lock": None, "current_run_id": None, "block_kind": None, "result": None, **row},
         )
     for row in events:
         conn.execute(
@@ -91,6 +96,11 @@ def make_board(tmp: Path, tasks=(), runs=(), events=()):
         if row.get("link_current"):
             conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?",
                          (cur.lastrowid, row["task_id"]))
+    for parent_id, child_id in links:
+        conn.execute(
+            "INSERT INTO task_links (parent_id,child_id) VALUES (?,?)",
+            (parent_id, child_id),
+        )
     conn.commit()
     conn.close()
     return db
@@ -129,6 +139,36 @@ class InvariantTests(unittest.TestCase):
         self.assertEqual(len(out), 1)
         self.assertIn("ghost claim", out[0])
         self.assertIn("t_ghost", out[0])
+
+    def test_done_open_pr_triage_card_without_linked_child_is_reported(self):
+        out = self.violations_for(
+            tasks=[{
+                "id": "t_orphan_triage",
+                "title": "Triage ns/Pod/api (BackOff) on c1",
+                "status": "done",
+                "assignee": "cluster-c1",
+                "result": "- **To authorize:** a GitOps Pull Request for the recommended fix is being opened automatically.",
+            }]
+        )
+        self.assertEqual(len(out), 1)
+        self.assertIn("missing follow-up child", out[0])
+        self.assertIn("t_orphan_triage", out[0])
+
+        # With the follow-up child linked in task_links, the invariant is silent.
+        linked = self.violations_for(
+            tasks=[
+                {
+                    "id": "t_triage",
+                    "title": "Triage ns/Pod/api (BackOff) on c1",
+                    "status": "done",
+                    "assignee": "cluster-c1",
+                    "result": "- **To authorize:** a GitOps Pull Request for the recommended fix is being opened automatically.",
+                },
+                {"id": "t_pr", "title": "Open GitOps PR for ns/Pod/api (BackOff) on c1", "status": "todo", "assignee": "platform"},
+            ],
+            links=[("t_triage", "t_pr")],
+        )
+        self.assertEqual(linked, [])
 
     def test_orphan_run_when_task_is_not_running(self):
         out = self.violations_for(
@@ -219,6 +259,27 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn('"judge rejected the report"', text)
         self.assertIn("hermes kanban unblock --reason", text)
         self.assertIn("hermes kanban archive t_stuck", text)
+
+    def test_stuck_card_names_todo_children_held_behind_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = make_board(
+                Path(d),
+                tasks=[
+                    {"id": "t_stuck", "title": "Triage x", "status": "blocked", "assignee": "cluster-a", "block_kind": "needs_input"},
+                    {"id": "t_pr", "title": "Open GitOps PR for x", "status": "todo", "assignee": "platform"},
+                ],
+                links=[("t_stuck", "t_pr")],
+            )
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, STUCK_PAYLOAD)[0],
+                                      binary="/x/hermes", env={}, context=context)
+        text = "\n".join(lines)
+        self.assertIn("holding todo child: t_pr (platform): Open GitOps PR for x", text)
 
     def test_a_stuck_card_without_context_falls_back_to_the_cli_s_fields(self):
         # An unmigrated board (no block_kind, no task_events) yields no context;

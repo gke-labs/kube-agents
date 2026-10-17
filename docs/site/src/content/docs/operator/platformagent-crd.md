@@ -61,6 +61,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below. |
 | `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
 | `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
+| `incidentTriage.openPullRequest`               | bool   | Open the triage report's recommended fix as a pull request without waiting for a human `apply` reply. Default `false`. See below.                                                                                                 |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
@@ -266,6 +267,41 @@ ownership is still read and reported, and you get the same cards without the ann
 Nothing else about the detector is exposed here. Which principals count as human, and which calls
 are dropped as failed or non-declarative, are compiled into the binary; what reaches it at all is
 set by the Terraform module's log sinks, not by the CR.
+
+### `spec.harness.incidentTriage`
+
+By default, a triage report from the `k8s-event-watcher` proposes GitOps fixes and stops. A human
+replies `apply` (or `apply Option B`), and the Platform Agent opens that fix as a pull request.
+`openPullRequest: true` removes the wait for the reply. The Planning Agent files a second card
+beside the triage card. That card is assigned to the Platform Agent and parented on the triage card,
+so the dispatcher holds it in `todo` until the diagnosis card settles (`done` or `archived`); if the
+diagnosis card ends `blocked`, the pull-request card stays held in `todo` (surfaced by
+`kanban_board_health` under the blocked parent) until the parent is unblocked and completed or
+archived. Once the report is complete, the second card opens the option the report marked
+Recommended, or the single proposed fix, through `submit-suggestion`.
+
+```yaml
+spec:
+  harness:
+    incidentTriage:
+      openPullRequest: true
+```
+
+A human still reviews and merges the pull request, and nothing is written to the live cluster. The
+branch is `platform-agent/incident-<incident>`, keyed to the event's coordinates (cluster,
+namespace, kind, workload name with Deployment replica suffixes and StatefulSet ordinals stripped,
+and reason). A retried event for the same workload fault therefore revises the open pull request
+rather than opening a second one, while distinct bare pods stay on separate branches. The second
+card's result, the pull request URL, is posted to the same chat thread as the report.
+
+The setting has limits. Drift reports from `drift-detector` are not covered; they still wait for a
+reply. On Slack with `KAGE_SLACK_UX` enabled, `slack_ux_incident` omits the primary `apply` button
+for the recommended or single fix that is already being opened, leaving buttons only for alternative
+options; a manual `apply Option B` reply in chat routes through `incident_context` on its own
+`submit-suggestion` branch. Changing the field rolls the gateway pod, because it reaches the agent
+as the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` environment variable. The operator sets that variable
+only when the field is `true`, so an install that never sets it keeps the pod it had. The Helm value
+is `platformAgent.harness.incidentTriage.openPullRequest`.
 
 ### `spec.harness.tuning`
 
