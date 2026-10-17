@@ -1644,7 +1644,7 @@ _ALL_FINDINGS_RE = re.compile(
 _HEADING_ID_RE = re.compile(r"^####[ \t].*?<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M)
 _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 # The notice audit_report's `_render_findings` writes when it omits findings.
-_OMITTED_NOTICE_RE = re.compile(r"\d+ further finding\(s\) are omitted from this description")
+_OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
 # Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
 _HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
@@ -3593,6 +3593,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             surface = f"the body of {ledger['slug']}"
 
         unnamed: list[str] = []
+        omitted_unlisted: re.Match | None = None
         if self.every_finding_named:
             filed = _finding_ids(ledger["body"])
             if filed is None:
@@ -3615,8 +3616,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission
             # notice still says they exist.
-            if filed[1] == "audit-findings" and _OMITTED_NOTICE_RE.search(_HTML_COMMENT_RE.sub("", body)):
-                unnamed.append("(omitted findings with no complete-id block to name them)")
+            if filed[1] == "audit-findings":
+                omitted_unlisted = _OMITTED_NOTICE_RE.search(_HTML_COMMENT_RE.sub("", body))
 
         missing = [p for p in self.required_phrases if p.lower() not in text]
         present = [p for p in self.forbidden_phrases if p.lower() in text]
@@ -3628,8 +3629,14 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
         }
-        if missing or present or any_of_miss or unnamed:
+        if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []
+            if omitted_unlisted:
+                parts.append(
+                    f"{ledger['slug']} says {omitted_unlisted.group(1)} further finding(s) are "
+                    "omitted from its description and carries no audit-findings-all block "
+                    "to name them, so they are filed but named nowhere"
+                )
             if unnamed:
                 parts.append(
                     f"{len(unnamed)} filed finding id(s) appear only in the hidden id "

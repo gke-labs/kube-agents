@@ -3798,7 +3798,8 @@ def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_bloc
     github.routes[_api()] = (200, _issue(body))
     res = _ledger_check(every_finding_named=True).verify(5.0)
     assert res.status == "fail"
-    assert "omitted" in res.reason
+    assert "says 3 further finding(s) are omitted" in res.reason
+    assert "hidden id blocks" not in res.reason
 
 
 def test_every_finding_named_fails_without_a_delta_block(token, github):
