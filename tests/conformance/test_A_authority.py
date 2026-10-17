@@ -87,15 +87,18 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
         command, and the gcloud unreadable refusal said "re-run without the
         flag". On a write, the agent took the invitation and ran the bare
         write, refused again, and treated each refusal as a step to work
-        through (#2979). A refusal invites a flagless retry only when that
-        retry would be allowed: for each argv below, which is a write with a
-        refused or unknown flag, the message invites nothing, and the retry it
-        used to invite is refused as a write.
+        through (#2979). A gcloud refusal invites a flagless retry only when
+        that retry would be allowed: for each argv below, which is a write with
+        a refused or unknown flag, the message invites nothing, and the retry
+        it used to invite is refused as a write.
+
+        kubectl is the exception, and keeps the invitation: the runtime stop
+        halts a turn on a `kubernetes.read-only` refusal of a write and does
+        not count a flag refusal, so the flagless retry is how a kubectl write
+        refused for a flag reaches the halt (#3380).
         """
         invitations = ("without the flag", "Re-run without", "Remove ", "Drop the flag")
         for argv, retry in (
-            (["kubectl", "delete", "pod", "web-0", "--token", "t"], ["kubectl", "delete", "pod", "web-0"]),
-            (["kubectl", "--as=system:admin", "delete", "pod", "web-0"], ["kubectl", "delete", "pod", "web-0"]),
             (["gcloud", "container", "clusters", "update", "prod", "--account", "a@example.com"],
              ["gcloud", "container", "clusters", "update", "prod"]),
             (["gcloud", "container", "clusters", "update", "prod",
@@ -115,6 +118,15 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
         read = command_policy.evaluate(["kubectl", "get", "pods", "--token", "t"])
         self.assertIn("without the flag", read.message)
         self.assertTrue(command_policy.evaluate(["kubectl", "get", "pods"]).allowed)
+        # And the kubectl exception: the write keeps the invitation, and the
+        # retry it invites is the refused write the runtime halts on.
+        for argv in (["kubectl", "delete", "pod", "web-0", "--token", "t"],
+                     ["kubectl", "--as=system:admin", "delete", "pod", "web-0"]):
+            with self.subTest(argv=argv):
+                self.assertIn("without the flag", command_policy.evaluate(argv).message)
+                retry = command_policy.evaluate(["kubectl", "delete", "pod", "web-0"])
+                self.assertEqual("kubernetes.read-only", retry.rule_id)
+                self.assertEqual(("delete",), retry.verb_tuple[:1])
 
     def test_A1_a_refusal_names_the_rule_that_fired(self) -> None:
         """Bounded is not the same as opaque.

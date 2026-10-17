@@ -772,6 +772,17 @@ Mutation(
         "agent runs the bare write it was always going to be refused",
     ),
     Mutation(
+        "A1-kubectl-flag-refusal-forbids-the-halting-retry",
+        "agents/platform/scripts/command_policy.py",
+        ('    if argv[0] == "kubectl":\n        return None\n    stripped = _strip_refused_flags(argv)\n',
+         "    stripped = _strip_refused_flags(argv)\n"),
+        "test_A1_a_refusal_invites_no_retry_it_would_refuse",
+        "apply the refused-retry wording to kubectl too, for consistency -- "
+        "a kubectl write refused for a flag tells the agent not to retry, the "
+        "flag refusal does not count toward the runtime halt, and the retry "
+        "that would have halted the turn is never made",
+    ),
+    Mutation(
         "A1-unknown-flag-invites-a-write-retry",
         "agents/platform/scripts/command_policy.py",
         ("        if retry_refused:\n",

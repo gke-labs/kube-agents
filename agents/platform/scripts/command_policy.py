@@ -1292,15 +1292,20 @@ def _still_refused_without_flags(argv: list[str]) -> str | None:
     message, which is fixed text (no caller bytes), so the flag refusal can
     say what the retry would meet instead of inviting it. None when the
     remainder would be allowed, or cannot be judged: an argv this cannot take
-    apart (an attached shorthand such as `-sURL`), a remainder that is itself
-    unreadable, or a kubectl local render, which the runtime treats as
-    guidance rather than a refusal.
+    apart (an attached shorthand such as `-sURL`), or a remainder that is
+    itself unreadable.
+
+    Also None for every kubectl argv, whose flag refusals keep inviting the
+    retry. The runtime's refusal stop halts a turn on a `kubernetes.read-only`
+    refusal of a write and does not count a flag refusal's own rule id, so for
+    a kubectl write refused for a flag the flagless retry is how the turn
+    reaches that halt (#3380).
     """
+    if argv[0] == "kubectl":
+        return None
     stripped = _strip_refused_flags(argv)
     if stripped == argv:
         # Evaluating it again would only ask this question again.
-        return None
-    if stripped[0] == "kubectl" and local_render(stripped):
         return None
     remainder = evaluate(stripped)
     if remainder.rule_id in (KUBERNETES_READ_ONLY_RULE, "gcp.read-only"):
