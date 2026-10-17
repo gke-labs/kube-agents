@@ -680,10 +680,10 @@
 
 # #3120: pdb-remediation-pr demoted 2026-10-17. It collapsed 0/3 on unrelated
 # pull requests after its roster line of 2026-10-14 (#2971, #3017, #3329):
-# the worker finds checkout-gateway with no PodDisruptionBudget, then
+# mostly, the worker finds checkout-gateway with no PodDisruptionBudget, then
 # declines to open a pull request because the pool's *-infra GitOps
-# repository holds no manifest for it, so the report names no pull request
-# it opened. Back on the roster once #3145 (seeds checkout-gateway's
+# repository holds no manifest for it (on #3017 it named an older pull
+# request it had not opened), so the report names no pull request it opened. Back on the roster once #3145 (seeds checkout-gateway's
 # manifest into every pool's -infra repository) merges and the case's
 # record holds (#3120). Still on the GitLab lane (gitlab-cases.txt), now
 # held out there.
