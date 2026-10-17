@@ -12,21 +12,24 @@
 # (`./scripts/audit_cluster.sh`) resolves to nothing from the card's working
 # directory. Observed on main: the worker searched for the script
 # (`find / -name audit_cluster.sh`) and ran the first copy it found, or a
-# call by the profile's skill path printed `No such file or directory`. The answer can still
-# read right, so the checks grade the route: a Cluster Agent did the work,
-# ran /opt/data/scripts/audit_cluster.sh against seeded-a, never searched
-# for the script, and no call's result shows it missing.
+# call by the profile's skill path printed `No such file or directory`. The
+# answer can still read right, so the checks grade the route: a Cluster Agent
+# did the work, ran /opt/data/scripts/audit_cluster.sh against seeded-a, and
+# no call's result shows the script missing. A copy found by a search runs
+# from its own path, so the required pattern fails it; no pattern over the
+# search itself is needed. bench/tests/test_cluster_agent_security_audit_patterns.py
+# pins the command and result shapes.
 #
 # The run is read as a text pattern rather than `required_runs`: the worker
 # types `bash <path>/audit_cluster.sh`, as SOUL.md dictates for preflight,
 # and a run through `bash <file>` is not credited there.
 #
-# The forbidden checks open their window at the first result any worker call
-# in the card's lineage returns, and grade only calls issued in a later turn.
+# The result check opens its window at the first result any worker call in
+# the card's lineage returns, and grades only calls issued in a later turn.
 # A Cluster Agent runs cluster_preflight.sh before any diagnostics
-# (agents/cluster/SOUL.md), so a search or a missing script shows in the
-# window unless the worker skips preflight, or chains or parallelizes the
-# audit with it in that same first turn.
+# (agents/cluster/SOUL.md), so a missing script shows in the window unless
+# the worker skips preflight, or chains or parallelizes the audit with it in
+# that same first turn.
 #
 # No planted defect: the script reads the cluster's own configuration, and
 # any seeded cluster has one. Isolation class: read-only. Eligible tier:
@@ -69,10 +72,7 @@ verification_spec:
       after_result_pattern: '[\s\S]'
       required_patterns:
         # The path the skill names, so a copy found some other way does not count.
-        - '(?:/opt/data/scripts/|\bcd\s+/opt/data/scripts/?\s*&&[^\n]*?)audit_cluster\.sh[''"]?\s+[''"]?seeded-a\b'
-      forbidden_patterns:
-        # From a segment start, so a `which` batched ahead of the run is not a search.
-        - '(?:^|[;&|(]\s*)(?:find|locate|which)\b[^;&|\n]*audit_cluster'
+        - '(?:/opt/data/scripts/|\bcd\s+/opt/data/scripts/?\s*(?:&&|;|\n)\s*[^\n]*?)audit_cluster\.sh[''"]?\s+[''"]?seeded-a\b'
       forbidden_result_patterns:
         - 'audit_cluster\.sh[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
   - name: report-carries-the-script-results
