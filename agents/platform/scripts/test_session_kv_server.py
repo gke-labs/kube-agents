@@ -3520,7 +3520,8 @@ class TestAuditChatReport(unittest.TestCase):
         with open(os.path.join(self.scratch, f"chat_report_{job}.json"), "w", encoding="utf-8") as handle:
             json.dump(record, handle)
 
-    def post(self, fleet_audit=True, send=None, job="compliance-audit", shipped=True, scheduler=True):
+    def post(self, fleet_audit=True, send=None, job="compliance-audit", shipped=True, scheduler=True,
+             report=None, failure=False):
         sent = []
 
         def default_send(platform, message, chat_id="", thread_id="", timeout=None):
@@ -3534,8 +3535,9 @@ class TestAuditChatReport(unittest.TestCase):
             response = self.client.post(
                 "/v1/cron-reports",
                 json={
-                    "job_id": job, "title": "Security & RBAC Posture Audit", "report": self.FINAL,
+                    "job_id": job, "title": "Security & RBAC Posture Audit", "report": report or self.FINAL,
                     **({"also_delivered_to": []} if scheduler else {}),
+                    **({"scheduler_failure": True} if failure else {}),
                 },
             )
         return response, sent
@@ -3579,6 +3581,28 @@ class TestAuditChatReport(unittest.TestCase):
         self.assertIn("chat_report_compliance-audit.json", sent[0])
         self.assertIn("https://github.com/acme/fleet/issues/3", sent[0].split("\n\n", 1)[0])
         self.assertNotIn("cron/output/", sent[0])
+
+    FAILURE = (
+        "⚠️ Cron 'Security & RBAC Posture Audit' failed: provider quota limit. "
+        "Fallback chain exhausted. Full details saved in cron output."
+    )
+
+    def test_a_failed_runs_line_is_posted_in_place_of_an_unposted_record(self):
+        # A silent run left a finished record; this run died before `start`.
+        self.leave([self.REPORT])
+        _, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(sent, [self.FAILURE])
+
+    def test_the_failure_marks_the_record_so_a_later_run_does_not_post_it(self):
+        self.leave([self.REPORT])
+        self.post(report=self.FAILURE, failure=True)
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_the_flag_without_the_scheduler_leg_changes_nothing(self):
+        self.leave([])
+        _, sent = self.post(report=self.FAILURE, failure=True, scheduler=False)
+        self.assertEqual(sent, [self.FAILURE])
 
     def test_a_mid_run_report_to_chat_is_posted_as_written(self):
         self.leave([])

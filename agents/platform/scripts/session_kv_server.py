@@ -221,6 +221,9 @@ IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
 # The field the relay plugin (deploy/docker/plugins/chat/adapter.py) sends on
 # every scheduled delivery and `report_to_chat` never does.
 SCHEDULER_LEG_KEY = "also_delivered_to"
+# deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
+# delivery is the scheduler's failure line for the run.
+SCHEDULER_FAILURE_KEY = "scheduler_failure"
 AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
 # `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
 AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
@@ -3332,6 +3335,15 @@ def _is_shipped_audit_job(job_id: str) -> bool:
     return _roster_runs_fleet_audit(store, job_id)
 
 
+def _record_run(job_id: str) -> str:
+    """The run id of the chat record on disk for `job_id`, or "" when there is none to read."""
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return ""
+    return str((record or {}).get(CHAT_REPORT_RUN_KEY) or "")
+
+
 def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
     """What a fleet-audit job posts, and the run it is for: `(report, run)`.
 
@@ -3673,8 +3685,16 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
     # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
     # `report_to_chat` does not, and its text is posted as written.
     from_scheduler = SCHEDULER_LEG_KEY in request_data
+    failure_run = ""
     if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
-        report, audit_run = audit_chat_report(profile, job_id, title)
+        if request_data.get(SCHEDULER_FAILURE_KEY) is True:
+            # The scheduler's line for a failed run, posted as written, as on
+            # main: it says why the run failed, and the record on disk may be
+            # an earlier run's. Marking that record posted keeps a later run
+            # that never reached `start` from posting it as its own.
+            failure_run = _record_run(job_id)
+        else:
+            report, audit_run = audit_chat_report(profile, job_id, title)
     report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -3689,8 +3709,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {type(exc).__name__}") from exc
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
-    if audit_run:
-        _mark_run_posted(profile, job_id, audit_run)
+    if audit_run or failure_run:
+        _mark_run_posted(profile, job_id, audit_run or failure_run)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they

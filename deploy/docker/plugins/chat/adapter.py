@@ -133,6 +133,22 @@ _CRON_ROSTER = ("cron", "jobs.json")
 #: image-build time and fails the build if it is not this string.
 SILENT_MARKER = "[SILENT]"
 
+# The openings of the failure line the scheduler delivers in place of a failed
+# run's final response (cron/scheduler.py: _summarize_cron_failure_for_delivery
+# and the blocked-config branch of _compose_run_delivery), with the job's name. The relay
+# posts such a line as written, where it would otherwise post the fleet-audit
+# record, so the match is exact against the wrapper's own title and bounded in
+# length: a model message that only starts the same way is not a failure line.
+# verify_chat_relay.py pins every shape against the real scheduler.
+SCHEDULER_FAILURE_PREFIXES = (
+    "⚠️ Cron '{title}' failed: ",
+    "⛔ Cron '{title}' blocked by configuration validation",
+)
+SCHEDULER_FAILURE_MAX_CHARS = 2000
+# The payload field that tells the relay this delivery is the scheduler's
+# failure line.
+SCHEDULER_FAILURE_FIELD = "scheduler_failure"
+
 #: ``_deliver_result``'s wrapper. Matched, not assumed — see
 #: :func:`parse_cron_wrapper`.
 _WRAPPER_RE = re.compile(
@@ -164,6 +180,13 @@ def parse_cron_wrapper(message: str) -> Tuple[str, str, str]:
     if body.endswith(footer):
         body = body[: -len(footer)]
     return match.group("job_id").strip(), title, body.strip()
+
+
+def is_scheduler_failure(title: str, report: str) -> bool:
+    """Whether `report` is the scheduler's failure line for the job named `title`."""
+    if not title or len(report) > SCHEDULER_FAILURE_MAX_CHARS:
+        return False
+    return any(report.startswith(prefix.format(title=title)) for prefix in SCHEDULER_FAILURE_PREFIXES)
 
 
 def profile_name() -> str:
@@ -500,6 +523,8 @@ async def standalone_send(
         # same platforms itself -- lands twice in each of them.
         "also_delivered_to": sibling_delivery_targets(job_id),
     }
+    if is_scheduler_failure(title, report):
+        payload[SCHEDULER_FAILURE_FIELD] = True
     error, receipt = await asyncio.to_thread(_post, relay_url(), payload, api_key)
     if error:
         return {"error": error}

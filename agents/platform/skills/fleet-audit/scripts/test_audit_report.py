@@ -25976,6 +25976,15 @@ class TestChatReport(HarnessTestCase):
         audit_report.append_chat_report(AUDIT, "acme/b", "report B", NOW + timedelta(minutes=20))
         self.assertEqual(self.entries(), [("acme/a", "report A"), ("acme/b", "report B")])
 
+    def test_a_start_does_not_adopt_a_record_with_no_finished_part(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        dead = self.chat_record()
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW + timedelta(minutes=10))
+        fresh = self.chat_record()
+        self.assertNotEqual(fresh["run"], dead["run"])
+        self.assertEqual(fresh["started_at"], (NOW + timedelta(minutes=10)).timestamp())
+        self.assertEqual(self.entries(), [("acme/a", None)])
+
     def test_the_age_limit_counts_from_the_last_step(self):
         step = timedelta(seconds=audit_report.INFLIGHT_TTL_SECONDS - 60)
         audit_report.open_chat_report(AUDIT, "acme/a", NOW)

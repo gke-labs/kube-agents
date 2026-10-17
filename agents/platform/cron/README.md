@@ -420,8 +420,8 @@ returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
 scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
-on the same leg; for a fleet-audit job that never reached `finish`, the relay
-posts its not-finished notice instead.
+on the same leg, and the relay posts that line as written for a fleet-audit job
+too.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
@@ -462,8 +462,9 @@ exception: its scheduled delivery posts the report the run's `finish` rendered,
 not the final message,
 which holds whatever else the model wrote in its last turn. A run over several
 repositories posts each finished repository's report, then a line naming any it
-did not finish, and a run that finished none posts a one-line notice that it did
-not finish. On Slack the report is then replaced by a headline linking its
+did not finish. A failed run posts the scheduler's failure line, which says why,
+and a run that finished no repository without failing posts a one-line notice
+that it did not finish. On Slack the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
 with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the

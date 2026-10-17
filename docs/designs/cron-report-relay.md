@@ -219,19 +219,24 @@ it renders from its own line and the findings document (`render_chat_report`;
 `summary` on a no-forge run). An SOP that walks several repositories runs
 `start` and `finish` once for each, so a record whose last step is within two
 hours (the stream lease, which covers one step) and that holds no finished
-report for this repository is the same run, and a `start` retried after a
-failure keeps its own pending entry; any other `start` opens a new record. A
-`finish` applies the same rule. The relay
+report for this repository is the same run; any other `start` opens a new
+record, and so does a `start` that finds no finished part, which a run that
+never reached `finish` left. A `finish` applies the age and repository rule. The relay
 reads the record, over the gateway's sandbox login where the shell runs in the
 shell sandbox (`sandbox_exec.read_bytes`).
 
 The relay posts the finished repositories' reports as one message, followed by
 a line naming each repository the run started and did not finish. It posts each
-run once: the run it last posted per job is kept in `audit_report_runs`. A
-record with no finished repository, one already posted, or one whose last step
-is older than two hours means the run did not reach `finish`, and the relay
-posts a one-line notice that the job did not finish in place of whatever the
-scheduler delivered, a final message or its failure summary. A read of the file
+run once: the run it last posted per job is kept in `audit_report_runs`. A run
+that failed is delivered as the scheduler's failure line, which the relay
+plugin recognises by its exact opening and the job's name
+(`adapter.SCHEDULER_FAILURE_PREFIXES`, pinned against the scheduler at image
+build) and flags; the relay posts that line as written, as on main, and marks
+the record on disk posted, so a later run cannot post an earlier run's report
+as its own. Otherwise a record with no finished repository, one already posted,
+or one whose last step is older than two hours means the run did not reach
+`finish`, and the relay posts a one-line notice that the job did not finish in
+place of the final message. A read of the file
 that fails, rather than finding none, posts a second notice naming the failure,
 and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
 silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
@@ -252,13 +257,13 @@ unreadable notice.
 
 The match is by job id, because Hermes hands the relay no run id, and three
 cases fall outside it. A repository whose `start` was refused, or never run,
-has no entry, so nothing names it. A cron run that dies before `start` within
-two hours of the last step of a run whose report was never posted (an on-demand
-run, or a silent one the scheduler dropped) posts that run's report. A run of
-another repository within two hours of an earlier run's last step joins that
-earlier record, as does a run whose first repository is one an earlier run
-started and left unfinished; when the earlier run was already posted, the relay
-posts the not-finished notice.
+has no entry, so nothing names it. A run that neither fails nor calls `start`
+(the model skips the SOP, or an on-demand run holds the stream) within two hours
+of the last step of a run whose report was never posted, an on-demand run or a
+silent one the scheduler dropped, posts that run's report. And an on-demand run
+of one later repository, followed within two hours by a scheduled run, leaves
+its part in the record the scheduled run joins; the scheduled report then leaves
+out its own first repository, whose ledger issue is still published.
 
 ## Which key the loopback call presents
 
@@ -625,8 +630,8 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either. For a fleet-audit job the relay posts its not-finished notice in place of
-that failure summary, as it does in place of any final message. One case the scheduler's check misses: it matches the bare marker only,
+either. For a fleet-audit job the relay posts that failure summary as written
+too, and in place of any other final message it posts the rendered report. One case the scheduler's check misses: it matches the bare marker only,
 and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,

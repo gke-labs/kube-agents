@@ -340,6 +340,42 @@ def main() -> None:
         "an alert that quotes the marker in prose is not silence",
     )
 
+    # 11. The adapter flags the scheduler's failure line by its exact opening
+    # (adapter.SCHEDULER_FAILURE_PREFIXES), and the relay then posts it as
+    # written in place of a fleet-audit record. Each branch of the
+    # summarizer is its own f-string, so drive every one, and the
+    # blocked-config line, which _compose_run_delivery builds without it.
+    import inspect
+
+    import cron.scheduler as scheduler
+    from plugins.platforms.chat.adapter import is_scheduler_failure
+
+    title = "Security & RBAC Posture Audit"
+    failed_job = {"id": "compliance-audit", "name": title}
+    for error in (
+        "Script timed out after 30s: /x.py",
+        "HTTP 429 TPM quota exhausted",
+        "Cron job 'x' idle for 600s (limit 600s)",
+        "ReadTimeout talking to the provider",
+        "403 authentication failed",
+        "RuntimeError: something else broke",
+    ):
+        line = scheduler._summarize_cron_failure_for_delivery(failed_job, error)
+        check(is_scheduler_failure(title, line), f"the adapter flags the scheduler's failure line {line[:60]!r}")
+    check(
+        not is_scheduler_failure(title, "Security & RBAC Posture Audit: 0 new, 0 resolved."),
+        "the adapter does not flag a report",
+    )
+    source = inspect.getsource(scheduler._compose_run_delivery)
+    check(
+        "⛔ Cron '" in source and "' blocked by " in source and '"configuration validation' in source,
+        "_compose_run_delivery still builds the blocked-config line the adapter flags",
+    )
+    check(
+        is_scheduler_failure(title, f"⛔ Cron '{title}' blocked by configuration validation (no LLM call was made): x"),
+        "the adapter flags the blocked-config line",
+    )
+
     print("\nverify_chat_relay: all checks passed")
 
 
