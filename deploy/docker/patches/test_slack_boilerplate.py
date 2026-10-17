@@ -1149,7 +1149,7 @@ class SystemReplyTest(unittest.TestCase):
             sent,
             {
                 "Got it — I'll pick this up when I finish the current one.",
-                "Stopping what I was doing to look at this.",
+                "Got it — looking at this now.",
                 "Got it — I'll fold this into what I'm working on now.",
                 "Got it — changing course with your correction.",
                 "Got it — I'll pick this up when the current work finishes.",
