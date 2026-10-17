@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -56,10 +57,12 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
-	// defaultGatewayWait matches the agent container's startup probe budget
-	// (agentAPIProbe(10, 90) in platformagent_manifests.go): past it the
-	// kubelet gives up on that start of the gateway.
-	defaultGatewayWait = 15 * time.Minute
+	// defaultGatewayWait is two of the agent container's startup probe
+	// budgets (agentAPIProbe(10, 90) in platformagent_manifests.go, 905s).
+	// A boot that overruns one budget is restarted, and the restarted
+	// entrypoint redoes its profile steps before the gateway binds, so a
+	// single budget would give up on exactly the slowest boots.
+	defaultGatewayWait = 30 * time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -209,6 +212,14 @@ func (f *flags) validate() error {
 	}
 	if strings.HasSuffix(f.gatewayURL, "/") {
 		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
+	}
+	// Checked here because a URL the probe cannot use fails every attempt the
+	// way a gateway that is not up yet does, and would hold the informers for
+	// the whole wait.
+	if f.gatewayURL != "" {
+		if u, err := url.Parse(f.gatewayURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("--gateway-url must be an http:// or https:// URL with a host (got %q)", f.gatewayURL)
+		}
 	}
 	// Cluster sources are additive, not exclusive: --profiles-dir contributes
 	// every Cluster Agent profile, and --in-cluster / --kubeconfig contributes
