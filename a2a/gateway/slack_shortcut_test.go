@@ -229,6 +229,19 @@ func TestSlackShortcutOnAMessageAlreadyWaitingIsDropped(t *testing.T) {
 	}
 }
 
+// The typed message a shortcut was used on, arriving after it, does not
+// replace the shortcut's pending entry: the shortcut's verdict still finds
+// the clicker (here, a refused one told privately).
+func TestSlackShortcutPendingEntrySurvivesTheTypedMessage(t *testing.T) {
+	a, hooks := newShortcutAdapter(&fakeSlackAPI{})
+	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "204.5", alertMessage()))
+	a.notePending(InboundMessage{Conversation: turns[0].Conversation, AuthorID: "U2", MessageID: turns[0].MessageID, Text: "is payments down?"})
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, false)
+	if got := hooks.got(); len(got) != 1 || got[0].text != unverifiedNotice(slackBackend, "U1") {
+		t.Errorf("notes = %+v, want the clicker told privately", got)
+	}
+}
+
 func TestSlackShortcutStartsNothingOnShutdown(t *testing.T) {
 	a, _ := newShortcutAdapter(&fakeSlackAPI{})
 	ctx, cancel := context.WithCancel(context.Background())

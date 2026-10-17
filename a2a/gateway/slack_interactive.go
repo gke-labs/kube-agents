@@ -299,16 +299,22 @@ func (s *SlackAdapter) notePending(msg InboundMessage) {
 		slackPending{conversation: msg.Conversation, author: msg.AuthorID, text: msg.Text})
 }
 
+// The first entry under a key stands until the gateway's verdict takes it: a
+// shortcut and the typed message it was used on share one key (the message's
+// ts), and a second writer would take the first's verdict. Nothing else
+// writes a key twice: a redelivered message is dropped by alreadySeen, and a
+// click is keyed by its own action_ts.
 func (s *SlackAdapter) addPendingLocked(key string, p slackPending) {
 	ux := s.uxLocked()
-	if _, ok := ux.pending[key]; !ok {
-		remember(&ux.pendingOrder, key, func(k string) {
-			if old, ok := ux.pending[k]; ok && old.click {
-				delete(ux.claims, old.question.channel+"/"+old.question.ts)
-			}
-			delete(ux.pending, k)
-		})
+	if _, ok := ux.pending[key]; ok {
+		return
 	}
+	remember(&ux.pendingOrder, key, func(k string) {
+		if old, ok := ux.pending[k]; ok && old.click {
+			delete(ux.claims, old.question.channel+"/"+old.question.ts)
+		}
+		delete(ux.pending, k)
+	})
 	ux.pending[key] = p
 }
 
