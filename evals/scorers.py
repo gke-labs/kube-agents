@@ -21,17 +21,11 @@ from typing import Any
 
 _MARKDOWN_NOISE = str.maketrans("", "", "*_`#")
 
-_STUB_PATTERNS = (
-    "checking ",
-    "i am checking",
-    "let me check",
-    "looking into",
-    "filed a task",
-    "task has been created",
-    "currently checking",
-    "querying ",
-    "inspecting ",
-    "gathering ",
+# Opening phrases that indicate an unfulfilled turn-1 progress notification rather than a completed response.
+_STUB_OPENING_RE = re.compile(
+    r"^(?:(?:i\s+am|i'm|let\s+me|currently)\s+)?(?:checking|inspecting|looking\s+into|gathering|querying)\b"
+    r"|^filed\s+a\s+task\b|^task\s+has\s+been\s+created\b",
+    re.IGNORECASE,
 )
 
 _TERMINAL_CONTENT_MARKERS = (
@@ -48,6 +42,29 @@ _TERMINAL_CONTENT_MARKERS = (
     "AGE",
 )
 
+# Markers indicating a definitive informative response or policy boundary rather than an in-flight status stub.
+_INFORMATIVE_MARKERS = (
+    "is restricted",
+    "was restricted",
+    "are restricted",
+    "permission denied",
+    "forbidden",
+    "rbac",
+    "unauthorized",
+    "not allowed",
+    "found",
+    "returned",
+    "shows",
+    "following",
+    "here are",
+    "there are",
+    "no warning",
+    "0 pods",
+    "0 events",
+)
+
+_STATUS_KEYWORDS = {"ready", "running", "healthy", "active"}
+
 
 def normalize_text(text: str | None) -> str:
     if not text:
@@ -59,6 +76,22 @@ def _contains_word(keyword: str, text: str) -> bool:
     """Checks for keyword presence using word boundaries."""
     escaped = re.escape(keyword.lower().strip())
     return bool(re.search(rf"(?:\b|^){escaped}(?:\b|$)", text.lower()))
+
+
+def _has_negated_status(keyword: str, text: str) -> bool:
+    """Detects if a status keyword is negated (e.g. 'not running', 'unhealthy')."""
+    k = keyword.lower().strip()
+    if k not in _STATUS_KEYWORDS:
+        return False
+    negation_patterns = [
+        rf"\b(?:not|never|no|non|isn't|is\s+not|aren't|are\s+not|failed\s+to\s+be)\s+(?:currently\s+)?{re.escape(k)}\b",
+    ]
+    if k == "healthy":
+        negation_patterns.append(r"\bunhealthy\b")
+    for pat in negation_patterns:
+        if re.search(pat, text, re.IGNORECASE):
+            return True
+    return False
 
 
 def evaluate_response_quality(
@@ -77,13 +110,15 @@ def evaluate_response_quality(
     if not output_text or len(output_text.strip()) < min_length:
         return False, f"Fail: Response truncated or too short (<{min_length} chars)"
 
-    lowered = normalize_text(output_text)
+    trimmed = output_text.strip()
+    lowered = normalize_text(trimmed)
 
-    # 1. Delegation stub check: agent must return completed diagnostic, not a turn-1 stub.
-    # Rejects turn-1 status messages regardless of length unless substantive diagnostic output exists.
-    is_stub = any(p in lowered for p in _STUB_PATTERNS)
+    # 1. Delegation stub check: reject turn-1 status notices opening with a stub phrase
+    # unless substantive diagnostic content (tables, code blocks, lists, status headers)
+    # or an informative outcome/restriction statement is present.
     has_diagnostic_content = any(c in output_text for c in _TERMINAL_CONTENT_MARKERS)
-    if is_stub and not has_diagnostic_content:
+    is_informative = any(m in lowered for m in _INFORMATIVE_MARKERS)
+    if _STUB_OPENING_RE.search(trimmed) and not (has_diagnostic_content or is_informative):
         return False, "Fail: Delegation stub returned instead of completed diagnostic"
 
     # 2. Clarification loop check: agent should default to host cluster rather than halting
@@ -123,9 +158,12 @@ def evaluate_response_quality(
                 missing.append("/plan staging prior to enabling")
             return False, f"Fail: Incomplete substrate plan, missing {', '.join(missing)}"
 
-    # 5. General required keyword presence (anchored with word boundaries)
+    # 5. General required keyword presence (anchored with word boundaries & negation checks)
     if required_keywords:
-        missing_req = [k for k in required_keywords if not _contains_word(k, lowered)]
+        missing_req = []
+        for k in required_keywords:
+            if not _contains_word(k, lowered) or _has_negated_status(k, lowered):
+                missing_req.append(k)
         if missing_req:
             return False, f"Fail: Missing required keyword(s): {', '.join(missing_req)}"
 

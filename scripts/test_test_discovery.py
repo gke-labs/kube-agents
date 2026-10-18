@@ -56,8 +56,6 @@ EXCLUDED = {
     # they open an admin portal and talk to a deployed agent, so they are
     # deliberately manual: `uv run --project bench pytest -s bench/cuj`.
     "bench/cuj": "live manual suite, needs a provisioned install",
-    # Inspect AI evaluation suite for gke-labs/eval-runner; runs under eval-runner or inspect
-    "evals": "Inspect AI evaluation suite, runs under eval-runner or inspect",
     # tests/integration left this list when the seam tier came off probation
     # and joined PYTHON_TEST_DIRS; the contradiction check below now keeps it
     # out mechanically, so no comment has to.

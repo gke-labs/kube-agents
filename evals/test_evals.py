@@ -87,13 +87,42 @@ Please review this /plan before enabling or mutating cluster infrastructure.
         self.assertIn("Workload part", msg)
 
     def test_delegation_stub_rejection(self):
-        """Tests that delegation stubs are rejected."""
+        """Tests that opening delegation stubs are rejected."""
         passed, msg = evaluate_response_quality(
             prompt_id=9,
             output_text="checking pods in kubeagents-system.",
         )
         self.assertFalse(passed)
         self.assertIn("Delegation stub", msg)
+
+    def test_narrative_stub_non_rejection(self):
+        """Tests that full narrative answers containing words like 'querying' are not rejected as stubs."""
+        passed, msg = evaluate_response_quality(
+            prompt_id=19,
+            output_text="Querying container logs is restricted by RBAC for platform-agent-gateway in namespace kubeagents-system.",
+            required_keywords=["platform-agent-gateway"],
+        )
+        self.assertTrue(passed, msg)
+
+    def test_negation_rejection(self):
+        """Tests that negated status conditions do not satisfy positive requirements."""
+        passed, msg = evaluate_response_quality(
+            prompt_id=11,
+            output_text="The platform-agent pod is not running in the cluster.",
+            required_keywords=["platform-agent", "running"],
+        )
+        self.assertFalse(passed)
+        self.assertIn("Missing required keyword", msg)
+
+    def test_status_word_boundary(self):
+        """Tests that substring matches like 'already' do not satisfy 'ready'."""
+        passed, msg = evaluate_response_quality(
+            prompt_id=10,
+            output_text="The node is already prepared and configured.",
+            required_keywords=["node", "ready"],
+        )
+        self.assertFalse(passed)
+        self.assertIn("Missing required keyword", msg)
 
 
 if __name__ == "__main__":
