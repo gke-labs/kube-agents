@@ -639,7 +639,13 @@ class TestTheRulesReject(unittest.TestCase):
     def test_a_domain_the_filer_would_read_differently_is_rejected(self):
         spec = {k: v for k, v in self.VALID.items() if k != "domain"}
         text = yaml.safe_dump(spec) + "domain: >-\n  " + self.VALID["domain"] + "\n"
-        self._only("'domain:' reads as", text=text)
+        problem = self._only("'domain:' reads as", text=text)
+        self.assertNotIn("'owner:'", problem)
+
+    def test_an_owner_line_inside_another_field_names_the_cause(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        text = yaml.safe_dump(spec) + 'notes: "first\nowner: mallory"\n'
+        self.assertIn("inside another field", self._only("to scripts/case_owner.py", text=text))
 
     def test_an_empty_string_owner_is_rejected(self):
         self._only("is not a GitHub login string", owner="")

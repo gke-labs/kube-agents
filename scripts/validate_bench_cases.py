@@ -963,9 +963,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             if scanned != parsed:
                 problems.append(
                     f"'{key}:' reads as {parsed!r} to YAML but as {scanned!r} to "
-                    "scripts/case_owner.py, which routes the case's bugs. Write "
-                    f"it as a plain '{key}: value' on one line, or delete an "
-                    "empty 'owner:' line"
+                    "scripts/case_owner.py, which routes the case's bugs from the "
+                    f"first line that starts '{key}:' at column 0. Make that line a "
+                    f"plain '{key}: value' (no null, block scalar, anchor or quoted "
+                    "key), and check for such a line inside another field's text or "
+                    "an invisible character such as a byte-order mark before it"
+                    + (", or delete an empty 'owner:' line" if key == "owner" else "")
                 )
 
     # The audit streams a case drives without grading their ledger. The runner
