@@ -42,3 +42,17 @@ variable "policy_display_name" {
   description = "Display name of the planted alert policy"
   default     = "ka-bench orbital-checkout restart storm"
 }
+
+# Identify the CI run that created the policy; see
+# bench/tf/prebuilt/gpu-stress-test/variables.tf. Both are empty outside CI.
+variable "prow_build_id" {
+  type        = string
+  description = "Prow BUILD_ID of the run that created this fixture"
+  default     = ""
+}
+
+variable "prow_pull_number" {
+  type        = string
+  description = "Prow PULL_NUMBER of the run that created this fixture"
+  default     = ""
+}

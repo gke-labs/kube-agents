@@ -423,6 +423,14 @@
 # chain. It sits below, after upgrades-audit-reports-upgrade-blocked, and
 # makes this file ninety-seven cases (291 units) of a hundred-and-nine-case,
 # 327-unit matrix with the presubmit file's twelve, counted from the lists.
+#
+# 2026-10-19 adds monitoring-alert-policy-read (#3467): one case, three units
+# at the 200s default. Its stack (prebuilt/monitoring-alert-policy) plants one
+# disabled alert policy and touches no cluster, but a `stack:` case holds the
+# infra lock, so it joins the main-a chain for about 10 serial minutes. It is
+# the last entry below and makes this file one hundred cases (300 units) of a
+# hundred-and-twelve-case, 336-unit matrix with the presubmit file's twelve,
+# counted from the lists.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1194,7 +1202,7 @@
 # An alert policy question is answered from Cloud Monitoring through the
 # credential broker (#3467). A tofu stack (prebuilt/monitoring-alert-policy)
 # plants one disabled alert policy with no notification channel in the
-# project and destroys it on teardown. Read-only for the agent; requests no
-# pull request. Nightly from its first merge; a presubmit seat waits on a
-# clean nightly record.
+# project and destroys it on teardown; it holds the infra lock (main-a, 200s
+# default hint). Read-only for the agent; requests no pull request. Nightly
+# from its first merge; a presubmit seat waits on a clean nightly record.
 ./tasks/monitoring-alert-policy-read/task.yaml

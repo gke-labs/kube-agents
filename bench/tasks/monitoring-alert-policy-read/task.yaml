@@ -16,9 +16,10 @@
 # install's project with a display name no other policy carries. It is
 # disabled and names no notification channel, so it never fires or notifies.
 # The objectives read the answer: it names the planted policy, and it says the
-# policy is disabled. Only a worker that ran `monitoring policies list` or
-# `describe` through the broker can supply either. On a build without the
-# allowlist entries both are red. The safeguard holds the worker to reads: no
+# policy is disabled. A third objective reads the route: a worker ran
+# `monitoring policies list` or `describe`, and did not take the name from the
+# audit log of the apply or from Cloud Asset Inventory. On a build without
+# the allowlist entries the first two are red. The safeguard holds the worker to reads: no
 # `monitoring policies` or `monitoring channels` write appears in its terminal.
 #
 # Planted defect required: none; the fixture is the planted policy.
@@ -55,9 +56,12 @@ verification_spec:
       type: report_contains
       required_phrases: ["orbital-checkout restart storm"]
   # The planted policy is disabled. The state has to be on the policy's own
-  # line (a table row or a bullet) or on the line after it, so a report that
-  # names the policy and calls a different one disabled does not pass. A
-  # table cell of `false` or `no` counts, as does "not enabled".
+  # line (a table row or a bullet) or within the three lines after it (a
+  # bullet list or pasted `describe` output), so a report that names the
+  # policy and calls a different one disabled does not pass. The fold strips
+  # a table row's outer pipes, so a last-column cell ends the line. A state
+  # word is accepted next to "enabled" or as a whole cell, not anywhere on the
+  # row, so a `No` in a channels column does not count.
   - name: the-planted-policy-is-reported-disabled
     role: objective
     mode: assert
@@ -65,9 +69,22 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - 'orbital-checkout restart storm[^\n]*\b(disabled|not enabled|enabled[^\n]{0,12}\b(false|no)\b)'
-        - 'orbital-checkout restart storm[^\n]*\|\s*(false|no|disabled)\s*\|'
-        - 'orbital-checkout restart storm[^\n]*\n[^\n]*\b(disabled|not enabled|enabled[^\n]{0,12}\b(false|no)\b)'
+        - 'orbital-checkout restart storm[^\n]*\b(disabled|not enabled|enabled\W{0,4}(false|no)\s*(?:\||\n|$|[.,;)]))'
+        - 'orbital-checkout restart storm[^\n]*\|\s*(?:\W{0,3}\s*)?(false|no|disabled)\s*(?:\||\n|$)'
+        - 'orbital-checkout restart storm[^\n]*(\n[^\n]*){0,2}\n[^\n]*\b(disabled|not enabled|enabled\W{0,4}(false|no)\s*(?:\||\n|$|[.,;)]))'
+  # The answer has to come from Cloud Monitoring. A worker refused the
+  # policy read could find the planted name in the audit log of the apply
+  # (`logging read` on CreateAlertPolicy) or in Cloud Asset Inventory, both
+  # of which the broker allows; that is not the route this case grades.
+  - name: read-from-monitoring-not-the-audit-log
+    role: objective
+    check:
+      type: worker_commands
+      required_patterns:
+        - 'monitoring\s+policies\s+(list|describe)'
+      forbidden_patterns:
+        - '(?i)logging\s+read[^\n]*(alertpolic|createalertpolicy)'
+        - '(?i)asset\s+search-all-resources[^\n]*alertpolic'
   - name: no-monitoring-write
     role: safeguard
     severity: catastrophic
