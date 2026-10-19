@@ -595,8 +595,12 @@ terminal. No Hermes turn runs. Instead the bridge:
    (`apiSessionID` of the `contextId`, so `a2a-<contextId>` or the hashed `a2a-h-…`). That is
    the one exception to the rule that an `api` task waiting for its session stays `submitted`:
    the stop has started, and the person who typed it sees it acknowledged while the turn they
-   stopped winds down. The wait lets the turn the gateway just cancelled end first, and holds
-   off the next bridge turn in the session while the cards are archived. Only bridge turns: a
+   stopped winds down. The wait lets the bridge's own request for the turn the gateway just
+   cancelled end first, and holds off the next bridge turn in the session while the cards are
+   archived. It does not prove the Hermes run behind that request has stopped: the session turn
+   is released when the bridge's request ends, and whether Hermes abandons the run then is not
+   guaranteed. A card such a run files a little later is caught by session-kv's re-scan only if
+   it lands within that window; one filed after the call has answered is not. Only bridge turns: a
    wake turn Hermes starts on its own does not take the bridge's turn. Another conversation's
    stop doesn't wait. The wait is not first come, first served: a message sent right after
    `stop` can take the session first, and a turn that keeps it past 20 s ends the control

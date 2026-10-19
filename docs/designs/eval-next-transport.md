@@ -350,10 +350,10 @@ names, or a trace older than the read that ended the wait), and grades the check
 (a `none`-wrapped check that failed stays graded whatever the loss: the trace shows the call); a
 case with no other objective is not graded on the lane rather than collapsed. A
 marker reporting no loss retires the set-aside for a `tool_called` in its default `router` scope
-— it states the door's capability to show calls, whether or not the run made one — and nothing
+with no `result` pattern — it states the door's capability to show calls, whether or not the run made one — and nothing
 else: a `tool_called` in the `workers` or `all`
 scope reads the workers' tagged entries, which the trace does not carry, and stays set aside with
-the worker checks
+the worker checks, as does a `tool_called` with a `result` pattern, since the trace records no results
 ([`eval-scorer.md`](eval-scorer.md), "The inject lane sets aside what its transport
 cannot show"). A case whose premise
 needs the front door — `agent-kanban-smoke`, which grades
@@ -700,8 +700,8 @@ running it: a scheduled lane on `main` under the flag, with a record of its own,
 presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
 of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
 is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
-presubmit, the periodic on main, and the full-catalog nightly that runs beside a today-mode nightly
-on the same agent model), and refuses it on any other Prow run, so the flag mis-set on the today
+presubmit, the periodic on main, the full-catalog nightly that runs beside a today-mode nightly
+on the same agent model, and the GitLab lane's nightly under next), and refuses it on any other Prow run, so the flag mis-set on the today
 nightly or a postsubmit still stops the deploy before anything is built. The record of its
 own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
 store would be today's once written, and the dashboard has no next lane to file a run under. Until

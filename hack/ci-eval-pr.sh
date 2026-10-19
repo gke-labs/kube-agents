@@ -1971,7 +1971,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14; the presubmit file's last section).
+# its roster line 2026-10-14, demoted back here 2026-10-17, #3120; the
+# presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -2637,8 +2638,8 @@ if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ]
   exit 1
 fi
 
-# The GitLab lane's list may hold no roster case (two of its three seats are
-# held out), which empties the export by design, like a nightly part: said
+# The GitLab lane's list may hold no roster case (all three of its seats are
+# held out since pdb-remediation-pr's demotion of 2026-10-17, #3120), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -2796,6 +2797,26 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that now runs the waste collector's sweep (#2386):
+    # the waste audit's band, without the ledger write.
+    cost-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that runs the reliability collector's sweep (#2386):
+    # the audit band, without the ledger write.
+    reliability-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that now runs the stockout collector's sweep (#2386):
+    # the stockout audit's band, without the ledger write.
+    stockout-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that runs the patch audit's collector (#2386): its
+    # upgrade-blocked phase alone has a 420s budget on a fleet with a behind
+    # cluster; the audit band, without the ledger write.
+    upgrade-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that runs the drift collector (#2386): one card and
+    # one gcloud list per project; priced a little above the consistency probe.
+    drift-chat-request-runs-collector) echo 400 ;;
+    # A plain chat request that runs the AI security collector (#2386) on the
+    # same tofu stack shape as ai-security-planted-model-audit; that case's
+    # hint until this one has a record.
+    ai-security-chat-request-runs-collector) echo 1450 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
     # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
     # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
@@ -2808,16 +2829,17 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # On the roster since 2026-10-14 (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
-    # to then. The 2026-09-22 promotion (#1023) was withdrawn before merge:
+    # Nightly-only since 2026-10-17 (demoted on #3120); on the roster 2026-10-14
+    # to then (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
+    # to 2026-09-28. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in
     # August); median of the September run, kept although the four graded
     # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
-    # under pull_request_opened says otherwise. The presubmit's largest hint,
-    # so it launches first in each repetition round; its three repetitions
-    # serialize on the task lock, ~62min at the hint and ~96min at the
-    # measured maximum.
+    # under pull_request_opened says otherwise. While in the presubmit it was
+    # the largest hint, so it launched first in each repetition round; its
+    # three repetitions serialize on the task lock, ~62min at the hint and
+    # ~96min at the measured maximum.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
@@ -3555,6 +3577,13 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   if [ -n "${dir}" ] && [ -f "${timing}" ]; then
     cp "${timing}" "${dir}/${EVAL_TIMING_FILE}" 2>/dev/null || true
   fi
+  # A gated judged score the judge failed to return is asked for once more
+  # from the saved answer (kube_agents_bench/rejudge.py), before the .dir
+  # state file below hands this record to the grading pass. Best effort: a
+  # re-judge that cannot run leaves the record as devops-bench wrote it.
+  if [ -n "${dir}" ] && [ -f "${dir}/results.json" ]; then
+    (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.rejudge "${dir}/results.json" 2>&1 | _ts_lines >> "${log}") || true
+  fi
   # Written while this unit still holds the task lock, and counted under it:
   # repetitions of one task write their state files serially, so exactly one
   # of them -- the last to finish -- sees the count reach EVAL_REPETITIONS,
@@ -3702,17 +3731,23 @@ report_github_leftovers() {
   if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] || [ -z "${BENCH_GITOPS_REPO:-}" ]; then
     return 0
   fi
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] GitHub writes this run left on ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
+  # Named by forge: under EVAL_FORGE=gitlab BENCH_GITOPS_REPO is a GitLab
+  # project and the listing is of its merge requests.
+  local forge="GitHub" kind="repository"
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+    forge="GitLab" kind="project"
+  fi
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${forge} writes this run left on the ${forge} ${kind} ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
   if ! mint_ledger_token "leftovers"; then
-    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
+    echo "WARNING: ${forge} leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
-    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."
+    echo "WARNING: ${forge} leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."
     return 0
   fi
-  echo "GitHub leftovers: this listing closes none of them; the next lease's reset (hack/ci_reset_agent_pulls.py) and the periodic sweep ci-kube-agents-pull-sweep close them and delete their branches. The safeguard verdict above was read during each repetition and does not depend on this listing."
+  echo "${forge} leftovers: this listing closes none of them; the next lease's reset (hack/ci_reset_agent_pulls.py) and the periodic sweep ci-kube-agents-pull-sweep close them and delete their branches. The safeguard verdict above was read during each repetition and does not depend on this listing."
 }
 report_github_leftovers
 
@@ -3779,8 +3814,9 @@ profile_begin "record + final gate"
 # against a window it had just moved.
 #
 # EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
-# lane's periodic and nightly on main (ci-kube-agents-eval-next,
-# ci-kube-agents-eval-nightly-next-claude) are also periodics with no
+# lane's periodic and nightlies on main (ci-kube-agents-eval-next,
+# ci-kube-agents-eval-nightly-next-claude and
+# ci-kube-agents-eval-nightly-gitlab-next) are also periodics with no
 # PULL_NUMBER, and the key has no mode field either, so their samples would
 # be today's the moment they landed. The deploy admits the flag on those
 # jobs by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what

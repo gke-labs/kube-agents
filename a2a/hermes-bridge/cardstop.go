@@ -177,10 +177,12 @@ func (b *Bridge) runCardStop(ctx context.Context, run *taskRun) {
 		return
 	}
 
-	// The turn is held across the POST: the turn the gateway cancelled has
-	// answered or ended, and a turn queued behind this one cannot file a
-	// card the stop then misses. Nothing that holds a session's turn waits
-	// on this goroutine, which takes no worker slot.
+	// The turn is held across the POST: the bridge's request for the turn the
+	// gateway cancelled has ended (which does not prove the Hermes run behind
+	// it stopped; see a2a/docs/hermes-bridge.md), and a bridge turn queued
+	// behind this one cannot file a card the stop then misses. Nothing that
+	// holds a session's turn waits on this goroutine, which takes no worker
+	// slot.
 	sessionID := apiSessionID(run.origin.ContextID)
 	waitCtx, stopWait := context.WithTimeout(stopCtx, cardStopTurnWait)
 	release := b.turns.acquire(waitCtx, sessionID)

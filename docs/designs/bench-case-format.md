@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -123,8 +123,9 @@ stands in for the trajectory, and the token, latency and status signals still ap
 a bare YAML boolean, and devops-bench ignores it.
 
 `audit_streams` is for a case whose stack starts real audit runs without grading their
-ledger: a list of the Platform Agent job ids it starts
-(`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
+ledger, or whose agent runs a stream's collector outside a ledger run and so shares that
+stream's scratch state (`upgrade-chat-request-runs-collector`): a list of the Platform Agent
+job ids (`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
 lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
@@ -248,9 +249,9 @@ prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
-the delegated workers ran, read from each card's worker log before the harness
-purges it; each of its `exempt_patterns` removes the text it matches from a
-command before the forbidden list reads it, and nothing else, and takes a
+the delegated workers ran, read from the worker log of each card the front agent filed before the harness
+purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory; each of its `exempt_patterns` removes the text it matches from a
+command, a log line or a tagged call alike, before the forbidden list reads it, and nothing else, and takes a
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
 `grep` exempted through its pattern argument so that whatever else shares the
@@ -308,6 +309,12 @@ that got going (running, completed, or ended after its start), each starting onl
 `relay-report` stack's state file and what the Session KV server stored for the report's threads,
 and passes when the route answered `delivered` and every stored post is the report exactly; a
 route that delivered but stored nothing fails, and one whose send registered no thread (outcome unknown) is an error.
+`audit_chat_report_posted`, in its own module (`bench/kube_agents_bench/audit_chat_report.py`), reads
+the `audit-chat-report` stack's state file, what the Session KV server stored for the fired audit
+job's threads since the fire, and the chat report the run's `finish` left on the shell sandbox, and
+passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
+whose record predates the fire, or that did not finish every repository it started fails, and a
+silent run or one that never ended is an error.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
@@ -325,15 +332,17 @@ And `report_contains` defaults to `scope: final`, the answer the user receives. 
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears
 in quoted material. `worker_commands` reads the route a worker took through its terminal
-commands, not its MCP tool calls, and only for cards the run delegated — a router that
+commands, not its MCP tool calls, and only for cards the run delegated (a card a worker
+filed is read from the trajectory, as far as the capture reached it) — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. What it reads is the one-line rendering hermes writes to the card log, not the command
-as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
-command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
-chained behind another, and the quotes stay, so a listed word the command splits with an empty
-quote inside it is one word to the shell and none to the pattern; the command as typed is on the
-trajectory, tagged with the worker's profile, and reading it from there, split into words, is the
-verifier change that closes both gaps. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
+log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a pattern
+never sees a command chained behind another, and the quotes stay, so a listed word the command
+splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
+worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
+written against the rendering can miss that card's command behind a `cd … &&` or on a second
+line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
@@ -393,12 +402,10 @@ while the coverage report shows the domain it actually exercises as a gap, and n
 finds out until someone writes a second case for a domain that already had one. So a case
 declares a domain.
 
-The exception is a case that genuinely covers no row in `domains.yaml` — the way
-`gpu-stress-test-diagnosis` is a chat-prompted post-incident RCA and not the event-fired
-autoops triage `incident-triage` names. That is a real answer, and the answer is recorded
-as a reviewed entry in the validator's `KNOWN_NO_DOMAIN` map with its reason, not as an
-absent field. The distinction the map owns is the one between "covers nothing, and we
-checked" and "nobody remembered".
+There is no exemption. A case no row describes gets a new row in `domains.yaml`, with
+the `owner:` who answers for the domain's cases as a set, a different `backup:`, and a
+one-sentence `meaning:` a reader outside the code understands; `scripts/test_domain_coverage.py`
+fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist.
 
 ## Every case declares a verification spec
 
@@ -450,8 +457,7 @@ may first seat its candidate in the presubmit file without a roster line, to ear
 presubmit volume; it cannot red a pull request on quality there, only on rungs 1–3) and cites that record — never the pull request that makes it pass. Cases that stay in the nightly for good are
 the ones kept out of the presubmit for cost, because a cheaper probe holds their presubmit
 seat, or because what they grade is not one of the core journeys the presubmit gate is
-for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`, and a case
-that claims no domain there is outside them by construction. A case the agent cannot pass
+for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A case the agent cannot pass
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
@@ -520,7 +526,7 @@ is a populated list, and the empty string is in every text there has ever been, 
 check reads as an assertion and can only pass; the validator treats a blank phrase as no
 phrase.
 
-The three allowlists (`KNOWN_UNREGISTERED`, `KNOWN_NO_DOMAIN`, `KNOWN_JUDGE_ONLY`) all
+The two allowlists (`KNOWN_UNREGISTERED`, `KNOWN_JUDGE_ONLY`) both
 work the same way: an entry names a case and carries the reason, and an entry whose case
 no longer exists fails the lint.
 

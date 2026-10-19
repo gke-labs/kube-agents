@@ -31,6 +31,10 @@ import os
 # next stack holds the chat backend (platformagent_manifests.go,
 # a2aNotifyPlatformEnvVar). Its value is a platform name as Hermes spells it.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
+# The variable the operator renders whenever the gateway arms its chat.notify
+# route, home channel or not (platformagent_manifests.go,
+# a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
+NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # The bus CLI in the agent image (a2a/cmd/a2a), on PATH.
@@ -77,6 +81,15 @@ def alert_update_key(session_id: str) -> str:
 def routed_platform() -> str:
     """The platform whose posts go through the gateway, or "" when none does."""
     return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+
+
+def gateway_platform() -> str:
+    """The platform whose backend the gateway holds, or "" when it holds none.
+
+    Unlike :func:`routed_platform` this is set with no home channel, so it names
+    the platform an install has when nothing routes a proactive post there.
+    """
+    return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
 
 
 def routes(platform: str) -> bool:

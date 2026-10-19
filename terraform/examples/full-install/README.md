@@ -93,6 +93,17 @@ install without the interview.
   `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
+- Optionally (`model_provider = "openai_compatible"`) a server speaking the OpenAI
+  chat-completions API (vLLM, TGI, an internal gateway), reached through the
+  gateway. No GCP resource: the composition passes the chart
+  `litellm.openaiCompatible` from `openai_compatible_api_base` (the base URL
+  including `/v1`), `openai_compatible_target_port` (the server pod's port, for
+  an in-cluster Service), `openai_compatible_egress_cidrs` (the private ranges
+  any other host is reached at; none for a public endpoint on 443) and
+  `openai_compatible_ca_secret_name` (a Secret you create holding the CA under
+  `ca.crt`), and puts `openai_compatible_api_key`, when set, in the credentials
+  Secret as `OPENAI_COMPATIBLE_API_KEY`. `model_default_name` has no default for
+  it; the plan fails without it or the base URL.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on

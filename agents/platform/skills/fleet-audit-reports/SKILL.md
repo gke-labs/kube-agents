@@ -186,7 +186,7 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
 - **Never read `document` or `ledger_body` whole** to answer a question a subcommand answers.
 - **Never run, publish, or remediate from here.** Dispatching a stream, rewriting a ledger and
   opening remediation pull requests belong to `fleet-audit`
-  ([Running a stream on demand](../fleet-audit/SKILL.md#running-a-stream-on-demand)).
+  ([Running a stream on demand](../fleet-audit/references/on-demand.md#running-a-stream-on-demand)).
 - **Never act on a `running` or `died` stream's lease.** It is `fleet-audit`'s; report the state.
 - **Never quote a count the store did not give you.** The counts are keys; re-deriving one by hand
   from prose is how a stale number reaches a user with the authority of a file read.

@@ -266,7 +266,7 @@ func TestTheBrokerArmsTheA2ARelayUnderNext(t *testing.T) {
 		t.Errorf("GOOGLE_CHAT_SUBSCRIPTION_NAME=%q rendered beside the A2A subscription: two relay instances would split one subscription, and the proxy refuses to start on the pair", value)
 	}
 	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
-	if callers != "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
+	if callers != "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway" {
 		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the A2A gateway's ServiceAccount third", callers)
 	}
 }

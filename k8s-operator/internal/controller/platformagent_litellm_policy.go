@@ -18,7 +18,10 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/netip"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -74,7 +77,17 @@ const (
 	// AnnotationOTLPCollectorNamespace specifies the namespace of the OpenTelemetry collector
 	// when it cannot be derived from the endpoint host.
 	AnnotationOTLPCollectorNamespace = "kubeagents.x-k8s.io/otlp-collector-namespace"
-	disabledValue                    = "false"
+	// AnnotationLiteLLMUpstreamEgress carries the one extra egress rule LiteLLM needs to
+	// reach a self-hosted or private model server, as compact JSON naming either an
+	// in-cluster namespace or a list of CIDRs, plus a port. The chart stamps it from
+	// litellm.openaiCompatible; the operator never sees the provider itself.
+	AnnotationLiteLLMUpstreamEgress = "kubeagents.x-k8s.io/litellm-upstream-egress"
+	disabledValue                   = "false"
+
+	// maxLiteLLMUpstreamCIDRs bounds the cidrs list in AnnotationLiteLLMUpstreamEgress.
+	maxLiteLLMUpstreamCIDRs = 50
+	minTCPPortNumber        = 1
+	maxTCPPortNumber        = 65535
 
 	managedByHelm      = "Helm"
 	managedByKustomize = "kustomize"
@@ -94,6 +107,8 @@ const (
 //   - Port 988 (or profile.MetadataDaemonPort) (TCP) to 169.254.169.254/32 and profile.MetadataDaemonIP/32
 //     (GKE Workload Identity host-network daemon post-NAT / iptables, if profile.MetadataDaemonIP != "")
 //   - Ports 4317, 4318 (TCP) to litellmOTLPCollectorNamespace(agent) (if non-empty)
+//   - The model server's port (TCP) to the namespace or CIDRs in
+//     AnnotationLiteLLMUpstreamEgress (if set and valid; see litellmUpstreamEgressRule)
 func buildLiteLLMNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpolProfile) *networkingv1.NetworkPolicy {
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
@@ -237,6 +252,11 @@ func buildLiteLLMNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpo
 		})
 	}
 
+	// 6. Self-hosted or private model server (conditional)
+	if upstreamRule := litellmUpstreamEgressRule(agent); upstreamRule != nil {
+		egressRules = append(egressRules, *upstreamRule)
+	}
+
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: netpolAPIVersion,
@@ -294,6 +314,116 @@ func litellmOTLPCollectorNamespace(agent *agentv1alpha1.PlatformAgent) string {
 		return otlpCollectorNamespace(agent.Spec.Telemetry.OTLPEndpoint)
 	}
 	return managedOTelCollectorNamespace
+}
+
+// litellmUpstreamEgress is the JSON shape of AnnotationLiteLLMUpstreamEgress:
+// exactly one of Namespace or CIDRs, plus the TCP port LiteLLM dials.
+type litellmUpstreamEgress struct {
+	Namespace string   `json:"namespace,omitempty"`
+	CIDRs     []string `json:"cidrs,omitempty"`
+	Port      int      `json:"port"`
+}
+
+// litellmUpstreamEgressRule turns AnnotationLiteLLMUpstreamEgress into the egress rule
+// that lets LiteLLM reach its model server, or nil when the annotation is absent or
+// invalid. Invalid is logged and ignored, as for AnnotationOTLPCollectorNamespace: the
+// rest of the policy is still worth applying, and the server is then unreachable rather
+// than reachable through a rule nobody checked.
+func litellmUpstreamEgressRule(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicyEgressRule {
+	raw := trimmedAnnotation(agent, AnnotationLiteLLMUpstreamEgress)
+	if raw == "" {
+		return nil
+	}
+	rule, err := parseLiteLLMUpstreamEgress(raw)
+	if err != nil {
+		logf.Log.Info("Ignoring invalid annotation value", "annotation", AnnotationLiteLLMUpstreamEgress, "value", raw, "reason", err.Error())
+		return nil
+	}
+	return rule
+}
+
+// parseLiteLLMUpstreamEgress decodes and validates one AnnotationLiteLLMUpstreamEgress
+// value. Strict, and exactly one JSON value: a misspelled key that decoded to nothing
+// would drop the destination, and anything after the first value would go unread.
+func parseLiteLLMUpstreamEgress(raw string) (*networkingv1.NetworkPolicyEgressRule, error) {
+	var upstream litellmUpstreamEgress
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&upstream); err != nil {
+		return nil, fmt.Errorf("not valid JSON for this annotation: %w", err)
+	}
+	if extra := dec.Decode(new(json.RawMessage)); extra != io.EOF {
+		return nil, fmt.Errorf("it has content after the first JSON value")
+	}
+	if upstream.Port < minTCPPortNumber || upstream.Port > maxTCPPortNumber {
+		return nil, fmt.Errorf("port %d is outside %d-%d", upstream.Port, minTCPPortNumber, maxTCPPortNumber)
+	}
+	hasNamespace := upstream.Namespace != ""
+	hasCIDRs := upstream.CIDRs != nil
+	if hasNamespace == hasCIDRs {
+		return nil, fmt.Errorf("exactly one of namespace or cidrs must be set")
+	}
+	ports := []networkingv1.NetworkPolicyPort{tcpPort(int32(upstream.Port))}
+
+	if hasNamespace {
+		// A DNS-1123 label for the same reason litellmOTLPCollectorNamespace insists on
+		// one: kubernetes.io/metadata.name only ever holds such a name.
+		if errs := validation.IsDNS1123Label(upstream.Namespace); len(errs) != 0 {
+			return nil, fmt.Errorf("namespace %q is not a DNS-1123 label", upstream.Namespace)
+		}
+		return &networkingv1.NetworkPolicyEgressRule{
+			Ports: ports,
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							labelMetadataName: upstream.Namespace,
+						},
+					},
+				},
+			},
+		}, nil
+	}
+
+	if len(upstream.CIDRs) == 0 || len(upstream.CIDRs) > maxLiteLLMUpstreamCIDRs {
+		return nil, fmt.Errorf("cidrs must hold 1 to %d entries, got %d", maxLiteLLMUpstreamCIDRs, len(upstream.CIDRs))
+	}
+	for _, entry := range upstream.CIDRs {
+		if reason := litellmUpstreamCIDRRefusal(entry); reason != "" {
+			return nil, fmt.Errorf("%s", reason)
+		}
+	}
+	return &networkingv1.NetworkPolicyEgressRule{
+		Ports: ports,
+		To:    formatCIDRPeers(upstream.CIDRs, true),
+	}, nil
+}
+
+// litellmUpstreamCIDRRefusal returns why one cidrs entry may not be rendered, or "" if
+// it may. normalizeCIDRTarget applies the /12 and /48 floors and collapses IPv4-mapped
+// forms. The link-local and metadata checks then keep this rule from being a way round
+// the policy's own refusal of those ranges: the model server is never on them, and the
+// metadata server hands out the gateway's Workload Identity credentials.
+func litellmUpstreamCIDRRefusal(entry string) string {
+	ipNet, ok := normalizeCIDRTarget(entry, true)
+	if !ok {
+		return fmt.Sprintf("%q is not a CIDR or address, or is broader than /%d (IPv4) or /%d (IPv6)", entry, minIPv4CIDRPrefix, minIPv6CIDRPrefix)
+	}
+	prefix, err := netip.ParsePrefix(ipNet.String())
+	if err != nil {
+		return fmt.Sprintf("%q is not a valid CIDR", entry)
+	}
+	for _, block := range []string{linkLocalIPv4Block, ipv6LinkLocal} {
+		if prefix.Overlaps(netip.MustParsePrefix(block)) {
+			return fmt.Sprintf("%q overlaps the link-local range %s", entry, block)
+		}
+	}
+	for _, address := range metadataServerAddresses {
+		if addr, addrErr := netip.ParseAddr(address); addrErr == nil && prefix.Contains(addr) {
+			return fmt.Sprintf("%q contains the metadata server address %s", entry, address)
+		}
+	}
+	return ""
 }
 
 // deleteManagedLiteLLMPolicy deletes litellm-policy in agent.Namespace only if it is
