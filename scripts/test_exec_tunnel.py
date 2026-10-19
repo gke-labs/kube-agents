@@ -258,14 +258,21 @@ class ExecTunnelTest(unittest.TestCase):
     def test_ready_timeout_does_not_hang_on_a_listener_that_never_answers(self):
         # A remote port nothing is bound to: the remote half raises before it
         # writes READY, so _spawn must reject rather than block the handler.
+        #
+        # Handler.handle() re-resolves the pod and retries once upon spawn
+        # failure (for refresh in (False, True)), so up to two ready_timeout
+        # cycles can elapse before the relay rejects and closes the connection.
+        # Keep ready_timeout bounded and the client socket timeout safely above
+        # 2 * ready_timeout plus subprocess overhead to avoid TimeoutError races
+        # on loaded runners.
         dead = socket.socket()
         dead.bind(("127.0.0.1", 0))
         dead_port = dead.getsockname()[1]
         dead.close()
 
-        port = self._tunnel(remote_port=dead_port, ready_timeout=5.0, stderr=self._temp_sink())
+        port = self._tunnel(remote_port=dead_port, ready_timeout=2.0, stderr=self._temp_sink())
         started = time.time()
-        with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
+        with socket.create_connection(("127.0.0.1", port), timeout=30) as client:
             client.sendall(b"GET / HTTP/1.0\r\n\r\n")
             try:
                 # Clean close or reset both mean "no bytes and not hung", which
