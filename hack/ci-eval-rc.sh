@@ -58,6 +58,12 @@
 #                     inert wherever it runs.
 #   RC_TAG            pin a candidate instead of resolving the newest one.
 #                     Passed through to resolve-rc-target.sh.
+#   EVAL_MODE_NEXT    the Prow job config sets it to 1, so the candidate is
+#                     graded under spec.mode: next, the mode a new install
+#                     gets. Read by the candidate's ci-deploy.sh and
+#                     ci-eval-pr.sh, not here. A candidate whose ci-deploy.sh
+#                     does not list this job in EVAL_MODE_NEXT_JOB_NAMES
+#                     refuses the flag at second zero, which reports NOT RUN.
 #   PULL_NUMBER       Prow's. Set = a pull request, which never measures a
 #                     release candidate; skip.
 #   ARTIFACTS         Prow's. When set, receives rc-target.env and the

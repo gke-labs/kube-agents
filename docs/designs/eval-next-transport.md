@@ -701,8 +701,9 @@ presubmit. The flag admits that lane by name and nothing else without a pull req
 of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
 is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
 presubmit, the periodic on main, the full-catalog nightly that runs beside a today-mode nightly
-on the same agent model, and the GitLab lane's nightly under next), and refuses it on any other Prow run, so the flag mis-set on the today
-nightly or a postsubmit still stops the deploy before anything is built. The record of its
+on the same agent model, the GitLab lane's nightly under next, and the release-candidate eval's
+postsubmit, which grades a candidate in the mode a new install gets), and refuses it on any other Prow run, so the flag mis-set on the today
+nightly or another postsubmit still stops the deploy before anything is built. The record of its
 own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
 store would be today's once written, and the dashboard has no next lane to file a run under. Until
 both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the

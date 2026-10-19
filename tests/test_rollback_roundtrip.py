@@ -1422,7 +1422,7 @@ class CiEvalWiringTest(unittest.TestCase):
     """run_rollback_roundtrip in hack/ci-eval-pr.sh, lifted and run."""
 
     def run_wiring(
-        self, *, mode_next: str | None, script_status: int = 0, elapsed: int = 0, job_age: int | None = None, build_id: str | None = None, timeout_on_path: bool = False
+        self, *, mode_next: str | None, script_status: int = 0, elapsed: int = 0, job_age: int | None = None, build_id: str | None = None, timeout_on_path: bool = False, rc_commit_sha: str | None = None
     ) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
         """`elapsed` is the eval's age (START_TIME), `job_age` this script's
         (EVAL_SCRIPT_STARTED_EPOCH, defaulting to the eval's), `build_id` the
@@ -1439,6 +1439,7 @@ class CiEvalWiringTest(unittest.TestCase):
         )
         flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
         build = "unset BUILD_ID" if build_id is None else f"export BUILD_ID={build_id}"
+        rc = "unset RC_COMMIT_SHA" if rc_commit_sha is None else f"export RC_COMMIT_SHA={rc_commit_sha}"
         age = elapsed if job_age is None else job_age
         script = textwrap.dedent(
             f"""\
@@ -1453,6 +1454,7 @@ class CiEvalWiringTest(unittest.TestCase):
             EVAL_SCRIPT_STARTED_EPOCH=$(($(date +%s) - {age}))
             {flag}
             {build}
+            {rc}
             profile_begin() {{ echo "PROFILE $*"; }}
             collect_gateway_log() {{ echo COLLECT_GATEWAY; }}
             collect_credential_proxy_evidence() {{ echo COLLECT_PROXY; }}
@@ -1484,6 +1486,19 @@ class CiEvalWiringTest(unittest.TestCase):
                 self.assertNotIn("PROFILE", result.stdout)
                 self.assertNotIn("Rollback round trip", result.stdout)
                 self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_skipped_on_a_release_candidate_run(self) -> None:
+        """The RC eval's verdict is read only after its job finishes, inside the
+        promotion poller's 330 minutes; a report-only hour would spend that
+        budget on a check that cannot change the verdict."""
+        result, artifacts = self.run_wiring(mode_next="1", rc_commit_sha="b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stub ran", result.stdout)
+        self.assertNotIn("PROFILE", result.stdout)
+        self.assertNotIn("COLLECT_GATEWAY", result.stdout)
+        self.assertIn("Rollback round trip skipped: a release-candidate run (RC_COMMIT_SHA=b4ee5f3", result.stdout)
+        self.assertIn("returned=0", result.stdout)
+        self.assertEqual(list(artifacts.iterdir()), [])
 
     def test_a_failed_round_trip_is_reported_and_changes_nothing(self) -> None:
         result, artifacts = self.run_wiring(mode_next="1", script_status=1)

@@ -3982,6 +3982,14 @@ run_rollback_roundtrip() {
   if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
     return 0
   fi
+  # A release-candidate run's verdict is read only once the job has finished
+  # (scripts/release/poll_rc_eval_verdict.py waits for finished.json, and
+  # gives up at 330 minutes), so an hour of report-only round trip here would
+  # be an hour off the promotion's budget for a check that cannot change it.
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    echo "Rollback round trip skipped: a release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}); its verdict waits on this job finishing, and the round trip is reported, never gated"
+    return 0
+  fi
   local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"
   local now job_age status=0 outcome
   local -a bound=()
