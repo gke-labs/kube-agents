@@ -521,6 +521,17 @@ class Tracker:
         line = INFRA_ADDRESSEE.format(owner=self.infra_owner, backup=backup)
         return dict(payload, body=f"{payload['body'].rstrip()}\n\n{line}\n", assignees=[self.infra_owner])
 
+    def file_addressed(self, payload: dict):
+        """POST an infrastructure issue addressed to the infra owner. When
+        that fails, POST it once more without the assignee, so a login
+        GitHub will not assign costs the assignment and never the issue."""
+        addressed = self.addressed(payload)
+        created = self.gh.call("POST", self.gh.path(ISSUES_PATH), addressed)
+        if created is None and "assignees" in addressed and not self.gh.dry_run:
+            log(f"warning: filing the issue assigned to {self.infra_owner} failed; retrying unassigned")
+            created = self.gh.call("POST", self.gh.path(ISSUES_PATH), {key: value for key, value in addressed.items() if key != "assignees"})
+        return created
+
     def existing(self, names: list[str], title_only: bool = False, marker: re.Pattern | None = None) -> dict | None:
         """An open `presubmit-gate` issue whose title or body names every
         one of `names` (the failing cases, or the lost nodes) -- a human got
@@ -581,7 +592,7 @@ class Tracker:
             "body": render_lost_pods_body(health, when_text, window_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload)), CONDITION_LOST_PODS)
+        created = as_issue(self.file_addressed(payload), CONDITION_LOST_PODS)
         if created:
             log(f"tracking issue: filed #{created['number']} for the cluster owner")
         return created
@@ -596,7 +607,7 @@ class Tracker:
             "body": render_deadline_kill_body(health, since_text, window_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload)), CONDITION_DEADLINE_KILL)
+        created = as_issue(self.file_addressed(payload), CONDITION_DEADLINE_KILL)
         if created:
             log(f"tracking issue: filed #{created['number']} for the gate's deadline kills")
         return created
@@ -612,7 +623,7 @@ class Tracker:
             "body": render_fixture_drift_body(health, since_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload)), CONDITION_FIXTURE_DRIFT)
+        created = as_issue(self.file_addressed(payload), CONDITION_FIXTURE_DRIFT)
         if created:
             log(f"tracking issue: filed #{created['number']} for the fleet owner")
         return created
@@ -633,7 +644,7 @@ class Tracker:
             "body": render_pool_drift_body(health, since_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload)), CONDITION_POOL_DRIFT)
+        created = as_issue(self.file_addressed(payload), CONDITION_POOL_DRIFT)
         if created:
             log(f"tracking issue: filed #{created['number']} for the pool owner")
         return created

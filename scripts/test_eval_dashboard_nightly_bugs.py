@@ -480,6 +480,32 @@ class LostJobTest(Harness):
         self.assertEqual(again.writes(), [])
 
 
+    def test_a_later_lost_night_is_noted_without_the_threshold_again(self):
+        issue = {"number": 3981, "title": "t", "body": f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", "created_at": "2026-10-14T12:00:00Z"}
+        doc = data(night(15, [green()]), night(16, [green()]), night(17, [green()], truncated=True))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("Again on the 2026-10-17 nightly", comment)
+
+    def test_a_clean_rerun_the_same_date_rescues_the_night(self):
+        doc = data(night(15, [green()], truncated=True), night(16, [green()]), night(17, [green()], truncated=True), night(17, [green()], hour="09"))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # A lost re-run after a clean build does not make the night lost.
+        doc = data(night(15, [green()], truncated=True), night(16, [green()]), night(17, [green()]), night(17, [green()], hour="09", truncated=True))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_no_infra_owner_files_unassigned_without_a_stray_mention(self):
+        domains = self.root / "docs" / "designs" / "domains.yaml"
+        domains.write_text("\n".join(line for line in domains.read_text().splitlines() if not line.startswith("infra_")) + "\n")
+        gh, _, _ = self.run_once(data(night(15, [green()], truncated=True), night(16, [green()]), night(17, [], lost=True)))
+        [issue] = self.filed(gh, infra=True)
+        self.assertNotIn("assignees", issue)
+        self.assertNotIn("@unknown", issue["body"])
+        self.assertIn("names no `infra_owner`", issue["body"])
+
+
 class InfraCaseTest(Harness):
     def test_three_all_infra_nights_file_one_infra_issue_with_the_reason(self):
         gh, _, _ = self.run_once(data(*(night(d, [infra_task("case-red")]) for d in (15, 16, 17))))
@@ -532,6 +558,26 @@ class InfraCaseTest(Harness):
         self.assertEqual(self.filed(gh, infra=True), [])
         again, _, _ = self.run_once(doc, FakeGh(open_issues=[issue], comments={3970: [{"body": comment}]}))
         self.assertEqual(again.writes(), [])
+
+    def test_a_later_kept_night_is_noted_without_a_new_streak(self):
+        issue = {"number": 3971, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-14T12:00:00Z"}
+        doc = data(night(15, [red()]), night(16, [green("case-red")]), night(17, [infra_task("case-red")]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("Again on the 2026-10-17 nightly: `3 of 3 repetitions infrastructure", comment)
+
+    def test_a_human_issue_about_the_case_neither_blocks_nor_receives_infra(self):
+        human = {"number": 3950, "title": "case-red fails on main", "body": "see the nightly", "created_at": "2026-10-01T00:00:00Z"}
+        gh, _, _ = self.run_once(data(*(night(d, [infra_task("case-red")]) for d in (15, 16, 17))), FakeGh(open_issues=[human]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+        gh, _, _ = self.run_once(data(night(15, [infra_task("case-red")]), night(16, [green("case-red")])), FakeGh(open_issues=[human]))
+        self.assertEqual(self.comments(gh), [], "no infra recovery on a human's code issue")
+
+    def test_a_night_that_recorded_almost_nothing_is_skipped(self):
+        # The 17th printed a verdict and recorded no cases: not "absent" for
+        # every case.
+        gh, _, _ = self.run_once(data(night(14, [green("case-red")]), night(15, []), night(16, []), night(17, [], filler=False)))
+        self.assertEqual(self.filed(gh, infra=True), [])
 
     def test_a_domain_bug_is_not_taken_for_the_infra_issue_or_the_reverse(self):
         infra_issue = {"number": 3960, "title": "Nightly infra: case-red", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-20T00:00:00Z"}

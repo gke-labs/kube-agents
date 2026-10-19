@@ -688,7 +688,8 @@ The four infrastructure shapes (`lost_pods`, `fixture_drift`, `pool_drift`,
 line naming that owner and mentioning `infra_backup`; their label and dedupe
 are as above. An OUTAGE's issue, a shared break that may be any case's code,
 is not assigned. When `domains.yaml` names no infra owner the issues are filed
-as before, unassigned.
+as before, unassigned; when GitHub refuses the assignee, the issue is filed
+again without one, so the assignment never costs the issue.
 
 ## Nightly bugs
 
@@ -741,24 +742,29 @@ rules). Neither changes the domain streak above.
 
 - **Nights lost.** Each part is judged on its own. A night of a part is lost
   when Prow ended the build before the eval loop's verdict (the deadline, an
-  abort) or its pod went away. A part that lost 2 of its last 3 nights gets one
-  issue for its job, listing the three nights, their run links and where each
-  stopped.
+  abort) or its pod went away; a clean re-run the same date rescues the night.
+  A part that lost 2 of its last 3 nights gets one issue for its job, listing
+  the three nights, their run links and where each stopped.
 - **A case kept from running.** A case is kept from running on a night when its
   part (the one that last recorded it) ran to its verdict and the case graded
   nothing: every repetition classified as infrastructure, or no line for it. 3
   such nights in a row file one issue naming the case and the classifier's
   reason. A night is skipped, not counted, when the part did not run or was
   lost, when it predates the case's first recorded night (a case new to the
-  matrix), or when infrastructure took half or more of the part's cases (a
-  pool-wide outage, which is not one case's problem). A graded night ends the
-  streak. `expected_fail` cases and cases off the matrix are not filed.
+  matrix), when infrastructure took half or more of the part's cases (a
+  pool-wide outage, which is not one case's problem), or when the part recorded
+  under half the cases of its fullest night in the window (a short run would
+  otherwise make every missing case "absent"). A graded night ends the streak.
+  `expected_fail` cases and cases off the matrix are not filed.
 
-An infra issue is deduplicated by its own marker, a bot issue of one kind
-never stands in for another, and a closed one counts as for domain bugs. While
-it is open, each later night of the same kind gets one comment, and a later
-clean night (the part runs to its verdict, or the case is graded) gets one
-recovery comment.
+An infra issue is deduplicated by its own marker alone: a bot issue of one
+kind never stands in for another, and a human's `nightly-red` issue about a
+case is about its code, so it neither replaces the infra issue nor receives its
+comments. A closed one counts as for domain bugs. While it is open, every later
+lost night of the part, or kept night of the case, gets one comment whether or
+not the threshold is met again, and a later clean night (the part runs to its
+verdict, or the case is graded) gets one recovery comment. With no
+`infra_owner` in `domains.yaml` the issue is filed unassigned and says so.
 
 The step runs in dry run until armed: it reads the open issues and the comments
 it needs, prints what it would file, comment and assign, and writes nothing.

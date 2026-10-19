@@ -81,11 +81,11 @@ except ImportError:  # the workflow installs pyyaml; main() says so if absent
     yaml = None
 
 try:
-    from eval_dashboard import classify, ghcli, nightly, nightly_infra
+    from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/nightly_bugs.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, ghcli, nightly, nightly_infra
+    from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
     from eval_dashboard.post_health import NIGHTLY_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -102,8 +102,6 @@ TASK_OWNER_KEY = "owner"
 TASK_DOMAIN_KEY = "domain"
 TASK_EXPECTED_FAIL_KEY = "expected_fail"
 DOMAIN_ROW_KEYS = ("name", "owner", "backup")
-INFRA_OWNER_KEY = "infra_owner"
-INFRA_BACKUP_KEY = "infra_backup"
 CASE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 # How many graded nights in a row a case must fail every repetition on.
@@ -208,7 +206,7 @@ INFRA_CASE_BODY = """\
 {marker}
 `{case}` graded nothing on its last {nights} nights where its part of the nightly (`{job}`) ran to its verdict: every repetition was classified as infrastructure (`classify.py`), or the run recorded no line for the case. Domain: `{domain}` (owner @{domain_owner}).
 
-**Assigned to** @{infra_owner} (the infra owner in `docs/designs/domains.yaml`). Infra backup: @{infra_backup}.
+{addressee}
 
 **Nights** (newest first; a night the part did not run or lost, and a night infrastructure took half the part's cases, are skipped)
 
@@ -222,7 +220,7 @@ INFRA_JOB_BODY = """\
 {marker}
 The nightly's {part} part (`{job}`) lost {lost} of its last {nights} nights: Prow ended the build before the eval loop's verdict (the job deadline, an abort) or the pod went away, so the cases it had not reached were never graded.
 
-**Assigned to** @{infra_owner} (the infra owner in `docs/designs/domains.yaml`). Infra backup: @{infra_backup}.
+{addressee}
 
 **Nights** (newest first)
 
@@ -241,6 +239,9 @@ INFRA_RECOVERY_COMMENT = """\
 {marker}
 {what} on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
 """
+INFRA_ASSIGNED = "**Assigned to** @{owner} (the infra owner in `docs/designs/domains.yaml`).{backup}"
+INFRA_BACKUP_MENTION = " Infra backup: @{backup}."
+INFRA_UNASSIGNED = "**Unassigned:** `docs/designs/domains.yaml` names no `infra_owner`."
 JOB_RECOVERED = "The {part} part (`{job}`) ran to its verdict"
 CASE_RECOVERED = "`{case}` was graded"
 WHY_INFRA_OWNER = "infra owner"
@@ -435,11 +436,13 @@ def render_issue(case: str, domain: str, domain_row: dict, assignee: str, why: s
 def names_case(issue: dict, case: str, kind: str = KIND_RED) -> bool:
     """The bot's issue by its marker of ``kind``; one without any bot
     marker (a human's) by the case named as a whole word in its title or
-    body. A job's issue (KIND_LOST) is matched on its marker alone: a
-    human's issue about a case links runs whose URLs name the job."""
+    body. The infra kinds are matched on their marker alone: a human's
+    `nightly-red` issue about a case is about its code (it must not take
+    the infra issue's place or its comments), and one about anything links
+    runs whose URLs name the job."""
     body = issue.get("body") or ""
     markers = BOT_MARKER_RE.findall(body)
-    if markers or kind == KIND_LOST:
+    if markers or kind != KIND_RED:
         return (kind, case) in markers
     pattern = NAME_IN_TEXT_RE.format(name=re.escape(case))
     return bool(re.search(pattern, f"{issue.get('title') or ''}\n{body}"))
@@ -467,8 +470,7 @@ class Filer:
         self.repo_root = repo_root
         self.domains = load_domains(repo_root)
         self.owners = load_owners(repo_root)
-        doc = load_yaml(repo_root / DOMAINS_FILE)
-        self.infra_owner, self.infra_backup = doc.get(INFRA_OWNER_KEY), doc.get(INFRA_BACKUP_KEY)
+        self.infra_owner, self.infra_backup = gate_issue.infra_addressees(repo_root / DOMAINS_FILE)
 
     def open_issues(self) -> list[dict] | None:
         return self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
@@ -527,28 +529,46 @@ class Filer:
 
     def run_infra(self, data: dict, parts: dict, active: set, open_issues: list, closed_issues: list, result: dict) -> None:
         """The two infra shapes (module docstring, nightly_infra.py)."""
+        # An open job issue: one comment on the part's newest night when it
+        # was lost after the issue opened, or once when it ran clean again.
+        for part, part_list in parts.items():
+            job = part_list[-1]["job"] if part_list else None
+            issue = tracking_issue(open_issues, job, KIND_LOST) if job else None
+            if not issue:
+                continue
+            result["tracked"].append({"case": job, "issue": issue["number"]})
+            if part_list[-1]["lost"]:
+                self.note_night(KIND_LOST, KEY_JOB, job, issue, part_list[-1], part_list[-1]["how"], result)
+            clean = nightly_infra.first_clean_after_lost(part_list)
+            if clean:
+                self.recover_infra(KIND_LOST, KEY_JOB, job, issue, clean, JOB_RECOVERED.format(part=part, job=job), result)
         for lost in nightly_infra.lost_jobs(parts):
             job = lost["job"]
+            if tracking_issue(open_issues, job, KIND_LOST):
+                continue
             losses = [n for n in lost["nights"] if n["lost"]]
             title = INFRA_JOB_TITLE.format(job=job, lost=len(losses), nights=nightly_infra.JOB_LOST_WINDOW)
             body = INFRA_JOB_BODY.format(
                 marker=BOT_MARKER.format(kind=KIND_LOST, field=KEY_JOB, key=job), part=lost["part"], job=job, lost=len(losses),
-                nights=nightly_infra.JOB_LOST_WINDOW, infra_owner=self.infra_owner or UNKNOWN, infra_backup=self.infra_backup or UNKNOWN,
+                nights=nightly_infra.JOB_LOST_WINDOW, addressee=self.addressee(),
                 nights_block="\n".join(INFRA_NIGHT_LINE.format(date=n["date"], how=n["how"], run_url=n["run_url"]) for n in reversed(lost["nights"])),
                 nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
-            latest = losses[-1]
-            self.ensure_infra(KIND_LOST, KEY_JOB, job, latest, title, body, lost["nights"], latest["how"], open_issues, closed_issues, result)
-        for part, part_list in parts.items():
-            clean = nightly_infra.first_clean_after_lost(part_list)
-            job = part_list[-1]["job"] if part_list else None
-            issue = tracking_issue(open_issues, job, KIND_LOST) if job and clean else None
-            if issue:
-                what = JOB_RECOVERED.format(part=part, job=job)
-                self.recover_infra(KIND_LOST, KEY_JOB, job, issue, clean, what, result)
+            self.file_infra(KIND_LOST, job, losses[-1], title, body, lost["nights"], closed_issues, result)
         candidates = sorted(c for c in active if c)
         for case, verdicts in sorted(nightly_infra.case_verdicts(data, parts, candidates).items()):
             fields = task_fields(case, self.repo_root)
             if fields is None or fields["expected_fail"]:
+                continue
+            issue = tracking_issue(open_issues, case, KIND_INFRA)
+            if issue:
+                # Open: the newest eligible night, kept from running after the
+                # issue opened, gets one comment; a graded one, one recovery.
+                result["tracked"].append({"case": case, "issue": issue["number"]})
+                if verdicts[-1]["state"] in nightly_infra.KEPT_STATES:
+                    self.note_night(KIND_INFRA, KEY_CASE, case, issue, verdicts[-1], quoted(verdicts[-1]["reason"]), result)
+                graded = nightly_infra.first_graded_after_kept(verdicts)
+                if graded:
+                    self.recover_infra(KIND_INFRA, KEY_CASE, case, issue, graded, CASE_RECOVERED.format(case=case), result)
                 continue
             streak = nightly_infra.kept_streak(verdicts)
             if streak:
@@ -558,30 +578,32 @@ class Filer:
                 body = INFRA_CASE_BODY.format(
                     marker=BOT_MARKER.format(kind=KIND_INFRA, field=KEY_CASE, key=case), case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS,
                     job=job, domain=domain, domain_owner=(self.domains.get(domain) or {}).get("owner") or UNKNOWN,
-                    infra_owner=self.infra_owner or UNKNOWN, infra_backup=self.infra_backup or UNKNOWN,
+                    addressee=self.addressee(),
                     nights_block="\n".join(INFRA_CASE_LINE.format(date=v["date"], reason=quoted(v["reason"]), run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
                     nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
-                self.ensure_infra(KIND_INFRA, KEY_CASE, case, streak[-1], title, body, streak, quoted(streak[-1]["reason"]), open_issues, closed_issues, result)
-                continue
-            graded = nightly_infra.first_graded_after_kept(verdicts)
-            issue = tracking_issue(open_issues, case, KIND_INFRA) if graded else None
-            if issue:
-                self.recover_infra(KIND_INFRA, KEY_CASE, case, issue, graded, CASE_RECOVERED.format(case=case), result)
+                self.file_infra(KIND_INFRA, case, streak[-1], title, body, streak, closed_issues, result)
 
-    def ensure_infra(self, kind, field, key, newest, title, body, nights, what, open_issues, closed_issues, result) -> None:
-        """File the infra issue for ``key``, or, when one is open, comment
-        once on ``newest`` if it is a night after the issue was opened."""
-        issue = tracking_issue(open_issues, key, kind)
-        if issue:
-            result["tracked"].append({"case": key, "issue": issue["number"]})
-            opened, started = nightly.parse_iso(issue.get("created_at")), nightly.parse_iso(newest.get("started"))
-            if opened and started and started > opened:
-                marker = NIGHT_MARKER.format(kind=kind, field=field, key=key, build=newest["build"])
-                comment = INFRA_NIGHT_COMMENT.format(marker=marker, date=newest["date"], what=what, run_url=newest["run_url"])
-                done = self.comment_once(issue["number"], marker, comment)
-                if done is not None:
-                    result["noted" if done or self.gh.dry_run else "failed"].append({"case": key, "issue": issue["number"], "night": newest["date"], "run": newest["run_url"]})
+    def addressee(self) -> str:
+        if not self.infra_owner:
+            return INFRA_UNASSIGNED
+        backup = INFRA_BACKUP_MENTION.format(backup=self.infra_backup) if self.infra_backup else ""
+        return INFRA_ASSIGNED.format(owner=self.infra_owner, backup=backup)
+
+    def note_night(self, kind, field, key, issue, night, what, result) -> None:
+        """One comment on an open infra issue for ``night``, when it started
+        after the issue was opened."""
+        opened, started = nightly.parse_iso(issue.get("created_at")), nightly.parse_iso(night.get("started"))
+        if not (opened and started and started > opened):
             return
+        marker = NIGHT_MARKER.format(kind=kind, field=field, key=key, build=night["build"])
+        comment = INFRA_NIGHT_COMMENT.format(marker=marker, date=night["date"], what=what, run_url=night["run_url"])
+        done = self.comment_once(issue["number"], marker, comment)
+        if done is not None:
+            result["noted" if done or self.gh.dry_run else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
+
+    def file_infra(self, kind, key, newest, title, body, nights, closed_issues, result) -> None:
+        """File the infra issue for ``key`` unless one closed after
+        ``newest`` already saw this streak."""
         closed = tracking_issue([i for i in closed_issues if closed_after(i, newest)], key, kind)
         if closed:
             result["tracked"].append({"case": key, "issue": closed["number"], "closed": True})

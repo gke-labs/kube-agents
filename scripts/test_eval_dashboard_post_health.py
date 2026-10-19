@@ -1543,6 +1543,24 @@ class InfraAddressee(unittest.TestCase):
                 self.assertEqual(body["labels"], ["presubmit-gate"])
                 self.assertTrue(body["body"].rstrip().endswith("Infra owner: @ivan, backup @iris (`infra_owner` in docs/designs/domains.yaml)."))
 
+    def test_a_refused_assignee_still_files_the_issue(self):
+        class RefusesAssignees(FakeGh):
+            def __call__(self, argv, input=None, **kwargs):
+                if input and "assignees" in json.loads(input):
+                    self.calls.append(("POST", argv[argv.index("-X") + 2], json.loads(input)))
+                    return GhResult(rc=1, stderr="HTTP 422: Validation Failed")
+                return super().__call__(argv, input=input, **kwargs)
+
+        gh = RefusesAssignees()
+        tracker = post_health.gate_issue.Tracker(post_health.ghcli.Gh(runner=gh), infra=("ivan", "iris"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            issue = tracker.ensure(lost_pods(), T0, "Mon 9:00 AM ET", "brief", "9:00 AM–9:15 AM ET")
+        posts = [c[2] for c in gh.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 2)
+        self.assertNotIn("assignees", posts[1])
+        self.assertIn("@ivan", posts[1]["body"])
+        self.assertEqual(issue["number"], 1300)
+
     def test_an_outage_is_not_addressed_to_infra(self):
         body = self.ensure(outage())
         self.assertNotIn("assignees", body)

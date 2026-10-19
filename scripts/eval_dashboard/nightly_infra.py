@@ -15,9 +15,10 @@ for the case at all. INFRA_STREAK_NIGHTS such nights in a row file one issue
 for the case. A night is not counted, either way, when the case's part did
 not run or was lost (the job itself did not run), when the night predates
 the case's first recorded night (a case new to the matrix is not "never
-graded" on the nights before it existed), or when infrastructure took at
-least INFRA_EVENT_FRACTION of the part's cases (a pool-wide outage, which is
-not one case's problem). A graded night ends the streak.
+graded" on the nights before it existed), when infrastructure took at least
+INFRA_EVENT_FRACTION of the part's cases (a pool-wide outage, which is not
+one case's problem), or when the part recorded under THIN_NIGHT_FRACTION of
+the cases its fullest night in the window did. A graded night ends the streak.
 
 Neither shape touches the domain streak: ``nightly_bugs.graded_nights``
 still drops every infrastructure repetition before it calls a night failing.
@@ -45,6 +46,11 @@ INFRA_STREAK_NIGHTS = 3
 # is a pool-wide infrastructure event: skipped for every case. The worst
 # nightly night of 2026-10-10..19 had 4 of 81 cases ungraded.
 INFRA_EVENT_FRACTION = 0.5
+# A part night that recorded fewer than this fraction of the cases the
+# part's fullest night in the window recorded (zero included) ran short in a
+# way no other rule names: every missing case would read "absent", so the
+# night is skipped for every case instead.
+THIN_NIGHT_FRACTION = 0.5
 # Verdicts of a case on an eligible night.
 STATE_INFRA = "infra"
 STATE_ABSENT = "absent"
@@ -55,6 +61,7 @@ STOPPED_POD = "the pod was lost (node {node}, last event {event}); nothing recor
 STOPPED_CUT = "ended before its verdict after {took} (result {result}); {recorded} cases recorded"
 STOPPED_CLEAN = "ran to its verdict (result {result}); {recorded} cases recorded"
 UNKNOWN = "unknown"
+UNKNOWN_WALL_CLOCK = "an unknown wall clock"
 ABSENT_REASON = "no line for the case: the {part} part ran to its verdict and recorded nothing for it"
 INFRA_REASON = "{infra} of {reps} repetitions infrastructure{ceiling}: {reason}"
 CEILING_NOTE = " ({ceiling} at the delegation ceiling)"
@@ -76,15 +83,17 @@ def stopped(run: dict) -> tuple[bool, str]:
         return True, STOPPED_POD.format(node=run.get("pod_node") or UNKNOWN, event=run.get("pod_last_event") or UNKNOWN)
     if nightly.run_truncated(run):
         seconds = nightly.run_duration(run)
-        took = nightly.duration_text(seconds) if seconds is not None else "an unknown wall clock"
+        took = nightly.duration_text(seconds) if seconds is not None else UNKNOWN_WALL_CLOCK
         return True, STOPPED_CUT.format(took=took, result=result, recorded=recorded)
     return False, STOPPED_CLEAN.format(result=result, recorded=recorded)
 
 
 def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
     """``{part: [night, ...]}``, oldest first, one per date inside the
-    window: the newest build of that part that date. A night is ``{date,
-    started, build, job, part, run_url, lost, how, run}``."""
+    window: the newest build of that part that date that was not lost, else
+    the newest (a clean re-run rescues its night; a lost re-run does not undo
+    a clean build). A night is ``{date, started, build, job, part, run_url,
+    lost, how, run}``."""
     window = window_dates(data, lookback)
     by_part: dict[str, dict[datetime.date, dict]] = {}
     for run in nightly.sorted_nightly_runs(data):
@@ -93,6 +102,9 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
             continue
         lost, how = stopped(run)
         part = nightly.night_part(run)
+        held = by_part.get(part, {}).get(day)
+        if held and lost and not held["lost"]:
+            continue
         by_part.setdefault(part, {})[day] = {
             "date": day.isoformat(),
             "started": run.get("started"),
@@ -133,6 +145,10 @@ def infra_event(run: dict) -> bool:
     return bool(tasks) and ungraded / len(tasks) >= INFRA_EVENT_FRACTION
 
 
+def thin_night(run: dict, fullest: int) -> bool:
+    return len(classify.run_tasks(run)) < THIN_NIGHT_FRACTION * fullest or not classify.run_tasks(run)
+
+
 def case_homes(data: dict) -> dict[str, tuple[str, datetime.date | None]]:
     """``{case: (the part that last recorded it, the first date it was
     recorded)}`` over every nightly run on record."""
@@ -162,7 +178,8 @@ def case_verdicts(data: dict, parts: dict[str, list[dict]], cases: list[str]) ->
     homes = case_homes(data)
     eligible = {}
     for part, nights in parts.items():
-        eligible[part] = [n for n in nights if not n["lost"] and not infra_event(n["run"])]
+        fullest = max((len(classify.run_tasks(n["run"])) for n in nights), default=0)
+        eligible[part] = [n for n in nights if not n["lost"] and not infra_event(n["run"]) and not thin_night(n["run"], fullest)]
     out: dict[str, list[dict]] = {}
     for case in cases:
         if case not in homes:
