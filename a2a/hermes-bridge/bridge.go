@@ -420,8 +420,9 @@ type Bridge struct {
 	// it while a cancel lands, without a bus that misbehaves on cue.
 	publishTurn func(ctx context.Context, run *taskRun, artifactID, text string) error
 	// resultPublish publishes a task's result artifact, publishResult by
-	// default; a field so a test can fail it. chat, when set, is the
-	// kube-agents.chat/v1 DataPart the last chunk carries (chat.go).
+	// default; a field so a test can fail it. chat, when set, is the data
+	// part the last chunk carries: the kube-agents.chat/v1 DataPart (chat.go)
+	// for a turn, or the cardStop result part (cardstop.go) for a control.
 	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
 
 	// apiClient is the API executor's HTTP client (api.go).
