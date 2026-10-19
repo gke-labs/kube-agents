@@ -618,6 +618,22 @@ DRIFT_ALERT_EMOJI = "🔀"
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
 
+# What a drift card says when the install has no usable GitOps repository
+# registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
+# that are all unusable). The object may well be synced from a repository by a
+# GitOps tool; what the install lacks is a repository it can open a pull
+# request against. So the card asks for an explanation only: no options, no
+# "To authorize:" line, and so no buttons a reader could click for an action
+# that can only block (gke-labs#3313). The registration paths are
+# gitops_preflight.REGISTRATION_STEPS'; test_session_kv_server holds the two
+# to the same field and flag.
+DRIFT_NO_GITOPS_LINE = (
+    "No usable GitOps repository is registered with this install, so the agent cannot open a pull request to "
+    "revert or codify this change. Register one, or fix the existing entry, in the PlatformAgent's "
+    "spec.integration.repositories (or re-run the installer with --gitops-repo) to get those options on later "
+    "drift alerts."
+)
+
 # The `join` value the detector sends when it actually read the live object's
 # `managedFields` (`joinEnriched` in k8s-operator/cmd/drift-detector/join.go).
 # Any other value means ownership is absent because the lookup did not happen,
@@ -2064,6 +2080,107 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _drift_audit_facts(payload: Dict[str, Any]) -> str:
+    """The audit record a drift card opens with, and whether it was reconciled since."""
+    resource_path = _drift_resource_path(payload)
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
+    user_agent = _defang_drift_field(payload.get("user_agent"))
+    verb = _defang_drift_field(payload.get("verb")) or DRIFT_UNKNOWN_FIELD
+    method_name = _defang_drift_field(payload.get("method_name")) or DRIFT_UNKNOWN_FIELD
+    timestamp = _defang_drift_field(payload.get("timestamp")) or DRIFT_UNKNOWN_FIELD
+    insert_id = _defang_drift_field(payload.get("insert_id")) or DRIFT_UNKNOWN_FIELD
+    project = _defang_drift_field(payload.get("project")) or DRIFT_UNKNOWN_FIELD
+
+    reconciled_by = _defang_drift_field(payload.get("reconciled_by"))
+    if payload.get("reconciled"):
+        reconcile_line = (
+            f"- **Possibly already reverted:** `{reconciled_by or DRIFT_UNKNOWN_FIELD}` wrote to this object "
+            f"after the change above, so a GitOps controller may have reconciled it already. Check the live "
+            f"object before proposing anything — there may be nothing left to do."
+        )
+    else:
+        reconcile_line = (
+            "- **Not shown to be reconciled:** no configured GitOps manager was recorded writing to this "
+            "object after the change. That is the absence of evidence, not evidence the change still stands; "
+            "read the live object to find out which."
+        )
+
+    return (
+        f"**What the audit log recorded:**\n"
+        f"- **Object:** {resource_path}\n"
+        f"- **Cluster / project:** {cluster_name} / {project}\n"
+        f"- **Who:** {principal}"
+        + (f" (self-declared user agent `{user_agent}`, which names a tool and never a person)" if user_agent else "")
+        + f"\n"
+        f"- **What:** `{verb}` via `{method_name}`\n"
+        f"- **When:** {timestamp}\n"
+        f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
+        f"{_drift_ownership_block(payload)}\n"
+        f"{reconcile_line}"
+    )
+
+
+def _gitops_repo_registered() -> Optional[bool]:
+    """Whether the install has a usable GitOps repository: True, False, or None when unknown.
+
+    Asks gitops_preflight, the check a PR-writing worker runs first, so the
+    drift card and the worker that would act on it cannot disagree about
+    whether there is a repository. A registry that cannot be read is None,
+    and the card then keeps its options: the worker's own preflight still
+    stops an action that cannot be carried out.
+    """
+    try:
+        import gitops_preflight
+
+        code, _ = gitops_preflight.preflight()
+    except Exception:  # noqa: BLE001 - an unknown answer keeps upstream's card
+        return None
+    if code == gitops_preflight.EXIT_REGISTERED:
+        return True
+    if code == gitops_preflight.EXIT_NO_REGISTERED_REPO:
+        return False
+    return None
+
+
+def _drift_task_body_without_gitops(payload: Dict[str, Any]) -> str:
+    """The drift card for an install with no GitOps repository: explain, offer nothing.
+
+    The same audit facts and the same delivery as :func:`_drift_task_body`,
+    but the report's 'What to do' is :data:`DRIFT_NO_GITOPS_LINE` and nothing
+    else. Without a 'To authorize:' line kanban_notifier.actionable_report
+    files no incidents row, and the Slack presenter draws no option buttons.
+    """
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}', and the audit log "
+        f"recorded it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
+        f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
+        f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
+        f"use it.\n\n"
+        f"**{DRIFT_NO_GITOPS_LINE}** So this report explains the change and proposes nothing: no revert, no "
+        f"codify, no other fix, and no call to action.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
+        f"the alert was raised, and `result` is what gets posted there.\n\n"
+        f"**Done when:** the report says who changed what, what the live object looks like now, whether the change "
+        f"still stands, and what it affects. Nothing else is a condition of finishing.\n\n"
+        f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it.** "
+        f"**Do not judge the change by who made it**, and change nothing in the cluster.\n\n"
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
+        f"these three `##` sections are the only ones:\n\n"
+        f"## What's wrong\n\n"
+        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"## Why\n\n"
+        f"- <What the live object shows now, with the evidence>\n"
+        f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
+        f"## What to do\n\n"
+        f"- {DRIFT_NO_GITOPS_LINE}\n\n"
+        f"Every <...> above is a placeholder: fill each one in. Write the 'What to do' bullet exactly as given."
+    )
+
+
 def _drift_task_body(payload: Dict[str, Any]) -> str:
     """The kanban card body for an out-of-band change to a live object.
 
@@ -2095,45 +2212,19 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     skill carries is the step a report can skip while looking complete —
     establishing whether the state git declares still runs before proposing that
     the change be undone.
-    """
-    resource_path = _drift_resource_path(payload)
-    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
-    principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
-    user_agent = _defang_drift_field(payload.get("user_agent"))
-    verb = _defang_drift_field(payload.get("verb")) or DRIFT_UNKNOWN_FIELD
-    method_name = _defang_drift_field(payload.get("method_name")) or DRIFT_UNKNOWN_FIELD
-    timestamp = _defang_drift_field(payload.get("timestamp")) or DRIFT_UNKNOWN_FIELD
-    insert_id = _defang_drift_field(payload.get("insert_id")) or DRIFT_UNKNOWN_FIELD
-    project = _defang_drift_field(payload.get("project")) or DRIFT_UNKNOWN_FIELD
 
-    reconciled_by = _defang_drift_field(payload.get("reconciled_by"))
-    if payload.get("reconciled"):
-        reconcile_line = (
-            f"- **Possibly already reverted:** `{reconciled_by or DRIFT_UNKNOWN_FIELD}` wrote to this object "
-            f"after the change above, so a GitOps controller may have reconciled it already. Check the live "
-            f"object before proposing anything — there may be nothing left to do."
-        )
-    else:
-        reconcile_line = (
-            "- **Not shown to be reconciled:** no configured GitOps manager was recorded writing to this "
-            "object after the change. That is the absence of evidence, not evidence the change still stands; "
-            "read the live object to find out which."
-        )
+    On an install with no usable GitOps repository the card is
+    :func:`_drift_task_body_without_gitops` instead: an explanation with no
+    options. The bench contract above binds only this, the registered path.
+    """
+    if _gitops_repo_registered() is False:
+        return _drift_task_body_without_gitops(payload)
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
 
     return (
         f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
         f"through git, and the audit log is how we know about it.\n\n"
-        f"**What the audit log recorded:**\n"
-        f"- **Object:** {resource_path}\n"
-        f"- **Cluster / project:** {cluster_name} / {project}\n"
-        f"- **Who:** {principal}"
-        + (f" (self-declared user agent `{user_agent}`, which names a tool and never a person)" if user_agent else "")
-        + f"\n"
-        f"- **What:** `{verb}` via `{method_name}`\n"
-        f"- **When:** {timestamp}\n"
-        f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
-        f"{_drift_ownership_block(payload)}\n"
-        f"{reconcile_line}\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
         f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
         f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
         f"use it.\n\n"

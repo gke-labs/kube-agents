@@ -3724,17 +3724,23 @@ report_github_leftovers() {
   if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] || [ -z "${BENCH_GITOPS_REPO:-}" ]; then
     return 0
   fi
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] GitHub writes this run left on ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
+  # Named by forge: under EVAL_FORGE=gitlab BENCH_GITOPS_REPO is a GitLab
+  # project and the listing is of its merge requests.
+  local forge="GitHub" kind="repository"
+  if [ "${EVAL_FORGE:-github}" = "gitlab" ]; then
+    forge="GitLab" kind="project"
+  fi
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${forge} writes this run left on the ${forge} ${kind} ${BENCH_GITOPS_REPO} since ${EVAL_RUN_STARTED_AT} <<<"
   if ! mint_ledger_token "leftovers"; then
-    echo "WARNING: GitHub leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
+    echo "WARNING: ${forge} leftovers: no read token, so what this run wrote to ${BENCH_GITOPS_REPO} is not listed here; the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close it."
     return 0
   fi
   if ! (cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.github_writes \
       --repo "${BENCH_GITOPS_REPO}" --since "${EVAL_RUN_STARTED_AT}"); then
-    echo "WARNING: GitHub leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."
+    echo "WARNING: ${forge} leftovers: the listing of ${BENCH_GITOPS_REPO} failed (above); the next lease's reset and the periodic sweep ci-kube-agents-pull-sweep still close what this run left."
     return 0
   fi
-  echo "GitHub leftovers: this listing closes none of them; the next lease's reset (hack/ci_reset_agent_pulls.py) and the periodic sweep ci-kube-agents-pull-sweep close them and delete their branches. The safeguard verdict above was read during each repetition and does not depend on this listing."
+  echo "${forge} leftovers: this listing closes none of them; the next lease's reset (hack/ci_reset_agent_pulls.py) and the periodic sweep ci-kube-agents-pull-sweep close them and delete their branches. The safeguard verdict above was read during each repetition and does not depend on this listing."
 }
 report_github_leftovers
 
@@ -3801,8 +3807,9 @@ profile_begin "record + final gate"
 # against a window it had just moved.
 #
 # EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
-# lane's periodic and nightly on main (ci-kube-agents-eval-next,
-# ci-kube-agents-eval-nightly-next-claude) are also periodics with no
+# lane's periodic and nightlies on main (ci-kube-agents-eval-next,
+# ci-kube-agents-eval-nightly-next-claude and
+# ci-kube-agents-eval-nightly-gitlab-next) are also periodics with no
 # PULL_NUMBER, and the key has no mode field either, so their samples would
 # be today's the moment they landed. The deploy admits the flag on those
 # jobs by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what

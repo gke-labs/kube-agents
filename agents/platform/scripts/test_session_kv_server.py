@@ -4807,6 +4807,10 @@ class TestFindingsQueueApi(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/findings/publication/backlog").status_code, 200)
 
 
+# setUp below patches the module attribute; this keeps the real check for the test of it.
+_REAL_GITOPS_REPO_REGISTERED = session_kv_server._gitops_repo_registered
+
+
 class TestDriftInject(unittest.TestCase):
     """The `gitops-drift` half of /sessions/{id}/inject.
 
@@ -4858,6 +4862,12 @@ class TestDriftInject(unittest.TestCase):
 
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        # The card's options depend on whether a GitOps repository is
+        # registered; the tests below that do not say otherwise are about an
+        # install that has one.
+        registered = patch.object(session_kv_server, "_gitops_repo_registered", return_value=True)
+        registered.start()
+        self.addCleanup(registered.stop)
         # The ceiling is fleet-wide and the database is shared by the whole
         # file, so today's spend has to be cleared or these order-depend on
         # whatever ran before them.
@@ -4875,6 +4885,60 @@ class TestDriftInject(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def test_without_a_gitops_repository_the_card_explains_and_offers_nothing(self):
+        with patch.object(session_kv_server, "_gitops_repo_registered", return_value=False):
+            card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn(session_kv_server.DRIFT_NO_GITOPS_LINE, card)
+        self.assertNotIn("To authorize:", card)
+        self.assertNotIn("Option A", card)
+        self.assertNotIn("Revert", card)
+        self.assertNotIn("Recommended", card)
+        # The audit facts are still the opening of the card.
+        self.assertIn(self.DRIFT_PAYLOAD["principal"], card)
+        self.assertIn("**Read the live object before you conclude anything.**", card)
+
+    def test_a_report_written_to_that_card_earns_no_incident_row(self):
+        # The notifier's gate is what draws the buttons; a report that follows
+        # the no-repository template has nothing it accepts.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches"))
+        import kanban_notifier
+
+        report = (
+            "## What's wrong\n\nme changed replicas, still live\n\n## Why\n\n- 3 replicas\n- cost\n\n"
+            f"## What to do\n\n- {session_kv_server.DRIFT_NO_GITOPS_LINE}\n"
+        )
+        self.assertFalse(kanban_notifier.actionable_report(report))
+
+    def test_an_unreadable_registry_keeps_the_options(self):
+        with patch.object(session_kv_server, "_gitops_repo_registered", return_value=None):
+            card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("To authorize:", card)
+        self.assertNotIn(session_kv_server.DRIFT_NO_GITOPS_LINE, card)
+
+    def test_a_preflight_that_raises_is_unknown_and_keeps_the_options(self):
+        import gitops_preflight
+
+        with patch.object(gitops_preflight, "preflight", side_effect=RuntimeError("boom")):
+            self.assertIsNone(_REAL_GITOPS_REPO_REGISTERED())
+
+    def test_the_no_repository_line_names_the_registration_paths_the_preflight_names(self):
+        import gitops_preflight
+
+        for path in ("spec.integration.repositories", "--gitops-repo"):
+            self.assertIn(path, gitops_preflight.REGISTRATION_STEPS)
+            self.assertIn(path, session_kv_server.DRIFT_NO_GITOPS_LINE)
+
+    def test_the_registration_answer_comes_from_gitops_preflight(self):
+        import gitops_preflight
+
+        for code, want in (
+            (gitops_preflight.EXIT_REGISTERED, True),
+            (gitops_preflight.EXIT_NO_REGISTERED_REPO, False),
+            (gitops_preflight.EXIT_STATE_UNREADABLE, None),
+        ):
+            with patch.object(gitops_preflight, "preflight", return_value=(code, "line")):
+                self.assertIs(_REAL_GITOPS_REPO_REGISTERED(), want)
 
     def _payload(self, **overrides):
         payload = json.loads(json.dumps(self.DRIFT_PAYLOAD))
