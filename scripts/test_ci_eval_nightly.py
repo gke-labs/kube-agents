@@ -836,13 +836,19 @@ class NightlyPartTest(unittest.TestCase):
         # The onboarding cases all run in main-a, one at a time under their
         # own state lock, some of them off lock-infra; that chain must not
         # outgrow the longer stack chain, or main-a is the long half whatever
-        # the list says.
+        # the list says. The list can lift the longer stack chain only to half
+        # the stack total plus one case's worth; past that, no list edit helps.
         onboarding = [n for n, a in self.script_answers(self.names(a), "unit_state_lock {name}").items() if a == "onboarding"]
         chain_onboarding = sum(int(c) for c in self.script_answers(onboarding, "unit_cost_hint {name}").values())
+        reach = (chain_a + chain_b + max(cost.values())) // 2
         self.assertLessEqual(
             chain_onboarding,
             max(chain_a, chain_b),
-            f"main-a's onboarding chain is {chain_onboarding}s, longer than either stack chain ({chain_a}s, {chain_b}s)",
+            f"main-a's onboarding chain is {chain_onboarding}s, longer than either stack chain ({chain_a}s, {chain_b}s). "
+            f"The onboarding cases always run in main-a. If the chain is at most {reach}s, list a stack case in, or out of, "
+            "hack/eval/nightly-main-b.txt to lengthen the longer stack chain. If it is longer, no list edit can fix it: "
+            "check the onboarding cases' unit_cost_hint in hack/ci-eval-pr.sh, and if the hints are right, "
+            "raise the split's design on #3384.",
         )
 
     def test_the_cases_without_a_stack_split_roughly_evenly(self):
