@@ -12,7 +12,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scripts.check_skill_size import HERMES_RESULT_CAP_CHARS, LIMIT_CHARS, REPO, oversized, skill_documents
+from scripts.check_skill_size import HERMES_RESULT_CAP_CHARS, LIMIT_CHARS, REPO, oversized, shipped_skill_documents
 
 
 class TestSkillSize(unittest.TestCase):
@@ -52,7 +52,7 @@ class TestSkillSize(unittest.TestCase):
 
     def test_a_directory_without_skill_md_is_not_a_skill(self):
         self.write("agents/platform/skills/notes/big.md", 41)
-        self.assertEqual(skill_documents(self.repo), [])
+        self.assertEqual(shipped_skill_documents(self.repo), [])
 
     def test_the_limit_stays_under_half_of_hermes_cap(self):
         # A document at the limit, wrapped in JSON and opened beside another, must still come back whole.

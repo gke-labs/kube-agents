@@ -263,6 +263,15 @@ litellm:
   # inference-gateway page, "Setting the output-token budget". Chart-only;
   # the kustomize dev base carries no such key.
   maxTokens: 0
+  # Reasoning effort the gateway asks for on a request that names none,
+  # rendered as reasoning_effort under every model_list alias: low, medium or
+  # high. Empty leaves the key out, so the rendered config and its rollout
+  # checksum are what they were and the model uses its own default. LiteLLM
+  # translates it per provider; on Gemini 3.x it becomes thinkingLevel. What
+  # it maps to, and when a request's own value wins, is on the site's
+  # inference-gateway page, "Setting the reasoning effort". Chart-only; the
+  # kustomize dev base carries no such key.
+  reasoningEffort: ""
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity, so the chart always creates this KSA — no operator reconciles it.
@@ -947,8 +956,10 @@ platformAgent:
     # Bounds the Job itself (image pull, scheduling) above that wait.
     activeDeadlineSeconds: 300
   security:
-    # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
-    # binding must target this KSA (see the chart README); the default matches
+    # Kubernetes ServiceAccount the credential broker pod runs as; the agent
+    # gateway pod runs as its own unannotated `<name>-gateway-agent`, which the
+    # operator creates. The Workload Identity binding must target this KSA (see
+    # the chart README); the default matches
     # PLATFORM_AGENT_KSA_NAME in scripts/installer/common.sh.
     # Ownership: with serviceAccountAnnotations set, the OPERATOR creates and
     # manages the KSA; with no annotations, the operator treats it as

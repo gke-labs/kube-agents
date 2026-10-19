@@ -36,6 +36,11 @@ on:
         required: false
         default: "defer"
         type: string
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
       # For an environment that may not be provisioned yet: when the GitHub
       # environment does not exist, or exists without GCP_PROJECT_ID, the run
       # posts a notice and reports `skipped` instead of failing on the strict
@@ -89,6 +94,11 @@ on:
           - "fail"
           - "defer"
           - "ignore"
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   # Asks whether the GitHub environment exists before any job binds it, because
@@ -275,6 +285,7 @@ jobs:
           GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
           IMAGE_TAG: ${{ inputs.image_tag }}
           LEASE_POLICY: ${{ inputs.lease_policy }}
+          ALLOW_BREAKING_DOWNGRADE: ${{ inputs.allow_breaking_downgrade }}
           GH_TOKEN: ${{ github.token }}
           # Every install setting, under the names render_install_env.sh maps.
           # An environment missing one of the required ones fails there, naming

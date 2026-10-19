@@ -413,12 +413,37 @@ chart's default `platformAgent.name` value.
 
 The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-report.json`.
 
+## The gateway's own ServiceAccount
+
+From the release in which the gateway Pod runs as its own ServiceAccount, an upgrade moves the
+gateway from the agent ServiceAccount (`spec.security.serviceAccountName`, `kubeagents-platform-agent`
+by default) to `<name>-gateway-agent`, which the operator creates with no annotation. The agent
+ServiceAccount, its Workload Identity annotation and its IAM binding stay where they are, with the
+credential broker, so neither Terraform nor IAM changes. The new ServiceAccount is bound to the same
+read-only `kubeagents:minimal` ClusterRole and the `kubeagents:local` and `kubeagents:leader` Roles
+the gateway already used.
+
+Two things an install may have added by hand do not follow the gateway:
+
+- **RBAC bound to your own ServiceAccount.** If you set `serviceAccountName` and bound extra roles to
+  it expecting the gateway to use them, the gateway no longer runs as it. Bind them to
+  `<name>-gateway-agent` if the gateway needs them; the broker keeps whatever is bound to yours.
+- **IAM granted to the gateway's Kubernetes identity directly.** A `principal://…/subject/ns/<ns>/sa/<sa>`
+  or namespace-wide `principalSet://` grant reaches whichever Pod runs as that ServiceAccount, and the
+  gateway's metadata path is closed, so such a grant no longer reaches the gateway. Anything in the
+  gateway that needs Google goes through the broker.
+
+To check: `kubectl get deployment platform-agent-gateway -n kubeagents-system -o
+jsonpath='{.spec.template.spec.serviceAccountName}'` prints `platform-agent-gateway-agent` for the
+chart's default name.
+
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first four are
-settled before the run touches the cluster at all. The last five need the cluster: they are settled
-after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
-skips those — but still before any CRD, chart or Terraform change of the new release.
+settled before the run touches the cluster at all. The last six need the cluster: they are settled
+after `kubectl` has been pointed at it, and except for the breaking-change check, after a real run's
+pre-flight Secret backfills — a plan skips those — but still before any CRD, chart or Terraform
+change of the new release.
 
 - **The sources do not match the release.** The checkout's `HEAD` is not the release's commit, the
   tree has uncommitted changes, or an unpacked tree names a release other than the one asked for —
@@ -439,6 +464,13 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   [Recovering `install.env`](#recovering-installenv).
 - **`GITHUB_APP_ID` is not a number.** The token minter needs the GitHub App's numeric ID, the "App
   ID" on the App's General settings page, not its name or slug. `--dry-run` refuses it too.
+- **The move leaves behind a commit marked as a breaking change.** When the target does not
+  contain the installed commit — a rollback to an older release, or a commit build moved to a
+  release that lacks some of its commits — the run reads the commits the target lacks. It stops
+  before the Secret backfills if any has a `type!:` subject or a `BREAKING CHANGE:` footer, and
+  names each one. Read them, then re-run with `--allow-breaking-downgrade`, in any mode. `--plan`
+  warns instead. A move between two release tags to the newer one is not checked, and neither is a
+  run whose tag is read off the install. See [Rolling back a release](/kube-agents/deploy/rollback/).
 - **No Helm release.** The target namespace has no `kube-agents` release to upgrade.
 - **The memory store cannot be checked and nothing named one.** When the configuration records no
   `MEMORY`, the upgrade asks the cluster whether it runs the Hindsight memory store, so that a store

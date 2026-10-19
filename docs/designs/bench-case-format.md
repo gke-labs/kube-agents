@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -309,6 +309,12 @@ that got going (running, completed, or ended after its start), each starting onl
 `relay-report` stack's state file and what the Session KV server stored for the report's threads,
 and passes when the route answered `delivered` and every stored post is the report exactly; a
 route that delivered but stored nothing fails, and one whose send registered no thread (outcome unknown) is an error.
+`audit_chat_report_posted`, in its own module (`bench/kube_agents_bench/audit_chat_report.py`), reads
+the `audit-chat-report` stack's state file, what the Session KV server stored for the fired audit
+job's threads since the fire, and the chat report the run's `finish` left on the shell sandbox, and
+passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
+whose record predates the fire, or that did not finish every repository it started fails, and a
+silent run or one that never ended is an error.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated

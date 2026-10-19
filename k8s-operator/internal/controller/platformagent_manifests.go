@@ -693,13 +693,25 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
 
 	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
-	// ahead of the metadata server, and since the scope prune exists a management
-	// identity that changes retires the old project's profiles. Unpinned, one line in
-	// the PVC .env would re-point it, and two clean runs later every profile of the
-	// real management project would be gone. Nothing in the operator or the chart sets
-	// it, so pinning it empty costs no install anything; the script treats an empty
-	// value as unset and asks the metadata server.
+	// first, and since the scope prune exists a management identity that changes
+	// retires the old project's profiles. Unpinned, one line in the PVC .env would
+	// re-point it, and two clean runs later every profile of the real management
+	// project would be gone. Nothing in the operator or the chart sets it, so pinning it
+	// empty costs no install anything; the script treats an empty value as unset and
+	// reads GKE_PROJECT_ID next.
 	add(reconcileProjectEnvKey, "")
+
+	// GKE_PROJECT_ID, pinned to the harness's own value, for the same reason. The
+	// reconcile reads it as the management project once RECONCILE_PROJECT is empty: the
+	// gateway reaches no metadata server, so this is now the answer. The container env
+	// carries it too, but the PVC .env beats the container env, so without this pin one
+	// line there would re-point the management project exactly as above.
+	// Not on kind, where the container env deliberately carries no GKE_PROJECT_ID
+	// (buildPodTemplateSpec): pinning `kind` here would hand every reader in the
+	// gateway a project that does not exist.
+	if harness := agent.Spec.Harness; harness != nil && !harnessOnKind(harness) {
+		add(gkeProjectEnvKey, harness.ProjectID)
+	}
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -971,6 +983,9 @@ const (
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
 	reconcileProjectEnvKey = "RECONCILE_PROJECT"
+	// gkeProjectEnvKey is the management project the reconcile reads, rendered on the
+	// container and pinned in the managed .env (see renderManagedEnv).
+	gkeProjectEnvKey = "GKE_PROJECT_ID"
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.
@@ -2530,7 +2545,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 
-	saName := agentServiceAccountName(agent)
+	// The gateway's own ServiceAccount, not the broker's: see
+	// gatewayServiceAccountName.
+	saName := gatewayServiceAccountName(agent)
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
@@ -3834,8 +3851,10 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 //
 // The harness triple is part of the condition rather than a validation reported
 // elsewhere. The detector requires --project; --cluster-name requires
-// --cluster-location; and it checks that name against the cluster its credentials
-// actually reach, exiting on a mismatch. An install that asks for the detector
+// --cluster-location; and, where its in-cluster probe can reach the metadata server
+// (not inside the gateway, where the probe times out and the triple is taken on
+// trust), it checks that name against the cluster its credentials actually reach,
+// exiting on a mismatch. An install that asks for the detector
 // without naming its cluster would therefore get a restart loop for as long as the
 // pod lives, so the operator reports it as off and leaves the pod quiet.
 //
@@ -5951,13 +5970,11 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	}
 }
 
-// buildLeaderRoleBinding generates the RoleBinding manifest for leader election in the agent namespace
+// buildLeaderRoleBinding binds the leader Role to the gateway's own
+// ServiceAccount alone. Leader election runs in the gateway (leader_elect.py);
+// nothing in the credential broker's Pod touches a Lease or patches a pod, so
+// the broker, which used to share this subject, holds none of it.
 func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
-
 	return &rbacv1.RoleBinding{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -5967,13 +5984,7 @@ func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, rol
 			Name:      bindingName,
 			Namespace: agent.Namespace,
 		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      saName,
-				Namespace: agent.Namespace,
-			},
-		},
+		Subjects: []rbacv1.Subject{gatewaySubject(agent)},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "Role",
@@ -6331,11 +6342,6 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		apiPeers = formatCIDRPeers([]string{"10.96.0.1"}, true)
 	}
 
-	// The link-local address a workload actually connects to. Dataplane V2 (eBPF)
-	// evaluates policy pre-NAT, so this peer matches there on the pre-DNAT ports;
-	// Dataplane V1 DNATs first, so its token fetches are matched by rule 3 instead.
-	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
-
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
 			From: []networkingv1.NetworkPolicyPeer{
@@ -6420,47 +6426,14 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: dnsPeers,
 		},
-		// 2. GCP Metadata Server (pre-NAT link-local address). Workloads dial 169.254.169.254
-		//    on port 80 for HTTP metadata / OAuth2 token fetches. On Dataplane V2 (eBPF),
-		//    policy evaluates pre-NAT and this rule admits token fetches directly. Port 8080,
-		//    the pre-NAT ALTS handshaker port, is deliberately absent — rule 3 says why.
-		{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
-			},
-			To: linkLocalPeers,
-		},
-	}
-
-	// 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-	//    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
-	//    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
-	//    policy is evaluated pre-NAT at the socket layer and matched by rule 2. If
-	//    profile.MetadataDaemonIP == "", rule 3 is suppressed.
-	//
-	//    Google network policy guidance recommends allowing ports 988/987 (iptables) and
-	//    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
-	//    because kube-agents components use standard OAuth2/REST token fetches and no client
-	//    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
-	//    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
-	//
-	//    That is a deviation from the guidance, which warns that workloads omitting these
-	//    ports "might experience disruptions during auto-upgrades". If a token fetch starts
-	//    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
-	//    check: capture the drop's destination port and reopen 987/8080 here if it is one
-	//    of them.
-	if profile.MetadataDaemonIP != "" {
-		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
-		port := profile.MetadataDaemonPort
-		if port == 0 {
-			port = metadataDaemonDefaultPort
-		}
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(port))},
-			},
-			To: metadataDaemonPeers,
-		})
+		// No metadata-server rule. The gateway pod holds no Google identity (its
+		// ServiceAccount carries no Workload Identity annotation; the broker's does),
+		// and everything in it that called Google -- the remote MCP servers, the
+		// event watcher and the drift detector -- goes through the broker. The two
+		// rules that used to sit here admitted the link-local token fetch (port 80
+		// pre-NAT, the WI daemon port post-NAT); without them a token request from
+		// any container in the pod is dropped, which is what the conformance suite's
+		// metadata assertion checks.
 	}
 
 	egressRules = append(egressRules,
