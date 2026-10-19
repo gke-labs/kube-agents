@@ -1548,7 +1548,8 @@ class InfraAddressee(unittest.TestCase):
             def __call__(self, argv, input=None, **kwargs):
                 if input and "assignees" in json.loads(input):
                     self.calls.append(("POST", argv[argv.index("-X") + 2], json.loads(input)))
-                    return GhResult(rc=1, stderr="HTTP 422: Validation Failed")
+                    errors = [{"value": "ivan", "resource": "Issue", "field": "assignees", "code": "invalid"}]
+                    return GhResult(rc=1, stderr="gh: Validation Failed (HTTP 422)", stdout=json.dumps({"message": "Validation Failed", "errors": errors}))
                 return super().__call__(argv, input=input, **kwargs)
 
         gh = RefusesAssignees()
@@ -1560,6 +1561,15 @@ class InfraAddressee(unittest.TestCase):
         self.assertNotIn("assignees", posts[1])
         self.assertIn("@ivan", posts[1]["body"])
         self.assertEqual(issue["number"], 1300)
+
+    def test_a_failure_that_is_not_a_refusal_is_not_retried_unassigned(self):
+        gh = FakeGh(fail_writes=True)
+        tracker = post_health.gate_issue.Tracker(post_health.ghcli.Gh(runner=gh), infra=("ivan", "iris"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            issue = tracker.ensure(lost_pods(), T0, "Mon 9:00 AM ET", "brief", "9:00 AM–9:15 AM ET")
+        posts = [c[2] for c in gh.calls if c[0] == "POST"]
+        self.assertEqual([p["assignees"] for p in posts], [["ivan"]], "a 403 files nothing this tick; the next tick retries assigned")
+        self.assertIsNone(issue)
 
     def test_an_outage_is_not_addressed_to_infra(self):
         body = self.ensure(outage())

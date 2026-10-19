@@ -81,6 +81,8 @@ INFRA_BACKUP_KEY = "infra_backup"
 TOP_LEVEL_KEY_RE = r"^{key}:\s*([A-Za-z0-9-]+)\s*(?:#.*)?$"
 INFRA_ADDRESSEE = "Infra owner: @{owner}{backup} (`infra_owner` in docs/designs/domains.yaml)."
 INFRA_BACKUP_NOTE = ", backup @{backup}"
+# The issue field GitHub names when it will not assign a login.
+ASSIGNEES_FIELD = "assignees"
 JOB_NAME = "pull-kube-agents-smoke-test"
 # Where the bot looks for a human's issue first.
 OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
@@ -523,11 +525,12 @@ class Tracker:
 
     def file_addressed(self, payload: dict):
         """POST an infrastructure issue addressed to the infra owner. When
-        that fails, POST it once more without the assignee, so a login
-        GitHub will not assign costs the assignment and never the issue."""
+        GitHub refuses the assignee, POST it once more without one, so a
+        login GitHub will not assign costs the assignment and never the
+        issue. Any other failure files nothing this tick, as before."""
         addressed = self.addressed(payload)
         created = self.gh.call("POST", self.gh.path(ISSUES_PATH), addressed)
-        if created is None and "assignees" in addressed and not self.gh.dry_run:
+        if created is None and "assignees" in addressed and not self.gh.dry_run and self.gh.refused(ASSIGNEES_FIELD):
             log(f"warning: filing the issue assigned to {self.infra_owner} failed; retrying unassigned")
             created = self.gh.call("POST", self.gh.path(ISSUES_PATH), {key: value for key, value in addressed.items() if key != "assignees"})
         return created

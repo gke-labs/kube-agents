@@ -86,7 +86,7 @@ class FakeGh:
     """A `gh api` runner: open issues and per-issue comments for reads, a
     freshly numbered object for writes; records every call."""
 
-    def __init__(self, open_issues=(), closed_issues=(), comments=None, fail_list=False, fail_closed=False, refuse_assignees=False, lands_then_fails=False, fail_writes=False):
+    def __init__(self, open_issues=(), closed_issues=(), comments=None, fail_list=False, fail_closed=False, refuse_assignees=False, lands_then_fails=False, fail_writes=False, fail_comments=False):
         self.calls = []
         self.open_issues = list(open_issues)
         self.closed_issues = list(closed_issues)
@@ -96,6 +96,7 @@ class FakeGh:
         self.refuse_assignees = refuse_assignees
         self.lands_then_fails = lands_then_fails
         self.fail_writes = fail_writes
+        self.fail_comments = fail_comments
         self.next_number = 4000
 
     def __call__(self, argv, input=None, **kwargs):
@@ -104,6 +105,8 @@ class FakeGh:
         self.calls.append((method, path, body))
         if method == "GET" and "/comments" in path:
             number = int(path.split("/issues/")[1].split("/")[0])
+            if self.fail_comments:
+                return GhResult(rc=1, stderr="HTTP 502")
             return GhResult(stdout="\n".join(json.dumps(c) for c in self.comments.get(number, [])))
         if method == "GET" and "state=closed" in path:
             if self.fail_closed:
@@ -115,8 +118,12 @@ class FakeGh:
             return GhResult(stdout="\n".join(json.dumps(i) for i in self.open_issues))
         if self.fail_writes:
             return GhResult(rc=1, stderr="HTTP 403")
-        if self.refuse_assignees and body and body.get("assignees"):
-            return GhResult(rc=1, stderr="HTTP 422: Validation Failed (assignees)")
+        # True refuses every login; a tuple, the logins in it. gh prints the
+        # status to stderr and GitHub's JSON, naming the field, to stdout.
+        refused = self.refuse_assignees is True or set(body.get("assignees") or []) & set(self.refuse_assignees or ()) if body else False
+        if refused and body.get("assignees"):
+            errors = [{"value": body["assignees"][0], "resource": "Issue", "field": "assignees", "code": "invalid"}]
+            return GhResult(rc=1, stderr="gh: Validation Failed (HTTP 422)", stdout=json.dumps({"message": "Validation Failed", "errors": errors}))
         if self.lands_then_fails and body and body.get("assignees"):
             # The write landed and the call still failed (a timeout, a 5xx).
             self.open_issues.append({"number": 4100, "title": body["title"], "body": body["body"]})
@@ -256,6 +263,15 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue]))
         self.assertEqual(gh.writes(), [])
 
+    def test_a_case_name_ending_a_sentence_is_a_whole_word(self):
+        for text in ("The nightly keeps failing on case-red.", "fails (see case-red.)", "case-red...", "case-red, again"):
+            with self.subTest(text=text):
+                gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[{"number": 3998, "title": "nightly red", "body": text}]))
+                self.assertEqual(gh.writes(), [])
+        for text in ("case-red-extended.", "case-red.v2 fails", "case-red_old"):
+            with self.subTest(text=text):
+                self.assertFalse(nightly_bugs.names_case({"title": "", "body": text}, "case-red"))
+
     def test_an_issue_naming_a_longer_case_name_is_not_a_match(self):
         issue = {"number": 3997, "title": "case-red-extended flakes", "body": nightly_bugs.MARKER.format(case="case-red-extended")}
         gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue]))
@@ -312,6 +328,20 @@ class RecoveryTest(Harness):
         self.assertEqual(again.writes(), [])
         self.assertFalse([c for c in again.calls if c[0] == "PATCH"], "never closes or edits the issue")
 
+    def test_a_same_date_rerun_does_not_comment_on_the_recovery_again(self):
+        gh, _, _ = self.run_once(self.recovered_data(), FakeGh(open_issues=[self.ISSUE]))
+        [(_, _, posted)] = gh.writes()
+        rerun = self.recovered_data()
+        rerun["runs"].append(night(17, [green("case-red")], hour="09"))
+        again, _, _ = self.run_once(rerun, FakeGh(open_issues=[self.ISSUE], comments={3990: [{"body": posted["body"]}]}))
+        self.assertEqual(again.writes(), [], "one night, one recovery comment, whichever build of it")
+
+    def test_unreadable_comments_are_reported_failed(self):
+        _, out, err = self.run_once(self.recovered_data(), FakeGh(open_issues=[self.ISSUE], fail_comments=True))
+        self.assertIn("1 failed", out)
+        self.assertIn("failed: case-red", out)
+        self.assertIn("could not read the comments on #3990", err)
+
     def test_no_comment_without_an_open_issue_or_while_still_partial(self):
         gh, _, _ = self.run_once(self.recovered_data())
         self.assertEqual(gh.writes(), [])
@@ -360,10 +390,22 @@ class AssigneeTest(Harness):
         self.assertIn("domain:security", by_case["case-outsider"]["labels"])
 
     def test_a_write_that_landed_before_failing_is_not_filed_twice(self):
-        gh, out, err = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(lands_then_fails=True))
-        self.assertEqual(len(self.filed(gh)), 1, "no unassigned retry: the marker found the issue")
-        self.assertNotIn("retrying unassigned", err)
-        self.assertIn("file #4100: case-red", out)
+        doc = data(*(night(d, [red()]) for d in (15, 16, 17)))
+        gh = FakeGh(lands_then_fails=True)
+        _, out, _ = self.run_once(doc, gh)
+        self.assertEqual(len(self.filed(gh)), 1, "a timeout or 5xx is not a refusal: no retry this tick")
+        self.assertIn("failed: case-red", out)
+        # The next tick's list finds the issue the failed call created.
+        gh.calls.clear()
+        _, out, _ = self.run_once(doc, gh)
+        self.assertEqual(self.filed(gh), [])
+        self.assertIn("tracked: case-red by #4100", out)
+
+    def test_a_transient_failure_is_not_retried_unassigned(self):
+        gh, out, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(fail_writes=True))
+        [attempt] = self.filed(gh)
+        self.assertEqual(attempt["assignees"], ["alice"])
+        self.assertIn("failed: case-red", out)
 
     def test_a_refused_write_is_reported_failed_not_filed(self):
         _, out, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(fail_writes=True))
@@ -371,13 +413,23 @@ class AssigneeTest(Harness):
         self.assertIn("1 failed", out)
         self.assertIn("failed: case-red", out)
 
-    def test_an_unassignable_login_files_unassigned(self):
-        gh, _, err = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(refuse_assignees=True))
+    def test_a_refused_case_owner_falls_back_to_the_domain_owner(self):
+        gh, out, err = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(refuse_assignees=("alice",)))
+        first, second = self.filed(gh)
+        self.assertEqual(first["assignees"], ["alice"])
+        self.assertEqual(second["assignees"], ["carol"])
+        self.assertIn("**Assigned to** @carol (domain owner; GitHub refused @alice as assignee).", second["body"])
+        self.assertNotIn("Assigned to** @alice", second["body"])
+        self.assertIn("GitHub refused @alice", err)
+        self.assertIn("file #4000: case-red [nightly-red, domain:capacity, needs-triage] assign @carol", out)
+
+    def test_an_unassignable_domain_owner_too_files_unassigned_and_says_so(self):
+        gh, out, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(refuse_assignees=True))
         attempts = self.filed(gh)
-        self.assertEqual(len(attempts), 2)
-        self.assertNotIn("assignees", attempts[1])
-        self.assertIn("@carol", attempts[1]["body"])
-        self.assertIn("retrying unassigned", err)
+        self.assertEqual([a.get("assignees") for a in attempts], [["alice"], ["carol"], None])
+        self.assertIn("**Unassigned** (GitHub refused @alice, @carol as assignee). Domain owner: @carol", attempts[2]["body"])
+        self.assertNotIn("Assigned to", attempts[2]["body"])
+        self.assertIn("unassigned (GitHub refused @alice, @carol as assignee)", out)
 
 
 class DryRunTest(Harness):

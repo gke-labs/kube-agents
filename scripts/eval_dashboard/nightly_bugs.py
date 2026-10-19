@@ -42,6 +42,11 @@ night: the newest graded verdict of that date stands.
 listed in the root OWNERS file; otherwise -- ``owner: maintainers``, no
 owner, or a login OWNERS does not list -- the domain's ``owner:`` in
 ``docs/designs/domains.yaml``. The domain owner is @-mentioned either way.
+When GitHub refuses the case owner as assignee, the issue goes to the domain
+owner; when it refuses that login too, it is filed unassigned and says so. Any
+other failed write files nothing that tick: the next tick's issue list finds,
+by its marker, an issue the failed call created anyway (a timeout after the
+write).
 
 **Infra** (``nightly_infra.py`` has the rules). Two shapes file an issue
 labelled `nightly-red`, `Infra` and `needs-triage` instead of a domain label,
@@ -70,6 +75,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import functools
 import json
 import pathlib
 import re
@@ -145,12 +151,14 @@ BOT_MARKER = "<!-- kube-agents-bot:{kind} {field}={key} -->"
 BOT_MARKER_RE = re.compile(r"<!-- kube-agents-bot:(nightly-red|nightly-infra|nightly-lost) (?:case|job)=([A-Za-z0-9._-]+) -->")
 MARKER = BOT_MARKER.format(kind=KIND_RED, field=KEY_CASE, key="{case}")
 # One recovery comment per recovery, and one comment per later night: keyed
-# by the night's build.
-RECOVERY_MARKER = "<!-- kube-agents-bot:nightly-red-recovered case={case} build={build} -->"
-NIGHT_MARKER = "<!-- kube-agents-bot:{kind}-night {field}={key} build={build} -->"
-INFRA_RECOVERY_MARKER = "<!-- kube-agents-bot:{kind}-recovered {field}={key} build={build} -->"
-# A case name inside text, bounded by characters a case name cannot hold.
-NAME_IN_TEXT_RE = r"(?<![A-Za-z0-9._-]){name}(?![A-Za-z0-9._-])"
+# by the night's date, so a same-date re-run (one night) does not comment again.
+RECOVERY_MARKER = "<!-- kube-agents-bot:nightly-red-recovered case={case} night={date} -->"
+NIGHT_MARKER = "<!-- kube-agents-bot:{kind}-night {field}={key} night={date} -->"
+INFRA_RECOVERY_MARKER = "<!-- kube-agents-bot:{kind}-recovered {field}={key} night={date} -->"
+# A case name inside text, bounded by characters a case name cannot hold; a
+# `.`, `_` or `-` ends it unless a name character follows, so "fails on
+# case-red." names case-red and "case-red-extended" does not.
+NAME_IN_TEXT_RE = r"(?<![A-Za-z0-9._-]){name}(?![A-Za-z0-9]|[._-][A-Za-z0-9])"
 # GitHub's limits: a longer title or body is refused and files nothing.
 TITLE_MAX_CHARS = 256
 ISSUE_BODY_MAX_CHARS = 65536
@@ -165,7 +173,7 @@ BODY = """\
 {marker}
 `{case}` failed every graded repetition on its last {nights} graded nightly nights. Domain: **{domain_name}** (`{domain}`).
 
-**Assigned to** @{assignee} ({why}). Domain owner: @{domain_owner}{backup}.
+{addressee} Domain owner: @{domain_owner}{backup}.
 
 **Nights** (newest first; a night cut off at the job deadline, a night where nothing was graded, and a night where nearly every case failed are skipped, not counted)
 
@@ -189,6 +197,13 @@ REASON_LINE = "  - failed: {reason}"
 NO_REASON_LINE = "  - (no reason recorded)"
 WHY_CASE_OWNER = "the case's `owner:`"
 WHY_DOMAIN_OWNER = "domain owner; the case's `owner:` is {owner}"
+WHY_REFUSED = "domain owner; GitHub refused @{refused} as assignee"
+WHY_UNASSIGNED_REFUSED = "GitHub refused {refused} as assignee"
+WHY_UNASSIGNED_NO_OWNER = "`docs/designs/domains.yaml` names no owner for `{domain}`"
+ASSIGNED = "**Assigned to** @{assignee} ({why})."
+UNASSIGNED = "**Unassigned** ({why})."
+# The issue field GitHub names when it will not assign a login.
+ASSIGNEES_FIELD = gate_issue.ASSIGNEES_FIELD
 RECOVERY_COMMENT = """\
 {marker}
 `{case}` passed every graded repetition ({passed}/{graded}) on the {date} nightly: [run]({run_url}). The bot will not close this issue; the triager decides whether it is fixed.
@@ -242,9 +257,11 @@ INFRA_RECOVERY_COMMENT = """\
 INFRA_ASSIGNED = "**Assigned to** @{owner} (the infra owner in `docs/designs/domains.yaml`).{backup}"
 INFRA_BACKUP_MENTION = " Infra backup: @{backup}."
 INFRA_UNASSIGNED = "**Unassigned:** `docs/designs/domains.yaml` names no `infra_owner`."
+INFRA_REFUSED = "**Unassigned:** GitHub refused @{owner}, the infra owner in `docs/designs/domains.yaml`, as assignee.{backup}"
 JOB_RECOVERED = "The {part} part (`{job}`) ran to its verdict"
 CASE_RECOVERED = "`{case}` was graded"
 WHY_INFRA_OWNER = "infra owner"
+WHY_NO_INFRA_OWNER = "`docs/designs/domains.yaml` names no `infra_owner`"
 
 
 def log(message: str) -> None:
@@ -410,7 +427,7 @@ def night_block(streak: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_issue(case: str, domain: str, domain_row: dict, assignee: str, why: str, streak: list[dict]) -> tuple[str, str]:
+def render_issue(case: str, domain: str, domain_row: dict, assignee: str | None, why: str, streak: list[dict]) -> tuple[str, str]:
     title = TITLE.format(case=case, nights=STREAK_NIGHTS)[:TITLE_MAX_CHARS]
     backup = domain_row.get("backup")
     body = BODY.format(
@@ -419,8 +436,7 @@ def render_issue(case: str, domain: str, domain_row: dict, assignee: str, why: s
         nights=STREAK_NIGHTS,
         domain=domain,
         domain_name=domain_row.get("name") or domain,
-        assignee=assignee or UNKNOWN,
-        why=why,
+        addressee=(ASSIGNED if assignee else UNASSIGNED).format(assignee=assignee, why=why),
         domain_owner=domain_row.get("owner") or UNKNOWN,
         backup=f" (backup @{backup})" if backup else "",
         nights_block=night_block(streak),
@@ -523,7 +539,7 @@ class Filer:
             if recovered and issue:
                 done = self.recover(case, issue, recovered)
                 if done:
-                    result["recovered" if done["ok"] or self.gh.dry_run else "failed"].append(done)
+                    result["recovered" if done["ok"] else "failed"].append(done)
         self.run_infra(data, parts, active, open_issues, closed_issues, result)
         return result
 
@@ -548,9 +564,10 @@ class Filer:
                 continue
             losses = [n for n in lost["nights"] if n["lost"]]
             title = INFRA_JOB_TITLE.format(job=job, lost=len(losses), nights=nightly_infra.JOB_LOST_WINDOW)
-            body = INFRA_JOB_BODY.format(
+            body = functools.partial(
+                INFRA_JOB_BODY.format,
                 marker=BOT_MARKER.format(kind=KIND_LOST, field=KEY_JOB, key=job), part=lost["part"], job=job, lost=len(losses),
-                nights=nightly_infra.JOB_LOST_WINDOW, addressee=self.addressee(),
+                nights=nightly_infra.JOB_LOST_WINDOW,
                 nights_block="\n".join(INFRA_NIGHT_LINE.format(date=n["date"], how=n["how"], run_url=n["run_url"]) for n in reversed(lost["nights"])),
                 nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
             self.file_infra(KIND_LOST, job, losses[-1], title, body, lost["nights"], closed_issues, result)
@@ -575,19 +592,21 @@ class Filer:
                 domain = fields.get("domain") or UNKNOWN
                 job = next((n["job"] for ns in parts.values() for n in ns if n["build"] == streak[-1]["build"]), nightly.DEFAULT_NIGHTLY_JOB)
                 title = INFRA_CASE_TITLE.format(case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS)
-                body = INFRA_CASE_BODY.format(
+                body = functools.partial(
+                    INFRA_CASE_BODY.format,
                     marker=BOT_MARKER.format(kind=KIND_INFRA, field=KEY_CASE, key=case), case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS,
                     job=job, domain=domain, domain_owner=(self.domains.get(domain) or {}).get("owner") or UNKNOWN,
-                    addressee=self.addressee(),
                     nights_block="\n".join(INFRA_CASE_LINE.format(date=v["date"], reason=quoted(v["reason"]), run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
                     nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
                 self.file_infra(KIND_INFRA, case, streak[-1], title, body, streak, closed_issues, result)
 
-    def addressee(self) -> str:
+    def addressee(self, refused: bool = False) -> str:
+        """The infra issue's assignment line; ``refused`` when GitHub would
+        not assign the infra owner."""
         if not self.infra_owner:
             return INFRA_UNASSIGNED
         backup = INFRA_BACKUP_MENTION.format(backup=self.infra_backup) if self.infra_backup else ""
-        return INFRA_ASSIGNED.format(owner=self.infra_owner, backup=backup)
+        return (INFRA_REFUSED if refused else INFRA_ASSIGNED).format(owner=self.infra_owner, backup=backup)
 
     def note_night(self, kind, field, key, issue, night, what, result) -> None:
         """One comment on an open infra issue for ``night``, when it started
@@ -595,76 +614,99 @@ class Filer:
         opened, started = nightly.parse_iso(issue.get("created_at")), nightly.parse_iso(night.get("started"))
         if not (opened and started and started > opened):
             return
-        marker = NIGHT_MARKER.format(kind=kind, field=field, key=key, build=night["build"])
+        marker = NIGHT_MARKER.format(kind=kind, field=field, key=key, date=night["date"])
         comment = INFRA_NIGHT_COMMENT.format(marker=marker, date=night["date"], what=what, run_url=night["run_url"])
         done = self.comment_once(issue["number"], marker, comment)
         if done is not None:
-            result["noted" if done or self.gh.dry_run else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
+            result["noted" if done else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
 
     def file_infra(self, kind, key, newest, title, body, nights, closed_issues, result) -> None:
         """File the infra issue for ``key`` unless one closed after
-        ``newest`` already saw this streak."""
+        ``newest`` already saw this streak. ``body(addressee=...)`` renders
+        it with the assignment line."""
         closed = tracking_issue([i for i in closed_issues if closed_after(i, newest)], key, kind)
         if closed:
             result["tracked"].append({"case": key, "issue": closed["number"], "closed": True})
             return
         labels = [LABEL, INFRA_LABEL, TRIAGE_LABEL]
-        payload = {"title": title[:TITLE_MAX_CHARS], "body": body[:ISSUE_BODY_MAX_CHARS], "labels": labels}
+
+        def payload(owner, refused=False):
+            return {"title": title[:TITLE_MAX_CHARS], "body": body(addressee=self.addressee(refused))[:ISSUE_BODY_MAX_CHARS], "labels": labels,
+                    **({"assignees": [owner]} if owner else {})}
+
+        attempts = [(self.infra_owner, payload(self.infra_owner))]
         if self.infra_owner:
-            payload["assignees"] = [self.infra_owner]
-        created = self.create(payload, key, kind)
+            attempts.append((None, payload(None, refused=True)))
+        created, assignee = self.create(attempts, key)
         number = created.get("number") if isinstance(created, dict) else None
-        entry = {"case": key, "assignee": self.infra_owner, "why": WHY_INFRA_OWNER, "mention": self.infra_backup, "labels": labels,
+        why = WHY_INFRA_OWNER if assignee else WHY_UNASSIGNED_REFUSED.format(refused=f"@{self.infra_owner}") if self.infra_owner else WHY_NO_INFRA_OWNER
+        entry = {"case": key, "assignee": assignee, "why": why, "mention": self.infra_backup, "labels": labels,
                  "nights": [n["date"] for n in nights], "runs": [n["run_url"] for n in nights], "issue": number}
         result["filed" if number or self.gh.dry_run else "failed"].append(entry)
 
     def recover_infra(self, kind, field, key, issue, night, what, result) -> None:
-        marker = INFRA_RECOVERY_MARKER.format(kind=kind, field=field, key=key, build=night["build"])
+        marker = INFRA_RECOVERY_MARKER.format(kind=kind, field=field, key=key, date=night["date"])
         comment = INFRA_RECOVERY_COMMENT.format(marker=marker, what=what, date=night["date"], run_url=night["run_url"])
         done = self.comment_once(issue["number"], marker, comment)
         if done is not None:
-            result["recovered" if done or self.gh.dry_run else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
+            result["recovered" if done else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
 
     def comment_once(self, number: int, marker: str, body: str) -> bool | None:
         """Post ``body`` unless a comment already carries ``marker``: None
-        when nothing was attempted (already there, or unreadable), else
-        whether the post went through."""
+        when it is already there, else whether the post went through (or,
+        dry, would be sent). Comments that cannot be read are a failure:
+        the post is owed and was not attempted."""
         already = self.commented(number, marker)
-        if already is None or already:
+        if already:
             return None
-        return self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=number)), {"body": body}) is not None
+        if already is None:
+            log(f"warning: could not read the comments on #{number}; not commenting this tick")
+            return False
+        return self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=number)), {"body": body}) is not None or self.gh.dry_run
 
-    def create(self, payload: dict, key: str, kind: str):
-        """POST the issue; on a failure, adopt it if the call created it
-        after all (a timeout, a 5xx after the write), else file it once more
-        without the assignee (a login GitHub will not assign)."""
-        created = self.gh.call("POST", self.gh.path(ISSUES_PATH), payload)
-        if created is None and payload.get("assignees") and not self.gh.dry_run:
-            landed = tracking_issue(self.open_issues() or [], key, kind)
-            if landed:
-                return landed
-            log(f"warning: filing {key} assigned to {payload['assignees'][0]} failed; retrying unassigned")
-            created = self.gh.call("POST", self.gh.path(ISSUES_PATH), {k: v for k, v in payload.items() if k != "assignees"})
-        return created
+    def create(self, attempts: list[tuple[str | None, dict]], key: str) -> tuple[dict | None, str | None]:
+        """POST the first of ``attempts`` (``(assignee, payload)``, each
+        body saying who it is assigned to) that GitHub takes, and return it
+        with its assignee. A refused assignee moves on to the next attempt.
+        Any other failure (a timeout, a 5xx, a 403) stops: nothing more is
+        written this tick, and the next tick's issue list finds an issue the
+        call created anyway by its marker, so it is never filed twice."""
+        for assignee, payload in attempts:
+            created = self.gh.call("POST", self.gh.path(ISSUES_PATH), payload)
+            if created is not None or self.gh.dry_run:
+                return created, assignee
+            if not (assignee and self.gh.refused(ASSIGNEES_FIELD)):
+                return None, assignee
+            log(f"warning: GitHub refused @{assignee} as the assignee of {key}'s issue; trying the next")
+        return None, None
 
     def file(self, case: str, fields: dict, streak: list[dict]) -> dict:
         domain = fields.get("domain") or UNKNOWN
         row = self.domains.get(domain) or {}
-        assignee, why = resolve_assignee(fields.get("owner"), row.get("owner"), self.owners)
-        title, body = render_issue(case, domain, row, assignee, why, streak)
+        domain_owner = row.get("owner")
+        assignee, why = resolve_assignee(fields.get("owner"), domain_owner, self.owners)
+        # Who it goes to, in order: the resolved owner; the domain owner when
+        # GitHub refuses a case owner; no one, saying who was refused.
+        candidates = [(assignee, why)] if assignee else []
+        if assignee and domain_owner and assignee.lower() != domain_owner.lower():
+            candidates.append((domain_owner, WHY_REFUSED.format(refused=assignee)))
+        refused = ", ".join(f"@{login}" for login, _ in candidates)
+        candidates.append((None, WHY_UNASSIGNED_REFUSED.format(refused=refused) if refused else WHY_UNASSIGNED_NO_OWNER.format(domain=domain)))
         labels = [LABEL, DOMAIN_LABEL.format(slug=domain), TRIAGE_LABEL]
-        payload = {"title": title, "body": body, "labels": labels}
-        if assignee:
-            payload["assignees"] = [assignee]
-        created = self.create(payload, case, KIND_RED)
+        attempts, reasons = [], {}
+        for login, reason in candidates:
+            title, body = render_issue(case, domain, row, login, reason, streak)
+            attempts.append((login, {"title": title, "body": body, "labels": labels, **({"assignees": [login]} if login else {})}))
+            reasons[login] = reason
+        created, assignee = self.create(attempts, case)
         number = created.get("number") if isinstance(created, dict) else None
         if number:
             log(f"nightly bug: filed #{number} for {case}")
-        return {"case": case, "domain": domain, "assignee": assignee, "why": why, "mention": row.get("owner"),
+        return {"case": case, "domain": domain, "assignee": assignee, "why": reasons[assignee], "mention": domain_owner,
                 "labels": labels, "nights": [v["date"] for v in streak], "runs": [v["run_url"] for v in streak], "issue": number}
 
     def recover(self, case: str, issue: dict, night: dict) -> dict | None:
-        marker = RECOVERY_MARKER.format(case=case, build=night["build"])
+        marker = RECOVERY_MARKER.format(case=case, date=night["date"])
         body = RECOVERY_COMMENT.format(marker=marker, case=case, passed=night["passed"], graded=night["graded"], date=night["date"], run_url=night["run_url"])
         posted = self.comment_once(issue["number"], marker, body)
         if posted is None:
@@ -687,7 +729,8 @@ def summary(result: dict, dry_run: bool) -> str:
     lines = [head]
     for f in result["filed"]:
         issue = f" #{f['issue']}" if f["issue"] else ""
-        lines.append(f"  file{issue}: {f['case']} [{', '.join(f['labels'])}] assign @{f['assignee']} ({f['why']}); mention @{f['mention']}; nights {', '.join(f['nights'])}")
+        who = f"assign @{f['assignee']}" if f["assignee"] else "unassigned"
+        lines.append(f"  file{issue}: {f['case']} [{', '.join(f['labels'])}] {who} ({f['why']}); mention @{f['mention']}; nights {', '.join(f['nights'])}")
         lines.extend(f"    {url}" for url in f["runs"] if url)
     lines += [f"  recovered: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["recovered"]]
     lines += [f"  new night: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["noted"]]

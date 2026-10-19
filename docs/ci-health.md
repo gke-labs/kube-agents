@@ -689,7 +689,8 @@ line naming that owner and mentioning `infra_backup`; their label and dedupe
 are as above. An OUTAGE's issue, a shared break that may be any case's code,
 is not assigned. When `domains.yaml` names no infra owner the issues are filed
 as before, unassigned; when GitHub refuses the assignee, the issue is filed
-again without one, so the assignment never costs the issue.
+again without one, so the assignment never costs the issue. Any other failed
+write (a timeout, a 5xx, a 403) files nothing that tick.
 
 ## Nightly bugs
 
@@ -721,8 +722,11 @@ failure is closed in favour of the infra issue. It is assigned to the case's
 `owner:` when the root `OWNERS` file lists that login, and otherwise (an
 `owner: maintainers`, no owner, or a login `OWNERS` does not list) to the
 domain's `owner:` in
-[`docs/designs/domains.yaml`](designs/domains.yaml). A login GitHub refuses to
-assign files the issue unassigned, with the mentions intact.
+[`docs/designs/domains.yaml`](designs/domains.yaml). When GitHub refuses the
+case owner as assignee, the issue goes to the domain owner instead; when it
+refuses that login too, the issue is filed unassigned and says who was refused.
+Any other failed write (a timeout, a 5xx, a 403) files nothing that tick; the
+next tick's list finds, by its marker, an issue the failed call created anyway.
 
 An open `nightly-red` issue that carries the case's marker, or (for an issue
 without a marker, a human's) names the case as a whole word in its title or
@@ -764,7 +768,8 @@ comments. A closed one counts as for domain bugs. While it is open, every later
 lost night of the part, or kept night of the case, gets one comment whether or
 not the threshold is met again, and a later clean night (the part runs to its
 verdict, or the case is graded) gets one recovery comment. With no
-`infra_owner` in `domains.yaml` the issue is filed unassigned and says so.
+`infra_owner` in `domains.yaml`, or when GitHub refuses that login, the issue is
+filed unassigned and says so.
 
 The step runs in dry run until armed: it reads the open issues and the comments
 it needs, prints what it would file, comment and assign, and writes nothing.
