@@ -60,6 +60,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 | `stall-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `stall_watch.py` |
 | `upgrade-readiness-watch` | Platform Agent | `10 10 * * *` | Daily 10:10 | yes | `upgrade_readiness_watch.py` |
+| `leeway-watch` | Platform Agent | `30 8 * * *` | Daily 08:30 | yes | `leeway_watch.py` |
 | `chat-delivery-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `chat_delivery_watch.py` |
 
 <!-- prettier-ignore-end -->

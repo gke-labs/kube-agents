@@ -1,0 +1,1004 @@
+#!/usr/bin/env python3
+"""leeway_watch.py - sweep fleet clusters daily with `leeway report` and
+surface new, worsened, or weekly-refreshed topology skew findings.
+
+The `topology-drift` skill diagnoses single-cluster and fleet-wide placement
+drift (`leeway.placement_drift`), unschedulable topology skew
+(`leeway.unschedulable_skew`), unavailable topology domains
+(`leeway.domain_unavailable`), and compute-class priority rank cascades
+(`leeway.rank_cascade`, `leeway.scaleup_stalled`) on demand. This job runs once
+a day from the Platform Agent's cron roster (`no_agent: true`, `deliver:
+"chat"`) so the fleet learns about single-zone blast-radius concentration and
+broken spread constraints before a zone outage or node drain exposes them.
+
+Which clusters. Target clusters are resolved on the agent pod:
+1. `LEEWAY_WATCH_CLUSTERS` when set (comma-separated `project/location/cluster`
+   triples), passed directly to `leeway report --clusters`.
+2. Otherwise `LEEWAY_WATCH_PROJECTS` when set, or the management project
+   (`GCP_PROJECT_ID`) together with every project a Cluster Agent profile's
+   `cluster_identity` names; with neither, the sandbox's `gcloud config
+   get-value project`; and with nothing at all the tick fails closed rather
+   than enumerate every project the credential can list. Each project is swept
+   via `leeway report --topology-tier-c-signals --clusters-from <project>`.
+
+Where it runs. `leeway` is baked into `agent-sandbox` at `/usr/local/bin/leeway`
+and routes GCP Container API discovery and Kubernetes object reads through the
+sandbox's `credential-proxy` shims (`CREDENTIAL_PROXY_URL`). `leeway_watch.py`
+invokes `leeway report` in the sandbox through `sandbox_exec.run` and parses
+the `leeway.report/v1alpha1` JSON document from stdout.
+
+State ledger and 7-day reminder gate. Under `<profile home>/leeway/`:
+- `ledger.json`: tracks each active finding by key
+  (`<cluster>/<namespace>/<kind>/<name>/<topologyKey>`) with `first_seen`,
+  `last_report_at`, `suspected_cause`, `severity`, `tier`, `max_domain_share`,
+  and `observed_skew`.
+- `reports/<timestamp>.md` and `reports/<timestamp>.json` (with `latest.md` and
+  `latest.json` symlinks, keeping the newest 10 pairs): written whenever at
+  least one finding is due.
+A finding is due for reporting when:
+1. It is **new** (not present in `ledger.json`),
+2. Its **suspected cause changed or severity escalated** since the last report,
+   or
+3. Its **7-day scheduled refresh** window has elapsed (`now - last_report_at >=
+   7 days - 10m`).
+Findings on clusters whose scan succeeded (`status == "ok"`) and that are no
+longer present are retired from `ledger.json` with a single resolution line.
+Clusters whose scan failed (`status == "error"`) or whose project could not be
+scanned retain their existing ledger entries so a transient outage does not
+erase state and re-page as new tomorrow. A quiet tick prints nothing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gitops_workspace  # noqa: E402
+import sandbox_exec  # noqa: E402
+
+# Where the job keeps its ledger and reports, under the agent home.
+HOME_ENV = "HERMES_HOME"
+DEFAULT_HOME = "/opt/data"
+PROFILE_HOME = Path("profiles") / "platform"
+WATCH_HOME_ENV = "LEEWAY_WATCH_HOME"
+WATCH_DIR_NAME = "leeway"
+LEDGER_FILE_NAME = "ledger.json"
+LEDGER_TMP_SUFFIX = ".tmp"
+LEDGER_SCHEMA_KEY = "schema_version"
+LEDGER_SCHEMA_VERSION = 1
+REPORTS_DIR_NAME = "reports"
+REPORT_MARKDOWN_SUFFIX = ".md"
+REPORT_JSON_SUFFIX = ".json"
+REPORT_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+LATEST_MD_LINK_NAME = "latest.md"
+LATEST_JSON_LINK_NAME = "latest.json"
+REPORTS_KEPT = 10
+JSON_INDENT = 2
+
+# Refresh cadence: report once on appearance or cause/severity escalation, then
+# once a week while the finding persists.
+REFRESH_DAYS_ENV = "LEEWAY_WATCH_REFRESH_DAYS"
+REFRESH_DAYS_DEFAULT = 7
+REFRESH_DAYS_MAX = 365
+REFRESH_SLACK_SECONDS = 10 * 60
+
+# Cluster and project discovery.
+CLUSTERS_ENV = "LEEWAY_WATCH_CLUSTERS"
+PROJECTS_ENV = "LEEWAY_WATCH_PROJECTS"
+CSV_SEPARATOR = ","
+MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
+PROFILES_DIR = "profiles"
+IDENTITY_PROJECT_KEY = "project"
+CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
+PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
+NO_PROJECT_DETAIL = (
+    f"no GCP project: set {CLUSTERS_ENV}, {PROJECTS_ENV}, or {MANAGEMENT_PROJECT_ENV}, "
+    "onboard a cluster, or configure gcloud in the sandbox; "
+    "refusing to let the sweep enumerate every project the credential can list"
+)
+
+# How `leeway report` runs in the sandbox.
+LEEWAY_EXECUTABLE = "leeway"
+LEEWAY_REPORT_SUBCOMMAND = "report"
+TIER_C_FLAG = "--topology-tier-c-signals"
+CLUSTERS_FLAG = "--clusters"
+CLUSTERS_FROM_FLAG = "--clusters-from"
+PROJECT_TIMEOUT_SECONDS = 900
+TICK_BUDGET_SECONDS = 2700
+MIN_PROJECT_RUN_SECONDS = 60
+STDERR_EXCERPT_CHARS = 300
+TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
+BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before {target} could run"
+SCAN_CUT_SHORT_DETAIL = "leeway scan for {target} cut short by the tick budget"
+SCAN_FAILED_DETAIL = "leeway scan for {target} failed: {error}"
+
+# `leeway.report/v1alpha1` schema vocabulary.
+SCHEMA_VERSION_VALUE = "leeway.report/v1alpha1"
+STATUS_OK = "ok"
+STATUS_ERROR = "error"
+CLUSTER_KEY_SEPARATOR = "/"
+CLUSTER_WIDE_NAMESPACE = "_cluster"
+
+# A2A blackboard topic (`a2a.topics.agent.platform.topology-skew`).
+NATS_URL_ENV = "NATS_URL"
+A2A_EXECUTABLE = "a2a"
+A2A_TOPIC_NAME = "topology-skew"
+A2A_PUBLISH_TIMEOUT_SECONDS = 30
+
+# Severity ordering for escalation detection.
+SEVERITY_RANKS: dict[str, int] = {
+    "info": 1,
+    "warning": 2,
+    "critical": 3,
+}
+
+# Trigger reasons.
+REASON_NEW = "new finding"
+REASON_CHANGED = "cause/severity change"
+REASON_REFRESH = "scheduled refresh"
+
+# Ledger keys.
+FINDINGS_KEY = "findings"
+FIRST_SEEN_KEY = "first_seen"
+LAST_REPORT_KEY = "last_report_at"
+LAST_TICK_KEY = "last_tick"
+PROJECT_RUNS_KEY = "project_runs"
+SCAN_ERRORS_KEY = "scan_errors"
+ANNOUNCED_KEY = "announced"
+ANNOUNCED_PARTIAL_KEY = "partial"
+FAILURE_MARKER_FILE_NAME = "last-failure.txt"
+
+# Output lines (stdout is `deliver: "chat"`).
+LINE_PREFIX = "leeway"
+RECOVERED_LINE = "{prefix} watch: the tick runs again"
+FAILED_LINE = "{prefix} watch: {what} failed: {detail}"
+FAILED_WHAT_TICK = "the tick"
+FAILED_WHAT_WRITE = "writing the ledger or the report"
+RETIRED_LINE = "{prefix}: {count} finding(s) resolved ({names}); retired from the watch"
+REPORT_LINE = (
+    "{prefix}: {due_count} finding(s) due ({reasons}) across {cluster_count} cluster(s) ({clusters}); "
+    "report on the gateway pod at {path}; next refresh after {next_date}"
+)
+PARTIAL_LINE = (
+    "{prefix} watch: the fleet scan was partial ({errors} error(s)): {reasons}; "
+    "findings on unreadable clusters are retained until read again"
+)
+PARTIAL_CLEARED_LINE = "{prefix} watch: the fleet scan reads every target again"
+DRY_RUN_WOULD_REPORT = "dry run: would report {count} finding(s) ({reasons}) across {clusters}: {names}"
+DRY_RUN_WOULD_RETIRE = "dry run: would retire {count} resolved finding(s) ({names})"
+DRY_RUN_NOTHING_DUE = "dry run: nothing due; active findings: {count}"
+MAX_NAMES_IN_LINE = 6
+NAMES_OVERFLOW = ", +{more} more"
+WRITE_FAILED_EXIT = 2
+DATE_FORMAT = "%Y-%m-%d"
+
+
+class SandboxTimedOut(RuntimeError):
+    """The sandbox run hit the client-side timeout."""
+
+
+class WriteFailed(Exception):
+    """The ledger or a report file could not be written; the tick's result must not be claimed."""
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def iso(moment: datetime) -> str:
+    return moment.isoformat()
+
+
+def parse_iso(value: object) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def refresh_days() -> int:
+    raw = os.environ.get(REFRESH_DAYS_ENV, "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return REFRESH_DAYS_DEFAULT
+    return value if 0 < value <= REFRESH_DAYS_MAX else REFRESH_DAYS_DEFAULT
+
+
+def profile_home() -> Path:
+    """The platform profile's home: HERMES_HOME itself under the ticker, or the
+    profile directory beneath it from a shell in the container."""
+    home = Path(os.environ.get(HOME_ENV, DEFAULT_HOME))
+    beneath = home / PROFILE_HOME
+    return beneath if beneath.is_dir() else home
+
+
+def watch_home() -> Path:
+    override = os.environ.get(WATCH_HOME_ENV, "").strip()
+    if override:
+        return Path(override)
+    return profile_home() / WATCH_DIR_NAME
+
+
+# --- cluster & project discovery ---------------------------------------------
+
+
+def explicit_clusters() -> list[str]:
+    """Explicit cluster triples from LEEWAY_WATCH_CLUSTERS, when set."""
+    raw = os.environ.get(CLUSTERS_ENV, "").strip()
+    if not raw:
+        return []
+    return sorted({c.strip() for c in raw.split(CSV_SEPARATOR) if c.strip()})
+
+
+def roster_projects() -> set[str]:
+    """The projects the Cluster Agent profiles' identities name."""
+    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity
+
+    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
+    if not base.is_dir():
+        return set()
+    found: set[str] = set()
+    for home in base.iterdir():
+        if home.name in RESERVED_PROFILES or not home.is_dir():
+            continue
+        try:
+            identity = read_cluster_identity(home)
+        except Exception:  # noqa: BLE001
+            identity = None
+        if identity and identity.get(IDENTITY_PROJECT_KEY):
+            found.add(identity[IDENTITY_PROJECT_KEY])
+    return found
+
+
+def projects() -> list[str]:
+    explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(CSV_SEPARATOR) if p.strip()]
+    if explicit:
+        return sorted(set(explicit))
+    found = roster_projects()
+    management = os.environ.get(MANAGEMENT_PROJECT_ENV, "").strip()
+    if management:
+        found.add(management)
+    if found:
+        return sorted(found)
+    try:
+        completed = sandbox_exec.run(list(CONFIG_PROJECT_ARGV), timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(TIMED_OUT_DETAIL.format(seconds=PROJECT_LOOKUP_TIMEOUT_SECONDS)) from None
+    configured = (completed.stdout or "").strip()
+    if not configured:
+        raise RuntimeError(NO_PROJECT_DETAIL)
+    return [configured]
+
+
+def order_by_least_recent(items: list[str], stamps: dict[str, Any]) -> list[str]:
+    """Order targets so those never run or run longest ago go first."""
+    return sorted(items, key=lambda item: (str(stamps.get(item) or ""), item))
+
+
+# --- sandbox execution -------------------------------------------------------
+
+
+def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Run `leeway report --topology-tier-c-signals <flag> <value>` in the sandbox."""
+    argv = [LEEWAY_EXECUTABLE, LEEWAY_REPORT_SUBCOMMAND, TIER_C_FLAG, flag, value]
+    try:
+        completed = sandbox_exec.run(argv, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        raise SandboxTimedOut(TIMED_OUT_DETAIL.format(seconds=timeout)) from None
+    stdout = (completed.stdout or "").strip()
+    if not stdout:
+        stderr = (completed.stderr or "").strip()
+        excerpt = stderr[-STDERR_EXCERPT_CHARS:] if stderr else "no output"
+        raise RuntimeError(f"leeway exited {completed.returncode} without a report: {excerpt}")
+    try:
+        report = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"leeway output was not valid JSON: {exc}") from exc
+    if not isinstance(report, dict) or not isinstance(report.get("clusters"), list):
+        raise RuntimeError("leeway report JSON is missing the 'clusters' list")
+    return report
+
+
+def merge_reports(reports: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
+    """Combine per-project `leeway.report/v1alpha1` documents into one."""
+    clusters_by_name: dict[str, dict[str, Any]] = {}
+    for rep in reports:
+        for cr in rep.get("clusters", []):
+            if isinstance(cr, dict) and cr.get("cluster"):
+                clusters_by_name[str(cr["cluster"])] = cr
+    merged_clusters = [clusters_by_name[k] for k in sorted(clusters_by_name)]
+    succeeded = 0
+    failed = 0
+    topo_total = 0
+    rank_total = 0
+    by_severity: dict[str, int] = {}
+    by_tier: dict[str, int] = {}
+    for cr in merged_clusters:
+        if cr.get("status") == STATUS_OK:
+            succeeded += 1
+        else:
+            failed += 1
+        t_findings = cr.get("topology_findings") or []
+        r_findings = cr.get("rank_findings") or []
+        topo_total += len(t_findings)
+        rank_total += len(r_findings)
+        for f in list(t_findings) + list(r_findings):
+            if not isinstance(f, dict):
+                continue
+            sev = str(f.get("severity") or "")
+            tier = str(f.get("tier") or "")
+            if sev:
+                by_severity[sev] = by_severity.get(sev, 0) + 1
+            if tier:
+                by_tier[tier] = by_tier.get(tier, 0) + 1
+    summary: dict[str, Any] = {
+        "clusters_total": len(merged_clusters),
+        "clusters_succeeded": succeeded,
+        "clusters_failed": failed,
+        "topology_findings": topo_total,
+        "rank_findings": rank_total,
+    }
+    if by_severity:
+        summary["by_severity"] = by_severity
+    if by_tier:
+        summary["by_tier"] = by_tier
+    return {
+        "schema_version": SCHEMA_VERSION_VALUE,
+        "generated_at": iso(now),
+        "clusters": merged_clusters,
+        "summary": summary,
+    }
+
+
+# --- findings extraction & gate ----------------------------------------------
+
+
+def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a single topology_findings entry with its canonical ledger key."""
+    subject = finding.get("subject") if isinstance(finding.get("subject"), dict) else {}
+    ns = str(subject.get("namespace") or CLUSTER_WIDE_NAMESPACE)
+    s_kind = str(subject.get("kind") or "Cluster")
+    s_name = str(subject.get("name") or finding.get("kind") or "unknown")
+    replicas = int(subject.get("replicas") or 0)
+    topo_key = str(finding.get("topologyKey") or "unknown")
+    f_kind = str(finding.get("kind") or "leeway.placement_drift")
+    key = CLUSTER_KEY_SEPARATOR.join([cluster, ns, s_kind, s_name, topo_key, f_kind])
+
+    score = finding.get("score") if isinstance(finding.get("score"), dict) else {}
+    domains = finding.get("domains") if isinstance(finding.get("domains"), list) else []
+    max_actual = 0
+    total_actual = 0
+    domain_parts: list[str] = []
+    for d in domains:
+        if not isinstance(d, dict):
+            continue
+        d_name = str(d.get("domain") or "?")
+        actual = int(d.get("actual") or 0)
+        if actual > max_actual:
+            max_actual = actual
+        total_actual += actual
+        domain_parts.append(f"{d_name}: {actual}")
+    denom = replicas if replicas > 0 else total_actual
+    max_share = float(score.get("maxDomainShare") or (max_actual / denom if denom > 0 else 0.0))
+    blast_pct = round(max_share * 100)
+    blast_radius = f"{max_actual}/{denom} ({blast_pct}%)" if denom > 0 else "n/a"
+
+    remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
+    return {
+        "key": key,
+        "category": "topology",
+        "cluster": cluster,
+        "kind": f_kind,
+        "namespace": ns,
+        "subject_kind": s_kind,
+        "subject_name": s_name,
+        "replicas": replicas,
+        "topology_key": topo_key,
+        "tier": str(finding.get("tier") or ""),
+        "severity": str(finding.get("severity") or "warning"),
+        "suspected_cause": str(finding.get("suspectedCause") or "unknown"),
+        "contributing_factors": list(finding.get("contributingFactors") or []),
+        "observed_skew": int(score.get("observedSkew") or 0),
+        "max_domain_share": round(max_share, 4),
+        "distribution_display": ", ".join(domain_parts) if domain_parts else "n/a",
+        "blast_radius_display": blast_radius,
+        "remediation": {
+            "kind": str(remediation.get("kind") or ""),
+            "summary": str(remediation.get("summary") or ""),
+            "yaml": str(remediation.get("yaml") or ""),
+        },
+        "raw": finding,
+    }
+
+
+def normalize_rank_finding(cluster: str, finding: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a single rank_findings entry with its canonical ledger key."""
+    cc_name = str(finding.get("computeClass") or "unknown")
+    f_kind = str(finding.get("kind") or "leeway.rank_cascade")
+    key = CLUSTER_KEY_SEPARATOR.join([cluster, CLUSTER_WIDE_NAMESPACE, "ComputeClass", cc_name, f_kind])
+    remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
+    active_rank = finding.get("activeRank")
+    floor_share = float(finding.get("floorShare") or 0.0)
+    return {
+        "key": key,
+        "category": "compute_class",
+        "cluster": cluster,
+        "kind": f_kind,
+        "namespace": CLUSTER_WIDE_NAMESPACE,
+        "subject_kind": "ComputeClass",
+        "subject_name": cc_name,
+        "replicas": int(finding.get("unreadyPods") or 0),
+        "topology_key": f"rank:{active_rank}" if active_rank is not None else "compute-class",
+        "tier": str(finding.get("tier") or ""),
+        "severity": str(finding.get("severity") or "warning"),
+        "suspected_cause": str(finding.get("suspectedCause") or "unknown"),
+        "contributing_factors": list(finding.get("contributingFactors") or []),
+        "observed_skew": int(active_rank or 0),
+        "max_domain_share": round(floor_share, 4),
+        "distribution_display": f"activeRank={active_rank}, floorShare={round(floor_share * 100)}%",
+        "blast_radius_display": f"floorShare {round(floor_share * 100)}%",
+        "remediation": {
+            "kind": str(remediation.get("kind") or ""),
+            "summary": str(remediation.get("summary") or ""),
+            "yaml": str(remediation.get("yaml") or ""),
+        },
+        "raw": finding,
+    }
+
+
+def extract_findings(report: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, str]]:
+    """Extract normalized findings, ok clusters, and per-cluster errors from a report."""
+    findings: dict[str, dict[str, Any]] = {}
+    ok_clusters: set[str] = set()
+    cluster_errors: dict[str, str] = {}
+    for cr in report.get("clusters", []):
+        if not isinstance(cr, dict):
+            continue
+        cluster = str(cr.get("cluster") or "").strip()
+        if not cluster:
+            continue
+        if cr.get("status") == STATUS_OK:
+            ok_clusters.add(cluster)
+            for tf in cr.get("topology_findings") or []:
+                if isinstance(tf, dict):
+                    norm = normalize_topology_finding(cluster, tf)
+                    findings[norm["key"]] = norm
+            for rf in cr.get("rank_findings") or []:
+                if isinstance(rf, dict):
+                    norm = normalize_rank_finding(cluster, rf)
+                    findings[norm["key"]] = norm
+        else:
+            cluster_errors[cluster] = str(cr.get("error") or "cluster scan failed")
+    return findings, ok_clusters, cluster_errors
+
+
+def finding_trigger_reason(
+    item: dict[str, Any],
+    prior: dict[str, Any] | None,
+    now: datetime,
+    days: int,
+) -> str | None:
+    """Return why a finding is due to be reported on this tick, or None if not due."""
+    if not prior or not isinstance(prior, dict):
+        return REASON_NEW
+    prior_cause = str(prior.get("suspected_cause") or "")
+    prior_sev = str(prior.get("severity") or "")
+    cur_cause = str(item.get("suspected_cause") or "")
+    cur_sev = str(item.get("severity") or "")
+    if cur_cause != prior_cause or SEVERITY_RANKS.get(cur_sev, 0) > SEVERITY_RANKS.get(prior_sev, 0):
+        return REASON_CHANGED
+    last_reported = parse_iso(prior.get(LAST_REPORT_KEY))
+    if last_reported is None:
+        return REASON_NEW
+    window = timedelta(days=days) - timedelta(seconds=REFRESH_SLACK_SECONDS)
+    if now - last_reported >= window:
+        return REASON_REFRESH
+    return None
+
+
+def short_finding_label(item: dict[str, Any]) -> str:
+    """Concise human label for chat lines."""
+    cluster_short = str(item.get("cluster") or "").rsplit("/", 1)[-1]
+    ns = str(item.get("namespace") or "")
+    name = str(item.get("subject_name") or "")
+    if ns and ns != CLUSTER_WIDE_NAMESPACE:
+        return f"{cluster_short}:{ns}/{name}"
+    return f"{cluster_short}:{name}"
+
+
+def format_name_list(names: list[str], limit: int = MAX_NAMES_IN_LINE) -> str:
+    if len(names) <= limit:
+        return ", ".join(names)
+    shown = ", ".join(names[:limit])
+    return shown + NAMES_OVERFLOW.format(more=len(names) - limit)
+
+
+# --- ledger & report persistence ---------------------------------------------
+
+
+def load_ledger(home: Path) -> dict[str, Any]:
+    path = home / LEDGER_FILE_NAME
+    if not path.is_file():
+        return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, FINDINGS_KEY: {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, FINDINGS_KEY: {}}
+    if not isinstance(data, dict):
+        return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, FINDINGS_KEY: {}}
+    if not isinstance(data.get(FINDINGS_KEY), dict):
+        data[FINDINGS_KEY] = {}
+    data[LEDGER_SCHEMA_KEY] = LEDGER_SCHEMA_VERSION
+    return data
+
+
+def save_ledger(home: Path, ledger: dict[str, Any]) -> None:
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        target = home / LEDGER_FILE_NAME
+        tmp = home / (LEDGER_FILE_NAME + LEDGER_TMP_SUFFIX)
+        tmp.write_text(json.dumps(ledger, indent=JSON_INDENT, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError as exc:
+        raise WriteFailed(f"cannot write ledger at {home / LEDGER_FILE_NAME}: {exc}") from exc
+
+
+def render_markdown_report(
+    report: dict[str, Any],
+    findings: dict[str, dict[str, Any]],
+    due_reasons: dict[str, str],
+    scan_errors: dict[str, str],
+    now: datetime,
+    days: int,
+) -> str:
+    next_date = (now + timedelta(days=days)).strftime(DATE_FORMAT)
+    reasons_counts: dict[str, int] = {}
+    for reason in due_reasons.values():
+        reasons_counts[reason] = reasons_counts.get(reason, 0) + 1
+    reasons_summary = ", ".join(f"{count} {reason}" for reason, count in sorted(reasons_counts.items()))
+
+    lines: list[str] = [
+        "# Topology Skew & Leeway Report",
+        "",
+        (
+            f"Produced {iso(now)} by the `leeway-watch` job ({reasons_summary}). "
+            f"The next scheduled refresh is after {next_date} while any finding persists."
+        ),
+        "",
+        "## Fleet Summary",
+        "",
+        "| Cluster | Status | Topology Findings | Rank Findings | Due This Tick |",
+        "| ------- | ------ | ----------------: | ------------: | ------------: |",
+    ]
+    for cr in report.get("clusters", []):
+        if not isinstance(cr, dict):
+            continue
+        c_name = str(cr.get("cluster") or "")
+        status = str(cr.get("status") or "")
+        t_count = len(cr.get("topology_findings") or [])
+        r_count = len(cr.get("rank_findings") or [])
+        c_due = sum(1 for k, f in findings.items() if f["cluster"] == c_name and k in due_reasons)
+        lines.append(f"| `{c_name}` | `{status}` | {t_count} | {r_count} | {c_due} |")
+
+    lines.extend(
+        [
+            "",
+            "## Findings",
+            "",
+            "| Cluster | Workload / Subject | Axis | Tier | Severity | Blast Radius | Distribution | Suspected Cause | Trigger |",
+            "| ------- | ------------------ | ---- | :--: | -------- | ------------ | ------------ | --------------- | ------- |",
+        ]
+    )
+    for key in sorted(findings):
+        item = findings[key]
+        subj = (
+            f"`{item['namespace']}/{item['subject_kind']}/{item['subject_name']}`"
+            if item["namespace"] != CLUSTER_WIDE_NAMESPACE
+            else f"`{item['subject_kind']}/{item['subject_name']}`"
+        )
+        trigger = due_reasons.get(key, "active")
+        lines.append(
+            f"| `{item['cluster']}` | {subj} | `{item['topology_key']}` | {item['tier'] or '—'} | "
+            f"`{item['severity']}` | {item['blast_radius_display']} | {item['distribution_display']} | "
+            f"`{item['suspected_cause']}` | {trigger} |"
+        )
+
+    lines.extend(["", "## Remediation Details", ""])
+    for key in sorted(findings):
+        item = findings[key]
+        subj = (
+            f"{item['namespace']}/{item['subject_kind']}/{item['subject_name']}"
+            if item["namespace"] != CLUSTER_WIDE_NAMESPACE
+            else f"{item['subject_kind']}/{item['subject_name']}"
+        )
+        rem = item.get("remediation") or {}
+        lines.append(f"### `{item['cluster']}` — `{subj}` (`{item['kind']}`)")
+        lines.append("")
+        lines.append(f"- **Severity / Tier:** `{item['severity']}` (Tier {item['tier'] or '—'})")
+        lines.append(f"- **Topology Key:** `{item['topology_key']}`")
+        lines.append(f"- **Replica Distribution:** {item['distribution_display']}")
+        lines.append(f"- **Single-Zone Blast Radius:** {item['blast_radius_display']}")
+        lines.append(f"- **Suspected Cause:** `{item['suspected_cause']}`")
+        if item.get("contributing_factors"):
+            lines.append(f"- **Contributing Factors:** {', '.join(item['contributing_factors'])}")
+        if rem.get("kind") or rem.get("summary"):
+            lines.append(f"- **Remediation (`{rem.get('kind') or 'action'}`):** {rem.get('summary')}")
+        if rem.get("yaml"):
+            lines.extend(["", "```yaml", str(rem["yaml"]).rstrip(), "```"])
+        lines.append("")
+
+    if scan_errors:
+        lines.extend(["## Scan Errors", ""])
+        for target, err in sorted(scan_errors.items()):
+            lines.append(f"- `{target}`: {err}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def update_symlink(link: Path, target_name: str) -> None:
+    tmp = link.with_name(link.name + LEDGER_TMP_SUFFIX)
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+    tmp.symlink_to(target_name)
+    os.replace(tmp, link)
+
+
+def prune_old_reports(reports_dir: Path) -> None:
+    md_files = sorted(
+        p for p in reports_dir.glob(f"*{REPORT_MARKDOWN_SUFFIX}") if not p.is_symlink()
+    )
+    excess = len(md_files) - REPORTS_KEPT
+    if excess <= 0:
+        return
+    for old_md in md_files[:excess]:
+        old_json = old_md.with_suffix(REPORT_JSON_SUFFIX)
+        for p in (old_md, old_json):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def write_report_files(
+    home: Path,
+    report: dict[str, Any],
+    markdown: str,
+    now: datetime,
+) -> Path:
+    reports_dir = home / REPORTS_DIR_NAME
+    stamp = now.strftime(REPORT_TIMESTAMP_FORMAT)
+    md_name = stamp + REPORT_MARKDOWN_SUFFIX
+    json_name = stamp + REPORT_JSON_SUFFIX
+    md_path = reports_dir / md_name
+    json_path = reports_dir / json_name
+    try:
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        md_path.write_text(markdown, encoding="utf-8")
+        json_path.write_text(json.dumps(report, indent=JSON_INDENT, sort_keys=True) + "\n", encoding="utf-8")
+        update_symlink(reports_dir / LATEST_MD_LINK_NAME, md_name)
+        update_symlink(reports_dir / LATEST_JSON_LINK_NAME, json_name)
+        prune_old_reports(reports_dir)
+    except OSError as exc:
+        raise WriteFailed(f"cannot write report under {reports_dir}: {exc}") from exc
+    return md_path
+
+
+def publish_blackboard_topic(summary_text: str, json_path: Path) -> bool:
+    """Publish the latest leeway report to `agent.platform.topology-skew` when the A2A bus is configured."""
+    if not os.environ.get(NATS_URL_ENV, "").strip() or not shutil.which(A2A_EXECUTABLE):
+        return False
+    argv = [
+        A2A_EXECUTABLE,
+        "topics",
+        "write",
+        A2A_TOPIC_NAME,
+        "--text",
+        summary_text,
+        "--data",
+        f"@{json_path}",
+    ]
+    try:
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=A2A_PUBLISH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0
+
+
+# --- failure marker ----------------------------------------------------------
+
+
+def record_tick_failure(home: Path, detail: str, *, dry_run: bool) -> list[str]:
+    line = FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_TICK, detail=detail)
+    if dry_run:
+        return [line]
+    marker = home / FAILURE_MARKER_FILE_NAME
+    try:
+        if marker.is_file() and marker.read_text(encoding="utf-8").strip() == detail:
+            return []
+        home.mkdir(parents=True, exist_ok=True)
+        marker.write_text(detail + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return [line]
+
+
+def clear_tick_failure(home: Path, *, dry_run: bool) -> list[str]:
+    marker = home / FAILURE_MARKER_FILE_NAME
+    if dry_run or not marker.is_file():
+        return []
+    try:
+        marker.unlink()
+    except OSError:
+        return []
+    return [RECOVERED_LINE.format(prefix=LINE_PREFIX)]
+
+
+# --- main tick ---------------------------------------------------------------
+
+
+def sweep_fleet(
+    ledger: dict[str, Any],
+    now: datetime,
+    deadline: float,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str], set[str]]:
+    """Run `leeway report` across configured clusters or projects."""
+    clusters = explicit_clusters()
+    project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {})
+    scan_errors: dict[str, str] = {}
+    reports: list[dict[str, Any]] = []
+    scanned_projects: set[str] = set()
+
+    if clusters:
+        target_label = ",".join(clusters)
+        remaining = int(deadline - time.monotonic())
+        if remaining < MIN_PROJECT_RUN_SECONDS:
+            raise RuntimeError(BUDGET_EXHAUSTED_DETAIL.format(target=target_label))
+        rep = run_leeway_report(CLUSTERS_FLAG, target_label, timeout=min(PROJECT_TIMEOUT_SECONDS, remaining))
+        reports.append(rep)
+        return merge_reports(reports, now), project_runs, scan_errors, scanned_projects
+
+    target_projects = order_by_least_recent(projects(), project_runs)
+    for proj in target_projects:
+        remaining = int(deadline - time.monotonic())
+        if remaining < MIN_PROJECT_RUN_SECONDS:
+            scan_errors[proj] = BUDGET_EXHAUSTED_DETAIL.format(target=proj)
+            continue
+        timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
+        try:
+            rep = run_leeway_report(CLUSTERS_FROM_FLAG, proj, timeout=timeout)
+        except SandboxTimedOut:
+            if timeout < PROJECT_TIMEOUT_SECONDS:
+                scan_errors[proj] = SCAN_CUT_SHORT_DETAIL.format(target=proj)
+            else:
+                scan_errors[proj] = TIMED_OUT_DETAIL.format(seconds=timeout)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            scan_errors[proj] = SCAN_FAILED_DETAIL.format(target=proj, error=f"{type(exc).__name__}: {exc}")
+            continue
+        reports.append(rep)
+        scanned_projects.add(proj)
+        project_runs[proj] = iso(now)
+
+    if not reports and scan_errors:
+        reasons = "; ".join(f"{k}: {v}" for k, v in sorted(scan_errors.items()))
+        raise RuntimeError(reasons)
+
+    return merge_reports(reports, now), project_runs, scan_errors, scanned_projects
+
+
+def can_retire_finding(
+    key: str,
+    prior_entry: dict[str, Any],
+    ok_clusters: set[str],
+    cluster_errors: dict[str, str],
+    scanned_projects: set[str],
+    scan_errors: dict[str, str],
+) -> bool:
+    """Return True when a prior finding's absence is backed by a clean read."""
+    cluster = str(prior_entry.get("cluster") or key.split(CLUSTER_KEY_SEPARATOR, 1)[0])
+    if cluster in ok_clusters:
+        return True
+    if cluster in cluster_errors:
+        return False
+    # If the cluster was not in the report at all, retire only when its project
+    # was cleanly scanned (meaning the cluster was deleted or is no longer in scope).
+    proj = cluster.split(CLUSTER_KEY_SEPARATOR, 1)[0] if CLUSTER_KEY_SEPARATOR in cluster else ""
+    if proj and proj in scanned_projects and proj not in scan_errors:
+        return True
+    return False
+
+
+def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
+    moment = now or now_utc()
+    home = watch_home()
+    days = refresh_days()
+    ledger = load_ledger(home)
+    deadline = time.monotonic() + TICK_BUDGET_SECONDS
+
+    try:
+        report, project_runs, scan_errors, scanned_projects = sweep_fleet(ledger, moment, deadline)
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {exc}"
+        for line in record_tick_failure(home, detail, dry_run=dry_run):
+            print(line)
+        return 0
+
+    lines: list[str] = []
+    lines.extend(clear_tick_failure(home, dry_run=dry_run))
+
+    active_findings, ok_clusters, cluster_errors = extract_findings(report)
+    all_errors: dict[str, str] = {**scan_errors, **cluster_errors}
+
+    # Partial-scan announcement gate (keyed by error targets so transient text
+    # jitter does not re-page every day, and recovery is announced once).
+    announced = dict(ledger.get(ANNOUNCED_KEY) or {})
+    partial_sig = sorted(all_errors.keys())
+    if partial_sig:
+        if announced.get(ANNOUNCED_PARTIAL_KEY) != partial_sig:
+            reasons = "; ".join(f"{k}: {v}" for k, v in sorted(all_errors.items()))
+            lines.append(
+                PARTIAL_LINE.format(
+                    prefix=LINE_PREFIX,
+                    errors=len(all_errors),
+                    reasons=reasons,
+                )
+            )
+        announced[ANNOUNCED_PARTIAL_KEY] = partial_sig
+    elif ANNOUNCED_PARTIAL_KEY in announced:
+        del announced[ANNOUNCED_PARTIAL_KEY]
+        lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
+
+    prior_findings: dict[str, Any] = dict(ledger.get(FINDINGS_KEY) or {})
+    next_findings: dict[str, Any] = {}
+    due_reasons: dict[str, str] = {}
+    retired_labels: list[str] = []
+
+    # 1. Evaluate active findings against the ledger.
+    for key, item in sorted(active_findings.items()):
+        prior = prior_findings.get(key) if isinstance(prior_findings.get(key), dict) else None
+        reason = finding_trigger_reason(item, prior, moment, days)
+        if reason is not None:
+            due_reasons[key] = reason
+        first_seen = str(prior.get(FIRST_SEEN_KEY)) if prior and prior.get(FIRST_SEEN_KEY) else iso(moment)
+        last_report_at = (
+            iso(moment)
+            if reason is not None
+            else (str(prior.get(LAST_REPORT_KEY)) if prior and prior.get(LAST_REPORT_KEY) else iso(moment))
+        )
+        next_findings[key] = {
+            "cluster": item["cluster"],
+            "kind": item["kind"],
+            "namespace": item["namespace"],
+            "subject_kind": item["subject_kind"],
+            "subject_name": item["subject_name"],
+            "topology_key": item["topology_key"],
+            "tier": item["tier"],
+            "severity": item["severity"],
+            "suspected_cause": item["suspected_cause"],
+            "observed_skew": item["observed_skew"],
+            "max_domain_share": item["max_domain_share"],
+            FIRST_SEEN_KEY: first_seen,
+            LAST_REPORT_KEY: last_report_at,
+        }
+
+    # 2. Check prior findings not seen in this tick: retire if their cluster
+    #    was cleanly scanned, or retain if the cluster/project scan failed.
+    for key, prior in sorted(prior_findings.items()):
+        if key in active_findings or not isinstance(prior, dict):
+            continue
+        if can_retire_finding(key, prior, ok_clusters, cluster_errors, scanned_projects, scan_errors):
+            retired_labels.append(short_finding_label(prior))
+        else:
+            next_findings[key] = prior
+
+    if dry_run:
+        if retired_labels:
+            print(
+                DRY_RUN_WOULD_RETIRE.format(
+                    count=len(retired_labels),
+                    names=format_name_list(retired_labels),
+                )
+            )
+        if due_reasons:
+            due_items = [active_findings[k] for k in sorted(due_reasons)]
+            due_clusters = sorted({item["cluster"] for item in due_items})
+            reasons_counts: dict[str, int] = {}
+            for r in due_reasons.values():
+                reasons_counts[r] = reasons_counts.get(r, 0) + 1
+            reasons_str = ", ".join(f"{c} {r}" for r, c in sorted(reasons_counts.items()))
+            print(
+                DRY_RUN_WOULD_REPORT.format(
+                    count=len(due_reasons),
+                    reasons=reasons_str,
+                    clusters=format_name_list(due_clusters),
+                    names=format_name_list([short_finding_label(i) for i in due_items]),
+                )
+            )
+        if not retired_labels and not due_reasons:
+            print(DRY_RUN_NOTHING_DUE.format(count=len(active_findings)))
+        return 0
+
+    try:
+        if retired_labels:
+            lines.append(
+                RETIRED_LINE.format(
+                    prefix=LINE_PREFIX,
+                    count=len(retired_labels),
+                    names=format_name_list(retired_labels),
+                )
+            )
+        if due_reasons:
+            markdown = render_markdown_report(report, active_findings, due_reasons, all_errors, moment, days)
+            md_path = write_report_files(home, report, markdown, moment)
+            due_items = [active_findings[k] for k in sorted(due_reasons)]
+            due_clusters = sorted({item["cluster"] for item in due_items})
+            reasons_counts = {}
+            for r in due_reasons.values():
+                reasons_counts[r] = reasons_counts.get(r, 0) + 1
+            reasons_str = ", ".join(f"{c} {r}" for r, c in sorted(reasons_counts.items()))
+            next_date = (moment + timedelta(days=days)).strftime(DATE_FORMAT)
+            report_line = REPORT_LINE.format(
+                prefix=LINE_PREFIX,
+                due_count=len(due_reasons),
+                reasons=reasons_str,
+                cluster_count=len(due_clusters),
+                clusters=format_name_list(due_clusters),
+                path=md_path,
+                next_date=next_date,
+            )
+            lines.append(report_line)
+            publish_blackboard_topic(report_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
+
+        updated_ledger: dict[str, Any] = {
+            LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION,
+            LAST_TICK_KEY: iso(moment),
+            FINDINGS_KEY: next_findings,
+            PROJECT_RUNS_KEY: project_runs,
+        }
+        if all_errors:
+            updated_ledger[SCAN_ERRORS_KEY] = all_errors
+        if announced:
+            updated_ledger[ANNOUNCED_KEY] = announced
+        save_ledger(home, updated_ledger)
+    except WriteFailed as exc:
+        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=str(exc)))
+        return WRITE_FAILED_EXIT
+
+    for line in lines:
+        print(line)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the daily fleet topology skew & leeway watch.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run the fleet scan and gate without writing reports or modifying the ledger.",
+    )
+    args = parser.parse_args(argv)
+    return tick(dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
