@@ -1,5 +1,8 @@
-# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
-# `upgrades` off the coverage allowlist in docs/designs/domains.yaml.
+# NIGHTLY-ACTIVE — an entry in hack/eval/nightly-cases.txt since 2026-10-16,
+# demoted from the blocking roster on #3269 (the agent compares against the
+# channel's upgradeTargetVersion instead of its defaultVersion);
+# `upgrades` is on the coverage allowlist in docs/designs/domains.yaml until
+# it returns.
 #
 # A PROBE, not the audit. The full security-patch-orchestrator sweep exists
 # and is spec-ready (upgrade-readiness-lagging-cluster); on 2026-08-26 its

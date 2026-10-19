@@ -247,6 +247,7 @@ Pick one at least:
 - `GEMINI_API_KEY` (recommended default; get one at [aistudio.google.com](https://aistudio.google.com)).
 - `ANTHROPIC_API_KEY`.
 - `OPENAI_API_KEY`.
+- `OPENAI_COMPATIBLE_API_KEY`, for an OpenAI-compatible server you run (`openai_compatible`), and only if that server checks a key. See [Inference gateway](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private).
 
 Or route one of these keys through a self-hosted LiteLLM gateway — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a Gemini API-key template.
 

@@ -130,10 +130,10 @@ layout and are collected from the moment they start running.
   step 0 (`hack/ci-revalidate.sh`) ended before the eval loop; then
   it falls back to `finished − started` (which also counts provisioning, when there was any).
 - `tasks[]` — one entry per `Task <name> Result:` line, in log order (a
-  verdict outside the vocabulary below — `[EXPECTED_FAIL]`, which no
-  `task.yaml` sets, and `[NOT_GRADED_ON_TRANSPORT]`, the inject lane's word
-  for a case whose every objective check is not applicable on that
-  transport — does not parse and yields no entry, so such a case is missing
+  verdict outside the vocabulary below — `[EXPECTED_FAIL]`, the verdict of
+  a case marked `expected_fail: true`, and `[NOT_GRADED_ON_TRANSPORT]`, the
+  inject lane's word for a case whose every objective check is not
+  applicable on that transport — does not parse and yields no entry, so such a case is missing
   from `tasks[]` rather than misfiled; the next-mode key is #2008's):
   - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]` **and**
     `[UNSTABLE]` (a multi-repetition case that passed some but not all

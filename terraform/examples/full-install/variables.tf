@@ -329,13 +329,13 @@ variable "third_party_image_registry" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, vertex_ai, or openai_compatible). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; openai_compatible is any server speaking the OpenAI chat-completions API (vLLM, TGI, an internal gateway), set with model_default_name and the openai_compatible_* variables."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, openai, or vertex_ai."
+    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "openai_compatible"], var.model_provider)
+    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, or openai_compatible."
   }
 }
 
@@ -358,7 +358,7 @@ variable "vertex_manage_serving_project" {
 }
 
 variable "model_default_name" {
-  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts)."
+  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts); openai_compatible has no default and requires it."
   type        = string
   default     = ""
 }
@@ -389,6 +389,44 @@ variable "alert_daily_limits" {
   validation {
     condition     = alltrue([for limit in values(var.alert_daily_limits) : limit >= 0 && limit <= 2147483647 && floor(limit) == limit if limit != null])
     error_message = "Each alert_daily_limits value must be a whole number of alerts, from 0 to 2147483647."
+  }
+}
+
+variable "openai_compatible_api_base" {
+  description = "The server's OpenAI-compatible base URL, including /v1, when model_provider = \"openai_compatible\" (required with it). An in-cluster Service (<svc>, <svc>.<namespace>.svc, <svc>.<namespace>.svc.cluster.local) needs openai_compatible_target_port; any other host needs openai_compatible_egress_cidrs, unless it is a public endpoint on port 443."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.openai_compatible_api_base == "" || can(regex("^https?://", var.openai_compatible_api_base))
+    error_message = "openai_compatible_api_base must be an http:// or https:// URL."
+  }
+}
+
+variable "openai_compatible_target_port" {
+  description = "The server pod's port when openai_compatible_api_base names an in-cluster Service: the gateway's NetworkPolicy matches the pod's port, not the Service's. 0 leaves it unset."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.openai_compatible_target_port == 0 || (floor(var.openai_compatible_target_port) == var.openai_compatible_target_port && var.openai_compatible_target_port >= 1 && var.openai_compatible_target_port <= 65535)
+    error_message = "openai_compatible_target_port must be 0 (unset) or a port from 1 to 65535."
+  }
+}
+
+variable "openai_compatible_egress_cidrs" {
+  description = "Private ranges, in CIDR form, the gateway may reach the server at when openai_compatible_api_base is not an in-cluster Service (an internal load balancer, an on-prem address). NetworkPolicy cannot match a DNS name, so a hostname needs the ranges it resolves to. None for a public endpoint on 443, which the gateway's existing egress rule reaches. Ignored for an in-cluster Service."
+  type        = list(string)
+  default     = []
+}
+
+variable "openai_compatible_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed the server's TLS certificate, under the key `ca.crt`. The gateway trusts it for this server only. Empty: the gateway's default CAs. Terraform only names it; create the Secret yourself."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.openai_compatible_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.openai_compatible_ca_secret_name)) && length(var.openai_compatible_ca_secret_name) <= 253)
+    error_message = "openai_compatible_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
   }
 }
 
@@ -471,6 +509,13 @@ variable "gemini_api_key" {
 
 variable "openai_api_key" {
   description = "OPENAI_API_KEY model-provider credential (optional; omitted from the Secret when empty)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "openai_compatible_api_key" {
+  description = "The openai_compatible server's API key, stored as OPENAI_COMPATIBLE_API_KEY (optional; omitted from the Secret when empty). The gateway sends it to that server only."
   type        = string
   sensitive   = true
   default     = ""

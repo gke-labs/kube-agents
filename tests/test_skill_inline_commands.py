@@ -54,6 +54,14 @@ VARIABLE_PATH_PROGRAM_RE = re.compile(
 REFUSED_EXAMPLE_RE = re.compile(r"whose program is a variable \(`[^`]*`\)")
 
 
+def skill_documents(tree):
+    """Each SKILL.md under ``tree`` and its reference pages, which the agent reads at a step."""
+    docs = []
+    for skill in sorted(tree.rglob("SKILL.md")):
+        docs += [skill, *sorted(skill.parent.glob("references/*.md"))]
+    return docs
+
+
 def inline_code(text):
     for token in MarkdownIt("commonmark").parse(text):
         if token.type == "inline":
@@ -88,7 +96,7 @@ class SkillInlineCommandsTest(unittest.TestCase):
         found = [
             f"{skill.relative_to(REPO_ROOT)}:{line}: {span}"
             for tree in SKILL_TREES
-            for skill in sorted((REPO_ROOT / tree).rglob("SKILL.md"))
+            for skill in skill_documents(REPO_ROOT / tree)
             for line, span in inline_code(
                 REFUSED_EXAMPLE_RE.sub("", skill.read_text(encoding="utf-8"))
             )

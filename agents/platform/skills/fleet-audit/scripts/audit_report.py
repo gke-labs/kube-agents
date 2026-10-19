@@ -61,6 +61,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -770,6 +771,17 @@ GITOPS_WORKSPACE = os.environ.get("FLEET_AUDIT_GITOPS_ROOT") or "/opt/data/gitop
 # profile home names nothing.
 PLATFORM_PROFILE_SUBDIR = "profiles/platform"
 GOVERNANCE_DIR_NAME = "governance"
+# The skill's own tree under the profile home, named in full for the same reason.
+# Its SKILL.md is the short core; the detail each step needs is a reference file,
+# and `start` names the ones the next steps need so the worker does not have to
+# have read the whole skill to find them.
+SKILL_SUBDIR = "skills/fleet-audit"
+SCRIPTS_DIR_NAME = "scripts"
+REFERENCES_DIR_NAME = "references"
+SCRIPT_NAME = "audit_report.py"
+FINDINGS_REFERENCE = "findings-document.md"
+FINISH_REFERENCE = "finish.md"
+NEXT_STEPS_KEY = "next_steps"
 
 # The report store: what each `finish` published, kept on the PVC beside the
 # run that produced it (docs/designs/fleet-audit-report-store.md). A fixed root
@@ -792,6 +804,22 @@ REPORT_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 # and the copy of the newest. report_status.py spells them the same way.
 REPORT_RUNS_DIR = "runs"
 REPORT_LATEST_NAME = "latest.json"
+# The chat report `finish` leaves for the relay: one record per stream in
+# SCRATCH_DIR, read over ssh by `session_kv_server.audit_chat_report`, which
+# spells these keys the same way.
+CHAT_REPORT_AUDIT_KEY = "audit"
+CHAT_REPORT_RUN_KEY = "run"
+CHAT_REPORT_STARTED_KEY = "started_at"
+# When the run last started or finished a repository; a run's record is current
+# for INFLIGHT_TTL_SECONDS after its last step, as one step's lease is.
+CHAT_REPORT_UPDATED_KEY = "updated_at"
+# One entry per repository the run started, with its report once `finish` ran.
+CHAT_REPORT_PARTS_KEY = "parts"
+CHAT_REPORT_REPO_KEY = "repo"
+CHAT_REPORT_TEXT_KEY = "text"
+# The rendered report's last line. `slack_audit_report.ledger_ref` finds the
+# ledger only behind a "ledger:" label, a dash or a markdown link.
+CHAT_REPORT_LEDGER_LINE = "Ledger: {url}"
 # The store's modes, whatever the writer's umask, for the reason the in-flight
 # lock clears its umask: a hand-run `finish` over `kubectl exec` lands as root,
 # the tick and every session as uid 1000, and a mode is only a request the
@@ -866,8 +894,8 @@ GLOB_METACHARACTERS = "*?[]"
 # took the id back out of the branch name; it costs nothing and the gate is
 # already in place the day an id returns to a ref.
 #
-# Two documents quote a *normalised* form of this pattern — SKILL.md and the
-# ledger design doc, both with a capturing group and `$` for `\Z`, because
+# Two documents quote a *normalised* form of this pattern — the skill's
+# references/findings-document.md and the ledger design doc, both with a capturing group and `$` for `\Z`, because
 # neither difference means anything to a model reading prose. The governance
 # SOPs no longer quote it at all: the id is derived, so a worker never types
 # one. `hack/check-docs-terminology.sh` derives the normalised form from this
@@ -2330,6 +2358,37 @@ def sop_path(audit_id: str) -> str:
     )
 
 
+def skill_path(*parts: str) -> str:
+    """A full path inside this skill's tree, under the agent home `sop_path` uses."""
+    import gitops_workspace
+
+    return "/".join([gitops_workspace.agent_home(), PLATFORM_PROFILE_SUBDIR, SKILL_SUBDIR, *parts])
+
+
+def next_steps(audit_id: str, findings_path: str) -> list[str]:
+    """What `start` tells the worker to do after it, each step with the file it needs."""
+    finish = (
+        f"{skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} finish --audit {audit_id} "
+        f"--findings-file {findings_path}"
+    )
+    if audit_id in COLLECTOR_AUDITS:
+        finish += f" --manifest-file {manifest_path_for(audit_id)}"
+    return [
+        f"Read the SOP at {sop_path(audit_id)} in full, then run every check in `checks` "
+        "the way it says, recording each check and its command in checks_run as it completes.",
+        f"Write the findings document at {findings_path}"
+        + (
+            f", starting it with {skill_path(SCRIPTS_DIR_NAME, SCRIPT_NAME)} draft --audit {audit_id} "
+            f"--manifest-file {manifest_path_for(audit_id)}"
+            if audit_id in COLLECTOR_AUDITS
+            else ""
+        )
+        + f". Its rules are in {skill_path(REFERENCES_DIR_NAME, FINDINGS_REFERENCE)}.",
+        f"Run {finish}. Its output and exit codes are in "
+        f"{skill_path(REFERENCES_DIR_NAME, FINISH_REFERENCE)}.",
+    ]
+
+
 def checks_ran(cluster: object) -> list[str]:
     """The check slugs a `scope.clusters` entry claims to have run.
 
@@ -2387,6 +2446,11 @@ def manifest_path_for(audit_id: str) -> str:
 def run_record_path_for(audit_id: str) -> str:
     """Where `start` records which repositories this run was told to search."""
     return f"{SCRATCH_DIR}/run_{audit_id}.json"
+
+
+def chat_report_path_for(audit_id: str) -> str:
+    """Where `finish` leaves the report the chat relay posts for this run."""
+    return f"{SCRATCH_DIR}/chat_report_{audit_id}.json"
 
 
 def declarations_path_for(audit_id: str) -> str:
@@ -2908,6 +2972,184 @@ def _atomic_write(path: Path, text: str) -> None:
         # where the prune globs `*.json` and never collects it.
         Path(handle.name).unlink(missing_ok=True)
         raise
+
+
+def _write_chat_record(audit_id: str, record: dict) -> None:
+    path = Path(chat_report_path_for(audit_id))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(path, json.dumps(record))
+
+
+def _read_chat_record(audit_id: str) -> dict | None:
+    """This stream's chat report record, or None when there is none that parses."""
+    try:
+        record = json.loads(Path(chat_report_path_for(audit_id)).read_text(encoding="utf-8"))
+        updated = float(record[CHAT_REPORT_UPDATED_KEY])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if not math.isfinite(updated):
+        return None
+    run = record.get(CHAT_REPORT_RUN_KEY)
+    if not isinstance(run, str) or not run:
+        return None
+    if not isinstance(record.get(CHAT_REPORT_PARTS_KEY), list):
+        return None
+    if not all(isinstance(part, dict) for part in record[CHAT_REPORT_PARTS_KEY]):
+        return None
+    return record
+
+
+def _new_chat_record(audit_id: str, now: datetime) -> dict:
+    return {
+        CHAT_REPORT_AUDIT_KEY: audit_id,
+        CHAT_REPORT_RUN_KEY: now.strftime(REPORT_STAMP_FORMAT),
+        CHAT_REPORT_STARTED_KEY: now.timestamp(),
+        CHAT_REPORT_UPDATED_KEY: now.timestamp(),
+        CHAT_REPORT_PARTS_KEY: [],
+    }
+
+
+def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
+    """This run's record: the one on disk when its last step is within
+    `INFLIGHT_TTL_SECONDS` and it holds no finished report for `repo`, else a
+    new one."""
+    record = _read_chat_record(audit_id)
+    if record is None:
+        return _new_chat_record(audit_id, now)
+    finished = {
+        str(part.get(CHAT_REPORT_REPO_KEY))
+        for part in record[CHAT_REPORT_PARTS_KEY]
+        if part.get(CHAT_REPORT_TEXT_KEY)
+    }
+    if now.timestamp() - float(record[CHAT_REPORT_UPDATED_KEY]) >= INFLIGHT_TTL_SECONDS or repo in finished:
+        return _new_chat_record(audit_id, now)
+    return record
+
+
+def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
+    """Record that this run started `repo`. Best-effort: never fails the run.
+
+    The relay posts what the record holds instead of the run's final message,
+    and names each repository the run started but did not finish. An SOP that
+    walks `managed_repos` runs `start` and `finish` once per repository within
+    one run, so a record whose last step is within `INFLIGHT_TTL_SECONDS` and
+    that holds no finished report for `repo` is this run's; otherwise this
+    `start` opens a new run, as does one that finds `repo` pending in a record
+    with no finished part (a run that never finished it).
+    """
+    record = _current_chat_record(audit_id, repo, now)
+    # A record with no finished part that already holds `repo` pending was
+    # left by a run that never finished it, and adopting it would carry that
+    # run's stamps into this one. One pending only for other repositories is
+    # this run's earlier repository, which the relay must still name.
+    parts = record[CHAT_REPORT_PARTS_KEY]
+    if not any(part.get(CHAT_REPORT_TEXT_KEY) for part in parts) and any(
+        part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts
+    ):
+        record = _new_chat_record(audit_id, now)
+    if not any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in record[CHAT_REPORT_PARTS_KEY]):
+        record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: None})
+    record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
+    try:
+        _write_chat_record(audit_id, record)
+    except OSError as exc:
+        log(f"WARNING: chat report for {audit_id} not opened: {exc}")
+
+
+def append_chat_report(audit_id: str, repo: str, text: str, now: datetime) -> None:
+    """Add `repo`'s report to this run's chat report. Best-effort: never fails the run.
+
+    Fills the entry `start` opened for `repo`. A `finish` with no such entry
+    adds one, and with no current record (see `_current_chat_record`) opens
+    one, so its report still reaches the relay under a run of its own.
+    """
+    record = _current_chat_record(audit_id, repo, now)
+    pending = [
+        part for part in record[CHAT_REPORT_PARTS_KEY]
+        if part.get(CHAT_REPORT_REPO_KEY) == repo and not part.get(CHAT_REPORT_TEXT_KEY)
+    ]
+    if pending:
+        pending[-1][CHAT_REPORT_TEXT_KEY] = text
+    else:
+        record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: text})
+    record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
+    try:
+        _write_chat_record(audit_id, record)
+    except OSError as exc:
+        log(f"WARNING: chat report for {audit_id} not written: {exc}")
+
+
+def render_chat_report(audit_id: str, payload: dict, data: dict, delta_known: bool = True) -> str:
+    """The report the chat relay posts for a run that published to a ledger.
+
+    Built from `finish`'s own line and the findings document, so the channel
+    gets the same words whatever the model wrote after it. The first line is
+    the audit line with its counts and the last is the labelled ledger URL: the
+    Slack headline reads the line above a link-only last line
+    (`slack_audit_report._ledger_line`). With no trusted memory of the previous
+    run (`delta_known` false) the line's `new` and `resolved` are withheld
+    zeros, so it says the change is unknown instead of counting them; a HELD
+    run prints no counts and keeps its own line.
+    """
+    findings = list(data.get("findings") or [])
+    clusters = len((data.get("scope") or {}).get("clusters") or [])
+    name = audit_name(audit_id)
+    status = payload.get("status")
+    resolved = int(payload.get("resolved") or 0)
+    unaccounted = list(payload.get(UNACCOUNTED_KEY) or [])
+    if status == "CLEAN" and delta_known:
+        head = f"{name}: clean, 0 findings, {resolved} resolved across {clusters} cluster(s)."
+    elif status == "HELD" and unaccounted:
+        head = (
+            f"{name}: 0 findings across {clusters} cluster(s), but the ledger stays open: "
+            f"{len(unaccounted)} carried finding(s) were not accounted for."
+        )
+    elif status == "HELD":
+        # `finish` holds a clean ledger open with nothing unaccounted only when
+        # it could not read the issue's comments, where a `/remediate` may wait.
+        head = (
+            f"{name}: 0 findings across {clusters} cluster(s), but the ledger stays open: "
+            f"its comments could not be read, so a /remediate there may be unanswered."
+        )
+    elif not delta_known:
+        head = (
+            f"{name}: {findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
+            f"across {clusters} cluster(s); the change since the last run is unknown."
+        )
+    else:
+        head = (
+            f"{name}: {int(payload.get('new') or 0)} new, {resolved} resolved; "
+            f"{findings_phrase(len(findings))} ({severity_counts(findings)['critical']} critical) "
+            f"across {clusters} cluster(s)."
+        )
+    lines = [head]
+    for label, key in (
+        ("Pull requests opened", "prs_opened"),
+        ("Pull requests waiting for review", "prs_still_open"),
+        ("Pull requests closed", "prs_closed"),
+    ):
+        urls = [str(url) for url in payload.get(key) or []]
+        if urls:
+            lines.append(f"- {label}: " + ", ".join(urls))
+    gaps = list(payload.get("coverage_gaps") or [])
+    if gaps:
+        lines.append("- Coverage is incomplete: " + "; ".join(redact_secrets(gap) for gap in gaps))
+    under_gap = list(payload.get(UNREPORTED_UNDER_GAP_KEY) or [])
+    if under_gap:
+        lines.append(
+            f"- {len(under_gap)} finding(s) are no longer reported while a coverage gap stays "
+            f"(not resolved): " + ", ".join(under_gap)
+        )
+    if unaccounted:
+        lines.append("- Not accounted for: " + ", ".join(unaccounted))
+    dropped = list(payload.get(UNPUBLISHED_CANDIDATES_KEY) or [])
+    if dropped:
+        lines.append(
+            f"- The collector flagged {len(dropped)} candidate(s) this run's document does not carry."
+        )
+    if payload.get("issue_url"):
+        lines.append(CHAT_REPORT_LEDGER_LINE.format(url=payload["issue_url"]))
+    return "\n".join(lines)
 
 
 def write_report(
@@ -15030,6 +15272,10 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
 
     opt_repo = getattr(args, "repo", None)
     repo = resolve_repo_or_no_forge(audit_id, opt_repo)
+    # The relay posts what this file holds instead of the run's final message,
+    # so a run that dies before its `finish` must not leave the previous run's
+    # report there.
+    open_chat_report(audit_id, repo, datetime.now(timezone.utc))
     no_forge = repo == NO_FORGE_REPO
     if no_forge:
         # The checks still run; only the ledger and the fixes have nowhere to go.
@@ -15175,6 +15421,7 @@ def _start(args: argparse.Namespace, audit_id: str) -> None:
                     "reasons. A check you could have run and did not is not one "
                     "of those; it is a limitations note and a real gap."
                 ),
+                NEXT_STEPS_KEY: next_steps(audit_id, findings_path),
             }
         )
     )
@@ -16361,6 +16608,7 @@ def _finish_without_forge(
     payload["summary"] = render_no_forge_summary(
         audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
     )
+    append_chat_report(audit_id, NO_FORGE_REPO, payload["summary"], now)
     print(json.dumps(payload))
 
 
@@ -17454,6 +17702,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             ledger_unchanged=body_untouched,
         )
+        append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
         print(json.dumps(payload))
         return
 
@@ -17918,6 +18167,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         ),
         now,
     )
+    append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
     print(json.dumps(payload))
 
 
