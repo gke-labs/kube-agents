@@ -375,6 +375,51 @@ class _RuntimeCase(unittest.TestCase):
         self.addCleanup(env.stop)
 
 
+class ThreadSettledTest(_RuntimeCase):
+    """Whether a card's settled report is the last its ask gets (answer feedback)."""
+
+    SUB = {"chat_id": CHANNEL, "thread_id": THREAD}
+
+    def _plan(self, *statuses, pending=(), waiting=False):
+        plan = runtime._Plan(TEAM)
+        for i, status in enumerate(statuses):
+            row = runtime._Row(f"t_{i}", "card")
+            row.status = status
+            plan.rows[row.task_id] = row
+        for card in pending:
+            plan.pending[card] = True
+        if waiting:
+            plan.waiting[f"t_w"] = True
+        runtime._plans[(CHANNEL, THREAD)] = plan
+        return plan
+
+    def test_no_plan_is_settled(self):
+        self.assertTrue(runtime.thread_settled(self.SUB))
+
+    def test_every_card_settled_is_settled(self):
+        self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_ERROR)
+        self.assertTrue(runtime.thread_settled(self.SUB))
+
+    def test_a_card_running_or_waiting_is_not(self):
+        self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_RUNNING)
+        self.assertFalse(runtime.thread_settled(self.SUB))
+        self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_PENDING)
+        self.assertFalse(runtime.thread_settled(self.SUB))
+
+    def test_a_card_expected_but_not_started_is_not(self):
+        self._plan(slack_status.TASK_COMPLETE, pending=("t_next",))
+        self.assertFalse(runtime.thread_settled(self.SUB))
+
+    def test_a_live_card_on_a_set_aside_plan_holds_it(self):
+        old = runtime._Plan(TEAM)
+        row = runtime._Row("t_old", "card")
+        row.status = slack_status.TASK_RUNNING
+        old.rows["t_old"] = row
+        runtime._lapsed[(CHANNEL, THREAD)] = [old]
+        self._plan(slack_status.TASK_COMPLETE)
+        self.assertFalse(runtime.thread_settled(self.SUB))
+
+
 class SessionTest(_RuntimeCase):
     def _status(self, adapter, status, thread=THREAD):
         _run(adapter._set_thread_status(CHANNEL, TEAM, thread, status, "failed"))

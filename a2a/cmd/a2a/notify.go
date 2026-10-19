@@ -91,6 +91,7 @@ func runNotify(args []string) error {
 	blocksFile := fs.String("blocks-file", "", "a JSON array of Slack Block Kit blocks to post as one message, with the text as its fallback (Slack only)")
 	chatFile := fs.String("chat-file", "", "a kube-agents.chat/v1 JSON object to lay the post out with, the text as its fallback")
 	update := fs.String("update", "", "a key naming the message: a later notify with the same key edits it in place")
+	isAnswer := fs.Bool("answer", false, "the post answers the conversation's latest ask (with --conversation): rating controls go on it")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -109,6 +110,9 @@ func runNotify(args []string) error {
 	}
 	if *conversation != "" && *thread != "" {
 		return errors.New("notify: --thread or --conversation, not both")
+	}
+	if *isAnswer && *conversation == "" {
+		return errors.New("notify: --answer goes with --conversation")
 	}
 	// flag drops the "--" it stops at, so whether one was given is read from
 	// the raw arguments: after it, a lone "-" is text, not "read stdin".
@@ -140,6 +144,7 @@ func runNotify(args []string) error {
 		req.Chat = raw
 	}
 	req.Update = *update
+	req.Answer = *isAnswer
 	body, err := json.Marshal(req)
 	if err != nil {
 		return err

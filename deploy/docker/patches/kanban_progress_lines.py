@@ -888,14 +888,18 @@ def _chat_notify() -> Any:
     return kanban_chat_notify
 
 
-def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict]) -> Optional[dict]:
+def _with_answer(
+    adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict], final: bool = False,
+) -> Optional[dict]:
     """``metadata`` with a completed card's report, or a hard-wall block's reason, laid out as an answer, for the chat.notify stand-in.
 
     Under ``spec.mode: next`` the gateway lays the report out from a
     ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
     ``KAGE_SLACK_UX`` on for a Slack card, never for an actionable report,
     whose call to action stays in view as today, and never raises: anything
-    that goes wrong posts the text alone, as today.
+    that goes wrong posts the text alone, as today. ``final`` says this report
+    settles every card the ask filed, so it is the ask's answer and is flagged
+    for the gateway's rating controls (``kanban_chat_notify.ANSWER_METADATA_KEY``).
     """
     notify = _chat_notify()
     if quiet is None or kind != ANSWER_KIND or notify is None or not notify.chat_route(adapter):
@@ -911,7 +915,21 @@ def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Op
         return metadata
     if chat is None:
         return metadata
-    return {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
+    out = {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
+    if final:
+        out[notify.ANSWER_METADATA_KEY] = True
+    return out
+
+
+def _settles_ask(plan: Any, sub: dict) -> bool:
+    """Whether the thread's plan has no card left running, waiting or expected, never raising."""
+    if plan is None:
+        return False
+    try:
+        return bool(plan.thread_settled(sub))
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: reading whether %s settles its ask failed: %s", sub.get("task_id"), exc)
+        return False
 
 
 def hard_wall_line(payload: object, message: str) -> str:
@@ -1111,8 +1129,11 @@ async def deliver(
             await _settle_reaction(adapter, sub, settled_as, board)
             return None
         laid_out = ANSWER_KIND if hard_wall else kind
+        # A completed card's report is the ask's answer when no card of the
+        # ask is left once it settles (a hard-wall block's reason is not).
+        final = kind == ANSWER_KIND and not hard_wall and _settles_ask(plan, sub)
         result = await adapter.send(
-            chat_id, message, metadata=_with_answer(adapter, quiet, laid_out, message, metadata),
+            chat_id, message, metadata=_with_answer(adapter, quiet, laid_out, message, metadata, final),
         )
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's

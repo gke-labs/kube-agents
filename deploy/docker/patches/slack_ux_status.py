@@ -506,6 +506,22 @@ def _live(row: _Row) -> bool:
     return row.status in (_status.TASK_RUNNING, _status.TASK_PENDING)
 
 
+def thread_settled(sub: dict) -> bool:
+    """Whether no card in the thread still runs, waits on the user or is expected to start.
+
+    Read right after a card's terminal event has settled its row (``settle_row``): True
+    then means that card's report is the last one the ask gets, its answer
+    (``kanban_progress_lines``, answer feedback). A child folded into its fan-out's row
+    posts no report, so a fan-out answers once, with its creator's completion.
+    """
+    key = _thread(sub)
+    current = _plans.get(key)
+    if current is not None and (current.pending or current.waiting):
+        return False
+    plans = [*_lapsed.get(key, ()), *((current,) if current is not None else ())]
+    return not any(_live(row) for plan in plans for row in plan.rows.values())
+
+
 def _open(row: _Row) -> bool:
     """Whether the row can still move: live, or a card that gave up, which ``unblocked`` resumes."""
     return _live(row) or (row.status == _status.TASK_ERROR and not row.archived)

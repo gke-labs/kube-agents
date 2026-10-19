@@ -68,6 +68,13 @@ type NotifyRequest struct {
 	// out the same way; it ignores Update.
 	Chat   json.RawMessage `json:"chat,omitempty"`
 	Update string          `json:"update,omitempty"`
+	// Answer, on a conversation request, says the post is the answer to
+	// the conversation's latest ask: the delivered report of the card whose
+	// completion settles every card that ask filed (the kanban notifier
+	// sets it). A backend that draws rating controls draws them on it
+	// (answer feedback). Ignored on a home channel request and with
+	// Update, which names a message edited in place rather than an answer.
+	Answer bool `json:"answer,omitempty"`
 }
 
 // NotifyReply is the answer: the first message posted and the thread it

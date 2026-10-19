@@ -1914,12 +1914,19 @@ chain runs.
 ### Answer feedback (added 10/16)
 
 A chat user rates the final answer of an ask 👍 or 👎, and a 👎 keeps the exchange so an operator
-can turn it into an eval case. The gateway marks the one message of a chain that is its answer
-(`OutMessage.Feedback`, the chain's root task id): the completed result of the task whose end is
-the chain's (`observedAs`), never a hand-off line (`handOffEnd`), the same message the
-`DeliverableObserver` is handed. Plan rows, progress, a question waiting on the user, notices, a
-child's own result and the notify route's posts are not marked. A text answer chunked under the
-cap carries the mark on its last chunk.
+can turn it into an eval case. The gateway marks the one message that answers the ask
+(`OutMessage.Feedback`, the root task id of the ask's chain), and it is one of two. When the
+Planning Agent answers itself, it is the completed result of the task whose end is the chain's
+(`observedAs`), never a hand-off line (`handOffEnd`), the same message the `DeliverableObserver`
+is handed. When the turn hands the ask to kanban cards (its terminal mark keeps the ask's kind,
+`cardsPending`), that result is only the acknowledgement and is not marked; the answer is the
+card report the kanban notifier flags with `answer: true` on its conversation notify (the report
+that leaves no card of the ask running, waiting or still to start, so one per ask, a fan-out's
+creator's), which the notify route marks under the conversation's latest ask
+(`latestChainIndex`). Plan rows, progress, a question waiting on the user, notices, a child's own
+result, any other report and a keyed notify are not marked. A text answer chunked under the cap
+carries the mark on its last chunk. A card answer that also offers a next step or options keeps
+them as its buttons, with the rating controls under them as the last block.
 
 The Slack adapter draws the mark as Slack's own feedback buttons: a `context_actions` block holding
 one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the message's last

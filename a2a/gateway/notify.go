@@ -113,6 +113,14 @@ type NotifyConversations interface {
 	EditMessage(conversation, messageID string, m OutMessage) error
 }
 
+// notifyFeedbackTarget is the optional extension NotifyConversations
+// implements to name the task an answer posted on the route is rated under
+// (answer feedback, feedback.go): the root of the conversation's latest ask,
+// or "" when feedback is off or the conversation has none.
+type notifyFeedbackTarget interface {
+	AnswerFeedbackTarget(conversation string) string
+}
+
 // notifyPoster is the backend half: post text into a space, new thread or
 // reply, and say where it landed. GoogleChatAdapter and SlackAdapter
 // implement it; the Notifier, not the poster, holds the home-only bound.
@@ -645,6 +653,11 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 		if m.Chat == nil {
 			return false
 		}
+		// The card report that settles the ask's cards is the ask's answer
+		// (the sender says so), and the one post on the route that is rated.
+		if ft, ok := n.conv.(notifyFeedbackTarget); ok && job.req.Answer {
+			m.Feedback = ft.AnswerFeedbackTarget(conversation)
+		}
 		message, err := n.conv.PostMessage(conversation, m)
 		if !n.chatOutcome(conversation, err) {
 			return false
@@ -982,6 +995,25 @@ func (c gatewayConversations) ConversationContext(ctx context.Context, key strin
 		return "", err
 	}
 	return rec.ContextID, nil
+}
+
+// AnswerFeedbackTarget is the root task of the conversation's latest ask,
+// when answer feedback is on (notifyFeedbackTarget).
+func (c gatewayConversations) AnswerFeedbackTarget(conversation string) string {
+	g := c.g
+	if g.feedback.Load() == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
+	defer cancel()
+	rec, err := g.reg.Get(ctx, conversation)
+	if err != nil || rec == nil {
+		return ""
+	}
+	if i := rec.latestChainIndex(); i >= 0 {
+		return rec.Tasks[i].ID
+	}
+	return ""
 }
 
 func (c gatewayConversations) Post(conversation, text string) (string, error) {
