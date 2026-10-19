@@ -271,6 +271,30 @@ replaces the first one, with no error. If the line already has a `platformAgent.
 list, add the entry to that list, because Helm replaces a list as a whole. See
 [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) for how the line works.
 
+## Switching `spec.mode`
+
+`next` is an unsupported development stack. To move a running install between `today` and
+`next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
+`install.sh`. The operator and harness modes re-apply the values the release recorded, so they do
+not switch. Preview a full upgrade with `upgrade.sh --plan` first; a run that switches says so
+before it applies.
+
+- **Slack.** With Slack on and Google Chat off, `next` hands Slack to the A2A gateway. Before the
+  switch, check the three Slack settings the run refuses (see
+  [When an upgrade is refused](#when-an-upgrade-is-refused)). After it, edit the Slack app as
+  [Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
+  describes.
+- **Switching back** to `today` is the same `install.env` edit the other way. Put the Slack app's
+  slash commands back too, as that section says.
+- **A mode set on the PlatformAgent by hand** (`kubectl patch`, as 0.9.0 needed) survives upgrades,
+  because Helm sees no change in a value the release already renders. When `install.env` names a
+  mode and the CR carries the other one, the run says so and leaves the CR as it is. To bring them
+  together, patch `spec.mode` on the CR to the mode you want, or apply once with
+  `PLATFORM_AGENT_MODE` set to the mode the CR carries and then again with the one you want.
+
+What a switch changes inside the install is in the design document,
+[`docs/designs/spec-mode-switch.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-mode-switch.md).
+
 ## Upgrade modes
 
 - `--upgrade-mode=harness` re-tags the Platform Agent image, the sandbox image it reaches over
@@ -310,6 +334,9 @@ to run.
   commit, or a release the script does not itself carry. It is not part of upgrading to a published
   release. Mutable refs such as `latest`, `main` and `HEAD` are rejected, so the scripts and the
   container images always name the same revision.
+  A commit on `main` carries the chart's unstamped placeholder version, `0.1.0`, so
+  `helm history` and the plan show the chart moving from your release to `kube-agents-0.1.0`.
+  That is the placeholder, not a downgrade: only the release pipeline stamps the version.
 - `--keep-image-tag` upgrades everything except the images, leaving them on the tag the install
   already serves. It refuses `--image-tag`, because the two ask for opposite things — and since a
   release copy already carries a version, it refuses this flag as well. Run it from a checkout,
@@ -386,12 +413,37 @@ chart's default `platformAgent.name` value.
 
 The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-report.json`.
 
+## The gateway's own ServiceAccount
+
+From the release in which the gateway Pod runs as its own ServiceAccount, an upgrade moves the
+gateway from the agent ServiceAccount (`spec.security.serviceAccountName`, `kubeagents-platform-agent`
+by default) to `<name>-gateway-agent`, which the operator creates with no annotation. The agent
+ServiceAccount, its Workload Identity annotation and its IAM binding stay where they are, with the
+credential broker, so neither Terraform nor IAM changes. The new ServiceAccount is bound to the same
+read-only `kubeagents:minimal` ClusterRole and the `kubeagents:local` and `kubeagents:leader` Roles
+the gateway already used.
+
+Two things an install may have added by hand do not follow the gateway:
+
+- **RBAC bound to your own ServiceAccount.** If you set `serviceAccountName` and bound extra roles to
+  it expecting the gateway to use them, the gateway no longer runs as it. Bind them to
+  `<name>-gateway-agent` if the gateway needs them; the broker keeps whatever is bound to yours.
+- **IAM granted to the gateway's Kubernetes identity directly.** A `principal://…/subject/ns/<ns>/sa/<sa>`
+  or namespace-wide `principalSet://` grant reaches whichever Pod runs as that ServiceAccount, and the
+  gateway's metadata path is closed, so such a grant no longer reaches the gateway. Anything in the
+  gateway that needs Google goes through the broker.
+
+To check: `kubectl get deployment platform-agent-gateway -n kubeagents-system -o
+jsonpath='{.spec.template.spec.serviceAccountName}'` prints `platform-agent-gateway-agent` for the
+chart's default name.
+
 ## When an upgrade is refused
 
 Every one of these stops the run before any of the new release is applied. The first four are
-settled before the run touches the cluster at all. The last five need the cluster: they are settled
-after `kubectl` has been pointed at it, and after a real run's pre-flight Secret backfills — a plan
-skips those — but still before any CRD, chart or Terraform change of the new release.
+settled before the run touches the cluster at all. The last six need the cluster: they are settled
+after `kubectl` has been pointed at it, and except for the breaking-change check, after a real run's
+pre-flight Secret backfills — a plan skips those — but still before any CRD, chart or Terraform
+change of the new release.
 
 - **The sources do not match the release.** The checkout's `HEAD` is not the release's commit, the
   tree has uncommitted changes, or an unpacked tree names a release other than the one asked for —
@@ -412,6 +464,13 @@ skips those — but still before any CRD, chart or Terraform change of the new r
   [Recovering `install.env`](#recovering-installenv).
 - **`GITHUB_APP_ID` is not a number.** The token minter needs the GitHub App's numeric ID, the "App
   ID" on the App's General settings page, not its name or slug. `--dry-run` refuses it too.
+- **The move leaves behind a commit marked as a breaking change.** When the target does not
+  contain the installed commit — a rollback to an older release, or a commit build moved to a
+  release that lacks some of its commits — the run reads the commits the target lacks. It stops
+  before the Secret backfills if any has a `type!:` subject or a `BREAKING CHANGE:` footer, and
+  names each one. Read them, then re-run with `--allow-breaking-downgrade`, in any mode. `--plan`
+  warns instead. A move between two release tags to the newer one is not checked, and neither is a
+  run whose tag is read off the install. See [Rolling back a release](/kube-agents/deploy/rollback/).
 - **No Helm release.** The target namespace has no `kube-agents` release to upgrade.
 - **The memory store cannot be checked and nothing named one.** When the configuration records no
   `MEMORY`, the upgrade asks the cluster whether it runs the Hindsight memory store, so that a store

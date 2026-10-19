@@ -159,6 +159,10 @@
           "type": "integer",
           "minimum": 0
         },
+        "reasoningEffort": {
+          "type": "string",
+          "enum": ["", "low", "medium", "high"]
+        },
         "vertex": {
           "type": "object",
           "additionalProperties": false,
@@ -174,6 +178,38 @@
             },
             "location": {
               "type": "string"
+            }
+          }
+        },
+        "openaiCompatible": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "apiBase": {
+              "type": "string"
+            },
+            "targetPort": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "egressCIDRs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "caBundleSecretRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              }
             }
           }
         },

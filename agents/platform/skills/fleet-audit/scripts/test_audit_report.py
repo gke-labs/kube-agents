@@ -2189,9 +2189,9 @@ class TestAuditCatalogue(unittest.TestCase):
         then dropped — leaving a watchdog that has stopped working
         indistinguishable from a fleet with nothing to report.
 
-        The audit's own findings do not travel this leg — Tier 1 is the ledger
-        issue — so this is not the route for reports, only for the failure of
-        the thing that produces them.
+        The leg carries the report `finish` rendered and, for a run that did
+        not reach `finish`, a notice that it did not finish; the findings
+        themselves are on the ledger issue.
         """
         audible = {"all", "chat"}
         # The one entry whose product is not a chat message: `chat-delivery-watch`
@@ -2215,6 +2215,11 @@ class TestAuditCatalogue(unittest.TestCase):
                     self.assertTrue(job.get("no_agent"))
                     self.assertTrue((scripts_dir / str(job.get("script"))).is_file())
                     continue
+                skills = job.get("skills") or job.get("skill") or []
+                if "fleet-audit" in ([skills] if isinstance(skills, str) else skills):
+                    # Under "all" the scheduler posts the final message itself,
+                    # past the relay that posts what `finish` rendered.
+                    self.assertEqual(job.get("deliver"), "chat")
                 self.assertIn(
                     job.get("deliver"),
                     audible,
@@ -4993,6 +4998,40 @@ class TestStart(HarnessTestCase):
             "declarations_path_for",
             lambda audit_id: str(self.tmp_path / f"declarations_{audit_id}.json"),
         )
+
+    def test_start_records_its_repository_and_a_refused_start_changes_nothing(self):
+        self.patch_attr("claim_in_flight", self.real_claim_in_flight)
+        self.harness.replies = {"issue-list": self.issue_list()}
+        path = Path(audit_report.chat_report_path_for(AUDIT))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        first = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(first["parts"], [{"repo": "acme/fleet", "text": None}])
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 2)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), first)
+
+    def test_starts_of_two_repositories_in_one_run_share_one_record(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        repos = iter(["acme/fleet", "acme/other"])
+        self.patch_attr("resolve_repo_or_no_forge", lambda audit_id, opt_repo: next(repos))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        audit_report.append_chat_report(AUDIT, "acme/fleet", "report A", datetime.now(timezone.utc))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["parts"],
+            [{"repo": "acme/fleet", "text": "report A"}, {"repo": "acme/other", "text": None}],
+        )
+
+    def test_a_later_start_of_the_same_repository_opens_a_new_run(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        path = Path(audit_report.chat_report_path_for(AUDIT))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        audit_report.append_chat_report(AUDIT, "acme/fleet", "the first run's report", datetime.now(timezone.utc))
+        first = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        second = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotEqual(second["run"], first["run"])
+        self.assertEqual(second["parts"], [{"repo": "acme/fleet", "text": None}])
 
     def test_emits_one_json_line(self):
         self.harness.replies = {"issue-list": self.issue_list()}
@@ -25657,6 +25696,11 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(summary[-1], audit_report.NO_FORGE_NOTE)
         latest = json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
         self.assertEqual(latest["status"], audit_report.NO_FORGE_STATUS)
+        # The chat relay posts the summary, from the record `finish` leaves.
+        record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(
+            record["parts"], [{"repo": audit_report.NO_FORGE_REPO, "text": out["summary"]}]
+        )
         self.assertEqual(latest["repo"], audit_report.NO_FORGE_REPO)
         self.assertIsNone(latest["issue_number"])
         self.assertEqual(len(latest["current_ids"]), 4)
@@ -25803,22 +25847,88 @@ class TestSopPath(unittest.TestCase):
             )
 
     # A skill file (script, SKILL.md, reference page) or an SOP named relative to
-    # the profile home, with or without a leading `./` or `../`.
-    RELATIVE = re.compile(r"(?<![\w/.-])(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)")
+    # the profile home, with or without a leading `./` or `../`, or a script named
+    # relative to the skill's own folder with `./` or `../`.
+    RELATIVE = re.compile(
+        r"(?<![\w/.-])(?:(?:\.\.?/)*(?:skills/[\w-]+/|governance/[\w-]+\.md\b)|\.\.?/scripts/)"
+    )
+    # A bare `scripts/...` is relative to the skill folder too, but prose uses the
+    # same spelling to name a file ("the script is `scripts/vcs.py`"). So a bare
+    # path counts only where a shell runs it: in a fenced block, as the first word
+    # of a command or after a wrapper or interpreter; in inline code, only after a
+    # wrapper or interpreter, because a span that is just a path names a file.
+    # Only shell fences are read: a fence labelled sh, bash, shell, zsh or console,
+    # or one with no label. A YAML or text fence lists paths, it does not run them.
+    FENCE = re.compile(
+        r"^[ \t]*(```|~~~)[ \t]*([\w+-]*)[^\n]*\n(.*?)^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL
+    )
+    SHELL_FENCES = {"", "sh", "bash", "shell", "zsh", "console"}
+    INLINE_CODE = re.compile(r"`([^`\n]+)`")
+    COMMAND_BREAK = re.compile(r"&&|\|\||[;|]|\$\(|`")
+    ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+    INTERPRETER = re.compile(r"^(?:python(?:3(?:\.\d+)?)?|bash|sh)$")
+    WRAPPERS = {"exec", "env", "nohup", "time", "command"}
 
-    def test_audit_documents_name_skill_files_and_sops_by_full_path(self):
-        """A kanban worker starts in its card's workspace, where `./skills/...`
-        and `governance/...` name nothing; the SOPs and the audit skills must
-        not send it there."""
+    @classmethod
+    def runs_bare_script(cls, segment, first_word_counts):
+        words = segment.split()
+        wrapped = False
+        while words:
+            word = words[0]
+            if cls.ASSIGNMENT.match(word) or word.startswith("-"):
+                words.pop(0)
+            elif word in cls.WRAPPERS or cls.INTERPRETER.match(word):
+                words.pop(0)
+                wrapped = True
+            elif word == "timeout":
+                words[:2] = []
+                wrapped = True
+            else:
+                break
+        return bool(words) and words[0].startswith("scripts/") and (wrapped or first_word_counts)
+
+    @classmethod
+    def bare_script_commands(cls, text):
+        found = []
+        for block in cls.FENCE.finditer(text):
+            if block.group(2).lower() not in cls.SHELL_FENCES:
+                continue
+            # A line that ends in a backslash continues on the next one.
+            for line in re.sub(r"\\\n", " ", block.group(3)).splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                found += [
+                    segment.strip()
+                    for segment in cls.COMMAND_BREAK.split(line)
+                    if cls.runs_bare_script(segment, first_word_counts=True)
+                ]
+        for span in cls.INLINE_CODE.finditer(cls.FENCE.sub("", text)):
+            found += [
+                segment.strip()
+                for segment in cls.COMMAND_BREAK.split(span.group(1))
+                if cls.runs_bare_script(segment, first_word_counts=False)
+            ]
+        return found
+
+    @classmethod
+    def relative_references(cls, text):
+        return cls.RELATIVE.findall(text) + cls.bare_script_commands(text)
+
+    def test_skills_and_sops_name_skill_files_and_sops_by_full_path(self):
+        """A kanban worker starts in its card's workspace, where `./skills/...`,
+        `scripts/...` and `governance/...` name nothing; no SOP and no platform
+        skill may send it there. A mirrored skill's text comes from its overlay's
+        `append.md` or patches, so the generated SKILL.md covers those too."""
         platform = Path(__file__).resolve().parents[3]
-        documents = sorted((platform / "governance").glob("*_sop.md")) + [
-            platform / "skills" / name / "SKILL.md"
-            for name in ("fleet-audit", "gce-compute-fleet-audit", "gcp-networking-fabric-audit")
-        ] + sorted((platform / "skills" / "fleet-audit" / "references").glob("*.md"))
+        documents = (
+            sorted((platform / "governance").glob("*_sop.md"))
+            + sorted((platform / "skills").glob("*/SKILL.md"))
+            + sorted((platform / "skills" / "fleet-audit" / "references").glob("*.md"))
+        )
         for document in documents:
-            with self.subTest(document=document.name):
+            with self.subTest(document=str(document.relative_to(platform))):
                 self.assertEqual(
-                    [], self.RELATIVE.findall(document.read_text(encoding="utf-8"))
+                    [], self.relative_references(document.read_text(encoding="utf-8"))
                 )
 
     def test_the_relative_form_is_caught_in_every_spelling(self):
@@ -25829,19 +25939,223 @@ class TestSopPath(unittest.TestCase):
             "(../skills/fleet-audit/reference.md)",
             "`skills/gke-compute-classes/references/ccc.md`",
             "`governance/compliance_audit_sop.md`",
+            "python3 ./scripts/get_chat_users.py",
+            "Run `python3 scripts/get_chat_users.py --hours 2` for the window.",
+            "```bash\nscripts/audit_cluster.sh <cluster-name> <region> <project-id>\n```",
+            "```bash\npython3 scripts/get_chat_users.py\n```",
+            "```bash\npython3 -u scripts/x.py\n```",
+            "```bash\npython3.12 scripts/x.py\n```",
+            "```bash\ntimeout 600 scripts/collect.py\n```",
+            "```bash\ncd /opt/data/scratch && scripts/audit_cluster.sh a b c\n```",
+            "```bash\nexec scripts/x.sh\n```",
+            "```bash\nH=$(scripts/x.py open)\n```",
+            "```bash\nFOO=1 scripts/x.sh\n```",
+            "```\nscripts/x.sh\n```",
+            "```console\nscripts/x.sh --help\n```",
+            "```bash\nexport V=1 \\\n  && scripts/x.sh\n```",
         ):
             with self.subTest(relative=relative):
-                self.assertRegex(relative, self.RELATIVE)
+                self.assertTrue(self.relative_references(relative), relative)
         for full in (
             "/opt/data/profiles/platform/skills/fleet-audit/scripts/collect.py",
             '"$HERMES_HOME"/skills/fleet-audit/scripts/collect.py',
             "/opt/data/profiles/platform/governance/compliance_audit_sop.md",
+            "The script is `scripts/vcs.py`.",
+            "The engine is\nscripts/vcs.py, which speaks to a broker.",
+            "  scripts/collect.py\n  scripts/fleet_drift.py",
+            "```bash\npython3 $V annotate scripts/rotate-keys.sh\n```",
+            "```bash\n# run scripts/x.py from the profile home\n```",
+            "```yaml\nsteps:\n  - scripts/x.sh\n```",
+            "```text\nfleet-audit/\n  scripts/\n  scripts/collect.py\n```",
+            "```bash\npython3 $V annotate \\\n  scripts/rotate-keys.sh\n```",
+            "```bash\npython3 /opt/data/profiles/platform/skills/x/scripts/y.py\n```",
         ):
             with self.subTest(full=full):
-                self.assertNotRegex(full, self.RELATIVE)
+                self.assertEqual([], self.relative_references(full), full)
 
     def test_a_rejection_points_at_the_sop_by_full_path(self):
         self.assertIn(audit_report.sop_path(AUDIT), audit_report._sop_pointer(AUDIT))
+
+
+
+class TestChatReport(HarnessTestCase):
+    """The record `start` and `finish` leave for the chat relay, which posts it in place of the final message."""
+
+    def chat_record(self, audit=AUDIT):
+        return json.loads(Path(audit_report.chat_report_path_for(audit)).read_text(encoding="utf-8"))
+
+    def entries(self):
+        return [(part["repo"], part["text"]) for part in self.chat_record()["parts"]]
+
+    def setUp(self):
+        super().setUp()
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
+    def test_an_opened_ledger_leaves_its_line_and_the_ledger_url(self):
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        [(repo, text)] = self.entries()
+        self.assertEqual(repo, "acme/fleet")
+        lines = text.splitlines()
+        self.assertTrue(lines[0].startswith(f"{audit_report.audit_name(AUDIT)}: "))
+        self.assertIn(" new, ", lines[0])
+        self.assertEqual(lines[-1], "Ledger: https://github.com/acme/fleet/issues/7")
+        self.assertNotIn("chat_report", self.stdout_json())
+
+    def test_detail_lines_sit_between_the_audit_line_and_the_ledger_url(self):
+        payload = {"status": "UPDATED", "issue_url": "https://github.com/acme/fleet/issues/7",
+                   "new": 2, "resolved": 1, "prs_opened": ["https://github.com/acme/fleet/pull/9"],
+                   "coverage_gaps": ["seeded-c: 3 of 16 checks did not run"]}
+        lines = audit_report.render_chat_report(AUDIT, payload, make_doc()).splitlines()
+        self.assertEqual(lines[1], "- Pull requests opened: https://github.com/acme/fleet/pull/9")
+        self.assertEqual(lines[2], "- Coverage is incomplete: seeded-c: 3 of 16 checks did not run")
+        self.assertEqual(lines[-1], f"Ledger: {payload['issue_url']}")
+
+    def test_a_held_run_names_what_it_did_not_account_for(self):
+        payload = {"status": "HELD", "issue_url": "https://github.com/acme/fleet/issues/7",
+                   "new": 0, "resolved": 0, audit_report.UNACCOUNTED_KEY: ["rbac.a", "rbac.b"]}
+        text = audit_report.render_chat_report(AUDIT, payload, make_doc(findings=[]))
+        self.assertIn("2 carried finding(s) were not accounted for", text.splitlines()[0])
+        self.assertIn("- Not accounted for: rbac.a, rbac.b", text)
+
+    def test_a_run_with_no_memory_of_the_last_says_the_change_is_unknown(self):
+        payload = {"status": "UPDATED", "issue_url": "https://github.com/acme/fleet/issues/7",
+                   "new": 0, "resolved": 0}
+        head = audit_report.render_chat_report(AUDIT, payload, make_doc(), delta_known=False).splitlines()[0]
+        self.assertIn("the change since the last run is unknown", head)
+        self.assertNotIn("0 new", head)
+
+    def test_a_held_run_with_no_memory_still_says_the_ledger_stays_open(self):
+        payload = {"status": "HELD", "issue_url": "https://github.com/acme/fleet/issues/7",
+                   "new": 0, "resolved": 0, audit_report.UNACCOUNTED_KEY: []}
+        head = audit_report.render_chat_report(
+            AUDIT, payload, make_doc(findings=[]), delta_known=False
+        ).splitlines()[0]
+        self.assertIn("its comments could not be read", head)
+
+    def test_a_held_run_with_unreadable_comments_says_so(self):
+        payload = {"status": "HELD", "issue_url": "https://github.com/acme/fleet/issues/7",
+                   "new": 0, "resolved": 0, audit_report.UNACCOUNTED_KEY: []}
+        head = audit_report.render_chat_report(AUDIT, payload, make_doc(findings=[])).splitlines()[0]
+        self.assertIn("its comments could not be read", head)
+        self.assertNotIn("0 carried", head)
+
+    def test_one_run_over_two_repositories_keeps_both(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW + timedelta(minutes=5))
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(minutes=10))
+        audit_report.append_chat_report(AUDIT, "acme/b", "report B", NOW + timedelta(minutes=20))
+        self.assertEqual(self.entries(), [("acme/a", "report A"), ("acme/b", "report B")])
+
+    def test_a_repository_that_started_and_did_not_finish_stays_pending(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW)
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(minutes=10))
+        self.assertEqual(self.entries(), [("acme/a", "report A"), ("acme/b", None)])
+
+    def test_a_retried_start_keeps_the_runs_finished_reports(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW)
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(minutes=10))
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(minutes=12))
+        audit_report.append_chat_report(AUDIT, "acme/b", "report B", NOW + timedelta(minutes=20))
+        self.assertEqual(self.entries(), [("acme/a", "report A"), ("acme/b", "report B")])
+
+    def test_a_start_does_not_adopt_a_record_with_no_finished_part(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        dead = self.chat_record()
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW + timedelta(minutes=10))
+        fresh = self.chat_record()
+        self.assertNotEqual(fresh["run"], dead["run"])
+        self.assertEqual(fresh["started_at"], (NOW + timedelta(minutes=10)).timestamp())
+        self.assertEqual(self.entries(), [("acme/a", None)])
+
+    def test_a_live_runs_pending_first_repository_is_kept(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(minutes=10))
+        audit_report.append_chat_report(AUDIT, "acme/b", "report B", NOW + timedelta(minutes=20))
+        self.assertEqual(self.entries(), [("acme/a", None), ("acme/b", "report B")])
+
+    def test_the_age_limit_counts_from_the_last_step(self):
+        step = timedelta(seconds=audit_report.INFLIGHT_TTL_SECONDS - 60)
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW + step)
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + 2 * step)
+        self.assertEqual([repo for repo, _ in self.entries()], ["acme/a", "acme/b"])
+
+    def test_a_repositorys_second_start_opens_a_new_run(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "earlier run", NOW)
+        run = self.chat_record()["run"]
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW + timedelta(minutes=30))
+        self.assertEqual(self.entries(), [("acme/a", None)])
+        self.assertNotEqual(self.chat_record()["run"], run)
+
+    def test_a_record_idle_longer_than_a_step_can_last_is_replaced(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "yesterday", NOW)
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW + timedelta(days=1))
+        self.assertEqual(self.entries(), [("acme/b", None)])
+
+    def test_a_clean_run_leaves_its_report_for_the_relay(self):
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
+            generated_at=NOW,
+        )
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
+        [(repo, text)] = self.entries()
+        self.assertEqual(repo, "acme/fleet")
+        self.assertTrue(text.splitlines()[0].startswith(f"{audit_report.audit_name(AUDIT)}: "))
+        self.assertTrue(text.splitlines()[-1].startswith("Ledger: "))
+
+    def test_a_finish_with_no_start_does_not_join_a_stale_record(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        audit_report.append_chat_report(AUDIT, "acme/a", "yesterday", NOW)
+        run = self.chat_record()["run"]
+        audit_report.append_chat_report(AUDIT, "acme/a", "today", NOW + timedelta(days=1))
+        self.assertEqual(self.entries(), [("acme/a", "today")])
+        self.assertNotEqual(self.chat_record()["run"], run)
+
+    def test_a_non_finite_stamp_does_not_hold_a_record_current(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        record = self.chat_record()
+        record["updated_at"] = float("inf")
+        Path(audit_report.chat_report_path_for(AUDIT)).write_text(json.dumps(record), encoding="utf-8")
+        audit_report.open_chat_report(AUDIT, "acme/b", NOW)
+        self.assertEqual(self.entries(), [("acme/b", None)])
+
+    def test_a_record_with_no_run_is_replaced(self):
+        audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+        record = self.chat_record()
+        del record["run"]
+        Path(audit_report.chat_report_path_for(AUDIT)).write_text(json.dumps(record), encoding="utf-8")
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW)
+        self.assertTrue(self.chat_record()["run"])
+        self.assertEqual(self.entries(), [("acme/a", "report A")])
+
+    def test_a_finish_with_no_start_still_leaves_its_report(self):
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", NOW)
+        self.assertEqual(self.entries(), [("acme/a", "report A")])
+
+    def test_an_unwritable_report_does_not_fail_the_run(self):
+        self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "file-not-dir" / "scratch"))
+        (self.tmp_path / "file-not-dir").write_text("x", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.open_chat_report(AUDIT, "acme/a", NOW)
+            audit_report.append_chat_report(AUDIT, "acme/a", "text", NOW)
+        self.assertIn(f"chat report for {AUDIT} not opened", err.getvalue())
+        self.assertIn(f"chat report for {AUDIT} not written", err.getvalue())
 
 
 if __name__ == "__main__":

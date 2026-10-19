@@ -44,10 +44,10 @@ import (
 //
 // spec.security.workloadIdentityFederation is optional hardening on top. It
 // moves this pod's cloud identity off the metadata server and onto a projected
-// token file: the pod's ServiceAccount carries no iam.gke.io/gcp-service-account
-// annotation, so the metadata server answers with an unbound
-// <project>.svc.id.goog principal that IAM grants nothing, and the provider's
-// attribute conditions bound what the exchange can mint. It narrows what this
+// token file the provider's attribute conditions bound. Without it this pod
+// takes its Google identity from the Workload Identity annotation on its
+// ServiceAccount (agentServiceAccountName), which the gateway Pod no longer
+// shares. It narrows what this
 // pod may mint; it does not decide where the pod runs.
 //
 // The split is by role rather than by copy: the same image runs here and in the
