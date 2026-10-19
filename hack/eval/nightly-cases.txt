@@ -1162,3 +1162,11 @@
 # the preflight's stop. Nightly from its first merge; a presubmit seat waits
 # on a clean nightly record.
 ./tasks/cluster-setting-request-proposes-pr/task.yaml
+
+# An alert policy question is answered from Cloud Monitoring through the
+# credential broker (#3467). A tofu stack (prebuilt/monitoring-alert-policy)
+# plants one disabled alert policy with no notification channel in the
+# project and destroys it on teardown. Read-only for the agent; requests no
+# pull request. Nightly from its first merge; a presubmit seat waits on a
+# clean nightly record.
+./tasks/monitoring-alert-policy-read/task.yaml
