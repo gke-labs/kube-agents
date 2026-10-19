@@ -1262,7 +1262,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal)); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:

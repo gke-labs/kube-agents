@@ -1763,7 +1763,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_ended_run.py /opt/hermes && \
     test "$(grep -c '_kanban_refuse_ended_run(tid, _kanban_ended_run_connect)' /opt/hermes/tools/kanban_tools.py)" = "2" && \
     test "$(grep -c '_kanban_ended_run_refusal(tid, conn) or' /opt/hermes/tools/kanban_tools.py)" = "2" && \
+    test "$(grep -c '_kanban_waiting_parent_refusal(tid, conn) or' /opt/hermes/tools/kanban_tools.py)" = "1" && \
     grep -qF 'block_task = _kanban_stop_worker_on_external_block(' /opt/hermes/hermes_cli/kanban_db.py && \
+    grep -qF 'lines.extend(_kanban_saved_result_banner(conn, task_id))' /opt/hermes/hermes_cli/kanban_db.py && \
     cp /tmp/latency-patches/kanban_self_copy.py /opt/hermes/tools/kanban_self_copy.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_self_copy.py /opt/hermes && \
     test "$(grep -c '_kanban_refuse_self_copy(self_task, assignee, parents)' /opt/hermes/tools/kanban_tools.py)" = "1" && \
