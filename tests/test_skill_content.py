@@ -40,3 +40,30 @@ class RoutedSkillsExistTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _description(skill):
+    """The frontmatter `description:` of a platform skill, which the router reads."""
+    text = (REPO_ROOT / "agents/platform/skills" / skill / "SKILL.md").read_text(encoding="utf-8")
+    front = text.split("---", 2)[1]
+    for line in front.splitlines():
+        if line.startswith("description:"):
+            return line
+    raise AssertionError(f"{skill} has no description line")
+
+
+class DeleteRequestsRouteToTheDeletionSectionTest(unittest.TestCase):
+    """A delete request on a cluster once routed to cluster-agent-lifecycle (its
+    description says "deleted" and "single-cluster"), and the worker never
+    opened the deletion section; it probed a `kubectl delete` instead (#3077,
+    #3086's repro runs). Both descriptions name the split."""
+
+    def test_submit_suggestion_claims_deletions(self):
+        description = _description("submit-suggestion")
+        self.assertIn("delete a resource", description)
+        self.assertIn("Deleting a resource", description)
+
+    def test_cluster_agent_lifecycle_disclaims_them(self):
+        description = _description("cluster-agent-lifecycle")
+        self.assertIn("Not for a request to delete or change a resource on a cluster", description)
+        self.assertIn("submit-suggestion", description)

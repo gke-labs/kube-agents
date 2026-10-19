@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review. Also answers a request to delete a resource (its "Deleting a resource" section). Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a request to delete a resource: a deletion removes the resource's manifest from the repository, and its "Deleting a resource" section says when that is a stated stop instead. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
