@@ -458,6 +458,8 @@ class ConversationRouteTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--chat-file") + 1], "/tmp/c.json")
         self.assertEqual(argv[argv.index("--update") + 1], "key")
         self.assertEqual(argv[argv.index("--timeout") + 1], "60s")
+        argv = chat_notify.conversation_command("slack", "slack:D0DM/1.1", "ctx-1", "x", timeout_s=0.5)
+        self.assertEqual(argv[argv.index("--timeout") + 1], "1s")
 
     def test_the_bus_and_the_served_platform_come_from_the_env(self):
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: " slack ", "NATS_URL": "nats://n:4222",

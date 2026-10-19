@@ -406,7 +406,9 @@ class DeliveryToConversationTest(unittest.TestCase):
                 if (self.d / DELIVERED).exists():
                     (self.d / DELIVERED).replace(self.d / INVENTORY)
                 self._answer(answer, "", "no answer")
-                self._run()
+                with mock.patch.object(bootstrap_delivery, "_mark_shown", return_value=True) as mark_shown:
+                    self._run()
+                mark_shown.assert_called_once()
                 self.assertTrue((self.d / COMPLETED).exists())
                 self.assertFalse((self.d / INVENTORY).exists())
                 self.assertEqual(self._attempts()["attempts"], 0)
@@ -509,6 +511,16 @@ class DeliveryToConversationTest(unittest.TestCase):
         self._run()
         log = (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
         self.assertIn(f"not posted after {bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS} attempts", log)
+
+    def test_a_report_past_one_post_is_refused_before_the_claim(self):
+        (self.d / INVENTORY).write_text("x" * (bootstrap_delivery.CONVERSATION_REPORT_MAX_BYTES + 1), encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = bootstrap_delivery.main(self.d)
+        self.assertEqual(rc, 1)
+        self.assertEqual(buf.getvalue(), "")
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertIn("larger than", self._attempts()["last_reason"])
 
     def test_the_gateway_answers_delivery_reads_are_the_gateway_s(self):
         # The gateway and the agent ship in different images, so these texts cannot change.

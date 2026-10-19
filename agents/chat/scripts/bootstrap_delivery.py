@@ -46,8 +46,8 @@ wrote in (``CONVERSATION_FILE``, with ``CONVERSATION_ALIGNED_MARKER`` as the hum
 That record wins over a job origin. The run then never prints the report, since the scheduler
 cannot reach a gateway conversation: it checks before the claim that this child's env carries the
 bus address, a bus identity and the gateway's platform, posts the report
-and the audits note with ``a2a notify --conversation``, marks the findings shown only once the post
-landed, and releases the claim to try again after a wait (on the card path for anything short of a
+and the audits note with ``a2a notify --conversation``, marks the findings shown only once it keeps
+the claim, and releases the claim to try again after a wait (on the card path for anything short of a
 post, since the next attempt's update key edits a card that landed; on the text path for
 ``NOT_POSTED``; on either for a claim that outlives the longest post with no outcome), up to
 ``CONVERSATION_MAX_ATTEMPTS`` (``CONVERSATION_ATTEMPTS_FILE`` records why). So on that path a claim
@@ -168,6 +168,10 @@ SANDBOX_HOME = "/opt/data"
 # chat message. It bounds what one tick moves over ssh; a report past it is
 # refused rather than cut, since a truncated report would be delivered as whole.
 REPORT_MAX_BYTES = 256 * 1024
+# The conversation path hands the report to `a2a notify` as one argv string,
+# which Linux caps at 128 KiB (MAX_ARG_STRLEN); this leaves room for the audits
+# note and the Slack reshape. A larger report is refused there, not cut.
+CONVERSATION_REPORT_MAX_BYTES = 96 * 1024
 SANDBOX_TIMEOUT_SECONDS = 30
 
 # The longest one conversation post can run (_notify_conversation): every try of
@@ -1056,8 +1060,9 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
                              no_ranking: bool | None, suppressed: set[str]) -> None:
     """After the claim: post into the conversation, and release the claim unless the report is out.
 
-    The findings are marked shown only once the report posted, so a released
-    claim leaves none counted against the day's limit.
+    The findings are marked shown only once the claim is kept (posted, or on
+    the text path most likely posted), so a released claim leaves none counted
+    against the day's limit.
     """
     note = _audits_note(data_dir, no_ranking is True, home=bool(chat_notify.routed_platform()))
     outcome, reason = _post_to_conversation(data_dir, conversation, content, note)
@@ -1066,12 +1071,10 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
         _record_attempt(data_dir, reason, counted=True)
         _release_claim(data_dir)
         return
-    shown = False
-    if outcome == POSTED:
-        shown = _mark_shown(data_dir, in_sandbox, suppressed)
-    else:
+    # A kept claim is final for this report, whether it posted or most likely did.
+    if outcome != POSTED:
         _record_attempt(data_dir, reason, counted=False)
-    _cleanup(data_dir, in_sandbox, shown)
+    _cleanup(data_dir, in_sandbox, _mark_shown(data_dir, in_sandbox, suppressed))
 
 
 def main(data_dir: Path | None = None) -> int:
@@ -1117,6 +1120,14 @@ def main(data_dir: Path | None = None) -> int:
     if len(raw) > REPORT_MAX_BYTES:
         sys.stderr.write(
             f"bootstrap_delivery: INVENTORY.md is larger than {REPORT_MAX_BYTES} bytes; not delivering it\n"
+        )
+        return 1
+    if conversation is not None and len(raw) > CONVERSATION_REPORT_MAX_BYTES:
+        _record_attempt(
+            data_dir,
+            f"INVENTORY.md is larger than {CONVERSATION_REPORT_MAX_BYTES} bytes, more than one post into the "
+            "conversation can carry; not delivering it",
+            counted=False,
         )
         return 1
     content = raw.decode("utf-8", errors="replace")

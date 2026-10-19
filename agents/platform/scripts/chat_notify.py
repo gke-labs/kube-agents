@@ -165,7 +165,7 @@ def conversation_command(platform: str, conversation: str, context_id: str, text
     if update:
         argv += ["--update", update]
     if timeout_s > 0:
-        argv += ["--timeout", f"{int(timeout_s)}s"]
+        argv += ["--timeout", f"{max(1, int(timeout_s))}s"]
     return argv + ["--", text]
 
 

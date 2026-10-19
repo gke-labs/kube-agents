@@ -956,7 +956,8 @@ that is never claimed leaves them new for the nudge; one claimed and then lost i
 moment between the claim and the marks can announce the report's items as new. Under
 `spec.mode: next`, where the report goes into the conversation the user first wrote in, the marks
 follow the post instead: a claim there can be released and retried (Rule 5 in the plugin README),
-so only a landed post marks the items, and one that may have landed marks none. Marking never holds
+so only a kept claim marks the items (a landed post, or on the text path one that most likely
+landed), and a released one marks none. Marking never holds
 delivery back: a row the queue refuses, such as one it never registered, is skipped, a queue that
 does not answer ends the marking for that delivery, and either goes to the delivery run's stderr. An
 item whose mark failed stays unshown, and the nudge adds it as new later. A paced publisher may
