@@ -424,15 +424,6 @@ nothing in the two roster files changes, and every case not named in the lane's 
 (below) runs and can red the job exactly as on the api lane. Two things differ, and they are
 kept apart on purpose.
 
-One thing about the install differs too. The lane's write safeguard
-(`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
-window to the case in flight, and the fleet audits' automatic remediation sweep opens one on its
-own wherever a pool repository declares a workload with a `major` finding on the sweep's list, the
-fresh install's first-run chain included. So `hack/ci-deploy.sh` installs the lane's agent with
-`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in `spec.deployment.env`: the audits still run and file
-their ledgers, `finish` opens nothing nobody asked for, and a `/remediate` still works. The api
-lane keeps the sweep on, where the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
-
 A check the transport blinds is the scorer's business. The door's trace carries no card ids,
 no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor, but the scorer still treats
@@ -489,6 +480,15 @@ nothing never shares the repository with one that writes by design and no window
 into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
 the set of requesting cases. The same approvers as the exclusion list, for the same reason.
+
+One thing about the lane's install differs too. That write safeguard
+(`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
+window to the case in flight, and the fleet audits' automatic remediation sweep opens one on its
+own wherever a pool repository declares a workload with a `major` finding on the sweep's list, the
+fresh install's first-run chain included. So `hack/ci-deploy.sh` installs the lane's agent with
+`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in `spec.deployment.env`: the audits still run and file
+their ledgers, `finish` opens nothing nobody asked for, and a `/remediate` still works. The api
+lane keeps the sweep on, where the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
 ## The GitLab lane
 

@@ -4103,6 +4103,24 @@ class TestPublishedBodies(HarnessTestCase):
             f'<!-- audit-findings: ["{derived_id()}"] -->', bodies[0]
         )
 
+    def test_the_install_switch_stops_finish_from_opening_a_pull_request(self):
+        """`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, read from the sandbox's root-owned
+        file: the same run that promotes above opens nothing, and the ledger it
+        publishes says the sweep is off and that `/remediate` still works (#3439)."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with tempfile.TemporaryDirectory() as tmp:
+            switch = os.path.join(tmp, "audit-auto-promote")
+            pathlib.Path(switch).write_text("false\n")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch), patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+                self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.harness.bodies_for("proposal-create"), [])
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
+        self.assertTrue(any("## Awaiting `/remediate`" in b and f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), published)
+
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
         # by default rather than by somebody remembering to add a test.

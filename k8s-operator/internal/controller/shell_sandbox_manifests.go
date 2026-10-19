@@ -540,10 +540,13 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	}
 
 	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
+	// As a literal value only, the rule every spec.deployment.env entry meets
+	// before it reaches a sandbox: a valueFrom could name a credential this
+	// pod must never hold.
 	if agent.Spec.Deployment != nil {
 		for _, v := range agent.Spec.Deployment.Env {
-			if v.Name == envAuditAutoPromote {
-				env = append(env, *v.DeepCopy())
+			if v.Name == envAuditAutoPromote && v.ValueFrom == nil {
+				env = append(env, corev1.EnvVar{Name: v.Name, Value: v.Value})
 				break
 			}
 		}

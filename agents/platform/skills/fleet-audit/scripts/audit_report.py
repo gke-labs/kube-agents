@@ -9040,8 +9040,9 @@ def promotion_candidates(
     `/remediate` is handled in the loop above and never consults them. Both are
     empty on a run without a collector manifest.
 
-    `auto_promote=False` turns the sweep off entirely and is what the `remediate`
-    subcommand passes. That command is a person naming ids, and a person who
+    `auto_promote=False` turns the sweep off entirely; the `remediate`
+    subcommand passes it, and so does `finish` on an install whose
+    `auto_promotion_enabled()` switch is off. That command is a person naming ids, and a person who
     names one id and receives six pull requests has been surprised by their own
     tool — the five they did not ask for are indistinguishable, in the
     repository, from five they did. Auto-promotion belongs to the cron, where a
@@ -10403,6 +10404,8 @@ def _render_withheld(
     triaged = list(needs_triage or [])
     floor = list(below_floor or [])
     if sweep_off:
+        if not any((f.get("remediation") or {}).get("kind") == "manifest" for f in findings):
+            return []
         return [
             "",
             "## Awaiting `/remediate`",
@@ -15881,6 +15884,8 @@ def _handle_finish_dry_run(
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
     triage_reasons = triage_markers(findings, manifest)
     sweep_on = auto_promotion_enabled()
+    if not sweep_on:
+        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep is off; only `/remediate` requests open a {noun}.")
     plan = promotion_candidates(
         findings,
         {},

@@ -11,7 +11,8 @@ to put in a diff otherwise. Three paths lead there:
   `MAJOR_SWEEP_CHECKS` (`no-pdb`, `unbound-sa-automount`, `ccc-no-ondemand-floor`) where the
   collector's candidate is at least `major` — that is a `manifest`, has no live pull request on its branch — and, on a run that passed
   `--manifest-file`, is neither uncorroborated nor triage-marked by the collector — is promoted
-  automatically by `finish` — **at most five per run**. Every other `major` finding is held to the `critical` floor:
+  automatically by `finish` — **at most five per run** — unless the install's
+  `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is `false`, when `finish` opens only what `/remediate` named. Every other `major` finding is held to the `critical` floor:
   a SOP's grade says how bad the finding is, not whether its fix is safe to open unasked. The collector marks a fix that scales a controller to zero, writes a
   default-deny NetworkPolicy, resizes a `Guaranteed` pod, needs a new ComputeClass, owes its
   `major` to the Autopilot bump, turns off a namespace's default ServiceAccount token, rewrites

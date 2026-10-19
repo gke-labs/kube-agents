@@ -711,6 +711,14 @@ func TestShellSandboxAuditAutoPromoteEnv(t *testing.T) {
 	if !ok || got != "false" {
 		t.Errorf("%s = %q, %v with spec.deployment.env setting it to false; want false, true", envAuditAutoPromote, got, ok)
 	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envAuditAutoPromote,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envAuditAutoPromote)
+	}
 	if _, other := func() (string, bool) {
 		sts := buildShellSandboxStatefulSet(off, "sandbox-ssh", "", "settings-hash")
 		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {

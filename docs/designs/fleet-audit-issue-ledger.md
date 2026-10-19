@@ -151,7 +151,8 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
-   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)).
+   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)), and
+5. the install's `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is not `false` (step 7 below).
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
