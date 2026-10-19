@@ -18,8 +18,8 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
-bar the two on `"all"`. That routes the report through the
+The entry ships `deliver: "chat"`, as every report-producing entry on the roster does.
+That routes the report through the
 relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has

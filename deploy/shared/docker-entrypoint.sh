@@ -21,6 +21,12 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
+# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
+# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
+readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# The first four bytes of an ELF executable, in hex: step 4.4's check that a file
+# named tirith is a binary before it removes it.
+readonly ELF_MAGIC_HEX=7f454c46
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -1861,6 +1867,26 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
         echo "ERROR: a profile's scheduled runs would not use the managed ssh terminal, or the managed block is unusable (see the lines above); refusing to start" >&2
         exit 1
     fi
+fi
+
+# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
+# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
+# so with the image's copy there a home's bin/tirith is dead cache, never used
+# again, and it was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data
+# volume at 209 clusters (gke-labs#3325). Removed only when PATH resolves the
+# image's copy, and only a regular file named exactly tirith in $TARGET_DIR/bin
+# or a profile's bin/ that starts with the ELF magic. The file is never run: it
+# sits on a volume workers can write, and this is the bootstrap container. Each
+# removal is logged with its size, so an operator can see where the space went.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
+    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
+        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
+        [ "$(od -An -tx1 -N4 "$stale_tirith" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
+        stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
+        if rm -f "$stale_tirith"; then
+            echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
+        fi
+    done
 fi
 
 # Everything that writes shared volume state is done; release the bootstrap lock
