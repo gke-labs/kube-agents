@@ -660,7 +660,7 @@ no `inject_kinds` at all are all refusals, because treating any of them as permi
 behaviour the check exists to prevent. A startup check rather than a per-record one because the
 answer cannot change under a running process, and a refusal rather than a fall back to log-only
 because an operator who set `--daemon-url` asked for escalation and the two modes are
-indistinguishable in every later line. The error names dropping the flag as the way to get the
+indistinguishable in every later line but the backlog marker. The error names dropping the flag as the way to get the
 degraded mode deliberately.
 
 The same reply's `features` is read too, and does not gate the start: without `drift-backlog` on it,

@@ -254,8 +254,14 @@ func parseFlags(args []string) (*flags, error) {
 // to stay callable from a test that stands up neither. onDrift arrives the same
 // way and for the same reason: building it needs a validated token out of the
 // environment, which a test should not have to set to exercise the wiring.
-func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool) (*driftFilter, *joiner) {
+//
+// skipBacklog is the inject handler's backlogRoute, and an argument rather than
+// a field set afterwards: DriftEvent.Digest, which the handler routes on, is
+// derived from it, so dropping the wiring has to be a compile error rather than
+// a detector that cards every backlog record.
+func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool, skipBacklog bool) (*driftFilter, *joiner) {
 	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), newProfileScope(f.profilesDir), alreadyInjected, onDrift)
+	join.skipBacklog = skipBacklog
 	return newDriftFilter(NewClassifier(f.automationPrincipals, f.humanDomains), join.Handle, f.logDropped), join
 }
 
@@ -535,8 +541,7 @@ func realMain(argv []string) error {
 	}
 
 	injectHandler := newDriftInjectHandler(inject)
-	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected)
-	join.skipBacklog = injectHandler.backlogRoute
+	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected, injectHandler.backlogRoute)
 
 	// Said at startup, because the difference between the two modes is nearly
 	// invisible in every later line: a run with the inject off emits the DRIFT

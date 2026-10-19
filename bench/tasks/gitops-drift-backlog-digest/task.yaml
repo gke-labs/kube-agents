@@ -1,5 +1,5 @@
 # Domain: incident triage. Journey: changes queue while the drift detector is
-# not pulling (an install, an uninstall, a pod roll), and they are recorded and
+# not pulling (an install, a pod roll), and they are recorded and
 # summarised in one digest rather than triaged one card each; a change made
 # after the detector is pulling again still gets its card.
 #

@@ -717,8 +717,9 @@ type driftInjectHandler struct {
 	seen   *insertIDSet
 	counts injectCounts
 
-	// backlogRoute sends backlog records to driftBacklogPath. Set when the
-	// daemon advertises featureDriftBacklog.
+	// backlogRoute is whether the daemon advertises featureDriftBacklog. realMain
+	// passes it to the joiner, which sets DriftEvent.Digest from it; Handle
+	// routes on that field.
 	backlogRoute bool
 }
 

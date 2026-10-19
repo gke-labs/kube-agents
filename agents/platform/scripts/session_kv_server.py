@@ -724,10 +724,10 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # (published before its process first pulled, or after waiting longer than its
 # max wait; `subscriber.backlog` in the detector). They arrive on
 # `POST /v1/drift-backlog`, write a ledger row with `backlog` set, spend no
-# quota, start no turn, and are posted as one digest. An install and a pod roll
-# each queue such a burst under the installer's own account, and
-# triaging it one card at a time spent the day's drift budget on kube-agents'
-# own objects.
+# quota, start no turn, and are posted as one digest. An install queues such a
+# burst under the installer's own account, and triaging it one card at a time
+# spent the day's drift budget on kube-agents' own objects. A pod roll queues
+# whatever was published while it restarted.
 #
 # Advertised in `/healthz` `features`, so a detector reading an older daemon
 # keeps sending every record as a card.
