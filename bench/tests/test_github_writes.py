@@ -37,7 +37,7 @@ import tomllib
 from devops_bench.verification.base import VERIFIERS
 from devops_bench.verification.runner import VerifierAgent
 from devops_bench.verification.spec import VerificationEntry, parse_node
-from kube_agents_bench import github_writes, transcript, verifiers
+from kube_agents_bench import forges, github_writes, transcript, verifiers
 from kube_agents_bench.verifiers import GitHubWritesVerifier
 from pydantic import ValidationError
 
@@ -305,6 +305,37 @@ def test_an_empty_token_file_falls_back_to_the_environment(env, github, monkeypa
     monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(tmp_path / "missing"))
     assert check().verify(5.0).status == "fail"
 
+
+#: Token-file contents that cannot be a token, each of which must fall back
+#: to BENCH_GITHUB_TOKEN rather than raise out of the check: bytes that are
+#: not UTF-8 (UnicodeDecodeError), whitespace alone, and inner whitespace or a
+#: second line, which would otherwise reach the Authorization header and make
+#: http.client raise ValueError mid-request.
+NOT_A_TOKEN = {
+    "not-utf8": b"\xff\xfeghs_renewed\n",
+    "whitespace-only": b" \n\t\n",
+    "two-lines": b"ghs_renewed\nghs_other\n",
+    "inner-space": b"ghs re newed\n",
+    "control-char": b"ghs_\x00renewed\n",
+}
+
+
+@pytest.mark.parametrize("content", NOT_A_TOKEN.values(), ids=NOT_A_TOKEN.keys())
+def test_a_token_file_that_is_not_one_token_falls_back_to_the_environment(
+    env, github, monkeypatch, tmp_path, content
+):
+    stash()
+    route_listing(github, "pulls-empty.json")
+    token_file = tmp_path / "ledger-token"
+    token_file.write_bytes(content)
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    assert forges.read_token(forges.FORGE_GITHUB) == "ghs_fake"
+    assert check().verify(5.0).status == "fail"
+
+
+def test_a_token_file_path_that_is_a_directory_falls_back_to_the_environment(env, monkeypatch, tmp_path):
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(tmp_path))
+    assert forges.read_token(forges.FORGE_GITHUB) == "ghs_fake"
 
 def test_a_leftover_from_an_earlier_lease_is_not_this_runs(env, github):
     """The listing is newest update first and the walk stops at the first
