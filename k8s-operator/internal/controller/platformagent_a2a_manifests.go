@@ -2662,7 +2662,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 }
 
 // a2aProvisionScript is the provisioning payload: the four streams, three KV
-// buckets, and three starter topics from the deployment spec, created
+// buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
@@ -3035,6 +3035,16 @@ elif [ "${live_subject_cap}" != "` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `
   echo "  stream and does not assume the difference is unintended. To align it anyway, knowing that" >&2
   echo "  lowering it evicts every subject already over the new value, oldest event first:" >&2
   echo "    nats stream edit TASKS --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + `" >&2
+fi
+# TOPICS-STATE older than this render: check that topology-skew is in its subject list.
+# Provisioning is create-only convergence, so an existing TOPICS-STATE stream keeps
+# the subject list it was created with.
+topics_state_json="$($NATS stream info TOPICS-STATE --json 2>/dev/null | tr -d ' \t\r\n' || true)"
+if printf '%s' "${topics_state_json}" | grep -q '"subjects":\[' && \
+   ! printf '%s' "${topics_state_json}" | grep -q '"a2a\.topics\.agent\.platform\.topology-skew"'; then
+  echo "NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew." >&2
+  echo "  Provisioning does not edit an existing stream; to add the subject on an existing install:" >&2
+  echo "    nats stream edit TOPICS-STATE --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe'" >&2
 fi
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully

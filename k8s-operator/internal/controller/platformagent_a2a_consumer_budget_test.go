@@ -1030,6 +1030,12 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 			wantExit:   1,
 			wantStderr: []string{"could not read max_msgs_per_subject"},
 		},
+		{
+			name:       "an existing TOPICS-STATE missing topology-skew prints the stream edit note",
+			liveJSON:   `{"name":"TASKS","max_consumers":332,"max_msgs_per_subject":4096,"subjects":["a2a.topics.agent.platform.upgrade-readiness","a2a.topics.shared.blueprint","a2a.topics.shared.probe"]}`,
+			wantExit:   0,
+			wantStderr: []string{"NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew", "nats stream edit TOPICS-STATE --subjects="},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
