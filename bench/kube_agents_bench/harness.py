@@ -657,7 +657,6 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
 def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
     result.output = ""
-    del result.trajectory[:]
     result.errors = [f"{INFRA_FAILURE_MARKER}: {detail}", *result.errors]
     result.metadata.pop("final_message", None)
     result.metadata["infra_failure"] = detail
@@ -2552,13 +2551,20 @@ class KubeAgentsHarness(AgentHarness):
 
     @staticmethod
     def _extract_board_card_messages(
-        bstate: tuple[dict[str, str], dict[str, str], dict[str, str]],
+        bstate: tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]]
+        | tuple[dict[str, str], dict[str, str], dict[str, str]],
         task_id: str,
     ) -> list[str]:
         """Summary and error strings for ``task_id`` if the board shows it in a failure status."""
-        bstatuses, bsummaries, berrors = bstate
+        bstatuses, bsummaries, berrors = bstate[:3]
+        bblock_kinds = bstate[3] if len(bstate) > 3 else {}
         msgs: list[str] = []
-        if bstatuses.get(task_id) in _FAILURE_STATUSES:
+        status = bstatuses.get(task_id)
+        if status in _FAILURE_STATUSES:
+            # A blocked card must have block_kind == "transient" to be recognized as infra,
+            # preventing worker-authored kanban_block calls from spoofing the infra prefix.
+            if status == "blocked" and bblock_kinds.get(task_id) != "transient":
+                return []
             if task_id in bsummaries:
                 msgs.append(bsummaries[task_id])
             if task_id in berrors:
@@ -2583,6 +2589,9 @@ class KubeAgentsHarness(AgentHarness):
             if isinstance(shown, dict):
                 tid = str(shown.get("id"))
                 if tid in wanted:
+                    if shown.get("status") == "blocked" and shown.get("block_kind") != "transient":
+                        found.pop(tid, None)
+                        continue
                     runs = payload.get("runs")
                     if isinstance(runs, list):
                         if runs and isinstance(runs[-1], dict):
@@ -2599,6 +2608,9 @@ class KubeAgentsHarness(AgentHarness):
                     if isinstance(item, dict):
                         tid = str(item.get("id"))
                         if tid in wanted:
+                            if item.get("status") == "blocked" and item.get("block_kind") != "transient":
+                                found.pop(tid, None)
+                                continue
                             runs = item.get("runs")
                             if isinstance(runs, list):
                                 if runs and isinstance(runs[-1], dict):
@@ -2636,7 +2648,6 @@ class KubeAgentsHarness(AgentHarness):
                         board_messages.extend(fallback_messages[t])
             return board_messages
 
-        bstatuses, bsummaries, berrors = final_bstate
         for t in failure_cards:
             card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
             if card_msgs:
@@ -2969,7 +2980,7 @@ class KubeAgentsHarness(AgentHarness):
             # ceiling still ends a wait on a card the agent cannot see.
             bstate = board.read_board_state(_agent_shell, outstanding, _EXEC_TIMEOUT)
             if bstate is not None:
-                on_board, bsummaries, berrors = bstate
+                on_board = bstate[0]
                 latest.update(on_board)
                 for t in outstanding:
                     if on_board.get(t) not in _FAILURE_STATUSES:
