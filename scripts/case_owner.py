@@ -43,7 +43,8 @@ GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 _TOP_LEVEL_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):")
 _DOMAIN_SLUG = re.compile(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)")
 _DOMAIN_OWNER = re.compile(r"^\s+owner:\s*([^\s#]+)")
-_TASK_FIELD = r"^{key}:\s*([^\s#]+)"
+# [ \t]*, not \s*: a blank `owner:` must not capture the next line.
+_TASK_FIELD = r"^{key}:[ \t]*([^\s#]+)"
 _QUOTES = "'\""
 
 

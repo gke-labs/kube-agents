@@ -622,6 +622,13 @@ class TestTheRulesReject(unittest.TestCase):
         # Optional: the case's bugs go to its domain's owner.
         self.assertEqual(self._validate(owner=DELETE), [])
 
+    def test_a_blank_owner_passes_like_a_missing_one(self):
+        # `owner:` with no value is YAML null; case_owner reads it as absent too.
+        self.assertEqual(self._validate(owner=None), [])
+
+    def test_an_empty_string_owner_is_rejected(self):
+        self._only("is not a GitHub login string", owner="")
+
     def test_the_retired_maintainers_owner_is_rejected(self):
         for owner in ("maintainers", "Maintainers"):
             with self.subTest(owner=owner):

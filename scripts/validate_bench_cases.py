@@ -924,9 +924,10 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     # owner in docs/designs/domains.yaml when it is absent (scripts/case_owner.py).
     # Offline: whether GitHub accepts the login as an assignee is checked when
     # a bug is filed, not here. devops-bench discards the key, so like `domain`
-    # it is enforced here or nowhere.
-    if "owner" in spec:
-        owner = spec["owner"]
+    # it is enforced here or nowhere. A blank `owner:` (YAML null) counts as
+    # absent, as it does for `domain` and in case_owner.
+    owner = spec.get("owner")
+    if owner is not None:
         if not isinstance(owner, str) or not owner:
             problems.append(f"'owner:' {owner!r} is not a GitHub login string")
         elif owner.startswith("@"):
