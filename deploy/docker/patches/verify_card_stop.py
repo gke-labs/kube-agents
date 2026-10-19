@@ -16,9 +16,10 @@ dispatcher's board does:
 2. a running parent with a gated todo child, a ready fan-out child under
    another session id and its gated fan-out grandchild, plus a card filed
    after a compression, are all archived, and ``recompute_ready`` promotes
-   none of them on the way (the fan-out is found through
-   ``kanban_worker_children`` when the children patch recorded it, else the
-   ``created`` event's ``creator_task_id``);
+   none of them on the way. One fan-out is found through the ``created``
+   event's ``creator_task_id``, and another only through
+   ``kanban_worker_children``, written by the children patch's own
+   ``record_worker_child``;
 3. the running card's worker, a real process started as the dispatcher starts
    one, is terminated through the route's ``signal_fn``
    (``archive_worker_termination``), and the ``sleep`` it started is gone too;
@@ -28,8 +29,11 @@ dispatcher's board does:
    session, a cron job's and an alert's are not archived, though Hermes'
    ``create_task(parents=...)`` and ``link_tasks`` copied our thread's
    subscription onto them and the route is called with that thread; nor are
-   the cards filed in a branch or by a delegate of the compressed session, nor
-   another conversation's card; a done card is untouched and reported settled;
+   the session-less cards that inherited it the same way, which only the
+   route's inherited-subscription filter excludes, while a session-less card
+   subscribed to our thread directly is stopped; nor are the cards filed in a
+   branch or by a delegate of the compressed session, nor another
+   conversation's card; a done card is untouched and reported settled;
 5. a second call stops nothing;
 6. a worker pid written onto a card after it was archived (the claim->spawn
    window in ``_set_worker_pid``) is killed and cleared by the late-pid sweep.
@@ -43,6 +47,7 @@ Usage::
 
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import json
 import os
@@ -99,6 +104,22 @@ from hermes_cli import kanban_db_dispatch as dispatch  # noqa: E402
 from hermes_cli.kanban_db_connect import connect  # noqa: E402
 
 import session_kv_server as skv  # noqa: E402
+
+
+def children_patch():
+    """deploy/docker/patches/kanban_children_settled.py: in the image the applier
+    installed it as tools/kanban_children_settled.py; from a checkout, the file
+    beside this one."""
+    try:
+        from tools import kanban_children_settled
+
+        return kanban_children_settled
+    except ImportError:
+        path = Path(__file__).resolve().parent / "kanban_children_settled.py"
+        spec = importlib.util.spec_from_file_location("kanban_children_settled", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
 skv.KANBAN_DB_PATH = str(DB)
 skv.CARD_STOP_RESCAN_INTERVAL_SECONDS = 0.0
@@ -194,6 +215,37 @@ try:
     }
     check("Hermes copied our subscription onto the waiting cards (create_task and link_tasks)",
           {foreign_conv, foreign_cron, foreign_linked} <= inherited, str(inherited))
+    # Session-less cards that wait on ours and inherited our subscription, from
+    # create_task(parents=...) and from link_tasks: the session check cannot
+    # exclude them, only the inherited-subscription filter.
+    sessionless_child = kb.create_task(conn, title="session-less, waits on it", parents=[parent])
+    sessionless_linked = kb.create_task(conn, title="session-less, linked later")
+    kb.link_tasks(conn, parent, sessionless_linked)
+    sessionless_links = [sessionless_child, sessionless_linked]
+    inherited_too = {
+        r[0]
+        for r in conn.execute(
+            "SELECT s.task_id FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
+            "WHERE s.chat_id = ? AND s.thread_id = ? AND t.session_id IS NULL",
+            (SESSION, CONVERSATION),
+        )
+    }
+    check("the session-less link children carry our subscription, and no session",
+          set(sessionless_links) <= inherited_too, str(inherited_too))
+    # The positive control: session-less, subscribed to our thread directly.
+    direct = kb.create_task(conn, title="session-less, subscribed directly")
+    add_notify_sub(conn, task_id=direct, platform="slack", chat_id=SESSION, thread_id=CONVERSATION)
+    # A fan-out known only to the children patch's table: no creator in its
+    # `created` event, and a session of its own.
+    patch_module = children_patch()
+    check("the children patch's table is the one the route reads",
+          patch_module.CHILDREN_TABLE == skv.CARD_STOP_CHILDREN_TABLE, patch_module.CHILDREN_TABLE)
+    table_only = kb.create_task(conn, title="cluster b, recorded by the patch", session_id="verify-explicit-4")
+    check("the table-only fan-out is recorded by record_worker_child", patch_module.record_worker_child(conn, table_only, parent))
+    created_creator = json.loads(conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created'", (table_only,)
+    ).fetchone()[0]).get("creator_task_id")
+    check("and its created event names no creator", created_creator is None, str(created_creator))
     on_branch = kb.create_task(conn, title="filed in a branch", session_id="verify-branch")
     on_delegate = kb.create_task(conn, title="filed by a delegate", session_id="verify-delegate")
     # Running, with a pid that a process without the card's marker holds.
@@ -207,18 +259,21 @@ try:
     kb.complete_task(conn, done, result="done earlier", summary="done earlier")
     other = kb.create_task(conn, title="another conversation", session_id="a2a-ctx-other")
     other_child = kb.create_task(conn, title="another conversation, gated", parents=[other], session_id="a2a-ctx-other")
-    tree = [parent, linked, fanned, grand, after_compression, impostor_card]
+    tree = [parent, linked, fanned, grand, after_compression, impostor_card, direct, table_only]
     check(
-        "the tree starts open: running, todo, ready, todo, ready, running",
-        [status(t) for t in tree] == ["running", "todo", "ready", "todo", "ready", "running"],
+        "the tree starts open: running, todo, ready, todo, ready, running, ready, ready",
+        [status(t) for t in tree] == ["running", "todo", "ready", "todo", "ready", "running", "ready", "ready"],
         str([status(t) for t in tree]),
     )
+    check("the session-less link children start todo", [status(t) for t in sessionless_links] == ["todo"] * 2,
+          str([status(t) for t in sessionless_links]))
     foreign = [foreign_conv, foreign_cron, foreign_linked]
     check("the cards waiting on it start todo", [status(t) for t in foreign] == ["todo"] * 3, str([status(t) for t in foreign]))
     # Hermes stamps created_at in whole seconds, so every card here ties and the
     # route's tie-break is the random id. Spread them in filing order, parents
     # first, which is the order that promotes a child if the route archived by age.
-    for n, task_id in enumerate([parent, linked, fanned, grand, *foreign, impostor_card, after_compression]):
+    for n, task_id in enumerate([parent, linked, fanned, grand, *foreign, *sessionless_links, impostor_card,
+                                 after_compression, direct, table_only]):
         conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (1_700_000_000 + n, task_id))
     check("the done card is done", status(done) == "done", status(done))
     last_event = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
@@ -235,6 +290,12 @@ try:
     check("recompute_ready promoted none of them", not set(promoted) & set(tree), str(promoted))
     check("the cards waiting on it, carrying our subscription, are not archived (and are promoted, as finishing it would have)",
           [status(t) for t in foreign] == ["ready"] * 3, str([status(t) for t in foreign]))
+    check("the session-less cards that inherited our subscription through a link are not archived",
+          [status(t) for t in sessionless_links] == ["ready"] * 2, str([status(t) for t in sessionless_links]))
+    check("the session-less card subscribed directly was stopped by its subscription",
+          (stopped.get(direct) or {}).get("via") == "subscription", json.dumps(stopped.get(direct)))
+    check("the fan-out only kanban_worker_children knows was stopped as a child",
+          (stopped.get(table_only) or {}).get("via") == "child", json.dumps(stopped.get(table_only)))
     check("a branch's and a delegate's cards are not the conversation's",
           (status(on_branch), status(on_delegate)) == ("ready", "ready"), str((status(on_branch), status(on_delegate))))
 
