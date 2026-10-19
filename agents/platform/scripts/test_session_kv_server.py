@@ -6336,6 +6336,26 @@ class TestDriftBacklog(unittest.TestCase):
         self._post()
         self.assertEqual(len(self._rows()), 1)
 
+    def test_a_record_that_already_has_a_live_card_is_not_recorded_again(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO intercepted_events (object_uid, reason, notified, session_id) VALUES (?, ?, 1, 's-1')",
+                    ("carded-id", session_kv_server.DRIFT_LEDGER_REASON),
+                )
+        self.addCleanup(self._delete_uid, "carded-id")
+        self.assertEqual(self._post(insert_id="carded-id").status_code, 200)
+        self.assertEqual(self._rows(), [])
+
+    def _delete_uid(self, uid):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM intercepted_events WHERE object_uid = ?", (uid,))
+
     def test_a_record_with_no_insert_id_is_still_recorded(self):
         self._post(insert_id="")
         self._post(insert_id="")

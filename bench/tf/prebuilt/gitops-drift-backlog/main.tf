@@ -313,6 +313,14 @@ resource "null_resource" "drift_backlog" {
       card_finished=""
       while :; do
         if card_is_finished "$live_id"; then card_finished=1; break; fi
+        # A live record marked backlog gets no card, so check its row here,
+        # before the wait runs out and the no-card branch excludes the run.
+        live_row="$(ledger_rows "$live_id" | tail -1)"
+        live_backlog="$(printf '%s' "$live_row" | cut -d'|' -f4)"
+        if [ -n "$live_row" ] && [ "$live_backlog" != "0" ] && [ "$live_backlog" != "none" ]; then
+          write_verdict live-marked-backlog "the live record, published after the relaunched detector's first pull, was marked backlog: $live_row"
+          exit 0
+        fi
         [ "$waited" -ge "${var.card_timeout_seconds}" ] && break
         sleep 15
         waited=$(( waited + 15 ))
@@ -348,12 +356,6 @@ resource "null_resource" "drift_backlog" {
         echo "ERROR: the live card did not finish. This is the install, not the change. Excluding the repetition." >&2
         exit 1
       fi
-      live_backlog="$(printf '%s' "$live_row" | cut -d'|' -f4)"
-      if [ "$live_backlog" != "0" ] && [ "$live_backlog" != "none" ]; then
-        write_verdict live-marked-backlog "the live record, published after the relaunched detector's first pull, was marked backlog: $live_row"
-        exit 0
-      fi
-
       write_verdict ok "$${#backlog_ids[@]} backlog records recorded with no card and given their digest; live card finished"
       echo "backlog digested: no card for $${#backlog_ids[@]} backlog records, live card for $live_id finished"
     EOT

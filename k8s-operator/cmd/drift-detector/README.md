@@ -37,7 +37,9 @@ after the handler returns, redelivery is ordinary rather than exceptional: the d
 the last few thousand `insertId`s it has injected and suppresses a repeat before opening a second
 session, so one redelivered batch does not page a human twice for one change. That set is in memory
 and per-process, which leaves one case uncovered: a non-graceful exit leaves its batch unacked, and
-the next instance starts with an empty set and injects those records again. A climbing `duplicate=`
+the next instance starts with an empty set. Those records were published before its first pull, so
+they come back as backlog, and the daemon drops each one that already has a drift row. Against a
+daemon without the digest route, the next instance injects them again. A climbing `duplicate=`
 count in the shutdown tally is a sign the ack deadline is too tight, not that the cluster is busy.
 Climbing alongside `failed=` means something else — a record is marked seen before its send, so a
 failed inject is not retried on redelivery either.

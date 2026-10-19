@@ -916,14 +916,15 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_created_at "
                 "ON intercepted_events (created_at)"
             )
-            # Partial, so they cost nothing on the rows that are not backlog,
-            # which is nearly all of them. The queries that use them spell the
-            # backlog value as a literal, because SQLite matches a partial
-            # index's WHERE against the query's text and a bound parameter
-            # never matches.
+            # Partial, so they cost nothing on the rows they do not cover:
+            # the first holds drift rows only, the second pending backlog rows
+            # only. The queries that use them spell the value as a literal,
+            # because SQLite matches a partial index's WHERE against the
+            # query's text and a bound parameter never matches.
+            conn.execute("DROP INDEX IF EXISTS idx_intercepted_events_backlog_uid")
             conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_backlog_uid "
-                f"ON intercepted_events (object_uid) WHERE backlog != {DRIFT_BACKLOG_NONE}"
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_drift_uid "
+                f"ON intercepted_events (object_uid) WHERE reason = '{DRIFT_LEDGER_REASON}'"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_backlog_pending "
@@ -4152,9 +4153,11 @@ def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
     a turn: the burst this exists for is an install's or a pod roll's own
     writes, and one card each is what spent the drift budget on them.
 
-    One row per insert id. The detector retries a failed post once and loses its
-    seen set on a restart, so the same record can arrive twice; a second row
-    would count it twice in the digest.
+    One drift row per insert id, backlog or live. The detector retries a failed
+    post once and loses its seen set on a restart, so the same record can
+    arrive twice; and a record carded by a process that died before it acked
+    comes back to the next one as backlog. A second row would count the record
+    in the digest, once more or for the first time, though it was already sent.
     """
     if payload.get("kind") != INJECT_KIND_DRIFT:
         raise HTTPException(status_code=400, detail=f"a drift backlog record needs kind {INJECT_KIND_DRIFT!r}")
@@ -4172,7 +4175,7 @@ def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
                     "occurrences, notified, session_id, backlog, principal) "
                     "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, '', ?, ? "
                     "WHERE ? = '' OR NOT EXISTS "
-                    f"(SELECT 1 FROM intercepted_events WHERE object_uid = ? AND backlog != {DRIFT_BACKLOG_NONE})",
+                    f"(SELECT 1 FROM intercepted_events WHERE object_uid = ? AND reason = '{DRIFT_LEDGER_REASON}')",
                     (
                         _defang_drift_field(cluster),
                         _defang_drift_field(resource.get("namespace")),

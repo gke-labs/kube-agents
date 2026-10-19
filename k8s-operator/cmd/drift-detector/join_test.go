@@ -1161,3 +1161,16 @@ func TestJoinStillHoldsAnOutOfScopeBacklogRecord(t *testing.T) {
 		t.Errorf("outcome=%s out_of_scope=%t digest=%t, want %s, held, and not digested", got.Outcome, got.OutOfScope, got.Digest, joinUnreachable)
 	}
 }
+
+// A live record still gets its lookup, and is not marked Digest, when the join
+// is told the daemon digests backlog.
+func TestJoinStillLooksUpALiveRecordWithTheDigestRouteOn(t *testing.T) {
+	getter := &stubGetter{obj: &unstructured.Unstructured{Object: map[string]any{}}}
+	var got DriftEvent
+	j := newJoiner(joinSet(getter), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.skipBacklog = true
+	j.Handle(context.Background(), joinRecord())
+	if got.Outcome != joinEnriched || len(getter.refs) != 1 || got.Digest {
+		t.Errorf("outcome=%s lookups=%d digest=%t, want %s, one lookup, not digested", got.Outcome, len(getter.refs), got.Digest, joinEnriched)
+	}
+}

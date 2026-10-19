@@ -1030,11 +1030,20 @@ func TestBacklogMarksAMessageThatWaitedPastTheMaxWait(t *testing.T) {
 	sub := newSubscriber(&fakeSource{}, func(context.Context, AuditRecord) {}, defaultMaxMessages, defaultBatchJoinBudget)
 	sub.firstPullAt = firstPull
 	sub.pulledAt = firstPull.Add(2 * time.Hour)
+	if sub.backlogAge != backlogMaxWait {
+		t.Fatalf("backlogAge = %s, want backlogMaxWait (%s)", sub.backlogAge, backlogMaxWait)
+	}
 
 	published := sub.pulledAt.Add(-backlogMaxWait - time.Second)
 	if !sub.backlog(published) {
 		t.Errorf("a message that waited %s was not backlog", sub.pulledAt.Sub(published))
 	}
+	// The field, not the constant, is what the rule reads.
+	sub.backlogAge = 3 * time.Hour
+	if sub.backlog(published) {
+		t.Errorf("a message that waited %s was backlog under a %s max wait", sub.pulledAt.Sub(published), sub.backlogAge)
+	}
+	sub.backlogAge = backlogMaxWait
 	published = sub.pulledAt.Add(-backlogMaxWait + time.Second)
 	if sub.backlog(published) {
 		t.Errorf("a message that waited %s was backlog", sub.pulledAt.Sub(published))
