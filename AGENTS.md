@@ -1,5 +1,7 @@
 # AGENTS.md
 
+<!-- merge-queue dry run (#1363): T2 adds these bytes, fits alone. -->
+
 ## Project Overview
 
 This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent configurations, personas, and skills for managing Kubernetes/GKE operations.
