@@ -427,8 +427,8 @@
 # 2026-10-15 adds delete-namespace-unowned-stops (#3077): one case, three
 # units, deployer: noop on the seeded fleet's stalled-controller namespace,
 # unhinted at the 200s default. Counted from the lists with it, the last
-# entry below: one one hundred and three cases (309 units) here, of a one-hundred-and-fifteen-case,
-# 345-unit matrix.
+# entry below: one one hundred and one hundred and four cases (312 units) here, of a one-hundred-and-sixteen-case,
+# 348-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1214,6 +1214,11 @@
 # not ask about declares no next step (the report-format stanza). Read-only
 # against the no-pdb-workload and crashloop-workload fixtures; one card.
 ./tasks/chat-answer-tangent-offer-declares-no-step/task.yaml
+
+# #3371: a zonal seeded cluster asked about by its region must be found, not
+# declared absent. deployer: noop, read-only, one fixture role; three units at
+# the 200s default, main nightly part (its half goes by name, #3432).
+./tasks/fleet-zonal-cluster-named-by-region/task.yaml
 
 # A request to delete a namespace the GitOps repository does not declare: the
 # agent stops, says a pull request cannot delete it (or that no repository is
