@@ -2066,14 +2066,17 @@ esac
 # run one unit at a time after every other unit (unit_phase, below), and on
 # one project that phase and the infra lock's stretch did not fit the 480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
-# those cases out and "writers" runs them alone. The split is applied after
-# the lane step, which is what names them. A part outside the nightly would
-# silently run a subset of the presubmit, so it stops the job, as does any
-# other value.
+# those cases out and "writers" runs them alone. "main-a" and "main-b" split
+# "main" again, so it can run as two periodics on two more leased projects:
+# its length is set by the stack-bearing units, which run one at a time under
+# lock-infra, and each project has a lock of its own (#3384). The split is
+# applied after the lane step, which is what names the writers. A part
+# outside the nightly would silently run a subset of the presubmit, so it
+# stops the job, as does any other value.
 EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"
 case "${EVAL_NIGHTLY_PART}" in
   all) ;;
-  main | writers)
+  main | main-a | main-b | writers)
     if [ "${EVAL_TIER}" != "nightly" ]; then
       echo "ERROR: EVAL_NIGHTLY_PART=${EVAL_NIGHTLY_PART} selects part of the nightly matrix, but EVAL_TIER=${EVAL_TIER}; unset it, or set it to 'all', outside the nightly." >&2
       exit 1
@@ -2084,7 +2087,7 @@ case "${EVAL_NIGHTLY_PART}" in
     fi
     ;;
   *)
-    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
+    echo "ERROR: EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b' or 'writers', got '${EVAL_NIGHTLY_PART}'." >&2
     exit 1
     ;;
 esac
@@ -2259,16 +2262,112 @@ unit_task_path() { # <task-path> <task-name>
 # BOOTSTRAP_ADMITTED export, as the lane's are.
 # The "Nightly part:" line is the record of which part a night ran, and
 # names the cases the part left out.
+#
+# main-a and main-b halve the stack-bearing units, the ones that take
+# lock-infra, since their one-at-a-time chain is what sets the main part's
+# length; the cases without a stack are halved too. The onboarding cases
+# (unit_state_lock) all go to main-a: they rewrite one install's onboarding
+# state, and only a run on one install keeps them apart. Each remaining case
+# goes, in matrix order, to the half with fewer of its kind so far, main-a on
+# a tie, so a case's half depends only on the matrix. The three helpers it
+# reads are defined here, ahead of the fan-out further down that also uses
+# them, because the split runs first.
+
+# Reads infrastructure.stack out of a task file. The nightly part split uses
+# it to tell a stack-bearing case, and the fan-out's loop to decide whether
+# the task's stack opts into seeded-cluster reuse.
+#
+# task_has_spec() used to sit beside this and is gone: bench-gate parses the
+# task file with a real YAML parser (bench/kube_agents_bench/cases.py), which
+# can tell a real `verification_spec:` from one inside a comment or a prompt
+# block. task_stack stays a regex because nothing has moved tf stack selection
+# into the scorer, and it must not.
+task_stack() {
+  python3 -c "
+import re, sys
+text = open(sys.argv[1]).read()
+m = re.search(r'^\s*stack:\s*(.+?)\s*\$', text, re.M)
+print(m.group(1).strip('\'\"') if m else '')
+" "$1" 2>/dev/null || echo ""
+}
+
+# A stack-bearing case listed in infra_lock_exempt runs beside the other tofu
+# units: its stack reaches the agent install through a kubeconfig of its own
+# and touches no task cluster, and run_one_unit gives the unit a private copy
+# of the shared kubeconfig, so the get-credentials devops-bench runs for the
+# stack's cluster_name output cannot move another unit's current-context.
+infra_lock_exempt() { # <task-name>
+  case "$1" in
+    oobe-first-run-audits) return 0 ;;
+  esac
+  return 1
+}
+# The agent-install state a case's stack rewrites that another case's stack
+# rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
+# markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
+# Agent's `oobe` cron job. The infra lock cannot keep an exempt case apart
+# from the others, so this lock does.
+unit_state_lock() { # <task-name>
+  case "$1" in
+    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
+  esac
+}
+
+# Each case's kind for the halves: filled in by the first loop below, read
+# by the second.
+NIGHTLY_HALF_KIND=()
 NIGHTLY_PART_DROPPED=""
 if [ "${EVAL_TIER}" = "nightly" ]; then
   NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
   if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
-    NIGHTLY_PART_KEPT=()
+    # First pass: each case's kind -- writers, onboarding, stack or plain --
+    # and the onboarding cases' share of main-a, so the second pass balances
+    # the rest around them.
+    HALF_A_STACK=0 HALF_B_STACK=0 HALF_A_PLAIN=0 HALF_B_PLAIN=0
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
+      KIND="plain"
+      # An inject-lane copy is an absolute path (lane_task_entry, above).
+      case "${ENTRY}" in
+        /*) ENTRY_FILE="${ENTRY}" ;;
+        *) ENTRY_FILE="${BENCH_DIR}/${ENTRY}" ;;
+      esac
+      if [ -n "$(task_stack "${ENTRY_FILE}")" ] && ! infra_lock_exempt "${NAME}"; then KIND="stack"; fi
       case ",${INJECT_LANE_REQUESTING}," in
-        *",${NAME},"*) ENTRY_PART="writers" ;;
-        *) ENTRY_PART="main" ;;
+        *",${NAME},"*) KIND="writers" ;;
+        *)
+          if [ "$(unit_state_lock "${NAME}")" = "onboarding" ]; then
+            if [ "${KIND}" = "stack" ]; then HALF_A_STACK=$((HALF_A_STACK + 1)); else HALF_A_PLAIN=$((HALF_A_PLAIN + 1)); fi
+            KIND="onboarding"
+          fi
+          ;;
+      esac
+      NIGHTLY_HALF_KIND+=("${KIND}")
+    done
+    NIGHTLY_PART_KEPT=()
+    INDEX=0
+    for ENTRY in "${TASKS[@]}"; do
+      NAME="$(basename "$(dirname "${ENTRY}")")"
+      KIND="${NIGHTLY_HALF_KIND[${INDEX}]}"
+      INDEX=$((INDEX + 1))
+      case "${EVAL_NIGHTLY_PART}:${KIND}" in
+        *:writers) ENTRY_PART="writers" ;;
+        main:*) ENTRY_PART="main" ;;
+        *:onboarding) ENTRY_PART="main-a" ;;
+        *:stack)
+          if [ "${HALF_B_STACK}" -lt "${HALF_A_STACK}" ]; then
+            ENTRY_PART="main-b"; HALF_B_STACK=$((HALF_B_STACK + 1))
+          else
+            ENTRY_PART="main-a"; HALF_A_STACK=$((HALF_A_STACK + 1))
+          fi
+          ;;
+        *)
+          if [ "${HALF_B_PLAIN}" -lt "${HALF_A_PLAIN}" ]; then
+            ENTRY_PART="main-b"; HALF_B_PLAIN=$((HALF_B_PLAIN + 1))
+          else
+            ENTRY_PART="main-a"; HALF_A_PLAIN=$((HALF_A_PLAIN + 1))
+          fi
+          ;;
       esac
       if [ "${ENTRY_PART}" = "${EVAL_NIGHTLY_PART}" ]; then
         NIGHTLY_PART_KEPT+=("${ENTRY}")
@@ -2497,23 +2596,6 @@ export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 # docs/eval-gate-roster.md ("The whole-suite rate") carries the recipe and
 # what the author sees when it fires.
 export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
-
-# Reads infrastructure.stack out of a task file. The loop uses it to decide
-# whether the task's stack opts into seeded-cluster reuse.
-#
-# task_has_spec() used to sit beside this and is gone: bench-gate parses the
-# task file with a real YAML parser (bench/kube_agents_bench/cases.py), which
-# can tell a real `verification_spec:` from one inside a comment or a prompt
-# block. task_stack stays a regex because nothing has moved tf stack selection
-# into the scorer, and it must not.
-task_stack() {
-  python3 -c "
-import re, sys
-text = open(sys.argv[1]).read()
-m = re.search(r'^\s*stack:\s*(.+?)\s*\$', text, re.M)
-print(m.group(1).strip('\'\"') if m else '')
-" "$1" 2>/dev/null || echo ""
-}
 
 # Who admits a case: the roster below, or the evidence store. Decided
 # 2026-09-14 on #1493: the roster stays hand-edited and the record informs.
@@ -2945,27 +3027,6 @@ unit_delegation_timeout() {
 # since a unit that held none of its declared locks would run beside the
 # audit cases they keep out.
 #
-# A stack-bearing case listed in infra_lock_exempt runs beside the other tofu
-# units: its stack reaches the agent install through a kubeconfig of its own
-# and touches no task cluster, and run_one_unit gives the unit a private copy
-# of the shared kubeconfig, so the get-credentials devops-bench runs for the
-# stack's cluster_name output cannot move another unit's current-context.
-infra_lock_exempt() { # <task-name>
-  case "$1" in
-    oobe-first-run-audits) return 0 ;;
-  esac
-  return 1
-}
-# The agent-install state a case's stack rewrites that another case's stack
-# rewrites too, as a lock name, or nothing. "onboarding" is the onboarding
-# markers (.bootstrap_scan_filed, .bootstrap_handoff_filed) and the Planning
-# Agent's `oobe` cron job. The infra lock cannot keep an exempt case apart
-# from the others, so this lock does.
-unit_state_lock() { # <task-name>
-  case "$1" in
-    oobe-first-run-audits | bootstrap-discovery-fanout | bootstrap-inventory-ranking-delivery) echo "onboarding" ;;
-  esac
-}
 TASK_NAMES=()
 TASK_REUSE=()
 TASK_HAS_STACK=()

@@ -760,17 +760,67 @@ class NightlyPartTest(unittest.TestCase):
             with self.subTest(tier=tier):
                 result = load_matrix_through_the_part({"EVAL_TIER": tier, "EVAL_NIGHTLY_PART": "writer"})
                 self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("EVAL_NIGHTLY_PART must be 'all', 'main' or 'writers', got 'writer'", result.stderr)
+                self.assertIn("EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b' or 'writers', got 'writer'", result.stderr)
                 self.assertNotIn("TASK ", result.stdout)
 
     def test_a_part_outside_the_nightly_is_refused(self):
-        for part in ("main", "writers"):
+        for part in ("main", "main-a", "main-b", "writers"):
             for env in ({}, {"EVAL_TIER": "presubmit"}):
                 with self.subTest(part=part, env=env):
                     result = load_matrix_through_the_part({**env, "EVAL_NIGHTLY_PART": part})
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                     self.assertIn(f"EVAL_NIGHTLY_PART={part} selects part of the nightly matrix, but EVAL_TIER=presubmit", result.stderr)
                     self.assertNotIn("TASK ", result.stdout)
+
+    def has_stack(self, entry: str) -> bool:
+        """Takes lock-infra: names a stack, and is not the exempt case."""
+        name = pathlib.Path(entry).parent.name
+        text = (BENCH_DIR / entry).read_text(encoding="utf-8")
+        return name != "oobe-first-run-audits" and re.search(r"^\s*stack:\s*\S", text, re.M) is not None
+
+    def halves(self) -> tuple[list[str], list[str]]:
+        a = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main-a"})
+        b = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main-b"})
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertEqual(b.returncode, 0, b.stderr)
+        return lines_tagged(a, "TASK"), lines_tagged(b, "TASK")
+
+    def test_the_halves_cover_main_once_in_matrix_order(self):
+        a, b = self.halves()
+        main = [e for e in self.nightly_matrix() if not self.is_writer(e)]
+        self.assertEqual(sorted(a + b), sorted(main))
+        self.assertFalse(set(a) & set(b))
+        self.assertEqual(a, [e for e in main if e in a])
+        self.assertEqual(b, [e for e in main if e in b])
+
+    def test_the_halves_split_the_stack_bearing_cases_evenly(self):
+        # The stack units' one-at-a-time chain is what sets the main part's
+        # length (#3384), so it is the count that has to come out even.
+        a, b = self.halves()
+        stack_a, stack_b = sum(map(self.has_stack, a)), sum(map(self.has_stack, b))
+        self.assertGreater(stack_a + stack_b, 1, "the matrix has stack cases to split")
+        self.assertLessEqual(abs(stack_a - stack_b), 1, (stack_a, stack_b))
+        plain_a, plain_b = len(a) - stack_a, len(b) - stack_b
+        self.assertLessEqual(abs(plain_a - plain_b), 1, (plain_a, plain_b))
+
+    def test_the_onboarding_cases_share_main_a(self):
+        # They rewrite one install's onboarding state (unit_state_lock); only
+        # a run on one install keeps them apart.
+        a, b = self.halves()
+        onboarding = {"oobe-first-run-audits", "bootstrap-discovery-fanout", "bootstrap-inventory-ranking-delivery"}
+        in_matrix = {pathlib.Path(e).parent.name for e in self.nightly_matrix()} & onboarding
+        self.assertTrue(in_matrix, "the nightly runs onboarding cases")
+        self.assertEqual({pathlib.Path(e).parent.name for e in a} & onboarding, in_matrix)
+        self.assertFalse({pathlib.Path(e).parent.name for e in b} & onboarding)
+
+    def test_the_halves_export_only_their_own_roster_cases(self):
+        a, b = self.halves()
+        for part, tasks in (("main-a", a), ("main-b", b)):
+            with self.subTest(part=part):
+                result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+                names = {pathlib.Path(t).parent.name for t in tasks}
+                self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in names)])
+                self.assertIn(f"Nightly part: {part} ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
 
     def test_an_empty_part_is_refused(self):
         result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"}, requesting=[])

@@ -15,7 +15,8 @@
 # ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
 # ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
 # cases that request a pull request, on a second project (the variable's
-# comment in the script says why). The budget below prices the whole matrix
+# comment in the script says why). EVAL_NIGHTLY_PART=main-a and main-b halve
+# the main part again, for two jobs on two projects (#3384). The budget below prices the whole matrix
 # on one job, as it ran before that split.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
