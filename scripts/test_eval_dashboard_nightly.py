@@ -1201,6 +1201,10 @@ class ThreePartNightPageTest(unittest.TestCase):
         self.assertIn(f'<a href="{MAIN_B_URL}">main-b part</a>', app)
         self.assertIn("<b>The night was cut short:</b> main-b part cut short after 2h 30m. Prow ended the job with 6 of 7 cases recorded", app)
         self.assertIn("<h1>Last night's run</h1>", dom_text(out / "nightly.html", fragment=f"#build={MAIN_B_2}"))
+        # The Brief's line names the half cut short too, not the main half's clock.
+        brief = dom_text(out / "index.html")
+        self.assertIn("truncated: 6 of 7 cases recorded · main-b part cut short after 2h 30m.", brief)
+        self.assertNotIn("truncated after 6h 40m", brief)
 
 if __name__ == "__main__":
     unittest.main()

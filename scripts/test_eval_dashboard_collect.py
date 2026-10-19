@@ -1330,6 +1330,22 @@ class TestNightlySource(_MergeBase):
         self.assertIn(f"warning: --nightly-main-b-prefix {other} names job my-main-b, not ci-kube-agents-eval-nightly-main-b", stderr)
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
 
+    def test_the_writers_prefix_under_the_main_b_flag_is_named_as_writers_and_listed_once(self):
+        """The warning names the part the runs really file as, and one job
+        named by both flags is listed once, not twice above one watermark."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_INFRA, periodic=FAKE_WRITERS_PREFIX)
+        _, stderr = self.quiet_collect(
+            nightly_prefix=FAKE_NIGHTLY_PREFIX,
+            nightly_writers_prefix=FAKE_WRITERS_PREFIX,
+            nightly_main_b_prefix=FAKE_WRITERS_PREFIX,
+            gsutil=gsutil,
+        )
+        self.assertIn(f"names job {collect.DEFAULT_NIGHTLY_WRITERS_JOB}, not ci-kube-agents-eval-nightly-main-b; the report files its runs as the writers part", stderr)
+        self.assertIn("both name job", stderr)
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}"])
+
     def test_the_main_b_job_resumes_above_its_own_watermark(self):
         """main-a and main-b start together and either may finish first: a
         main-b id on record must not lift the main job's watermark, nor the

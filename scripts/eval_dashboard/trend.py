@@ -196,9 +196,9 @@ def night_id(record: dict, anchors: dict[str, str] | None = None) -> str:
     """One nightly job's records share its build; a record without one (a
     laptop run, a name outside the layout) stands alone under its stamp.
     ``anchors`` (nightly.night_builds) puts the builds of a night split
-    across two jobs under the one build the report files that night by, so
-    the night is one night here too, and a domain's point that night pools
-    the cases of both parts."""
+    across jobs (main, main-b, writers) under the one build the report files
+    that night by, so the night is one night here too, and a domain's point
+    that night pools the cases of all its parts."""
     build = record.get("build")
     if isinstance(build, str) and build and anchors:
         build = anchors.get(build, build)
@@ -435,8 +435,8 @@ def latency_document(data: dict, store_nights: list[dict], in_window) -> dict:
     """The ``latency`` block of the trend document: ``nights[]`` (``{id, at,
     build}``, oldest first) and, per scope, one point per night the scope
     recorded a rep (``latency_point``). A night is the Nightly page's
-    (``nightly.filed_nights``, its parts only; a case both parts recorded
-    counts as the main part recorded it) under the id the store's records
+    (``nightly.filed_nights``, its parts only; a case two parts recorded
+    counts as the first part in report order recorded it) under the id the store's records
     of it carry (``night_id``), dated by the store's night when it holds
     one, so the row's points sit under the bars above them, else by its
     parts' newest finish (or start). ``in_window`` is the page's window."""

@@ -2117,12 +2117,22 @@ def collect(
         ("--nightly-main-b-prefix", nightly_main_b_prefix, main_b_job, DEFAULT_NIGHTLY_MAIN_B_JOB),
     ):
         if job != expected:
-            # nightly.py tells the part by this job name alone.
+            # nightly.py tells the part by this job name alone (PART_JOBS).
+            part = {DEFAULT_NIGHTLY_WRITERS_JOB: "writers", DEFAULT_NIGHTLY_MAIN_B_JOB: "main-b"}.get(job, "main")
             print(
                 f"warning: {flag} {prefix} names job {job}, not {expected};"
-                " the report files its runs as the main part",
+                f" the report files its runs as the {part} part",
                 file=sys.stderr,
             )
+    # Both flags naming one job would list it twice above one watermark:
+    # list it once, under --nightly-writers-prefix.
+    if nightly_writers_prefix and nightly_main_b_prefix and writers_job == main_b_job:
+        print(
+            f"warning: --nightly-writers-prefix and --nightly-main-b-prefix both name job {writers_job};"
+            " listing it once",
+            file=sys.stderr,
+        )
+        nightly_main_b_prefix = None
     after_build = None
     nightly_after = None
     writers_after = None

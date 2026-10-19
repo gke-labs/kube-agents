@@ -1656,9 +1656,11 @@ function nightlyBriefHtml() {
   if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 9 AM digest.</p>`;
   else {
     const c = night.counts;
-    const notes = partNotes(night, !night.truncated).map((n) => ` · ${esc(n)}`).join("");
+    // With a main-b part, each half cut short is named with its own wall
+    // clock (as on the Nightly page and in the digest), not one for the night.
+    const notes = partNotes(night, !night.truncated || nightHasMainB(night)).map((n) => ` · ${esc(n)}`).join("");
     const summary = night.truncated
-      ? `truncated after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
+      ? `truncated${nightHasMainB(night) ? "" : ` after ${nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "an unknown time"}`}: ${c.recorded} of ${c.expected || "?"} cases recorded${notes}`
       : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length && !nightLacksMain(night) ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${notes}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
     body = `<p>${nightPill(night)} <b>${esc(nightDay(night))}</b> — ${summary}. <a href="${esc(nightHref(night))}">Read the report →</a></p>`;
   }
