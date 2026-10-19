@@ -97,11 +97,12 @@
 # read-back. The green runs are longer because the verb route does the
 # read-back the CLI route skipped.
 #
-# No `domain:`: rca-remediation-pr owns the remediation journey -- a proposed
-# fix landing as a pull request -- and this case proposes no fix. It grades a
-# route, like vcs-history-only-fact.
+# Domain source-control, not remediation: rca-remediation-pr owns the
+# remediation journey -- a proposed fix landing as a pull request -- and this
+# case proposes no fix. It grades the route to the forge.
 id: vcs-review-feedback-read-back
 name: A second revision on a pull request, read back from the forge before it is described
+domain: source-control
 prompt: >-
   Do all of the following as ONE delegated task, in order — do not split it
   across several tasks.
@@ -196,8 +197,9 @@ verification_spec:
       # `env A=b $G add`). The
       # patterns show whether this case's worker hit the refusal. What keeps
       # the skills from teaching the variable form again is the image build's
-      # check_skill_commands.py, which runs the shell blocks of their SKILL.md
-      # files through Tirith, and for inline code
+      # check_skill_commands.py, which runs the shell blocks of every document
+      # of the agent image's skills (deploy/docker/skill_documents.py) through
+      # Tirith, and for inline code
       # tests/test_skill_inline_commands.py and the stockout plugin's
       # test_skill_commands.py. Those read the skill's own
       # text, so they see a chain's later commands, but their patterns miss

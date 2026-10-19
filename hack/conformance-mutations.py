@@ -513,6 +513,63 @@ Mutation(
         "a 404 and the gke tools stop working with no policy refusal to read",
     ),
     Mutation(
+        "C1-gateway-identity-annotated",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: platformagent-gateway-agent\n  namespace: kubeagents-system\n  ownerReferences:\n',
+         '  annotations:\n    iam.gke.io/gcp-service-account: kubeagents-platform-gsa@kube-agents-gkedemos.iam.gserviceaccount.com\n'
+         '  name: platformagent-gateway-agent\n  namespace: kubeagents-system\n  ownerReferences:\n'),
+        "test_C1_the_gateway_identity_carries_no_cloud_annotation",
+        "copy the broker's annotation onto the gateway's ServiceAccount so a script "
+        "in the gateway can call a Google API -- the model's pod is back on the "
+        "install's whole IAM grant",
+    ),
+    Mutation(
+        "C1-gateway-identity-gains-a-binding",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: kubeagents:tokenreview:kubeagents-system:platformagent\nsubjects:\n  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n',
+         '  name: kubeagents:tokenreview:kubeagents-system:platformagent\nsubjects:\n  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n'
+         '  - kind: ServiceAccount\n    name: platformagent-gateway-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "bind the gateway to the broker's TokenReview role too -- the agent can then "
+        "validate any bearer token it gets hold of, a grant its own token use never "
+        "asked for",
+    ),
+    Mutation(
+        "C1-broker-keeps-the-leader-binding",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('  name: kubeagents:leader:kubeagents-system:platformagent\nsubjects:\n',
+         '  name: kubeagents:leader:kubeagents-system:platformagent\nsubjects:\n'
+         '  - kind: ServiceAccount\n    name: kubeagents-platform-agent\n    namespace: kubeagents-system\n'),
+        "test_C1_the_gateway_identity_holds_only_the_audited_bindings",
+        "leave the broker on the leader Role as well -- at replicas > 1 it carries "
+        "namespace-wide pods get/patch the broker never uses",
+    ),
+    Mutation(
+        "C1-api-token-in-the-agent-container",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ('              name: agent-credential-proxy-token\n              readOnly: true\n',
+         '              name: agent-credential-proxy-token\n              readOnly: true\n'
+         '            - mountPath: /var/run/secrets/kubernetes.io/serviceaccount\n'
+         '              name: event-watcher-ksa-token\n'
+         '              readOnly: true\n'),
+        "test_C1_only_agent_api_auth_holds_a_kubernetes_api_token_in_the_gateway",
+        "mount the in-cluster token into platform-agent for a kubectl-free skill -- "
+        "the model's container then holds a Kubernetes API credential with the "
+        "minimal ClusterRole's reads",
+    ),
+    Mutation(
+        "C1-gateway-metadata-rule-restored",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-egress-allowlist.yaml",
+        ('            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n          protocol: TCP\n        - port: 4000\n',
+         '            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n          protocol: TCP\n'
+         '      to:\n        - ipBlock:\n            cidr: 169.254.169.254/32\n'
+         '    - ports:\n        - port: 80\n          protocol: TCP\n        - port: 4000\n'),
+        "test_C1_the_rendered_egress_policy_reaches_no_metadata_address",
+        "put the gateway's port-80 metadata rule back for a script that wants the "
+        "project id -- every container in the gateway pod can then fetch a token "
+        "again wherever the pod still has an identity to fetch",
+    ),
+    Mutation(
         "C1-watcher-token-in-the-agent-container",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ('              name: agent-credential-proxy-token\n              readOnly: true\n',
@@ -544,6 +601,26 @@ Mutation(
         "keep the client certificate too, in case a future watcher talks to the "
         "control plane directly -- every watcher-token holder then gets a key "
         "for each fleet cluster that has client certificate issuance on",
+    ),
+    Mutation(
+        "C1-gateway-metadata-dns-rule-widened-to-a-range",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-egress-allowlist.yaml",
+        ("        - port: 53\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n",
+         "        - port: 53\n          endPort: 988\n          protocol: TCP\n      to:\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: kube-dns\n        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: kube-system\n          podSelector:\n            matchLabels:\n              k8s-app: node-local-dns\n        - ipBlock:\n            cidr: 169.254.20.10/32\n        - ipBlock:\n            cidr: 169.254.169.254/32\n        - ipBlock:\n            cidr: 10.96.0.10/32\n    - ports:\n        - port: 80\n"),
+        "test_C1_the_rendered_egress_policy_reaches_no_metadata_address",
+        "widen the gateway's DNS rule to a range for a new resolver port -- "
+        "{port: 53, endPort: 988} still reads as port 53 and admits the "
+        "pre-NAT and post-NAT token fetches",
+    ),
+    Mutation(
+        "C3-management-project-unpinned",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    RECONCILE_PROJECT=\n    GKE_PROJECT_ID=example-project\n",
+         "    RECONCILE_PROJECT=\n"),
+        "test_C3_the_management_project_cannot_come_from_the_agents_env_file",
+        "drop the GKE_PROJECT_ID pin as a duplicate of the container env -- one "
+        "line in the agent-writable PVC .env then re-points the management "
+        "project, and two clean runs later its profiles are retired",
     ),
     Mutation(
         "C1-watcher-route-allows-a-list",
@@ -2034,12 +2111,33 @@ Mutation(
     Mutation(
         "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
-        "derive a session pod a publish grant on the notify subject, so a "
-        "session can post its result to the home channel itself. The gateway "
-        "then posts as the install's bot for whatever runs in a session pod",
+        "derive a session pod (and, through the shared executorGrants, an "
+        "AgentProfile pod) a publish grant on the notify subject, so a session "
+        "can post its result to the home channel itself. The gateway then "
+        "posts as the install's bot for whatever runs in that pod",
+    ),
+    Mutation(
+        "A3-agent-answers-the-board",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aBoardReplySubjects)\n"),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the board reply namespace, so the agent "
+        "container can answer the gateway's board request itself. What it "
+        "answers is drawn on the Slack Home tab of every admitted member",
+    ),
+    Mutation(
+        "A3-session-asks-the-board",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.BoardSubject,\n\t\t},'),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "derive a session pod a publish grant on the board request, so "
+        "whatever runs in a session pod can make the bridge read session-kv "
+        "on its behalf",
     ),
     Mutation(
         "A3-session-per-task-wildcard",
@@ -2183,8 +2281,8 @@ Mutation(
     Mutation(
         "C1-agent-principal-gets-a-static-password",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
-        ('\t\tuser:           a2aAgentBusUser,',
-         '\t\tuser:           a2aAgentBusUser,\n\t\tcredsKey:       a2aBridgePasswordKey,'),
+        ('\t\tuser:    a2aAgentBusUser,',
+         '\t\tuser:    a2aAgentBusUser,\n\t\tcredsKey: a2aBridgePasswordKey,'),
         "test_C1_the_agent_principal_carries_no_static_bus_password",
         "give the agent's callout principal a Secret key as well, so the same "
         "name is answered for by both the callout and nats.conf's auth_users "

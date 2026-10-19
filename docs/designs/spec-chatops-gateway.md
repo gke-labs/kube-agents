@@ -493,7 +493,7 @@ link in the mint's own write, the refusal in its own - so neither path runs a re
 child's result is already posted, so it tells the session to reply with what it means rather than
 repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
 answer. Either way it says to state plainly when the child failed or reports more work still
-running. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
+running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
 `A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn has the tool turned
 off by its adapter for each task whose authority block carries `via`, which only a wake's does
 and only the gateway can publish. A wake that could delegate read an interim answer such as "still
@@ -1612,9 +1612,11 @@ thread is the session in a DM as in a channel. So `stop`, a status question and
 the top of the DM is a conversation with nothing running in it, so it starts no task
 and its reply says to send it in the question's thread instead; the adapter marks such
 a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
-gateway keys the reply on that mark, not on the conversation's task history, so a
-`stop` in a thread with nothing running (a question refused at the session cap, say)
-gets the plain "nothing is running". A top-level status question matches the exact
+gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
+nothing running gets "nothing is running": the plain reply when the conversation has
+never run a task (a question refused at the session cap, say), and otherwise one that
+adds that if the agent filed a card, that card keeps working until it finishes, since
+`stop` cannot reach a card (gke-labs#3263). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
 A bare `/session` asks for the next message in its thread.
 
@@ -1756,7 +1758,8 @@ added, the name from `users.info` (display name, real name, handle; never an id)
 typed reply in a conversation whose question is still open answers it the same way, with the
 reply's first words; a gateway command (a stop, a status ask or a short question about
 progress in the wide form, `/session`, a delegate) answers nothing. A question is answered once, and a second click on it is dropped. The open question
-is the latest message the adapter laid out with choices in the conversation, and one laid out
+is the latest message the adapter laid out with choices in the conversation, other than choices
+that are all an answer's next steps (`next`), which ask nothing, and one laid out
 with choices again is a fresh question whatever answered it before; an edit that takes its
 choices away (a card's question settled by its notify `update` key, laid out or as text) closes
 it, and keeps the answered line when one was drawn. The open question and the answered set live in
@@ -1908,6 +1911,23 @@ mark (at most 16 keys a chain, the least recently used dropped first, as the not
 key reaches that ask while a newer chain runs. A `mark` with no key goes to the latest chain
 once nothing runs, and is dropped, logged and counted (`notify_marks_dropped_total`) while a
 chain runs.
+
+**The Home tab.** A member opening the app's Home tab (`app_home_opened`, tab `home`) is answered
+with `views.publish`: a dashboard of five panels, with no model in the loop (`slack_home.go`). Fleet,
+Running, Recent pull requests and Last audit are one board snapshot, read over the board route: the
+gateway publishes an empty request on `chat.board` with its reply under `chat.board.reply.gateway.`,
+and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
+every Cluster Agent profile's cluster and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total, the running
+kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
+store. Waiting on you is the adapter's own record: the open question of each conversation whose
+latest verified asker is the viewer, so it is per member and the rest is the install's, and it holds
+only questions posted since the gateway started. One snapshot serves every open for 30 seconds, and a failed read for 5; one republish pass runs at a time, from one read. A
+member who opened the tab in the last ten minutes is published to again, ten seconds after a burst
+of changes: a card's plan moving or a mark changing reads the board again, a question asked or
+answered recomputes who is waiting and reads the board only once the snapshot has aged out. At
+most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
+when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
+A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
 
 ## The console adapter (added 9/23)
 

@@ -18,8 +18,8 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
-bar the two on `"all"`. That routes the report through the
+The entry ships `deliver: "chat"`, as every report-producing entry on the roster does.
+That routes the report through the
 relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
@@ -56,7 +56,15 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 
 The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
+`spec.mode: next` `/sethome` does not reach the gateway, so for the platform the gateway holds the CR
+field is the only way. The operator renders the Google Chat field into the gateway as
+`A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
+`spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
+only chat platform is the gateway's and has no home channel gets no send at all: the error names the
+platform and the field, as in
+`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`.
+A malformed home channel gets the same refusal without the platform. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
 so an install without a home channel loses those events entirely rather than seeing them late.

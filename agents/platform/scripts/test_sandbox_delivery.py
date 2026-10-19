@@ -330,7 +330,7 @@ class SandboxDelivery(unittest.TestCase):
         for pattern in INSTRUCTION_GLOBS:
             for doc in REPO.glob(pattern):
                 for name in CALL.findall(doc.read_text()):
-                    if name in self.shared:
+                    if staged_source(name) is not None:
                         wanted.setdefault(name, []).append(
                             str(doc.relative_to(REPO))
                         )
