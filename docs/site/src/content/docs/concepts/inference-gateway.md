@@ -84,6 +84,24 @@ At the default of `0` nothing is rendered and the gateway config is what it was.
 
 The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. The agent image pinned today (Hermes `v2026.9.14`) does not send `max_tokens` on agent turns, so this value is the one the agent's requests get, the same as a direct call to the gateway's `/v1/chat/completions` that omits the field. Images built on `v2026.8.19` and earlier sent their own `max_tokens` on every request; on those the client's value won for agent turns and only a request that omitted the field took the configured one.
 
+### Setting the reasoning effort
+
+`litellm.reasoningEffort` is the reasoning effort the gateway asks the model for on a request that names none: `low`, `medium` or `high`. The chart renders it as `reasoning_effort` under every `model_list` alias. With `litellm.modelProvider=vertex_ai` and `litellm.reasoningEffort=high` the first alias reads:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: vertex_ai/gemini-3.5-flash
+      reasoning_effort: "high"
+```
+
+LiteLLM translates the value for each provider. On Gemini 3.x, through `gemini` or `vertex_ai`, it becomes `thinkingConfig.thinkingLevel` on the request to Google. On Claude it becomes adaptive thinking with that effort, and OpenAI and `openai_compatible` servers receive `reasoning_effort` as written. A model that LiteLLM does not treat as a reasoning model, such as `gemini-2.0-flash`, fails every request with `UnsupportedParamsError`, so leave the value empty for one.
+
+At the default, empty, nothing is rendered: the gateway config and its checksum are what they were, and the model thinks at its own default level. The value is a default the gateway supplies, the same as `max_tokens` above: LiteLLM lets a request's own `reasoning_effort` win over the one in `litellm_params`.
+
+The chart is the only path that renders it. The kustomize dev copy carries no `reasoning_effort`, and neither `install.env` nor the Terraform example has a variable for it. Set it through the Terraform example's `extra_helm_values` (`{ litellm = { reasoningEffort = "high" } }`) or with `--set litellm.reasoningEffort=high` on a direct Helm install.
+
 ### Prompt caching
 
 Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request — so when the default model is an Anthropic-family one (`MODEL_PROVIDER=anthropic`, or `vertex_ai` with a `claude-` model), the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in its `config.yaml`:
