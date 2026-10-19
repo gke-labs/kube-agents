@@ -1688,7 +1688,7 @@ class InstallerCommonTest(unittest.TestCase):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 for line in expect:
                     self.assertIn(line, proc.stdout)
-                self.assertIn("docs/designs/spec-mode-switch.md", proc.stdout)
+                self.assertIn("https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode", proc.stdout)
 
     def test_an_ungated_switch_does_not_offer_run_again(self):
         # upgrade.sh's full arm, the menu's apply and install.sh -y apply with
