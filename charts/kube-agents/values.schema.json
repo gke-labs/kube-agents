@@ -159,6 +159,10 @@
           "type": "integer",
           "minimum": 0
         },
+        "reasoningEffort": {
+          "type": "string",
+          "enum": ["", "low", "medium", "high"]
+        },
         "vertex": {
           "type": "object",
           "additionalProperties": false,

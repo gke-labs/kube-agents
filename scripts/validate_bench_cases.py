@@ -202,6 +202,9 @@ KNOWN_UNREGISTERED = {
     "chat-relay-posts-report-as-written": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
+    "fleet-audit-chat-report-is-the-report": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
     # It grades a GitHub forge declared at a GitHub Enterprise Server host,
     # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
     # it. No eval lane deploys either, so it runs by hand with the recipe in
@@ -496,6 +499,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
+    # This repository, agent-pod- and sandbox-reading. No field: whether every
+    # post a fired audit run produced is the report its `finish` rendered is the
+    # whole assertion.
+    "audit_chat_report_posted": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on

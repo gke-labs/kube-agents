@@ -1,0 +1,64 @@
+# Domain: chat and routing. Journey: a scheduled fleet audit posts its report to
+# the chat, and nothing else.
+#
+# Every fleet-audit job delivers through the chat relay
+# (docs/designs/cron-report-relay.md). Since the relay stopped running a Chat
+# Agent turn over each report (#2742), it posted the job's final message as
+# written, and the final message is the model's whole last turn. On 2026-10-15 a
+# daily compliance-audit report reached the channel after several paragraphs of
+# the model reasoning over `finish`'s JSON line and quoting its own instructions
+# (gke-labs/kube-agents#3217).
+#
+# bench/tf/prebuilt/audit-chat-report fires one real scheduled compliance-audit
+# run, made non-silent by moving the stream's stored memory aside, and waits for
+# it to end. The verifier (kube_agents_bench/audit_chat_report.py) reads what the
+# relay stored for the job's thread, which is what the channel received, and
+# passes when the scheduled delivery, the thread's stored post, is the report the
+# run's `finish` rendered (the table keeps the latest post per thread, so a
+# mid-run `report_to_chat` is not graded). An
+# image that posts the final message fails: its `finish` renders no chat report,
+# and the post is the model's text.
+#
+# It needs a chat platform: on an install with none the relay posts nothing and
+# stores nothing. No CI install has one, so the case is a reviewed
+# KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py and runs by hand
+# against a chat install.
+#
+# The conversation is not what is graded. Its prompt asks for one roster read
+# and nothing that touches the board or the cron roster, and the safeguards hold
+# it to that.
+id: fleet-audit-chat-report-is-the-report
+name: A scheduled fleet audit posts only its report to the chat
+fixtures: []
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/audit-chat-report"
+  teardown: true
+validated: false
+domain: chat-and-routing
+owner: toshiowang
+audit_streams: [compliance-audit]
+prompt: |
+  Which specialist agents can you hand work to on this install? Check your
+  roster and name them in one line. Do not file any task, and do not run,
+  trigger or schedule anything.
+expected_output: |
+  critical requirements:
+  - One line naming the specialist agents the roster lists, read from the roster.
+  - No task is filed and no job is run, triggered or scheduled.
+verification_spec:
+  - name: audit-report-posted-alone
+    role: objective
+    mode: assert
+    check:
+      type: audit_chat_report_posted
+  - name: conversation-files-no-card
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

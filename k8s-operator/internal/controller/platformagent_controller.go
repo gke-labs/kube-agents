@@ -298,6 +298,10 @@ const (
 
 	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
+	// reasonReservedServiceAccount: spec.security.serviceAccountName names a
+	// ServiceAccount the operator creates for another workload. See
+	// ReservedServiceAccountOverride.
+	reasonReservedServiceAccount = "ReservedServiceAccountName"
 )
 
 var (
@@ -655,8 +659,30 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}()
 	}
 
-	// 3. Reconcile Service Account (with Workload Identity annotation)
+	// 2z. Refuse an override that names one of the operator's own
+	// ServiceAccounts, before step 3 writes it with the broker's Workload
+	// Identity annotation. The webhook refuses it at admission, but the chart
+	// ships the webhook off and it fails open, so this is the check that holds.
+	// The same rescue as the volume refusal below: keep the guardrails, render
+	// no workload.
+	if msg := ReservedServiceAccountOverride(instance); msg != "" {
+		log.Info(msg)
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, workloadNotRendered); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 3. Reconcile Service Account (with Workload Identity annotation): the
+	// broker's. And the gateway's own, which carries none.
 	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileGatewayServiceAccount(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 	// 3b. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
@@ -1163,6 +1189,13 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 	}
 
 	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, commonLabels(agent), fieldOwner)
+}
+
+// reconcileGatewayServiceAccount mints the gateway Pod's own ServiceAccount,
+// with no annotations, so it resolves to no Google identity. Unconditional:
+// a user-owned spec.security.serviceAccountName is the broker's now.
+func (r *PlatformAgentReconciler) reconcileGatewayServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, gatewayServiceAccountName(agent), agent.Namespace, nil, commonLabels(agent), fieldOwner)
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -3200,6 +3233,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	}
 
 	crbMinimal := buildClusterRoleBinding(agent, minimalBindingName, minimalRole.Name)
+	// The gateway's own ServiceAccount takes the same read-only grant: its
+	// agent-api-auth container watches and joins the management cluster with
+	// an in-cluster token. Same rules, a second principal; no new permission.
+	crbMinimal.Subjects = append(crbMinimal.Subjects, gatewaySubject(agent))
 	if err := r.applyManaged(ctx, agent, crbMinimal); err != nil {
 		return fmt.Errorf("failed to reconcile minimal ClusterRoleBinding: %w", err)
 	}
@@ -3214,6 +3251,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	}
 
 	localBinding := buildRoleBinding(agent, localBindingName, localRole.Name)
+	// The gateway's drift detector joins audit records by reading the object
+	// they name, PlatformAgents included (cmd/drift-detector/join.go). Same
+	// read-only grant, a second principal.
+	localBinding.Subjects = append(localBinding.Subjects, gatewaySubject(agent))
 	if err := ctrl.SetControllerReference(agent, localBinding, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on local RoleBinding: %w", err)
 	}

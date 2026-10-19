@@ -49,15 +49,17 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Fourteen cases, forty-two units at the script's EVAL_REPETITIONS
-# of 3: six domain probes, one reliability prompt variation, the remediation
-# writer pdb-remediation-pr (420-1929s measured, hinted at 1250; its three
-# repetitions serialize on the task lock), three cluster-debugging cases, the
-# incident-triage probe, the kanban smoke, and one held-out seat (the
-# compliance canary, ~1000-2000s a repetition, serialized the same way).
-# pdb-remediation-pr took its roster line 2026-10-14 (#2016), which took
-# remediation off the docs/designs/domains.yaml allowlist; rca-remediation-pr
-# stays demoted (#1189). The 2026-08-26
+# BUDGET. Twelve cases, thirty-six units at the script's EVAL_REPETITIONS
+# of 3: five domain probes, one reliability prompt variation, three
+# cluster-debugging cases, the incident-triage probe, the kanban smoke, and
+# one held-out seat (the compliance canary, ~1000-2000s a repetition; its
+# three repetitions serialize on the task lock). upgrades-lagging-master-probe
+# left for the nightly 2026-10-16 (#3269), putting upgrades on the
+# docs/designs/domains.yaml allowlist. The remediation writer
+# pdb-remediation-pr (420-1929s measured, hinted at 1250) took its roster
+# line 2026-10-14 (#2016), which took remediation off that allowlist, and was
+# demoted to the nightly 2026-10-17 (#3120), which put it back on;
+# rca-remediation-pr stays demoted (#1189). The 2026-08-26
 # smoke run (build 2092638061140643840, kube-agents-evals-3) measured what
 # six full audits cost: obtainability-planted-pdb PASSED in 962s and
 # compliance-rbac-overgrant in 606s, the three that failed did so on
@@ -94,13 +96,6 @@
 # since 2026-09-22 #1049's three (pdb-semantics, fleet-exposure-sweep,
 # healthy-namespace-silence) -- run in the nightly.
 ./tasks/obtainability-remediation-proposal/task.yaml
-# The remediation domain's writer: submit-suggestion's pull request on the
-# leased *-infra repository, graded by pull_request_opened. Seated held out
-# 2026-09-28 (#2016 step 2); roster line 2026-10-14 (#2016 step 4) on 3/3 on
-# the writers nightlies 10-12 to 10-14, the store at would-admit, and 90.2 %
-# of 2,086 graded presubmit repetitions since #2263 (2026-10-03). 420-1929s a
-# repetition, hinted at 1250; its three repetitions serialize on the task lock.
-./tasks/pdb-remediation-pr/task.yaml
 
 # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
 # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
@@ -156,7 +151,7 @@
 # ── Held out: seated here without a roster line ──────────────────────────────
 # The documented exception to the 2026-09-22 rule above, one case per
 # coverage tracker (one today: #2013, fleet-audits; #2016's seat became a
-# roster line 2026-10-14). A case
+# roster line 2026-10-14, demoted to the nightly 2026-10-17, #3120). A case
 # in this section runs on every pull request and, under the default
 # EVAL_ADMISSION_MODE=roster, CANNOT red one on a graded failure: it is not
 # in blocking-roster.txt, so rung 4 (collapse) and rung 6 (judged
@@ -179,9 +174,10 @@
 
 # The audit-machinery canary (fleet-audits), #2013 step 2, seated 2026-09-29.
 # Demoted from the roster 2026-09-02 (#1171, closed 2026-09-08; the bar now
-# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. The first of the
-# two presubmit cases that write to GitHub (pdb-remediation-pr, on the roster
-# above, is the second): the minted token, the cloned *-infra workspace, the ledger write.
+# lives on #2013 step 3), nightly 2026-09-22 to 2026-09-29. The one
+# presubmit case that writes to GitHub (pdb-remediation-pr was the second,
+# on the roster 2026-10-14 to 2026-10-17, then demoted to the nightly,
+# #3120): the minted token, the cloned *-infra workspace, the ledger write.
 # 1002s median / 2074s p90 over 903 presubmit
 # repetitions 2026-09-04 to 09-15, the 3000s delegation ceiling, priced in
 # unit_cost_hint. Roster line when #2013 step 3's three clean days hold;
