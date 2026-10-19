@@ -69,13 +69,21 @@ def _iso(epoch: float | None) -> str | None:
 
 
 def _wire_int(value: Any) -> int:
-    """``value`` as an int the wire shape's Go int holds; raises ValueError otherwise."""
-    if isinstance(value, bool):
-        raise ValueError("a boolean is not a number")
-    n = int(value or 0)
-    if not WIRE_INT_MIN <= n <= WIRE_INT_MAX:
-        raise ValueError(f"{n} is outside the wire int range")
-    return n
+    """``value`` as an int the wire shape's Go int holds; raises ValueError otherwise.
+
+    None (a field the row leaves out) is 0. Anything else must already be an
+    integer, or a float with no fraction: a string, a list or ``41.9`` is not
+    coerced into some other number.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{value!r} is not an integer")
+    if not WIRE_INT_MIN <= value <= WIRE_INT_MAX:
+        raise ValueError(f"{value} is outside the wire int range")
+    return value
 
 
 def _rfc3339(value: Any) -> str:

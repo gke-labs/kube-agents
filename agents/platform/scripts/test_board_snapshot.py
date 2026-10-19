@@ -169,6 +169,9 @@ class BoardSnapshotTest(unittest.TestCase):
                 ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/4", "number": 4}), 1e30),
                 ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/5", "number": 5}), 1.79e18),
                 ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/6", "number": 1e30}), STARTED + 3),
+                ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/7", "number": []}), STARTED + 4),
+                ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/8", "number": 41.9}), STARTED + 5),
+                ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/9", "number": "9"}), STARTED + 6),
             ],
         )
         board = self.snap(kb)

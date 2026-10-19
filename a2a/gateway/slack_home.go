@@ -101,6 +101,10 @@ const (
 	findingCritical = "critical"
 )
 
+// slackHomeRepoEnds are where a pull or merge request URL's repository path
+// ends: GitHub's "/pull/", then GitLab's "/-/".
+var slackHomeRepoEnds = []string{"/pull/", "/-/"}
+
 // BoardReader reads the agent pod's board snapshot.
 type BoardReader func(ctx context.Context) (*lib.Board, error)
 
@@ -528,17 +532,23 @@ func (s *SlackAdapter) permalink(q slackQuestion) string {
 	return link
 }
 
-// prRepo is "owner/name" out of a forge's pull request URL
-// (https://github.com/owner/name/pull/41); empty when the URL is not that
-// shape.
+// prRepo is the repository path out of a forge's pull or merge request URL:
+// everything between the host and "/pull/" (GitHub) or "/-/" (GitLab, whose
+// projects nest under subgroups: https://gitlab.com/grp/sub/proj/-/merge_requests/3
+// is grp/sub/proj). Empty when the URL is not that shape.
 func prRepo(url string) string {
 	rest, ok := strings.CutPrefix(url, slackHomeHTTPS)
 	if !ok {
 		return ""
 	}
-	parts := strings.Split(rest, "/")
-	if len(parts) < 3 || parts[1] == "" || parts[2] == "" {
+	_, path, ok := strings.Cut(rest, "/")
+	if !ok {
 		return ""
 	}
-	return parts[1] + "/" + parts[2]
+	for _, sep := range slackHomeRepoEnds {
+		if repo, _, found := strings.Cut(path, sep); found && strings.Count(repo, "/") >= 1 {
+			return repo
+		}
+	}
+	return ""
 }

@@ -4733,7 +4733,7 @@ def get_board() -> Dict[str, Any]:
                 return board_snapshot.snapshot(session_db, None, datetime.now(timezone.utc))
             with closing(_read_only(board)) as kanban:
                 return board_snapshot.snapshot(session_db, kanban, datetime.now(timezone.utc))
-    except (sqlite3.Error, board_snapshot.BoardError) as exc:
+    except Exception as exc:  # noqa: BLE001 — a source that cannot be read is a 503, whatever raised
         raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
 
 

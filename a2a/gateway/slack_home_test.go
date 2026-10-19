@@ -334,12 +334,52 @@ func TestSlackHomeMarkAndQuestionChangesArmARepublish(t *testing.T) {
 	}
 }
 
+// The asker is whoever asked; a member who answers the question, by typing,
+// does not take the next question over, and a question asked or answered
+// arms a republish that only recomputes who is waiting.
+func TestSlackHomeAnAnswerDoesNotMoveTheAsker(t *testing.T) {
+	a, _, _ := homeAdapter(t, homeBoardFixture(), nil)
+	conv := "slack:C1/40.0"
+	ask := InboundMessage{Conversation: conv, AuthorID: "U1", MessageID: "m1", Text: "check seeded-a"}
+	a.notePending(ask)
+	a.InboundVerified(conv, ask.MessageID, true)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	q := func(ts, headline string) {
+		a.trackQuestion(conv, ts, OutMessage{Text: headline, Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: headline,
+			Choices: []chatmsg.Choice{{Text: "a"}, {Text: "b"}}}})
+	}
+	q("50.0", "First?")
+	a.home.mu.Lock()
+	armed, refetch := a.home.timer != nil, a.home.refetch
+	a.home.mu.Unlock()
+	if !armed || refetch {
+		t.Errorf("a question armed=%v refetch=%v; want a republish that does not re-read the board", armed, refetch)
+	}
+	answer := InboundMessage{Conversation: conv, AuthorID: "U2", MessageID: "m2", Text: "the second one"}
+	a.notePending(answer)
+	a.InboundVerified(conv, answer.MessageID, true)
+	q("60.0", "Second?")
+	if got := a.waitingOn("U1"); len(got) != 1 || got[0].text != "Second?" {
+		t.Errorf("waiting on U1 = %+v; the asker moved to whoever answered", got)
+	}
+	if got := a.waitingOn("U2"); len(got) != 0 {
+		t.Errorf("waiting on U2 = %+v", got)
+	}
+	a.home.mu.Lock()
+	if a.home.timer != nil {
+		a.home.timer.Stop()
+	}
+	a.home.mu.Unlock()
+}
+
 func TestPRRepo(t *testing.T) {
 	for in, want := range map[string]string{
-		"https://github.com/acme/fleet-config/pull/41":   "acme/fleet-config",
-		"https://gitlab.com/grp/proj/-/merge_requests/3": "grp/proj",
-		"http://github.com/acme/x/pull/1":                "",
-		"https://github.com/":                            "",
+		"https://github.com/acme/fleet-config/pull/41":       "acme/fleet-config",
+		"https://gitlab.com/grp/proj/-/merge_requests/3":     "grp/proj",
+		"https://gitlab.com/grp/sub/proj/-/merge_requests/3": "grp/sub/proj",
+		"https://github.com/acme/fleet-config/issues/2":      "",
+		"http://github.com/acme/x/pull/1":                    "",
+		"https://github.com/":                                "",
 	} {
 		if got := prRepo(in); got != want {
 			t.Errorf("prRepo(%q) = %q, want %q", in, got, want)

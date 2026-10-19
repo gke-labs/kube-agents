@@ -5574,6 +5574,11 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
             resp = self.client.get("/v1/board")
         self.assertEqual(resp.status_code, 503, resp.text)
 
+    def test_board_a_malformed_source_row_is_a_503_not_a_500(self):
+        with patch.object(session_kv_server.board_snapshot, "snapshot", side_effect=ValueError("rubric is not JSON")):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 503, resp.text)
+
     def test_board_with_no_kanban_board_yet_is_empty(self):
         with patch.object(session_kv_server.board_snapshot, "default_audit", lambda: None), patch.object(
             session_kv_server.board_snapshot, "PROFILES_DIR", self.root / "profiles"

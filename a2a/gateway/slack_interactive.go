@@ -436,7 +436,9 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		}
 	}
 	s.mu.Unlock()
-	if verified && !p.click && !chattext.IsCommand(p.text) {
+	if verified && !p.click && !chattext.IsCommand(p.text) && q.ts == "" {
+		// An ask, not an answer: whoever answers a question, by typing or by
+		// clicking, does not become the one the next question waits on.
 		s.noteAsker(conversation, p.author)
 	}
 	if q.ts != "" {

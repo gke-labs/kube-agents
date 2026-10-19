@@ -23,8 +23,9 @@ type Board struct {
 	// GeneratedAt is when the sender read it.
 	GeneratedAt time.Time `json:"generated_at"`
 	// Clusters is the clusters the agent manages (a Cluster Agent profile
-	// each), with their open findings, worst first and capped by the sender;
-	// ClusterCount is how many there are in all.
+	// each) and any other cluster an open finding names, with their open
+	// findings, worst first and capped by the sender; ClusterCount is how many
+	// there are in all. A name repeated across projects is "project/cluster".
 	Clusters     []BoardCluster `json:"clusters"`
 	ClusterCount int            `json:"cluster_count"`
 	// Running is the kanban cards in flight.
