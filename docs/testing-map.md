@@ -174,3 +174,5 @@ traps for eval cases — a missing `domain:` slug counting as coverage of nothin
 seat before the activation blockers in [`../bench/tasks/DRAFTS.md`](../bench/tasks/DRAFTS.md)
 clear — are in [`bench-case-format.md`](designs/bench-case-format.md), enforced rather than
 described.
+
+<!-- merge-queue dry run (#1363): T7, the hold probe. -->
