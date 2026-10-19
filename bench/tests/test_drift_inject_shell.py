@@ -230,6 +230,8 @@ class DriftShellTestBase(unittest.TestCase):
         self.jq_bin.chmod(self.jq_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
         self.log_file = pathlib.Path(self.temp_dir.name) / "kubectl_calls.log"
+        self.curl_log_file = pathlib.Path(self.temp_dir.name) / "curl_calls.log"
+        self.jq_log_file = pathlib.Path(self.temp_dir.name) / "jq_calls.log"
         self.config_file = pathlib.Path(self.temp_dir.name) / "kubectl_config.json"
         self.script_text = SCRIPT.read_text(encoding="utf-8")
 
@@ -245,10 +247,24 @@ class DriftShellTestBase(unittest.TestCase):
         lines = self.log_file.read_text(encoding="utf-8").strip().splitlines()
         return [json.loads(line) for line in lines if line.strip()]
 
+    def get_curl_calls(self) -> list[list[str]]:
+        if not self.curl_log_file.exists():
+            return []
+        lines = self.curl_log_file.read_text(encoding="utf-8").strip().splitlines()
+        return [json.loads(line) for line in lines if line.strip()]
+
+    def get_jq_calls(self) -> list[list[str]]:
+        if not self.jq_log_file.exists():
+            return []
+        lines = self.jq_log_file.read_text(encoding="utf-8").strip().splitlines()
+        return [json.loads(line) for line in lines if line.strip()]
+
     def run_bash(self, script: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
         env["KUBECTL_LOG"] = str(self.log_file)
+        env["CURL_LOG"] = str(self.curl_log_file)
+        env["JQ_LOG"] = str(self.jq_log_file)
         env["KUBECTL_CONFIG"] = str(self.config_file)
         if extra_env:
             env.update(extra_env)
@@ -450,9 +466,8 @@ drift_clear_namespace
 
 class DriftOnExitTrapTests(DriftShellTestBase):
     def test_exit_trap_deletes_when_status_nonzero_and_drift_planted_ns_set(self):
-        func = lift_function("drift_init", self.script_text, SCRIPT)
         script = f"""\
-set -e
+set -euo pipefail
 # Stub gcloud to avoid network calls during drift_init
 gcloud() {{ return 0; }}
 
@@ -465,7 +480,7 @@ drift_agent_namespace="kubeagents-system"
 drift_agent_container="platform-agent"
 drift_planted_ns=""
 
-{func}
+source "{SCRIPT}"
 
 drift_init
 drift_planted_ns="1"
@@ -479,6 +494,17 @@ exit 42
         self.assertIn("Deleting eval-ns so the next run starts from a clean namespace.", proc.stderr)
 
         calls = self.get_kubectl_calls()
+        dump_calls = [c for c in calls if len(c) > 0 and c[0] == "get" and c[1] != "namespace"]
+        self.assertEqual(len(dump_calls), 2)
+        self.assertEqual(
+            dump_calls[0],
+            ["get", "deployments,replicasets,pods", "-n", "eval-ns", "-o", "wide"],
+        )
+        self.assertEqual(
+            dump_calls[1],
+            ["get", "events", "-n", "eval-ns", "--sort-by=.metadata.creationTimestamp"],
+        )
+
         delete_calls = [c for c in calls if len(c) > 0 and c[0] == "delete"]
         self.assertEqual(len(delete_calls), 1)
         self.assertEqual(
@@ -487,9 +513,8 @@ exit 42
         )
 
     def test_exit_trap_does_not_delete_when_drift_planted_ns_unset(self):
-        func = lift_function("drift_init", self.script_text, SCRIPT)
         script = f"""\
-set -e
+set -euo pipefail
 gcloud() {{ return 0; }}
 
 drift_ns="eval-ns"
@@ -500,7 +525,7 @@ drift_agent_deployment="agent"
 drift_agent_namespace="kubeagents-system"
 drift_agent_container="platform-agent"
 
-{func}
+source "{SCRIPT}"
 
 drift_init
 
@@ -516,9 +541,8 @@ exit 1
         self.assertEqual(len(delete_calls), 0)
 
     def test_exit_trap_does_not_delete_when_status_zero(self):
-        func = lift_function("drift_init", self.script_text, SCRIPT)
         script = f"""\
-set -e
+set -euo pipefail
 gcloud() {{ return 0; }}
 
 drift_ns="eval-ns"
@@ -529,7 +553,7 @@ drift_agent_deployment="agent"
 drift_agent_namespace="kubeagents-system"
 drift_agent_container="platform-agent"
 
-{func}
+source "{SCRIPT}"
 
 drift_init
 drift_planted_ns="1"
@@ -726,6 +750,17 @@ drift_require_daemon
         self.assertIn("|| exit $?", sh_script)
         self.assertIn('jq -r ".inject_kinds[]?"', sh_script)
         self.assertEqual(exec_call[10:], ["sh", "http://daemon:8080", "10"])
+
+        curl_calls = self.get_curl_calls()
+        self.assertEqual(len(curl_calls), 1)
+        self.assertEqual(
+            curl_calls[0],
+            ["-fsS", "--max-time", "10", "http://daemon:8080/healthz"],
+        )
+
+        jq_calls = self.get_jq_calls()
+        self.assertEqual(len(jq_calls), 1)
+        self.assertEqual(jq_calls[0], ["-r", ".inject_kinds[]?"])
 
 
 class DriftInjectModuleStructureTests(DriftShellTestBase):
