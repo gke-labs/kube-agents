@@ -6155,19 +6155,19 @@ class PlatformAgentModeTest(unittest.TestCase):
             proc = self._adopt(tmp, json_list=cr, pre="PARAM_PLATFORM_AGENT_MODE=next")
             self.assertIn("FALLBACK=[next]", proc.stdout, proc.stderr)
 
-    def test_the_mode_is_adopted_before_the_tfvars_are_generated(self):
+    def test_the_mode_is_settled_before_step_6_reads_it(self):
+        # Step 6's prompts and Slack refusals follow the mode, so the live CR
+        # and the mirror are consulted once the target is known and before it.
         text = _INSTALL_SH.read_text()
-        adopt = text.index('  adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n')
-        self.assertLess(text.index("  export CLUSTER_NAME=\"$cluster_name\"\n"), adopt)
-        export = text.index('  export PLATFORM_AGENT_MODE="$platform_agent_mode"\n', adopt)
-        self.assertEqual(
-            text[adopt:export].splitlines()[1:],
-            [
-                '  mirrored_first_install_mode "$third_party_registry_prefix"',
-                '  platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"',
-            ],
-        )
-        self.assertLess(export, text.index("    write_tfvars_from_state \"$tfvars_file\" \"$image_tag\"\n", export))
+        main_start = text.index('  print_step "5. GKE Cluster Topology & Capacity Setup"')
+        adopt = text.index('    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n', main_start)
+        self.assertIn('  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \\\n', text[adopt - 90 : adopt])
+        mirror = text.index('  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"\n', adopt)
+        step_6 = text.index('  print_step "6. Chat & Messaging Integrations Setup"')
+        self.assertLess(mirror, step_6)
+        self.assertNotIn("PLATFORM_AGENT_MODE_FALLBACK", text[main_start:adopt])
+        self.assertEqual(text.count("adopt_live_platform_agent_mode \""), 1)
+        self.assertEqual(text.count("  mirrored_first_install_mode \""), 1)
 
     def test_a_mirrored_first_install_defaults_to_today(self):
         # next's bus images are not pointed at the mirror, so a first install
@@ -6404,6 +6404,38 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             after = path.read_text()
         self.assertEqual(after, content, "the refusal rewrote install.env")
         return proc
+
+    def test_a_live_today_install_without_its_install_env_is_not_refused_under_next_rules(self):
+        # No install.env against a cluster whose PlatformAgent runs today:
+        # the mode is adopted before step 6, so a multi-workspace Slack token,
+        # valid on today, is not refused under next's gateway rules.
+        stubs = (
+            "has_controlling_tty() { return 1; }\n"
+            "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
+            "tf_state_chat_subscription_name() { :; }\n"
+            "gcloud() { return 0; }\n"
+            "read_platform_agent_install_state() { PLATFORM_AGENT_CR_READ=ok; "
+            "PLATFORM_AGENT_CR_JSON='{\"items\":[{\"spec\":{}}]}'; }\n"
+        )
+        flags = "--enable-slack --slack-bot-token=xoxb-1-a,xoxb-2-b --slack-app-token=xapp-1 --slack-allowed-users=U0123ABCD"
+        with tempfile.TemporaryDirectory() as tmp:
+            for adopt, expected in ((True, "went on"), (False, "SLACK_BOT_TOKEN holds 2 tokens")):
+                with self.subTest(adopt=adopt):
+                    settle = (
+                        'PROJECT_ID=p CLUSTER_NAME=c REGION=r adopt_live_platform_agent_mode || exit 1\n' if adopt else ""
+                    )
+                    proc = self._run(
+                        f"{stubs}{self._chat_step()}parse_args --non-interactive {flags}\n"
+                        "INSTALL_ENV_FOUND_AT_START=false\n"
+                        "resolve_shared_defaults\n"
+                        "validate_platform_agent_mode || exit 1\n"
+                        "PARAM_DRY_RUN=false\n"
+                        f"{settle}"
+                        "project_id=p region=r cluster_name=c\n"
+                        '_chat_step; echo "went on"',
+                        install_env=self._file(tmp, ""),
+                    )
+                    self.assertIn(expected, proc.stdout + proc.stderr)
 
     def test_next_with_slack_on_the_gateway_refuses_each_setting_before_anything_is_written(self):
         token = "xoxb-1-secretpart"

@@ -4644,12 +4644,16 @@ adopt_live_platform_agent_mode() {
   gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" \
     --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
   read_platform_agent_install_state "$namespace" cr-only
+  # Not held for the mode notice: this read skipped the release, which the
+  # notice needs, so it reads again. Read by take_platform_agent_install_state.
+  # shellcheck disable=SC2034
   PLATFORM_AGENT_READS_HELD_FOR=""
   case "$PLATFORM_AGENT_CR_READ" in
     "$PLATFORM_AGENT_READ_OK") ;;
     "$PLATFORM_AGENT_READ_NONE") return 0 ;;
     *)
-      local why="the kubeconfig has no context '$(gke_context_name)'"
+      local why
+      why="the kubeconfig has no context '$(gke_context_name)'"
       [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_FAILED" ] && why="the read failed (${PLATFORM_AGENT_READ_ERROR})"
       if [ "$PARAM_DRY_RUN" = "true" ]; then
         print_warning "Cluster '${CLUSTER_NAME}' exists and there is no install.env, but whether it already runs a PlatformAgent could not be read: ${why}. This preview assumes a first install (spec.mode ${PLATFORM_AGENT_MODE_FALLBACK}); an applying run would be refused."
@@ -6522,6 +6526,14 @@ main() {
   fi
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
+  # Settled before step 6, whose prompts and Slack refusals follow the mode:
+  # a run with no install.env against a cluster that already runs a
+  # PlatformAgent keeps that CR's mode, and a mirrored first install
+  # defaults to today. The target is known from here; the exports come later.
+  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
+    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"
+
   # 6. Chat & Messaging Platform Integration
   print_step "6. Chat & Messaging Integrations Setup"
   # The option the loaded configuration already corresponds to. It is a
@@ -7592,10 +7604,6 @@ main() {
   export LITELLM_REDACTION_ENABLED="$redaction_enabled"
   export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
-  # A run with no install.env against a cluster that already runs a
-  # PlatformAgent keeps that CR's mode rather than a first install's.
-  adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
-  mirrored_first_install_mode "$third_party_registry_prefix"
   platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   export PLATFORM_AGENT_MODE="$platform_agent_mode"
   # The bus's two third-party images are the operator's compiled defaults

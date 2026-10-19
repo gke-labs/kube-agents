@@ -965,6 +965,8 @@ platform_agent_mode_extra_values_caveat() {
 # Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
   local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
   PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   [ -n "$record" ] && [ -n "$live" ] || return 0
   from="$(effective_platform_agent_mode "$live")"
@@ -977,6 +979,7 @@ announce_platform_agent_mode_switch() {
     fi
     return 0
   fi
+  # shellcheck disable=SC2034
   PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
   print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
   if [ "$to" = "next" ]; then
@@ -1252,6 +1255,8 @@ _platform_agent_mode_unread() {
 # happen, and is said with the scope check's remedy.
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
   PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
     PLATFORM_AGENT_READS_HELD_FOR=""
