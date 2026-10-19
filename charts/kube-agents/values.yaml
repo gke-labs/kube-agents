@@ -1238,7 +1238,7 @@ platformAgent:
       homeChannel: ""
       homeChannelName: ""
       # Under spec.mode next, Slack's 👍/👎 buttons under each final answer;
-      # a 👎 keeps its question, answer and note on the install for the feedback bucket's max age (30 days as provisioned).
+      # each rating keeps its question and answer (a 👎 its note too) on the install for the feedback bucket's max age (30 days as provisioned).
       # false hides the buttons and keeps nothing.
       answerFeedback: true
     teams:

@@ -19,8 +19,9 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// The export: every 👎 the feedback bucket holds, newest first, as a draft
-// eval case an operator copies into bench/tasks/ (`/gateway feedback export`,
+// The export: every rating the feedback bucket holds, newest first, as a
+// draft eval case an operator copies into bench/tasks/: a 👎 as a case the
+// rated answer should fail, a 👍 as a good answer, a case it should pass (`/gateway feedback export`,
 // run in the gateway's pod, which holds the bucket's only credentials). Each
 // draft is a directory in a tar on the writer: task.yaml, a case skeleton per
 // docs/designs/bench-case-format.md whose prompt is the rater's ask, and
@@ -42,6 +43,8 @@ const (
 	// feedbackSummaryAskMax clips the ask on a draft's summary line.
 	feedbackSummaryAskMax = 28
 	feedbackNoNote        = "(no note)"
+	feedbackUpMark        = "👍"
+	feedbackDownMark      = "👎"
 	// feedbackNoAsk stands in for an ask the session record no longer held
 	// when the answer was rated (past AskTTL, or a reaped session).
 	feedbackNoAsk = "TODO: the question was no longer on record when this answer was rated; take it from the conversation"
@@ -70,7 +73,7 @@ var yamlUnprintable = func() *strings.Replacer {
 	return strings.NewReplacer(pairs...)
 }()
 
-// ExportFeedback writes every 👎 kept in the last since (all of them when
+// ExportFeedback writes every rating kept in the last since (all of them when
 // since is zero) to w as a tar of draft eval cases, and a line per draft to
 // log. It returns how many it wrote.
 func ExportFeedback(ctx context.Context, c *lib.Client, since time.Duration, now time.Time, w, log io.Writer) (int, error) {
@@ -126,7 +129,7 @@ func ExportFeedback(ctx context.Context, c *lib.Client, since time.Duration, now
 				return i, err
 			}
 		}
-		fmt.Fprintf(log, "%d 👎 · %s · “%s”\n%s\n%s\n", i+1, k.rec.RatedAt.Format(feedbackRatedDateForm),
+		fmt.Fprintf(log, "%d %s · %s · “%s”\n%s\n%s\n", i+1, feedbackMark(k.rec), k.rec.RatedAt.Format(feedbackRatedDateForm),
 			clipWords(k.rec.Ask, feedbackSummaryAskMax), files[0].name, files[1].name)
 	}
 	return len(recs), tw.Close()
@@ -139,23 +142,36 @@ func feedbackCaseID(key string, ratedAt time.Time, digits int) string {
 	return feedbackCaseIDPrefix + ratedAt.UTC().Format(feedbackCaseDateForm) + "-" + hex.EncodeToString(sum[:])[:digits]
 }
 
+// feedbackMark is the record's rating as the export shows it.
+func feedbackMark(rec FeedbackRecord) string {
+	if rec.Rating == FeedbackUp {
+		return feedbackUpMark
+	}
+	return feedbackDownMark
+}
+
 // feedbackCaseYAML is the draft's task.yaml. The strings are written as
 // JSON, which YAML reads as double-quoted scalars, so no ask needs escaping
 // by hand.
 func feedbackCaseYAML(id string, rec FeedbackRecord) string {
+	good := rec.Rating == FeedbackUp
 	note := rec.Note
 	if note == "" {
 		note = feedbackNoNote
 	}
 	var b strings.Builder
-	b.WriteString("# A candidate eval case from a 👎 on an answer, exported from an install\n")
+	fmt.Fprintf(&b, "# A candidate eval case from a %s on an answer, exported from an install\n", feedbackMark(rec))
 	b.WriteString("# (`/gateway feedback export`). It is a draft: fill in every TODO before\n")
 	b.WriteString("# submitting it, per bench/CONTRIBUTING.md and\n")
 	b.WriteString("# docs/designs/bench-case-format.md. transcript.md beside it is the\n")
 	b.WriteString("# exchange that was rated.\n#\n")
-	fmt.Fprintf(&b, "# Rated %s. What the rater said was wrong:\n", rec.RatedAt.UTC().Format(feedbackRatedDateForm))
-	for _, line := range strings.Split(note, "\n") {
-		b.WriteString("#   " + yamlComment(line) + "\n")
+	if good {
+		fmt.Fprintf(&b, "# Rated %s as a good answer: the checks should pass on it.\n", rec.RatedAt.UTC().Format(feedbackRatedDateForm))
+	} else {
+		fmt.Fprintf(&b, "# Rated %s. What the rater said was wrong:\n", rec.RatedAt.UTC().Format(feedbackRatedDateForm))
+		for _, line := range strings.Split(note, "\n") {
+			b.WriteString("#   " + yamlComment(line) + "\n")
+		}
 	}
 	b.WriteString("#\n# Before submitting: make the prompt install-neutral (a cluster the\n")
 	b.WriteString("# install named becomes a fixture role or {{CLUSTER_NAME}}), and leave\n")
@@ -163,11 +179,19 @@ func feedbackCaseYAML(id string, rec FeedbackRecord) string {
 	fmt.Fprintf(&b, "id: %s\n", id)
 	fmt.Fprintf(&b, "name: %s\n", yamlString("TODO: what a right answer does"))
 	fmt.Fprintf(&b, "prompt: %s\n", yamlString(feedbackAskOrTODO(rec)))
-	fmt.Fprintf(&b, "expected_output: %s\n", yamlString("TODO: what a right answer says. The rater said: "+note))
+	expected := "TODO: what a right answer says. The rater said: " + note
+	if good {
+		expected = "TODO: what a right answer says. The rated answer in transcript.md was marked good."
+	}
+	fmt.Fprintf(&b, "expected_output: %s\n", yamlString(expected))
 	b.WriteString("infrastructure:\n  deployer: noop\nvalidated: false\n\n")
 	b.WriteString("# TODO: a slug from docs/designs/domains.yaml.\n# domain:\n\n")
 	b.WriteString("# TODO: who answers when this case flakes (bench/CONTRIBUTING.md).\n# owner:\n\n")
-	b.WriteString("# TODO: the checks that red on the rated answer and pass on a right one\n")
+	if good {
+		b.WriteString("# TODO: the checks the rated answer passes and a wrong one fails\n")
+	} else {
+		b.WriteString("# TODO: the checks that red on the rated answer and pass on a right one\n")
+	}
 	b.WriteString("# (docs/designs/bench-case-format.md, \"The check types\").\n")
 	b.WriteString("verification_spec: []\n")
 	return b.String()
@@ -181,8 +205,12 @@ func feedbackTranscriptMD(rec FeedbackRecord) string {
 	}
 	var b strings.Builder
 	b.WriteString("# The rated exchange\n\n")
-	fmt.Fprintf(&b, "Rated 👎 on %s (%s). What the rater said was wrong: %s\n\n",
-		rec.RatedAt.UTC().Format(feedbackRatedDateForm), rec.Platform, note)
+	if rec.Rating == FeedbackUp {
+		fmt.Fprintf(&b, "Rated 👍 on %s (%s), a good answer.\n\n", rec.RatedAt.UTC().Format(feedbackRatedDateForm), rec.Platform)
+	} else {
+		fmt.Fprintf(&b, "Rated 👎 on %s (%s). What the rater said was wrong: %s\n\n",
+			rec.RatedAt.UTC().Format(feedbackRatedDateForm), rec.Platform, note)
+	}
 	fmt.Fprintf(&b, "- Task: `%s`\n", rec.TaskID)
 	if rec.ContextID != "" {
 		fmt.Fprintf(&b, "- Context: `%s`\n", rec.ContextID)

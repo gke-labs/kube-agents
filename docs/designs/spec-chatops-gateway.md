@@ -1931,8 +1931,8 @@ A board that cannot be read draws Fleet with a line saying so, never an empty fl
 
 ### Answer feedback (added 10/16)
 
-A chat user rates the final answer of an ask 👍 or 👎, and a 👎 keeps the exchange so an operator
-can turn it into an eval case. The gateway marks the one message that answers the ask
+A chat user rates the final answer of an ask 👍 or 👎, and the rating keeps the exchange so an
+operator can turn it into an eval case: a 👎 one the answer should fail, a 👍 one it should pass. The gateway marks the one message that answers the ask
 (`OutMessage.Feedback`, the root task id of the ask's chain), and it is one of two. When the
 Planning Agent answers itself, it is the completed result of the task whose end is the chain's
 (`observedAs`), never a hand-off line (`handOffEnd`), the same message the `DeliverableObserver`
@@ -1964,9 +1964,9 @@ escaping takes it past a section's cap) and the block; a chunk Slack refuses pos
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
-A 👍 is counted and nothing is kept or posted (Slack fills the tapped icon itself); it also
-deletes the rater's 👎 on the same answer, if one is kept, and writes nothing when none is (a KV
-delete writes a marker whether or not the key exists, so the key is looked up first). A 👎 is
+A 👍 is counted and kept with the ask and the rated answer, and nothing is posted (Slack fills the
+tapped icon itself); a rater has one rating per answer, so it replaces that rater's 👎 on the same
+answer and drops its note, which said what went wrong. A 👎 is
 counted and kept with the rated answer first, one KV write, and only once it is kept opens a modal
 on the tap's trigger, which lapses three seconds after the tap ("What went wrong?" over one
 optional field, "Anything else?", of up to 500 characters, and a line telling the rater how long
@@ -1977,23 +1977,26 @@ rated chain (`TaskRef.Request` on the root entry, as written and held to its 1 K
 it, and the adapter reads nothing of the thread; a draft whose ask was no longer on record says so
 in its `prompt` rather than shipping an empty one. The answer is the rated message's text, which for a text answer longer than one chunk is
 its last chunk. Send writes the note into the kept 👎 and posts "Thanks. I kept this answer for
-your team to review." to the rater alone (`chat.postEphemeral`) in the thread; with no 👎 kept (a
-👍 took it back) it keeps nothing and posts nothing. Cancel keeps the 👎 without a note. A note and
+your team to review." to the rater alone, followed by a link to the project's feedback form
+(`https://gke-labs.github.io/kube-agents/feedback`, nothing pre-filled) and a warning that it opens
+a public issue, so the install's details stay out of it (`chat.postEphemeral`, in the thread); with no 👎 kept (its
+write failed, or a 👍 replaced it) it keeps nothing and posts nothing. Cancel keeps the 👎 without a note. A note and
 a re-rating merge under the record's revision (`mergeFeedback`), so neither loses the other's part,
 and the ratings on one answer by one rater run one at a time, so a 👍 tapped while the 👎 is still
-being written takes it back. A redelivered Send (Socket Mode is at-least-once) is handled once.
+being written replaces it. A redelivered Send (Socket Mode is at-least-once) is handled once.
 No new scope: `chat:write` covers the ephemeral line, and `views.open` takes only the trigger.
 
-A kept 👎 is a JSON record in the `feedback` KV bucket, one key per answer and rater
+A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
 member id, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
 unmarked otherwise (an install whose operator predates the bucket, or a bucket someone recreated
-without one), looking again every minute so that a provision Job finishing after an upgraded
-gateway started still turns it on; and the gateway's user is the bucket's only reader and writer by
-grant. It is capped at 64MiB, past which a 👎 is counted but not kept. Logs carry the task id, the
+without one), looking again every minute for 30 minutes so that a provision Job finishing after an
+upgraded gateway started still turns it on, then stopping, so a NATS server that never grants the
+gateway the bucket does not log a refused request every minute; and the gateway's user is the bucket's only reader and writer by
+grant. It is capped at 64MiB, past which a rating is counted but not kept. Logs carry the task id, the
 conversation and the rating, never the text; `answer_feedback_total` carries only the platform and
 the rating.
 
@@ -2004,13 +2007,18 @@ stay the last block.
 An operator reads the bucket through the gateway's own binary, in its pod, since nothing else holds
 the bucket's credentials:
 `kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- /gateway feedback export [--since 7d] > feedback.tar`.
-Each kept 👎 becomes a directory `feedback-<date>-<hash>/` (more digits when two would share one)
+Each kept rating becomes a directory `feedback-<date>-<hash>/` (more digits when two would share one)
 holding `task.yaml`, a draft case per [`bench-case-format.md`](bench-case-format.md) (the ask as its
-`prompt`, `deployer: noop`, the note in its header comment and `expected_output`, and TODOs for
-`domain`, `owner` and the `verification_spec`), and `transcript.md`, the ask, the answer and the
-note with their ids. The draft is for a person to finish and submit; `transcript.md` holds the
+`prompt`, `deployer: noop`, and TODOs for `domain`, `owner` and the `verification_spec`; a 👎's
+header comment and `expected_output` carry its note, a 👍's say the rated answer was good and the
+checks should pass on it), and `transcript.md`, the ask, the answer and any note with their ids. The draft is for a person to finish and submit; `transcript.md` holds the
 install's data and stays out of the pull request. The install never writes to this repository, and
-no sink files the drafts anywhere.
+no sink files the drafts anywhere: nothing is filed automatically into the public kube-agents
+repository, and a rating leaves the install only if the customer chooses to send it.
+
+The Slack Home tab ends, under a divider, with "This week: N 👍, M 👎", the kept ratings given in
+the last seven days (`FeedbackRecorder.Tally`, a scan of the bucket's keys), read on the board's
+schedule and left out when feedback is off or the tally cannot be read.
 
 An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
 operator renders `A2A_SLACK_ANSWER_FEEDBACK=false` on the gateway only for an explicit `false`, so an

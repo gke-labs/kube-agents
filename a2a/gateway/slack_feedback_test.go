@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/slack-go/slack"
 
@@ -21,6 +22,10 @@ type fakeRecorder struct {
 	notes   []string
 	rateErr error
 	noteErr error
+	// up, down and tallyErr are what Tally answers; tallies counts its calls.
+	up, down int
+	tallyErr error
+	tallies  int
 	// onRate runs inside Rate, for a test that checks what had happened
 	// by then.
 	onRate func()
@@ -37,6 +42,13 @@ func (f *fakeRecorder) Rate(r FeedbackRating) error {
 	defer f.mu.Unlock()
 	f.ratings = append(f.ratings, r)
 	return f.rateErr
+}
+
+func (f *fakeRecorder) Tally(context.Context, time.Time) (int, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tallies++
+	return f.up, f.down, f.tallyErr
 }
 
 func (f *fakeRecorder) Note(r FeedbackRating, note string) error {
@@ -208,8 +220,8 @@ func TestSlackUpRatingIsRecordedAndIsNoTurn(t *testing.T) {
 		t.Fatal("a rating is never a turn")
 	}
 	if len(rec.ratings) != 1 || rec.ratings[0].Rating != FeedbackUp || rec.ratings[0].TaskID != "t-root" ||
-		rec.ratings[0].Conversation != "slack:C1/40.0" || rec.ratings[0].Answer != "" {
-		t.Fatalf("ratings = %+v, want one bare 👍 on t-root", rec.ratings)
+		rec.ratings[0].Conversation != "slack:C1/40.0" || rec.ratings[0].Answer != "*It is OOMKilled.*" {
+		t.Fatalf("ratings = %+v, want one 👍 on t-root with the answer", rec.ratings)
 	}
 	if len(api.views) != 0 || len(api.ephemerals) != 0 {
 		t.Error("a 👍 opens nothing and posts nothing")
@@ -277,7 +289,9 @@ func TestSlackNoteJoinsTheRatingAndThanksTheRaterAlone(t *testing.T) {
 	if len(rec.notes) != 1 || rec.notes[0] != "U1 t-root 50.0 slack:C1/40.0 the limit is 256Mi" {
 		t.Errorf("notes = %v", rec.notes)
 	}
-	if len(api.ephemerals) != 1 || api.ephemerals[0] != "C1 U1 40.0 "+slackFeedbackThanksLine {
+	if len(api.ephemerals) != 1 || api.ephemerals[0] != "C1 U1 40.0 "+slackFeedbackThanks() ||
+		!strings.Contains(api.ephemerals[0], "<https://gke-labs.github.io/kube-agents/feedback>") ||
+		!strings.Contains(api.ephemerals[0], "public issue") {
 		t.Errorf("ephemerals = %v, want the thanks in the thread, to the rater", api.ephemerals)
 	}
 }

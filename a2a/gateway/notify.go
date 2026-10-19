@@ -720,12 +720,16 @@ func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 	if len(chunks) == 0 {
 		return false
 	}
+	first, rated := "", false
 	for i, chunk := range chunks {
 		var message string
 		var err error
 		if i == len(chunks)-1 {
 			message, err = n.conv.PostMessage(conversation, OutMessage{Text: chunk, Feedback: m.Feedback})
-			if err != nil {
+			if err == nil {
+				rated = true
+			} else {
+				n.log.Warn("notify: the rated post failed; posting it without rating controls", "conversation", conversation, "err", err)
 				message, err = n.conv.Post(conversation, chunk)
 			}
 		} else {
@@ -739,10 +743,11 @@ func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 			return true
 		}
 		if i == 0 {
+			first = message
 			n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
-			n.log.Info("notify posted", "conversation", conversation, "message", message, "rated", true)
 		}
 	}
+	n.log.Info("notify posted", "conversation", conversation, "message", first, "rated", rated)
 	return true
 }
 
@@ -1052,10 +1057,15 @@ func (c gatewayConversations) AnswerFeedbackTarget(conversation, answerTo string
 	if g.feedback.Load() == nil {
 		return ""
 	}
-	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
+	// The notify worker's lookup bound, as post's own read of the record.
+	ctx, cancel := context.WithTimeout(g.runCtx, notifyLookupTimeout)
 	defer cancel()
 	rec, err := g.reg.Get(ctx, conversation)
-	if err != nil || rec == nil {
+	if err != nil {
+		g.log.Warn("answer feedback: the session record could not be read; the card answer posts unrated", "conversation", conversation, "err", err)
+		return ""
+	}
+	if rec == nil {
 		return ""
 	}
 	if i := rec.notifyChainIndex(answerTo); i >= 0 {

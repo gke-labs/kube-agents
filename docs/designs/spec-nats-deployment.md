@@ -223,7 +223,7 @@ Four KV buckets ride the same JetStream deployment:
   it is a denial it has to be enumerated over every principal on the bus rather than
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
   `a2a/authcallout` against the config the operator renders.
-- `feedback` - the 👎 ratings chat users gave the gateway's answers, each with the
+- `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
   exchange it rated: user content that can hold cluster data. The one bucket with a max
   age (`--ttl=720h`), which is its retention, and capped at 64MiB. The gateway's user is
   its only reader and writer by grant, with the registry's four verbs on `KV_feedback`,

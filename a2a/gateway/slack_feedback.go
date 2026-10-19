@@ -47,6 +47,10 @@ const (
 	slackFeedbackDays       = "%d days"
 	slackFeedbackOneDay     = "1 day"
 	slackFeedbackThanksLine = "Thanks. I kept this answer for your team to review."
+	// slackFeedbackFormLine points the rater at the project's feedback form,
+	// with nothing pre-filled: the install never files anything itself.
+	slackFeedbackFormLine = "To tell the kube-agents maintainers as well, use <%s>. It opens a public issue, so leave out cluster names and other details from your install."
+	slackFeedbackFormURL  = "https://gke-labs.github.io/kube-agents/feedback"
 
 	// slackFeedbackDeadline bounds the Slack calls one tap makes.
 	slackFeedbackDeadline = 15 * time.Second
@@ -228,13 +232,11 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		return
 	}
 	conversation, thread, _ := slackClickConversation(p)
+	// The message's text is the mrkdwn fallback the adapter posted; its
+	// entities are undone so the draft reads as the answer did.
 	rating := FeedbackRating{Platform: platformSlack, Backend: slackBackend, Rater: p.User.ID,
-		Conversation: conversation, MessageID: p.Message.TS, TaskID: taskID, Rating: value}
-	if value == FeedbackDown {
-		// The message's text is the mrkdwn fallback the adapter posted;
-		// its entities are undone so the draft reads as the answer did.
-		rating.Answer = slackUnescaper.Replace(p.Message.Text)
-	}
+		Conversation: conversation, MessageID: p.Message.TS, TaskID: taskID, Rating: value,
+		Answer: slackUnescaper.Replace(p.Message.Text)}
 	s.goSession(func() {
 		// Kept first, so the note the modal sends and a 👍 that follows find
 		// the 👎 already there; one KV write, inside the three seconds the
@@ -255,6 +257,11 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 			s.log.Warn("slack: opening the feedback note failed; the 👎 is kept without one", "channel", p.Channel.ID, "err", err)
 		}
 	})
+}
+
+// slackFeedbackThanks is the line a kept note is thanked with.
+func slackFeedbackThanks() string {
+	return slackFeedbackThanksLine + " " + fmt.Sprintf(slackFeedbackFormLine, slackFeedbackFormURL)
 }
 
 // slackFeedbackModal is the note a 👎 asks for.
@@ -312,7 +319,7 @@ func (s *SlackAdapter) feedbackNote(raw json.RawMessage) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), slackFeedbackDeadline)
 		defer cancel()
-		opts := []slack.MsgOption{slack.MsgOptionText(slackFeedbackThanksLine, false)}
+		opts := []slack.MsgOption{slack.MsgOptionText(slackFeedbackThanks(), false)}
 		if meta.Thread != "" {
 			opts = append(opts, slack.MsgOptionTS(meta.Thread))
 		}

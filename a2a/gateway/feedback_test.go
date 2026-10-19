@@ -91,8 +91,17 @@ func TestLongAnswerIsMarkedOnItsLastChunkOnly(t *testing.T) {
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	long := strings.Repeat("word ", discordChunk/2)
 	completeTurn(t, r, "discord:g1/fb2", "d-1", long)
-	if got := r.adapter.feedbackMarks(); len(got) != 1 {
-		t.Fatalf("feedback marks = %v, want one, on the last chunk", got)
+	// The first chunk can land before the marked one; wait for the mark.
+	waitFor(t, "the marked chunk", func() bool { return len(r.adapter.feedbackMarks()) > 0 })
+	chunks := chatChunks(long, discordChunk)
+	if len(chunks) < 2 {
+		t.Fatalf("the answer is %d chunk(s); the test needs more than one", len(chunks))
+	}
+	r.adapter.mu.Lock()
+	marked := append([]string(nil), r.adapter.markedTexts...)
+	r.adapter.mu.Unlock()
+	if len(marked) != 1 || marked[0] != chunks[len(chunks)-1] {
+		t.Fatalf("marked posts = %q, want only the last of %d chunks", marked, len(chunks))
 	}
 }
 
@@ -158,7 +167,7 @@ func TestFeedbackTargetIsTheChainsFinalAnswerOnly(t *testing.T) {
 	}
 }
 
-func TestDeskKeepsADownRatingWithItsNoteAndAnUpTakesItBack(t *testing.T) {
+func TestDeskKeepsADownRatingWithItsNoteAndAnUpReplacesIt(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
@@ -223,17 +232,21 @@ func TestDeskKeepsADownRatingWithItsNoteAndAnUpTakesItBack(t *testing.T) {
 	if err := desk.Rate(up); err != nil {
 		t.Fatal(err)
 	}
-	out.Reset()
-	if n, err := ExportFeedback(context.Background(), r.client, 0, time.Now(), &out, io.Discard); err != nil || n != 0 {
-		t.Fatalf("export after 👍 = %d, %v; want nothing kept", n, err)
+	kv, err := r.client.KV(context.Background(), lib.FeedbackBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := getFeedback(context.Background(), kv, feedbackKey(origin.TaskID, "1001"))
+	if err != nil || rec.Rating != FeedbackUp || rec.Note != "" || rec.Ask != "why is it crashing?" || rec.Answer != "it is OOMKilled" {
+		t.Fatalf("record after 👍 = %+v, %v; want a 👍 with the ask and answer and no note", rec, err)
 	}
 	// A note sent after a 👍 keeps nothing and says so, so nobody is
-	// thanked for a record that does not exist.
+	// thanked for a 👎 that is no longer there.
 	if err := desk.Note(down, "late"); !errors.Is(err, errFeedbackNotKept) {
 		t.Errorf("a note after a 👍 = %v, want errFeedbackNotKept", err)
 	}
-	if n, _ := ExportFeedback(context.Background(), r.client, 0, time.Now(), io.Discard, io.Discard); n != 0 {
-		t.Errorf("a note sent after a 👍 kept %d, want nothing", n)
+	if rec, _ := getFeedback(context.Background(), kv, feedbackKey(origin.TaskID, "1001")); rec.Note != "" {
+		t.Errorf("a note sent after a 👍 was kept: %q", rec.Note)
 	}
 	m := r.g.Metrics()
 	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, FeedbackDown)); got != 1 {
@@ -272,22 +285,62 @@ func TestDeskReRatingKeepsTheNote(t *testing.T) {
 	}
 }
 
-func TestDeskUpOnAnUnratedAnswerWritesNothing(t *testing.T) {
+func TestDeskKeepsAnUpAsAGoodAnswerAndTalliesTheWeek(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	origin := completeTurn(t, r, "discord:g1/fb11", "d-1", "it is OOMKilled")
 	up := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb11",
-		MessageID: "m1", TaskID: "t-6", Rating: FeedbackUp}
-	if err := r.g.feedback.Load().Rate(up); err != nil {
+		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackUp, Answer: "it is OOMKilled"}
+	if err := desk.Rate(up); err != nil {
 		t.Fatal(err)
 	}
-	js := r.client.JetStream()
-	stream, err := js.Stream(context.Background(), "KV_"+lib.FeedbackBucket)
-	if err != nil {
+	other := up
+	other.Rater, other.Rating = "1002", FeedbackDown
+	if err := desk.Rate(other); err != nil {
 		t.Fatal(err)
 	}
-	info, err := stream.Info(context.Background())
-	if err != nil || info.State.Msgs != 0 {
-		t.Fatalf("KV_feedback holds %d messages (%v) after a 👍; a delete marker would record the 👍", info.State.Msgs, err)
+	ctx := context.Background()
+	if u, d, err := desk.Tally(ctx, time.Now().Add(-time.Hour)); err != nil || u != 1 || d != 1 {
+		t.Errorf("tally = %d 👍, %d 👎, %v; want 1 and 1", u, d, err)
+	}
+	if u, d, err := desk.Tally(ctx, time.Now().Add(time.Hour)); err != nil || u != 0 || d != 0 {
+		t.Errorf("tally since a later time = %d, %d, %v; want none", u, d, err)
+	}
+	var out, log bytes.Buffer
+	if n, err := ExportFeedback(ctx, r.client, 0, time.Now(), &out, &log); err != nil || n != 2 {
+		t.Fatalf("export = %d, %v; want both ratings", n, err)
+	}
+	if !strings.Contains(log.String(), " 👍 · ") || !strings.Contains(log.String(), " 👎 · ") {
+		t.Errorf("export log = %q, want a line per rating with its mark", log.String())
+	}
+	var task, transcript string
+	tr := tar.NewReader(&out)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(tr)
+		if strings.Contains(string(body), "👍") {
+			switch {
+			case strings.HasSuffix(h.Name, "/"+feedbackTaskFile):
+				task = string(body)
+			case strings.HasSuffix(h.Name, "/"+feedbackTranscript):
+				transcript = string(body)
+			}
+		}
+	}
+	for _, want := range []string{"from a 👍 on an answer", "as a good answer", `prompt: "why is it crashing?"`, "the checks the rated answer passes"} {
+		if !strings.Contains(task, want) {
+			t.Errorf("the 👍 task.yaml lacks %q:\n%s", want, task)
+		}
+	}
+	if strings.Contains(task, "said was wrong") || !strings.Contains(transcript, "a good answer") || !strings.Contains(transcript, "it is OOMKilled") {
+		t.Errorf("the 👍 draft must read as a good answer:\n%s\n%s", task, transcript)
 	}
 }
 

@@ -63,7 +63,7 @@ var errNotifyRouteUnavailable = errors.New("route unavailable")
 // alert-<event session>).
 const notifyUpdateMax = 128
 
-const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path> | --chat-file <path>] [--update <key>] [--timeout <d>] [--] [text]
+const notifyUsage = `usage: a2a notify --platform <platform> [--thread <thread> | --conversation <key> --context <id>] [--blocks-file <path> | --chat-file <path>] [--update <key>] [--answer-to <key>] [--timeout <d>] [--] [text]
 
 Post text to the install's chat home channel through the A2A gateway: a new
 thread, or a reply on --thread, which must be a thread of the home channel.
@@ -73,6 +73,8 @@ posts only into a live conversation whose session record has that context.
 --chat-file names a kube-agents.chat/v1 object to lay the post out with, the
 text being its fallback; --update names the message: a later notify with the
 same key, in the same conversation, edits that message instead of posting.
+--answer-to, with --conversation, names the plan whose ask the post answers,
+by its update key: the gateway draws the rating controls on it.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
 prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway

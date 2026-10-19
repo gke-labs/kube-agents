@@ -67,6 +67,29 @@ func TestNotifyMarksOnlyTheFlaggedAnswer(t *testing.T) {
 	}
 }
 
+// A flagged card answer whose layout the backend refuses keeps its rating:
+// it posts as text with the mark on its last chunk.
+func TestNotifyRefusedLayoutKeepsTheRatingOnText(t *testing.T) {
+	conv := &feedbackConversations{
+		fakeConversations: &fakeConversations{contexts: map[string]string{testConversation: testContext}},
+		target:            "task-root",
+	}
+	n := newTestNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(conv)
+	req := lib.NotifyRequest{Text: "Both pods are up.", Chat: json.RawMessage(testAnswerChat), AnswerTo: "plan-1",
+		Conversation: testConversation, ContextID: testContext}
+	if got := serveJSON(t, n, req); got.Error != "" || got.MessageID == "" {
+		t.Fatalf("reply = %+v", got)
+	}
+	// The refused layout, then the text post that carries the controls.
+	if len(conv.feedbacks) != 2 || conv.feedbacks[1] != "task-root" {
+		t.Fatalf("feedback marks = %q, want the rated text post last", conv.feedbacks)
+	}
+	if len(conv.chats) != 1 || conv.chats[0] != nil {
+		t.Errorf("posted chats = %v, want one text post", conv.chats)
+	}
+}
+
 // The target is the root of the ask the plan key is bound to, none for a key
 // no ask holds, and none while feedback is off.
 func TestAnswerFeedbackTargetIsTheAskItsPlanNames(t *testing.T) {
