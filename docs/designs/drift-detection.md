@@ -46,10 +46,11 @@ Detection can be **event-driven** (a resource informer or an audit-log subscript
 
 **Where the desired value comes from: Git.** `managedFields` says which fields a non-GitOps manager owns; it does not keep the value those fields held before the change, and neither does the live object. To show a diff or propose a revert, the agent reads the desired manifest out of the GitOps repository — the same copy `submit-suggestion` takes to write the PR, so this is an existing path and not a new dependency.
 
-The MVP takes **no dependency on any GitOps tool**. This baseline works on every cluster and covers resources no tool manages. Argo/Flux is an optional enrichment we add later (see _Future enhancements_), never a prerequisite. **No GitOps tool is not the same as no Git:** Argo and Flux are what we do without; the repository is still the source of desired state. Two cases fall outside that:
+The MVP takes **no dependency on any GitOps tool**. This baseline works on every cluster and covers resources no tool manages. Argo/Flux is an optional enrichment we add later (see _Future enhancements_), never a prerequisite. **No GitOps tool is not the same as no Git:** Argo and Flux are what we do without; the repository is still the source of desired state. Three cases fall outside that:
 
 - **Rendered manifests.** Where the repo goes through Kustomize or Helm, the file in Git is not the applied object, so the comparison needs a render step first. This is the drift-from-Git long tail the Argo/Flux enrichment covers.
 - **Resources not in Git at all.** There is no desired state to revert to, so the only sound proposals are **codify** or **delete** — never revert. CUJ 1's revert-or-codify assumes a Git-managed resource.
+- **No repository registered with the install.** The agent can't open a pull request at all, so the triage explains the change and proposes nothing until a repository is registered.
 
 ## How we judge the diff (Job B)
 

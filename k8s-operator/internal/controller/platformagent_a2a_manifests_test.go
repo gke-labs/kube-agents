@@ -4564,6 +4564,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// another principal's reply subject is interception, because
 		// anyone who may subscribe may join a queue group.
 		"a2a.cap.reply." + a2aBridgeAddressee + ".>",
+		// The Home tab's board request, which the bridge answers.
+		"chat.board",
 		"_INBOX." + a2aBridgeUser + ".>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("bridge subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -4580,7 +4582,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// let this principal name itself anything; one subject is what makes
 	// the subject-as-identity check sound. No read on the cap bucket
 	// appears anywhere in this list, and that is the point of asking.
-	want = append(want, "a2a.cap.verify."+a2aBridgeAddressee)
+	want = append(want, "a2a.cap.verify."+a2aBridgeAddressee, "chat.board.reply.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("bridge publish allow-list changed.\n got: %q\nwant: %q", got, want)
 	}
@@ -4870,7 +4872,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "_INBOX.gateway.>",
+		"agents.hb.>", "$KV.session-state.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack",
+		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
 	}
@@ -4886,6 +4889,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		// under `cap.hop.>` -- the gateway mints each successor's root
 		// itself, so a hop grant here would be authority with no caller.
 		"$KV.cap.root.*",
+		"chat.board",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
@@ -5867,7 +5871,7 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 
 // The console chat door, in the one spelling every check here shares. Two
 // exact subjects, not a namespace: the render's other chat.* grants are the
-// notify route's, held by their own check below, so admitting the "chat"
+// notify and board routes', held by their own checks, so admitting the "chat"
 // namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
@@ -5882,13 +5886,20 @@ const (
 	notifyReply        = "chat.notify.reply.agent.>"
 )
 
+// The board route's two subjects, spelled independently for the same reason.
+const (
+	boardRequest = "chat.board"
+	boardReply   = "chat.board.reply.gateway.>"
+)
+
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyReply}
+var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
-// chat door subjects: the console's two and the notify route's two.
+// chat door subjects: the console's two, the notify route's three and the
+// board route's two.
 //
 // The door is deliberately not a namespace here. Admitting "chat" would stop
 // refusing chat.gchat.>, chat.console.*.status or chat.console.*.in.x by
@@ -7610,6 +7621,36 @@ func TestTheSessionFenceIsTheLastFenceTheTeardownDeletes(t *testing.T) {
 	if got, want := lastFence, a2aSessionNetpolName(agent); got != want {
 		t.Errorf("the last fence the teardown deletes is %q, want %q; a fence deleted after the session "+
 			"fence is left behind forever on an install refused on its first reconcile", got, want)
+	}
+}
+
+// TestChatBoardSubjectsHaveExactlyOneWriterAndOneReader is the board
+// route's authorization: the gateway alone asks and reads the answers, the
+// bridge alone reads the asks and answers. The gateway draws the Slack Home
+// tab from the answer, so a second writer on the reply namespace could put
+// words on it.
+func TestChatBoardSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
+	ids := a2aIdentities(a2aTestAgent())
+	rules := []struct{ verb, pattern, owner string }{
+		{"publish", boardRequest, "gateway"},
+		{"subscribe", boardReply, "gateway"},
+		{"subscribe", boardRequest, a2aBridgeUser},
+		{"publish", boardReply, a2aBridgeUser},
+	}
+	for _, r := range rules {
+		var holders []string
+		for _, id := range ids {
+			list := id.publish
+			if r.verb == "subscribe" {
+				list = id.subscribe
+			}
+			if slices.ContainsFunc(list, func(g string) bool { return subjectPatternsOverlap(g, r.pattern) }) {
+				holders = append(holders, id.user)
+			}
+		}
+		if !slices.Equal(holders, []string{r.owner}) {
+			t.Errorf("%s %s is held by %v; want %s alone", r.verb, r.pattern, holders, r.owner)
+		}
 	}
 }
 

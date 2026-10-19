@@ -100,6 +100,9 @@ type slackClickPayload struct {
 type slackQuestion struct {
 	channel, thread, ts, text string
 	blocks, attachments       json.RawMessage
+	// title is the question as the Home tab lists it: its chat message's
+	// headline, or its text when it has none.
+	title string
 }
 
 // slackPending is a message handed to the gateway and not yet verified: a
@@ -197,13 +200,22 @@ func (s *SlackAdapter) noteQuestion(conversation string, q slackQuestion) {
 // never displaces a question that is open. Called once Slack has the message.
 func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 	channel, thread, _ := slackChannelThread(conversation)
+	if m.Chat != nil && m.Chat.Plan != nil {
+		// A card moved: the Home tab's running list reads the board again.
+		s.homeChanged(true)
+	}
 	if m.Chat == nil || !asksQuestion(m.Chat.Choices) {
 		s.mu.Lock()
 		ux := s.uxLocked()
+		closed := false
 		if open, ok := ux.questions[conversation]; ok && open.ts == ts {
 			delete(ux.questions, conversation)
+			closed = true
 		}
 		s.mu.Unlock()
+		if closed {
+			s.homeChanged(false)
+		}
 		return
 	}
 	text := toMrkdwn(m.Text)
@@ -226,7 +238,13 @@ func (s *SlackAdapter) trackQuestion(conversation, ts string, m OutMessage) {
 	delete(ux.answered, channel+"/"+ts)
 	delete(ux.lines, channel+"/"+ts)
 	s.mu.Unlock()
-	s.noteQuestion(conversation, slackQuestion{channel: channel, thread: thread, ts: ts, text: text, blocks: blocks, attachments: attachments})
+	title := text
+	if strings.TrimSpace(m.Chat.Headline) != "" {
+		title = toMrkdwn(m.Chat.Headline)
+	}
+	s.noteQuestion(conversation, slackQuestion{channel: channel, thread: thread, ts: ts, text: text, title: title,
+		blocks: blocks, attachments: attachments})
+	s.homeChanged(false)
 }
 
 // asksQuestion is whether choices hold one that is not an answer's next step.
@@ -431,6 +449,14 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 		}
 	}
 	s.mu.Unlock()
+	if verified && !p.click && !chattext.IsCommand(p.text) && q.ts == "" {
+		// An ask, not an answer: whoever answers a question, by typing or by
+		// clicking, does not become the one the next question waits on.
+		s.noteAsker(conversation, p.author)
+	}
+	if q.ts != "" {
+		s.homeChanged(false)
+	}
 	if verified && !p.click && !chattext.IsCommand(p.text) && q.ts == "" {
 		// A command neither answers nor titles, and an answer to an open
 		// question is no ask to title the thread after.

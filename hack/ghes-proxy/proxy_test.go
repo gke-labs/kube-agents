@@ -238,9 +238,9 @@ func TestOtherPathsAreRefused(t *testing.T) {
 
 func TestAuthorizationIsPassedThroughUnchanged(t *testing.T) {
 	f := newFixture(t)
-	bearer := "Bearer ghs_exampleinstallationtoken"
-	jwt := "Bearer eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxMjMifQ.c2ln"
-	basic := "Basic eC1hY2Nlc3MtdG9rZW46Z2hzX2V4YW1wbGU="
+	bearer := "Bearer test-installation-token"
+	jwt := "Bearer test-app-jwt"
+	basic := "Basic eC1hY2Nlc3MtdG9rZW46dGVzdC1naXQtdG9rZW4="
 	f.do(t, "GET", "/api/v3/repos/acme/infra", nil, http.Header{"Authorization": {bearer}})
 	f.do(t, "POST", "/api/v3/app/installations/1/access_tokens", nil, http.Header{"Authorization": {jwt}})
 	f.do(t, "POST", "/api/graphql", strings.NewReader(`{"query":"{viewer{login}}"}`), http.Header{"Authorization": {bearer}})
@@ -491,25 +491,25 @@ func TestAJSONBodyOverTheCapIsSentAsItIs(t *testing.T) {
 }
 
 func TestNoCredentialReachesTheLog(t *testing.T) {
-	secrets := []string{"ghs_SECRETinstallation", "eyJSECRETjwt", "x-access-token:ghs_SECRETgit", "SECRETquery", "SECRETbody", "ghs_SECRETminted"}
+	secrets := []string{"test-SECRET-installation", "test-SECRET-jwt", "x-access-token:test-SECRET-git", "SECRETquery", "SECRETbody", "test-SECRET-minted"}
 	f := newFixture(t)
 	f.api.handler = func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Location", "https://example.com/?token=SECRETquery")
-		_, _ = io.WriteString(w, `{"token":"ghs_SECRETminted","html_url":"https://`+f.web.host()+`/a"}`)
+		_, _ = io.WriteString(w, `{"token":"test-SECRET-minted","html_url":"https://`+f.web.host()+`/a"}`)
 	}
-	f.do(t, "GET", "/api/v3/user?access_token=SECRETquery", nil, http.Header{"Authorization": {"Bearer ghs_SECRETinstallation"}})
-	f.do(t, "POST", "/api/v3/app/installations/1/access_tokens", strings.NewReader("SECRETbody"), http.Header{"Authorization": {"Bearer eyJSECRETjwt"}})
-	f.do(t, "POST", "/acme/infra.git/git-receive-pack", strings.NewReader("SECRETbody"), http.Header{"Authorization": {"Basic x-access-token:ghs_SECRETgit"}})
-	f.do(t, "GET", "/nothing?token=SECRETquery", nil, http.Header{"Authorization": {"Bearer ghs_SECRETinstallation"}})
+	f.do(t, "GET", "/api/v3/user?access_token=SECRETquery", nil, http.Header{"Authorization": {"Bearer test-SECRET-installation"}})
+	f.do(t, "POST", "/api/v3/app/installations/1/access_tokens", strings.NewReader("SECRETbody"), http.Header{"Authorization": {"Bearer test-SECRET-jwt"}})
+	f.do(t, "POST", "/acme/infra.git/git-receive-pack", strings.NewReader("SECRETbody"), http.Header{"Authorization": {"Basic x-access-token:test-SECRET-git"}})
+	f.do(t, "GET", "/nothing?token=SECRETquery", nil, http.Header{"Authorization": {"Bearer test-SECRET-installation"}})
 	// The escaped-slash request that once reached the HTTP/2 encoder, whose
 	// error quotes the whole request URI.
-	f.do(t, "GET", "/api/v3%2Fuser?access_token=SECRETquery", nil, http.Header{"Authorization": {"Bearer ghs_SECRETinstallation"}})
+	f.do(t, "GET", "/api/v3%2Fuser?access_token=SECRETquery", nil, http.Header{"Authorization": {"Bearer test-SECRET-installation"}})
 
 	// An upstream that cannot be reached: the transport's error names the
 	// URL, query string included.
 	broken := newFixture(t, func(c *Config) { c.UpstreamAPIHost = "127.0.0.1:1" })
-	resp := broken.do(t, "GET", "/api/v3/user?access_token=SECRETquery", nil, http.Header{"Authorization": {"Bearer ghs_SECRETinstallation"}})
+	resp := broken.do(t, "GET", "/api/v3/user?access_token=SECRETquery", nil, http.Header{"Authorization": {"Bearer test-SECRET-installation"}})
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("unreachable upstream: status %d", resp.StatusCode)
 	}

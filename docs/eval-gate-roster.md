@@ -500,7 +500,9 @@ takes a ledger, not that the agent publishes one; that stays a case's job once o
 nightly runs the same list once a night on its own leased project
 (`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
-GitLab.
+GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
+(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
+show in Prow only, as the dashboard has no next lane.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on
@@ -517,8 +519,8 @@ goes through the same forge abstraction on both forges, so the GitHub presubmit 
 what a pull request can break in the agent; what GitLab can break on its own is the provider
 and the forge, which the nightly catches within a day and the on-demand run checks for a pull
 request that touches the provider. The file needs the normal approvers, like
-`nightly-cases.txt` and the inject-lane files: it changes what one on-demand lane and the
-nightly run, not what can red a pull request.
+`nightly-cases.txt` and the inject-lane files: it changes what one on-demand lane and the two
+nightlies run, not what can red a pull request.
 
 ## Demoting a flaky case
 

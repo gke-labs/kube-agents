@@ -5396,5 +5396,66 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
 
+
+class NextHomeChannelUnsetWarningTest(unittest.TestCase):
+    """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
+    gateway makes the proactive posts and arms them only on a home channel,
+    so a chat backend the gateway holds with none drops every alert while
+    conversations keep working. The front doors warn, never refuse, and the
+    closing summary says it again. The backend follows the operator's
+    a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
+
+    def _run(self, mode="next", slack="true", chat="false", slack_home="", chat_home="", flags=False, summary=False):
+        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, slack_home, chat_home) + (("flags",) if flags else ()))
+        script = (
+            'print_info() { echo "INFO: $*"; }\n'
+            'print_warning() { echo "WARN: $*"; }\n'
+            'print_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; warn_next_home_channel_unset {args} || rc=$?; echo "rc=$rc key=$NEXT_HOME_CHANNEL_UNSET_KEY"\n'
+            + (f'print_next_home_channel_unset_summary {"flags" if flags else ""}\n' if summary else "")
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+
+    def test_next_slack_without_a_home_channel_warns_and_names_the_key(self):
+        proc = self._run()
+        self.assertIn("rc=0 key=SLACK_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", proc.stdout)
+        self.assertIn("drop every one of them", proc.stdout)
+        self.assertIn("HomeChannelUnset", proc.stdout)
+        self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", proc.stdout)
+        self.assertIn("slack-app/#home-channel", proc.stdout)
+
+    def test_next_chat_without_a_home_channel_names_the_chat_key(self):
+        proc = self._run(slack="false", chat="true")
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
+
+    def test_chat_holds_the_gateway_when_both_are_on(self):
+        # Slack stays on the today path then, so only Chat's home counts.
+        self.assertIn("key=GOOGLE_CHAT_HOME_CHANNEL", self._run(chat="true", slack_home="C0123ABCD").stdout)
+        self.assertEqual(self._run(chat="true", chat_home="spaces/AAA").stdout, "rc=0 key=\n")
+
+    def test_flags_name_the_flag(self):
+        self.assertIn("install.env or --slack-home-channel", self._run(flags=True).stdout)
+        self.assertIn("install.env or --google-chat-home-channel", self._run(slack="false", chat="true", flags=True).stdout)
+
+    def test_silent_when_nothing_is_dropped(self):
+        for kw in ({"slack_home": "C0123ABCD"}, {"slack_home": "  ", "mode": "today"}, {"mode": "today"},
+                   {"slack": "false"}, {"slack": "false", "chat": "true", "chat_home": "spaces/AAA"}):
+            with self.subTest(**kw):
+                self.assertEqual(self._run(**kw).stdout, "rc=0 key=\n")
+
+    def test_a_blank_home_channel_counts_as_unset(self):
+        self.assertIn("key=SLACK_HOME_CHANNEL", self._run(slack_home="   ").stdout)
+
+    def test_the_summary_repeats_it_last(self):
+        proc = self._run(summary=True)
+        lines = [l for l in proc.stdout.splitlines() if l]
+        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
+        self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
+        self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
+
 if __name__ == "__main__":
     unittest.main()

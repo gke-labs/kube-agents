@@ -206,7 +206,7 @@ answer reads like, and — where the answer is objectively checkable — asserts
 cluster.
 
 Every task in this repository carries a top-level `domain: <slug>` field, and a task that
-covers no row gets a reviewed `KNOWN_NO_DOMAIN` entry instead of an absent field —
+no row describes gets a new row (with its `owner:`, `backup:` and `meaning:`) instead of an absent field —
 `docs/designs/bench-case-format.md` is the contract, and this section is the how-to.
 The slugs live in `docs/designs/domains.yaml`, and
 `scripts/test_domain_coverage.py` counts a domain as covered only when a task carries its
