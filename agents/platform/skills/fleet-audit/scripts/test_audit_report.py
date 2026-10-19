@@ -19645,6 +19645,28 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn(DECLINE_REASON, "".join(self.harness.bodies_for("issue-*")))
         self.assertIn("published with a manual remediation instead", self.err)
 
+    def test_the_install_switch_keeps_the_refusal_and_lists_the_written_fix_as_awaiting_a_request(self):
+        """On an install whose `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is off a
+        `/remediate` needs the written fix as much as the sweep does, so an
+        unwritten one is refused as on any install; once written it publishes
+        with no pull request, named on the ledger as awaiting a request (#3474)."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        with tempfile.TemporaryDirectory() as tmp:
+            switch = os.path.join(tmp, "audit-auto-promote")
+            pathlib.Path(switch).write_text("false\n")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch):
+                self.assertEqual(self.run_finish(doc), 2)
+                self.assertIn("their fix is not written", self.err)
+                self.touch(doc["findings"][0]["remediation"]["path"])
+                self.assertEqual(self.run_finish(doc), 0, self.err)
+                self.assertFalse(self.harness.forge_calls("proposal-create"))
+                body = "".join(self.harness.bodies_for("issue-*"))
+                self.assertIn("## Awaiting `/remediate`", body)
+                self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
+                self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
+
     def test_finish_publishes_once_the_fix_is_written(self):
         self.harness.replies = {"issue-list": issues_view([])}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)

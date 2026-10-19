@@ -11493,9 +11493,8 @@ def render_stale_close_comment(
         resolution
         or (
             f"If the finding comes back: the automatic remediation sweep is off on this "
-            f"install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so it is listed on the "
-            "ledger as awaiting `/remediate <finding-id>`, which re-opens it on request "
-            "on this same branch."
+            f"install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so nothing is re-proposed "
+            "without a request; `/remediate <finding-id>` re-opens it on this same branch."
             if sweep_off
             else f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
             f"or `{AUTO_PROMOTION_FLOOR}` for {_sweep_checks_text()} where the collector "
@@ -17248,12 +17247,12 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A promised path the containment check refused is no fix the sweep would
     # open: writing at it is what the check stops, so it is not refused again
     # as unwritten, and publishes `manual` with its SECURITY line as before.
-    # On an install whose switch is off the sweep opens nothing, so there is no
-    # fix it "would open" to refuse over or to write: the worker's `manual`
-    # publishes as `manual`, and the finding is listed as awaiting `/remediate`.
+    # The install's switch (`sweep_on`) changes none of this: a `/remediate`
+    # there needs the written fix as much as the sweep does, so an unwritten
+    # one is refused, planned and written the same, and opened only on request.
     unwritten = without_refused_paths(
         unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
-        if findings and sweep_on
+        if findings
         else {},
         degraded,
         promised,
