@@ -44,10 +44,10 @@
 # indented, which is an unterminated heredoc.
 # bench/tests/test_tf_heredoc_renders.py is what catches that.
 #
-# This directory is outside the fixture sanitization scan -- SANITIZED_ROOTS in
-# scripts/validate_bench_cases.py is bench/tasks and bench/tf/prebuilt only --
-# so nothing here may carry a real project, cluster, address or principal.
-# Every such value belongs to the caller and arrives as a variable.
+# This directory is inside the fixture sanitization scan -- SANITIZED_ROOTS in
+# scripts/validate_bench_cases.py includes bench/tf/modules -- so nothing here
+# may carry a real project, cluster, address or principal. Every such value
+# belongs to the caller and arrives as a variable.
 #
 # Defines functions and a handful of DRIFT_* constants, and runs nothing, so it
 # may be sourced before or after the caller's own assignments. The caller then
