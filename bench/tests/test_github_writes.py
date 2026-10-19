@@ -309,14 +309,15 @@ def test_an_empty_token_file_falls_back_to_the_environment(env, github, monkeypa
 #: Token-file contents that cannot be a token, each of which must fall back
 #: to BENCH_GITHUB_TOKEN rather than raise out of the check: bytes that are
 #: not UTF-8 (UnicodeDecodeError), whitespace alone, and inner whitespace or a
-#: second line, which would otherwise reach the Authorization header and make
-#: http.client raise ValueError mid-request.
+#: second line, or a character outside Latin-1, which would otherwise reach
+#: the Authorization header and make http.client raise ValueError mid-request.
 NOT_A_TOKEN = {
     "not-utf8": b"\xff\xfeghs_renewed\n",
     "whitespace-only": b" \n\t\n",
     "two-lines": b"ghs_renewed\nghs_other\n",
     "inner-space": b"ghs re newed\n",
     "control-char": b"ghs_\x00renewed\n",
+    "non-latin1": "ghs_renewed\u2019\n".encode(),
 }
 
 

@@ -193,11 +193,11 @@ def token_env_vars(forge: str) -> tuple[str, ...]:
 def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | None:
     """The grading credential: GITHUB_TOKEN_FILE_ENV_VAR's file on GitHub when
     it holds one, else the first of :func:`token_env_vars` that is set. A
-    file that is unreadable, not UTF-8, empty, or anything but one line with
-    no whitespace or control characters inside falls back to the variables,
+    file that is unreadable, not UTF-8, empty, or anything but one line of
+    printable ASCII with no whitespace inside falls back to the variables,
     which hold the token the unit started with: such a file cannot be a
-    token, and an embedded newline would otherwise raise out of the HTTP
-    request's header instead of grading."""
+    token, and an embedded newline or a non-Latin-1 character would otherwise
+    raise out of the HTTP request's header instead of grading."""
     env = _env(environ)
     token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
     if forge != FORGE_GITLAB and token_file:
@@ -205,7 +205,7 @@ def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | No
             token = Path(token_file).read_text(encoding="utf-8").strip()
         except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
             token = ""
-        if token and token.isprintable() and not any(c.isspace() for c in token):
+        if token and token.isascii() and token.isprintable() and not any(c.isspace() for c in token):
             return token
     return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
 
