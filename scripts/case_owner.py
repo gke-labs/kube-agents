@@ -1,18 +1,23 @@
 """Who a bench case's bugs go to first: its effective owner.
 
 The rule (bench/CONTRIBUTING.md, "Ownership"): a case's `owner:` in its
-`bench/tasks/<id>/task.yaml` names the person whose bugs it is first. When the
-field is absent, or names someone who is not in the root `OWNERS` file
-(approvers or reviewers), the case falls back to its domain's `owner:` in
-`docs/designs/domains.yaml`. The literal `maintainers` named nobody and is no
-longer accepted.
+`bench/tasks/<id>/task.yaml` names the person whose bugs it is first, any
+GitHub login. When the field is absent, the case belongs to its domain's
+`owner:` in `docs/designs/domains.yaml`. The literal `maintainers` named
+nobody and is no longer accepted.
+
+This module answers offline, from the checkout alone, so it cannot know
+whether a login can be assigned an issue. That check happens at bug-filing
+time: the filer assigns `effective_owner()`, and when GitHub refuses the
+assignee (not an organisation member or collaborator), it files to
+`domain_owner()` instead.
 
 `scripts/validate_bench_cases.py` imports this to lint the field, and the eval
 dashboard (`scripts/eval_dashboard/`) can import it to route a nightly red to a
 person. Stdlib-only for the same reason as `eval_rosters.py`: the dashboard's
-collector runs with no third-party imports, so the two files are line-scanned.
-`scripts/test_case_owner.py` asserts the scans agree with a YAML parse of the
-real files.
+collector runs with no third-party imports, so domains.yaml is line-scanned.
+`scripts/test_case_owner.py` asserts the scan agrees with a YAML parse of the
+real file.
 """
 
 from __future__ import annotations
@@ -22,46 +27,24 @@ import re
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # Relative to a checkout, so effective_owner_of_case can read another one.
-OWNERS_PATH = pathlib.Path("OWNERS")
 DOMAINS_PATH = pathlib.Path("docs") / "designs" / "domains.yaml"
 TASKS_PATH = pathlib.Path("bench") / "tasks"
 TASK_FILENAME = "task.yaml"
-OWNERS_FILE = REPO_ROOT / OWNERS_PATH
 DOMAINS_FILE = REPO_ROOT / DOMAINS_PATH
 
 # The value that used to mean "the OWNERS approvers". It named nobody, so the
 # validator rejects it and this module never treats it as a person.
 RETIRED_OWNER = "maintainers"
-# The two root OWNERS lists whose members may own a case.
-OWNERS_LIST_KEYS = ("approvers", "reviewers")
+# GitHub's own login rule: alphanumerics and single interior hyphens, at most
+# 39 characters, so a stray e-mail address or a display name is rejected
+# before a reviewer has to spot it.
+GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 
 _TOP_LEVEL_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):")
-_LIST_ITEM = re.compile(r"^\s*-\s*([^\s#]+)")
 _DOMAIN_SLUG = re.compile(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)")
 _DOMAIN_OWNER = re.compile(r"^\s+owner:\s*([^\s#]+)")
 _TASK_FIELD = r"^{key}:\s*([^\s#]+)"
 _QUOTES = "'\""
-
-
-def parse_root_owners(text: str) -> frozenset[str]:
-    """Lower-cased logins in the OWNERS text's `approvers:` and `reviewers:` lists.
-
-    Lower-cased because GitHub logins are case-insensitive, as
-    scripts/request_reviewers.py and scripts/test_ownership.py read them.
-    """
-    logins: set[str] = set()
-    current = None
-    for line in text.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        key = _TOP_LEVEL_KEY.match(line)
-        if key:
-            current = key.group(1)
-            continue
-        item = _LIST_ITEM.match(line)
-        if item and current in OWNERS_LIST_KEYS:
-            logins.add(item.group(1).strip(_QUOTES).lower())
-    return frozenset(logins)
 
 
 def parse_domain_owners(text: str) -> dict[str, str]:
@@ -82,10 +65,6 @@ def parse_domain_owners(text: str) -> dict[str, str]:
     return owners
 
 
-def load_root_owners(path: pathlib.Path = OWNERS_FILE) -> frozenset[str]:
-    return parse_root_owners(path.read_text())
-
-
 def load_domain_owners(path: pathlib.Path = DOMAINS_FILE) -> dict[str, str]:
     return parse_domain_owners(path.read_text())
 
@@ -94,28 +73,27 @@ def is_retired_owner(owner: object) -> bool:
     return isinstance(owner, str) and owner.strip().lower() == RETIRED_OWNER
 
 
-def is_listed_owner(owner: object, root_owners: frozenset[str]) -> bool:
-    """True when `owner` is a login in the root OWNERS lists (case-insensitive)."""
-    return isinstance(owner, str) and owner.strip().lower() in root_owners
+def is_person_login(owner: object) -> bool:
+    """True when `owner` could name a GitHub user: a login, and not `maintainers`."""
+    return isinstance(owner, str) and bool(GITHUB_LOGIN.fullmatch(owner)) and not is_retired_owner(owner)
 
 
-def effective_owner(
-    case_owner: object,
-    domain: object,
-    *,
-    root_owners: frozenset[str],
-    domain_owners: dict[str, str],
-) -> str | None:
-    """The case's owner when it is a person in OWNERS, else its domain's owner.
+def domain_owner(domain: object, domain_owners: dict[str, str]) -> str | None:
+    """The domain's owner: the fallback when a case names no one, or GitHub refuses its owner."""
+    return domain_owners.get(domain) if isinstance(domain, str) else None
 
-    None only when neither resolves: no valid case owner and a domain that
-    domains.yaml does not define (the validator rejects such a case).
+
+def effective_owner(case_owner: object, domain: object, *, domain_owners: dict[str, str]) -> str | None:
+    """The case's owner when it names a person, else its domain's owner.
+
+    Not checked here: whether GitHub will accept the login as an assignee.
+    A filer that gets a refusal retries with `domain_owner()` (module
+    docstring). None only when neither resolves: no case owner and a domain
+    that domains.yaml does not define (the validator rejects such a case).
     """
-    if is_listed_owner(case_owner, root_owners):
-        return str(case_owner).strip()
-    if isinstance(domain, str):
-        return domain_owners.get(domain)
-    return None
+    if is_person_login(case_owner):
+        return str(case_owner)
+    return domain_owner(domain, domain_owners)
 
 
 def _task_field(text: str, key: str) -> str | None:
@@ -129,6 +107,5 @@ def effective_owner_of_case(name: str, repo_root: pathlib.Path = REPO_ROOT) -> s
     return effective_owner(
         _task_field(text, "owner"),
         _task_field(text, "domain"),
-        root_owners=load_root_owners(repo_root / OWNERS_PATH),
         domain_owners=load_domain_owners(repo_root / DOMAINS_PATH),
     )

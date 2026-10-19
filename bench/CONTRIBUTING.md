@@ -107,17 +107,17 @@ themselves:
 owner: some-login
 ```
 
-The field is optional, and when set it must be a login in the root [`OWNERS`](../OWNERS)
-file (approvers or reviewers). Without it the case belongs to its domain's `owner:` in
-[`docs/designs/domains.yaml`](../docs/designs/domains.yaml); `scripts/case_owner.py` resolves
-that effective owner, and also falls back for a login that has left `OWNERS`. A change that
-removes someone from `OWNERS` drops or updates their cases' `owner:` lines in the same diff.
+The field is optional and takes any GitHub login. Without it the case belongs to its
+domain's `owner:` in [`docs/designs/domains.yaml`](../docs/designs/domains.yaml);
+`scripts/case_owner.py` resolves that effective owner. The lint runs offline, so whether
+GitHub will assign the login an issue is checked when a bug is filed: if GitHub refuses the
+assignee (not an organisation member or collaborator), the bug goes to the domain owner.
 The login is written without the at sign, because a `task.yaml` gets quoted into issues and
 comments, where a leading at sign pages someone. devops-bench discards the key, so it is a
 repository-lint field like `domain`.
 
-**Check:** `make bench-case-check` rejects `owner: maintainers`, which named nobody, a login
-not in `OWNERS`, a value with a leading at sign, and one that is not a login.
+**Check:** `make bench-case-check` rejects `owner: maintainers`, which named nobody, a value
+with a leading at sign, and one that is not a login.
 
 What the owner is on the hook for is the demotion mechanic in
 [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md): the issue a demotion files goes

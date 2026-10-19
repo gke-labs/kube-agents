@@ -267,7 +267,7 @@ fails if it reported anything, so a case that passes locally passes there too.
 id: my-provisioned-task
 name: Human-readable name
 domain: capacity # required; a slug from docs/designs/domains.yaml
-owner: some-login # optional; a login in OWNERS, else the domain's owner -- see CONTRIBUTING.md
+owner: some-login # optional; a GitHub login, else the domain's owner -- see CONTRIBUTING.md
 fixtures: [] # required when the spec reads cluster state; seeded-fleet roles, or [] for none
 prompt: >-
   The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.

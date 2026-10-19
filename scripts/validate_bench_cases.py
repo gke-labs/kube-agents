@@ -7,7 +7,7 @@ slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
 nothing; a fixture role the seeded fleet does not define is a case addressing
 a defect that was never planted; a check with no assertion is a check that
 cannot fail; a case no roster file under `hack/eval/` names never runs; an
-`owner:` outside `OWNERS` sends a case's bugs to someone who may have left; a fixture carrying a real
+`owner: maintainers` sends a case's bugs to nobody; a fixture carrying a real
 address or a credential is a leak the moment it merges. None of those needs a
 cluster to find.
 
@@ -78,15 +78,12 @@ FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # to name a role differently, which fixture_catalog_disagreements() enforces.
 ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
-# The optional `owner:` field, from bench/CONTRIBUTING.md: a GitHub login in
-# the root OWNERS file, written bare because the field is a name to look up,
-# not a mention -- a task.yaml is quoted into issues and pull-request
-# comments, where a leading at sign pages someone. Absent, the case's bugs go
-# to its domain's owner (scripts/case_owner.py).
-# GitHub's own login rule: alphanumerics and single interior hyphens, at most
-# 39 characters, so a stray e-mail address or a display name is rejected
-# before a reviewer has to spot it.
-GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+# The optional `owner:` field, from bench/CONTRIBUTING.md: a GitHub login,
+# written bare because the field is a name to look up, not a mention -- a
+# task.yaml is quoted into issues and pull-request comments, where a leading
+# at sign pages someone. Absent, the case's bugs go to its domain's owner
+# (scripts/case_owner.py, which owns the login rule).
+GITHUB_LOGIN = case_owner.GITHUB_LOGIN
 
 # The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
 # contributed case brings with it lives in one of these two trees -- the case
@@ -559,11 +556,6 @@ def known_domains() -> set[str]:
     return {d["slug"] for d in data.get("domains") or []}
 
 
-def root_owners() -> frozenset[str]:
-    """Lower-cased logins in the root OWNERS file's approvers and reviewers."""
-    return case_owner.load_root_owners()
-
-
 # `{cluster:<slot>}` in a report_contains pattern, as bench/kube_agents_bench/
 # verifiers.py's _CLUSTER_PLACEHOLDER reads it (this script does not import
 # the bench package, so the regex is restated here; the verifier owns it).
@@ -929,9 +921,10 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         )
 
     # The owner, optional. A case's bugs go to it first, and to the domain's
-    # owner in docs/designs/domains.yaml when it is absent or names someone
-    # not in OWNERS (scripts/case_owner.py). devops-bench discards the key, so
-    # like `domain` it is enforced here or nowhere.
+    # owner in docs/designs/domains.yaml when it is absent (scripts/case_owner.py).
+    # Offline: whether GitHub accepts the login as an assignee is checked when
+    # a bug is filed, not here. devops-bench discards the key, so like `domain`
+    # it is enforced here or nowhere.
     if "owner" in spec:
         owner = spec["owner"]
         if not isinstance(owner, str) or not owner:
@@ -953,13 +946,6 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             problems.append(
                 f"owner {owner!r} is not a GitHub login (letters, digits and "
                 "single hyphens, at most 39 characters)"
-            )
-        elif not case_owner.is_listed_owner(owner, root_owners()):
-            problems.append(
-                f"owner {owner!r} is not in the root OWNERS file (approvers or "
-                "reviewers), so the case falls back to its domain's owner in "
-                "docs/designs/domains.yaml; drop the 'owner:' line or name "
-                "someone listed there"
             )
 
     # The audit streams a case drives without grading their ledger. The runner

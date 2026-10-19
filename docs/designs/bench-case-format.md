@@ -485,7 +485,7 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
-not in `OWNERS`, written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
+written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader

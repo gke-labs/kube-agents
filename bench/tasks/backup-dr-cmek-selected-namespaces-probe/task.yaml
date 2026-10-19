@@ -15,6 +15,7 @@
 id: backup-dr-cmek-selected-namespaces-probe
 name: A CMEK backup plan for two namespaces uses the real Backup for GKE flags
 
+owner: GinnyJI
 domain: reliability
 
 prompt: >-

@@ -18,6 +18,7 @@
 id: upgrades-freeze-runbook-probe
 name: Node-pool upgrade runbook uses a real command and the 92-day exclusion rule
 
+owner: GinnyJI
 domain: upgrades
 
 prompt: >-
