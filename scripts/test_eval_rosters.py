@@ -13,7 +13,8 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013; #2016's seat took its roster line 2026-10-14) -- and the nightly file holds the
+the documented exception: #2013; #2016's seat took its roster line 2026-10-14) and the
+cases demoted since (DEMOTED_AFTER_THE_SPLIT) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
 whatever landed there since (ADDED_AFTER_THE_SPLIT, ADDED_AFTER_THE_MOVED_BLOCK),
@@ -86,7 +87,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016)
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120)
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here had no
@@ -187,6 +188,14 @@ ADDED_AFTER_THE_MOVE = [
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
     "cost-chat-request-runs-collector",  # a plain cost request runs the waste collector, #2386
+    "reliability-chat-request-runs-collector",  # a plain workload-reliability request runs the obtainability collector, #2386
+    "stockout-chat-request-runs-collector",  # a plain stockout-risk request runs the stockout collector, #2386
+    "upgrade-chat-request-runs-collector",  # a plain upgrade-readiness request runs the patch collector, #2386
+    "drift-chat-request-runs-collector",  # a plain peer-consistency request runs the drift collector, #2386
+    "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
+    "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
+    "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
+    "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -250,6 +259,7 @@ HELD_OUT_IN_PRESUBMIT = [
 # follows). Restoring a case deletes its entry here.
 DEMOTED_AFTER_THE_SPLIT = [
     ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
+    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 
@@ -378,6 +388,8 @@ class SplitLostNothingTest(unittest.TestCase):
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:
+            if case in DEMOTED:
+                continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
                 self.assertIn(case, eval_rosters.presubmit_cases())
                 self.assertIn(case, eval_rosters.blocking_roster())
@@ -627,6 +639,10 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
+    # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
+    # may propose the change as a pull request; its objective's
+    # pull_request_opened leaf allows one.
+    "cluster-setting-request-proposes-pr",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the

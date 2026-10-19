@@ -65,7 +65,11 @@ Because automated release deploys must not silently drop candidate releases or r
 success on an unapplied commit, lease contention fails loudly (`lease_policy: fail`)
 rather than deferring silently.
 
-Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). Locally,
+Run one by hand with `Shared: Reconcile Environment` (`mode: apply`). An apply to an older
+`image_tag` stops when the move leaves behind a commit marked as a breaking change, and names each
+one; set `allow_breaking_downgrade` on that dispatch, or on the `image_tag` dispatch of
+`Autopush: Deploy`, `Autopush-Next: Deploy` or `Staging: Deploy`, to roll the environment back
+anyway. Locally,
 `./upgrade.sh --plan` against any install shows what a reconcile would change;
 [`terraform/examples/full-install/README.md`](../terraform/examples/full-install/README.md#asking-what-an-apply-would-change)
 documents it.

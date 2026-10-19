@@ -1,8 +1,10 @@
 # GKE MCP Server Usage
 
-The GKE MCP server provides 23 structured tools for cluster management,
-Kubernetes resource operations, and diagnostics — without requiring shell access
-or kubeconfig setup.
+The GKE MCP server provides structured read tools for clusters, node pools,
+Kubernetes resources, and diagnostics — without requiring shell access or
+kubeconfig setup.
+
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Connecting to the GKE MCP Server
 
@@ -25,32 +27,25 @@ Use `locations/-` to match all regions when listing.
 
 ### Cluster Management
 
-| Tool             | Mode        | Purpose                                                 |
-| ---------------- | ----------- | ------------------------------------------------------- |
-| `list_clusters`  | READ        | Discover clusters in a project/region                   |
-| `get_cluster`    | READ        | Inspect cluster config. Use `readMask` to select fields |
-| `create_cluster` | MUTATE      | Create a cluster from JSON config                       |
-| `update_cluster` | DESTRUCTIVE | Change Day-1 cluster settings                           |
+| Tool            | Mode | Purpose                                                 |
+| --------------- | ---- | ------------------------------------------------------- |
+| `list_clusters` | READ | Discover clusters in a project/region                   |
+| `get_cluster`   | READ | Inspect cluster config. Use `readMask` to select fields |
 
 ### Node Pool Management
 
-| Tool               | Mode        | Purpose                        |
-| ------------------ | ----------- | ------------------------------ |
-| `list_node_pools`  | READ        | List pools in a cluster        |
-| `get_node_pool`    | READ        | Get pool details               |
-| `create_node_pool` | MUTATE      | Add a pool (Standard clusters) |
-| `update_node_pool` | DESTRUCTIVE | Modify a pool                  |
+| Tool              | Mode | Purpose                 |
+| ----------------- | ---- | ----------------------- |
+| `list_node_pools` | READ | List pools in a cluster |
+| `get_node_pool`   | READ | Get pool details        |
 
 ### Kubernetes Resources
 
-| Tool                     | Mode        | Purpose                                                    |
-| ------------------------ | ----------- | ---------------------------------------------------------- |
-| `get_k8s_resource`       | READ        | List/get any K8s resource (supports label/field selectors) |
-| `describe_k8s_resource`  | READ        | Detailed info with events and conditions                   |
-| `apply_k8s_manifest`     | DESTRUCTIVE | Apply YAML manifests (supports `dryRun`)                   |
-| `patch_k8s_resource`     | DESTRUCTIVE | JSON patch resource fields                                 |
-| `delete_k8s_resource`    | DESTRUCTIVE | Remove resources (supports `cascade`, `dryRun`)            |
-| `list_k8s_api_resources` | READ        | Discover available resource types                          |
+| Tool                     | Mode | Purpose                                                    |
+| ------------------------ | ---- | ---------------------------------------------------------- |
+| `get_k8s_resource`       | READ | List/get any K8s resource (supports label/field selectors) |
+| `describe_k8s_resource`  | READ | Detailed info with events and conditions                   |
+| `list_k8s_api_resources` | READ | Discover available resource types                          |
 
 ### Diagnostics & Observability
 
@@ -65,11 +60,10 @@ Use `locations/-` to match all regions when listing.
 
 ### Operations
 
-| Tool               | Mode        | Purpose                            |
-| ------------------ | ----------- | ---------------------------------- |
-| `list_operations`  | READ        | Pending/running cluster operations |
-| `get_operation`    | READ        | Track create/upgrade progress      |
-| `cancel_operation` | DESTRUCTIVE | Abort stuck operations             |
+| Tool              | Mode | Purpose                            |
+| ----------------- | ---- | ---------------------------------- |
+| `list_operations` | READ | Pending/running cluster operations |
+| `get_operation`   | READ | Track create/upgrade progress      |
 
 ## Developer Knowledge MCP Server
 

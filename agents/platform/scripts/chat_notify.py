@@ -39,12 +39,12 @@ from contextlib import closing
 # next stack holds the chat backend (platformagent_manifests.go,
 # a2aNotifyPlatformEnvVar). Its value is a platform name as Hermes spells it.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
-#: The Slack platform name, whose threads go out channel-qualified (command).
-SLACK_PLATFORM = "slack"
 # The variable the operator renders whenever the gateway arms its chat.notify
 # route, home channel or not (platformagent_a2a_manifests.go,
 # a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+#: The Slack platform name, whose threads go out channel-qualified (command).
+SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
 # bus URL and an identity, A2A_BUS_USER or the older NATS_USER.
 BUS_URL_ENV = "NATS_URL"
@@ -105,19 +105,20 @@ def routed_platform() -> str:
     return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
 
 
-def routes(platform: str) -> bool:
-    """Whether a post to ``platform`` goes through the gateway's chat.notify route."""
-    routed = routed_platform()
-    return bool(routed) and platform == routed
-
-
 def gateway_platform() -> str:
     """The platform whose backend the gateway holds, or "" when it holds none.
 
     Unlike :func:`routed_platform` this is set with no home channel, so it names
-    the platform whose conversations :func:`conversation_command` can post into.
+    the platform an install has when nothing routes a proactive post there, and
+    whose conversations :func:`conversation_command` can post into.
     """
     return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
+
+
+def routes(platform: str) -> bool:
+    """Whether a post to ``platform`` goes through the gateway's chat.notify route."""
+    routed = routed_platform()
+    return bool(routed) and platform == routed
 
 
 def bus_unreachable_reason() -> str:

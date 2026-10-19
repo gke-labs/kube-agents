@@ -5,15 +5,13 @@ metadata:
   namespace: kubeagents-system
 spec:
   replicas: 1
+  # Recreate, not a surge: the pod takes every GPU on its node, so a second pod
+  # beside it never schedules and a surge rollout waits forever. The cost is an
+  # outage of about 8 minutes per rollout while the new pod downloads and loads
+  # the model. For a rollout without an outage, give the pool a second GPU node
+  # and use RollingUpdate with maxUnavailable: 0 and maxSurge: 1.
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      # Why maxUnavailable is 0 here: pulling and loading Gemma model weights
-      # takes minutes (with a 10-minute startupProbe budget). At replicas: 1,
-      # maxUnavailable: 1 terminates the serving Pod immediately, causing minutes
-      # of inference outage during rollouts. maxUnavailable: 0 ensures continuous serving.
-      maxUnavailable: 0
-      maxSurge: 1
+    type: Recreate
   selector:
     matchLabels:
       app: gemma-server
@@ -21,48 +19,59 @@ spec:
     metadata:
       labels:
         app: gemma-server
-        ai.gke.io/model: gemma-4-e2b-it
+        ai.gke.io/model: gemma-4-26b-a4b-it
         ai.gke.io/inference-server: vllm
         examples.ai.gke.io/source: user-guide
     spec:
       containers:
         - name: inference-server
-          image: us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4
+          # vllm/vllm-openai:v0.31.0. Its entrypoint is `vllm serve`, the
+          # OpenAI-compatible server (/v1/chat/completions). It is built on CUDA 13,
+          # so the node needs NVIDIA driver 580 or later: the nodeSelector below asks
+          # GKE for the latest driver. The -cu129 build of this release does not
+          # start: its torchcodec needs CUDA 13 libraries that the image lacks.
+          image: docker.io/vllm/vllm-openai@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3
           resources:
             requests:
-              cpu: "2"
-              memory: "10Gi"
-              ephemeral-storage: "10Gi"
-              nvidia.com/gpu: "1"
+              cpu: "16"
+              memory: "64Gi"
+              ephemeral-storage: "60Gi"
+              nvidia.com/gpu: "2"
             limits:
-              cpu: "2"
-              memory: "10Gi"
-              ephemeral-storage: "10Gi"
-              nvidia.com/gpu: "1"
-          command: ["python3", "-m", "vllm.entrypoints.api_server"]
+              cpu: "16"
+              memory: "64Gi"
+              ephemeral-storage: "60Gi"
+              nvidia.com/gpu: "2"
           args:
-            - --model=$(MODEL_ID)
+            - $(MODEL_ID)
+            - --served-model-name=gemma-4-26b-a4b-it
             - --host=0.0.0.0
             - --port=8000
-            - --tensor-parallel-size=1
-            - --enable-log-requests
+            - --tensor-parallel-size=2
+            # The agent's requests average about 26k tokens and a scheduled audit's
+            # can reach about 83k, so the window has to be well above 32k.
+            - --max-model-len=131072
+            - --gpu-memory-utilization=0.90
+            - --max-num-seqs=8
             - --enable-chunked-prefill
             - --enable-prefix-caching
             - --enable-auto-tool-choice
-            - --generation-config=auto
             - --tool-call-parser=gemma4
-            - --dtype=bfloat16
-            - --max-num-seqs=16
-            - --max-model-len=32768
-            - --gpu-memory-utilization=0.95
             - --reasoning-parser=gemma4
-            - --trust-remote-code
+            - --chat-template=/vllm-workspace/examples/tool_chat_template_gemma4.jinja
+            - '--limit-mm-per-prompt={"image":0,"audio":0}'
             - --otlp-traces-endpoint=opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           env:
-            - name: LD_LIBRARY_PATH
-              value: ${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64
             - name: MODEL_ID
-              value: google/gemma-4-E2B-it
+              value: RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic
+            - name: HF_HOME
+              value: /models
             - name: OTEL_SERVICE_NAME
               value: vllm-gemma
 
@@ -70,8 +79,10 @@ spec:
           # resident on the GPU. That is the whole point here: pulling and
           # loading Gemma takes minutes, and without a readinessProbe the
           # Service publishes this pod immediately and every request in the
-          # meantime fails. The startupProbe carries that load — 60 failures at
-          # 10s is a 10-minute budget — so readiness can stay tight afterwards.
+          # meantime fails. The startupProbe carries that load — 30s, then 90
+          # failures at 10s, a budget of about 15.5 minutes — so readiness can stay
+          # tight afterwards. Measured on 2x L4: about 8 minutes from container start
+          # to ready, of which the weight download is 2 to 2.5.
           startupProbe:
             httpGet:
               path: /health
@@ -79,7 +90,7 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 60
+            failureThreshold: 90
           readinessProbe:
             httpGet:
               path: /health
@@ -90,12 +101,17 @@ spec:
           volumeMounts:
             - mountPath: /dev/shm
               name: dshm
+            - mountPath: /models
+              name: model-cache
       volumes:
         - name: dshm
           emptyDir:
             medium: Memory
+        - name: model-cache
+          emptyDir:
+            sizeLimit: 50Gi
       nodeSelector:
-        cloud.google.com/gke-accelerator: nvidia-rtx-pro-6000
+        cloud.google.com/gke-accelerator: nvidia-l4
         cloud.google.com/gke-gpu-driver-version: latest
 ---
 apiVersion: policy/v1

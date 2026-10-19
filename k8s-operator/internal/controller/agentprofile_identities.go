@@ -135,7 +135,8 @@ func agentProfileServiceAccountName(p *agentv1alpha1.AgentProfile) string {
 func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	return map[string]string{
 		"default":                             "the namespace's default ServiceAccount, which every pod naming none runs as",
-		agentServiceAccountName(agent):        "the platform agent's own ServiceAccount",
+		agentServiceAccountName(agent):        "the credential broker's ServiceAccount, which carries the cloud binding",
+		gatewayServiceAccountName(agent):      "the platform agent gateway's own ServiceAccount",
 		a2aSessionServiceAccountName(agent):   "the gateway's session pods' ServiceAccount",
 		a2aProvisionServiceAccountName(agent): "the bus provisioner's ServiceAccount",
 		a2aGatewayName(agent):                 "the A2A gateway's ServiceAccount",
@@ -299,4 +300,47 @@ func agentProfileMapEntries(agent *agentv1alpha1.PlatformAgent, profiles []agent
 		out = append(out, entry)
 	}
 	return out
+}
+
+// ReservedServiceAccountOverride returns a refusal message when
+// spec.security.serviceAccountName names a ServiceAccount the operator creates
+// for another of this agent's workloads, or "" when it does not. The broker
+// runs as that name with its Workload Identity binding, so a collision would
+// hand the other workload (the gateway above all) the broker's cloud identity,
+// and two reconcilers would fight over one ServiceAccount. The webhook refuses
+// it at admission; the controller refuses it too, before any ServiceAccount is
+// written, because the chart ships the webhook off and it fails open.
+func ReservedServiceAccountOverride(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Security == nil || agent.Spec.Security.ServiceAccountName == "" {
+		return ""
+	}
+	sa := agent.Spec.Security.ServiceAccountName
+	for _, minted := range operatorServiceAccountNames(agent) {
+		if sa == minted {
+			return fmt.Sprintf("%q is a ServiceAccount the operator creates for another of this agent's workloads; the broker's identity needs a name of its own", sa)
+		}
+	}
+	return ""
+}
+
+// operatorServiceAccountNames are the ServiceAccounts the operator mints for its
+// own workloads, other than the credential broker's. spec.security.serviceAccountName
+// names the broker's identity, and naming one of these instead would put the
+// broker (and its cloud binding) on another workload's ServiceAccount;
+// ReservedServiceAccountOverride refuses it.
+func operatorServiceAccountNames(agent *agentv1alpha1.PlatformAgent) []string {
+	// Computed with the override cleared: the broker's own name is the one the
+	// caller is checking, and leaving it set would take it out of the list.
+	plain := agent.DeepCopy()
+	if plain.Spec.Security != nil {
+		plain.Spec.Security.ServiceAccountName = ""
+	}
+	names := []string{}
+	for name := range reservedProfileServiceAccounts(plain) {
+		if name != agentServiceAccountName(plain) && name != "default" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }

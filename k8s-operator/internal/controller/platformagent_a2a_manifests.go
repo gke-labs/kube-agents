@@ -559,7 +559,9 @@ const (
 	// onboarding's first report too (agents/chat/scripts/bootstrap_delivery.py). Its own
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
-	// and so needs one.
+	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
+	// gateway_platform) reads it too, to name the platform whose home channel
+	// is missing when it refuses a report.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"

@@ -122,15 +122,15 @@ answered with the whole report. Under a fallback headline, that reply is the onl
 way to what the report said beyond its line, such as lines above it or the link
 targets the bold line drops.
 
-A fleet-audit report that ends with no ledger link and opens a "What's wrong" section
-(the Platform Agent's three sections, as a `##` heading or a bold label) is a run that
-could not write its ledger, most often because no GitOps repository is registered. With
-the flag on, its Slack leg posts that section's first sentence alone, as the agent wrote
-it (`slack_audit_report.failed_line`), and the incident row still stores the whole report
-for a reply in the thread. Under `spec.mode: next`, where a reply does not bring the
-report back, the line goes to the gateway as a chat message with the whole report folded
-under it (`slack_audit_report.failed_chat`), and the leg posts the report whole when that
-message did not post. A truncated report, or one with no such section, posts unchanged.
+`_failed_audit_line` posts the first sentence of a report's "What's wrong" section
+(`slack_audit_report.failed_line`, or `failed_chat` under `spec.mode: next`) for a report
+that ends with no ledger link, and only for a job that runs the fleet-audit skill. The
+scheduled delivery of a job the image ships posts what its `finish` rendered or a notice
+that it did not finish
+([A fleet-audit report comes from `finish`](#a-fleet-audit-report-comes-from-finish-not-the-final-message)),
+and neither has that section, so the line is not posted for it. A fleet-audit job created
+at runtime, and a mid-run `report_to_chat`, still post the model's text, and the line
+still applies to them.
 
 Every other report (Google Chat, one that does not end with
 a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
@@ -202,6 +202,71 @@ in practice and for what it did not provide:
 
 Platform formatting was never the turn's either: the instructions told it to keep
 the report's markdown, and the adapters render it for each platform on the send.
+
+## A fleet-audit report comes from `finish`, not the final message
+
+Posting the final message as written leaves one gap the turn used to close by
+accident: the final message is the model's whole last turn. On 2026-10-15 a
+`compliance-audit` report arrived after several paragraphs of the model
+reasoning over `finish`'s line and quoting its own instructions (#3217). The turn
+had rewritten that away; posting as written does not.
+
+So for a job that runs the fleet-audit skill, the relay does not post the final
+message at all. The run keeps a record in `chat_report_<audit>.json` in its
+scratch directory, with one entry per repository it starts. `start` adds the
+repository's entry, and `audit_report.py finish` fills it with the chat report
+it renders from its own line and the findings document (`render_chat_report`;
+`summary` on a no-forge run). An SOP that walks several repositories runs
+`start` and `finish` once for each, so a record whose last step is within two
+hours (the stream lease, which covers one step) and that holds no finished
+report for this repository is the same run; any other `start` opens a new
+record, and so does a `start` that finds no finished part, which a run that
+never reached `finish` left. A `finish` applies the age and repository rule. The relay
+reads the record, over the gateway's sandbox login where the shell runs in the
+shell sandbox (`sandbox_exec.read_bytes`).
+
+The relay posts the finished repositories' reports as one message, followed by
+a line naming each repository the run started and did not finish. It posts each
+run once: the run it last posted per job is kept in `audit_report_runs`. A run
+that failed is delivered as the scheduler's failure line, which the relay
+plugin recognises by its exact opening and the job's name
+(`adapter.SCHEDULER_FAILURE_PREFIXES`, pinned against the scheduler at image
+build) and flags; the relay posts that line as written, as on main, and marks
+the record on disk posted, so a later run cannot post an earlier run's report
+as its own. The flag is read off the text, which the model can also write, so
+when the record's last step is at or after the delivering run's start (its
+`running` row in the profile's `cron/executions.db`, read-only) and it holds a
+finished part, the run reached `finish` and its report is posted instead. Otherwise a record with no finished repository, one already posted,
+or one whose last step is older than two hours means the run did not reach
+`finish`, and the relay posts a one-line notice that the job did not finish in
+place of the final message. A read of the file
+that fails, rather than finding none, posts a second notice naming the failure,
+and leaves the run unposted. `[SILENT]` is unchanged: the scheduler drops a
+silent run before delivery. Only the scheduler's delivery leg is replaced: the relay plugin sends
+`also_delivered_to` on every delivery and `report_to_chat` never does, so a
+mid-run `report_to_chat` is posted as written.
+
+Each report ends with a `Ledger: <url>` line, which the Slack headline reads,
+so a run over one repository gets its card. A message that carries the line
+naming unfinished repositories, or several reports followed by a closing line
+that counts them, does not end with a ledger link, and Slack posts it whole with
+no card, because a card shows one repository's ledger and drops the rest.
+
+The substitution applies only to a job the image's Platform Agent roster ships
+with the fleet-audit skill (`/opt/platform-template/cron/jobs.json`), because
+only such a job runs under the stream id that names the record; a job created at
+runtime keeps posting its final message. A record over 1 MiB posts the
+unreadable notice.
+
+The match is by job id, because Hermes hands the relay no run id, and three
+cases fall outside it. A repository whose `start` was refused, or never run,
+has no entry, so nothing names it. A run that neither fails nor calls `start`
+(the model skips the SOP, or an on-demand run holds the stream) within two hours
+of the last step of a run whose report was never posted, an on-demand run or a
+silent one the scheduler dropped, posts that run's report. And an on-demand run
+of one later repository, followed within two hours by a scheduled run, leaves
+its part in the record the scheduled run joins; the scheduled report then leaves
+out its own first repository, whose ledger issue is still published.
 
 ## Which key the loopback call presents
 
@@ -465,8 +530,9 @@ finding then existed only in the job's saved output with a line in
 [Detecting a broken leg](#detecting-a-broken-leg)); #1094 records three runs lost that way
 over 30 and 31 August 2026, across `stockout-prevention` and `compliance-audit`,
 whose fleet-wide output runs to several times this cap. The head survives, and
-the message opens with a `[truncated]` line naming `cron/output/<job_id>/`,
-where the whole report is.
+the message opens with a `[truncated]` line naming where the whole report is:
+`cron/output/<job_id>/`, or for a fleet-audit job's record its
+`chat_report_<audit>.json` and the ledger issue.
 
 That line leads the posted message rather than ending it: a reader has to know
 the report is incomplete before reading it, and the Slack audit headline reads
@@ -483,6 +549,15 @@ booleans and therefore settles it outright on a deployed pod), then `CONFIG_PATH
 — `/opt/data/config.yaml`, the front door's own writable file rather than a named
 profile's — then per-platform environment signals for an install neither file
 describes.
+
+An install with no chat route gets no send at all: when the managed scope turns
+every platform off and nothing routes one through the gateway — a `next` install
+whose only chat platform is held by the gateway with no home channel, or an
+install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
+platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
+channel (`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
+exists when no platform can be named.
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the
@@ -567,13 +642,14 @@ time delivery is reached. `run_one_job` applies the `[SILENT]` check and, on a
 failed run, substitutes `_summarize_cron_failure_for_delivery(job, error)` —
 both _before_ calling `_deliver_result`. So a `deliver: "chat"` job inherits
 silence-on-nothing-to-report and audible failures without asking the model for
-either. One case the scheduler's check misses: it matches the bare marker only,
+either. For a fleet-audit job the relay posts that failure summary as written
+too, and in place of any other final message it posts the rendered report. One case the scheduler's check misses: it matches the bare marker only,
 and a run that emphasised it (`**[SILENT]**`, where the SOP asked for the bare
 marker as the whole response) reached both senders. The adapter therefore
 carries its own `is_silent_report`, which undresses the marker before testing,
 and the Slack sender imports the same predicate so the two ends agree. The
-scheduler's direct Google Chat leg, which the two roster jobs on `"all"` still
-use, is upstream's sender and carries no such guard.
+scheduler's direct Google Chat leg, which a job on `"all"` uses, is upstream's
+sender and carries no such guard; no roster job uses `"all"`.
 
 ## How the switch is wired: `chat` is a platform
 
@@ -640,7 +716,7 @@ every one of them is visible to a job author:
   on an install where the child can address every enabled platform, a job on
   `all` still posts twice; the subtraction bites only where the child could
   address a strict subset. That is why every report-producing job on the
-  Platform Agent roster names `"chat"` except the two the roster README names:
+  Platform Agent roster names `"chat"`:
   the `deliver` token itself remains additive, and `"chat"` is the only way to
   ask for one relayed copy without depending on a subtraction that is designed
   to give up rather than risk silence.

@@ -566,7 +566,7 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
         """Every clustered shorthand in executable product code, verbatim.
 
         Enumerated across `agents/`, `agentplugins/` and `scripts/` rather than
-        guessed at: these two are the whole set, and both put a letter a rule
+        guessed at: `-fdq` and `-it` are the whole set, and both put a letter a rule
         keys on inside a cluster -- `-fdq` carries `-f`, `-it` carries `-t`.
         A re-dashing walk that did not stop where the value starts would refuse
         the agent's own workspace reset.
@@ -576,7 +576,7 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
              "gitops_workspace.py:548"),
             (["kubectl", "exec", "-it", "gateway", "-n", "kubeagents-system",
               "--", "/bin/sh"],
-             "gke-basics/references/cli-reference.md:258"),
+             "the -it cluster as scripts/installer/print_instructions_slack.sh:39 prints it"),
             (["gh", "issue", "comment", "7", "-R", "o/r", "-F", "/tmp/report.md"],
              "audit_report.py:4403"),
             (["gh", "pr", "comment", "7", "-R", "o/r", "-F", "/tmp/report.md"],
