@@ -905,8 +905,8 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     if domain is None:
         problems.append(
             "declares no 'domain:'. Claim a slug from docs/designs/domains.yaml; "
-            "if no row there describes this case, add one (with its owner and "
-            "meaning) in the same change"
+            "if no row there describes this case, add one (with its owner, "
+            "backup and meaning) in the same change"
         )
     elif not isinstance(domain, str):
         problems.append(f"claims domain {domain!r}, which is not a slug string")

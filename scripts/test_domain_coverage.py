@@ -10,8 +10,8 @@ This test is what makes the rule a build failure:
   list stops being the progress metric it exists to be;
 * a task claiming an unknown domain is a typo that would otherwise count as
   coverage of nothing;
-* a domain with no ``owner:`` or ``meaning:`` has nobody answering for it and
-  no sentence saying what it checks.
+* a domain with no ``owner:``, ``backup:`` (a second login) or ``meaning:``
+  has nobody answering for it or no sentence saying what it checks.
 
 Delete allowlist entries as Phase 2 ACTIVATES scenarios. The shrinking
 allowlist is the tier-2 progress metric of the testing implementation plan.
@@ -32,7 +32,7 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import eval_rosters
+import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
@@ -126,24 +126,26 @@ class TestDomainCoverage(unittest.TestCase):
             "define:\n  " + "\n  ".join(unknown),
         )
 
-    def test_every_domain_has_an_owner_and_a_meaning(self):
+    def test_every_domain_has_an_owner_a_backup_and_a_meaning(self):
         domains, _ = load_domains()
         missing = sorted(
             f"{d.get('slug')}: {key}"
             for d in domains
-            for key in ("owner", "meaning")
+            for key in ("owner", "backup", "meaning")
             if not isinstance(d.get(key), str) or not d[key].strip()
         ) + sorted(
-            f"{d.get('slug')}: backup"
+            f"{d.get('slug')}: backup is the owner"
             for d in domains
-            if "backup" in d and (not isinstance(d["backup"], str) or not d["backup"].strip())
+            if isinstance(d.get("owner"), str)
+            and isinstance(d.get("backup"), str)
+            and d["owner"].strip().lower() == d["backup"].strip().lower()
         )
         self.assertEqual(
             missing,
             [],
             "\n\nEvery domain in docs/designs/domains.yaml needs a non-empty "
-            "`owner:` (a GitHub login) and `meaning:` (one plain sentence); a "
-            "`backup:`, when present, must name a login too:\n  " + "\n  ".join(missing),
+            "`owner:` and `backup:` (two different GitHub logins) and a "
+            "`meaning:` (one plain sentence):\n  " + "\n  ".join(missing),
         )
 
     def test_every_allowlist_entry_names_a_real_domain(self):

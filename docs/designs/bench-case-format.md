@@ -401,9 +401,9 @@ finds out until someone writes a second case for a domain that already had one. 
 declares a domain.
 
 There is no exemption. A case no row describes gets a new row in `domains.yaml`, with
-the `owner:` who answers for the domain's cases as a set and a one-sentence `meaning:` a
-reader outside the code understands; `scripts/test_domain_coverage.py` fails a row missing
-either. A new row with no blocking-roster case starts on that file's allowlist.
+the `owner:` who answers for the domain's cases as a set, a different `backup:`, and a
+one-sentence `meaning:` a reader outside the code understands; `scripts/test_domain_coverage.py`
+fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist.
 
 ## Every case declares a verification spec
 
