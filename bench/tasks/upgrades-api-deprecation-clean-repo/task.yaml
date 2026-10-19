@@ -62,8 +62,8 @@ owner: maintainers
 
 # report_contains: a chat prompt, so the sections are the reply. Three
 # objectives, one for each thing the report must do: name its source, give a
-# verdict, invent nothing; and one, worker_commands, for the route it must
-# take: run the scan. Split rather than one check so a red says which.
+# verdict, invent nothing; and two for the route it must take: delegate, and
+# run the scan. Split rather than one check so a red says which.
 verification_spec:
   - name: the-section-names-its-source
     role: objective
@@ -78,12 +78,22 @@ verification_spec:
       # so that phrase cannot fail. A report that read the repository another
       # way still has to say which commit its manifests were read at.
       required_phrases: ["manifests as of"]
+  # The request reached a specialist: without a card the worker check below
+  # would error, not fail.
+  - name: the-request-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
   # The routing check. required_runs reads each shell segment of a worker
   # command as an argv: a run counts when api_deprecation_scan.py is the
   # command word or follows python3, and not when the segment has -h or
   # --help, follows python3 -c, or only mentions the script (echo, grep, cat).
-  # The word pattern asks for the floor flag the scan exits 2 without, so a
-  # run that can only print a usage error does not count.
+  # It reads words, not the exit status: the word pattern refuses only a run
+  # with no floor flag, so a run that names one and still exits 2 (a missing
+  # file, a target the parser refuses) counts (#3404).
   - name: the-deprecation-scan-ran
     role: objective
     mode: assert
