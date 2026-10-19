@@ -521,17 +521,17 @@ class CacheTest(unittest.TestCase):
     def test_the_answer_is_re_read_once_it_expires(self):
         """The remedy this repository documents has to be able to take effect.
 
-        The `gke-networking` footer tells the agent to run `clusters update
-        --enable-dns-access` when a cluster's endpoint refuses external traffic,
-        and the MCP server and the credential proxy both outlive any number of
-        such changes. An answer kept for the life of the process would make the
-        remedy look like it did nothing.
+        The `gke-networking` footer tells the agent to propose turning on
+        `dnsEndpointConfig.allowExternalTraffic` when a cluster's endpoint
+        refuses external traffic, and the MCP server and the credential proxy
+        both outlive any number of such changes landing. An answer kept for
+        the life of the process would make the remedy look like it did nothing.
         """
         runner = FakeRunner(DNS_INTERNAL_ONLY)
         gke_endpoint.reset_cache()
         with expired_cache(), redirect_stderr(io.StringIO()):
             self.assertEqual(gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner), [])
-            runner.describe = DNS_EXTERNAL  # the operator ran --enable-dns-access
+            runner.describe = DNS_EXTERNAL  # the pull request landed
             self.assertEqual(
                 gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
                 ["--dns-endpoint"],
@@ -539,7 +539,7 @@ class CacheTest(unittest.TestCase):
         self.assertEqual(len(runner.describe_calls), 2)
 
     def test_the_reverse_change_is_picked_up_too(self):
-        # --no-enable-dns-access, the reversal. Keeping the flag past it means a
+        # allowExternalTraffic turned back off. Keeping the flag past it means a
         # kubeconfig whose every request comes back 403.
         runner = FakeRunner(DNS_EXTERNAL)
         gke_endpoint.reset_cache()

@@ -249,9 +249,9 @@ prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
-the delegated workers ran, read from each card's worker log before the harness
-purges it; each of its `exempt_patterns` removes the text it matches from a
-command before the forbidden list reads it, and nothing else, and takes a
+the delegated workers ran, read from the worker log of each card the front agent filed before the harness
+purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory; each of its `exempt_patterns` removes the text it matches from a
+command, a log line or a tagged call alike, before the forbidden list reads it, and nothing else, and takes a
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
 `grep` exempted through its pattern argument so that whatever else shares the
@@ -332,15 +332,17 @@ And `report_contains` defaults to `scope: final`, the answer the user receives. 
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears
 in quoted material. `worker_commands` reads the route a worker took through its terminal
-commands, not its MCP tool calls, and only for cards the run delegated — a router that
+commands, not its MCP tool calls, and only for cards the run delegated (a card a worker
+filed is read from the trajectory, as far as the capture reached it) — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. What it reads is the one-line rendering hermes writes to the card log, not the command
-as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
-command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
-chained behind another, and the quotes stay, so a listed word the command splits with an empty
-quote inside it is one word to the shell and none to the pattern; the command as typed is on the
-trajectory, tagged with the worker's profile, and reading it from there, split into words, is the
-verifier change that closes both gaps. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
+log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a pattern
+never sees a command chained behind another, and the quotes stay, so a listed word the command
+splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
+worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
+written against the rendering can miss that card's command behind a `cd … &&` or on a second
+line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,
