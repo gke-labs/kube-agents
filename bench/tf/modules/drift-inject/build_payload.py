@@ -90,28 +90,40 @@ def build(argv):
     # the shape that does not occur.
     owners = []
     for spec in values[2:]:
-        # Split from the RIGHT, and refuse an empty part. Splitting from the
-        # left absorbs a `|` in the manager into the operation: the field
-        # managers are unvalidated `var` strings, so `argo|cd` would parse as
-        # three parts and go out as manager `argo`, operation `cd`, and the
-        # real operation glued to the front of the first path -- a record
-        # naming an owner the agent cannot find on the live object, which is
-        # the fiction every stack's assertion exists to prevent. Paths may not
-        # contain `|`; managers may, and now say so rather than being absorbed.
+        # Split from the RIGHT. Splitting from the left absorbs a `|` in the
+        # manager into the operation: the field managers are unvalidated `var`
+        # strings, so `argo|cd` would parse as three parts and go out as
+        # manager `argo`, operation `cd`, and the real operation glued to the
+        # front of the first path. Paths may not contain `|`; managers may.
         parts = spec.rsplit("|", OWNER_PARTS - 1)
-        if len(parts) != OWNER_PARTS or not all(p.strip() for p in parts):
+        if len(parts) != OWNER_PARTS:
             raise SystemExit(
                 f"build_payload: owner spec {spec!r} is not "
-                f"'<manager>|<operation>|<path,path>' with all three present."
+                f"'<manager>|<operation>|<path,path>'."
             )
-        manager, operation, paths = parts
-        owners.append(
-            {
-                "manager": manager,
-                "operation": operation,
-                "paths": [p for p in paths.split(",") if p],
-            }
-        )
+
+        # Build the owner FIRST and validate that, rather than validating the
+        # raw parts and emitting something derived from them afterwards. The
+        # two are not the same object: a paths part of "," is a non-empty
+        # string that yields no paths, and " Apply " is a non-empty string
+        # that is not the operation anyone meant. Both used to pass a check on
+        # the parts and ship from a different value -- a record asserting that
+        # a manager the plant named owns no recorded paths, which
+        # `_drift_ownership_block` renders verbatim and which reaches a judge
+        # rather than an apply error.
+        owner = {
+            "manager": parts[0].strip(),
+            "operation": parts[1].strip(),
+            "paths": [path.strip() for path in parts[2].split(",") if path.strip()],
+        }
+        missing = [key for key, value in owner.items() if not value]
+        if missing:
+            raise SystemExit(
+                f"build_payload: owner spec {spec!r} yields no "
+                f"{', '.join(missing)}; every owner needs a manager, an "
+                f"operation and at least one path."
+            )
+        owners.append(owner)
     if owners:
         doc["owners"] = owners
     return doc

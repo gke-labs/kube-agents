@@ -169,12 +169,43 @@ class BuildPayload(unittest.TestCase):
         self.assertEqual(owner["operation"], "Apply")
         self.assertEqual(owner["paths"], [".spec.replicas"])
 
-    def test_an_empty_part_in_an_owner_spec_is_refused(self):
-        for spec in ("|Apply|.spec.replicas", "argocd-controller||.spec.replicas",
-                     "argocd-controller|Apply|"):
+    def test_an_owner_spec_that_yields_an_empty_field_is_refused(self):
+        """Judged on what ships, not on the raw parts.
+
+        A paths part of `","` is a non-empty string that yields no paths, and
+        a part of `" "` is non-empty too. Validating the parts and emitting a
+        value derived from them afterwards let both through: the record then
+        asserts that a manager the plant named owns no recorded paths, which
+        `_drift_ownership_block` renders as written and a judge reads as the
+        agent being wrong.
+        """
+        for spec in (
+            "|Apply|.spec.replicas",
+            "argocd-controller||.spec.replicas",
+            "argocd-controller|Apply|",
+            "argocd-controller|Apply|,",
+            "argocd-controller|Apply|, ,",
+            "argocd-controller| |.spec.replicas",
+        ):
             with self.subTest(spec=spec):
                 with self.assertRaises(SystemExit):
                     self.build("enriched", "false", spec)
+
+    def test_an_owner_spec_is_emitted_stripped(self):
+        """` Apply ` is not the operation anyone meant, and used to ship."""
+        doc = self.build(
+            "enriched", "false", " argocd-controller | Apply | .spec.replicas , .spec.replicas "
+        )
+        self.assertEqual(
+            doc["owners"],
+            [
+                {
+                    "manager": "argocd-controller",
+                    "operation": "Apply",
+                    "paths": [".spec.replicas", ".spec.replicas"],
+                }
+            ],
+        )
 
     def test_every_scalar_lands_under_its_own_key(self):
         """Placement, so a reordering of SCALARS cannot pass unnoticed."""
