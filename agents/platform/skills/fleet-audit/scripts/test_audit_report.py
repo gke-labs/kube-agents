@@ -10006,16 +10006,34 @@ class TestPromotion(BaseTestCase):
             manifest_finding("crit", "a.yaml", severity="critical"),
             manifest_finding("maj", "b.yaml", severity="major"),
         ]
-        plan = audit_report.promotion_candidates(findings, {}, auto_promote=False, vouched={"crit", "maj"})
+        findings.append(manifest_finding("min", "c.yaml", severity="minor"))
+        findings.append(manifest_finding("unb", "d.yaml", severity="critical"))
+        plan = audit_report.promotion_candidates(
+            findings, {}, sweep_off=True, vouched={"crit", "maj", "min"}, uncorroborated={"unb"}
+        )
         self.assertEqual(plan.promote, [])
-        self.assertEqual((plan.withheld, plan.below_floor), ([], []))
-        asked = audit_report.promotion_candidates(findings, {}, ["maj"], auto_promote=False, vouched={"crit", "maj"})
-        self.assertEqual(asked.promote, ["maj"])
-        body = render_body(make_doc(findings=findings), generated_at=NOW, sweep_off=True)
+        self.assertEqual(plan.switched_off, ["crit", "maj"], "what the sweep would have opened, still classified")
+        self.assertEqual(plan.withheld, [], "the cap never applied, so nothing is over it")
+        self.assertEqual((plan.below_floor, plan.uncorroborated), (["min"], ["unb"]), "the other blocks read as on any install")
+        asked = audit_report.promotion_candidates(
+            findings, {}, ["maj"], sweep_off=True, vouched={"crit", "maj", "min"}, uncorroborated={"unb"}
+        )
+        self.assertEqual(asked.promote, ["maj"], "a request still opens what it names")
+        self.assertEqual(asked.switched_off, ["crit"])
+        body = render_body(make_doc(findings=findings), generated_at=NOW, switched_off=plan.switched_off, below_floor=plan.below_floor)
         self.assertIn("## Awaiting `/remediate`", body)
         self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
         self.assertIn("/remediate <finding-id>", body)
+        section = body[body.index("## Awaiting `/remediate`"):]
+        self.assertLess(section.index("the automatic sweep is off"), section.index("`min`"), "the switch block comes first, the floor block still reads")
         self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+        on = render_body(make_doc(findings=findings), generated_at=NOW, below_floor=plan.below_floor)
+        self.assertNotIn(audit_report.AUTO_PROMOTE_ENV, on, "an install with the switch on never mentions it")
+        closing = audit_report.render_stale_close_comment("fleet-audit", findings[:1], NOW, pr_number=8, sweep_off=True)
+        self.assertNotIn("re-proposed automatically", closing, "a close on this install promises no automatic re-proposal")
+        self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", closing)
+        self.assertIn("/remediate <finding-id>", closing)
+        self.assertIn("re-proposed automatically", audit_report.render_stale_close_comment("fleet-audit", findings[:1], NOW, pr_number=8))
 
     def test_the_switch_reads_the_root_owned_file_before_the_variable(self):
         """A session can export the variable in one word; the sandbox entrypoint's

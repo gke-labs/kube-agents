@@ -4765,13 +4765,6 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"FEEDBACK_PROMPT_DELAY":       {},
 		"FEEDBACK_PROMPT_ENABLED":     {},
 		"KAGE_SLACK_UX":               {},
-
-		// The fleet audits' automatic remediation sweep, off when "false"; the
-		// shell sandbox pod, where finish runs, gets it too (envAuditAutoPromote
-		// in shell_sandbox_manifests.go). Kept apart from the block above so
-		// gofmt does not realign it.
-		envAuditAutoPromote: {},
-
 		envHermesOtelEnabled:          {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},

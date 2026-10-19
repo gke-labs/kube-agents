@@ -711,6 +711,15 @@ func TestShellSandboxAuditAutoPromoteEnv(t *testing.T) {
 	if !ok || got != "false" {
 		t.Errorf("%s = %q, %v with spec.deployment.env setting it to false; want false, true", envAuditAutoPromote, got, ok)
 	}
+	// The pod carries the operator's two words, never the CR's bytes: a quoted
+	// or backslashed literal would stop the sandbox entrypoint before sshd.
+	for value, want := range map[string]string{" FALSE ": "false", "true": "true", "\"false\"": "true", "off": "true"} {
+		odd := shellSandboxTestAgent()
+		odd.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envAuditAutoPromote, Value: value}}}
+		if got, ok := read(odd); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", envAuditAutoPromote, got, ok, value, want)
+		}
+	}
 	fromSecret := shellSandboxTestAgent()
 	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
 		Name:      envAuditAutoPromote,

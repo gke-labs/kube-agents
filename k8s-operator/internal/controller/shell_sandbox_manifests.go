@@ -540,13 +540,15 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	}
 
 	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
-	// As a literal value only, the rule every spec.deployment.env entry meets
-	// before it reaches a sandbox: a valueFrom could name a credential this
-	// pod must never hold.
+	// Normalised to the two words the script reads, so the bytes on the pod
+	// are the operator's, as every other forwarded variable's are: a valueFrom
+	// could name a credential this pod must never hold, and a literal with a
+	// quote or a backslash would stop the entrypoint before sshd starts.
 	if agent.Spec.Deployment != nil {
 		for _, v := range agent.Spec.Deployment.Env {
 			if v.Name == envAuditAutoPromote && v.ValueFrom == nil {
-				env = append(env, corev1.EnvVar{Name: v.Name, Value: v.Value})
+				off := strings.EqualFold(strings.TrimSpace(v.Value), "false")
+				env = append(env, corev1.EnvVar{Name: envAuditAutoPromote, Value: strconv.FormatBool(!off)})
 				break
 			}
 		}
