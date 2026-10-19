@@ -2,7 +2,7 @@
 # presubmit seat is a later pull request that cites this case's nightly record.
 #
 # Domain: chat and routing. What it grades is the agent's reading of an ask
-# made with Slack's "Ask ... about this" message shortcut, which the A2A
+# made with Slack's "Ask about this" message shortcut, which the A2A
 # gateway sends as a quote of someone else's message with no question of the
 # clicker's own (a2a/gateway/slack_shortcut.go, slackShortcutAsk). The prompt
 # below is that text, byte for byte, for an alert integration's post: the
