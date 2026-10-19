@@ -229,7 +229,7 @@
 # case's finding; the sibling stack already treats the first that way,
 # exiting 1 on
 # an inject_status of `suppressed` and saying why in the message
-# (bench/tf/prebuilt/gitops-drift/main.tf).
+# (bench/tf/modules/drift-inject/drift_inject.sh).
 #
 # The cut is not between the churn check and everything about the card. Two
 # observations are this case's finding, and they are the same regression in
@@ -324,9 +324,10 @@
 #   argocd-controller and kubectl-edit from, the third thing expected_output
 #   requires. The detector's own testdata captures all say
 #   example-project/us-central1/prod-1, so they cannot be copied as they
-#   stand. And every insertId is minted per apply, in the
-#   sibling's eval-drift-$(date -u +%s)-$RANDOM form
-#   (bench/tf/prebuilt/gitops-drift/main.tf). Distinct within the run is not
+#   stand. And every insertId is minted per apply, in the sibling stacks'
+#   <prefix>-$(date -u +%s)-$RANDOM form — the prefix is the stack's own
+#   argument, the tail is drift_mint_insert_id's
+#   (bench/tf/modules/drift-inject/drift_inject.sh). Distinct within the run is not
 #   enough, and fixed-but-distinct churn ids — the shape of the
 #   detector's own testdata — is the reading to rule out. driftInjectHandler
 #   .Handle calls seen.Add(record.InsertID) before the send (inject.go), on a
@@ -367,7 +368,7 @@
 #   (`insertId=<id>`, session_kv_server.py), so a bounded poll for that
 #   literal is run-scoped without needing a per-run object name — which is how
 #   the sibling stack scopes its own poll
-#   (bench/tf/prebuilt/gitops-drift/main.tf).
+#   (bench/tf/modules/drift-inject/drift_inject.sh).
 # - When that poll times out the stack says which failure it was, and the
 #   ledger is where it looks. Publishing to Pub/Sub gets no reply, so unlike
 #   the sibling's direct inject there is no `suppressed` status to read — but
