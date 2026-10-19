@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -206,6 +207,30 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: plain JSON. ``test_scoring.py`` asserts the two strings agree, so the
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
+_RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
+_FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
+
+
+def _extract_infra_failure_reason(text: str | None) -> str | None:
+    """Extract an infrastructure failure reason (rate_limit, billing) if present in text."""
+    if not text:
+        return None
+    match = _FAILURE_REASON_PATTERN.search(text)
+    if match and match.group(1) in _INFRA_FAILURE_REASONS:
+        return match.group(1)
+    if _RATE_LIMIT_REASON_PREFIX in text:
+        return "rate_limit"
+    lower_text = text.lower()
+    if "http 429" in lower_text and (
+        "quota exhausted" in lower_text
+        or "rate limit" in lower_text
+        or "retries exhausted" in lower_text
+    ):
+        return "rate_limit"
+    if "tpm quota exhausted" in lower_text:
+        return "rate_limit"
+    return None
 
 #: The trajectory entry name the harness's inject transport gives a task's
 #: lifecycle events (``inject_transport.EVENT_ENTRY_STATUS``; a transport
@@ -1158,6 +1183,25 @@ def classify_rep(
             "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent "
             f"({INFRA_FAILURE_MARKER}): the record is scored, but there is no "
             "answer in it to grade",
+        )
+
+    infra_reason = _extract_infra_failure_reason(record.output)
+    if not infra_reason and record.error:
+        infra_reason = _extract_infra_failure_reason(str(record.error))
+    if not infra_reason:
+        for entry in record.trajectory:
+            if isinstance(entry, dict):
+                for val in (entry.get("result"), entry.get("content"), entry.get("output")):
+                    if isinstance(val, str):
+                        infra_reason = _extract_infra_failure_reason(val)
+                        if infra_reason:
+                            break
+            if infra_reason:
+                break
+    if infra_reason:
+        return rep(
+            "infra",
+            f"the run hit infrastructure failure ({infra_reason}): model quota or rate limit exhausted during execution",
         )
 
     # The provisioning-death shape: ``deployer.up()`` raised before any agent

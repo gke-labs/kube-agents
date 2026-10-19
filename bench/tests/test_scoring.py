@@ -1132,6 +1132,14 @@ def test_the_marker_literal_matches_the_harness():
     assert INFRA_FAILURE_MARKER == harness_marker
 
 
+def test_the_infra_failure_reasons_literal_matches_the_harness():
+    """_INFRA_FAILURE_REASONS must not drift between harness and scoring."""
+    from kube_agents_bench.harness import _INFRA_FAILURE_REASONS as harness_reasons
+    from kube_agents_bench.scoring import _INFRA_FAILURE_REASONS as scoring_reasons
+
+    assert scoring_reasons == harness_reasons
+
+
 def test_the_ceiling_marker_literal_matches_the_harness():
     """Same contract as the transport marker: two files, one string."""
     from kube_agents_bench.harness import DELEGATION_CEILING_MARKER as harness_marker
@@ -1670,6 +1678,38 @@ def test_the_default_margin_absorbs_the_measured_judge_spread(noop_spec, make_ru
         baseline_judged={"OutcomeValidity": max(scores)},
     )
     assert verdict.rung is Rung.GREEN
+
+
+def test_reps_hitting_429_quota_are_infra_and_do_not_trigger_judged_regression(
+    noop_spec, make_run
+):
+    """#3399's case: 429 quota exhaustion in 2 of 3 reps is marked infra, not judged regression.
+
+    Repetitions 1 and 2 hit 429 quota exhaustion and score 0.0 with the judge.
+    Repetition 3 passes with 0.8 against main's 0.96.
+    If reps 1 and 2 are scored, mean drops to (0.0 + 0.0 + 0.8) / 3 = 0.27,
+    firing Rung 6 (JUDGED_REGRESSION).
+    Classified as infra, only rep 3 is graded (mean 0.80), which stays within
+    the margin of main's 0.96, so verdict is GREEN.
+    """
+    def worker_hit_429(rec):
+        rec["output"] = "The platform agent failed: HTTP 429: TPM quota exhausted"
+        rec["scores"]["OutcomeValidity"]["score"] = 0.0
+
+    run_throttled_1 = make_run(mutate=worker_hit_429)
+    run_throttled_2 = make_run(mutate=worker_hit_429)
+    run_healthy = make_run(mutate=depress_the_judge(0.8))
+
+    verdict = grade_case(
+        noop_spec,
+        [run_throttled_1, run_throttled_2, run_healthy],
+        admitted=True,
+        baseline_judged={"OutcomeValidity": 0.96},
+    )
+    assert verdict.rung is Rung.GREEN
+    assert verdict.reps[0].outcome == "infra"
+    assert verdict.reps[1].outcome == "infra"
+    assert verdict.reps[2].outcome == "pass"
 
 
 def test_rung_6_is_silent_with_no_baseline_at_all(noop_spec, make_run):
