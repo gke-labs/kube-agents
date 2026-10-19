@@ -823,6 +823,13 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # edit_message; the steer and auth failure replies are replaced where they
 # are built, so no exception text reaches Slack). See
 # deploy/docker/patches/slack_boilerplate.py.
+# Slack, flag or not: a message_changed with no `edited` object is dropped
+# instead of being read as a new message. Slack sends one for a thread's parent
+# whenever a reply in the thread changes, and after a restart empties the
+# adapter's processed-ts map that change re-ran the thread's opening @mention.
+# A real edit carries `edited`, so an @mention edited in still gets its turn.
+# Applied first, against upstream's text. See the module docstring in
+# deploy/docker/patches/apply_slack_unedited_change.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
@@ -860,8 +867,12 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/patchlib.py \
      deploy/docker/patches/apply_slack_agent_view.py \
      deploy/docker/patches/verify_slack_agent_view.py \
+     deploy/docker/patches/apply_slack_unedited_change.py \
+     deploy/docker/patches/verify_slack_unedited_change.py \
      /tmp/message-surface/
-RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
+RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_change.py /opt/hermes && \
+    grep -qF "kube-agents patch: slack_unedited_change" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
     ! grep -q "inline code is opaque" /opt/hermes/plugins/platforms/slack/block_kit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_google_chat_attachment_notice.py /opt/hermes && \
@@ -911,6 +922,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_failure.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_unedited_change.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
