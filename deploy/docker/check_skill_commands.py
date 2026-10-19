@@ -23,8 +23,8 @@ refused form therefore fails every time an agent copies it, and nothing short
 of a live run would say so.
 
 This reads every ``bash``, ``sh``, ``shell`` and ``zsh`` fenced block in each
-``SKILL.md`` under the skill trees named on the command line, and in that
-skill's ``references/*.md``, replaces each
+document of each skill under the skill trees named on the command line, as
+``skill_documents.py`` defines both, replaces each
 ``<placeholder>`` with its bare name, and passes the block whole to Hermes' own
 ``tools.tirith_security.check_command_security``, the call the approval gate
 makes on a terminal command of any length. The block is not split into
@@ -38,7 +38,8 @@ program output as often as commands. ``tests/test_skill_inline_commands.py``
 checks inline code for the forms the skills used to teach: a variable as the
 program, a script path starting with a variable, and a program's path put in
 a variable. The Dockerfile names the agent image's three trees; a plugin's
-skills ship in its own image and are not read.
+skills ship in its own image and this scan does not read them, though the
+inline-code test does.
 A tree with no shell block fails the check, and so do two trees where one path
 is, or holds, the other: an empty copy, or a path repeated from another tree in
 the Dockerfile, would otherwise pass a tree with nothing read.
@@ -89,10 +90,8 @@ from pathlib import Path
 
 from markdown_it import MarkdownIt
 
-SKILL_FILE_NAME = "SKILL.md"
-# A skill's reference pages hold commands the agent runs once SKILL.md sends it
-# there, so they are scanned with it.
-REFERENCES_GLOB = "references/*.md"
+from skill_documents import skill_documents
+
 SHELL_LANGUAGES = frozenset({"bash", "sh", "shell", "zsh"})
 REFUSED_ACTIONS = frozenset({"block", "warn"})
 
@@ -364,17 +363,13 @@ def substitute_placeholders(command: str) -> str:
 
 
 def skill_blocks(repo_dir: str, skills_dir: Path) -> list[Block]:
-    """Every shell block in the ``SKILL.md`` files under ``skills_dir`` and their reference pages.
+    """Every shell block in the documents of the skills under ``skills_dir``.
 
     ``repo_dir`` is where the repository keeps that tree, so a finding names the
     file to edit rather than its copy in the image.
     """
     shell_blocks = []
-    documents = []
-    for skill_md in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
-        documents += [skill_md, *sorted(skill_md.parent.glob(REFERENCES_GLOB))]
-    # A references/SKILL.md matches both globs.
-    for skill_file in dict.fromkeys(documents):
+    for skill_file in skill_documents(skills_dir):
         path = f"{repo_dir}/{skill_file.relative_to(skills_dir).as_posix()}"
         try:
             blocks = list(code_blocks(skill_file.read_text(encoding="utf-8")))
@@ -541,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
     empty = [(repo_dir, skills_dir) for repo_dir, skills_dir, found in trees if not found]
     for repo_dir, skills_dir in empty:
         print(
-            f"{skills_dir} holds no shell block in any {SKILL_FILE_NAME} or reference page, so {repo_dir} "
+            f"{skills_dir} holds no shell block in any skill document, so {repo_dir} "
             "would pass unread. Check the Dockerfile copies that tree to this path, or, if "
             "its skills no longer teach shell commands, drop the tree from the invocation.",
             file=sys.stderr,

@@ -2125,9 +2125,9 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # left. See the
 # module docstring for what a failure here means.
 #
-# check_skill_commands.py rides along the same way. It runs every shell block
-# in the SKILL.md files and references/*.md pages of the image's three skill
-# trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# check_skill_commands.py rides along the same way, with skill_documents.py,
+# which it imports. It runs every shell block in the skill documents of the
+# image's three skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
 # It downloads the Tirith release it pins; see its module docstring.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -2135,6 +2135,7 @@ COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
      deploy/docker/check_skill_commands.py \
+     deploy/docker/skill_documents.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
     cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \

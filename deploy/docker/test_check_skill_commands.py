@@ -135,7 +135,8 @@ class SkillBlocksTest(unittest.TestCase):
             skill.write_text(
                 "```bash\nls\n```\n```yaml\nkey: value\n```\n```\ntool_call()\n```\n```zsh\npwd\n```\n"
             )
-            (Path(tmp) / "demo" / "README.md").write_text("```bash\nrm -rf /\n```\n")
+            (Path(tmp) / "demo" / "scripts").mkdir()
+            (Path(tmp) / "demo" / "scripts" / "README.md").write_text("```bash\nrm -rf /\n```\n")
             got = check.skill_blocks("agents/platform/skills", Path(tmp))
         self.assertEqual(
             [
