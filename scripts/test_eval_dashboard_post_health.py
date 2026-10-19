@@ -1523,6 +1523,44 @@ class TrackingIssue(RunHarness):
         self.assertIn("Smoke gate outage: 1 case failing on every PR since", err)
 
 
+class InfraAddressee(unittest.TestCase):
+    """The four infrastructure shapes go to the infra owner; an OUTAGE does
+    not. Labels and the dedupe are the ones the shapes' own tests pin."""
+
+    def ensure(self, health_doc, infra=("ivan", "iris")):
+        gh = FakeGh()
+        tracker = post_health.gate_issue.Tracker(post_health.ghcli.Gh(runner=gh), infra=infra)
+        with contextlib.redirect_stderr(io.StringIO()):
+            tracker.ensure(health_doc, T0, "Mon 9:00 AM ET", "brief", "9:00 AM–9:15 AM ET")
+        [(_, _, body)] = [c for c in gh.calls if c[0] == "POST"]
+        return body
+
+    def test_each_infra_shape_is_assigned_and_mentions_the_backup(self):
+        for doc in (lost_pods(), deadline_kill(), fixture_drift(), pool_drift()):
+            with self.subTest(condition=doc["condition"]):
+                body = self.ensure(doc)
+                self.assertEqual(body["assignees"], ["ivan"])
+                self.assertEqual(body["labels"], ["presubmit-gate"])
+                self.assertTrue(body["body"].rstrip().endswith("Infra owner: @ivan, backup @iris (`infra_owner` in docs/designs/domains.yaml)."))
+
+    def test_an_outage_is_not_addressed_to_infra(self):
+        body = self.ensure(outage())
+        self.assertNotIn("assignees", body)
+        self.assertNotIn("Infra owner", body["body"])
+
+    def test_no_owner_on_record_files_as_before(self):
+        body = self.ensure(lost_pods(), infra=(None, None))
+        self.assertNotIn("assignees", body)
+        self.assertNotIn("Infra owner", body["body"])
+
+    def test_the_owner_is_read_from_domains_yaml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "domains.yaml"
+            path.write_text("# header\ninfra_owner: ivan  # who\ninfra_backup: iris\ndomains:\n  - slug: x\n    owner: y\n")
+            self.assertEqual(post_health.gate_issue.infra_addressees(path), ("ivan", "iris"))
+            self.assertEqual(post_health.gate_issue.infra_addressees(pathlib.Path(tmp) / "missing.yaml"), (None, None))
+
+
 class LostPods(RunHarness):
     """The build-cluster event of 2026-09-11 (#1478): the message names the
     nodes' count and the loss on the reader's clock, the cluster owner gets
@@ -1566,7 +1604,10 @@ class LostPods(RunHarness):
         self.assertIn("- lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC", text)
         self.assertIn("**Advice for authors:** nothing about your change; `/retest` once new jobs are progressing.", text)
         self.assertIn(f"Incident brief: {URL}#since=2026-09-11T14:05:52Z&view=gate", text)
-        self.assertTrue(text.rstrip().endswith("Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it."))
+        self.assertIn("Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it.", text)
+        owner, backup = post_health.gate_issue.infra_addressees()
+        self.assertEqual(body["assignees"], [owner], "the infra owner in domains.yaml")
+        self.assertTrue(text.rstrip().endswith(f"Infra owner: @{owner}, backup @{backup} (`infra_owner` in docs/designs/domains.yaml)."), text[-200:])
         self.assertTrue(self.opener.texts[0].split("\n")[0].endswith("retest once new jobs are running. Tracking #1300."))
         self.assertEqual(self.recorded()["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "lost_pods"})
         # The same event on the next tick: nothing posted, nothing filed.

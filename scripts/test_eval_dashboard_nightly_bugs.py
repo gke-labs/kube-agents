@@ -51,13 +51,16 @@ def task(name, *results, reason=FAIL_REASON):
 FILLER = ("filler-1", "filler-2", "filler-3", "filler-4")
 
 
-def night(day, tasks, build=None, job=JOB, truncated=False, hour="00", filler=True):
-    """One nightly build started at <hour>:00 UTC on 2026-10-<day>."""
-    tasks = list(tasks) + ([green(name) for name in FILLER] if filler else [])
+def night(day, tasks, build=None, job=JOB, truncated=False, hour="00", filler=True, lost=False):
+    """One nightly build started at <hour>:00 UTC on 2026-10-<day>; ``lost``
+    is a pod that died under it (no tasks, NodeNotReady)."""
+    tasks = [] if lost else list(tasks) + ([green(name) for name in FILLER] if filler else [])
     build = build or f"30000000000000{day:02d}{hour}0{1 if job == JOB else 2}"
     run = {"build_id": build, "tier": "nightly", "job": job, "pr": None, "started": f"2026-10-{day:02d}T{hour}:00:30+00:00",
            "finished": f"2026-10-{day:02d}T{hour}:59:00+00:00", "result": "FAILURE" if truncated else "SUCCESS",
            "eval_verdict": None if truncated else "GREEN", "duration_s": 3500, "tasks": tasks}
+    if lost:
+        run.update(result="FAILURE", eval_verdict=None, pod_node="node-7", pod_last_event="NodeNotReady")
     return run
 
 
@@ -146,8 +149,12 @@ class Harness(unittest.TestCase):
         self.assertEqual(rc, 0, err.getvalue())
         return gh, out.getvalue(), err.getvalue()
 
-    def filed(self, gh):
-        return [b for m, p, b in gh.writes() if m == "POST" and p == ISSUES]
+    def filed(self, gh, infra=False):
+        """The issues POSTed: domain bugs, or with ``infra`` the Infra ones."""
+        return [b for m, p, b in gh.writes() if m == "POST" and p == ISSUES and ("Infra" in b["labels"]) == infra]
+
+    def comments(self, gh):
+        return [(p, b["body"]) for m, p, b in gh.writes() if m == "POST" and p.endswith("/comments")]
 
 
 class StreakTest(Harness):
@@ -219,9 +226,10 @@ class StreakTest(Harness):
         self.assertIn("2026-10-17: 0/2 passed, 1 infra", issue["body"])
         self.assertNotIn("2026-10-14", issue["body"])
         self.assertNotIn("2026-10-15", issue["body"])
-        # Without the real reds, the infra nights alone file nothing.
+        # Without the real reds, the infra nights alone file no domain bug
+        # (they are an Infra issue: InfraCaseTest).
         gh, _, _ = self.run_once(data(night(15, [all_infra]), night(16, [all_infra]), night(17, [all_infra])))
-        self.assertEqual(gh.writes(), [])
+        self.assertEqual(self.filed(gh), [])
 
     def test_run_level_event_night_is_skipped(self):
         # Every graded case failed on the 17th: a run-level event, which says
@@ -414,6 +422,124 @@ class WorkflowSwitchTest(unittest.TestCase):
 
     def test_the_switch_defaults_off(self):
         self.assertIn("NIGHTLY_BUGS_LIVE: ${{ vars.NIGHTLY_BUGS_LIVE || 'false' }}", WORKFLOW.read_text())
+
+
+def infra_task(name, reason=STORM_REASON):
+    return task(name, "infra", "infra", "infra", reason=reason)
+
+
+class LostJobTest(Harness):
+    def test_two_lost_of_three_files_one_infra_issue_for_the_job(self):
+        doc = data(night(15, [green()], truncated=True), night(16, [green()]), night(17, [], lost=True))
+        gh, out, _ = self.run_once(doc)
+        [issue] = self.filed(gh, infra=True)
+        self.assertEqual(issue["labels"], ["nightly-red", "Infra", "needs-triage"])
+        self.assertEqual(issue["assignees"], ["ivan"])
+        self.assertIn(JOB, issue["title"])
+        body = issue["body"]
+        self.assertIn(f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", body)
+        self.assertIn("Infra backup: @iris", body)
+        self.assertIn("2026-10-17: the pod was lost (node node-7, last event NodeNotReady)", body)
+        self.assertIn("2026-10-16: ran to its verdict", body)
+        self.assertIn("2026-10-15: ended before its verdict after 58m (result FAILURE); 5 cases recorded", body)
+        self.assertIn(f"/logs/{JOB}/30000000000000150001", body)
+        self.assertIn(f"file #4000: {JOB} [nightly-red, Infra, needs-triage] assign @ivan (infra owner); mention @iris", out)
+
+    def test_one_lost_of_three_files_nothing(self):
+        gh, _, _ = self.run_once(data(night(15, [green()]), night(16, [green()]), night(17, [green()], truncated=True)))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_each_part_is_judged_on_its_own(self):
+        runs = [night(d, [green()]) for d in (15, 16, 17)] + [night(d, [green("case-red")], job=WRITERS_JOB, truncated=d != 16) for d in (15, 16, 17)]
+        gh, _, _ = self.run_once(data(*sorted(runs, key=lambda r: r["build_id"])))
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn(WRITERS_JOB, issue["title"])
+        self.assertIn("writers part", issue["body"])
+
+    def test_an_open_issue_gets_one_comment_per_later_lost_night_and_one_on_recovery(self):
+        issue = {"number": 3980, "title": "t", "body": f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", "created_at": "2026-10-16T12:00:00Z"}
+        doc = data(night(15, [green()], truncated=True), night(16, [green()]), night(17, [green()], truncated=True))
+        gh, out, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        self.assertEqual(self.filed(gh, infra=True), [], "no duplicate")
+        [(path, comment)] = self.comments(gh)
+        self.assertEqual(path, f"{ISSUES}/3980/comments")
+        self.assertIn("Again on the 2026-10-17 nightly: ended before its verdict", comment)
+        self.assertIn("new night: " + JOB, out)
+        again, _, _ = self.run_once(doc, FakeGh(open_issues=[issue], comments={3980: [{"body": comment}]}))
+        self.assertEqual(again.writes(), [], "once per night")
+        # A night lost before the issue was opened is not news.
+        older = dict(issue, created_at="2026-10-18T00:00:00Z")
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[older]))
+        self.assertEqual(gh.writes(), [])
+        # A later clean night: one recovery comment.
+        doc["runs"].append(night(18, [green()]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn(f"The main part (`{JOB}`) ran to its verdict on the 2026-10-18 nightly", comment)
+        again, _, _ = self.run_once(doc, FakeGh(open_issues=[issue], comments={3980: [{"body": comment}]}))
+        self.assertEqual(again.writes(), [])
+
+
+class InfraCaseTest(Harness):
+    def test_three_all_infra_nights_file_one_infra_issue_with_the_reason(self):
+        gh, _, _ = self.run_once(data(*(night(d, [infra_task("case-red")]) for d in (15, 16, 17))))
+        self.assertEqual(self.filed(gh), [], "never a domain bug")
+        [issue] = self.filed(gh, infra=True)
+        self.assertEqual(issue["labels"], ["nightly-red", "Infra", "needs-triage"])
+        self.assertEqual(issue["assignees"], ["ivan"])
+        self.assertIn("case-red", issue["title"])
+        body = issue["body"]
+        self.assertIn("<!-- kube-agents-bot:nightly-infra case=case-red -->", body)
+        self.assertIn("Infra backup: @iris", body)
+        self.assertIn("owner @carol", body, "the domain owner is named for a hand-off")
+        self.assertIn("`3 of 3 repetitions infrastructure: agent run failed: http 429 RESOURCE_EXHAUSTED`", body)
+        self.assertIn("eval_case-red_rep1.log", body)
+
+    def test_a_case_with_no_line_on_clean_nights_files(self):
+        gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *(night(d, []) for d in (15, 16, 17))))
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn("no line for the case", issue["body"])
+
+    def test_nights_before_a_case_first_ran_do_not_count(self):
+        gh, _, _ = self.run_once(data(night(15, []), night(16, []), night(17, [infra_task("case-red")])))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_a_graded_night_breaks_and_a_lost_night_is_skipped(self):
+        gh, _, _ = self.run_once(data(night(14, [infra_task("case-red")]), night(15, [infra_task("case-red")]), night(16, [red()]), night(17, [infra_task("case-red")])))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # The part cut short on the 16th: that night is skipped, not counted.
+        gh, _, _ = self.run_once(data(night(14, [infra_task("case-red")]), night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")], truncated=True), night(17, [infra_task("case-red")])))
+        [issue] = self.filed(gh, infra=True)
+        self.assertNotIn("2026-10-16", issue["body"].split("**Nights**")[1].split("Nightly report")[0])
+
+    def test_a_pool_wide_infra_night_is_skipped(self):
+        everything = [infra_task(name) for name in ("case-red", *FILLER)]
+        gh, _, _ = self.run_once(data(night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")]), night(17, everything, filler=False)))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_expected_fail_and_off_matrix_cases_are_not_filed(self):
+        doc = data(night(14, [green("case-xfail"), green("case-red")]), *(night(d, []) for d in (15, 16, 17)), inactive=("case-red",))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_recovery_comments_once_when_the_case_is_graded_again(self):
+        issue = {"number": 3970, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-18T00:00:00Z"}
+        doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [red()]), night(18, [green("case-red")]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(path, comment)] = self.comments(gh)
+        self.assertEqual(path, f"{ISSUES}/3970/comments")
+        self.assertIn("`case-red` was graded on the 2026-10-17 nightly", comment)
+        self.assertEqual(self.filed(gh, infra=True), [])
+        again, _, _ = self.run_once(doc, FakeGh(open_issues=[issue], comments={3970: [{"body": comment}]}))
+        self.assertEqual(again.writes(), [])
+
+    def test_a_domain_bug_is_not_taken_for_the_infra_issue_or_the_reverse(self):
+        infra_issue = {"number": 3960, "title": "Nightly infra: case-red", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-20T00:00:00Z"}
+        gh, _, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(open_issues=[infra_issue]))
+        self.assertEqual(len(self.filed(gh)), 1, "the infra issue does not track the domain streak")
+        red_issue = {"number": 3961, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-20T00:00:00Z"}
+        gh, _, _ = self.run_once(data(*(night(d, [infra_task("case-red")]) for d in (15, 16, 17))), FakeGh(open_issues=[red_issue]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
 
 class RunAsAScript(Harness):

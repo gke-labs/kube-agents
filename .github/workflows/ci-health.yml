@@ -106,7 +106,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # GitHub failure is a warning, retried next tick, never a failed run.
 # A third, scripts/eval_dashboard/nightly_bugs.py, files a `nightly-red`
 # issue for a case the nightly failed on every graded repetition three
-# graded nights in a row, and comments once when it passes again. It runs
+# graded nights in a row, and comments once when it passes again; and an
+# `Infra` one for the infra owner when a part of the nightly lost 2 of its
+# last 3 nights or a case graded nothing 3 nights running. It runs
 # every tick in dry run -- it reads the open issues and prints what it would
 # file, comment and assign -- and writes only when the repository variable
 # NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry

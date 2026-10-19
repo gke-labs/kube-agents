@@ -61,7 +61,8 @@ build node went away, whose run Prow killed at the deadline, or whose run
 the suite could not evaluate (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss, a seeded-fixture drift or a
 pool-project drift owes its owner (`gate_issue.py`), files a bug for a case
-the nightly fails on every run three nights in a row, dry run until armed
+the nightly fails on every run three nights in a row, and an infra bug when
+the nightly or a case is kept from running, dry run until armed
 ([Nightly bugs](#nightly-bugs)), and appends `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
 state and then every project's shape against the onboarding verifier,
@@ -681,6 +682,14 @@ names the job and quotes the evidence, which mentions deadline kills whenever
 one sits in the window. The Chat message reads `Tracking #NNN`, the issue
 rides in the state the same way, and the recovery comments on it.
 
+The four infrastructure shapes (`lost_pods`, `fixture_drift`, `pool_drift`,
+`deadline_kill`) are assigned to `infra_owner` in
+[`docs/designs/domains.yaml`](designs/domains.yaml), and each body ends with a
+line naming that owner and mentioning `infra_backup`; their label and dedupe
+are as above. An OUTAGE's issue, a shared break that may be any case's code,
+is not assigned. When `domains.yaml` names no infra owner the issues are filed
+as before, unassigned.
+
 ## Nightly bugs
 
 `scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
@@ -725,10 +734,31 @@ repetition on a graded night after its last failing one, the bot comments with
 that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
 
-Infrastructure is not routed yet: `classify.py` judges repetitions, and an
-infrastructure repetition is excluded before a night counts as failing, so no
-failing night is attributed to infrastructure. A case that is never graded is
-not filed; routing it to `infra_owner` with the `Infra` label is a follow-up.
+Two infrastructure shapes file an issue labelled `nightly-red`, `Infra` and
+`needs-triage` instead of a domain label, assigned to `infra_owner` in
+`domains.yaml` with `infra_backup` mentioned (`nightly_infra.py` holds the
+rules). Neither changes the domain streak above.
+
+- **Nights lost.** Each part is judged on its own. A night of a part is lost
+  when Prow ended the build before the eval loop's verdict (the deadline, an
+  abort) or its pod went away. A part that lost 2 of its last 3 nights gets one
+  issue for its job, listing the three nights, their run links and where each
+  stopped.
+- **A case kept from running.** A case is kept from running on a night when its
+  part (the one that last recorded it) ran to its verdict and the case graded
+  nothing: every repetition classified as infrastructure, or no line for it. 3
+  such nights in a row file one issue naming the case and the classifier's
+  reason. A night is skipped, not counted, when the part did not run or was
+  lost, when it predates the case's first recorded night (a case new to the
+  matrix), or when infrastructure took half or more of the part's cases (a
+  pool-wide outage, which is not one case's problem). A graded night ends the
+  streak. `expected_fail` cases and cases off the matrix are not filed.
+
+An infra issue is deduplicated by its own marker, a bot issue of one kind
+never stands in for another, and a closed one counts as for domain bugs. While
+it is open, each later night of the same kind gets one comment, and a later
+clean night (the part runs to its verdict, or the case is graded) gets one
+recovery comment.
 
 The step runs in dry run until armed: it reads the open issues and the comments
 it needs, prints what it would file, comment and assign, and writes nothing.
