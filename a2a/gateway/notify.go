@@ -664,6 +664,10 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 		}
 		message, err := n.conv.PostMessage(conversation, m)
 		if !n.chatOutcome(conversation, err) {
+			if m.Feedback != "" {
+				// The text fallback keeps the rating, as the relay's does.
+				return n.postRatedText(job, m)
+			}
 			return false
 		}
 		n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
@@ -704,18 +708,18 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	return true
 }
 
-// postRatedText posts an answer with no chat message as its text, chunked
-// under the cap, the rating controls on its last chunk (Gateway.postMessage
-// does the same for the relay's answers), and reports whether it answered
-// the request. A last chunk the backend will not draw the controls on posts
-// as plain text.
+// postRatedText posts an answer as its text, chunked under the cap, the
+// rating controls on its last chunk (Gateway.postMessage does the same for
+// the relay's answers), and reports whether it answered the request. As the
+// plain text post does, it answers once the first chunk lands, so a later
+// chunk that fails is logged rather than reposting the whole report. A last
+// chunk the backend will not draw the controls on posts as plain text.
 func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 	conversation := job.req.Conversation
 	chunks := chatChunks(m.Text, discordChunk)
 	if len(chunks) == 0 {
 		return false
 	}
-	var first string
 	for i, chunk := range chunks {
 		var message string
 		var err error
@@ -729,15 +733,16 @@ func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 		}
 		if err != nil {
 			n.log.Error("notify post failed", "conversation", conversation, "err", err)
-			n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+			if i == 0 {
+				n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+			}
 			return true
 		}
-		if first == "" {
-			first = message
+		if i == 0 {
+			n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
+			n.log.Info("notify posted", "conversation", conversation, "message", message, "rated", true)
 		}
 	}
-	n.reply(job, lib.NotifyReply{MessageID: first, ThreadID: conversation})
-	n.log.Info("notify posted", "conversation", conversation, "message", first, "rated", true)
 	return true
 }
 

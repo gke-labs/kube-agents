@@ -410,6 +410,18 @@ class AnswerKeyTest(_RuntimeCase):
             _run(runtime._retire(_Adapter(), (CHANNEL, THREAD), plan, "t_0"))
             self.assertEqual(runtime.answer_key(self._sub("t_0")), "")
 
+    def test_a_set_aside_plan_its_last_card_finishes_answers_it(self):
+        # A plan quiet past the hold is set aside; its last card's settle still answers its ask.
+        plan = runtime._Plan(TEAM)
+        plan.ts = "plan-t_0-2"
+        row = runtime._Row("t_0", "card")
+        row.status = slack_status.TASK_RUNNING
+        plan.rows["t_0"] = row
+        runtime._lapsed[(CHANNEL, THREAD)] = [plan]
+        status = slack_status.task_status("completed")
+        _run(runtime._settle_lapsed(_Adapter(), (CHANNEL, THREAD), "t_0", "completed", status, True))
+        self.assertEqual(runtime.answer_key(self._sub("t_0")), "plan-t_0-2")
+
     def test_no_plan_answers_nothing(self):
         # After a restart the plan is gone, and no report is taken for the answer.
         self.assertEqual(runtime.answer_key(self._sub("t_0")), "")

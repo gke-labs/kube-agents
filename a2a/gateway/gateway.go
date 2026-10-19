@@ -1268,8 +1268,14 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
+			// As the relay does: a child that handed the ask to cards leaves
+			// the answer, and its rating, to the card's report.
+			toCards := cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))
+			if toCards {
+				rec.markCardsAnswer(active.TaskID)
+			}
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, toCards); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:

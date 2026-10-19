@@ -926,6 +926,9 @@ async def _settle_lapsed(
             old.rolling.discard(card)
         row = old.rows.get(card)
         if row is not None and _move(row, kind, result):
+            if done and old.ts and _settled(old):
+                # A set-aside plan this card finishes: its report answers that ask.
+                _remember(_answers, (*key, card), old.ts, SEEN_MAX)
             if row.status == _status.TASK_RUNNING:
                 # Before the render's await, as in deliver_row: an expiry due
                 # during it must not drop the plan the card resumes on.

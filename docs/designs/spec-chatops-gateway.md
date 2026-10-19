@@ -1927,8 +1927,11 @@ plan (so one per ask; a fan-out's children fold into their rows and post nothing
 creator's), naming that plan's `update` key. The notify route marks it under the ask the key is
 bound to (`notifyChainIndex`, bound by the plan's first mark), laid out or, for a report that
 posts as text (an actionable one), on its last chunk; a key no ask holds is not marked rather than
-guessed at. The notifier keeps the plan in memory, so a card that settles an ask after the agent
-restarted is not flagged and that ask goes unrated. Plan rows, progress, a question waiting on the
+guessed at. Some asks go unrated rather than rated wrongly: the notifier keeps the plan in
+memory, so a card that settles an ask after the agent restarted is not flagged; a last card that
+gives up without a hard-wall reason posts no answer to flag; the flag is read once, so a report
+whose send is retried goes out unflagged; and a plan's key binds to the conversation's latest ask
+at the plan's first mark, so a follow-up asked before that mark takes the card's answer. Plan rows, progress, a question waiting on the
 user, notices, any other report, a card failure the wake explains and a keyed notify are not
 marked. A text answer chunked under the cap
 carries the mark on its last chunk. A card answer that also offers a next step or options keeps
