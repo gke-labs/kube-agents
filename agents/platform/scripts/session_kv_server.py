@@ -27,6 +27,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import board_snapshot
 import chat_notify
 import findings_queue
 import gitops_workspace
@@ -618,6 +619,22 @@ DRIFT_ALERT_EMOJI = "🔀"
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
 
+# What a drift card says when the install has no usable GitOps repository
+# registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
+# that are all unusable). The object may well be synced from a repository by a
+# GitOps tool; what the install lacks is a repository it can open a pull
+# request against. So the card asks for an explanation only: no options, no
+# "To authorize:" line, and so no buttons a reader could click for an action
+# that can only block (gke-labs#3313). The registration paths are
+# gitops_preflight.REGISTRATION_STEPS'; test_session_kv_server holds the two
+# to the same field and flag.
+DRIFT_NO_GITOPS_LINE = (
+    "No usable GitOps repository is registered with this install, so the agent cannot open a pull request to "
+    "revert or codify this change. Register one, or fix the existing entry, in the PlatformAgent's "
+    "spec.integration.repositories (or re-run the installer with --gitops-repo) to get those options on later "
+    "drift alerts."
+)
+
 # The `join` value the detector sends when it actually read the live object's
 # `managedFields` (`joinEnriched` in k8s-operator/cmd/drift-detector/join.go).
 # Any other value means ownership is absent because the lookup did not happen,
@@ -1177,6 +1194,17 @@ _CHAT_ENV_SIGNALS: Dict[str, tuple[str, ...]] = {
 # worse off than it was and no send is addressed to the empty string.
 DEFAULT_CHAT_PLATFORM = "google_chat"
 
+# Where each platform's home channel is set, named in the relay's refusal when
+# the gateway holds that platform's backend with no home channel: the CR field,
+# then the install.env key the installer turns into it.
+HOME_CHANNEL_SETTINGS: Dict[str, str] = {
+    "google_chat": "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
+    "slack": "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",
+}
+# The refusal when no platform can be named: no chat at all, a malformed home
+# channel the gateway refuses, or a backend this file has no route for.
+NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
+
 
 def _mapping(value: object) -> dict:
     """`value` if it is a mapping, else an empty one.
@@ -1380,6 +1408,23 @@ def _chat_platforms_disabled() -> bool:
     """
     resolved, explicit = _resolve_chat_platforms()
     return not resolved and bool(explicit) and not any(explicit.values())
+
+
+def _no_chat_route_error() -> str:
+    """Why a report was not sent on an install with no chat route.
+
+    It reaches `last_delivery_error` through the relay adapter and the 502, and
+    from there the dashboard, `hermes cron list`, the cronjob tool's reply in
+    chat and the `chat_delivery_watch` ledger issue. The gateway names its
+    backend whether or not a home channel is set, so with one named the cause is
+    the missing home channel; without one this cannot tell no chat from a
+    misconfigured one, so it guesses at neither.
+    """
+    platform = chat_notify.gateway_platform()
+    setting = HOME_CHANNEL_SETTINGS.get(platform)
+    if setting:
+        return f"composed but not delivered to {platform} (no home channel: set {setting})"
+    return NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -2064,6 +2109,107 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _drift_audit_facts(payload: Dict[str, Any]) -> str:
+    """The audit record a drift card opens with, and whether it was reconciled since."""
+    resource_path = _drift_resource_path(payload)
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
+    user_agent = _defang_drift_field(payload.get("user_agent"))
+    verb = _defang_drift_field(payload.get("verb")) or DRIFT_UNKNOWN_FIELD
+    method_name = _defang_drift_field(payload.get("method_name")) or DRIFT_UNKNOWN_FIELD
+    timestamp = _defang_drift_field(payload.get("timestamp")) or DRIFT_UNKNOWN_FIELD
+    insert_id = _defang_drift_field(payload.get("insert_id")) or DRIFT_UNKNOWN_FIELD
+    project = _defang_drift_field(payload.get("project")) or DRIFT_UNKNOWN_FIELD
+
+    reconciled_by = _defang_drift_field(payload.get("reconciled_by"))
+    if payload.get("reconciled"):
+        reconcile_line = (
+            f"- **Possibly already reverted:** `{reconciled_by or DRIFT_UNKNOWN_FIELD}` wrote to this object "
+            f"after the change above, so a GitOps controller may have reconciled it already. Check the live "
+            f"object before proposing anything — there may be nothing left to do."
+        )
+    else:
+        reconcile_line = (
+            "- **Not shown to be reconciled:** no configured GitOps manager was recorded writing to this "
+            "object after the change. That is the absence of evidence, not evidence the change still stands; "
+            "read the live object to find out which."
+        )
+
+    return (
+        f"**What the audit log recorded:**\n"
+        f"- **Object:** {resource_path}\n"
+        f"- **Cluster / project:** {cluster_name} / {project}\n"
+        f"- **Who:** {principal}"
+        + (f" (self-declared user agent `{user_agent}`, which names a tool and never a person)" if user_agent else "")
+        + f"\n"
+        f"- **What:** `{verb}` via `{method_name}`\n"
+        f"- **When:** {timestamp}\n"
+        f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
+        f"{_drift_ownership_block(payload)}\n"
+        f"{reconcile_line}"
+    )
+
+
+def _gitops_repo_registered() -> Optional[bool]:
+    """Whether the install has a usable GitOps repository: True, False, or None when unknown.
+
+    Asks gitops_preflight, the check a PR-writing worker runs first, so the
+    drift card and the worker that would act on it cannot disagree about
+    whether there is a repository. A registry that cannot be read is None,
+    and the card then keeps its options: the worker's own preflight still
+    stops an action that cannot be carried out.
+    """
+    try:
+        import gitops_preflight
+
+        code, _ = gitops_preflight.preflight()
+    except Exception:  # noqa: BLE001 - an unknown answer keeps upstream's card
+        return None
+    if code == gitops_preflight.EXIT_REGISTERED:
+        return True
+    if code == gitops_preflight.EXIT_NO_REGISTERED_REPO:
+        return False
+    return None
+
+
+def _drift_task_body_without_gitops(payload: Dict[str, Any]) -> str:
+    """The drift card for an install with no GitOps repository: explain, offer nothing.
+
+    The same audit facts and the same delivery as :func:`_drift_task_body`,
+    but the report's 'What to do' is :data:`DRIFT_NO_GITOPS_LINE` and nothing
+    else. Without a 'To authorize:' line kanban_notifier.actionable_report
+    files no incidents row, and the Slack presenter draws no option buttons.
+    """
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}', and the audit log "
+        f"recorded it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
+        f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
+        f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
+        f"use it.\n\n"
+        f"**{DRIFT_NO_GITOPS_LINE}** So this report explains the change and proposes nothing: no revert, no "
+        f"codify, no other fix, and no call to action.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
+        f"the alert was raised, and `result` is what gets posted there.\n\n"
+        f"**Done when:** the report says who changed what, what the live object looks like now, whether the change "
+        f"still stands, and what it affects. Nothing else is a condition of finishing.\n\n"
+        f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it.** "
+        f"**Do not judge the change by who made it**, and change nothing in the cluster.\n\n"
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
+        f"these three `##` sections are the only ones:\n\n"
+        f"## What's wrong\n\n"
+        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"## Why\n\n"
+        f"- <What the live object shows now, with the evidence>\n"
+        f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
+        f"## What to do\n\n"
+        f"- {DRIFT_NO_GITOPS_LINE}\n\n"
+        f"Every <...> above is a placeholder: fill each one in. Write the 'What to do' bullet exactly as given."
+    )
+
+
 def _drift_task_body(payload: Dict[str, Any]) -> str:
     """The kanban card body for an out-of-band change to a live object.
 
@@ -2095,45 +2241,19 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     skill carries is the step a report can skip while looking complete —
     establishing whether the state git declares still runs before proposing that
     the change be undone.
-    """
-    resource_path = _drift_resource_path(payload)
-    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
-    principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
-    user_agent = _defang_drift_field(payload.get("user_agent"))
-    verb = _defang_drift_field(payload.get("verb")) or DRIFT_UNKNOWN_FIELD
-    method_name = _defang_drift_field(payload.get("method_name")) or DRIFT_UNKNOWN_FIELD
-    timestamp = _defang_drift_field(payload.get("timestamp")) or DRIFT_UNKNOWN_FIELD
-    insert_id = _defang_drift_field(payload.get("insert_id")) or DRIFT_UNKNOWN_FIELD
-    project = _defang_drift_field(payload.get("project")) or DRIFT_UNKNOWN_FIELD
 
-    reconciled_by = _defang_drift_field(payload.get("reconciled_by"))
-    if payload.get("reconciled"):
-        reconcile_line = (
-            f"- **Possibly already reverted:** `{reconciled_by or DRIFT_UNKNOWN_FIELD}` wrote to this object "
-            f"after the change above, so a GitOps controller may have reconciled it already. Check the live "
-            f"object before proposing anything — there may be nothing left to do."
-        )
-    else:
-        reconcile_line = (
-            "- **Not shown to be reconciled:** no configured GitOps manager was recorded writing to this "
-            "object after the change. That is the absence of evidence, not evidence the change still stands; "
-            "read the live object to find out which."
-        )
+    On an install with no usable GitOps repository the card is
+    :func:`_drift_task_body_without_gitops` instead: an explanation with no
+    options. The bench contract above binds only this, the registered path.
+    """
+    if _gitops_repo_registered() is False:
+        return _drift_task_body_without_gitops(payload)
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
 
     return (
         f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
         f"through git, and the audit log is how we know about it.\n\n"
-        f"**What the audit log recorded:**\n"
-        f"- **Object:** {resource_path}\n"
-        f"- **Cluster / project:** {cluster_name} / {project}\n"
-        f"- **Who:** {principal}"
-        + (f" (self-declared user agent `{user_agent}`, which names a tool and never a person)" if user_agent else "")
-        + f"\n"
-        f"- **What:** `{verb}` via `{method_name}`\n"
-        f"- **When:** {timestamp}\n"
-        f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
-        f"{_drift_ownership_block(payload)}\n"
-        f"{reconcile_line}\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
         f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
         f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
         f"use it.\n\n"
@@ -3515,6 +3635,13 @@ def relay_cron_report(
     `also_delivered_to` are not in it: the scheduler is posting there itself, so
     they are skipped rather than missed.
 
+    An install with no chat route gets no send at all, where the fallback to
+    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): a
+    `next` install whose gateway holds Slack with no home channel. The error
+    names the platform and the setting that arms it, in the wording
+    `chat_delivery_watch` reads the platform from; see
+    :func:`_no_chat_route_error`.
+
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line
     about a kanban card it had filed) that were then posted and recorded as
@@ -3522,6 +3649,11 @@ def relay_cron_report(
     in its thread: that comes from the incident row stored below, which
     `incident_context` replays, not from a session the turn left behind.
     """
+    if _chat_platforms_disabled():
+        error = _no_chat_route_error()
+        logger.error(f"Relay for {profile}/{job_id}: report not sent: {error}")
+        return error, []
+
     posts_deadline = time.monotonic() + CRON_RELAY_POSTS_BUDGET_S
     blocks_deadline = posts_deadline - AUDIT_TEXT_SEND_RESERVE_S
     # Floored at the full set, so a wrong sibling list cannot silence the report:
@@ -4716,6 +4848,24 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     fleet that got healthier.
     """
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
+
+
+@app.get("/v1/board", dependencies=[Depends(verify_api_key)])
+def get_board() -> Dict[str, Any]:
+    """The Slack Home tab's snapshot (`board_snapshot.py`), relayed by the Hermes bridge.
+
+    A source that cannot be read is a 503, never an empty board: the gateway
+    then says it could not read the board rather than drawing a clean fleet.
+    """
+    board = _kanban_db_path()
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as session_db:
+            if not os.path.isfile(board):
+                return board_snapshot.snapshot(session_db, None, datetime.now(timezone.utc))
+            with closing(_read_only(board)) as kanban:
+                return board_snapshot.snapshot(session_db, kanban, datetime.now(timezone.utc))
+    except Exception as exc:  # noqa: BLE001 — a source that cannot be read is a 503, whatever raised
+        raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
 
 
 @app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])

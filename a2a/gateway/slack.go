@@ -152,6 +152,7 @@ type slackAPI interface {
 	GetUserInfoContext(ctx context.Context, user string, options ...slack.GetUserInfoOption) (*slack.User, error)
 	GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error)
 	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
+	PublishView(userID string, view slack.HomeTabViewRequest, hash string) (*slack.ViewResponse, error)
 }
 
 // SlackAdapter is the first real mapped-identity backend. Transport is
@@ -238,6 +239,12 @@ type SlackAdapter struct {
 	// postWebhook posts to a shortcut's response_url (slack_shortcut.go);
 	// nil is slack-go's, through the bounded client. Tests fake it.
 	postWebhook func(ctx context.Context, url string, msg *slack.WebhookMessage) error
+
+	// workspaceURL is the bot's workspace as auth.test names it
+	// ("https://acme.slack.com/"), the root of a message's permalink; home is
+	// the Home tab's state (slack_home.go).
+	workspaceURL string
+	home         slackHome
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -696,8 +703,11 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}
-			case *slackevents.AssistantThreadStartedEvent, *slackevents.AppHomeOpenedEvent:
+			case *slackevents.AssistantThreadStartedEvent:
 				s.suggestPrompts(inner)
+			case *slackevents.AppHomeOpenedEvent:
+				s.suggestPrompts(inner)
+				s.homeOpened(inner)
 			}
 		}
 	}()
@@ -1242,6 +1252,7 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	s.botUserID = auth.UserID
 	s.teamID = auth.TeamID
+	s.workspaceURL = auth.URL
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID, "team", auth.TeamID)
 	if auth.TeamID == "" {
 		// foreignSender fails closed without it, so a message that names any

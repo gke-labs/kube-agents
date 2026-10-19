@@ -2154,6 +2154,11 @@ main() {
     if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
       refuse_next_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
     fi
+    # A chat backend the gateway holds with no home channel (#3320): warned
+    # on every run, applying or not, and again at the end.
+    if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
+      warn_next_home_channel_unset_from_env
+    fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -2177,6 +2182,9 @@ main() {
         write_report "PLAN_FAILED"
         ;;
     esac
+    if declare -F print_next_home_channel_unset_summary >/dev/null; then
+      print_next_home_channel_unset_summary
+    fi
     exit "$plan_status"
   fi
 
@@ -2275,6 +2283,9 @@ main() {
           rm -f "$tfvars_file"
           exit 1
         fi
+      fi
+      if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
+        warn_next_home_channel_unset_from_env
       fi
       # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
       # install.env, so a key edited since the last apply switches the install
@@ -2377,6 +2388,9 @@ main() {
   write_report "SUCCESS"
 
   print_step "🎉 Upgrade Complete!"
+  if declare -F print_next_home_channel_unset_summary >/dev/null; then
+    print_next_home_channel_unset_summary
+  fi
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

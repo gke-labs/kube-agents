@@ -116,9 +116,9 @@ class CaseSpec:
     """Human label for the verdict summary. Falls back to the case id."""
 
     domain: str | None
-    """``domain:``, for per-domain reporting. None is a real answer: a task
-    that claims no domain covers no journey, which ``gpu-stress-test-diagnosis``
-    documents at length in its own comments."""
+    """``domain:``, for per-domain reporting. scripts/validate_bench_cases.py
+    rejects a task without one, so None appears only for a file read outside
+    that lint."""
 
     deployer: str
     """``infrastructure.deployer``, defaulting to ``noop``."""

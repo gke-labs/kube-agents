@@ -1,7 +1,21 @@
-# The eleven domains the Platform Agent operates in, as data. Each is a job
-# area with its own SOP, cron stream, and journeys (the testing-strategy design
-# document, in review, is the source of the list; until it lands this file is
+# The domains the Platform Agent operates in, as data. Each is a job area with
+# its own SOP, cron stream, and journeys (the testing-strategy design document,
+# in review, is the source of the list; until it lands this file is
 # self-contained).
+#
+# Every bench case claims one of these with a top-level `domain: <slug>` in its
+# task.yaml; scripts/validate_bench_cases.py rejects a case that claims none.
+# A case no row describes gets a new row here, not an exemption.
+#
+# Each row carries, besides `slug`, `name` and `journey`:
+#   owner    the GitHub login (no at sign) who answers for the domain's cases
+#            as a set: what is covered, what is missing, what a red means.
+#            A case's own `owner:` still answers when that case flakes.
+#   backup   the GitHub login who covers when the owner is out; not the owner.
+#   meaning  one plain sentence saying what the domain checks, for a reader
+#            who does not know the code.
+# scripts/test_domain_coverage.py fails on a row missing any of the three, or
+# whose backup is its owner.
 #
 # scripts/test_domain_coverage.py reads this file and fails when a domain has
 # no bench task carrying a deterministic verification_spec -- the rule "a
@@ -36,39 +50,78 @@
 # (hack/eval/nightly-cases.txt), and back into the presubmit file, held out,
 # on 2026-09-29 (#2013); only a roster line counts as coverage.
 
+# Not a domain, and no case claims it: who a nightly eval failure caused by
+# infrastructure (pool projects, seeded fleet, CI, Prow) is filed to. Area
+# ownership of that infrastructure stays in docs/ownership.md.
+infra_owner: lapis2002
+infra_backup: jayantid
+
 domains:
   - slug: chat-and-routing
     name: Chat and routing
+    owner: toshiowang
+    backup: jayantid
+    meaning: Answers questions about the fleet and hands work to the right specialist.
     journey: Ask the fleet a question; routed to the right specialist, answered from observed evidence
   - slug: reliability
     name: Reliability (obtainability-audit)
+    owner: stalhaali
+    backup: dshnayder
+    meaning: Checks whether workloads survive maintenance, such as a node drain.
     journey: A targeted probe asks whether the planted workload survives a drain and answers from observed evidence
   - slug: capacity
     name: Capacity (stockout-prevention)
+    owner: haoxuw
+    backup: stalhaali
+    meaning: Checks whether node pools can take more load, and names what blocks them.
     journey: A targeted probe asks whether the pinned pool can absorb load and names the cap that stops it
   - slug: cost
     name: Cost (fleet-wide-cost-analysis)
+    owner: Fuxiao-Gao
+    backup: haoxuw
+    meaning: Finds idle resources you are paying for.
     journey: A targeted probe names the node pool running no workloads right now, from live reads
   - slug: security
     name: Security (compliance-audit, ai-security-audit)
+    owner: jayantid
+    backup: lapis2002
+    meaning: Finds risky access, such as an over-broad admin grant, and refuses unsafe self-changes.
     journey: A targeted probe asks whether the planted RBAC binding is appropriately scoped and names the over-grant
   - slug: upgrades
     name: Upgrades (security-patch-orchestrator)
+    owner: haoxuw
+    backup: toshiowang
+    meaning: Checks whether clusters are current and safe to upgrade.
     journey: A targeted probe asks whether a control plane is current and reports the lag it actually read
   - slug: consistency
     name: Consistency (fleet-consistency-drift)
+    owner: toshiowang
+    backup: dshnayder
+    meaning: Spots a cluster configured differently from its peers.
     journey: A targeted probe compares one cluster's configuration against its live peers and names the differing facet
   - slug: fleet-audits
     name: Fleet audits (SOP machinery)
+    owner: dshnayder
+    backup: lapis2002
+    meaning: Runs a scheduled audit end to end and files a report people can act on.
     journey: "A scheduled audit SOP runs end to end: delegates to a worker, sweeps the fleet, and files a ledger issue a human can act on"
   - slug: remediation
     name: Remediation (fleet-audit cron remediation, RCA chat prompt via submit-suggestion)
+    owner: Fuxiao-Gao
+    backup: dshnayder
+    meaning: Proposes fixes as pull requests; never applies them directly.
     journey: A proposed fix lands as a pull request; nothing applied directly
   - slug: cluster-debugging
     name: Cluster debugging
+    owner: bradhoekstra
+    backup: Fuxiao-Gao
+    meaning: Diagnoses a broken workload without changing anything.
     journey: Debugs a workload; the Cluster Agent stays read-only and inside its own cluster
   - slug: incident-triage
     name: Incident triage (autoops)
+    owner: stalhaali
+    backup: bradhoekstra
+    meaning: Turns a warning event into a root cause and fix options for a person to approve.
     # Not "and a pull request". The pull request is real but downstream and
     # someone else's: _triage_task_body in agents/platform/scripts/
     # session_kv_server.py ends the triage card at a report whose last bullet
@@ -76,8 +129,20 @@ domains:
     # holding the GitOps write path opens the PR, "not you, and not from this
     # card". Opening it is the remediation domain's journey, one row above.
     journey: A warning event is triaged to a root cause and remediation options a human authorizes, never a cluster write
+  - slug: observability
+    name: Observability (the agent's and the fleet's metrics, traces and alerting)
+    owner: bradhoekstra
+    backup: jayantid
+    meaning: Checks that metrics, traces and alerts are wired up and readable.
+    journey: A question about scraping, trace latency or an alert policy is answered from the live configuration, or written to the observability skill's guidance
+  - slug: source-control
+    name: Source control (forge and version-control work)
+    owner: lapis2002
+    backup: toshiowang
+    meaning: Works with issues, pull requests, review feedback and branches on the code forge.
+    journey: An issue, pull request, review comment or branch is read and written through the version-control verbs, never a credentialed clone or a forge CLI in the sandbox
 
-# Known-uncovered. Three entries; empty is Phase 2's exit criterion. The two
+# Known-uncovered. Five entries; empty is Phase 2's exit criterion. The two
 # kanban probes cover chat-and-routing; cluster-debugging came off first
 # among the Phase 2 domains, in #939. Reliability, capacity, security,
 # consistency and cost are covered by five domain probes (upgrades' probe
@@ -92,7 +157,8 @@ domains:
 # case moved to the nightly (2026-09-03), and came off again on 2026-09-22
 # when incident-triage-oom-event-probe took a roster seat (#1023).
 #
-# An entry goes back on here only alongside a scenario that stopped running.
+# An entry goes back on here only alongside a scenario that stopped running,
+# or arrives with a new row whose cases have no roster line yet.
 allowlist:
   # fleet-audits, since 2026-09-22 (#1023): the domain's one case, the
   # compliance-rbac-overgrant canary, was never admitted (demoted 2026-09-02
@@ -120,3 +186,8 @@ allowlist:
   # 2026-10-14 too. Delete this entry in the pull request that restores
   # pdb-remediation-pr to the roster.
   - remediation
+  # observability and source-control, since the rows were added: every case
+  # claiming either is a nightly case, so neither has a blocking-roster case.
+  # Delete an entry in the pull request that gives its domain a roster line.
+  - observability
+  - source-control

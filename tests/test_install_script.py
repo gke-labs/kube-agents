@@ -6112,6 +6112,43 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
+class NextHomeChannelUnsetWiringTest(unittest.TestCase):
+    """Where install.sh calls the #3320 home-channel warning and its closing
+    summary. The functions are tested in test_installer_common.py; these pin
+    the call sites a review found wrong: the Day-2 menu read the home channel
+    before exporting the one just typed, and two exits skipped the summary."""
+
+    def setUp(self):
+        self.text = _INSTALL_SH.read_text()
+
+    def test_the_menu_exports_its_home_channel_before_warning(self):
+        export = self.text.index('export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"')
+        warn = self.text.index("warn_next_home_channel_unset_from_env\n", export)
+        refuse = self.text.index("refuse_next_slack_gateway_settings_from_env || return 1")
+        self.assertLess(export, refuse)
+        self.assertLess(refuse, warn)
+        self.assertLess(warn - refuse, 200, "the menu's warning moved away from its Slack check")
+
+    def test_the_apply_path_warns_right_after_its_slack_check(self):
+        # The route --dry-run and a non-interactive apply take (#3320).
+        refuse = self.text.index("  elif ! refuse_next_slack_gateway_settings_from_env flags; then")
+        warn = self.text.index("  warn_next_home_channel_unset_from_env flags\n", refuse)
+        self.assertLess(warn - refuse, 600, "the apply path's warning moved away from its Slack check")
+        self.assertLess(warn, self.text.index('print_success "Terraform input saved to: $tfvars_file"', refuse))
+
+    def test_every_exit_that_warned_ends_on_the_summary(self):
+        for report in ('write_json_report "DRY_RUN_SUCCESS"', 'write_json_report "PAUSED"',
+                       'write_json_report "GENERATE_ONLY_SUCCESS"'):
+            with self.subTest(exit=report):
+                at = self.text.index(report)
+                tail = self.text[at:self.text.index("exit 0", at)]
+                self.assertIn("print_next_home_channel_unset_summary flags", tail)
+        menu = self.text.index("    run_menu_system\n")
+        self.assertIn("print_next_home_channel_unset_summary", self.text[menu:self.text.index("exit 0", menu)])
+        main_end = self.text.index('\nif [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then')
+        self.assertIn("  print_next_home_channel_unset_summary flags\n}\n", self.text[main_end - 400:main_end + 1])
+
+
 class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     """#2812 on install.sh. A run whose mode is next (--mode=next, or
     PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
@@ -6225,7 +6262,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 out = proc.stdout + proc.stderr
                 self.assertIn("went on", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
-                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("which is not a Slack channel id", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     def test_main_refuses_after_the_interview_and_again_after_recovery_before_any_write(self):
@@ -6319,7 +6356,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("USERS=[U0123ABCD] HOME=[C0123ABCD] TOKENS=", proc.stdout)
         self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)", out)
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789)", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)", out)
         self.assertNotIn("User IDs / Emails", out)
         self.assertNotIn("comma-separated for several workspaces", out)
         # Each bad answer is named and asked again, once.
@@ -6335,27 +6372,65 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # Bot token: a stray comma, then one token. Allowlist: emails, then
         # Enter, which keeps the refused list (an empty one would admit
         # everyone) under a default that shows it, then IDs. Home channel: a
-        # DM, then Enter, which clears it.
+        # DM, then Enter, which clears it, and a yes to going on without one
+        # (#3320).
         answers = ["xoxb-1-secretpart,", "xoxb-1-secretpart", "xapp-1",
                    "U0123ABCD,alice@example.com", "<enter>", "U0123ABCD",
-                   "D0123ABCD", "<enter>", "#ops"]
+                   "D0123ABCD", "<enter>", "y", "#ops"]
         proc = self._interview("--mode=next", "", answers)
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("went on ASKED=10", proc.stdout, out)
         self.assertIn("USERS=[U0123ABCD] HOME=[] TOKENS=", proc.stdout)
         self.assertIn("SLACK_BOT_TOKEN holds a comma or space.", out)
         self.assertEqual(out.count("These look like emails: alice@example.com."), 2)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails) "
                       "[default: U0123ABCD,alice@example.com]", out)
         self.assertNotIn("[default: empty list]", out.split("These look like emails", 1)[1])
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789) [default: ]", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there) [default: ]", out)
         self.assertNotIn("secretpart", out)
+
+    def test_an_empty_home_channel_under_next_is_confirmed_or_asked_again(self):
+        # #3320: under next the gateway posts alerts only to a home channel.
+        # Declining the warning asks again; accepting keeps the empty answer.
+        lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "C0123ABCD", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=7", proc.stdout, out)
+        self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("HOME=[]", proc.stdout, out)
+        # A home channel given at once is not questioned.
+        proc = self._interview("--mode=next", "", lead + ["C0123ABCD", "#ops"])
+        self.assertNotIn("Continue without a home channel", proc.stdout + proc.stderr)
+
+    def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
+        # #3320 on Chat, which holds the gateway whenever it is enabled under
+        # next. Allowlist, topic, subscription, then the home channel.
+        lead = ["", "", ""]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "spaces/AAA"], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
+        self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y"], choice="1")
+        self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
+        # Under today the prompt stays optional and nothing is confirmed.
+        proc = self._interview("", "", lead + [""], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=4", proc.stdout, out)
+        self.assertIn("Google Chat Home Channel / Space ID (optional", out)
+        self.assertNotIn("Continue without a home channel", out)
 
     def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
         answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
         for flags, choice in (("", "2"), ("--mode=next", "3")):
             with self.subTest(flags=flags, choice=choice):
-                chat = ["", "", "", ""] if choice == "3" else []
+                chat = ["", "", "", "spaces/AAA"] if choice == "3" else []
                 proc = self._interview(flags, "", chat + answers, choice=choice)
                 out = proc.stdout + proc.stderr
                 self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
@@ -11732,7 +11807,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
                       "the menu refusal does not name the pool flags it refuses")
         dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
         refusal = self.text.index("--menu takes no --scope-* flag")
-        run = self.text.index("    run_menu_system\n    exit 0")
+        run = self.text.index("    run_menu_system\n    print_next_home_channel_unset_summary\n    exit 0")
         self.assertLess(dispatch, refusal)
         self.assertLess(refusal, run)
 

@@ -97,11 +97,12 @@
 # read-back. The green runs are longer because the verb route does the
 # read-back the CLI route skipped.
 #
-# No `domain:`: rca-remediation-pr owns the remediation journey -- a proposed
-# fix landing as a pull request -- and this case proposes no fix. It grades a
-# route, like vcs-history-only-fact.
+# Domain source-control, not remediation: rca-remediation-pr owns the
+# remediation journey -- a proposed fix landing as a pull request -- and this
+# case proposes no fix. It grades the route to the forge.
 id: vcs-review-feedback-read-back
 name: A second revision on a pull request, read back from the forge before it is described
+domain: source-control
 prompt: >-
   Do all of the following as ONE delegated task, in order — do not split it
   across several tasks.
