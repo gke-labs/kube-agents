@@ -336,13 +336,16 @@ func (d *feedbackDesk) Note(r FeedbackRating, note string) error {
 	if !d.Admits(r.Backend, r.Rater) {
 		return errFeedbackUnverified
 	}
+	key := feedbackKey(r.TaskID, r.Rater)
+	// Under the rater's lock too: a 👍 between this read and write would
+	// otherwise delete the note this call is about to report kept.
+	defer d.lockKey(key)()
 	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
 	defer cancel()
 	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
 		return fmt.Errorf("feedback bucket: %w", err)
 	}
-	key := feedbackKey(r.TaskID, r.Rater)
 	kept, err := mergeFeedback(ctx, kv, key, false, func(rec *FeedbackRecord) {
 		rec.Note = truncateRunes(strings.TrimSpace(note), feedbackNoteMax)
 	})

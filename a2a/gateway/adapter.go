@@ -121,7 +121,8 @@ type Adapter interface {
 	// a backend that cannot hold this one, or whose API refuses it, returns
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
-	// With m.Chat nil it is Post(conversation, m.Text).
+	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
+	// marks an answer a backend draws rating controls on (feedback.go).
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under

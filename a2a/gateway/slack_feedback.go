@@ -231,7 +231,9 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 	rating := FeedbackRating{Platform: platformSlack, Backend: slackBackend, Rater: p.User.ID,
 		Conversation: conversation, MessageID: p.Message.TS, TaskID: taskID, Rating: value}
 	if value == FeedbackDown {
-		rating.Answer = p.Message.Text
+		// The message's text is the mrkdwn fallback the adapter posted;
+		// its entities are undone so the draft reads as the answer did.
+		rating.Answer = slackUnescaper.Replace(p.Message.Text)
 	}
 	s.goSession(func() {
 		// Kept first, so the note the modal sends and a 👍 that follows find
