@@ -189,8 +189,9 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   more cards than one stop takes, a stop that ran out of time). Titles are model text, so
   each is cut to one line of at most 80 runes, with angle brackets and `@` replaced by
   look-alikes so a title can't mention anyone, `[`, `]`, backticks, `~`, `|`, `*` and `_`
-  neutralised so it can't make a masked link or bleed formatting, and every `.` and `:`
-  replaced by look-alikes (`․`, `꞉`) so a bare URL or domain is not linked either. A stop that
+  neutralised so it can't make a masked link or bleed formatting, and every dot and colon,
+  full-width and ideographic forms included, replaced by look-alikes (`․`, `꞉`) so a bare URL
+  or domain is not linked either. A stop that
   found nothing open answers "🤷 nothing is running", which is then true, or "🤷 no card was
   open in this conversation" when a question asked after the stop is already running. A control that is rejected (an older bridge
   answers `no-text-parts`), fails, is canceled, completes with no `cardStop` part, or has

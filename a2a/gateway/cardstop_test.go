@@ -463,12 +463,14 @@ func TestCardStopTitleIsSanitized(t *testing.T) {
 		"zero​width‮bidi",
 		"see [x](https://evil.example)",
 		"check https://evil.example/x and evil.example",
+		"evil。example/x and evil．example and evil｡example",
+		"https：//x",
 		"||spoiler|| text",
 		"run `rm -rf` *now* _please_ ~~gone~~",
 		"unclosed ` and *",
 	} {
 		got := cardStopTitle(in)
-		if strings.ContainsAny(got, "<>@\n\r​‮[]`*_~|.:") {
+		if strings.ContainsAny(got, "<>@\n\r​‮[]`*_~|.:。．｡：") {
 			t.Errorf("cardStopTitle(%q) = %q keeps markup or a line break", in, got)
 		}
 	}
@@ -590,6 +592,35 @@ func TestCardStopFollowUpCatchesCardsFiledSinceTheLastStop(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if n := messagesOn(t, r, "platform"); n != 4 {
 		t.Fatalf("%d messages on platform, want 4: the mark was not capped at one follow-up", n)
+	}
+}
+
+// A stop told "the answer comes" while a quiet follow-up runs gets that
+// answer, even when the follow-up finds nothing.
+func TestCardStopPromisedAnswerFromAQuietFollowUp(t *testing.T) {
+	r := cardStopRig(t, 0)
+	conv := "discord:g1/thread-cardstop-again-promised"
+	ranATurn(t, r, conv)
+	sayStop(r, conv, "ap-stop-1")
+	first := awaitSubmission(t, r, "platform", 1)
+	sayStop(r, conv, "ap-stop-2")
+	waitForRecord(t, r, conv, "the mark", func(rec *SessionRecord) bool { return rec.CardStop != nil && rec.CardStop.Again != nil })
+	answerControl(t, r, first, &lib.CardStopResult{Stopped: []lib.CardStopCard{{ID: "t_1", Title: "pods on x"}}})
+	waitFor(t, "the first answer", shown(r, "🛑 stopped 1 card: pods on x"))
+	followUp := awaitSubmission(t, r, "platform", 2)
+	sayStop(r, conv, "ap-stop-3")
+	waitForRecord(t, r, conv, "the follow-up marked", func(rec *SessionRecord) bool {
+		return rec.CardStop != nil && rec.CardStop.TaskID == followUp.TaskID && rec.CardStop.Again != nil
+	})
+	answerControl(t, r, followUp, &lib.CardStopResult{})
+	waitFor(t, "the promised answer", shown(r, nothingRunningNotice))
+	// The follow-up the third stop asked for is quiet again.
+	second := awaitSubmission(t, r, "platform", 3)
+	answerControl(t, r, second, &lib.CardStopResult{})
+	waitForRecord(t, r, conv, "nothing in flight", func(rec *SessionRecord) bool { return rec.CardStop == nil })
+	time.Sleep(300 * time.Millisecond)
+	if n := strings.Count(strings.Join(r.adapter.postTexts(), "\n"), nothingRunningNotice); n != 1 {
+		t.Fatalf("%q posted %d times, want once: the last follow-up was not quiet", nothingRunningNotice, n)
 	}
 }
 

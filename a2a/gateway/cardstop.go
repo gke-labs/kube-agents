@@ -117,6 +117,10 @@ type CardStopRun struct {
 	// Quiet marks a follow-up (followUpCardStop): it posts only a stop that
 	// stopped something, and a failure.
 	Quiet bool `json:"quiet,omitempty"`
+	// Promised is set when a stop told "the answer comes"
+	// (cardStopAlreadyNotice) marked this control, so it answers in full
+	// even when Quiet.
+	Promised bool `json:"promised,omitempty"`
 	// Again is set by a stop that arrived while this control was in flight:
 	// that stop's authority, which the follow-up carries. Nil when none did.
 	Again *Authority `json:"again,omitempty"`
@@ -332,7 +336,7 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 			answer = cardStopReply(result, rec.ActiveTask != nil && !rec.ActiveTask.Detached)
 			// A follow-up that found nothing more says nothing: the first
 			// control already answered the stop.
-			post = !run.Quiet || cardStopNews(result)
+			post = !run.Quiet || run.Promised || cardStopNews(result)
 		}
 	}
 	if post {
@@ -585,10 +589,19 @@ func cardTitles(cards []lib.CardStopCard, cut bool) string {
 // that could make a masked link or bleed formatting into the rest of the
 // reply is neutralised the same way: [ and ] become ( and ), a backtick an
 // apostrophe, ~ a hyphen, | a broken bar, and * and _ a space, so
-// [x](https://…) is no link and an unclosed ` or * opens nothing. Every .
-// becomes the one-dot leader ․ and every : the look-alike ꞉, so a bare URL or
-// domain (https://evil.example, evil.example) reads the same but no surface
-// links it. It is at most cardStopTitleRunes runes, a cut one ending in "…".
+// [x](https://…) is no link and an unclosed ` or * opens nothing. Every dot
+// an autolinker reads as one (titleDots) becomes the one-dot leader ․ and
+// every colon (titleColons) the look-alike ꞉, so a bare URL or domain
+// (https://evil.example, evil.example) reads the same but no surface links
+// it. It is at most cardStopTitleRunes runes, a cut one ending in "…".
+// titleDots are the runes an IDNA-aware autolinker takes as a domain's dot:
+// ASCII ., the ideographic full stop, and the full-width and half-width
+// full stops. titleColons are ASCII : and the full-width colon.
+var (
+	titleDots   = map[rune]bool{'.': true, '。': true, '．': true, '｡': true}
+	titleColons = map[rune]bool{':': true, '：': true}
+)
+
 func cardStopTitle(s string) string {
 	var b strings.Builder
 	space := false
@@ -613,9 +626,9 @@ func cardStopTitle(s string) string {
 			r = '-'
 		case r == '|':
 			r = '¦'
-		case r == '.':
+		case titleDots[r]:
 			r = '․'
-		case r == ':':
+		case titleColons[r]:
 			r = '꞉'
 		case r == '*' || r == '_':
 			space = b.Len() > 0

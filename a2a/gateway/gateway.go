@@ -971,7 +971,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		case cardStop && rec.CardStop != nil:
 			// The control in flight is the stop on the bus: the inject
 			// door's cancel reports it, rather than a cancel never sent.
+			// The notice promises an answer, which a quiet follow-up would
+			// otherwise keep to itself when it finds nothing (Promised).
 			markCardStopAgain(rec, authority)
+			rec.CardStop.Promised = true
 			g.observeCancelPublished(rec.Key, rec.CardStop.TaskID)
 			g.post(rec.Key, cardStopAlreadyNotice)
 		case active != nil && cardStop:
