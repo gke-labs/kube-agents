@@ -60,8 +60,9 @@ The same tick comments on each pull request whose run went red, whose
 build node went away, whose run Prow killed at the deadline, or whose run
 the suite could not evaluate (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss, a seeded-fixture drift or a
-pool-project drift owes its owner (`gate_issue.py`), and appends `health.json`
-to a history feed. A second job in the same workflow, on its own hourly cron,
+pool-project drift owes its owner (`gate_issue.py`), files a bug for a case
+the nightly fails on every run three nights in a row, dry run until armed
+([Nightly bugs](#nightly-bugs)), and appends `health.json` to a history feed. A second job in the same workflow, on its own hourly cron,
 scans every CI pool project's seeded fleet for fixtures out of their designed
 state and then every project's shape against the onboarding verifier,
 publishing `fixture-state.json` and `pool-state.json` beside `health.json`
@@ -680,6 +681,58 @@ names the job and quotes the evidence, which mentions deadline kills whenever
 one sits in the window. The Chat message reads `Tracking #NNN`, the issue
 rides in the state the same way, and the recovery comments on it.
 
+## Nightly bugs
+
+`scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
+every graded repetition on its last 3 graded nightly nights, and comments on it
+once when the case passes every repetition again. It runs every tick after the
+post, on the same `data.json`.
+
+A graded night, for one case, is a night where the part that ran the case (main
+or writers) was not cut off at the job deadline and at least one of the case's
+repetitions was graded. Three kinds of night are skipped, so they neither count
+toward a streak nor break one: a part Prow cut off at the deadline; a night
+where the case was not run or every repetition was infrastructure
+(`classify.py`'s `rep_kind`: an `infra` verdict, a never-ran phrasing such as a
+429, or the delegation ceiling); and a night where nearly every graded case
+failed (`classify.py`'s run-level event, which the dashboard's per-case rates
+skip too). A repetition classified as infrastructure is never a failure. Two
+runs on one date are one night, and the newer graded result stands. The window
+is the last 14 nightly dates. A case whose `task.yaml` carries
+`expected_fail: true`, or that is no longer on the nightly matrix, is not filed.
+
+The issue is labelled `nightly-red`, `domain:<slug>` and `needs-triage`. Its
+body carries a marker naming the case, the domain, the assignee and why, the
+domain owner and backup as @-mentions, each of the three nights with its pass
+count, run link, transcript link and each failing check's reason, and what
+triage decides: a product bug gets a fixer, a priority and a date; a broken
+test is fixed or marked `expected_fail` with the issue linked; an infra
+failure is closed in favour of the infra issue. It is assigned to the case's
+`owner:` when the root `OWNERS` file lists that login, and otherwise (an
+`owner: maintainers`, no owner, or a login `OWNERS` does not list) to the
+domain's `owner:` in
+[`docs/designs/domains.yaml`](designs/domains.yaml). A login GitHub refuses to
+assign files the issue unassigned, with the mentions intact.
+
+An open `nightly-red` issue that carries the case's marker, or names the case as
+a whole word in its title or body, is adopted instead, so a case is filed once
+and a human's issue wins. When a case with an open issue passes every graded
+repetition on a graded night after its last failing one, the bot comments with
+that night's run link, keyed on the night so it comments once per recovery. It
+never closes an issue; the triager does.
+
+Infrastructure is not routed yet: `classify.py` judges repetitions, and an
+infrastructure repetition is excluded before a night counts as failing, so no
+failing night is attributed to infrastructure. A case that is never graded is
+not filed; routing it to `infra_owner` with the `Infra` label is a follow-up.
+
+The step runs in dry run until armed: it reads the open issues and the comments
+it needs, prints what it would file, comment and assign, and writes nothing.
+Setting the repository variable `NIGHTLY_BUGS_LIVE=true` arms it;
+`CI_HEALTH_MUTE=true` disarms it again with every other write. Locally,
+`python3 scripts/eval_dashboard/nightly_bugs.py --data data.json` is a dry run
+against any `data.json`; `--live` writes.
+
 ## The seeded-fleet scan
 
 Presence probes passed on 2026-09-07 while every slot-a fixture sat Pending on
@@ -971,7 +1024,7 @@ workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_SA` override them. The off switch is the repository variable
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
 configured" and exits 0 before it would file a tracking issue, the comment
-step on pull requests is skipped, and the refresh, the verdict and the
+step on pull requests is skipped, the nightly bug filer runs dry, and the refresh, the verdict and the
 `health.json` upload carry on. It exits before writing `health-state.json`
 too, so what the poster remembers stands still while muted: an alert already
 sent stays sent. The dashboard is unaffected — the pool episode's start rides

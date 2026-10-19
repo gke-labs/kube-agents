@@ -1,0 +1,6 @@
+# A root OWNERS file for nightly_bugs.py's tests: alice approves, bob reviews.
+approvers:
+- alice
+reviewers:
+- alice
+- Bob
