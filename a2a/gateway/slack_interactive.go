@@ -440,6 +440,9 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 			s.creditLocked(conversation, fmt.Sprintf(slackShortcutCredit, p.clicker))
 			s.mu.Unlock()
 			s.noteAsk(conversation, p.text)
+			// The clicker asked, so a question the task posts waits on them
+			// (the Home tab's "waiting on you"), as for a typed ask.
+			s.noteAsker(conversation, p.author)
 			return
 		}
 		s.mu.Unlock()

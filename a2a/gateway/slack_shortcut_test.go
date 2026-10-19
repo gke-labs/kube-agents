@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/slack-go/slack"
 	"sigs.k8s.io/yaml"
 )
@@ -239,6 +240,24 @@ func TestSlackShortcutPendingEntrySurvivesTheTypedMessage(t *testing.T) {
 	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, false)
 	if got := hooks.got(); len(got) != 1 || got[0].text != unverifiedNotice(slackBackend, "U1") {
 		t.Errorf("notes = %+v, want the clicker told privately", got)
+	}
+}
+
+// The clicker is the shortcut's asker: a question its task posts is waiting
+// on them on the Home tab, not on whoever typed in the thread before.
+func TestSlackShortcutClickerIsTheThreadsAsker(t *testing.T) {
+	a, _ := newShortcutAdapter(&fakeSlackAPI{})
+	turns := runShortcut(a, shortcutPayload(t, "C1", "oncall", "204.8", alertMessage()))
+	a.noteAsker(turns[0].Conversation, "U9")
+	a.InboundVerified(turns[0].Conversation, turns[0].MessageID, true)
+	a.trackQuestion(turns[0].Conversation, "106.0", OutMessage{Text: "Raise the limit?",
+		Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Raise the limit?",
+			Choices: []chatmsg.Choice{{Text: "yes"}, {Text: "no"}}}})
+	if got := a.waitingOn("U1"); len(got) != 1 {
+		t.Errorf("the clicker's Home tab lists %d questions, want 1", len(got))
+	}
+	if got := a.waitingOn("U9"); len(got) != 0 {
+		t.Errorf("the earlier asker's Home tab still lists the shortcut's question: %+v", got)
 	}
 }
 
