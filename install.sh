@@ -376,6 +376,13 @@ bootstrap_install_env() {
   if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_ID=[\"']?[0-9]" "$file" 2>/dev/null; then
     INSTALL_ENV_RECORDS_GITHUB_APP="true"
   fi
+  # The same for the App's private key path. The file is sourced after the
+  # shell's environment, so GITHUB_PEM_PATH is the file's value when the file
+  # assigns it; when it does not, the value is one the shell exported for this
+  # run, which counts as given, like --github-pem-path.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_PEM_PATH=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_PEM_PATH="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -479,6 +486,15 @@ PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
 # needs another App ID, given by --github-app-id (PARAM_GITHUB_APP_ID_FROM_FLAG,
 # which --github-pem-path does not set).
 PARAM_RECORDED_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
+# The private key path install.env records, and whether --github-pem-path gave
+# this run's: on a move of GitHub host the recorded path is the old App's key.
+# Only a path the file records (INSTALL_ENV_RECORDS_GITHUB_PEM_PATH): a path
+# exported in the shell is this run's.
+PARAM_RECORDED_GITHUB_PEM_PATH=""
+if [ "${INSTALL_ENV_RECORDS_GITHUB_PEM_PATH:-false}" = "true" ]; then
+  PARAM_RECORDED_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+fi
+PARAM_GITHUB_PEM_PATH_FROM_FLAG="false"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -1061,7 +1077,7 @@ parse_args() {
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
-      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_PEM_PATH_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
@@ -2183,7 +2199,8 @@ record_gitops_forge_keys() {
     fi
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
-  # run's validator would refuse the pair.
+  # run's validator would refuse the pair. GITHUB_PEM_PATH too: a GitLab
+  # install has no App. The GitHub branch below writes it back.
   local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
   # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
   # switch of host names the new App's key (--kms-key), and the next
@@ -2211,6 +2228,15 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
     write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
     write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+    # The path of the App's private key, never the key: the path this run
+    # uses (--github-pem-path, the PEM prompt, or the path install.env
+    # recorded). A rewrite of the forge keys must not drop a key the operator
+    # keeps: a later run reads the path from here when it must import the key
+    # again, for example after the KMS key version is disabled. Written only
+    # when set, so a file that recorded none gets no empty line.
+    if [ -n "${GITHUB_PEM_PATH:-}" ]; then
+      write_env_var "$tmp" GITHUB_PEM_PATH "$GITHUB_PEM_PATH"
+    fi
   fi
   chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$file"
@@ -4939,6 +4965,14 @@ validate_github_forge_flags() {
         [ "${PARAM_KMS_KEYRING:-$default_ring}/${PARAM_KMS_KEY:-$default_key}" = "${PARAM_RECORDED_KMS_KEYRING:-$default_ring}/${PARAM_RECORDED_KMS_KEY:-$default_key}" ]; }; then
       print_error "This install's GitHub App was created on ${recorded_host:-github.com}, and an App belongs to one GitHub host. To move the install to ${host:-github.com}, give the App on that host with --github-app-id (its App ID, not the recorded one) and --github-pem-path, and a new Cloud KMS key for its private key with --kms-key (INSTALL.md, \"Switch between github.com and a GitHub Enterprise Server\")."
       return 1
+    fi
+    # The recorded private key path is the old App's key. Imported into the
+    # new key, it would sign as the old App, so a move that gives no
+    # --github-pem-path imports nothing and records no path.
+    if [ "$host" != "$recorded_host" ] && [ "${PARAM_GITHUB_PEM_PATH_FROM_FLAG:-false}" != "true" ] &&
+      [ -n "${PARAM_GITHUB_PEM_PATH:-}" ] && [ "$PARAM_GITHUB_PEM_PATH" = "${PARAM_RECORDED_GITHUB_PEM_PATH:-}" ]; then
+      print_info "Dropping the recorded GITHUB_PEM_PATH: it is the private key of the App on ${recorded_host:-github.com}. Give the new App's key with --github-pem-path."
+      PARAM_GITHUB_PEM_PATH=""
     fi
   fi
   if [ -z "$host" ]; then
