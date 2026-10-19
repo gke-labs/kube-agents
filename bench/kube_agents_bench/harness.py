@@ -2561,9 +2561,10 @@ class KubeAgentsHarness(AgentHarness):
         msgs: list[str] = []
         status = bstatuses.get(task_id)
         if status in _FAILURE_STATUSES:
-            # A blocked card must have block_kind == "transient" to be recognized as infra,
-            # preventing worker-authored kanban_block calls from spoofing the infra prefix.
-            if status == "blocked" and bblock_kinds.get(task_id) != "transient":
+            # A card a block landed in ``blocked`` (or, on the loop breaker's second
+            # block, ``triage``) must carry block_kind == "transient" to be recognized
+            # as infra, so a worker-authored kanban_block cannot spoof the infra prefix.
+            if status in ("blocked", "triage") and bblock_kinds.get(task_id) != "transient":
                 return []
             if task_id in bsummaries:
                 msgs.append(bsummaries[task_id])
@@ -2589,7 +2590,7 @@ class KubeAgentsHarness(AgentHarness):
             if isinstance(shown, dict):
                 tid = str(shown.get("id"))
                 if tid in wanted:
-                    if shown.get("status") == "blocked" and shown.get("block_kind") != "transient":
+                    if shown.get("status") in ("blocked", "triage") and shown.get("block_kind") != "transient":
                         found.pop(tid, None)
                         continue
                     runs = payload.get("runs")
@@ -2608,7 +2609,7 @@ class KubeAgentsHarness(AgentHarness):
                     if isinstance(item, dict):
                         tid = str(item.get("id"))
                         if tid in wanted:
-                            if item.get("status") == "blocked" and item.get("block_kind") != "transient":
+                            if item.get("status") in ("blocked", "triage") and item.get("block_kind") != "transient":
                                 found.pop(tid, None)
                                 continue
                             runs = item.get("runs")
@@ -2652,7 +2653,11 @@ class KubeAgentsHarness(AgentHarness):
             card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
             if card_msgs:
                 board_messages.extend(card_msgs)
-            elif fallback_messages and t in fallback_messages:
+            elif (
+                fallback_messages
+                and t in fallback_messages
+                and (t not in final_bstate[0] or final_bstate[0].get(t) not in _FAILURE_STATUSES)
+            ):
                 board_messages.extend(fallback_messages[t])
         return board_messages
 
@@ -2801,11 +2806,12 @@ class KubeAgentsHarness(AgentHarness):
         # before a refused completion -- and delivering it would both grade
         # that text and hide the ceiling from the scorer.
         settled = [t for t in awaited if _status(t) in _TERMINAL_STATUSES]
-        if settled:
-            final = _read(settled)
+        want_cards = list(dict.fromkeys(settled + [t for t in awaited if _status(t) in _FAILURE_STATUSES]))
+        if want_cards:
+            final = _read(want_cards)
             if final is None:
                 raise _exhausted(outstanding)
-            final.cards = {**read.cards, **{t: c for t, c in final.cards.items() if t in settled}}
+            final.cards = {**read.cards, **{t: c for t, c in final.cards.items() if t in want_cards}}
             read = final
         observed: list[dict[str, Any]] = list(result.trajectory)
         observed.extend(
@@ -2834,13 +2840,28 @@ class KubeAgentsHarness(AgentHarness):
         # checks that could read them are set aside on inject records anyway.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
-        settled_statuses = {t: _status(t) for t in awaited}
-        read_summaries = {
-            t: [str(read.cards[t]["summary"])]
+        bstatuses = {t: _status(t) for t in awaited}
+        bsummaries = {
+            t: str(read.cards[t]["summary"])
             for t in awaited
-            if settled_statuses[t] in _FAILURE_STATUSES and read.cards.get(t, {}).get("summary")
+            if read.cards.get(t, {}).get("summary")
         }
-        board_messages = self._final_board_failures(awaited, settled_statuses, read_summaries)
+        berrors = {
+            t: str(read.cards[t]["error"])
+            for t in awaited
+            if read.cards.get(t, {}).get("error")
+        }
+        bblock_kinds = {
+            t: str(read.cards[t]["block_kind"])
+            for t in awaited
+            if read.cards.get(t, {}).get("block_kind")
+        }
+        bstate = (bstatuses, bsummaries, berrors, bblock_kinds)
+        board_messages: list[str] = []
+        for t in awaited:
+            msgs = self._extract_board_card_messages(bstate, t)
+            if msgs:
+                board_messages.extend(msgs)
         self._settle(
             result,
             observed,
@@ -2989,6 +3010,8 @@ class KubeAgentsHarness(AgentHarness):
                         msgs = self._extract_board_card_messages(bstate, t)
                         if msgs:
                             poll_failure_messages[t] = msgs
+                        else:
+                            poll_failure_messages.pop(t, None)
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
                 ):
@@ -3081,14 +3104,26 @@ class KubeAgentsHarness(AgentHarness):
             for t, s in fresh_reported.items():
                 if s not in _FAILURE_STATUSES:
                     poll_failure_messages.pop(t, None)
-                elif t in outstanding and t not in poll_failure_messages:
-                    cstate = board.read_board_state(_agent_shell, [t], _EXEC_TIMEOUT)
-                    if cstate is not None:
+            needed_read = [
+                t for t, s in fresh_reported.items()
+                if t in outstanding and s in _FAILURE_STATUSES and t not in poll_failure_messages
+            ]
+            if needed_read:
+                remaining_turn = max(0.0, deadline - time.monotonic())
+                cstate = board.read_board_state(
+                    _agent_shell, needed_read, min(_EXEC_TIMEOUT, remaining_turn)
+                )
+                if cstate is not None:
+                    for t in needed_read:
                         msgs = self._extract_board_card_messages(cstate, t)
                         if msgs:
                             poll_failure_messages[t] = msgs
-                    if t not in poll_failure_messages:
-                        traj_summaries = self._extract_trajectory_failure_summaries(turn_new_calls, [t])
+                still_needed = [t for t in needed_read if t not in poll_failure_messages]
+                if still_needed:
+                    traj_summaries = self._extract_trajectory_failure_summaries(
+                        turn_new_calls, still_needed
+                    )
+                    for t in still_needed:
                         if t in traj_summaries:
                             poll_failure_messages[t] = traj_summaries[t]
             _fold_status_turn(

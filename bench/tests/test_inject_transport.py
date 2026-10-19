@@ -2685,6 +2685,7 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
             "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
             'HTTP 429 ... "TPM quota exhausted"'
         ),
+        block_kind="transient",
     )
     monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
 
@@ -2693,6 +2694,30 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     assert infra(result)
     assert result.output == ""
     assert "rate_limit" in result.errors[0]
+
+
+def test_worker_authored_kanban_block_with_infra_prefix_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker-authored kanban_block with non-transient block_kind remains graded on inject lane."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="needs_input",
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert ACK in result.metadata["final_message"]
+    assert "TPM quota exhausted" in result.metadata["final_message"]
 
 
 def test_a_blocked_card_with_rate_limit_summary_on_inject_fallback_when_final_exec_fails(
@@ -2708,6 +2733,7 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_fallback_when_final_ex
             "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
             'HTTP 429 ... "TPM quota exhausted"'
         ),
+        block_kind="transient",
     )
     real = local_shell(tmp_path, monkeypatch)
 
