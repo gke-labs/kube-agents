@@ -2694,9 +2694,9 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # names every roster case would leave the export empty on the inject lane
 # with rung 4 disarmed for whatever the matrix still holds (the nightly tier
 # keeps its own cases past the every-case-excluded stop) and no banner,
-# because no name is misspelled. Stop instead: the exclusion file needs only
-# the normal approvers, and it must not be able to do what the roster file
-# is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
+# because no name is misspelled. Stop instead: an exclusion entry is not a
+# demotion, and it must not be able to do what the roster file is guarded
+# against. An explicit BOOTSTRAP_ADMITTED in the job's
 # environment, empty included, is the stated way to mean it, and wins below.
 # Read before the nightly part's drop, which empties the export by design
 # when the part holds no roster case, and is not the lane's doing.

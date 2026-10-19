@@ -427,7 +427,7 @@ its matrix goes through the A2A gateway's inject door — the harness's `AGENT_T
 which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
 ([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag"). The
 roster above is still the roster there: nothing in the two roster files changes, and every case
-not named in the lane's exclusion list (below) runs and can red the job. Two things differ from
+not named in the lane's exclusion list (below) runs and can red the job. Three things differ from
 the api transport, and they are kept apart on purpose.
 
 `today`, the mode a rollback lands on, is graded over the api transport by the today lane: the
@@ -475,8 +475,9 @@ fixture to an issue. An entry is not a demotion: the case keeps its seat in
 transport on the today lane and in the nightlies. It does leave what can red a pull request,
 though, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
 from the matrix and from `BOOTSTRAP_ADMITTED` there. `agent-kanban-smoke` is the one roster case
-listed, so until #2039's return condition is met no merge-blocking run grades delegation through
-the chat front door; the today lane and the nightlies do. `scripts/test_eval_rosters.py` pins
+listed, so until the lane's delegation wait reads card ids on this path, or the case is rewritten
+for a premise both transports have, no merge-blocking run grades delegation through the chat
+front door; the today lane and the nightlies do. `scripts/test_eval_rosters.py` pins
 that set, so listing a second roster case is a decision made in that test and on this page, not a
 side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
@@ -502,6 +503,15 @@ into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
 the set of requesting cases. The same approvers as the exclusion list: an entry is a rung 1 check
 on every pull request.
+
+Rung 6 does not compare on the inject lane. `main`'s judged record is the today-mode nightly's
+over the api transport, filed at a version key that carries neither the mode nor the transport,
+so an inject run's judged mean set against it measures the lane rather than the pull request:
+the next lane redded on rung 6 on four admitted cases at once on 2026-10-17 with nothing changed
+on its side. `bench-gate` skips the comparison under `AGENT_TRANSPORT=inject` and says so on
+each case it would have compared; main's mean is still printed beside the run's. Rungs 1 to 5
+are unchanged, and the today lane keeps rung 6. It comes back on the inject lane when the
+version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)).
 
 ## The GitLab lane
 
@@ -541,7 +551,7 @@ goes through the same forge abstraction on both forges, so the GitHub presubmit 
 what a pull request can break in the agent; what GitLab can break on its own is the provider
 and the forge, which the nightly catches within a day and the on-demand run checks for a pull
 request that touches the provider. The file needs the normal approvers, like
-`nightly-cases.txt` and the inject-lane files: it changes what one on-demand lane and the two
+`nightly-cases.txt`: it changes what one on-demand lane and the two
 nightlies run, not what can red a pull request.
 
 ## Demoting a flaky case

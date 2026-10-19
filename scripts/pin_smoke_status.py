@@ -58,9 +58,19 @@ is the POST itself. One pull request failing
 -- a head force-pushed away mid-sweep, a call out of retries -- is logged and
 the sweep goes on, because every pull request after it would otherwise wait
 for the next merge; the failure still sets the exit status.
+
+A green from before the gate changed what it grades is not pinned at all.
+When the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time
+(`2026-10-20T14:00:00Z`), a status created before it is left stale, so Tide
+retests the pull request rather than merging it on a verdict about the other
+mode: set it to the moment the blocking job's spec.mode changed in
+oss-test-infra (the swap to next, or a rollback to today), never earlier.
+Leaving it set afterwards is harmless, as every older status has long been
+superseded. An unparsable value pins nothing and exits non-zero.
 """
 
 import argparse
+import datetime
 import os
 import re
 import sys
@@ -87,6 +97,8 @@ USER_AGENT = "kube-agents-smoke-test-sticky"
 POOL_LABELS = frozenset({"lgtm", "approved"})
 HOLD_LABEL_PREFIX = "do-not-merge"
 SHORT_SHA = 8
+#: The cutoff (module docstring): a status created before this UTC time is not pinned.
+NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -118,12 +130,33 @@ def pinned_description(description, main_sha):
     return noted + suffix
 
 
-def skip_reason(status, main_sha):
+def parse_utc(value):
+    """A GitHub-style UTC time (`...Z` or an explicit offset) as an aware datetime; ValueError otherwise."""
+    parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{value!r} carries no time zone")
+    return parsed
+
+
+def not_before_from_env(environ=os.environ):
+    """The cutoff from NOT_BEFORE_ENV, None when unset or empty; ValueError when unparsable."""
+    raw = (environ.get(NOT_BEFORE_ENV) or "").strip()
+    return parse_utc(raw) if raw else None
+
+
+def skip_reason(status, main_sha, not_before=None):
     """Why a status is left alone, or None when it should be pinned."""
     if status is None:
         return f"no {CONTEXT} status on the commit"
     if status.get("state") != SUCCESS:
         return f"state is {status.get('state')!r}, not {SUCCESS}"
+    if not_before is not None:
+        try:
+            created = parse_utc(status.get("created_at") or "")
+        except ValueError:
+            return f"no readable created_at beside {NOT_BEFORE_ENV}"
+        if created < not_before:
+            return f"created {status.get('created_at')}, before {NOT_BEFORE_ENV} ({not_before.isoformat()})"
     _, base_sha = split_description(status.get("description") or "")
     if base_sha == main_sha:
         return "already pinned to the head of main"
@@ -161,7 +194,7 @@ def _resolve(main_sha):
     return main_sha() if callable(main_sha) else main_sha
 
 
-def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True, expected_main=None):
+def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True, expected_main=None, not_before=None):
     """Re-pin one commit's smoke status. Returns what happened, for the log.
 
     `main_sha` is a SHA or a callable returning one. `expected_main` is the head
@@ -177,7 +210,7 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
     status = latest_status(api, sha)
     if status_id is not None and status is not None and str(status.get("id")) != str(status_id):
         return f"{sha[:SHORT_SHA]}: status {status_id} is no longer the latest (now {status.get('id')}); leaving it"
-    reason = skip_reason(status, _NO_MAIN)
+    reason = skip_reason(status, _NO_MAIN, not_before)
     if reason:
         return f"{sha[:SHORT_SHA]}: {reason}"
     main_now = expected_main if expected_main is not None else _resolve(main_sha)
@@ -209,7 +242,7 @@ def in_tide_pool(pull_request):
     return POOL_LABELS <= labels and not any(str(name).startswith(HOLD_LABEL_PREFIX) for name in labels)
 
 
-def sweep(api, main_sha, dry_run=False):
+def sweep(api, main_sha, dry_run=False, not_before=None):
     """Every open pull request's head, after a push to main; the pool first.
 
     Returns (outcomes, failures). One pull request's failure does not end the
@@ -226,7 +259,9 @@ def sweep(api, main_sha, dry_run=False):
     for pull_request in pulls:
         sha = pull_request["head"]["sha"]
         try:
-            outcome = pin_head(api, sha, main_sha, dry_run=dry_run, check_base=False, expected_main=expected)
+            outcome = pin_head(
+                api, sha, main_sha, dry_run=dry_run, check_base=False, expected_main=expected, not_before=not_before
+            )
         except Exception as error:  # noqa: BLE001 -- one pull request must not end the sweep
             failures += 1
             outcome = f"{sha[:SHORT_SHA]}: failed, moving on: {error}"
@@ -261,12 +296,17 @@ def main(argv=None):
     if not args.repo or not token:
         print("GITHUB_REPOSITORY (or --repo) and GITHUB_TOKEN are required", file=sys.stderr)
         return 2
+    try:
+        not_before = not_before_from_env()
+    except ValueError as error:
+        print(f"{NOT_BEFORE_ENV} is not a UTC time, so nothing is pinned: {error}", file=sys.stderr)
+        return 2
     api = GitHubAPI(args.repo, token, user_agent=USER_AGENT)
     main_sha = args.main_sha or (lambda: main_head(api))
     if args.mode == "status":
-        log(pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run))
+        log(pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run, not_before=not_before))
         return 0
-    _, failures = sweep(api, main_sha, dry_run=args.dry_run)
+    _, failures = sweep(api, main_sha, dry_run=args.dry_run, not_before=not_before)
     return 1 if failures else 0
 
 

@@ -547,7 +547,7 @@ The two labels are the two people:
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root and [`hack/OWNERS`](../hack/OWNERS) for the
   presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`)
-  alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  and the inject lane's exclusions and safeguards under `hack/eval/` alone, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
   to what the presubmit runs or what blocks; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
@@ -694,6 +694,12 @@ reads the key so that such a run is never itself taken for a green. What this tr
 away, on every retest and not only when the sweep wins: the combination of a head with the `main`
 it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
 on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
+Neither carries a verdict across a change to what the job grades. When the blocking job's
+`spec.mode` changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the
+repository variable `SMOKE_PIN_NOT_BEFORE` to the UTC time it merged, never earlier, so the re-pin
+leaves every older green stale, and ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so
+the retests Tide then starts run the matrix instead of reusing the old green; drop the lever in a
+follow-up once the open queue has run under the new mode, about a week.
 Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.

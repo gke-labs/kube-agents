@@ -83,6 +83,15 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
         self.assertEqual(one["env"]["STATUS_ID"], "${{ github.event.id }}")
         self.assertEqual(one["env"]["SHA"], "${{ github.event.sha }}")
 
+    def test_both_pinning_steps_carry_the_mode_cutoff(self):
+        """A cutoff only one path honoured would let the other re-pin a green about the other mode."""
+        for step in self.steps.values():
+            if "run" in step:
+                self.assertEqual(
+                    step["env"][pin_smoke_status.NOT_BEFORE_ENV],
+                    "${{ vars." + pin_smoke_status.NOT_BEFORE_ENV + " }}",
+                )
+
     def test_each_step_s_command_line_parses_as_the_script_expects(self):
         """argparse rejects a parent option after the subcommand; the order in `run:` is the contract."""
         for step in self.steps.values():

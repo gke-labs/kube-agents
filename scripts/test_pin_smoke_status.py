@@ -314,6 +314,46 @@ class MainTest(unittest.TestCase):
         self.assertEqual(self._run(api, ["sweep"]), 1)
         self.assertEqual(len(api.posts), 1)
 
+    def _run_with_cutoff(self, api, argv, cutoff):
+        with unittest.mock.patch.dict("os.environ", {pin.NOT_BEFORE_ENV: cutoff}):
+            return self._run(api, argv)
+
+    def test_a_green_from_before_the_cutoff_is_left_stale(self):
+        """A verdict about the mode the gate graded before the swap must not
+        reach the merge on a re-pin; one created after the cutoff still does."""
+        old, new = "1" * 40, "2" * 40
+        api = FakeAPI(
+            statuses={
+                old: [status(created_at="2026-10-20T13:59:59Z")],
+                new: [status(created_at="2026-10-20T14:00:00Z")],
+            },
+            pulls=[pull(old), pull(new)],
+        )
+        self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T14:00:00Z"), 0)
+        self.assertEqual([path.rsplit("/", 1)[1] for path, _ in api.posts], [new])
+
+    def test_the_cutoff_reaches_the_status_event_path(self):
+        api = FakeAPI(statuses={HEAD: [status(created_at="2026-10-19T00:00:00Z")]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run_with_cutoff(api, ["status", "--sha", HEAD, "--status-id", "1"], "2026-10-20T00:00:00Z"), 0)
+        self.assertEqual(api.posts, [])
+
+    def test_a_status_with_no_creation_time_is_not_pinned_under_a_cutoff(self):
+        api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T00:00:00Z"), 0)
+        self.assertEqual(api.posts, [])
+
+    def test_an_empty_cutoff_changes_nothing(self):
+        api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run_with_cutoff(api, ["sweep"], ""), 0)
+        self.assertEqual(len(api.posts), 1)
+
+    def test_an_unparsable_cutoff_pins_nothing_and_fails(self):
+        for bad in ("yesterday", "2026-10-20T14:00:00"):  # the second carries no zone
+            with self.subTest(bad=bad):
+                api = FakeAPI(statuses={HEAD: [status(created_at="2026-10-21T00:00:00Z")]}, pulls=[pull(HEAD)])
+                self.assertEqual(self._run_with_cutoff(api, ["sweep"], bad), 2)
+                self.assertEqual(api.posts, [])
+
     def test_refuses_to_run_without_a_token(self):
         env = {k: v for k, v in __import__("os").environ.items() if k not in ("GITHUB_TOKEN",)}
         with unittest.mock.patch.dict("os.environ", env, clear=True):

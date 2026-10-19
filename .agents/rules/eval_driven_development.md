@@ -65,6 +65,15 @@ PLATFORM_AGENT_TOKEN=$(kubectl --context "$AGENT_CLUSTER_CONTEXT" get secret pla
 Without `GCP_PROJECT_ID` the judge fails to construct (`No API key was provided`); the eval
 still needs the judge even though only the deterministic checks decide.
 
+The blocking presubmit grades a `spec.mode: next` install through the A2A gateway's inject door,
+so that is the lane a case on its matrix goes red or green on. Against a next install, add the
+two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN`
+from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
+`hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
+the nightlies); run it without them. The lane also appends the GitHub-write safeguard in
+`hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
+it in CI.
+
 A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
 `BENCH_FLEET_KUBECONFIG_DIR` first. The runner refuses to write kubeconfigs on your own
