@@ -96,6 +96,10 @@ if cmd == "get":
                 if next_arg.startswith("jsonpath="):
                     expr = next_arg.split("jsonpath=", 1)[1].strip("'\\"")
             if expr is not None:
+                read_rc = ns_info.get("read_exit_code", 0)
+                if read_rc != 0:
+                    sys.stderr.write(ns_info.get("read_error", f'Error from server: failed to get namespace "{ns}"\\n'))
+                    sys.exit(read_rc)
                 if expr == "{.metadata.labels.managed-by}":
                     owner = ns_info.get("managed-by", "")
                     sys.stdout.write(owner)
@@ -109,6 +113,10 @@ if cmd == "get":
         sys.exit(0)
     else:
         # Generic get (e.g. failure resources or events in exit trap)
+        get_rc = config.get("get_exit_code", 0)
+        if get_rc != 0:
+            sys.stderr.write(config.get("get_error", "Error from server: generic get failed\\n"))
+            sys.exit(get_rc)
         sys.stdout.write("NAME READY STATUS AGE\\n")
         sys.exit(0)
 
@@ -463,6 +471,36 @@ drift_clear_namespace
         yaml_calls = [c for c in calls if "yaml" in " ".join(c)]
         self.assertEqual(len(yaml_calls), 1)
 
+    def test_namespace_second_read_failure_aborts_without_misreporting_label(self):
+        self.set_kubectl_config({
+            "namespaces": {
+                "eval-ns": {
+                    "exists": True,
+                    "read_exit_code": 1,
+                    "read_error": "Error from server (ServiceUnavailable): apiserver connection lost\\n",
+                }
+            }
+        })
+        func = lift_function("drift_clear_namespace", self.script_text, SCRIPT)
+        script = f"""\
+set -euo pipefail
+drift_ns="eval-ns"
+drift_cluster="eval-cluster"
+drift_managed_by="eval-drift"
+drift_leftover_timeout=30
+
+{func}
+
+drift_clear_namespace
+"""
+        proc = self.run_bash(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Error from server (ServiceUnavailable): apiserver connection lost", proc.stderr)
+        self.assertNotIn("not labelled managed-by=", proc.stderr)
+        calls = self.get_kubectl_calls()
+        delete_calls = [c for c in calls if len(c) > 0 and c[0] == "delete"]
+        self.assertEqual(len(delete_calls), 0)
+
 
 class DriftOnExitTrapTests(DriftShellTestBase):
     def test_exit_trap_deletes_when_status_nonzero_and_drift_planted_ns_set(self):
@@ -569,8 +607,70 @@ exit 0
         delete_calls = [c for c in calls if len(c) > 0 and c[0] == "delete"]
         self.assertEqual(len(delete_calls), 0)
 
+    def test_exit_trap_deletes_even_when_failure_resource_dump_fails(self):
+        self.set_kubectl_config({
+            "get_exit_code": 1,
+            "get_error": "Error from server (Forbidden): cannot list resource deployments in API group\\n",
+        })
+        script = f"""\
+set -euo pipefail
+gcloud() {{ return 0; }}
+
+drift_ns="eval-ns"
+drift_cluster="eval-cluster"
+drift_location="us-central1"
+drift_project_id="test-project"
+drift_agent_deployment="agent"
+drift_agent_namespace="kubeagents-system"
+drift_agent_container="platform-agent"
+drift_planted_ns=""
+
+source "{SCRIPT}"
+
+drift_init
+drift_planted_ns="1"
+
+echo "Simulating a plant failure..." >&2
+exit 42
+"""
+        proc = self.run_bash(script)
+        self.assertEqual(proc.returncode, 42)
+        self.assertIn("Plant failed (exit 42). State of eval-ns before cleanup:", proc.stderr)
+        self.assertIn("Error from server (Forbidden): cannot list resource deployments in API group", proc.stderr)
+        self.assertIn("Deleting eval-ns so the next run starts from a clean namespace.", proc.stderr)
+
+        calls = self.get_kubectl_calls()
+        delete_calls = [c for c in calls if len(c) > 0 and c[0] == "delete"]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual(
+            delete_calls[0],
+            ["delete", "namespace", "eval-ns", "--ignore-not-found", "--wait=false"],
+        )
+
 
 class DriftRequireDaemonTests(DriftShellTestBase):
+    _DAEMON_SCRIPT = f"""\
+set -euo pipefail
+gcloud() {{ return 0; }}
+
+drift_cluster="eval-cluster"
+drift_location="us-central1"
+drift_project_id="test-project"
+drift_agent_deployment="agent"
+drift_agent_namespace="kubeagents-system"
+drift_agent_container="platform-agent"
+drift_daemon_url="http://daemon:8080"
+drift_planted_ns=""
+
+source "{SCRIPT}"
+
+drift_init
+drift_require_daemon
+"""
+
+    def run_daemon(self) -> subprocess.CompletedProcess:
+        return self.run_bash(self._DAEMON_SCRIPT)
+
     def test_refuses_when_transport_failure_and_explains_distinction(self):
         self.set_kubectl_config({
             "curl": {
@@ -578,22 +678,7 @@ class DriftRequireDaemonTests(DriftShellTestBase):
                 "stderr": "curl: (7) Failed to connect to daemon:8080: Connection refused\\n",
             }
         })
-        func = lift_function("drift_require_daemon", self.script_text, SCRIPT)
-        script = f"""\
-set -euo pipefail
-DRIFT_INJECT_KIND="gitops-drift"
-DRIFT_HEALTHZ_TIMEOUT=10
-drift_agent_deployment="agent"
-drift_agent_namespace="kubeagents-system"
-drift_agent_container="platform-agent"
-drift_daemon_url="http://daemon:8080"
-drift_exec_in_pod=(kubectl exec "deployment/$drift_agent_deployment" -n "$drift_agent_namespace" -c "$drift_agent_container" --)
-
-{func}
-
-drift_require_daemon
-"""
-        proc = self.run_bash(script)
+        proc = self.run_daemon()
         self.assertEqual(proc.returncode, 1)
         self.assertIn("ERROR: could not read http://daemon:8080/healthz in platform-agent (exit 7)", proc.stderr)
         self.assertIn("curl: (7) Failed to connect to daemon:8080", proc.stderr)
@@ -607,22 +692,7 @@ drift_require_daemon
                 "http_code": 404,
             }
         })
-        func = lift_function("drift_require_daemon", self.script_text, SCRIPT)
-        script = f"""\
-set -euo pipefail
-DRIFT_INJECT_KIND="gitops-drift"
-DRIFT_HEALTHZ_TIMEOUT=10
-drift_agent_deployment="agent"
-drift_agent_namespace="kubeagents-system"
-drift_agent_container="platform-agent"
-drift_daemon_url="http://daemon:8080"
-drift_exec_in_pod=(kubectl exec "deployment/$drift_agent_deployment" -n "$drift_agent_namespace" -c "$drift_agent_container" --)
-
-{func}
-
-drift_require_daemon
-"""
-        proc = self.run_bash(script)
+        proc = self.run_daemon()
         self.assertEqual(proc.returncode, 1)
         self.assertIn("ERROR: could not read http://daemon:8080/healthz in platform-agent (exit 22)", proc.stderr)
         self.assertIn("curl: (22) The requested URL returned error: 404", proc.stderr)
@@ -631,28 +701,13 @@ drift_require_daemon
 
     def test_refuses_when_kubectl_exec_fails_before_container(self):
         self.set_kubectl_config({
-            "kubectl_exec_error": 'Error from server (NotFound): pods "agent" not found\n',
+            "kubectl_exec_error": 'Error from server (NotFound): pods "agent" not found\\n',
             "kubectl_exec_exit_code": 1,
         })
-        func = lift_function("drift_require_daemon", self.script_text, SCRIPT)
-        script = f"""\
-set -euo pipefail
-DRIFT_INJECT_KIND="gitops-drift"
-DRIFT_HEALTHZ_TIMEOUT=10
-drift_agent_deployment="agent"
-drift_agent_namespace="kubeagents-system"
-drift_agent_container="platform-agent"
-drift_daemon_url="http://daemon:8080"
-drift_exec_in_pod=(kubectl exec "deployment/$drift_agent_deployment" -n "$drift_agent_namespace" -c "$drift_agent_container" --)
-
-{func}
-
-drift_require_daemon
-"""
-        proc = self.run_bash(script)
+        proc = self.run_daemon()
         self.assertEqual(proc.returncode, 1)
         self.assertIn("ERROR: could not read http://daemon:8080/healthz in platform-agent (exit 1)", proc.stderr)
-        self.assertIn("Error from server (NotFound): pods \"agent\" not found", proc.stderr)
+        self.assertIn('Error from server (NotFound): pods "agent" not found', proc.stderr)
         self.assertIn("This says nothing about which inject kinds the daemon advertises", proc.stderr)
         self.assertNotIn("does not advertise the 'gitops-drift' inject kind", proc.stderr)
 
@@ -663,22 +718,7 @@ drift_require_daemon
                 "body": json.dumps({"inject_kinds": ["pod-event", "warning-event"]}),
             }
         })
-        func = lift_function("drift_require_daemon", self.script_text, SCRIPT)
-        script = f"""\
-set -euo pipefail
-DRIFT_INJECT_KIND="gitops-drift"
-DRIFT_HEALTHZ_TIMEOUT=10
-drift_agent_deployment="agent"
-drift_agent_namespace="kubeagents-system"
-drift_agent_container="platform-agent"
-drift_daemon_url="http://daemon:8080"
-drift_exec_in_pod=(kubectl exec "deployment/$drift_agent_deployment" -n "$drift_agent_namespace" -c "$drift_agent_container" --)
-
-{func}
-
-drift_require_daemon
-"""
-        proc = self.run_bash(script)
+        proc = self.run_daemon()
         self.assertEqual(proc.returncode, 1)
         self.assertIn("ERROR: the Session KV daemon at http://daemon:8080 does not advertise the 'gitops-drift' inject kind", proc.stderr)
         self.assertIn("(it advertises: pod-event\nwarning-event)", proc.stderr)
@@ -692,22 +732,7 @@ drift_require_daemon
                 "body": json.dumps({"inject_kinds": ["pod-event", "gitops-drift", "warning-event"]}),
             }
         })
-        func = lift_function("drift_require_daemon", self.script_text, SCRIPT)
-        script = f"""\
-set -euo pipefail
-DRIFT_INJECT_KIND="gitops-drift"
-DRIFT_HEALTHZ_TIMEOUT=10
-drift_agent_deployment="agent"
-drift_agent_namespace="kubeagents-system"
-drift_agent_container="platform-agent"
-drift_daemon_url="http://daemon:8080"
-drift_exec_in_pod=(kubectl exec "deployment/$drift_agent_deployment" -n "$drift_agent_namespace" -c "$drift_agent_container" --)
-
-{func}
-
-drift_require_daemon
-"""
-        proc = self.run_bash(script)
+        proc = self.run_daemon()
         self.assertEqual(proc.returncode, 0, f"Expected 0, stderr: {proc.stderr}")
         self.assertEqual(proc.stderr, "")
 
@@ -718,26 +743,12 @@ drift_require_daemon
                 "body": json.dumps({"inject_kinds": ["gitops-drift"]}),
             }
         })
-        func = lift_function("drift_require_daemon", self.script_text, SCRIPT)
-        script = f"""\
-set -euo pipefail
-DRIFT_INJECT_KIND="gitops-drift"
-DRIFT_HEALTHZ_TIMEOUT=10
-drift_agent_deployment="agent"
-drift_agent_namespace="kubeagents-system"
-drift_agent_container="platform-agent"
-drift_daemon_url="http://daemon:8080"
-drift_exec_in_pod=(kubectl exec "deployment/$drift_agent_deployment" -n "$drift_agent_namespace" -c "$drift_agent_container" --)
-
-{func}
-
-drift_require_daemon
-"""
-        proc = self.run_bash(script)
+        proc = self.run_daemon()
         self.assertEqual(proc.returncode, 0)
         calls = self.get_kubectl_calls()
         self.assertEqual(len(calls), 1)
         exec_call = calls[0]
+        # Validates that drift_init built drift_exec_in_pod from module code
         self.assertEqual(
             exec_call[:7],
             ["exec", "deployment/agent", "-n", "kubeagents-system", "-c", "platform-agent", "--"],
