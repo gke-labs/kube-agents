@@ -23,9 +23,9 @@ import (
 //
 // A 👍 is counted (answer_feedback_total) and nothing else is kept; it also
 // takes back an earlier 👎 from the same rater. A 👎 is counted and keeps
-// what the rater is told is kept, in the feedback bucket: the ask, the
-// answer, the ids, and an optional note from the rater, and nothing else of
-// the thread. The
+// what the rater is told is kept, in the feedback bucket: the ask that
+// started the rated chain, the answer, the ids, and an optional note from
+// the rater, and nothing else of the thread. The
 // bucket's max age is the retention, set where the deployment provisions it,
 // and the gateway refuses to keep anything in a bucket without one. The
 // gateway's user is the bucket's only reader and writer; an operator reads
@@ -74,6 +74,9 @@ var (
 	// errFeedbackContended is a record that kept changing under every
 	// attempt to merge into it.
 	errFeedbackContended = errors.New("the record kept changing; giving up")
+	// errFeedbackNotKept is a note for a 👎 the bucket does not hold: its
+	// write failed, or a 👍 took it back.
+	errFeedbackNotKept = errors.New("no 👎 is kept for this answer and rater")
 )
 
 // FeedbackRating is one rating as a backend hands it to the gateway.
@@ -111,14 +114,13 @@ type FeedbackRecord struct {
 }
 
 // FeedbackRecorder is what the gateway offers a backend that draws rating
-// controls: whether it takes ratings from a sender, record a rating, add
-// the ask to a kept 👎 once the backend has read it, add the rater's note,
-// and how many days a 👎 is kept (for the rater to be told). Every call is
-// safe from any goroutine and bounded by its own deadline.
+// controls: whether it takes ratings from a sender, record a rating, add the
+// rater's note to their kept 👎, and how many days a 👎 is kept (for the
+// rater to be told). Every call is safe from any goroutine and bounded by
+// its own deadline.
 type FeedbackRecorder interface {
 	Admits(backend, rater string) bool
 	Rate(r FeedbackRating) error
-	AddAsk(r FeedbackRating, ask string) error
 	Note(r FeedbackRating, note string) error
 	KeptDays() int
 }
@@ -246,21 +248,34 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	key := feedbackKey(r.TaskID, r.Rater)
 	if r.Rating != FeedbackDown {
 		// A 👍 keeps nothing, and takes back the rater's 👎 if there is one.
-		if err := kv.Delete(ctx, key); err != nil && !errors.Is(err, jetstream.ErrKeyNotFound) {
+		// Looked up first: a KV delete writes a marker whether or not the
+		// key exists, and a marker would record the 👍.
+		_, err := kv.Get(ctx, key)
+		switch {
+		case errors.Is(err, jetstream.ErrKeyNotFound):
+		case err != nil:
 			return fmt.Errorf("feedback %s: %w", key, err)
+		default:
+			if err := kv.Delete(ctx, key); err != nil {
+				return fmt.Errorf("feedback %s: %w", key, err)
+			}
 		}
 		g.log.Info("answer rated", "platform", r.Platform, "rating", r.Rating, "taskId", r.TaskID,
 			"conversation", r.Conversation, "kept", false)
 		return nil
 	}
-	// The context id joins the rating to the stream's copy of the
-	// conversation; best effort, since a reaped session has no record.
-	contextID := ""
+	// The ask is the human message that started the rated chain, as the
+	// session record holds it (TaskRef.Request, until AskTTL clears it),
+	// and the context id joins the rating to the stream's copy of the
+	// conversation; both best effort, since a reaped session has neither.
+	contextID, ask := "", ""
 	if session, err := g.reg.Get(ctx, r.Conversation); err == nil && session != nil {
 		contextID = session.ContextID
+		if root, ok := session.TaskRefFor(r.TaskID); ok {
+			ask = strings.Join(strings.Fields(root.Request), " ")
+		}
 	}
-	// Merged, not replaced: re-rating keeps the note and the ask already
-	// there, and a note sent from the modal may have started the record.
+	// Merged, not replaced: re-rating keeps the note already there.
 	if _, err := mergeFeedback(ctx, kv, key, true, func(rec *FeedbackRecord) {
 		*rec = FeedbackRecord{
 			Rating:       FeedbackDown,
@@ -271,7 +286,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 			MessageID:    r.MessageID,
 			TaskID:       r.TaskID,
 			ContextID:    contextID,
-			Ask:          rec.Ask,
+			Ask:          truncateRunes(ask, feedbackAskMax),
 			Answer:       truncateRunes(r.Answer, feedbackAnswerMax),
 			RatedAt:      time.Now().UTC(),
 		}
@@ -283,25 +298,10 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	return nil
 }
 
-// AddAsk adds the ask the backend read after the 👎 was kept. A 👎 taken
-// back by a 👍 in the meantime stays gone.
-func (d *feedbackDesk) AddAsk(r FeedbackRating, ask string) error {
-	g := d.g
-	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
-	defer cancel()
-	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
-	if err != nil {
-		return fmt.Errorf("feedback bucket: %w", err)
-	}
-	_, err = mergeFeedback(ctx, kv, feedbackKey(r.TaskID, r.Rater), false, func(rec *FeedbackRecord) {
-		rec.Ask = truncateRunes(ask, feedbackAskMax)
-	})
-	return err
-}
-
-// Note adds the rater's note (empty: none) to their 👎 on r's answer. A note
-// sent after a 👍 took the 👎 back keeps the 👎 again: Send under "What went
-// wrong?" is a 👎 of its own.
+// Note adds the rater's note (empty: none) to their kept 👎 on r's answer.
+// It keeps nothing when no 👎 is kept (its write failed, or a 👍 took it
+// back) and reports errFeedbackNotKept, so the rater is not thanked for a
+// record that does not exist.
 func (d *feedbackDesk) Note(r FeedbackRating, note string) error {
 	g := d.g
 	if !d.Admits(r.Backend, r.Rater) {
@@ -314,14 +314,14 @@ func (d *feedbackDesk) Note(r FeedbackRating, note string) error {
 		return fmt.Errorf("feedback bucket: %w", err)
 	}
 	key := feedbackKey(r.TaskID, r.Rater)
-	if _, err := mergeFeedback(ctx, kv, key, true, func(rec *FeedbackRecord) {
-		if rec.Rating == "" {
-			*rec = FeedbackRecord{Rating: FeedbackDown, Platform: r.Platform, Rater: r.Rater,
-				Conversation: r.Conversation, MessageID: r.MessageID, TaskID: r.TaskID, RatedAt: time.Now().UTC()}
-		}
+	kept, err := mergeFeedback(ctx, kv, key, false, func(rec *FeedbackRecord) {
 		rec.Note = truncateRunes(strings.TrimSpace(note), feedbackNoteMax)
-	}); err != nil {
+	})
+	if err != nil {
 		return err
+	}
+	if !kept {
+		return errFeedbackNotKept
 	}
 	g.log.Info("answer feedback note kept", "taskId", r.TaskID, "conversation", r.Conversation)
 	return nil

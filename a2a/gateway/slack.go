@@ -561,7 +561,9 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 				// choice buttons a chat message's layout carries
 				// (renderSlackChat), the home-channel cards the notify route
 				// lays out (the fleet audit's, the first inventory's) among
-				// them, becomes a turn (slack_interactive.go). A click on any
+				// them, becomes a turn (slack_interactive.go). A tap on an answer's
+				// feedback buttons, and the note its 👎 opens, are ratings, never
+				// turns (slack_feedback.go). A click on any
 				// other button (one on a message posted under today, a link)
 				// is acked and changes nothing. The route's raw blocks still
 				// carry none.

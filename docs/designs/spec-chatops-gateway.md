@@ -1929,21 +1929,21 @@ and a tap from a sender the gateway would not take a turn from (`resolvePrincipa
 another workspace's member, changes nothing.
 
 A 👍 is counted and nothing is kept or posted (Slack fills the tapped icon itself); it also
-deletes the rater's 👎 on the same answer, if one is kept. A 👎 is counted and kept with the rated
-answer first, one KV write, then opens a modal on the tap's trigger, which lapses three seconds
-after the tap ("What went wrong?" over one optional line, "Anything else?", of up to 500 characters, and a line telling
-the rater how long their question and the answer are kept, read from the bucket's max age). The
-adapter then reads the conversation up to the rated message (`conversations.replies`, or the last
-10 messages of `conversations.history` for a top-level answer) for the ask, the last message a
-person wrote before the answer, and adds it to the record; nothing else of the thread is kept, so
-what is stored is what the modal says is. The answer is the rated message's text, which for a text
-answer longer than one chunk is its last chunk. Send writes the note and posts "Thanks. I kept this
-answer for your team to review." to the rater alone (`chat.postEphemeral`) in the thread once the
-record holds it; Cancel keeps the 👎 without a note. The rating, the ask and the note are written
-by separate goroutines and merged under the record's revision (`mergeFeedback`), so none loses
-another's part: an ask read after a 👍 took the 👎 back leaves it gone, and Send after a 👍 keeps
-the 👎 again. No new scope: `chat:write` covers the ephemeral line, the history scopes the read,
-and `views.open` takes only the trigger.
+deletes the rater's 👎 on the same answer, if one is kept, and writes nothing when none is (a KV
+delete writes a marker whether or not the key exists, so the key is looked up first). A 👎 is
+counted and kept with the rated answer first, one KV write, and only once it is kept opens a modal
+on the tap's trigger, which lapses three seconds after the tap ("What went wrong?" over one
+optional field, "Anything else?", of up to 500 characters, and a line telling the rater how long
+their question and the answer are kept, read from the bucket's max age); a write that fails opens
+nothing. The gateway takes the ask from the session record: the human message that started the
+rated chain (`TaskRef.Request` on the root entry, until `AskTTL` clears it), so a later message in
+the thread, or another person's, is never taken for it, and the adapter reads nothing of the
+thread. The answer is the rated message's text, which for a text answer longer than one chunk is
+its last chunk. Send writes the note into the kept 👎 and posts "Thanks. I kept this answer for
+your team to review." to the rater alone (`chat.postEphemeral`) in the thread; with no 👎 kept (a
+👍 took it back) it keeps nothing and posts nothing. Cancel keeps the 👎 without a note. A note and
+a re-rating merge under the record's revision (`mergeFeedback`), so neither loses the other's part.
+No new scope: `chat:write` covers the ephemeral line, and `views.open` takes only the trigger.
 
 A kept 👎 is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack

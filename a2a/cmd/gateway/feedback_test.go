@@ -17,7 +17,7 @@ func TestParseSince(t *testing.T) {
 			t.Errorf("parseSince(%q) = %v, %v; want %v", in, got, err, want)
 		}
 	}
-	for _, in := range []string{"0d", "-1d", "xd", "soon", "-2h"} {
+	for _, in := range []string{"0d", "-1d", "xd", "soon", "-2h", "106752d", "213504d"} {
 		if _, err := parseSince(in); err == nil {
 			t.Errorf("parseSince(%q) must refuse", in)
 		}
@@ -32,5 +32,10 @@ func TestFeedbackCommandIsRecognisedAndNeedsExport(t *testing.T) {
 	err := feedbackMain(context.Background(), []string{"feedback"}, &bytes.Buffer{}, &errOut, slog.Default())
 	if !errors.Is(err, errFeedbackUsage) || !strings.Contains(errOut.String(), "feedback export") {
 		t.Errorf("feedback alone = %v, %q; want the usage", err, errOut.String())
+	}
+	errOut.Reset()
+	err = feedbackMain(context.Background(), []string{"feedback", "export", "7d"}, &bytes.Buffer{}, &errOut, slog.Default())
+	if !errors.Is(err, errFeedbackUsage) {
+		t.Errorf("a window without --since = %v; want the usage, not a whole-bucket export", err)
 	}
 }

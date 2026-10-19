@@ -15,13 +15,12 @@ import (
 // context_actions block under the final answer of an ask, the last block of
 // the message (inside its side bar when it has one, where Slack draws it as
 // well). A tap is never a turn. A 👍 is handed to the gateway and Slack
-// fills the icon; nothing posts. A 👎 is kept with the rated answer first,
-// then opens a modal asking what was wrong, optionally, while the adapter
-// reads the ask (the last message a person wrote before the answer) and adds
-// it; Send adds the note and thanks the rater with an ephemeral line in the
-// thread, and Cancel leaves the 👎 as it is. Nothing else of the thread is
-// kept. The controls are drawn only once the gateway has handed over its
-// recorder.
+// fills the icon; nothing posts. A 👎 is kept with the rated answer (the
+// gateway adds the ask that started the chain), and only once it is kept
+// opens a modal asking what went wrong, optionally; Send adds the note and
+// thanks the rater with an ephemeral line in the thread, and Cancel leaves
+// the 👎 as it is. The controls are drawn only once the gateway has handed
+// over its recorder.
 const (
 	// slackFeedbackAction is the feedback buttons' action_id; the answer's
 	// task id rides in the block's id after slackFeedbackBlockPrefix.
@@ -51,12 +50,8 @@ const (
 
 	// slackFeedbackDeadline bounds the Slack calls one tap makes.
 	slackFeedbackDeadline = 15 * time.Second
-	// slackFeedbackRepliesPage and slackFeedbackRepliesPages bound the read
-	// of the thread a 👎's ask is found in; slackFeedbackHistory is how far
-	// back a top-level answer (a DM's thread-less conversation) looks.
-	slackFeedbackRepliesPage  = 200
-	slackFeedbackRepliesPages = 5
-	slackFeedbackHistory      = 10
+	// slackFeedbackSeenPrefix keys a tap in the at-least-once dedupe ring.
+	slackFeedbackSeenPrefix = "feedback:"
 )
 
 // slackFeedbackAPI is the part of the Web API answer feedback calls,
@@ -64,8 +59,6 @@ const (
 type slackFeedbackAPI interface {
 	OpenViewContext(ctx context.Context, triggerID string, view slack.ModalViewRequest) (*slack.ViewResponse, error)
 	PostEphemeralContext(ctx context.Context, channelID, userID string, options ...slack.MsgOption) (string, error)
-	GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error)
-	GetConversationHistoryContext(ctx context.Context, params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error)
 }
 
 // slackFeedbackMeta is what the modal carries for its submission.
@@ -200,7 +193,7 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 			"userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
 		return
 	}
-	if s.alreadySeen("feedback:" + p.Channel.ID + "/" + p.ActionTS) {
+	if s.alreadySeen(slackFeedbackSeenPrefix + p.Channel.ID + "/" + p.ActionTS) {
 		return
 	}
 	if !recorder.Admits(slackBackend, p.User.ID) {
@@ -218,7 +211,10 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		// the 👎 already there; one KV write, inside the three seconds the
 		// modal's trigger lasts.
 		if err := recorder.Rate(rating); err != nil {
+			// The modal says the answer is kept; with nothing kept it
+			// does not open.
 			s.log.Warn("slack: recording a rating failed", "channel", p.Channel.ID, "taskId", taskID, "err", err)
+			return
 		}
 		if value != FeedbackDown {
 			return
@@ -228,11 +224,6 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		meta := slackFeedbackMeta{Conversation: conversation, Task: taskID, Channel: p.Channel.ID, Thread: thread, Message: p.Message.TS}
 		if _, err := s.feedbackAPI.OpenViewContext(ctx, p.TriggerID, slackFeedbackModal(meta, recorder.KeptDays())); err != nil {
 			s.log.Warn("slack: opening the feedback note failed; the 👎 is kept without one", "channel", p.Channel.ID, "err", err)
-		}
-		if ask := s.feedbackAsk(ctx, p.Channel.ID, thread, p.Message.TS); ask != "" {
-			if err := recorder.AddAsk(rating, ask); err != nil {
-				s.log.Warn("slack: adding the ask to a rating failed", "channel", p.Channel.ID, "taskId", taskID, "err", err)
-			}
 		}
 	})
 }
@@ -296,49 +287,4 @@ func (s *SlackAdapter) feedbackNote(raw json.RawMessage) {
 			s.log.Warn("slack: thanking a rater failed", "channel", meta.Channel, "err", err)
 		}
 	})
-}
-
-// feedbackAsk reads the conversation up to the rated message for its ask:
-// the last message a person wrote before it, as an eval prompt reads it (the
-// bot's mention gone, spaces collapsed). Slack timestamps compare as
-// strings: whole seconds of a fixed width, then the fraction. A read that
-// fails finds what it can; the rating is kept either way.
-func (s *SlackAdapter) feedbackAsk(ctx context.Context, channel, thread, ratedTS string) string {
-	var msgs []slack.Message
-	if thread != "" && thread != ratedTS {
-		params := &slack.GetConversationRepliesParameters{ChannelID: channel, Timestamp: thread,
-			Latest: ratedTS, Inclusive: true, Limit: slackFeedbackRepliesPage}
-		for range slackFeedbackRepliesPages {
-			page, more, cursor, err := s.feedbackAPI.GetConversationRepliesContext(ctx, params)
-			if err != nil {
-				s.log.Warn("slack: reading a rated thread failed", "channel", channel, "err", err)
-				break
-			}
-			msgs = append(msgs, page...)
-			if !more || cursor == "" {
-				break
-			}
-			params.Cursor = cursor
-		}
-	} else {
-		// A top-level answer: the channel's last few messages up to it,
-		// which Slack returns newest first.
-		resp, err := s.feedbackAPI.GetConversationHistoryContext(ctx, &slack.GetConversationHistoryParameters{
-			ChannelID: channel, Latest: ratedTS, Inclusive: true, Limit: slackFeedbackHistory})
-		if err != nil {
-			s.log.Warn("slack: reading a rated conversation failed", "channel", channel, "err", err)
-		} else {
-			for i := len(resp.Messages) - 1; i >= 0; i-- {
-				msgs = append(msgs, resp.Messages[i])
-			}
-		}
-	}
-	ask := ""
-	for _, m := range msgs {
-		agent := m.BotID != "" || (s.botUserID != "" && m.User == s.botUserID)
-		if m.Timestamp < ratedTS && !agent {
-			ask = m.Text
-		}
-	}
-	return strings.Join(strings.Fields(slackEntitiesReduced(ask)), " ")
 }

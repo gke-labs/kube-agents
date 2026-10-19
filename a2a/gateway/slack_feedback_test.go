@@ -18,8 +18,8 @@ type fakeRecorder struct {
 	mu      sync.Mutex
 	admit   map[string]bool
 	ratings []FeedbackRating
-	asks    []string
 	notes   []string
+	rateErr error
 	noteErr error
 	// onRate runs inside Rate, for a test that checks what had happened
 	// by then.
@@ -36,14 +36,7 @@ func (f *fakeRecorder) Rate(r FeedbackRating) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ratings = append(f.ratings, r)
-	return nil
-}
-
-func (f *fakeRecorder) AddAsk(_ FeedbackRating, ask string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.asks = append(f.asks, ask)
-	return nil
+	return f.rateErr
 }
 
 func (f *fakeRecorder) Note(r FeedbackRating, note string) error {
@@ -203,7 +196,7 @@ func TestSlackUpRatingIsRecordedAndIsNoTurn(t *testing.T) {
 		t.Fatal("a rating is never a turn")
 	}
 	if len(rec.ratings) != 1 || rec.ratings[0].Rating != FeedbackUp || rec.ratings[0].TaskID != "t-root" ||
-		rec.ratings[0].Conversation != "slack:C1/40.0" || rec.ratings[0].Answer != "" || len(rec.asks) != 0 {
+		rec.ratings[0].Conversation != "slack:C1/40.0" || rec.ratings[0].Answer != "" {
 		t.Fatalf("ratings = %+v, want one bare 👍 on t-root", rec.ratings)
 	}
 	if len(api.views) != 0 || len(api.ephemerals) != 0 {
@@ -242,9 +235,7 @@ func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 	if r.Rating != FeedbackDown || r.Answer != "*It is OOMKilled.*" {
 		t.Errorf("rating = %+v, want the 👎 with the rated answer", r)
 	}
-	if len(rec.asks) != 1 || rec.asks[0] != "why is payments-api crashing?" {
-		t.Errorf("asks = %q, want the ask without the mention", rec.asks)
-	}
+
 }
 
 func TestSlackRatingFromAnUnverifiedSenderChangesNothing(t *testing.T) {
@@ -301,19 +292,12 @@ func TestSlackNoteThatWasNotKeptThanksNobody(t *testing.T) {
 	}
 }
 
-func TestSlackAskIsTheLastMessageAPersonWroteBeforeTheAnswer(t *testing.T) {
+func TestSlackFailedDownWriteOpensNoModal(t *testing.T) {
 	a, rec, api := newFeedbackSlackAdapter()
-	api.replies = []slack.Message{
-		threadMsg("40.0", "U3", "", "<@UBOT> is checkout healthy?"),
-		threadMsg("41.0", "U4", "", "a colleague's aside"),
-		threadMsg("45.0", "UBOT", "B1", "It is."),
-		threadMsg("46.0", "U1", "", "are you sure?"),
-		threadMsg("50.0", "UBOT", "B1", "*It is OOMKilled.*"),
-	}
+	rec.rateErr = errFeedbackContended
 	a.interactive(ratingPayload(t, "U1", FeedbackDown))
-	// Only the ask is read out of the thread; nothing else of it is kept.
-	if len(rec.asks) != 1 || rec.asks[0] != "are you sure?" {
-		t.Errorf("asks = %q, want the last message a person wrote before the answer", rec.asks)
+	if len(api.views) != 0 {
+		t.Error("the modal says the answer is kept; with the write failed it must not open")
 	}
 }
 

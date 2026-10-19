@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +30,9 @@ const (
 	feedbackSinceUsage    = "only ratings this recent: a Go duration, or a whole number of days such as 7d (default: every kept rating)"
 	feedbackDaySuffix     = "d"
 	feedbackDay           = 24 * time.Hour
+	// feedbackMaxDays bounds a --since in days below time.Duration's
+	// overflow.
+	feedbackMaxDays = int(math.MaxInt64 / int64(feedbackDay))
 	feedbackClientName    = "a2a-gateway-feedback-export"
 	feedbackUsage         = "usage: /gateway feedback export [--since 7d] > feedback.tar"
 )
@@ -53,6 +57,11 @@ func feedbackMain(ctx context.Context, args []string, out, errOut io.Writer, log
 	since := fs.String(feedbackSinceFlag, "", feedbackSinceUsage)
 	if err := fs.Parse(args[2:]); err != nil {
 		return err
+	}
+	if fs.NArg() > 0 {
+		// A window typed without --since would otherwise export everything.
+		fmt.Fprintln(errOut, feedbackUsage)
+		return errFeedbackUsage
 	}
 	window, err := parseSince(*since)
 	if err != nil {
@@ -91,7 +100,7 @@ func parseSince(s string) (time.Duration, error) {
 	}
 	if days, ok := strings.CutSuffix(s, feedbackDaySuffix); ok {
 		n, err := strconv.Atoi(days)
-		if err != nil || n <= 0 {
+		if err != nil || n <= 0 || n > feedbackMaxDays {
 			return 0, fmt.Errorf("--%s %q: not a whole number of days", feedbackSinceFlag, s)
 		}
 		return time.Duration(n) * feedbackDay, nil
