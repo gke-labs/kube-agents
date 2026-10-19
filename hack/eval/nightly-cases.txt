@@ -1189,3 +1189,8 @@
 # the workload, rather than waiting for it (#2978). Worker-scope checks, so it
 # grades on the api lanes; fixture no-pdb-workload on seeded-a.
 ./tasks/fanout-absent-cluster-cards-complete/task.yaml
+
+# The front door's "what can you do?" calls a per-cluster agent "the <cluster>
+# cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
+# one front-door turn with no card: +3 units.
+./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
