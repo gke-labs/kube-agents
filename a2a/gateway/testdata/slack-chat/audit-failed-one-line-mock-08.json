@@ -1,0 +1,251 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "my-project",
+                "type": "text"
+              },
+              {
+                "text": ", but could not publish its findings because no GitOps repository is registered in the ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "platform-agent-gitops-state",
+                "type": "text"
+              },
+              {
+                "text": " ConfigMap.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "Here is the latest scheduled GCP networking fabric and VPC IPAM audit report from the platform agent.",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n\n",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "What's wrong",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "The GCP networking fabric and VPC IPAM audit ran and identified 2 critical firewall issues in project ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "my-project",
+                    "type": "text"
+                  },
+                  {
+                    "text": ", but could not publish its findings because no GitOps repository is registered in the ",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "platform-agent-gitops-state",
+                    "type": "text"
+                  },
+                  {
+                    "text": " ConfigMap.",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n\n",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Why",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "FirewallRule/default-allow-rdp",
+                        "type": "text"
+                      },
+                      {
+                        "text": " — ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "sourceRanges 0.0.0.0/0",
+                        "type": "text"
+                      },
+                      {
+                        "text": " allows ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "tcp:3389",
+                        "type": "text"
+                      },
+                      {
+                        "text": " (RDP) with no target restriction.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "FirewallRule/default-allow-ssh",
+                        "type": "text"
+                      },
+                      {
+                        "text": " — ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "sourceRanges 0.0.0.0/0",
+                        "type": "text"
+                      },
+                      {
+                        "text": " allows ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "tcp:22",
+                        "type": "text"
+                      },
+                      {
+                        "text": " (SSH) with no target restriction.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "What to do",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Register a GitOps repository",
+                        "type": "text"
+                      },
+                      {
+                        "text": " — add one to the ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "platform-agent-gitops-state",
+                        "type": "text"
+                      },
+                      {
+                        "text": " ConfigMap so future audits can open a ledger issue.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "why",
+          "type": "plain_text"
+        },
+        "type": "container"
+      }
+    ],
+    "attachments": []
+  }
+]

@@ -1,0 +1,130 @@
+name: Merge Gate
+
+# The merge queue's two gate checks: `Smoke gate` and `Merge labels` (#1363). Each stands in for something Tide decides today that no required
+# GitHub check covers; `scripts/merge_gate.py`'s docstring says what each one
+# reads and is the reference.
+#
+# The queue asks twice. A pull request must pass every required check to enter
+# it, so the `pull-request` job posts the two verdicts as commit statuses on
+# the pull request head when an input changes: a push, a label or a new smoke
+# status. A label that `hold-unresolved-threads.yml`
+# changes with `GITHUB_TOKEN` starts no run here; the enqueue sweep re-posts
+# the statuses of approved pull requests on its schedule. A status, not the job's own check
+# run: a run started by `status` attaches to the default branch, where the
+# queue does not look. Then the queue runs every required check again on its
+# own commit, and the `gate` jobs decide the same two
+# there under the check names themselves. The queue must group with
+# `ALLGREEN`; the script says why.
+#
+# Until a merge queue is enabled on `main` nothing requires these and
+# `merge_group` never fires. Tide does read them, as it reads every posted
+# context, so the head statuses are posted green only; `post_verdicts` in the
+# script says why. Tide also reads this job's own check run on the pull
+# request head, where a cancelled or failed run holds the merge, so the job
+# has no concurrency group (a superseded pending run is cancelled) and on
+# that trigger no step can fail it.
+on:
+  # zizmor: ignore[dangerous-triggers] - the job checks out the default
+  # branch only (the script) and reads pull-request state through the API;
+  # no pull-request content reaches the write token's context.
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+    # `merge-queue-dry-run` is the scratch copy of `main` that the dry run
+    # puts a queue on (`DRY_RUN_BASE` in the script). Its own copy of this
+    # file widens the `merge_group` filter below; this one is read from
+    # `main`, so the scratch branch is named here.
+    branches: [main, merge-queue-dry-run]
+  status:
+  merge_group:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  pull-request:
+    name: Post the merge gate statuses on the pull request head
+    # The repository guard, by the convention for workflows that write. The
+    # rest keeps events that cannot change a verdict off a runner: other
+    # labels, the statuses of every other context, which is most of the
+    # `status` events this repository sees.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      ((github.event_name == 'pull_request_target' &&
+        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+          github.event.label.name == 'lgtm' ||
+          github.event.label.name == 'approved' ||
+          startsWith(github.event.label.name, 'do-not-merge'))) ||
+        (github.event_name == 'status' &&
+          github.event.context == 'pull-kube-agents-smoke-test'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the default branch: the script
+      pull-requests: read # the pull request's labels and files
+      statuses: write # post the two gate statuses on its head
+    steps:
+      # The default branch, never a pull request head: this job holds a
+      # writable token and must not run code from a fork. `ref:` is explicit
+      # because on `pull_request_target` the fallback is the pull request's
+      # base branch.
+      - name: Checkout the default branch
+        continue-on-error: ${{ github.event_name == 'pull_request_target' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # Event fields go in through the environment, never into the script
+      # text. On `pull_request_target` a failure here or in the checkout is
+      # logged and left to the next event: that run's check run sits on the
+      # pull request head, and a red one would hold the Tide merge of a pull
+      # request the gate exists only to describe. A `status` run attaches to
+      # the default branch and holds nothing, so it goes red and a failure
+      # that repeats stays visible.
+      - name: Post the statuses
+        continue-on-error: ${{ github.event_name == 'pull_request_target' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT: ${{ github.event_name }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.sha }}
+        run: |
+          if [ "$EVENT" = "status" ]; then
+            python3 scripts/merge_gate.py status --sha "$SHA"
+          else
+            python3 scripts/merge_gate.py pull --number "$NUMBER"
+          fi
+
+  gate:
+    # The job name is the required check's name.
+    name: ${{ matrix.gate }}
+    # No repository guard here, unlike the job above. A skipped job reports
+    # success to a required check, so a guard that ever evaluated false on a
+    # queue commit would pass every group. A fork has no merge queue and never
+    # sees this event.
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the default branch: the script
+      pull-requests: read # the queued pull request's head, labels and files
+      statuses: read # the smoke status on that head
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [Smoke gate, Merge labels]
+    steps:
+      # The default branch, not the group, for the script: a pull request
+      # that changes `scripts/merge_gate.py` is judged by the script already
+      # on `main`. This workflow file itself is read from the group, so a
+      # change to it is a change to the gate; the OWNERS review covers it.
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Judge the queued pull request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF: ${{ github.event.merge_group.head_ref }}
+          GATE: ${{ matrix.gate }}
+        run: python3 scripts/merge_gate.py group --ref "$REF" --gate "$GATE"

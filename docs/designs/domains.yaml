@@ -77,11 +77,14 @@ domains:
     # card". Opening it is the remediation domain's journey, one row above.
     journey: A warning event is triaged to a root cause and remediation options a human authorizes, never a cluster write
 
-# Known-uncovered. One entry; empty is Phase 2's exit criterion. The two
+# Known-uncovered. Three entries; empty is Phase 2's exit criterion. The two
 # kanban probes cover chat-and-routing; cluster-debugging came off first
 # among the Phase 2 domains, in #939. Reliability, capacity, security,
-# upgrades, consistency and cost are covered by the six domain probes --
+# consistency and cost are covered by five domain probes (upgrades' probe
+# was demoted to the nightly on 2026-10-16, #3269, below) --
 # see the header above for why probes rather than six full audits.
+# remediation's one roster case, pdb-remediation-pr, was demoted to the
+# nightly on 2026-10-17 (#3120, below).
 # incident-triage came off in #1045, once bench/tf/prebuilt/autoops-incident
 # gave autoops-warning-event-triage an incident to triage (note that
 # gpu-stress-test-diagnosis never covered it, being a chat-prompted
@@ -102,3 +105,18 @@ allowlist:
   # nightly tier (#1175). incident-triage sat here from 2026-09-03 to
   # 2026-09-22 for the same shape of reason.
   - fleet-audits
+  # upgrades, since 2026-10-16 (#3269): the domain's one presubmit case,
+  # upgrades-lagging-master-probe, was demoted to the nightly that day after
+  # the agent began reading the channel's upgradeTargetVersion as its target and
+  # failed it on unrelated pull requests.
+  # Delete this entry in the pull request that restores it to the roster.
+  - upgrades
+  # remediation, since 2026-10-17 (#3120): the domain's one presubmit case,
+  # pdb-remediation-pr (on the roster from 2026-10-14, #2016), was demoted to
+  # the nightly that day after it collapsed on unrelated pull requests, the
+  # worker declining to open a pull request into a pool -infra repository that
+  # holds no manifest for checkout-gateway (#3145 seeds one).
+  # rca-remediation-pr stays nightly (#1189). It sat here from 2026-09-22 to
+  # 2026-10-14 too. Delete this entry in the pull request that restores
+  # pdb-remediation-pr to the roster.
+  - remediation

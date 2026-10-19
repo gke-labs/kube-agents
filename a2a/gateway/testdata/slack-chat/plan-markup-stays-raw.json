@@ -4,36 +4,30 @@
     "carrier": "notify",
     "blocks": [
       {
-        "tasks": [
-          {
-            "details": {
+        "details": {
+          "elements": [
+            {
               "elements": [
                 {
                   "elements": [
                     {
-                      "elements": [
-                        {
-                          "text": "◌ see <!here> <https://evil.example|docs>",
-                          "type": "text"
-                        }
-                      ],
-                      "type": "rich_text_section"
+                      "text": "◌ see <!here> <https://evil.example|docs>",
+                      "type": "text"
                     }
                   ],
-                  "style": "bullet",
-                  "type": "rich_text_list"
+                  "type": "rich_text_section"
                 }
               ],
-              "type": "rich_text"
-            },
-            "status": "in_progress",
-            "task_id": "t_a",
-            "title": "see <!here> <https://evil.example|docs>",
-            "type": "task_card"
-          }
-        ],
-        "title": "R&D: roll back",
-        "type": "plan"
+              "style": "bullet",
+              "type": "rich_text_list"
+            }
+          ],
+          "type": "rich_text"
+        },
+        "status": "in_progress",
+        "task_id": "t_a",
+        "title": "see <!here> <https://evil.example|docs>",
+        "type": "task_card"
       }
     ],
     "attachments": []

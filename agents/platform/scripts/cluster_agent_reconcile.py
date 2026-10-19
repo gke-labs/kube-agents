@@ -58,7 +58,6 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -83,7 +82,9 @@ DESCRIBE_TIMEOUT_SECONDS = 30
 # The reconcile notice's kill timeout for `hermes send`; a routed send gets
 # at least `a2a notify`'s own bound (chat_notify.subprocess_timeout).
 NOTIFY_SEND_TIMEOUT_SECONDS = 30
-_MD_BASE = "http://metadata.google.internal/computeMetadata/v1/"
+# The management project as the operator renders it from the CR's harness
+# (platformagent_manifests.go, GKE_PROJECT_ID on the agent container).
+OPERATOR_PROJECT_ENV = "GKE_PROJECT_ID"
 EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") if c}
 
 # Where the operator renders spec.scope (platformagent_manifests.go, scopeFileEnvKey). The
@@ -273,31 +274,46 @@ def _run_env() -> dict[str, str]:
     return {**os.environ, "HOME": "/tmp"}
 
 
-def _metadata(path: str):
-    """Read a GKE/GCE metadata value, or None if unavailable."""
-    try:
-        req = urllib.request.Request(_MD_BASE + path, headers={"Metadata-Flavor": "Google"})
-        # Context-managed: this runs on a cron tick, so a socket left to the garbage
-        # collector is a socket leaked once per tick, forever.
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.read().decode().strip()
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _project_source() -> tuple[str | None, bool]:
     """The management project and whether the answer is authoritative.
 
-    The metadata server is authoritative, and so is RECONCILE_PROJECT where it
-    still reaches this script: the operator pins it empty in the managed .env, so
-    that a line in the PVC .env cannot re-point the management project and have
-    the scope prune retire the real one, and an empty value reads as unset. The
-    gcloud config fallback is not authoritative: it answers whatever the broker
-    was bootstrapped with, so a metadata timeout can make it name a project the
-    pod does not run in, and the reconcile must not read that as the management
-    project having changed.
+    RECONCILE_PROJECT, then the operator's GKE_PROJECT_ID, are authoritative.
+    Both are pinned in the managed .env, which the agent cannot outrank from the
+    PVC .env (RECONCILE_PROJECT empty, which reads as unset; GKE_PROJECT_ID to
+    the harness's value), so a line the agent writes cannot re-point the
+    management project and have the scope prune retire the real one. No
+    metadata server is asked: the gateway pod reaches none once its Workload
+    Identity is gone. A GKE_PROJECT_ID that is a project number is resolved to
+    its ID through the broker; if that fails the run is unresolved. The gcloud
+    config fallback, reached only with no operator project at all, is not
+    authoritative: it answers whatever the broker was bootstrapped with, and the
+    reconcile must not read that as the management project having changed.
     """
-    p = os.environ.get("RECONCILE_PROJECT") or _metadata("project/project-id")
+    operator_project = os.environ.get(OPERATOR_PROJECT_ENV, "").strip()
+    if operator_project.isdigit():
+        # A harness can carry the project NUMBER (no CRD pattern refuses it).
+        # The snapshot records the project ID, so the number is resolved to
+        # its ID through the broker rather than used as it stands, which would
+        # read as the management project having changed and retire its
+        # profiles. The metadata server that used to answer here is closed to
+        # the gateway, so without this a numeric harness would leave the
+        # management project unresolved on every tick. An ID the scope cannot
+        # carry, or a failed lookup, is not an answer.
+        resolved, outcome = _project_id_of(operator_project)
+        if not (resolved and outcome == OUTCOME_OK):
+            # Not even the non-authoritative fallback: the broker's gcloud config
+            # was bootstrapped from this same variable, so it would answer the same
+            # number, and on a tick with no snapshot to disagree with, the number
+            # would stand as the management project and key every profile on it.
+            # An unresolved management project skips this run; the next tick asks
+            # again.
+            return None, False
+        operator_project = resolved
+    # No metadata rung: this change closes the gateway's route to the metadata
+    # server, and the CRD requires spec.harness.projectId, so GKE_PROJECT_ID is
+    # always rendered (and pinned in the managed .env, which the agent cannot
+    # outrank from the PVC .env).
+    p = os.environ.get("RECONCILE_PROJECT") or operator_project
     if p:
         return p, True
     try:

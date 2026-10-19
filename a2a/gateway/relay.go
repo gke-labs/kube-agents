@@ -249,6 +249,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 // rolling-line edit; posts always happen.
 func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
 	env := item.env
+	if g.sessionForTask(ctx, env.TaskID) != rec.Key {
+		return
+	}
 	rs := g.relayFor(env.TaskID)
 
 	switch env.Kind {
@@ -285,6 +288,7 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 			ask = "the task needs input to continue"
 		}
 		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: layoutOf(question)})
+		g.markFrom(rec, taskID, question)
 		g.updateRollingLine(rec, taskID, rs)
 	default:
 		// A steer notice is the executor's word on one follow-up and is
@@ -313,11 +317,14 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 		// A chat message here is the live message's whole state, so one
 		// without it returns the line to text.
-		rs.lineChat = layoutOf(g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts))
+		progress := g.readChat(rec.Key, taskID, chatmsg.Progress, a.Artifact.Parts)
+		rs.lineChat = layoutOf(progress)
 		if rs.lineChat != nil && rs.lineRefused != "" && lineKey("", rs) == rs.lineRefused {
 			// The backend refused this very layout already.
 			rs.lineChat = nil
 		}
+		// The mark is state whatever the batch renders.
+		g.markFrom(rec, taskID, progress)
 		if render {
 			g.updateRollingLine(rec, taskID, rs)
 		}
@@ -348,6 +355,7 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		// since it is not the deliverable the console reads off TASKS.
 		notice := g.readChat(rec.Key, taskID, chatmsg.Notice, a.Artifact.Parts)
 		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: layoutOf(notice)})
+		g.markFrom(rec, taskID, notice)
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
 		rs.sawDelegate = true
@@ -455,10 +463,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// A chat message needs its text fallback, so a non-text result
 		// posts the notice alone.
 		answer := OutMessage{Text: result}
+		var answerChat chatmsg.Reading
 		if result == "" {
 			answer.Text = completedNonTextResult
 		} else if !isConsoleConversation(rec.Key) {
-			answer.Chat = g.resultChat(rec.Key, taskID, rs, replayedResult)
+			answerChat = g.resultChat(rec.Key, taskID, rs, replayedResult)
+			answer.Chat = layoutOf(answerChat)
 		}
 		result = answer.Text
 		// The console renders answers straight off TASKS, so posting the
@@ -470,8 +480,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// post IS the answer. The replay above is skipped for the same
 		// backends, so reaching here with an empty result costs nothing.
 		if !isConsoleConversation(rec.Key) {
-			g.postMessage(rec.Key, answer)
+			if ref.TerminalObserved && result == completedNonTextResult {
+				// The heal already posted the status card; skip completedNonTextResult.
+			} else {
+				g.postMessage(rec.Key, answer)
+			}
 		}
+		g.markFrom(rec, taskID, answerChat)
 	case lib.StateFailed:
 		reason := ""
 		if s.Status.Message != nil {
@@ -504,10 +519,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	}
 	g.postSteerShortfall(rec, rs, taskID)
 	g.flushNotices(rec.Key, rs)
-	// The terminal's chat message is its mark alone, with no fallback.
+	// The terminal's chat message is its mark alone, with no fallback; a
+	// terminal without one takes the default (applyTerminalMark). After the
+	// answer, so the ask's reaction comes off once the answer is posted.
+	var terminal chatmsg.Reading
 	if s.Status.Message != nil {
-		g.relayMark(rec.Key, taskID, g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts))
+		terminal = g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts)
 	}
+	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" {
@@ -519,11 +538,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			}
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs)
 		}
+		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
-		// An executor's end of a live task is activity. The idle TTL that
-		// bounds the session (the reap, and the Slack adapter's session-
-		// thread rule through hasSession) counts from here, not from the ask
-		// that started the task: a long task's thread must not go quiet the
+		// An executor's end of a live task is activity. The Slack adapter's
+		// session-thread rule (hasSession, through LastTaskActivity) counts
+		// from here, not from the ask that started the task; the reap does
+		// not, it counts from the last user message (idleSince): a long task's thread must not go quiet the
 		// instant its answer posts, and the user's follow-up right after the
 		// result is the most ordinary message a session carries. The
 		// executor's confirmation of a stop is an answer too: a detached
@@ -592,7 +612,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// chain's (observedAs): a turn that delegated and a child end quietly,
 	// and the root's one terminal comes from the wake or, when none runs,
 	// from observeChildEnd below.
-	g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	if !ref.TerminalObserved {
+		g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	}
 
 	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
@@ -602,7 +624,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if turnsUnread {
 			wakeResult, wakeReason = withTurnsUnread(result), withTurnsUnread(reason)
 		}
-		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true); !woken {
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true, cardsPending(s.Status.State, terminal)); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}
@@ -678,6 +700,7 @@ func (g *Gateway) flushTurn(rec *SessionRecord, rs *relayState, taskID string) {
 	if text != "" && !isConsoleConversation(rec.Key) {
 		turn := g.readChatArtifact(rec.Key, taskID, chatmsg.Turn, chunks)
 		g.postMessage(rec.Key, OutMessage{Text: text, Chat: layoutOf(turn)})
+		g.markFrom(rec, taskID, turn)
 	}
 }
 

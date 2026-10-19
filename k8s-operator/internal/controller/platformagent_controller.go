@@ -240,6 +240,18 @@ const (
 	// directly after a full stop.
 	hostPathDroppedRollingClause = " That template is still rolling out, so Pods from an earlier revision may still be " +
 		"running with these volumes mounted."
+	// watcherAudienceDroppedEntryFormat and watcherAudienceDroppedMessageFormat are
+	// the same condition's report of the other volumes the render strips:
+	// those that would hand a container the watchers' broker token (see
+	// watcherTokenSourceNames). The webhook refuses the reserved name but not a
+	// projection of the watcher audience under another name, so without this a
+	// sidecar would lose a mount its author wrote with nothing in status to say
+	// why.
+	watcherAudienceDroppedEntryFormat   = "%s[%d] %q"
+	watcherAudienceDroppedMessageFormat = "Volumes that would deliver the credential proxy's watcher token are left out " +
+		"of the Pod template the operator renders, along with every volumeMount naming them: %s. That token belongs " +
+		"to the gateway's agent-api-auth container alone; any other container holding it would hold the broker's " +
+		"watcher role on every fleet cluster. Remove the entries from the spec to clear this condition."
 	hostPathDroppedEntrySeparator = ", "
 	// hostPathDroppedEntryBudget bounds the joined entries, and
 	// hostPathDroppedOverflowFormat counts whatever did not fit. Volume names
@@ -286,6 +298,10 @@ const (
 
 	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
+	// reasonReservedServiceAccount: spec.security.serviceAccountName names a
+	// ServiceAccount the operator creates for another workload. See
+	// ReservedServiceAccountOverride.
+	reasonReservedServiceAccount = "ReservedServiceAccountName"
 )
 
 var (
@@ -643,8 +659,30 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}()
 	}
 
-	// 3. Reconcile Service Account (with Workload Identity annotation)
+	// 2z. Refuse an override that names one of the operator's own
+	// ServiceAccounts, before step 3 writes it with the broker's Workload
+	// Identity annotation. The webhook refuses it at admission, but the chart
+	// ships the webhook off and it fails open, so this is the check that holds.
+	// The same rescue as the volume refusal below: keep the guardrails, render
+	// no workload.
+	if msg := ReservedServiceAccountOverride(instance); msg != "" {
+		log.Info(msg)
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, workloadNotRendered); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 3. Reconcile Service Account (with Workload Identity annotation): the
+	// broker's. And the gateway's own, which carries none.
 	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileGatewayServiceAccount(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 	// 3b. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
@@ -1153,6 +1191,13 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, commonLabels(agent), fieldOwner)
 }
 
+// reconcileGatewayServiceAccount mints the gateway Pod's own ServiceAccount,
+// with no annotations, so it resolves to no Google identity. Unconditional:
+// a user-owned spec.security.serviceAccountName is the broker's now.
+func (r *PlatformAgentReconciler) reconcileGatewayServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, gatewayServiceAccountName(agent), agent.Namespace, nil, commonLabels(agent), fieldOwner)
+}
+
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	pvcs := []*corev1.PersistentVolumeClaim{
 		buildPVC(agent),
@@ -1404,7 +1449,7 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 				next = agentv1alpha1.DefaultGitHubHost
 			}
 			r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonGitHubHostChanged, fmt.Sprintf(
-				"the install's GitHub host changed from %s to %s; the first GitHub forge declared that can be served decides it, and repositories registered on %s are no longer served",
+				"the install's GitHub host changed from %s to %s; the first GitHub forge declared decides it, and repositories registered on %s are no longer served",
 				previous, next, previous))
 			if found.Data == nil {
 				found.Data = map[string]string{}
@@ -3188,6 +3233,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	}
 
 	crbMinimal := buildClusterRoleBinding(agent, minimalBindingName, minimalRole.Name)
+	// The gateway's own ServiceAccount takes the same read-only grant: its
+	// agent-api-auth container watches and joins the management cluster with
+	// an in-cluster token. Same rules, a second principal; no new permission.
+	crbMinimal.Subjects = append(crbMinimal.Subjects, gatewaySubject(agent))
 	if err := r.applyManaged(ctx, agent, crbMinimal); err != nil {
 		return fmt.Errorf("failed to reconcile minimal ClusterRoleBinding: %w", err)
 	}
@@ -3202,6 +3251,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	}
 
 	localBinding := buildRoleBinding(agent, localBindingName, localRole.Name)
+	// The gateway's drift detector joins audit records by reading the object
+	// they name, PlatformAgents included (cmd/drift-detector/join.go). Same
+	// read-only grant, a second principal.
+	localBinding.Subjects = append(localBinding.Subjects, gatewaySubject(agent))
 	if err := ctrl.SetControllerReference(agent, localBinding, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on local RoleBinding: %w", err)
 	}
@@ -4198,19 +4251,47 @@ func (r *PlatformAgentReconciler) gatewayRollIncomplete(ctx context.Context, age
 // hostPath entries the render left out of the Pod template, or "" when the
 // spec carries none and the condition is to be absent.
 func hostPathDroppedMessage(agent *agentv1alpha1.PlatformAgent, oldPods oldPodsPossible) string {
-	dropped := hostPathVolumes(agent)
-	if len(dropped) == 0 {
-		return ""
+	var parts []string
+	if dropped := hostPathVolumes(agent); len(dropped) > 0 {
+		entries := make([]string, 0, len(dropped))
+		for _, d := range dropped {
+			entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
+		}
+		rolling := ""
+		if oldPods {
+			rolling = hostPathDroppedRollingClause
+		}
+		parts = append(parts, fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries), rolling))
 	}
-	entries := make([]string, 0, len(dropped))
-	for _, d := range dropped {
-		entries = append(entries, fmt.Sprintf(hostPathDroppedEntryFormat, d.field, d.index, d.name, d.path))
+	if entries := watcherTokenDroppedEntries(agent); len(entries) > 0 {
+		parts = append(parts, fmt.Sprintf(watcherAudienceDroppedMessageFormat, hostPathDroppedEntryList(entries)))
 	}
-	rolling := ""
-	if oldPods {
-		rolling = hostPathDroppedRollingClause
+	return strings.Join(parts, " ")
+}
+
+// watcherTokenDroppedEntries names, field and index, each user volume the
+// render strips for delivering the watcher token: the set
+// watcherTokenSourceNames builds, read back against the two volume lists.
+func watcherTokenDroppedEntries(agent *agentv1alpha1.PlatformAgent) []string {
+	if agent.Spec.Deployment == nil {
+		return nil
 	}
-	return fmt.Sprintf(hostPathDroppedMessageFormat, hostPathDroppedEntryList(entries), rolling)
+	sources := watcherTokenSourceNames(agent)
+	var entries []string
+	for _, list := range []struct {
+		field   string
+		volumes []corev1.Volume
+	}{
+		{hostPathExtraVolumesField, agent.Spec.Deployment.ExtraVolumes},
+		{hostPathSidecarVolumesField, agent.Spec.Deployment.SidecarVolumes},
+	} {
+		for i, v := range list.volumes {
+			if sources[v.Name] {
+				entries = append(entries, fmt.Sprintf(watcherAudienceDroppedEntryFormat, list.field, i, v.Name))
+			}
+		}
+	}
+	return entries
 }
 
 // hostPathDroppedEntryList joins as many entries as fit in

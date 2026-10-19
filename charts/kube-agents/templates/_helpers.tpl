@@ -207,6 +207,42 @@ true
 {{- end }}
 
 {{/*
+Whether the agent's ServiceMonitors render. platformAgent.serviceMonitor is a
+tri-state: true and false are answers, and null (the default) follows the
+cluster — the ServiceMonitor API is served where Prometheus Operator is
+installed. Pass --api-versions monitoring.coreos.com/v1/ServiceMonitor to helm
+template to see the default render.
+*/}}
+{{- define "kube-agents.platformAgentServiceMonitor" -}}
+{{- $explicit := .Values.platformAgent.serviceMonitor -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor" -}}
+true
+{{- end -}}
+{{- else if $explicit -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the agent's VMPodScrapes render. platformAgent.vmPodScrape is a
+tri-state: true and false are answers, and null (the default) follows the
+cluster — the VMPodScrape API is served where VictoriaMetrics Operator is
+installed. Pass --api-versions operator.victoriametrics.com/v1beta1/VMPodScrape
+to helm template to see the default render.
+*/}}
+{{- define "kube-agents.platformAgentVMPodScrape" -}}
+{{- $explicit := .Values.platformAgent.vmPodScrape -}}
+{{- if kindIs "invalid" $explicit -}}
+{{- if .Capabilities.APIVersions.Has "operator.victoriametrics.com/v1beta1/VMPodScrape" -}}
+true
+{{- end -}}
+{{- else if $explicit -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 The OTLP/HTTP collector base URL for the chart's own consumers (the LiteLLM exporter).
 
 Unset means the GKE Managed OpenTelemetry collector, which is what these consumers have
@@ -425,6 +461,227 @@ decidable here, and the docs say so.
 {{- end }}
 
 {{/*
+The egress litellm-policy needs for an openai_compatible server, as the compact JSON the
+operator reads from the kubeagents.x-k8s.io/litellm-upstream-egress annotation, or ""
+when the policy's port-443 rule already reaches the server. The static policy in
+litellm.yaml renders its rule from the same string, so the two copies cannot disagree.
+
+Read off litellm.openaiCompatible.apiBase, first match wins:
+- An in-cluster Service (<svc>, <svc>.<ns>.svc, or <svc>.<ns>.svc.cluster.local; a bare
+  <svc> is the release's own namespace, the way kubectl prints it) is
+  {"namespace":"<ns>","port":<targetPort>}. A two-label <a>.<b> is a hostname here, not
+  <svc>.<ns> as the OTLP lookup reads it: public endpoints such as openrouter.ai have no
+  longer name, and reading "ai" as a namespace would open egress to it. The pod's port,
+  not the URL's: NetworkPolicy matches after the Service has translated the address, so
+  the Service port opens nothing.
+- Otherwise a non-empty egressCIDRs is {"cidrs":[...],"port":<the URL's port>}.
+- Otherwise a host on port 443 that is not a private or IPv6 literal needs no rule: it
+  leaves over the port-443 rule, which reaches public addresses. A hostname that
+  resolves to a private address is not decidable here; egressCIDRs is the remedy.
+- Anything else fails: a NetworkPolicy cannot name a DNS name, and both copies of the
+  443 rule except private space (the static one has no IPv6 peer at all).
+
+Every refusal is a fail naming the value. One shape it cannot judge: a two-label host on
+443 may be a public endpoint or a short in-cluster Service name, so it renders with no
+rule and NOTES.txt warns. Callers include it only when litellm.modelProvider is
+openai_compatible.
+*/}}
+{{- define "kube-agents.openaiCompatibleEgress" -}}
+{{- $values := .Values.litellm.openaiCompatible | default dict -}}
+{{- $apiBase := $values.apiBase | default "" | toString -}}
+{{- /* The operator's cap on the annotation's cidrs list (maxLiteLLMUpstreamCIDRs). */ -}}
+{{- $maxCIDRs := 50 -}}
+{{- $maxPort := 65535 -}}
+{{- $httpsPort := 443 -}}
+{{- $httpPort := 80 -}}
+{{- if empty $apiBase -}}
+{{- fail "litellm.modelProvider 'openai_compatible' needs litellm.openaiCompatible.apiBase: the server's OpenAI-compatible base URL, including /v1." -}}
+{{- end -}}
+{{- if not (regexMatch "^https?://" $apiBase) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q must start with http:// or https:// (lowercase)." $apiBase) -}}
+{{- end -}}
+{{- $hostport := $apiBase | trimPrefix "https://" | trimPrefix "http://" | splitList "/" | first -}}
+{{- $bracketed := hasPrefix "[" $hostport -}}
+{{- $host := splitList ":" $hostport | first -}}
+{{- if $bracketed -}}
+{{- $host = regexFind "^\\[[^\\]]*\\]" $hostport | trimPrefix "[" | trimSuffix "]" -}}
+{{- end -}}
+{{- $afterHost := regexReplaceAll "^(\\[[^\\]]*\\]|[^:]*)" $hostport "" -}}
+{{- /*
+  Userinfo, a query or a fragment in the authority would leave the host and port
+  unreadable, and anything after the host other than :<digits> is not a port.
+*/ -}}
+{{- if or (empty $host) (regexMatch "[?#@]" $hostport) (and $afterHost (not (regexMatch "^:[0-9]+$" $afterHost))) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q: the render cannot read the host and port off it. Give it as http(s)://host[:port]/path, with no userinfo, query, or fragment (the API key belongs in the credentials Secret as OPENAI_COMPATIBLE_API_KEY)." $apiBase) -}}
+{{- end -}}
+{{- $host = lower $host -}}
+{{- $port := ternary $httpsPort $httpPort (hasPrefix "https://" $apiBase) -}}
+{{- if $afterHost -}}
+{{- $port = trimPrefix ":" $afterHost | atoi -}}
+{{- end -}}
+{{- if or (lt $port 1) (gt $port $maxPort) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q: port %d is outside 1-%d." $apiBase $port $maxPort) -}}
+{{- end -}}
+{{- $ipv4 := regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" $host -}}
+{{- $labels := splitList "." $host -}}
+{{- $namespace := "" -}}
+{{- if not (or $bracketed $ipv4) -}}
+{{- if eq (len $labels) 1 -}}
+{{- $namespace = .Release.Namespace -}}
+{{- else if regexMatch "^[^.]+\\.[^.]+\\.svc(\\.cluster\\.local)?\\.?$" $host -}}
+{{- /* A trailing dot is the absolute spelling of the same name. */ -}}
+{{- $namespace = index $labels 1 -}}
+{{- end -}}
+{{- end -}}
+{{- /*
+  A host ending in .svc or .cluster.local that is not <svc>.<ns>.svc[.cluster.local]
+  is an in-cluster name with a part missing or extra (vllm.svc has no namespace).
+  It would otherwise pass as a public hostname and get no rule, so it is refused.
+*/ -}}
+{{- if and (not $namespace) (not $ipv4) (not $bracketed) (regexMatch "\\.(svc|cluster\\.local)\\.?$" $host) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q ends like an in-cluster Service name but is not <svc>.<ns>.svc or <svc>.<ns>.svc.cluster.local, so the gateway could not be given an egress rule for it. Write the Service with both its name and its namespace." $apiBase) -}}
+{{- end -}}
+{{- $egress := dict -}}
+{{- if $namespace -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$" $namespace) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q reads as an in-cluster Service in namespace %q, which is not a valid namespace name (a lowercase RFC 1123 label), so the egress rule would select nothing." $apiBase $namespace) -}}
+{{- end -}}
+{{- $targetPort := $values.targetPort -}}
+{{- if or (kindIs "invalid" $targetPort) (empty $targetPort) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q names an in-cluster Service in namespace %q (a bare host is <svc> in the release namespace), so litellm.openaiCompatible.targetPort is required: the server pod's port, which the egress rule names. NetworkPolicy matches after Service translation, so the Service port in the URL opens nothing." $apiBase $namespace) -}}
+{{- end -}}
+{{- $targetPort = int $targetPort -}}
+{{- if or (lt $targetPort 1) (gt $targetPort $maxPort) -}}
+{{- fail (printf "litellm.openaiCompatible.targetPort %d is outside 1-%d." $targetPort $maxPort) -}}
+{{- end -}}
+{{- $egress = dict "namespace" $namespace "port" $targetPort -}}
+{{- else if $values.egressCIDRs -}}
+{{- if gt (len $values.egressCIDRs) $maxCIDRs -}}
+{{- fail (printf "litellm.openaiCompatible.egressCIDRs holds %d entries; the operator accepts at most %d." (len $values.egressCIDRs) $maxCIDRs) -}}
+{{- end -}}
+{{- $cidrs := list -}}
+{{- range $values.egressCIDRs -}}
+{{- $entry := toString . | trim -}}
+{{- with include "kube-agents.openaiCompatibleCIDRRefusal" $entry -}}
+{{- fail (printf "litellm.openaiCompatible.egressCIDRs entry %q %s." $entry .) -}}
+{{- end -}}
+{{- $cidrs = append $cidrs $entry -}}
+{{- end -}}
+{{- $egress = dict "cidrs" $cidrs "port" $port -}}
+{{- else -}}
+{{- /* RFC 1918, CGNAT and link-local: the ranges the operator's 443 rule excepts. */ -}}
+{{- $privateIPv4 := and $ipv4 (regexMatch "^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|169\\.254\\.|100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.)" $host) -}}
+{{- /*
+  <a>.<b> is a hostname here, but it is also the short form of an in-cluster
+  Service, so a mistaken Service gets the hint. Not when <b> is already "svc":
+  that host is missing its namespace, and appending .svc would not fix it.
+*/ -}}
+{{- $serviceHint := "" -}}
+{{- if and (not $ipv4) (eq (len $labels) 2) (ne (index $labels 1) "svc") -}}
+{{- $serviceHint = printf " If this is an in-cluster Service, write it as <svc>.<ns>.svc (%s.svc)." $host -}}
+{{- end -}}
+{{- /* Any host that is not a Service ignores targetPort, so a set one means a Service was meant. */ -}}
+{{- if not (or (kindIs "invalid" $values.targetPort) (empty $values.targetPort)) -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q is a hostname, not an in-cluster Service, so litellm.openaiCompatible.targetPort is not used and no egress rule would reach the server.%s" $apiBase $serviceHint) -}}
+{{- end -}}
+{{- if or $bracketed $privateIPv4 -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q names a private or IPv6 address, which the gateway's port-443 rule does not reach. Set litellm.openaiCompatible.egressCIDRs to the CIDR(s) the server is reached at." $apiBase) -}}
+{{- else if ne $port $httpsPort -}}
+{{- fail (printf "litellm.openaiCompatible.apiBase %q names a host outside the cluster on port %d, but a NetworkPolicy cannot name a DNS name and the gateway reaches external hosts on port %d only. Set litellm.openaiCompatible.egressCIDRs to the CIDR(s) the server is reached at, or use a port-%d endpoint.%s" $apiBase $port $httpsPort $httpsPort $serviceHint) -}}
+{{- end -}}
+{{- end -}}
+{{- with $egress -}}
+{{- toJson . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Why one litellm.openaiCompatible.egressCIDRs entry may not be rendered, or "" when it
+may. The operator refuses the same entries when it reads the annotation
+(litellmUpstreamCIDRRefusal), so a list the render accepts is one the operator keeps
+rather than drops with a log line: CIDR notation, no broader than /12 (IPv4) or /48
+(IPv6), not overlapping the link-local ranges 169.254.0.0/16 and fe80::/10, not inside
+fd20:ce::/48 (the metadata server's IPv6 address is fd20:ce::254), and not an
+IPv4-mapped IPv6 block, which the operator reads as the IPv4 block it maps.
+
+Takes the trimmed entry.
+*/}}
+{{- define "kube-agents.openaiCompatibleCIDRRefusal" -}}
+{{- /* The operator's floors (minIPv4CIDRPrefix, minIPv6CIDRPrefix). */ -}}
+{{- $minIPv4Prefix := 12 -}}
+{{- $minIPv6Prefix := 48 -}}
+{{- $ipv4Bits := 32 -}}
+{{- $ipv6Bits := 128 -}}
+{{- $ipv6Hextets := 8 -}}
+{{- $parts := splitList "/" (lower .) -}}
+{{- $address := first $parts -}}
+{{- $prefix := -1 -}}
+{{- if and (eq (len $parts) 2) (regexMatch "^[0-9]{1,3}$" (last $parts)) -}}
+{{- $prefix = atoi (last $parts) -}}
+{{- end -}}
+{{- /* No leading zeros in an octet: Go's parser, and so the operator, refuses them. */ -}}
+{{- if regexMatch "^(0|[1-9][0-9]{0,2})(\\.(0|[1-9][0-9]{0,2})){3}$" $address -}}
+{{- $octets := list -}}
+{{- range splitList "." $address -}}
+{{- $octets = append $octets (atoi .) -}}
+{{- end -}}
+{{- /* How many second-octet values the prefix spans; 1 at /16 and narrower. */ -}}
+{{- $secondOctetSpan := 1 -}}
+{{- range until (int (sub 16 (min $prefix 16))) -}}
+{{- $secondOctetSpan = mul $secondOctetSpan 2 -}}
+{{- end -}}
+{{- if or (lt $prefix 0) (gt $prefix $ipv4Bits) (gt (max (index $octets 0) (index $octets 1) (index $octets 2) (index $octets 3)) 255) -}}
+is not in CIDR notation (<address>/<prefix>)
+{{- else if lt $prefix $minIPv4Prefix -}}
+is broader than /{{ $minIPv4Prefix }}
+{{- else if and (eq (index $octets 0) 169) (eq (div (index $octets 1) $secondOctetSpan) (div 254 $secondOctetSpan)) -}}
+overlaps the link-local range 169.254.0.0/16, which holds the metadata server
+{{- end -}}
+{{- else if and (contains ":" $address) (regexMatch "^[0-9a-f:]+$" $address) -}}
+{{- $halves := splitList "::" $address -}}
+{{- $head := list -}}
+{{- $tail := list -}}
+{{- with index $halves 0 -}}
+{{- $head = splitList ":" . -}}
+{{- end -}}
+{{- if eq (len $halves) 2 -}}
+{{- with index $halves 1 -}}
+{{- $tail = splitList ":" . -}}
+{{- end -}}
+{{- end -}}
+{{- /* The zero hextets "::" stands for; none without it, at least one with it. */ -}}
+{{- $elided := int (sub $ipv6Hextets (add (len $head) (len $tail))) -}}
+{{- $valid := or (and (eq (len $halves) 1) (eq $elided 0)) (and (eq (len $halves) 2) (gt $elided 0)) -}}
+{{- $hextets := $head -}}
+{{- if gt $elided 0 -}}
+{{- range until $elided -}}
+{{- $hextets = append $hextets "0" -}}
+{{- end -}}
+{{- end -}}
+{{- $normalized := list -}}
+{{- range concat $hextets $tail -}}
+{{- if not (regexMatch "^[0-9a-f]{1,4}$" .) -}}
+{{- $valid = false -}}
+{{- end -}}
+{{- $normalized = append $normalized (regexReplaceAll "^0+(.)" . "${1}") -}}
+{{- end -}}
+{{- if or (not $valid) (lt $prefix 0) (gt $prefix $ipv6Bits) -}}
+is not in CIDR notation (<address>/<prefix>)
+{{- else if lt $prefix $minIPv6Prefix -}}
+is broader than /{{ $minIPv6Prefix }}
+{{- else if eq (slice $normalized 0 6 | join ":") "0:0:0:0:0:ffff" -}}
+is an IPv4-mapped IPv6 block, which the operator reads as the IPv4 block it maps; give that IPv4 CIDR instead
+{{- else if regexMatch "^fe[89ab][0-9a-f]$" (first $normalized) -}}
+overlaps the link-local range fe80::/10
+{{- else if eq (slice $normalized 0 3 | join ":") "fd20:ce:0" -}}
+is inside fd20:ce::/48, which holds the metadata server address fd20:ce::254
+{{- end -}}
+{{- else -}}
+is not in CIDR notation (<address>/<prefix>)
+{{- end -}}
+{{- end }}
+
+{{/*
 Renders a dict of optional CR fields as YAML, dropping the ones left unset.
 
 "Unset" is null or the empty string; `false` and `0` are values and survive,
@@ -465,8 +722,10 @@ ConfigMap changed, the checksum did not, the Deployment did not roll. The
 gateway mounts this with subPath, and a subPath ConfigMap mount never receives
 in-place updates, so the running pod would have kept the old file indefinitely.
 
-Takes a dict of provider, model, callbacks, and maxTokens (optional; 0 or
-absent renders no max_tokens).
+Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
+renders no max_tokens) and reasoningEffort (optional; empty or absent renders
+no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
+neither key), which only openai_compatible passes.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
@@ -480,6 +739,18 @@ absent renders no max_tokens).
   ceiling on one that does; values.yaml says what that means for the agent.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
+{{- /*
+  reasoning_effort on every alias when .reasoningEffort is set, and no key at
+  all otherwise, for the same reason as max_tokens above: the default render
+  and its checksum stay what they were. LiteLLM translates the OpenAI-style
+  value per provider (thinkingLevel on Gemini 3.x through gemini or vertex_ai,
+  adaptive thinking on Claude, reasoning_effort as-is on OpenAI and
+  hosted_vllm), and, like max_tokens, it is what a request that names no
+  reasoning_effort gets: a request's own value wins. The schema limits it to
+  low, medium and high, which LiteLLM maps on all three; "minimal" is left out
+  because Vertex AI refuses it on Gemini 3.x Flash (see the auxiliary block in
+  deploy/shared/defaults/config.yaml).
+*/}}
 {{- /*
   Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
   with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
@@ -497,30 +768,67 @@ absent renders no max_tokens).
   Gemini or OpenAI render stays byte-identical.
 */}}
 {{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
+{{- /*
+  openai_compatible goes through LiteLLM's hosted_vllm handler, which speaks the
+  same OpenAI chat-completions API, rather than through openai/. Read from
+  LiteLLM 1.104.0: openai/ with no api_key falls back to OPENAI_API_KEY, which
+  would hand a real OpenAI key to this server or fail every call, and it
+  ignores a per-model ssl_verify; hosted_vllm reads only HOSTED_VLLM_API_KEY
+  (a placeholder when unset) and honours ssl_verify for this entry alone. So no
+  api_key line: the key arrives as HOSTED_VLLM_API_KEY (litellm.yaml).
+*/}}
+{{- $litellmProvider := ternary "hosted_vllm" .provider (eq .provider "openai_compatible") -}}
 model_list:
   - model_name: model-default
     litellm_params:
-      model: {{ printf "%s/%s" .provider .model }}
+      model: {{ printf "%s/%s" $litellmProvider .model }}
+      {{- with .apiBase }}
+      api_base: {{ . | quote }}
+      {{- end }}
+      {{- with .sslVerify }}
+      ssl_verify: {{ . | quote }}
+      {{- end }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
       {{- end }}
       {{- if $claude }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: hermes-agent
     litellm_params:
-      model: {{ printf "%s/%s" .provider .model }}
+      model: {{ printf "%s/%s" $litellmProvider .model }}
+      {{- with .apiBase }}
+      api_base: {{ . | quote }}
+      {{- end }}
+      {{- with .sslVerify }}
+      ssl_verify: {{ . | quote }}
+      {{- end }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
       {{- end }}
       {{- if $claude }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: {{ .model }}
     litellm_params:
-      model: {{ printf "%s/%s" .provider .model }}
+      model: {{ printf "%s/%s" $litellmProvider .model }}
+      {{- with .apiBase }}
+      api_base: {{ . | quote }}
+      {{- end }}
+      {{- with .sslVerify }}
+      ssl_verify: {{ . | quote }}
+      {{- end }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
       {{- end }}
       {{- if $claude }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
@@ -690,13 +998,13 @@ gitlabNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- $host := $f.host | default "" -}}
 {{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
+{{- /* A forge at a host other than github.com names its provider, as the CRD's rule, and before the host is judged as a GitHub host, so the remedy named is the provider: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
+{{- if and (not $f.provider) $host (regexMatch "^[A-Za-z0-9.-]+$" $host) (not (has (lower $host) $githubHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
+{{- end -}}
 {{- /* A github forge is at github.com in one of its spellings, or at a GitHub Enterprise Server host: a hostname, label by label, that is not under a domain where GitHub runs its own services and not GitLab's. */ -}}
 {{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve: name github.com or a GitHub Enterprise Server host" $i $f.host) -}}
-{{- end -}}
-{{- /* A forge at a host other than github.com names its provider, as the CRD's rule: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
-{{- if and (not $f.provider) $host (not (has (lower $host) $githubHosts)) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
 {{- end -}}
 {{- /* One host per forge, and one GitHub host per install, as the operator's hostConflicts. */ -}}
 {{- $canon := lower ($host | default "") -}}

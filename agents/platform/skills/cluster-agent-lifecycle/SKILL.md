@@ -1,6 +1,6 @@
 ---
 name: cluster-agent-lifecycle
-description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded or deleted, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent.
+description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded, deleted or taken out of management, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent.
 ---
 
 # Cluster Agent Lifecycle Skill
@@ -20,7 +20,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \
   --project "<project>" --cluster "<cluster>" --location "<location>"
 ```
 
-This scaffolds the profile home on the persistent data PVC, pins a kubeconfig scoped to that cluster, writes the cluster identity into the profile's `USER.md`, and registers the profile. It is **idempotent** — safe to re-run. It prints the profile name.
+This scaffolds the profile home on the persistent data PVC, pins a kubeconfig scoped to that cluster, stamps the cluster identity into `SOUL.md` and `config.yaml`, writes the cluster identity and the control-plane endpoint it chose when one was decided into the profile's `USER.md` for preflight checks, probes the cluster once (a failure is logged with the endpoint it chose, when one was decided, and, for a connection failure, the remedy; the scaffold still succeeds), and registers the profile. It is **idempotent** — safe to re-run. It prints the profile name.
 
 ## How to delegate a debugging / runtime-ops task (kanban board)
 
@@ -46,7 +46,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 3. **Read the result** — the card carries the requester's chat subscription, so the completion (or a `needs_input` block) is posted into their thread. You can also inspect it: `kanban_show(<id>)`. The RCA is in the card's `result` — the field the gateway posts verbatim, and the only one the requester receives — with any proposed patch in `metadata`; neither is ever in the worker's chat reply, which is a bare acknowledgement by design.
 
-**Multi-cluster (fan-out):** create one card per cluster **with no `parents`**, assigned to that cluster's profile (never `platform`), in one burst, so they run in parallel. `parents` means "runs after", so a per-cluster card that lists your own running card as a parent can never be claimed — see `SOUL.md` §0. Then **keep your own card open**: poll each per-cluster card with `kanban_show(<id>)` (`sleep 60` between rounds), and once all of them are settled, synthesize their `result`/`metadata` into your own `kanban_complete(result=...)`. Completing your card is the delivery, so never complete it on a dispatch receipt — the image refuses a `kanban_complete` while your fanned-out cards are unfinished (#1010). See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
+**Multi-cluster (fan-out):** create one card per cluster **with no `parents`**, assigned to that cluster's profile (never `platform`), in one burst, so they run in parallel. `parents` means "runs after", so a per-cluster card that lists your own running card as a parent can never be claimed — see `SOUL.md` §0. Then **keep your own card open**: poll the unsettled per-cluster cards by emitting parallel `kanban_show(<id>)` tool calls in a single turn (`sleep 60` between rounds, never one `kanban_show` per turn), and once all of them are settled, synthesize their `result`/`metadata` into your own `kanban_complete(result=...)`. Completing your card is the delivery, so never complete it on a dispatch receipt — the image refuses a `kanban_complete` while your fanned-out cards are unfinished (#1010). See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
 
 ## Acting on the result
 
@@ -66,6 +66,8 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
 ```
 
 This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
+
+To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. Follow `manage-cluster`, "Stop managing": the exclusion is declared where the install's scope is declared (`SCOPE_EXCLUDE_CLUSTERS` in `install.env` on an install made with `install.sh`, applied with `./upgrade.sh --upgrade-mode=full`), and that section says how to tell the install shapes apart.
 
 ## Automatic reconciliation (create and prune)
 

@@ -1535,8 +1535,12 @@ minter, and the minter mints for one GitHub host. So an install serves
 github.com or one GitHub Enterprise Server, never both. The operator refuses a
 second GitHub forge at another host, and it refuses one host that two providers
 claim. Two GitHub forges at one host are still allowed: they name two
-organisations, as they always could. The first GitHub forge declared that can
-be served decides the host. A change of the declaration that moves the host
+organisations, as they always could. The first GitHub forge declared decides
+the host. While that forge's host can be read, the forge holds the host even
+when another of its fields is refused: the gitops-state key, the broker's
+configuration and the egress all stay on the host, and a later GitHub forge at
+another host stays refused, so a typo cannot move the install. A change of the
+declaration that moves the host
 writes a `GitHubHostChanged` Warning Event on the PlatformAgent, because the
 repositories registered on the old host are then no longer served.
 

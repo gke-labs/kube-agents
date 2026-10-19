@@ -21,8 +21,9 @@ package controller
 // The broker itself is rendered by credential_proxy_manifests.go — one pod, one
 // builder, unconditionally. What is left here is what stays behind on the agent
 // Pod once it moves: the audience-bound token the agent presents, the container
-// that presents it, the ServiceAccount both Pods share, and the TokenReview
-// grant the broker needs to check the token it is handed.
+// that presents it, the gateway's own ServiceAccount (the broker keeps the
+// annotated one), and the TokenReview grant the broker needs to check the token
+// it is handed.
 //
 // The boundary itself is that the agent no longer shares a network namespace
 // with the process holding the cloud credentials, so "reachable on 127.0.0.1"
@@ -95,6 +96,31 @@ const (
 
 	agentCredentialProxyTokenVolume = "agent-credential-proxy-token" // #nosec G101 -- Volume name, not a credential
 
+	// credentialProxyWatcherAudience is the gateway's watchers' audience: the
+	// k8s-event-watcher and the drift-detector in agent-api-auth make their
+	// Google calls through the broker under the `watcher` role. Its own
+	// audience because the role is conferred by audience, and its token is
+	// projected into agent-api-auth only, so the Hermes container beside it
+	// holds the chat token and cannot reach these routes. Spelled identically
+	// in credential_proxy.py.
+	credentialProxyWatcherAudience = "kubeagents-credential-proxy-watcher" // #nosec G101 -- Token audience name, not a credential
+	// watcherTokenVolume and watcherTokenMountPath carry that token.
+	watcherTokenVolume    = "watcher-credential-proxy-token"            // #nosec G101 -- Volume name, not a credential
+	watcherTokenMountPath = "/var/run/secrets/kubeagents/watcher-proxy" // #nosec G101 -- Mount path, not a credential
+	// watcherBrokerURLEnvVar and watcherBrokerTokenFileEnvVar tell the two
+	// watchers where the broker is and which token to present; the Go side
+	// reads them in internal/clusterprofiles (BrokerFromEnv).
+	watcherBrokerURLEnvVar       = "WATCHER_BROKER_URL"
+	watcherBrokerTokenFileEnvVar = "WATCHER_BROKER_TOKEN_FILE" // #nosec G101 -- Env var name, not a credential
+	// watcherSubscriptionEnvVar is the broker's copy of the drift detector's
+	// subscription, fully qualified: the one Pub/Sub target its watcher routes
+	// reach.
+	watcherSubscriptionEnvVar = "WATCHER_PUBSUB_SUBSCRIPTION"
+	// driftDetectorDefaultSubscription is the detector's own default, the
+	// subscription the drift-pubsub module creates (cmd/drift-detector/main.go
+	// defaultSubscriptionName). tests/conformance holds the two equal.
+	driftDetectorDefaultSubscription = "platform-agent-drift-audit-sub"
+
 	// mcpRelayURLEnvVar names the broker's remote MCP relay for the agent
 	// container. The agent configs interpolate it into each mcp-remote
 	// server's URL (`${KUBE_AGENTS_MCP_RELAY_URL}/gke`), so every
@@ -117,27 +143,44 @@ func credentialBrokerName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-credential-proxy"
 }
 
-// agentServiceAccountName is the ServiceAccount both Pods run as.
+// agentServiceAccountName is the credential broker's ServiceAccount: the name
+// the Workload Identity IAM binding (and spec.security.serviceAccountName,
+// and its annotations) refers to.
 //
-// They share one, and this is the weakest joint in the split: the identity the
-// broker verifies is "a Pod running as this ServiceAccount", not "the agent
-// Pod". Good enough to exclude everything else in the cluster, not good enough
-// to tell the two halves of this agent apart.
-//
-// It shares one because both Pods are rendered from this one name and nothing
-// here mints a second. Not because splitting them is impossible: the Workload
-// Identity IAM binding names this ServiceAccount, so the way to split it is to
-// leave the bound name with the *broker* — which is what actually needs the
-// cloud credential once it is split out — and give the agent a new one of its
-// own. That buys per-Pod attribution and takes the cloud credential away from
-// the sandbox's identity at the same time. It also moves which identity holds
-// the cloud credential, which is a bigger decision than a manifest change and
-// belongs with the per-cluster service-account work rather than here.
+// The gateway Pod used to run as it too, which was the weakest joint in the
+// split: the identity the broker verified was "a Pod running as this
+// ServiceAccount", and the model's Pod resolved to the install's Google service
+// account. The split this comment used to propose is done: the bound name stays
+// with the broker, the one Pod that needs the cloud credential, and the gateway
+// runs as gatewayServiceAccountName, minted with no annotation.
 func agentServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		return agent.Spec.Security.ServiceAccountName
 	}
 	return agent.Name
+}
+
+// gatewayServiceAccountSuffix makes the gateway Pod's own ServiceAccount name.
+// It ends in `-agent` because the kube-agents-agent-binding-scope admission
+// policy selects the bindings it governs by that suffix
+// (config/admission/agent-rbac-policy.yaml, binds-agent-sa).
+const gatewayServiceAccountSuffix = "-gateway-agent"
+
+// gatewayServiceAccountName is the ServiceAccount the gateway Pod runs as.
+//
+// The split agentServiceAccountName's comment describes, done the way it
+// describes: the Workload Identity-bound name stays with the broker, the one
+// Pod that needs a Google credential, and the gateway gets a ServiceAccount of
+// its own that the operator mints with no annotation. GKE resolves Workload
+// Identity by the Pod's ServiceAccount, so the gateway's metadata server then
+// has no Google service account to answer for, and its NetworkPolicy no longer
+// opens the metadata path at all.
+//
+// Always operator-owned, whatever spec.security.serviceAccountName says: that
+// field names the identity that carries the cloud binding, which is now the
+// broker's alone.
+func gatewayServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + gatewayServiceAccountSuffix
 }
 
 // credentialProxyBaseURL is where the agent Pod reaches the broker.
@@ -156,21 +199,22 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 // Two of them on every install; a third when the next stack takes Chat, and a
 // fourth under the cluster-view flag. The sandbox's is the caller that matters —
 // the shell is where every credentialed command runs, so a broker that served
-// only the agent's identity would answer 401 to all of them. The agent's is
-// there because the gateway's chat relays go through the same listener from
-// the agent Pod.
+// only the gateway's identity would answer 401 to all of them. The gateway's
+// is there because its chat relays and its watchers go through the same
+// listener.
 //
 // Two identities rather than one is not a widening of who may call: both Pods
 // belong to this agent, and neither could reach the broker without a token this
-// namespace mints. What it does not give is a way to tell them apart — the
-// sandbox runs as its own ServiceAccount, but the gateway shares the agent's
-// with the broker, so a username alone cannot say which Pod called. That is
-// what credentialProxyChatAudience is for. The A2A gateway runs as a
-// ServiceAccount of its own, so unlike the first two it is told apart by
-// name as well as by audience.
+// namespace mints. Each runs as a ServiceAccount of its own, so a username
+// says which Pod called; the audience (credentialProxyChatAudience and its
+// siblings) says which role the call is for. The A2A gateway is told apart
+// the same way.
 func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
 	callers := []string{
-		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent)),
+		// The gateway Pod, which presents the chat and watcher tokens. The
+		// broker's own ServiceAccount is not a caller: the broker serves these
+		// routes, it does not call them.
+		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, gatewayServiceAccountName(agent)),
 		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)),
 	}
 	// The A2A gateway, only while it is a caller: its Google Chat adapter
@@ -216,6 +260,37 @@ func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 	}
 }
 
+// buildWatcherTokenVolume projects the token the gateway's watchers present to
+// the broker, for the watcher audience. Mounted into agent-api-auth only.
+func buildWatcherTokenVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: watcherTokenVolume,
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr.To(int32(0400)),
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience: credentialProxyWatcherAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
+			}}},
+		}},
+	}
+}
+
+// watcherPubsubSubscription is the drift detector's subscription as the broker
+// pins it: `projects/<p>/subscriptions/<s>`. The detector takes a bare name or a
+// qualified one, and defaults the name when the CR gives none
+// (cmd/drift-detector/main.go defaultSubscriptionName); this resolves all three
+// the same way the detector does.
+func watcherPubsubSubscription(agent *agentv1alpha1.PlatformAgent) string {
+	name := driftDetectorSubscription(agent)
+	if strings.HasPrefix(name, "projects/") {
+		return name
+	}
+	if name == "" {
+		name = driftDetectorDefaultSubscription
+	}
+	project, _, _ := driftDetectorHarness(agent)
+	return fmt.Sprintf("projects/%s/subscriptions/%s", project, name)
+}
+
 // buildCredentialBrokerTokenReviewRole lets the broker verify the tokens its
 // callers present.
 //
@@ -225,13 +300,10 @@ func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 // needs. Deliberately not system:auth-delegator, which also carries
 // SubjectAccessReview.
 //
-// The cost, named rather than hidden: the binding names the ServiceAccount the
-// agent Pod also runs as, so wherever this is applied the agent can validate any
-// bearer token it gets hold of. It has no use for that. Narrowing it means
-// giving the Pods separate ServiceAccounts — see agentServiceAccountName —
-// which is why this is a cost of moving the broker rather than something the
-// move can fix on its own. reconcileCredentialBrokerTokenReviewRBAC applies it
-// on every install, because the broker is always off the agent's Pod.
+// The binding names the broker's ServiceAccount, which the gateway Pod no longer
+// runs as (gatewayServiceAccountName), so the agent cannot use it to validate a
+// bearer token it gets hold of. reconcileCredentialBrokerTokenReviewRBAC applies
+// it on every install, because the broker is always off the agent's Pod.
 func buildCredentialBrokerTokenReviewRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
@@ -244,4 +316,56 @@ func buildCredentialBrokerTokenReviewRole(agent *agentv1alpha1.PlatformAgent) *r
 			Verbs:     []string{"create"},
 		}},
 	}
+}
+
+// gatewaySubject is the gateway Pod's ServiceAccount as an RBAC subject.
+func gatewaySubject(agent *agentv1alpha1.PlatformAgent) rbacv1.Subject {
+	return rbacv1.Subject{Kind: "ServiceAccount", Name: gatewayServiceAccountName(agent), Namespace: agent.Namespace}
+}
+
+// watcherTokenSourceNames is the set of user-authored volume names that would
+// hand a container the watchers' broker token: the reserved name itself, and
+// any volume on either of the CR's volume lists that projects a
+// serviceAccountToken for the watcher audience under another name. The broker
+// confers the `watcher` role on the audience alone -- every fleet cluster's
+// events and named objects, and the drift subscription -- and the operator
+// projects that token into agent-api-auth and nowhere else, so a CR container
+// mounting either kind is a second holder of the role. buildPodTemplateSpec
+// strips those volumes, and every mount naming them, from all five
+// user-authored surfaces: sidecars, initContainers, sidecarVolumes,
+// extraVolumes and (in buildBaseContainers) extraVolumeMounts.
+//
+// The same two halves, name and source, as the A2A bus token's reservation
+// (a2aBusCredentialVolumeNames), and on the same terms: a guard against a
+// misconfiguration by the CR's author, who is the platform operator, not a
+// boundary against a hostile sidecar, since a pod's projected tokens are minted
+// for its ServiceAccount whichever container asks. Unlike that one it is not
+// gated on mode: the watcher token is in every gateway pod.
+func watcherTokenSourceNames(agent *agentv1alpha1.PlatformAgent) map[string]bool {
+	names := map[string]bool{watcherTokenVolume: true}
+	if agent.Spec.Deployment == nil {
+		return names
+	}
+	for _, list := range [][]corev1.Volume{agent.Spec.Deployment.SidecarVolumes, agent.Spec.Deployment.ExtraVolumes} {
+		for _, v := range list {
+			if projectsWatcherToken(v) {
+				names[v.Name] = true
+			}
+		}
+	}
+	return names
+}
+
+// projectsWatcherToken reports whether a volume delivers a token for the
+// watcher audience.
+func projectsWatcherToken(v corev1.Volume) bool {
+	if v.Projected == nil {
+		return false
+	}
+	for _, source := range v.Projected.Sources {
+		if source.ServiceAccountToken != nil && source.ServiceAccountToken.Audience == credentialProxyWatcherAudience {
+			return true
+		}
+	}
+	return false
 }

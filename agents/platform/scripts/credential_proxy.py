@@ -47,7 +47,27 @@ import providers
 import repo_ref
 import scoped_sa_pool
 import vcs_broker
+import watcher_policy
 
+# The verb words go onto a line protocol the agent runtime reads; see
+# credential_proxy_client.py, which applies the same rule.
+_VERB_WORD_SAFE_RE = re.compile(r"[^\w./:@-]")
+_VERB_WORD_MAX = 64
+# kubectl's own subcommand words, per verb: the refusal body keeps a verb's second
+# word only when it is one of these (the policy's multi-word entries and the write
+# families the refusal stop reads); any other second word is the caller's and is
+# dropped, so the body names no caller-supplied value (conformance A1).
+_KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "auth": frozenset({"can-i", "reconcile", "whoami"}),
+    "certificate": frozenset({"approve", "deny"}),
+    "cluster-info": frozenset({"dump"}),
+    "config": frozenset({
+        "current-context", "delete-cluster", "delete-context", "delete-user", "get-clusters",
+        "get-contexts", "get-users", "rename-context", "set", "set-cluster", "set-context",
+        "set-credentials", "unset", "use-context", "view",
+    }),
+    "rollout": frozenset({"history", "pause", "restart", "resume", "status", "undo"}),
+}
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
 # file is in its pod and not in this one; these are the vocabulary both sides
 # share, and importing them keeps the context-name grammar -- and where the
@@ -104,6 +124,31 @@ KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
 # A caller who named their own bound has already answered the question; honour
 # it rather than overriding it with a shorter one.
 KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
+# The two endpoint selectors a caller's `get-credentials` may carry; with
+# neither, the broker splices in gke_endpoint's decision (see
+# `_decision_for_callers_fetch`).
+GET_CREDENTIALS_ENDPOINT_FLAGS = ("--dns-endpoint", "--internal-ip")
+# gcloud's spellings of the location and project on that command, with or
+# without `=`.
+GET_CREDENTIALS_LOCATION_FLAGS = ("--location", "--region", "--zone", "-z")
+GET_CREDENTIALS_PROJECT_FLAG = "--project"
+GET_CREDENTIALS_DEFAULT_PROJECT_ENV = "GKE_PROJECT_ID"
+# Beside a managed kubeconfig written from a provisional endpoint decision
+# (`_provisional_marker`): the next request refetches rather than reusing it.
+PROVISIONAL_KUBECONFIG_SUFFIX = ".provisional"
+# How long a provisional kubeconfig is served before the next request decides
+# again. Bounds the cost of an own-cluster describe that keeps failing: without
+# a window every kubectl to such a cluster would refetch under the kubeconfig
+# lock, three gcloud runs each. One minute matches gke_endpoint's target TTL.
+PROVISIONAL_RETRY_SECONDS = 60
+# How much of gcloud's stderr the refetch-failure log line keeps.
+REFETCH_FAILURE_LOG_CHARS = 200
+# The bound on each gcloud the broker runs to decide a caller's unflagged
+# fetch (help probe, target describe, own-cluster describe). They run inside
+# the caller's own bound on the whole fetch -- 30 s for switch_kube_context --
+# so each is held well under a kubectl's 60 s; a describe that cannot answer
+# in this time leaves the fetch to run as given, marked provisional.
+SPLICE_DECISION_TIMEOUT_SECONDS = 15
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -332,6 +377,27 @@ MCP_RELAY_PROTOCOL_VERSION_SHAPE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 # The quota project, from the broker's own credential. The agent's mcp-remote
 # used to send it from its own ADC lookup; it no longer has one.
 MCP_RELAY_USER_PROJECT = "X-Goog-User-Project"
+
+# The watcher routes (`watcher_policy` decides what they relay). The Google half
+# shares the Cloud API relay's credential, timeouts and cap. The query keys the
+# Go API clients add to every call, and nothing else, are forwarded.
+WATCHER_GCP_QUERY_KEYS = frozenset({"alt", "prettyPrint"})
+# The Kubernetes half. The broker finds each cluster's control plane with the
+# GKE API and remembers it this long, so a watch reconnect does not cost a
+# describe call. A connect or TLS failure forgets it, so an address or CA that
+# rotates inside the window costs the request that found out.
+WATCHER_ENDPOINT_TTL_S = 300
+WATCHER_K8S_PORT = 443
+# A list or a named read is bounded like a relayed Google read. A watch is a
+# stream: each read may wait this long (above client-go's 5-10 minute watch
+# timeout, inside Envoy's 1200 s stream idle timeout), and the whole stream is
+# cut at the cap, which client-go answers by re-watching.
+WATCHER_WATCH_READ_TIMEOUT_S = 1100
+WATCHER_WATCH_MAX_S = 3600
+# Forwarded from the caller when it has this shape: client-go negotiates JSON or
+# protobuf with it.
+WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
+WATCHER_GCP_CONTENT_TYPE = "application/json"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
 # policy sees it. Anything else is a 400, not something to normalise: the
@@ -765,6 +831,11 @@ CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # read-only posture command_policy enforces is the view it gets. A demo aid
 # until declarative profiles carry a session's identity and tools.
 CALLER_ROLE_SESSION = "session"
+# The gateway pod's agent-api-auth container: the k8s-event-watcher and the
+# drift-detector. Its token is projected into that container only, never into
+# the Hermes container beside it, and it reaches the watcher routes and nothing
+# else.
+CALLER_ROLE_WATCHER = "watcher"
 
 # The TokenReview user.extra key under which the API server names the Pod a
 # projected token is bound to.
@@ -773,7 +844,13 @@ TOKEN_REVIEW_POD_NAME_EXTRA = "authentication.kubernetes.io/pod-name"
 # Every role that exists, for the table check below. Note that two of them
 # nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
 # a way that cannot tell those two apart.
-CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT, CALLER_ROLE_SESSION)
+CALLER_ROLES = (
+    CALLER_ROLE_SHELL,
+    CALLER_ROLE_CHAT,
+    CALLER_ROLE_A2A_CHAT,
+    CALLER_ROLE_SESSION,
+    CALLER_ROLE_WATCHER,
+)
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
 # whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session role is
@@ -940,6 +1017,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # admitted here yet: that is a new read path for them, argued in the change
     # that wires them, not by default.
     (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
+    # The watchers' Google calls: theirs alone. The Hermes container beside
+    # them holds the chat token and cannot present this one.
+    (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
+    (watcher_policy.WATCHER_K8S_PREFIX, (CALLER_ROLE_WATCHER,)),
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
@@ -2083,6 +2164,16 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
                     "is not; any allowed caller presenting the session audience gets the session "
                     "role, and nothing keeps a session caller off the other audiences"
                 )
+        # The gateway watchers' audience, read raw for the same reason.
+        watcher_audience = os.getenv("CREDENTIAL_PROXY_WATCHER_AUDIENCE", "").strip()
+        if watcher_audience and watcher_audience in audience_roles:
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_WATCHER_AUDIENCE equals the %s audience; the watcher "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[watcher_audience] or CALLER_ROLE_SHELL,
+            )
+        elif watcher_audience:
+            audience_roles[watcher_audience] = CALLER_ROLE_WATCHER
     else:
         audience_roles = {shell_audience: ""}
         if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
@@ -2486,6 +2577,24 @@ class GoogleApiRelay:
             )
         finally:
             connection.close()
+
+
+def watcher_cluster_address(cluster: dict[str, Any]) -> tuple[str, str] | None:
+    """`(host, CA PEM or "")` from a GKE `Cluster`, or None. See `_watcher_cluster_endpoint`."""
+    endpoints = cluster.get("controlPlaneEndpointsConfig") or {}
+    dns = endpoints.get("dnsEndpointConfig") or {}
+    dns_endpoint = dns.get("endpoint") or ""
+    endpoint = cluster.get("endpoint") or ""
+    if dns_endpoint and (dns.get("allowExternalTraffic") or endpoint == dns_endpoint):
+        return dns_endpoint, ""
+    ca = ((cluster.get("masterAuth") or {}).get("clusterCaCertificate")) or ""
+    if not endpoint or not ca:
+        return None
+    try:
+        pem = base64.b64decode(ca, validate=True).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return endpoint, pem
 
 
 class GoogleChatRelay:
@@ -3192,6 +3301,65 @@ class ExecutionResult:
 # get-credentials`. `ClusterTarget`, `parse_gke_context` and
 # `read_current_context` live with the shim for the same reason: the parsing
 # happens where the file is, which is not here.
+
+
+def _mtime_ns_or_none(path: Path) -> int | None:
+    """The file's mtime in nanoseconds, or None when it is absent or empty."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns if stat.st_size > 0 else None
+
+
+def _flags_of(decision) -> list[str]:
+    """The `get-credentials` flags an endpoint decision carries; none for None."""
+    return list(decision.flags) if decision is not None else []
+
+
+def _get_credentials_target(argv: list[str]) -> ClusterTarget | None:
+    """The (project, cluster, location) a `get-credentials` argv names, or None.
+
+    The cluster is the first positional after the verb that is not the value
+    of a flag; the location and project are read from gcloud's flags wherever
+    they sit, before or after the verb, in `--flag=value` or `--flag value`
+    form, with `-z` for `--zone`. Flags that take a detached value are the
+    ones `command_policy` already knows, so `--verbosity debug` ahead of the
+    verb does not read `debug` as the cluster. A missing project falls back
+    to the broker's own, which its bootstrap made gcloud's default; a missing
+    cluster or location is None, since gcloud's defaults for those are not
+    known here.
+    """
+    try:
+        verb_index = argv.index("get-credentials")
+    except ValueError:
+        return None
+    cluster = ""
+    location = ""
+    project = ""
+    skip = False
+    for position, argument in enumerate(argv):
+        if skip:
+            skip = False
+            continue
+        name, separator, value = argument.partition("=")
+        takes_value = name in command_policy._GCLOUD_FLAGS_WITH_VALUE
+        if takes_value and not separator:
+            value = argv[position + 1] if position + 1 < len(argv) else ""
+            skip = True
+        if name in GET_CREDENTIALS_LOCATION_FLAGS:
+            location = value
+        elif name == GET_CREDENTIALS_PROJECT_FLAG:
+            project = value
+        elif (position > verb_index and not argument.startswith("-")
+              and not cluster):
+            cluster = argument
+    # The hand-typed form omits --project. The bootstrap set gcloud's default
+    # project to GKE_PROJECT_ID, so that is the project gcloud will use.
+    project = project or os.environ.get(GET_CREDENTIALS_DEFAULT_PROJECT_ENV, "")
+    if not (project and cluster and location):
+        return None
+    return ClusterTarget(project=project, cluster=cluster, location=location)
 
 
 def _is_get_credentials(argv: list[str]) -> bool:
@@ -5174,6 +5342,14 @@ class CommandExecutor:
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
         self._kubeconfig_lock = threading.Lock()
+        # Serialises only the two filesystem steps that file a managed
+        # kubeconfig and its provisional mark (`_file_managed_kubeconfig`), so
+        # a caller's fetch never waits behind a cold read's gcloud runs, which
+        # `_kubeconfig_lock` covers.
+        self._marker_lock = threading.Lock()
+        # Set once `_endpoint_decision` finds gke_endpoint unimportable; that
+        # None is settled, unlike the None of a describe that failed.
+        self._endpoint_module_missing = False
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
@@ -6948,11 +7124,15 @@ class CommandExecutor:
     def _managed_kubeconfig(self, target: ClusterTarget) -> Path:
         return self.kubeconfig_dir / f"{target.context_name}.yaml"
 
-    def _dns_endpoint_args(self, gcloud: str, target: ClusterTarget) -> list[str]:
-        """Decide whether this cluster's credentials must name its DNS endpoint.
+    def _endpoint_decision(self, gcloud: str, target: ClusterTarget, timeout_seconds: int | None = None):
+        """Decide which endpoint this cluster's credentials must name.
 
-        The decision itself lives in `gke_endpoint`, shared with the two callers in
-        the agent container. What is local to the sidecar is *how* gcloud runs: the
+        Returns gke_endpoint's `EndpointDecision` -- its `flags` are
+        `--dns-endpoint`, `--internal-ip` or nothing, and its `provisional`
+        mark says the decision was made without the broker's own cluster -- or
+        None when nothing could be decided. The decision itself lives in
+        `gke_endpoint`, shared with the callers in the agent container
+        (`cluster_agent_profile.py`, `platform_mcp_server.py`, `stall_watch.py`). What is local to the sidecar is *how* gcloud runs: the
         binary is the resolved executable rather than whatever is on PATH, and it
         goes through `_execute` so the describe is subject to the same timeout,
         output cap, and working directory as every other command here.
@@ -6963,25 +7143,98 @@ class CommandExecutor:
         behaviour that shipped before it existed.
         """
         try:
-            from gke_endpoint import dns_endpoint_args
+            from gke_endpoint import endpoint_decision
         except ImportError as error:
             logging.warning(
                 "gke_endpoint is unavailable (%s); falling back to the IP endpoint for %s",
                 error,
                 target.context_name,
             )
-            return []
+            # Settled for the life of the pod: the module will not appear, so
+            # a file fetched without it is not provisional, or every cluster
+            # would refetch once a minute for nothing.
+            self._endpoint_module_missing = True
+            return None
+
+        bound = timeout_seconds if timeout_seconds is not None else self.kubectl_timeout_seconds
 
         def run(argv: list[str]) -> tuple[int, str]:
             # The short deadline: this is a control-plane lookup made on the
             # way to a kubectl, not a command the caller chose, and it runs
             # silently under the kubeconfig lock. See _ensure_managed_kubeconfig.
-            result = self._execute(
-                [gcloud, *argv[1:]], timeout_seconds=self.kubectl_timeout_seconds
-            )
+            # A caller's splice passes a tighter bound still.
+            result = self._execute([gcloud, *argv[1:]], timeout_seconds=bound)
             return result.exit_code, result.stdout
 
-        return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
+        return endpoint_decision(target.project, target.cluster, target.location, run=run)
+
+    def _provisional_marker(self, target: ClusterTarget) -> Path:
+        """Beside the managed kubeconfig: present while that file was written
+        from a decision made without the broker's own cluster (the describe
+        failed), or from no decision at all. A request after
+        PROVISIONAL_RETRY_SECONDS treats the file as a miss and decides again,
+        so one failed describe does not pin an endpoint until the pod restarts,
+        and one that keeps failing costs a refetch a minute rather than one a
+        request."""
+        return self._managed_kubeconfig(target).with_suffix(PROVISIONAL_KUBECONFIG_SUFFIX)
+
+    def _undecided(self, decision) -> bool:
+        """Is this the answer of a decision that could not be made now?
+
+        None from a describe that failed with nothing cached, or a decision
+        marked provisional. None because the module is missing is settled, and
+        so is the empty decision gke_endpoint returns for a gcloud without the
+        flag (it is not None at all).
+        """
+        if decision is None:
+            return not self._endpoint_module_missing
+        return bool(decision.provisional)
+
+    def _provisional_window_open(self, marker: Path) -> bool:
+        """Is the provisional kubeconfig beside `marker` still inside its window?"""
+        try:
+            return time.time() - marker.stat().st_mtime < PROVISIONAL_RETRY_SECONDS
+        except FileNotFoundError:
+            return False
+
+    def _file_managed_kubeconfig(self, scratch: Path, target: ClusterTarget, provisional: bool,
+                                 seen_mtime_ns: int | None) -> None:
+        """Move gcloud's output into place and set the provisional mark.
+
+        `seen_mtime_ns` is the managed file's mtime as the caller saw it before
+        the decision and the fetch ran, or None when there was no file. It is
+        what tells a settled file that landed *during* the fetch (newer than
+        the snapshot, or present where none was) from one that was simply
+        already there: an unmarked file is the steady state of every cluster
+        filed settled, not a race signature, and a provisional result still
+        has to refresh it or a re-run of the onboarding would change nothing.
+
+        The mark goes down before the file when the decision was provisional,
+        so a crash between the two leaves an unmarked file only when it was
+        settled; and it comes off after the file when it was settled. The two
+        steps run under `_marker_lock`, so a settled fetch and a provisional
+        one cannot interleave them, whether or not the caller also holds
+        `_kubeconfig_lock`. A provisional result never replaces an unmarked
+        file that is newer than the snapshot: a caller's fetch files outside
+        `_kubeconfig_lock`, so a settled answer can land during a cold or
+        window-expired broker fetch, and it outranks the undecided one.
+        """
+        marker = self._provisional_marker(target)
+        managed = self._managed_kubeconfig(target)
+        with self._marker_lock:
+            if provisional:
+                if (managed.is_file() and managed.stat().st_size > 0 and not marker.exists()
+                        and (seen_mtime_ns is None or managed.stat().st_mtime_ns > seen_mtime_ns)):
+                    logging.info(
+                        "a settled kubeconfig for %s landed during an undecided fetch; keeping it",
+                        target.context_name,
+                    )
+                    return
+                marker.touch()
+                os.replace(scratch, managed)
+            else:
+                os.replace(scratch, managed)
+                marker.unlink(missing_ok=True)
 
     def _ensure_managed_kubeconfig(self, target: ClusterTarget) -> Path:
         """Return the proxy-authored kubeconfig for a cluster, fetching on a miss.
@@ -6994,12 +7247,17 @@ class CommandExecutor:
         pinned by some earlier process.
         """
         managed = self._managed_kubeconfig(target)
+        marker = self._provisional_marker(target)
         with self._kubeconfig_lock:
-            if managed.is_file() and managed.stat().st_size > 0:
+            if managed.is_file() and managed.stat().st_size > 0 and (
+                not marker.exists() or self._provisional_window_open(marker)
+            ):
                 return managed
+            seen_mtime_ns = _mtime_ns_or_none(managed)
             gcloud = self.executables.get("gcloud")
             if not gcloud:
                 raise RuntimeError("gcloud is unavailable; cannot materialise a kubeconfig")
+            decision = self._endpoint_decision(gcloud, target)
             scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
             try:
                 result = self._execute(
@@ -7011,7 +7269,7 @@ class CommandExecutor:
                         target.cluster,
                         f"--location={target.location}",
                         f"--project={target.project}",
-                        *self._dns_endpoint_args(gcloud, target),
+                        *_flags_of(decision),
                     ],
                     kubeconfig_path=scratch,
                     # The short deadline, as for the describe above. A
@@ -7023,13 +7281,62 @@ class CommandExecutor:
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
+                    if managed.is_file() and managed.stat().st_size > 0:
+                        # A provisional file past its window brought us here,
+                        # or a caller filed a settled one while this fetch
+                        # ran. Either way the GKE API has just failed, the
+                        # kubeconfig on disk may well still work, and serving
+                        # it beats a 400. A provisional file's window is
+                        # pushed out so the next attempt waits again rather
+                        # than retrying per request.
+                        logging.warning(
+                            "refetch of the provisional kubeconfig for %s failed (%s); serving the file on disk",
+                            target.context_name, detail[:REFETCH_FAILURE_LOG_CHARS],
+                        )
+                        # Only an existing mark is pushed out: a caller may
+                        # have filed a settled kubeconfig for this cluster
+                        # outside `_kubeconfig_lock` since the miss above, and
+                        # marking that file would send it back here a minute
+                        # later for an undecided refetch to overwrite.
+                        with self._marker_lock:
+                            if marker.exists():
+                                marker.touch()
+                        return managed
                     raise ValueError(
                         f"could not obtain credentials for {target.context_name}: {detail[:400]}"
                     )
-                os.replace(scratch, managed)
+                self._file_managed_kubeconfig(
+                    scratch, target, provisional=self._undecided(decision),
+                    seen_mtime_ns=seen_mtime_ns)
             finally:
                 scratch.unlink(missing_ok=True)
         return managed
+
+    def _decision_for_callers_fetch(self, command: list[str]) -> tuple[bool, object]:
+        """`(attempted, decision)` for a caller's `get-credentials`.
+
+        `attempted` is False when the command is run as given: the caller named
+        an endpoint flag, or no full target could be read. It is True when the
+        broker decided for the caller, in which case `decision` is gke_endpoint's
+        answer or None when it could not decide -- and None is then as
+        provisional as the broker's own undecided fetch, not a settled result.
+
+        The file that fetch produces is filed as the shared kubeconfig for its
+        cluster (`_execute_get_credentials`), so a caller that names no endpoint
+        -- the Platform Agent running the command by hand, a skill that builds
+        its own -- would otherwise move a cluster the broker reaches over its
+        DNS or private endpoint back to the public IP for every brokered kubectl
+        after it. A caller that did name one is run as given; a command whose
+        target cannot be read is run as given too, since gcloud will resolve it
+        against defaults this side does not know.
+        """
+        if any(flag in command for flag in GET_CREDENTIALS_ENDPOINT_FLAGS):
+            return False, None
+        target = _get_credentials_target(command)
+        if target is None:
+            return False, None
+        return True, self._endpoint_decision(
+            command[0], target, timeout_seconds=SPLICE_DECISION_TIMEOUT_SECONDS)
 
     def _execute_get_credentials(
         self,
@@ -7057,6 +7364,14 @@ class CommandExecutor:
         # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
         # config, moving the `current-context` that every later context-less
         # kubectl resolves against.
+        # What is on disk for the cluster this fetch names, before anything
+        # runs: `_file_managed_kubeconfig` compares against it to tell a
+        # settled file that lands during the fetch from one already there.
+        seen_target = _get_credentials_target(command)
+        seen_mtime_ns = (_mtime_ns_or_none(self._managed_kubeconfig(seen_target))
+                         if seen_target is not None else None)
+        attempted, decision = self._decision_for_callers_fetch(command)
+        command = [*command, *_flags_of(decision)]
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(
@@ -7067,12 +7382,21 @@ class CommandExecutor:
                 context = read_current_context(generated)
                 target = parse_gke_context(context) if context else None
                 if target is not None:
-                    # Deliberately outside `_kubeconfig_lock`: `os.replace` is
-                    # atomic, so a concurrent cache miss for the same cluster
-                    # either sees the old file or this one, and at worst does one
-                    # redundant fetch. Taking the lock here would serialise every
-                    # scaffold behind every cold read for no benefit.
-                    os.replace(scratch, self._managed_kubeconfig(target))
+                    # Outside `_kubeconfig_lock`, as before: a scaffold never
+                    # waits behind a cold read's gcloud runs. The filing step
+                    # takes `_marker_lock` by itself, so the file and its
+                    # provisional mark cannot interleave with the broker's own
+                    # fetch. The same provisional rule as that fetch: a file
+                    # written while the broker tried to decide and could not --
+                    # the own-cluster describe failed, or the target's -- is
+                    # filed under a mark and is a miss after its window, unless
+                    # a settled file landed during the fetch; one written on a
+                    # settled decision, or run as given (the caller's own flag,
+                    # no readable target), clears an older mark.
+                    self._file_managed_kubeconfig(
+                        scratch, target,
+                        provisional=attempted and self._undecided(decision),
+                        seen_mtime_ns=seen_mtime_ns if seen_target == target else None)
                 if wants_kubeconfig:
                     result = replace(result, kubeconfig=generated)
             return result
@@ -7540,12 +7864,20 @@ def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | No
     elif decision.offending_flag:
         log_hint = decision.offending_flag
 
+    # The verb the policy resolved and whether the argv only rendered locally,
+    # so the shim can print them beside the rule: the agent runtime's refusal
+    # stop reads those lines instead of re-deriving the verb from shell text.
+    verb_words = list(decision.verb_tuple) if decision.verb_tuple else None
+    if verb_words and decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE:
+        verb_words = verb_words[:2] if verb_words[1:2] and verb_words[1] in _KUBECTL_SUBCOMMANDS.get(verb_words[0], ()) else verb_words[:1]
     return (
         {
             "status": "blocked",
             "code": "SECURITY_POLICY_BLOCKED",
             "rule": decision.rule_id,
             "message": decision.message,
+            "verb": [_VERB_WORD_SAFE_RE.sub("_", w)[:_VERB_WORD_MAX] for w in verb_words] if verb_words else None,
+            "local_render": decision.rule_id == command_policy.KUBERNETES_READ_ONLY_RULE and command_policy.local_render(argv),
         },
         log_hint,
     )
@@ -8138,6 +8470,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # exists. None only in a test that has not set it, where the route
     # answers 503.
     api_relay: GoogleApiRelay | None = None
+    # The drift detector's subscription, `projects/<p>/subscriptions/<s>`, the
+    # one Pub/Sub target the watcher relay reaches. Empty: the detector is off
+    # and every Pub/Sub call is refused.
+    watcher_subscription: str = ""
+    # (project, location, cluster) -> (deadline, host, CA PEM or ""), for the
+    # watcher's Kubernetes route. See `_watcher_cluster_endpoint`.
+    watcher_endpoints: dict[tuple[str, str, str], tuple[float, str, str]] = {}
+    watcher_endpoints_lock = threading.Lock()
     base_branch: str = ""
     # (forge host, path) -> the base every proposal onto that repository must
     # target, from `parse_pinned_bases`. Each pinned branch is also protected
@@ -8289,6 +8629,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith(API_RELAY_PREFIX):
             self._handle_api_relay()
             return
+        if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
+            self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
+            self._handle_watcher_k8s()
+            return
         if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
             # The optional server-to-client SSE channel. None of the relayed
             # servers streams, and the spec's answer for that is 405.
@@ -8361,6 +8707,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith(mcp_policy.MCP_RELAY_PREFIX):
             self._handle_mcp_relay()
+            return
+        if self.path.startswith(watcher_policy.WATCHER_GCP_PREFIX):
+            self._handle_watcher_gcp()
+            return
+        if self.path.startswith(watcher_policy.WATCHER_K8S_PREFIX):
+            # GET only; reaches the handler so the refusal names its rule.
+            self._handle_watcher_k8s()
             return
         if self.path.startswith("/v1/chat/slack/"):
             self._handle_slack_post()
@@ -9229,6 +9582,307 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(reply_body)))
         self.end_headers()
         self.wfile.write(reply_body)
+
+    def _handle_watcher_gcp(self) -> None:
+        """`/v1/watcher/gcp/<host>/<path>`: one GKE or Pub/Sub call for the watchers.
+
+        The k8s-event-watcher and the drift-detector used to make these calls on
+        the gateway pod's own Workload Identity. `watcher_policy.evaluate_gcp`
+        is the table; the forwarding is the Cloud API relay's, with a body for
+        the Pub/Sub POSTs, and the status, Content-Type and body pass back.
+        """
+        request_id = str(uuid.uuid4())
+        parts = urllib.parse.urlsplit(self.path)
+        host, _, path = parts.path[len(watcher_policy.WATCHER_GCP_PREFIX) :].partition("/")
+        self._log_watcher_request("watcher gcp", request_id, f"{host}/{path}")
+        body = b""
+        if self.command == watcher_policy.METHOD_POST:
+            # The two answers /v1/exec and the MCP relay give: 400 for a length
+            # that is not a number, 413 for one out of range.
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid content length"})
+                return
+            if length < 0 or length > self.max_request_bytes:
+                LOGGER.warning("watcher gcp rejected request_id=%s reason=content-length", request_id)
+                self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "request body too large"})
+                return
+            body = self.rfile.read(length)
+        # The Cloud API relay's own checks on the query too: its shape and its
+        # length cap, before the key check below narrows it to two keys.
+        problem = api_relay_target_problem(host, path, parts.query)
+        query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        if problem is None and not set(query) <= WATCHER_GCP_QUERY_KEYS:
+            problem = (API_RELAY_BAD_QUERY, "the watcher relay forwards no query keys but alt and prettyPrint")
+        if problem is not None:
+            code, reason = problem
+            LOGGER.warning("watcher gcp rejected request_id=%s code=%s", request_id, code)
+            self._json(HTTPStatus.BAD_REQUEST, {"error": reason, "code": code})
+            return
+        decision = watcher_policy.evaluate_gcp(self.command, host, path, body, self.watcher_subscription)
+        if not decision.allowed:
+            LOGGER.warning("watcher gcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return
+        if self.api_relay is None:
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"},
+            )
+            return
+        authorization = self._relay_authorization("watcher gcp", request_id)
+        if authorization is None:
+            return
+        target = f"/{path}?{parts.query}" if parts.query else f"/{path}"
+        extra: dict[str, Any] = {}
+        if self.command == watcher_policy.METHOD_POST:
+            extra = {"body": body, "headers": (("Content-Type", WATCHER_GCP_CONTENT_TYPE),)}
+        upstream = self._relay_fetch("watcher gcp", request_id, host, target, authorization, **extra)
+        if upstream is None:
+            return
+        if upstream.over_cap or HTTPStatus.MULTIPLE_CHOICES <= upstream.status < HTTPStatus.BAD_REQUEST:
+            LOGGER.warning(
+                "watcher gcp upstream refused request_id=%s status=%d over_cap=%s",
+                request_id,
+                upstream.status,
+                upstream.over_cap,
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+            )
+            return
+        relayed = upstream.body
+        if decision.rule_id == watcher_policy.RULE_GCP_CLUSTER_GET and upstream.status == HTTPStatus.OK:
+            # Only the fields the watchers read; never masterAuth's client key.
+            projected = watcher_policy.project_cluster(upstream.body)
+            if projected is None:
+                LOGGER.warning("watcher gcp unparseable cluster request_id=%s", request_id)
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                )
+                return
+            relayed = projected
+        LOGGER.info(
+            "watcher gcp forwarded request_id=%s rule=%s status=%d bytes=%d",
+            request_id,
+            decision.rule_id,
+            upstream.status,
+            len(relayed),
+        )
+        self.send_response(upstream.status)
+        if upstream.content_type:
+            self.send_header("Content-Type", sanitize_header(upstream.content_type))
+        self.send_header("Content-Length", str(len(relayed)))
+        self.end_headers()
+        self.wfile.write(relayed)
+
+    def _watcher_cluster_endpoint(self, target: dict[str, str], request_id: str) -> tuple[str, str] | None:
+        """`(host, CA PEM or "")` for a fleet cluster's control plane, or None after answering.
+
+        The same choice `clusterprofiles.ClientConfigForIdentity` makes in Go, on
+        the same GKE API fields: the DNS endpoint wherever it takes external
+        traffic, or wherever GKE mirrors it into `endpoint` (no CA: it is a
+        Google front end with a public certificate); otherwise the IP endpoint
+        with the cluster's own CA. Remembered for WATCHER_ENDPOINT_TTL_S.
+        """
+        key = (target["project"], target["location"], target["cluster"])
+        now = time.monotonic()
+        with self.watcher_endpoints_lock:
+            cached = self.watcher_endpoints.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1], cached[2]
+        if self.api_relay is None:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cloud API relay disabled", "code": "API_RELAY_DISABLED"})
+            return None
+        authorization = self._relay_authorization("watcher k8s", request_id)
+        if authorization is None:
+            return None
+        describe = f"/v1/projects/{key[0]}/locations/{key[1]}/clusters/{key[2]}"
+        upstream = self._relay_fetch("watcher k8s", request_id, watcher_policy.GKE_HOST, describe, authorization)
+        if upstream is None:
+            return None
+        try:
+            cluster = json.loads(upstream.body) if upstream.status == HTTPStatus.OK else None
+        except ValueError:
+            cluster = None
+        resolved = watcher_cluster_address(cluster) if isinstance(cluster, dict) else None
+        if resolved is None:
+            LOGGER.warning(
+                "watcher k8s endpoint unresolved request_id=%s describe_status=%d", request_id, upstream.status
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": "the cluster's control plane could not be found", "code": "CLUSTER_ENDPOINT_UNRESOLVED"},
+            )
+            return None
+        with self.watcher_endpoints_lock:
+            self.watcher_endpoints[key] = (now + WATCHER_ENDPOINT_TTL_S, resolved[0], resolved[1])
+        return resolved
+
+    def _log_watcher_request(self, label: str, request_id: str, target: str) -> None:
+        """The pre-decision audit line, naming the caller, as the other credentialed routes write it.
+
+        The broker makes every watcher call on its own credential, so this line
+        is the record of which ServiceAccount presented the watcher token.
+        """
+        principal = self.principal
+        LOGGER.info(
+            "%s request_id=%s principal=%s target=%s",
+            label,
+            request_id,
+            _sanitize_for_logging(principal.describe() if principal else "", max_length=PRINCIPAL_LOG_LENGTH),
+            # The Cloud API relay's path width: the object read on the broker's
+            # credential has to survive on the one line that names the caller.
+            _sanitize_for_logging(target, max_length=API_RELAY_PATH_LOG_LENGTH),
+        )
+
+    def _watcher_k8s_connection(self, host: str, ca_pem: str) -> http.client.HTTPConnection:
+        """A TLS connection to a fleet control plane; the seam a test points at a fake.
+
+        Verified against the cluster's own CA for an IP endpoint, against the
+        system roots for a DNS endpoint. The connect is bounded like the Cloud
+        API relay's.
+        """
+        context = ssl.create_default_context(cadata=ca_pem) if ca_pem else ssl.create_default_context()
+        return http.client.HTTPSConnection(
+            host, WATCHER_K8S_PORT, timeout=API_RELAY_CONNECT_TIMEOUT_S, context=context
+        )
+
+    def _handle_watcher_k8s(self) -> None:
+        """`GET /v1/k8s/<project>/<location>/<cluster>/<path>`: a fleet API server read.
+
+        The event watcher's list and watch of events, and the drift detector's
+        read of one named object, on the broker's credential.
+        `watcher_policy.evaluate_k8s` is the table. A watch is streamed through
+        as the API server sends it; everything else is streamed too, with the
+        Cloud API relay's deadline on each read.
+        """
+        request_id = str(uuid.uuid4())
+        if self.command != watcher_policy.METHOD_GET:
+            drain_request_body(self, self.max_request_bytes)
+        parts = urllib.parse.urlsplit(self.path)
+        rest = parts.path[len(watcher_policy.WATCHER_K8S_PREFIX) :]
+        self._log_watcher_request("watcher k8s", request_id, rest)
+        if len(parts.query) > API_RELAY_MAX_QUERY_BYTES or not API_RELAY_QUERY_SHAPE.match(parts.query):
+            # The same bound the Cloud API relay puts on a query it forwards:
+            # bytes http.client will put on a request line, and not too many.
+            LOGGER.warning("watcher k8s rejected request_id=%s code=%s", request_id, API_RELAY_BAD_QUERY)
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "the query is not in a form the relay forwards", "code": API_RELAY_BAD_QUERY},
+            )
+            return
+        query = urllib.parse.parse_qs(parts.query, keep_blank_values=True)
+        decision = watcher_policy.evaluate_k8s(self.command, rest, query)
+        if not decision.allowed:
+            LOGGER.warning("watcher k8s blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": decision.rule_id,
+                    "message": decision.message,
+                },
+            )
+            return
+        target, k8s_path = watcher_policy.split_k8s_target(rest)
+        resolved = self._watcher_cluster_endpoint(target, request_id)
+        if resolved is None:
+            return
+        host, ca_pem = resolved
+        authorization = self._relay_authorization("watcher k8s", request_id)
+        if authorization is None:
+            return
+        watching = watcher_policy.is_watch(query)
+        read_timeout = WATCHER_WATCH_READ_TIMEOUT_S if watching else API_RELAY_DEADLINE_S
+        # Built inside the try: a cached CA that will not load is a TLS failure
+        # like any other, answered 502 and forgotten, not an unanswered request.
+        connection: http.client.HTTPConnection | None = None
+        started = time.monotonic()
+        answered = False
+        try:
+            connection = self._watcher_k8s_connection(host, ca_pem)
+            connection.connect()
+            connection.sock.settimeout(read_timeout)
+            target_path = f"/{k8s_path}?{parts.query}" if parts.query else f"/{k8s_path}"
+            connection.putrequest(watcher_policy.METHOD_GET, target_path, skip_accept_encoding=True)
+            connection.putheader("Authorization", authorization)
+            accept = self.headers.get("Accept")
+            if accept and WATCHER_K8S_ACCEPT_SHAPE.match(accept):
+                connection.putheader("Accept", accept)
+            connection.endheaders()
+            response = connection.getresponse()
+            if HTTPStatus.MULTIPLE_CHOICES <= response.status < HTTPStatus.BAD_REQUEST:
+                LOGGER.warning("watcher k8s redirect refused request_id=%s status=%d", request_id, response.status)
+                self._json(
+                    HTTPStatus.BAD_GATEWAY,
+                    {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
+                )
+                return
+            LOGGER.info(
+                "watcher k8s forwarded request_id=%s rule=%s status=%d watch=%s",
+                request_id,
+                decision.rule_id,
+                response.status,
+                watching,
+            )
+            self.send_response(response.status)
+            answered = True
+            content_type = response.getheader("Content-Type", "")
+            if content_type:
+                self.send_header("Content-Type", sanitize_header(content_type))
+            self.end_headers()
+            # No Content-Length: the handler speaks HTTP/1.0 and closes after the
+            # body, which is how a stream of unknown length ends.
+            sent = 0
+            while True:
+                if watching and time.monotonic() - started > WATCHER_WATCH_MAX_S:
+                    break
+                chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                sent += len(chunk)
+            LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
+        except (OSError, http.client.HTTPException) as exc:
+            # Before the status line, an answer, and the cached address is
+            # forgotten in case it is what failed; after it, nothing more is
+            # written and the stream is cut, which the client answers by
+            # re-listing or re-watching, as it would on any dropped watch.
+            LOGGER.warning(
+                "watcher k8s upstream failed request_id=%s type=%s answered=%s",
+                request_id,
+                type(exc).__name__,
+                answered,
+            )
+            if answered:
+                self.close_connection = True
+            else:
+                key = (target["project"], target["location"], target["cluster"])
+                with self.watcher_endpoints_lock:
+                    self.watcher_endpoints.pop(key, None)
+                with contextlib.suppress(OSError):
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"error": "the API server could not be reached", "code": "UPSTREAM_UNAVAILABLE"},
+                    )
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.
@@ -10200,6 +10854,7 @@ def serve(args: argparse.Namespace) -> None:
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)
     CredentialProxyHandler.api_relay = GoogleApiRelay()
     LOGGER.info("Cloud API relay enabled routes=%d", len(api_policy.API_READ_ROUTES))
+    CredentialProxyHandler.watcher_subscription = os.getenv("WATCHER_PUBSUB_SUBSCRIPTION", "").strip()
     CredentialProxyHandler.slack_max_request_bytes = int(
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )

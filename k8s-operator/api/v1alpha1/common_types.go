@@ -210,7 +210,7 @@ var SensitiveEnvVars = map[string]struct{}{
 // source half of this reservation: the audience route, and the creds-Secret
 // route that is cheaper than it.
 //
-// One member so far. `a2a-bus-token` is the projected ServiceAccount token the
+// Two members. The first, `a2a-bus-token`, is the projected ServiceAccount token the
 // platform-agent container presents to the bus under `mode: next`, and it is
 // that container's alone — the auth callout resolves the POD's ServiceAccount,
 // so any other container mounting this token is a second workload wearing the
@@ -218,8 +218,16 @@ var SensitiveEnvVars = map[string]struct{}{
 // union of the two grant sets, which is the retired `worker` credential rebuilt
 // out of a volumeMount. See a2aStripBusTokenMounts and, for the fifth field,
 // a2aStripBusTokenVolumeMounts.
+//
+// The watchers' broker token is the second member, in either mode: it is
+// projected into the gateway's agent-api-auth container alone, and any other
+// container holding it holds the broker's watcher role (every fleet cluster's
+// events and named objects). The controller's watcherTokenSourceNames strips
+// it, and any volume projecting its audience under another name, at render;
+// this is the name half's admission message. The source half is render-only.
 var ReservedVolumeNames = map[string]struct{}{
-	"a2a-bus-token": {},
+	"a2a-bus-token":                  {},
+	"watcher-credential-proxy-token": {},
 }
 
 // BusCredentialRouteKind says which of the two sources a user-authored volume
@@ -678,9 +686,10 @@ type TuningSpec struct {
 	// preemption.
 	//
 	// The number lands in three places that deliberately differ. The gateway's
-	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap a new
-	// delegation is refused with a chat reply naming the numbers, never queued,
-	// never dropped. The namespace ResourceQuota is rendered a fixed headroom
+	// A2A_MAX_SESSIONS env carries it as a usability control: at the cap the
+	// gateway first evicts the longest-idle session pod (its conversation is
+	// told); only with none idle is a new turn refused with a chat reply naming
+	// the numbers, never queued, never dropped. The namespace ResourceQuota is rendered a fixed headroom
 	// ABOVE it as the enforcement control: a compromised or buggy gateway
 	// ignores its own cap and cannot ignore the quota, and keeping the quota
 	// above the cap is what makes users hit the honest refusal rather than an
@@ -722,9 +731,10 @@ type TuningSpec struct {
 	//
 	// Raising it buys concurrent delegations at the per-pod price plus model
 	// concurrency against the shared LiteLLM endpoint; the quota lifts with it.
-	// Lowering it turns busy-hour delegations into refusals sooner - a lower
-	// cap never reaps in-flight sessions, it only blocks new spawns until they
-	// finish. Setting it to 1 serialises delegated SESSION work; kanban worker
+	// Lowering it turns busy-hour delegations into evictions and refusals
+	// sooner - a lower cap never stops a running task: a new spawn at the cap
+	// evicts the session pod idle longest, and is refused only when none is
+	// idle. Setting it to 1 serialises delegated SESSION work; kanban worker
 	// concurrency is MaxInProgress above, a different lane.
 	//
 	// The Maximum exists because the quota render adds its headroom to this
@@ -1187,22 +1197,19 @@ type SecuritySpec struct {
 	// What the gateway policy already permits, and therefore what this cannot
 	// take away:
 	//
-	//   - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
-	//     metadata addresses — the pre- and post-DNAT forms of a metadata
-	//     request (the 988 rule is suppressed when the resolved metadata
-	//     daemon IP is empty). So the metadata path stays open. The same
-	//     address is also permitted on port 53, where it is the Cloud DNS for
-	//     GKE resolver rather than a credential path.
+	//   - 169.254.169.254/32 on port 53 only, where it is the Cloud DNS for
+	//     GKE resolver rather than a credential path. The gateway policy opens
+	//     no metadata credential port: the gateway Pod holds no Google identity
+	//     (it runs as its own unannotated ServiceAccount), so there is no
+	//     metadata path left for this field to close.
 	//   - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of
 	//     what this control is meant to be.
 	//
-	// The overlap is deliberate rather than an oversight. Workload Identity
-	// needs the metadata path, and <name>-gateway-netpol still permits it to
-	// the agent Pod. Narrowing that allowance to the broker Pod, which is the
-	// only one that mints a cloud token, is the work that turns this field into
-	// a control.
+	// The overlap is deliberate rather than an oversight. Narrowing
+	// <name>-gateway-netpol's internet rule is the work that turns this field
+	// into a control.
 	//
 	// So what is this for today? Two things, and they are worth having, but
 	// neither is enforcement. It renders an auditable statement of the
@@ -1250,11 +1257,9 @@ type SecuritySpec struct {
 	//     disables;
 	//   - github.com reached directly from the sandbox, though not the gh and
 	//     git wrappers, which go through the broker;
-	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
-	//     script's project id. It fails soft after a five-second timeout and
-	//     falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
-	//     pinned empty in the managed .env (a project other than the pod's belongs in
-	//     spec.scope.projects, the management project still has to resolve).
+	//   - nothing in cluster_agent_reconcile.py, which reads its management
+	//     project from GKE_PROJECT_ID (pinned in the managed .env, beside
+	//     RECONCILE_PROJECT pinned empty) and asks no metadata server.
 	//
 	// Those would not be accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this
@@ -1794,9 +1799,9 @@ type NetworkPolicySpec struct {
 	AdditionalEgress []EgressRule `json:"additionalEgress,omitempty"`
 }
 
-// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target (rule 3).
+// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target in the LiteLLM policy (litellm-policy), the one generated policy that still opens the metadata path; the gateway policy opens none.
 type MetadataDaemonSpec struct {
-	// Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+	// Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
 	// the empty alternative in the pattern is required because the API server
 	// validates an explicitly-set "", which omitempty does not suppress.
 	// +kubebuilder:validation:Pattern=`^($|(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
@@ -1963,11 +1968,11 @@ type NetworkPolicyStatus struct {
 	// +optional
 	DNSClusterIPsSource string `json:"dnsClusterIPsSource,omitempty"`
 
-	// MetadataDaemonIP is the post-NAT daemon IP in rule 3, empty when suppressed.
+	// MetadataDaemonIP is the post-NAT daemon IP in the LiteLLM policy's metadata rule, empty when suppressed.
 	// +optional
 	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
 
-	// MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+	// MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
 	// DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
 	// +optional
 	MetadataDaemonPort int32 `json:"metadataDaemonPort,omitempty"`
@@ -2054,9 +2059,10 @@ type AgentStatus struct {
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
 // update, and ToolExecutionsTotal, EventsIngestedTotal,
-// RemediationsProposedTotal, RemediationsMergedTotal, LastActiveTime,
-// ClustersRegistered and ClustersMonitored from the broker's and the event
-// watcher's metrics
+// RemediationsProposedTotal, RemediationsMergedTotal,
+// ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
+// ClustersMonitored from the broker's, the event watcher's and the chat
+// plugin's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
 // ServiceAccount holds no write verb on this status. SessionsTotal and
 // RemediationsAppliedTotal are declared so that the schema names them, but
@@ -2121,6 +2127,24 @@ type AgentUsageStatus struct {
 	// +optional
 	RemediationsMergedTotal int64 `json:"remediationsMergedTotal,omitempty"`
 
+	// ChatMessagesInboundTotal is the cumulative count of chat messages that
+	// reached the gateway, from every platform it serves: Google Chat, Slack,
+	// Teams and its own API port alike. Counted at the gateway's dispatch
+	// hook, which Hermes runs after dropping its own internal events and
+	// before it checks the sender against the allowlist, so an unlisted
+	// user's message counts and nothing the gateway never hands to the hook
+	// does. Read every five minutes from the chat_metrics plugin's
+	// kubeagents_chat_messages_inbound_total on the platform-agent container
+	// of the gateway pod that runs Hermes (above one replica, the leader
+	// alone), summed across the pods that have led, and, on a next-mode
+	// install, from the A2A gateway's
+	// kubeagents_a2a_gateway_messages_inbound_total as well, since Chat
+	// ingress is that gateway's there; kept monotonic the same way as
+	// ToolExecutionsTotal. Moves LastActiveTime, so a chat turn that runs no
+	// brokered command is activity.
+	// +optional
+	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
+
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
 	// Agent profiles the GKE API would describe, the management cluster
@@ -2164,13 +2188,12 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, a proposal was opened or merged, or an
-	// event was accepted for triage.
-	// Until SessionsTotal has a source, a chat turn that runs no brokered
-	// command does not move it. Scheduled maintenance jobs that run brokered
-	// commands do move it, though -- the Controller Stall Watch cron runs some
-	// every 30 minutes by default -- so it marks agent activity of any origin,
-	// not human or operator use alone. Advances at most once per five minutes.
+	// moved: a brokered command ran, a proposal was opened or merged, a chat
+	// message reached the gateway, or an event was accepted for triage.
+	// Scheduled maintenance jobs that run brokered commands move it too --
+	// the Controller Stall Watch cron runs some every 30 minutes by default
+	// -- so it marks agent activity of any origin, not human or operator use
+	// alone. Advances at most once per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
 }

@@ -70,7 +70,7 @@ KNOWN = {P7, P8}
 # code: sha256 over the sorted input entries joined by NUL, docs left out.
 LS_TREE_HEAD = ["ls-tree", "-r", "-z", "--full-tree", "HEAD", "--", "bench/tf/fleet"]
 LS_TREE_FETCHED = ["ls-tree", "-r", "-z", "--full-tree", "FETCH_HEAD", "--", "bench/tf/fleet"]
-FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4"}
+FLEET_INPUTS = {"main.tf": "aaa1", "versions.tf": "aaa2", ".terraform.lock.hcl": "aaa3", "reconcile-allow.json": "aaa4", "seeded_b_pin.py": "aaa5"}
 FLEET_DOCS = {"README.md": "doc1", "fixtures.json": "fix1"}
 
 
@@ -221,10 +221,10 @@ class PlanInspectionTest(unittest.TestCase):
     def test_the_fleet_stack_commits_a_lock_file_that_matches_its_constraints(self):
         lock = (reconcile.FLEET_DIR / ".terraform.lock.hcl").read_text()
         versions = (reconcile.FLEET_DIR / "versions.tf").read_text()
-        for provider in ("google", "kubernetes"):
+        for provider in ("google", "kubernetes", "external"):
             self.assertIn(f'provider "registry.opentofu.org/hashicorp/{provider}"', lock)
         constraints = re.findall(r'version\s*=\s*"(~> [\d.]+)"', versions)
-        self.assertEqual(len(constraints), 2, "one `~>` constraint per provider; another form needs this test and the lock re-done")
+        self.assertEqual(len(constraints), 3, "one `~>` constraint per provider; another form needs this test and the lock re-done")
         for constraint in constraints:
             self.assertIn(f'constraints = "{constraint}"', lock)
         # One h1 hash per locked platform per provider: linux_amd64 for the

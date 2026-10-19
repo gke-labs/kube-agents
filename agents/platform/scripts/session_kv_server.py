@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import hashlib
 import re
@@ -77,6 +78,8 @@ LEDGER_MAX_ROWS = int(os.getenv("SESSION_KV_LEDGER_MAX_ROWS", "200000"))
 # the failing container and the leading predicate, which is more than the
 # reader shows.
 LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", "512"))
+# The GitOpsDrift daily alert ceiling when ALERT_DAILY_LIMIT_DRIFT is not set.
+DEFAULT_ALERT_DAILY_LIMIT_DRIFT = 20
 
 # The read-only activity feed: `GET /v1/intercepted-events`, `GET /v1/tasks`,
 # `GET /v1/tasks/{id}` and `GET /v1/sessions/{id}/tasks`. It exists for an
@@ -194,6 +197,51 @@ MANAGED_DOTENV_PATH = os.path.join(
 MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
 )
+
+
+# The report a fleet-audit run's `finish` leaves for the relay, in the
+# directory the run's shell writes to (`audit_report.SCRATCH_DIR`, in the shell
+# sandbox when there is one). The relay posts it in place of the job's final
+# message, which holds whatever else the model wrote in its last turn.
+FLEET_AUDIT_SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
+CHAT_REPORT_FILE = "chat_report_{audit}.json"
+# `audit_report.CHAT_REPORT_*_KEY`.
+CHAT_REPORT_RUN_KEY = "run"
+CHAT_REPORT_UPDATED_KEY = "updated_at"
+CHAT_REPORT_PARTS_KEY = "parts"
+CHAT_REPORT_REPO_KEY = "repo"
+CHAT_REPORT_TEXT_KEY = "text"
+# The scheduler's run ledger under a profile home, and the status its row holds
+# from the run's start until after its delivery.
+RUN_LEDGER = ("cron", "executions.db")
+RUN_LEDGER_RUNNING = "running"
+# Above the relay's own report ceiling, so a long report is clipped with its
+# notice by `_truncate_report`; a record past it posts the unreadable notice.
+CHAT_REPORT_MAX_BYTES = 1024 * 1024
+# The roster the image ships for the Platform Agent. Only a job in it runs under
+# its audit stream's id, which is the name `finish` gives the record; a job
+# created at runtime keeps posting its final message.
+IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
+# The field the relay plugin (deploy/docker/plugins/chat/adapter.py) sends on
+# every scheduled delivery and `report_to_chat` never does.
+SCHEDULER_LEG_KEY = "also_delivered_to"
+# deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
+# delivery is the scheduler's failure line for the run.
+SCHEDULER_FAILURE_KEY = "scheduler_failure"
+AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
+# `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
+AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
+CHAT_REPORT_READ_TIMEOUT_S = 20
+# `audit_report.INFLIGHT_TTL_SECONDS`: no step of a run outlives its stream's
+# lease, so a record whose last step is older than that is an earlier run's.
+CHAT_REPORT_MAX_AGE_S = 2 * 60 * 60
+CHAT_REPORT_PARTS_SEPARATOR = "\n\n"
+AUDIT_NOT_FINISHED_NOTICE = "{label} did not finish, so it has no report. See the run log for job `{job}`."
+AUDIT_UNREADABLE_NOTICE = "{label}: the relay could not read the run's report ({why}). See the run log for job `{job}`."
+AUDIT_UNFINISHED_REPOS_LINE = "{label} did not finish for {repos}. See the run log for job `{job}`."
+# Busy timeout for the audit-run bookkeeping below, as for every other
+# connection this server opens.
+AUDIT_RUNS_DB_TIMEOUT_S = 5.0
 
 
 def _dotenv_value(path: str, name: str) -> str:
@@ -462,7 +510,18 @@ ALERT_DAILY_LIMITS = {
     # it displays as. Declared here rather than left to a `.get` miss because a
     # miss is allowed through *uncapped* (see the Info note above), and an
     # uncapped drift stream is exactly the flood this bucket exists to bound.
-    DRIFT_QUOTA_KEY: _alert_daily_limit("ALERT_DAILY_LIMIT_DRIFT", 5),
+    #
+    # The drift default is a judgment, not a measurement. One apply spends one
+    # inject for each object, because the detector does not combine records.
+    # install.sh and upgrade.sh enable the detector by default, so this value
+    # applies to the installs that these scripts manage. Only changes by people
+    # alert, so the default covers a few hand applies a day. A record that the
+    # detector cannot join to a live object still sends a card with less
+    # detail, unless its cluster is outside the install's scope. That card
+    # spends the same budget. Each admitted record starts a triage turn. The
+    # detector also reads the audit logs of each scoped project, so a wider
+    # scope sends more records. These are the reasons not to go higher.
+    DRIFT_QUOTA_KEY: _alert_daily_limit("ALERT_DAILY_LIMIT_DRIFT", DEFAULT_ALERT_DAILY_LIMIT_DRIFT),
 }
 
 # The `kind` a drift record carries, set by the drift detector
@@ -790,6 +849,20 @@ def init_db() -> None:
                     sent       INTEGER NOT NULL DEFAULT 0,
                     suppressed INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (day, severity)
+                )
+                """
+            )
+            # The fleet-audit run whose report each audit job last posted, so a
+            # run's report is posted once and a later run that never reached
+            # `finish` gets the not-finished notice instead of it.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_report_runs (
+                    profile   TEXT NOT NULL,
+                    job_id    TEXT NOT NULL,
+                    run       TEXT NOT NULL,
+                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (profile, job_id)
                 )
                 """
             )
@@ -2001,10 +2074,12 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     keys on to decide which completions earn an `incidents` row — which is what
     makes the offer to reply `apply` honourable. Those literals are load-bearing
     in both bodies for the same reasons; read that docstring before rewording
-    either. This body has its own third reader as well —
-    bench/tasks/gitops-drift-out-of-band-triage/task.yaml's delivery objective
-    keys on the same literals — and bench/tests/test_triage_delivery_contract.py
-    holds this template against both that case and the notifier gate.
+    either. This body has its own further readers as well — every
+    bench/tasks/gitops-drift-*/task.yaml delivery objective keys on the same
+    literals — and bench/tests/test_triage_delivery_contract.py holds this
+    template against each of those cases and against the notifier gate. The
+    count is deliberately not written out here: the list that decides it is
+    CONTRACTS in that test, which is where a new case is added.
 
     What is not shared is the question. An event says Kubernetes is unhappy and
     asks for a root cause. This says a person or a tool changed a live object
@@ -2012,6 +2087,14 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
     one that should win. That is a decision the reader makes, not a defect the
     agent diagnoses, so the report's job is to establish what changed, whether
     it still stands, and what each answer would cost.
+
+    The body names `gke-load-bearing-change` outright for the reason
+    `_stall_task_body` names its skill: the Cluster Agent reaches this text as a
+    verbatim presentation template and follows its format faithfully, and a
+    skill is not picked up by ambient relevance while it is doing that. What the
+    skill carries is the step a report can skip while looking complete —
+    establishing whether the state git declares still runs before proposing that
+    the change be undone.
     """
     resource_path = _drift_resource_path(payload)
     cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
@@ -2054,13 +2137,21 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
         f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
         f"use it.\n\n"
+        f"**Run the `gke-load-bearing-change` skill before you propose undoing the change.** Reading the live "
+        f"object tells you whether the change still stands. It does not tell you whether the state git declares "
+        f"would run if you put it back — and a change that is the only reason this object's workload is up is "
+        f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
+        f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
+        f"whichever way it comes out belongs in the report.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
         f"delivers one line to the person waiting for it.\n\n"
         f"**Done when:** the report says what the live object looks like now compared with what the change did; "
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
-        f"either reverting it to the declared state or codifying it in git, with the consequence of each. "
+        f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
+        f"revert's consequence being whether the state git declares would still run, read off this cluster or "
+        f"reported as not established. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -2625,7 +2716,7 @@ def _sanitize_label(value: str) -> str:
     return neutralised
 
 
-def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
+def _truncate_report(report: str, profile: str, job_id: str, audit_record: bool = False) -> tuple[str, str]:
     """Cut an oversized report to the cap. Returns `(report, notice)`.
 
     `notice` is `""` for a report that fits, and otherwise the line that says so,
@@ -2641,8 +2732,9 @@ def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
     cap.
 
     A cut report is worse than a whole one and much better than none. The head
-    survives, and the notice names the directory the scheduler saved the full
-    text to, so nothing is only in the truncated copy.
+    survives, and the notice names where the full text is: the directory the
+    scheduler saved it to, or for a fleet-audit record (`audit_record`) the
+    record and the ledger issues the report links.
 
     Not a link: the file lives on the agent's PVC under
     `$HERMES_HOME/cron/output/<job_id>/<timestamp>.md` and the run's own
@@ -2652,11 +2744,24 @@ def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
     if len(report) <= CRON_REPORT_MAX_CHARS:
         return report, ""
 
+    # A fleet-audit report is the record `finish` left, not the final message
+    # the scheduler saved, so the notice names the record.
+    # The ledger lines are what a reader can open; the cut keeps the head and
+    # drops each report's last line, which is where `finish` puts them.
+    ledgers = sorted(set(AUDIT_LEDGER_LINE_RE.findall(report))) if audit_record else []
+    saved = (
+        f"The whole report is in `{CHAT_REPORT_FILE.format(audit=job_id)}` in the "
+        f"shell's scratch directory, and its findings are on the ledger issue"
+        + (": " + ", ".join(ledgers) if ledgers else "")
+        + "."
+        if audit_record
+        else f"The whole report was saved by the scheduler under "
+        f"`cron/output/{job_id}/` in the {profile} profile's home."
+    )
     notice = (
         f"[truncated] This report was {len(report)} characters, over the "
         f"{CRON_REPORT_MAX_CHARS}-character chat limit, so what follows is the "
-        f"beginning of it. The whole report was saved by the scheduler under "
-        f"`cron/output/{job_id}/` in the {profile} profile's home.\n\n"
+        f"beginning of it. {saved}\n\n"
     )
     logger.warning(
         f"Relay for {profile}/{job_id}: report is {len(report)} chars, truncating to "
@@ -2930,6 +3035,11 @@ def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
         return False
+    return _roster_runs_fleet_audit(store, job_id)
+
+
+def _roster_runs_fleet_audit(store: Any, job_id: str) -> bool:
+    """Whether `job_id` in a cron roster's parsed JSON runs the fleet-audit skill."""
     jobs = store.get("jobs") if isinstance(store, dict) else store
     for job in jobs if isinstance(jobs, list) else []:
         if isinstance(job, dict) and str(job.get("id") or "") == job_id:
@@ -2997,6 +3107,8 @@ def _post_audit_blocks(
 ) -> AuditPost | None:
     """Post the audit report as Block Kit (headline, findings, choice and link
     buttons, or the clean card); where it landed, or None to post text instead.
+    Under ``spec.mode: next`` the same card goes to the gateway as a chat
+    message instead (:func:`_post_audit_chat_via_gateway`).
 
     None, before anything is posted, when there are no blocks to build (no
     issue, an issue that does not parse), no Slack relay in the
@@ -3016,7 +3128,10 @@ def _post_audit_blocks(
     if headline.issue is None or not (routed or slack_blocks_post.configured()):
         return None
     threaded = bool(chat_id and thread_id)
-    built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
+    if routed:
+        built = slack_audit_report.chat_from_issue(headline.issue, headline.ref, message)
+    else:
+        built = slack_audit_report.blocks_from_issue(headline.issue, headline.ref, message)
     if built is None:
         return None
     blocks, text = built
@@ -3025,7 +3140,7 @@ def _post_audit_blocks(
         logger.warning(f"Relay for {profile}/{job_id}: no time left for the report blocks, posting text")
         return None
     if routed:
-        return _post_audit_blocks_via_gateway(
+        return _post_audit_chat_via_gateway(
             profile, job_id, blocks, text, thread_id if threaded else "", min(AUDIT_BLOCKS_POST_TIMEOUT_S, left)
         )
     try:
@@ -3048,63 +3163,33 @@ def _post_audit_blocks(
     return AuditPost(thread_id if threaded else ts)
 
 
-# The A2A gateway answers no Slack interaction (it acks only Events API
-# envelopes), so a button posted through it is one a user clicks into a
-# timeout. Interactive elements are taken off the card on that path; a URL
-# button becomes a plain mrkdwn link so the ledger link survives.
-GATEWAY_INTERACTIVE_BLOCK = "actions"
-GATEWAY_BUTTON = "button"
 # How much sooner the CLI gives up than the subprocess bound, so the CLI's
 # own outcome-unknown exit is what a slow post ends in.
-GATEWAY_BLOCKS_TIMEOUT_MARGIN_S = 3
+GATEWAY_POST_TIMEOUT_MARGIN_S = 3
 
 
-def _without_interaction(blocks: list[dict]) -> list[dict]:
-    """The card without anything a user could click: no actions blocks and no
-    interactive accessories. The URLs of any link buttons come back as one
-    context block of mrkdwn links, so the card keeps where it points."""
-    kept: list[dict] = []
-    links: list[str] = []
-
-    def collect(element: dict) -> None:
-        if element.get("type") == GATEWAY_BUTTON and element.get("url"):
-            label = ((element.get("text") or {}).get("text") or element["url"]).replace("|", " ")
-            links.append(f"<{element['url']}|{label}>")
-
-    for block in blocks:
-        if block.get("type") == GATEWAY_INTERACTIVE_BLOCK:
-            for element in block.get("elements") or []:
-                collect(element)
-            continue
-        accessory = block.get("accessory")
-        if isinstance(accessory, dict) and accessory.get("type") not in ("image", None):
-            collect(accessory)
-            block = {key: value for key, value in block.items() if key != "accessory"}
-        kept.append(block)
-    if links:
-        kept.append({"type": "context", "elements": [{"type": "mrkdwn", "text": " · ".join(links)}]})
-    return kept
-
-
-def _post_audit_blocks_via_gateway(
-    profile: str, job_id: str, blocks: list[dict], text: str, thread_id: str, timeout: float
+def _post_audit_chat_via_gateway(
+    profile: str, job_id: str, chat: dict, text: str, thread_id: str, timeout: float
 ) -> AuditPost | None:
-    """Post the audit report's blocks through the gateway's Slack chat.notify route.
+    """Post the audit report's card through the gateway's Slack chat.notify route.
 
     The next-stack half of :func:`_post_audit_blocks`: under ``spec.mode: next``
-    the broker's Slack relay is gone and the gateway holds Slack, so the blocks
-    go as ``a2a notify --blocks-file`` into the home channel (chat_notify.py).
-    Same outcomes as the relay path: None, to post text instead, after a
-    refusal, a failure to send, or a post that may have landed.
+    the broker's Slack relay is gone and the gateway holds Slack, so the card
+    goes as a ``kube-agents.chat/v1`` message (``a2a notify --chat-file``,
+    chat_notify.py) into the home channel, and the gateway lays it out, its
+    buttons included. ``text`` is the message's fallback, which the gateway
+    posts itself when it does not lay the message out. Same outcomes as the
+    relay path: None, to post text instead, after a refusal, a failure to
+    send, or a post that may have landed.
     """
     path = ""
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-            json.dump(_without_interaction(blocks), handle)
+            json.dump(chat, handle)
             path = handle.name
         res = subprocess.run(
-            chat_notify.blocks_command(
-                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_BLOCKS_TIMEOUT_MARGIN_S, 1)
+            chat_notify.chat_command(
+                SLACK_PLATFORM, thread_id, text, path, max(timeout - GATEWAY_POST_TIMEOUT_MARGIN_S, 1)
             ),
             capture_output=True,
             text=True,
@@ -3113,7 +3198,7 @@ def _post_audit_blocks_via_gateway(
             timeout=timeout,
         )
     except Exception as exc:
-        logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {exc!r}")
+        logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {exc!r}")
         return None
     finally:
         if path:
@@ -3123,9 +3208,9 @@ def _post_audit_blocks_via_gateway(
                 pass
     if res.returncode != 0:
         if chat_notify.outcome_unknown(res.returncode):
-            logger.warning(f"Relay for {profile}/{job_id}: report blocks may have posted, posting text: {res.stderr.strip()}")
+            logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {res.stderr.strip()}")
         else:
-            logger.warning(f"Relay for {profile}/{job_id}: report blocks not posted, posting text: {res.stderr.strip()}")
+            logger.warning(f"Relay for {profile}/{job_id}: report card not posted, posting text: {res.stderr.strip()}")
         return None
     try:
         resp = json.loads(res.stdout) or {}
@@ -3134,6 +3219,245 @@ def _post_audit_blocks_via_gateway(
     if thread_id:
         return AuditPost(thread_id)
     return AuditPost(chat_notify.thread_from_response(SLACK_PLATFORM, resp if isinstance(resp, dict) else {}))
+
+
+def _post_failed_audit_via_gateway(
+    profile: str, job_id: str, report: str, chat_id: str, thread_id: str, deadline: float
+) -> AuditPost | None:
+    """Under ``spec.mode: next``, post a failed fleet-audit report as its one line with the report folded under it.
+
+    A reply in the thread reaches the gateway there, which cannot replay the
+    report as ``incident_context`` does under today, so the report rides in
+    the message's fold (:func:`slack_audit_report.failed_chat`). None, and the
+    caller posts the line as text, when the message cannot be built, too
+    little of `deadline` is left, or the gateway did not post it.
+    """
+    built = slack_audit_report.failed_chat(report)
+    left = deadline - time.monotonic()
+    if built is None or left < AUDIT_BLOCKS_MIN_POST_S:
+        return None
+    chat, text = built
+    thread = thread_id if chat_id and thread_id else ""
+    return _post_audit_chat_via_gateway(profile, job_id, chat, text, thread, min(AUDIT_BLOCKS_POST_TIMEOUT_S, left))
+
+
+def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, job_id: str) -> str | None:
+    """With ``KAGE_SLACK_UX`` on, the one line a fleet-audit report that could not complete posts in Slack.
+
+    None, and the leg posts the report as written, unless the leg is Slack, the
+    flag is on, a channel is known (the leg's chat id or the Slack home
+    channel), the report ends with no ledger link and opens a "What's wrong"
+    section (:func:`slack_audit_report.failed_line`), and the job runs the
+    fleet-audit skill. The line is that section's first sentence, the agent's
+    own words for what failed; the incident row the caller stores keeps the
+    whole report for a reply in the thread, and under ``spec.mode: next`` the
+    report folds under the line instead (:func:`_post_failed_audit_via_gateway`).
+    """
+    if platform != SLACK_PLATFORM or not slack_presenter.enabled():
+        return None
+    if not (chat_id or _slack_home_channel()):
+        return None
+    line = slack_audit_report.failed_line(report)
+    if line is None or not _is_fleet_audit_job(profile, job_id):
+        return None
+    return line
+
+
+class ChatReportUnreadable(Exception):
+    """The record may exist, but the read did not return it."""
+
+
+def _read_chat_report_record(job_id: str) -> dict | None:
+    """The chat report record `finish` left for `job_id`, or None when there is none.
+
+    Raises ChatReportUnreadable when the read itself failed, which says
+    nothing about whether the run finished.
+    """
+    path = os.path.join(FLEET_AUDIT_SCRATCH_DIR, CHAT_REPORT_FILE.format(audit=job_id))
+    try:
+        import sandbox_exec
+
+        # One byte past the cap, so a record over it is told from one at it.
+        if sandbox_exec.sandbox_enabled():
+            raw = sandbox_exec.read_bytes(
+                path, max_bytes=CHAT_REPORT_MAX_BYTES + 1, timeout=CHAT_REPORT_READ_TIMEOUT_S
+            )
+        else:
+            with open(path, "rb") as handle:
+                raw = handle.read(CHAT_REPORT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning(f"Relay for {job_id}: chat report unreadable: {exc!r}")
+        raise ChatReportUnreadable(type(exc).__name__) from exc
+    if raw is None:
+        return None
+    if len(raw) > CHAT_REPORT_MAX_BYTES:
+        logger.warning(f"Relay for {job_id}: chat report is over {CHAT_REPORT_MAX_BYTES} bytes")
+        raise ChatReportUnreadable(f"over {CHAT_REPORT_MAX_BYTES} bytes")
+    try:
+        record = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        logger.warning(f"Relay for {job_id}: chat report is not JSON")
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _last_posted_run(profile: str, job_id: str) -> str:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT run FROM audit_report_runs WHERE profile = ? AND job_id = ?",
+                (profile, job_id),
+            ).fetchone()
+        return str(row[0]) if row else ""
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: last posted run unreadable: {exc!r}")
+        return ""
+
+
+def _mark_run_posted(profile: str, job_id: str, run: str) -> None:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO audit_report_runs (profile, job_id, run) VALUES (?, ?, ?)",
+                    (profile, job_id, run),
+                )
+    except Exception as exc:
+        logger.error(f"Relay for {profile}/{job_id}: run {run} not marked posted: {exc!r}")
+
+
+def _is_shipped_audit_job(job_id: str) -> bool:
+    """Whether the image's Platform Agent roster ships `job_id` as a fleet-audit job."""
+    try:
+        with open(IMAGE_PLATFORM_ROSTER, encoding="utf-8") as handle:
+            store = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Relay for {job_id}: image roster unreadable: {exc}")
+        return False
+    return _roster_runs_fleet_audit(store, job_id)
+
+
+def _delivering_run_start(profile: str, job_id: str) -> float | None:
+    """When the run now delivering `job_id` started, from the scheduler's ledger; None when unknown.
+
+    The scheduler keeps the run's row `running` until after its delivery and
+    allows one live run per job. `claimed` rows are left out: a tick writes one
+    at submit and may lose the claim. Read-only, and any failure is None.
+    """
+    from gitops_workspace import agent_home
+
+    base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+    path = os.path.join(base, *RUN_LEDGER)
+    if not os.path.exists(path):
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT started_at FROM executions WHERE job_id = ? AND status = ?",
+                (job_id, RUN_LEDGER_RUNNING),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: run ledger unreadable: {exc}")
+        return None
+    starts = []
+    for (started,) in rows:
+        try:
+            stamp = datetime.fromisoformat(str(started)).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(stamp):
+            starts.append(stamp)
+    return max(starts) if starts else None
+
+
+def _record_written_by_this_run(profile: str, job_id: str) -> bool:
+    """Whether the delivering run finished a repository into the record on disk.
+
+    True when the record holds a finished part and its last step is at or after
+    the run's start in the scheduler's ledger. Unknown (no ledger row, no
+    record) is False, and the failure line is posted as on main.
+    """
+    started = _delivering_run_start(profile, job_id)
+    if started is None:
+        return False
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return False
+    if not record:
+        return False
+    try:
+        updated = float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        return False
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    finished = any(
+        isinstance(part, dict) and str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip()
+        for part in (parts if isinstance(parts, list) else [])
+    )
+    return finished and math.isfinite(updated) and updated >= started
+
+
+def _record_run(job_id: str) -> str:
+    """The run id of the chat record on disk for `job_id`, or "" when there is none to read."""
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return ""
+    return str((record or {}).get(CHAT_REPORT_RUN_KEY) or "")
+
+
+def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
+    """What a fleet-audit job posts, and the run it is for: `(report, run)`.
+
+    The reports `finish` left for each repository of this job's latest run,
+    followed by a line naming any repository the run started and did not
+    finish, when that run has not been posted and its last step is within
+    `CHAT_REPORT_MAX_AGE_S`. A run with no finished repository posts
+    `AUDIT_NOT_FINISHED_NOTICE`, as does one already posted or too old, with no
+    run. The final message is never posted: it is what the model wrote, and
+    posting it is how a channel got working notes in place of a report.
+    """
+    label = title or job_id
+    notice = AUDIT_NOT_FINISHED_NOTICE.format(label=label, job=job_id)
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable as exc:
+        return AUDIT_UNREADABLE_NOTICE.format(label=label, why=exc, job=job_id), ""
+    if record is None:
+        return notice, ""
+    run = str(record.get(CHAT_REPORT_RUN_KEY) or "")
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    parts = [part for part in (parts if isinstance(parts, list) else []) if isinstance(part, dict)]
+    texts = [str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip() for part in parts]
+    finished = [text for text in texts if text]
+    unfinished = [
+        str(part.get(CHAT_REPORT_REPO_KEY) or "")
+        for part, text in zip(parts, texts)
+        if not text
+    ]
+    try:
+        age = time.time() - float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        age = None
+    if age is not None and not math.isfinite(age):
+        age = None
+    if not run or not finished or age is None or age > CHAT_REPORT_MAX_AGE_S:
+        return notice, ""
+    if run == _last_posted_run(profile, job_id):
+        return notice, ""
+    # A closing line after several reports, or after the unfinished line, so
+    # the message does not end with a ledger link and Slack posts it whole: a
+    # headline card shows one repository's ledger and drops the rest.
+    if unfinished:
+        finished.append(
+            AUDIT_UNFINISHED_REPOS_LINE.format(label=label, repos=", ".join(unfinished), job=job_id)
+        )
+    elif len(finished) > 1:
+        finished.append(AUDIT_REPOS_SUMMARY_LINE.format(label=label, count=len(finished)))
+    return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
 
 
 def relay_cron_report(
@@ -3272,15 +3596,33 @@ def relay_cron_report(
             logger.warning(f"Relay for {profile}/{job_id}: audit headline skipped: {exc!r}")
             headline = None
         posted = None
-        # A truncated report keeps its notice, which the blocks have no place for.
+        failed = None
+        # A truncated report keeps its notice, which the blocks have no place for,
+        # and the rest of it.
         if headline and not truncation_notice:
             posted = _post_audit_blocks(
                 profile, job_id, headline, message, leg_chat_id, leg_thread_id, blocks_deadline
             )
+        elif not truncation_notice:
+            try:
+                failed = _failed_audit_line(platform, report, leg_chat_id, profile, job_id)
+            except Exception as exc:
+                logger.warning(f"Relay for {profile}/{job_id}: failed-audit line skipped: {exc!r}")
+            if failed and chat_notify.routes(platform):
+                posted = _post_failed_audit_via_gateway(
+                    profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
+                )
         if posted is not None:
             new_thread_id = posted.thread_id or None
         else:
-            leg_message = truncation_notice + headline.text if headline else message
+            # Under next a reply cannot bring the report back, so a failed audit
+            # whose folded card did not post goes out whole.
+            if headline:
+                leg_message = truncation_notice + headline.text
+            elif failed and not chat_notify.routes(platform):
+                leg_message = failed
+            else:
+                leg_message = message
             new_thread_id = _send_to_chat(platform, leg_message, leg_chat_id, leg_thread_id)
             if new_thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Posted (or may have): delivered, with no thread to register.
@@ -3404,7 +3746,24 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=400, detail="job_id field is required")
     if not report:
         raise HTTPException(status_code=400, detail="report field is required")
-    report, truncation_notice = _truncate_report(report, profile, job_id)
+    audit_run = ""
+    # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
+    # `report_to_chat` does not, and its text is posted as written.
+    from_scheduler = SCHEDULER_LEG_KEY in request_data
+    failure_run = ""
+    if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
+        if request_data.get(SCHEDULER_FAILURE_KEY) is True and not _record_written_by_this_run(profile, job_id):
+            # The scheduler's line for a failed run, posted as written, as on
+            # main: it says why the run failed, and the record on disk is an
+            # earlier run's. Marking that record posted keeps a later run that
+            # never reached `start` from posting it as its own.
+            failure_run = _record_run(job_id)
+        else:
+            # The flag is read off the text, which the model can also write:
+            # a run that wrote its own record reached `finish`, so its report
+            # is posted whatever its last message says.
+            report, audit_run = audit_chat_report(profile, job_id, title)
+    report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     session_id = _cron_report_session_id(profile, job_id, day)
@@ -3418,6 +3777,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {type(exc).__name__}") from exc
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
+    if audit_run or failure_run:
+        _mark_run_posted(profile, job_id, audit_run or failure_run)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they

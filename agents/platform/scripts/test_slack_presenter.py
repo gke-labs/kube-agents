@@ -436,6 +436,73 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertTrue(headline.endswith("…"))
 
 
+class ClauseCutTest(unittest.TestCase):
+    """A first sentence past HEADLINE_MAX is cut at a clause into a headline, the rest leading the body."""
+
+    LONG = (
+        "The `checkout-gateway` deployment in seeded-a is restarting every few minutes because its readiness probe "
+        "times out under load, which the HPA then reads as missing capacity."
+    )
+
+    def test_cut_before_because_not_before_which(self):
+        headline, body = sp.split_answer(self.LONG + " Raise the probe timeout to 5s.")
+        self.assertEqual(headline, "The checkout-gateway deployment in seeded-a is restarting every few minutes.")
+        self.assertEqual(
+            body,
+            ["Because its readiness probe times out under load, which the HPA then reads as missing capacity. "
+             "Raise the probe timeout to 5s."],
+        )
+
+    def test_the_last_break_that_fits_wins(self):
+        sentence = "Checkout is down in seeded-a, " + "and " * 10 + "the gateway pods are failing their probes, " + \
+            "while the database is fine and every other service in the namespace reports healthy right now."
+        head, rest = sp.clause_cut(sentence)
+        self.assertEqual(head, "Checkout is down in seeded-a, " + "and " * 10 + "the gateway pods are failing their probes.")
+        self.assertTrue(rest.startswith("While the database is fine"))
+
+    def test_a_spaced_dash_and_due_to_cut(self):
+        head, rest = sp.clause_cut("Every node pool on seeded-b lags the control plane by two minors — " + "x " * 60)
+        self.assertEqual(head, "Every node pool on seeded-b lags the control plane by two minors.")
+        head, rest = sp.clause_cut("payments-api is CrashLooping due to an OOMKill " + "y " * 70)
+        self.assertEqual((head, rest[:6]), ("payments-api is CrashLooping.", "Due to"))
+
+    def test_no_cut_inside_a_code_span_brackets_or_bold(self):
+        self.assertIsNone(sp.clause_cut("Run `" + "a, " * 60 + "` now and wait for it to finish."))
+        self.assertIsNone(sp.clause_cut("Three pods (" + "x, " * 60 + ") restarted overnight and stayed down."))
+        self.assertIsNone(sp.clause_cut("**" + "bold, " * 30 + "** is all of this sentence and nothing else."))
+
+    def test_a_sentence_bold_end_to_end_is_cut_inside_the_bold(self):
+        head, rest = sp.clause_cut("**payments-api is CrashLooping due to an OOMKill " + "y " * 70 + "end.**")
+        self.assertEqual(head, "**payments-api is CrashLooping.**")
+        self.assertTrue(rest.startswith("**Due to an OOMKill") and rest.endswith("end.**"))
+
+    def test_no_cut_inside_an_italic_run(self):
+        # The one break whose head fits opens an italic run it does not close, so there is no cut.
+        sentence = ("The ingress on seeded-c drops connections *because the pool has no headroom, "
+                    + "so the HPA " * 12 + "cannot add a replica* and the queue keeps growing.")
+        self.assertIsNone(sp.clause_cut(sentence))
+        self.assertIsNotNone(sp.clause_cut(sentence.replace("*", "")), "without the italic it cuts")
+
+    def test_no_leading_subordinate_clause_as_the_headline(self):
+        sentence = ("If the pool is full, the HPA cannot add a replica and the queue keeps growing until the "
+                    "ingress controller on seeded-c drops long-lived websocket connections.")
+        self.assertIsNone(sp.clause_cut(sentence))
+
+    def test_too_short_a_headline_is_no_cut(self):
+        self.assertIsNone(sp.clause_cut("In seeded-a, " + "z " * 80))
+
+    def test_no_clause_still_clips(self):
+        headline, _ = sp.split_answer("word " * 40 + "end.")
+        self.assertTrue(headline.endswith(sp.ELLIPSIS))
+
+    def test_split_lead_without_the_cut_keeps_the_sentence_whole(self):
+        lead, _ = sp.split_lead(self.LONG, cut=False)
+        self.assertEqual(lead, self.LONG)
+
+    def test_many_commas_stay_fast(self):
+        sp.split_answer("a, " * 20000 + "end.")
+
+
 class ButtonsTest(unittest.TestCase):
     def test_link_button(self):
         self.assertEqual(
