@@ -627,7 +627,6 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(owner=owner):
                 self._only("is no longer allowed", owner=owner)
 
-
     def test_an_owner_with_a_leading_at_sign_is_rejected(self):
         self._only("leading at sign", owner="@someone")
 

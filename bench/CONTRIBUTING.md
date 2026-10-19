@@ -109,9 +109,10 @@ owner: some-login
 
 The field is optional and takes any GitHub login. Without it the case belongs to its
 domain's `owner:` in [`docs/designs/domains.yaml`](../docs/designs/domains.yaml);
-`scripts/case_owner.py` resolves that effective owner. The lint runs offline, so whether
-GitHub will assign the login an issue is checked when a bug is filed: if GitHub refuses the
-assignee (not an organisation member or collaborator), the bug goes to the domain owner.
+`scripts/case_owner.py` resolves that effective owner. The lint runs offline, so it cannot
+tell whether GitHub will assign the login an issue; that is the bug filer's check, and a filer
+that GitHub refuses the assignee for (not an organisation member or collaborator) must file to
+the domain owner instead.
 The login is written without the at sign, because a `task.yaml` gets quoted into issues and
 comments, where a leading at sign pages someone. devops-bench discards the key, so it is a
 repository-lint field like `domain`.

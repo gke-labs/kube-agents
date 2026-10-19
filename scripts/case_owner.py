@@ -7,10 +7,10 @@ GitHub login. When the field is absent, the case belongs to its domain's
 nobody and is no longer accepted.
 
 This module answers offline, from the checkout alone, so it cannot know
-whether a login can be assigned an issue. That check happens at bug-filing
-time: the filer assigns `effective_owner()`, and when GitHub refuses the
-assignee (not an organisation member or collaborator), it files to
-`domain_owner()` instead.
+whether a login can be assigned an issue. That check belongs to whatever
+files the bug, and is its contract with this module: assign
+`effective_owner()`, and when GitHub refuses the assignee (not an
+organisation member or collaborator), file to `domain_owner()` instead.
 
 `scripts/validate_bench_cases.py` imports this to lint the field, and the eval
 dashboard (`scripts/eval_dashboard/`) can import it to route a nightly red to a
@@ -87,7 +87,7 @@ def effective_owner(case_owner: object, domain: object, *, domain_owners: dict[s
     """The case's owner when it names a person, else its domain's owner.
 
     Not checked here: whether GitHub will accept the login as an assignee.
-    A filer that gets a refusal retries with `domain_owner()` (module
+    A filer that gets a refusal must retry with `domain_owner()` (module
     docstring). None only when neither resolves: no case owner and a domain
     that domains.yaml does not define (the validator rejects such a case).
     """
