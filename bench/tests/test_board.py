@@ -381,3 +381,24 @@ def test_a_session_past_the_scan_bound_reports_its_total(
     read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5)
     assert read is not None
     assert (read.card_ids, read.total) == (cards[:3], 5)
+
+
+def test_read_board_state_returns_summaries_and_errors(tmp_path: Path) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            (FRONT, "failed", "HTTP 429 TPM quota exhausted"),
+        )
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            (FRONT, "API retries exhausted", "rate_limit"),
+        )
+    reply = _run_script(tmp_path, [FRONT])
+    got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
+    assert got is not None
+    statuses, summaries, errors = got
+    assert statuses == {FRONT: "failed"}
+    assert summaries == {FRONT: "API retries exhausted"}
+    assert errors == {FRONT: "HTTP 429 TPM quota exhausted"}

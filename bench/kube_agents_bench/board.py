@@ -48,7 +48,13 @@ from typing import Any
 from kube_agents_bench.parsing import _TASK_ID_RE, DELEGATION_TOOL, delegated_task_ids
 from kube_agents_bench.worker_trajectory import DATA_ROOT, FALLBACK_PYTHON, HERMES_PYTHON
 
-__all__ = ["SessionCards", "api_session_id", "read_session_cards", "read_statuses"]
+__all__ = [
+    "SessionCards",
+    "api_session_id",
+    "read_board_state",
+    "read_session_cards",
+    "read_statuses",
+]
 
 _log = logging.getLogger("kube_agents_bench.board")
 
@@ -78,14 +84,50 @@ ids = [a for a in sys.argv[4:] if a]
 # Seconds a read waits on a locked store before giving up. A hermes writer
 # holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
-out = {"statuses": {}, "error": None}
+out = {"statuses": {}, "summaries": {}, "errors": {}, "error": None}
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     marks = ",".join("?" for _ in ids)
-    rows = conn.execute("SELECT id, status FROM tasks WHERE id IN (%s)" % marks, ids).fetchall()
-    conn.close()
-    for tid, status in rows:
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    has_lfe = "last_failure_error" in cols
+    query = "SELECT id, status%s FROM tasks WHERE id IN (%s)" % (", last_failure_error" if has_lfe else "", marks)
+    rows = conn.execute(query, ids).fetchall()
+    for row in rows:
+        tid, status = row[0], row[1]
         out["statuses"][str(tid)] = str(status)
+        if has_lfe and len(row) > 2 and row[2]:
+            out["errors"][str(tid)] = str(row[2])
+    has_runs = False
+    try:
+        cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'")
+        has_runs = cur.fetchone() is not None
+    except sqlite3.Error:
+        pass
+    if has_runs:
+        run_cols = [r[1] for r in conn.execute("PRAGMA table_info(task_runs)").fetchall()]
+        has_run_sum = "summary" in run_cols
+        has_run_err = "error" in run_cols
+        sel_cols = []
+        if has_run_sum:
+            sel_cols.append("summary")
+        if has_run_err:
+            sel_cols.append("error")
+        if sel_cols:
+            for tid in ids:
+                r = conn.execute(
+                    "SELECT %s FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1" % ", ".join(sel_cols),
+                    (tid,)
+                ).fetchone()
+                if r:
+                    idx = 0
+                    if has_run_sum:
+                        if r[idx]:
+                            out["summaries"][str(tid)] = str(r[idx])
+                        idx += 1
+                    if has_run_err:
+                        if r[idx] and str(tid) not in out["errors"]:
+                            out["errors"][str(tid)] = str(r[idx])
+    conn.close()
 except sqlite3.Error as exc:
     out["error"] = "kanban board: %s" % exc
 print(SENTINEL)
@@ -319,19 +361,12 @@ def command(task_ids: list[str]) -> str:
     )
 
 
-def read_statuses(
+def read_board_state(
     shell: Callable[[str, float], str], task_ids: list[str], timeout: float
-) -> dict[str, str] | None:
-    """The board's current status for each of ``task_ids``, or ``None``.
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]] | None:
+    """The board's current status, latest summary, and errors for each of ``task_ids``, or ``None``.
 
-    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
-    module stays importable without the harness and testable with a canned
-    reply.
-
-    ``None`` means the read cannot be trusted: no card was asked for, the
-    script did not run to completion, its reply was not JSON, or the board
-    could not be opened. A card the board does not know is simply absent from
-    the returned map; the caller decides what an unknown card means.
+    Returns a tuple of ``(statuses, summaries, errors)``.
     """
     if not task_ids:
         return None
@@ -354,7 +389,39 @@ def read_statuses(
     statuses = payload.get("statuses")
     if not isinstance(statuses, dict):
         return None
-    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}
+    raw_summaries = payload.get("summaries")
+    summaries = (
+        {str(k): str(v) for k, v in raw_summaries.items() if k in task_ids}
+        if isinstance(raw_summaries, dict)
+        else {}
+    )
+    raw_errors = payload.get("errors")
+    errors = (
+        {str(k): str(v) for k, v in raw_errors.items() if k in task_ids}
+        if isinstance(raw_errors, dict)
+        else {}
+    )
+    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}, summaries, errors
+
+
+def read_statuses(
+    shell: Callable[[str, float], str], task_ids: list[str], timeout: float
+) -> dict[str, str] | None:
+    """The board's current status for each of ``task_ids``, or ``None``.
+
+    ``shell`` is :func:`harness._agent_shell`, taken as a parameter so this
+    module stays importable without the harness and testable with a canned
+    reply.
+
+    ``None`` means the read cannot be trusted: no card was asked for, the
+    script did not run to completion, its reply was not JSON, or the board
+    could not be opened. A card the board does not know is simply absent from
+    the returned map; the caller decides what an unknown card means.
+    """
+    got = read_board_state(shell, task_ids, timeout)
+    if got is None:
+        return None
+    return got[0]
 
 
 def api_session_id(context_id: str) -> str:
