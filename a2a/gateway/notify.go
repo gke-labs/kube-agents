@@ -115,10 +115,10 @@ type NotifyConversations interface {
 
 // notifyFeedbackTarget is the optional extension NotifyConversations
 // implements to name the task an answer posted on the route is rated under
-// (answer feedback, feedback.go): the root of the conversation's latest ask,
-// or "" when feedback is off or the conversation has none.
+// (answer feedback, feedback.go): the root of the ask the plan key answerTo
+// is bound to, or "" when feedback is off or no ask holds the key.
 type notifyFeedbackTarget interface {
-	AnswerFeedbackTarget(conversation string) string
+	AnswerFeedbackTarget(conversation, answerTo string) string
 }
 
 // notifyPoster is the backend half: post text into a space, new thread or
@@ -650,13 +650,17 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	m := OutMessage{Text: job.req.Text, Chat: layoutOf(reading)}
 	key := job.req.Update
 	if key == "" {
-		if m.Chat == nil {
-			return false
+		// The card report that settles an ask's plan is that ask's answer
+		// (the sender says so, naming the plan), and the one post on the
+		// route that is rated, laid out or as text.
+		if ft, ok := n.conv.(notifyFeedbackTarget); ok && job.req.AnswerTo != "" {
+			m.Feedback = ft.AnswerFeedbackTarget(conversation, job.req.AnswerTo)
 		}
-		// The card report that settles the ask's cards is the ask's answer
-		// (the sender says so), and the one post on the route that is rated.
-		if ft, ok := n.conv.(notifyFeedbackTarget); ok && job.req.Answer {
-			m.Feedback = ft.AnswerFeedbackTarget(conversation)
+		if m.Chat == nil {
+			if m.Feedback == "" {
+				return false
+			}
+			return n.postRatedText(job, m)
 		}
 		message, err := n.conv.PostMessage(conversation, m)
 		if !n.chatOutcome(conversation, err) {
@@ -697,6 +701,43 @@ func (n *Notifier) postConversation(job notifyJob) bool {
 	n.updates.put(conversation, key, message)
 	n.reply(job, lib.NotifyReply{MessageID: message, ThreadID: conversation})
 	n.log.Info("notify posted", "conversation", conversation, "message", message, "update", key)
+	return true
+}
+
+// postRatedText posts an answer with no chat message as its text, chunked
+// under the cap, the rating controls on its last chunk (Gateway.postMessage
+// does the same for the relay's answers), and reports whether it answered
+// the request. A last chunk the backend will not draw the controls on posts
+// as plain text.
+func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
+	conversation := job.req.Conversation
+	chunks := chatChunks(m.Text, discordChunk)
+	if len(chunks) == 0 {
+		return false
+	}
+	var first string
+	for i, chunk := range chunks {
+		var message string
+		var err error
+		if i == len(chunks)-1 {
+			message, err = n.conv.PostMessage(conversation, OutMessage{Text: chunk, Feedback: m.Feedback})
+			if err != nil {
+				message, err = n.conv.Post(conversation, chunk)
+			}
+		} else {
+			message, err = n.conv.Post(conversation, chunk)
+		}
+		if err != nil {
+			n.log.Error("notify post failed", "conversation", conversation, "err", err)
+			n.reply(job, lib.NotifyReply{Error: "post failed: " + err.Error()})
+			return true
+		}
+		if first == "" {
+			first = message
+		}
+	}
+	n.reply(job, lib.NotifyReply{MessageID: first, ThreadID: conversation})
+	n.log.Info("notify posted", "conversation", conversation, "message", first, "rated", true)
 	return true
 }
 
@@ -997,9 +1038,11 @@ func (c gatewayConversations) ConversationContext(ctx context.Context, key strin
 	return rec.ContextID, nil
 }
 
-// AnswerFeedbackTarget is the root task of the conversation's latest ask,
-// when answer feedback is on (notifyFeedbackTarget).
-func (c gatewayConversations) AnswerFeedbackTarget(conversation string) string {
+// AnswerFeedbackTarget is the root task of the ask the plan key answerTo is
+// bound to, when answer feedback is on (notifyFeedbackTarget). A key no ask
+// holds (a plan that never carried a mark, or one evicted) rates nothing
+// rather than guessing at the conversation's latest ask.
+func (c gatewayConversations) AnswerFeedbackTarget(conversation, answerTo string) string {
 	g := c.g
 	if g.feedback.Load() == nil {
 		return ""
@@ -1010,8 +1053,8 @@ func (c gatewayConversations) AnswerFeedbackTarget(conversation string) string {
 	if err != nil || rec == nil {
 		return ""
 	}
-	if i := rec.latestChainIndex(); i >= 0 {
-		return rec.Tasks[i].ID
+	if i := rec.notifyChainIndex(answerTo); i >= 0 {
+		return rec.Tasks[i].rootID()
 	}
 	return ""
 }

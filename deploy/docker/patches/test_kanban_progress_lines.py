@@ -1037,7 +1037,7 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         async def settle_row(adapter, sub, kind, result="", title=""):
             return True
 
-        return SimpleNamespace(settle_row=settle_row, thread_settled=lambda sub: settled(sub))
+        return SimpleNamespace(settle_row=settle_row, answer_key=lambda sub: "plan-1" if settled(sub) else "")
 
     async def test_the_report_that_settles_the_asks_cards_is_flagged_its_answer(self):
         adapter = _ChatNotifyStandIn()
@@ -1045,7 +1045,7 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         with mock.patch.object(kanban_progress_lines, "_slack_plan", return_value=plan), \
                 mock.patch.object(kanban_progress_lines, "_folds", return_value=False):
             await self._run(adapter, SLACK_SUB, "completed", "Both pods are up. Seeded-a runs two.")
-        self.assertIs(adapter.metadata[-1]["kage_answer"], True)
+        self.assertEqual(adapter.metadata[-1]["kage_answer"], "plan-1")
 
     async def test_a_report_with_cards_still_running_is_not_flagged(self):
         adapter = _ChatNotifyStandIn()
@@ -1077,7 +1077,7 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         self.assertEqual(len(adapter.sent), 1, "the children's reports folded into their rows")
         self.assertEqual(len(flagged), 1)
 
-    async def test_a_hard_wall_reason_is_not_flagged(self):
+    async def test_a_hard_wall_reason_that_settles_the_ask_is_its_answer(self):
         class Conversation(_ChatNotifyStandIn):
             pass
 
@@ -1086,7 +1086,16 @@ class ChatNotifyAnswerTest(SlackQuietTerminalTest):
         block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z."})
         with mock.patch.object(kanban_progress_lines, "_slack_plan", return_value=self._plan(lambda sub: True)):
             await deliver(SimpleNamespace(), adapter, SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
-        self.assertNotIn("kage_answer", adapter.metadata[-1])
+        self.assertEqual(adapter.metadata[-1]["kage_answer"], "plan-1")
+
+    async def test_an_actionable_report_that_settles_the_ask_is_flagged_as_text(self):
+        adapter = _ChatNotifyStandIn()
+        with mock.patch.object(kanban_progress_lines, "_slack_plan", return_value=self._plan(lambda sub: True)), \
+                mock.patch.object(kanban_progress_lines, "_folds", return_value=False), \
+                mock.patch.object(kanban_notifier, "actionable_report", return_value=True):
+            await self._run(adapter, SLACK_SUB, "completed", "Down. Reply apply.")
+        self.assertNotIn("kage_chat", adapter.metadata[-1])
+        self.assertEqual(adapter.metadata[-1]["kage_answer"], "plan-1")
 
     async def test_an_actionable_report_and_a_non_hard_wall_failure_post_their_text_alone(self):
         adapter = _ChatNotifyStandIn()

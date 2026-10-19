@@ -265,7 +265,7 @@ class SendTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_the_answer_flag_rides_only_a_conversation_post(self):
-        # The report that settles an ask's cards is flagged --answer for the
+        # The report that settles an ask's plan is flagged --answer-to for the
         # gateway's rating controls; a home post never carries it (the CLI
         # would refuse the whole post) and neither does a keyed edit.
         home = tempfile.TemporaryDirectory()
@@ -284,7 +284,7 @@ class SendTest(unittest.TestCase):
             calls.append(list(argv))
             return _Proc(0, b'{"message_id":"m"}')
 
-        flagged = {"thread_id": "slack:C1/1.2", kanban_chat_notify.ANSWER_METADATA_KEY: True}
+        flagged = {"thread_id": "slack:C1/1.2", kanban_chat_notify.ANSWER_METADATA_KEY: "plan-t_1-1"}
         with mock.patch.dict(os.environ, {kanban_chat_notify.SESSION_KV_DB_ENV: db}), \
                 mock.patch.object(kanban_chat_notify.asyncio, "create_subprocess_exec", fake_exec):
             asyncio.run(conversation.send("a2a-ctx-1", "the answer", metadata=flagged))
@@ -292,10 +292,10 @@ class SendTest(unittest.TestCase):
             asyncio.run(conversation.send("a2a-ctx-1", "plan", metadata={
                 **flagged, kanban_chat_notify.UPDATE_METADATA_KEY: "plan"}))
             asyncio.run(home_route.send("C1", "home", metadata={"thread_id": "1.2",
-                                                               kanban_chat_notify.ANSWER_METADATA_KEY: True}))
-        self.assertEqual(calls[0][-3:], ["--answer", "--", "the answer"])
+                                                               kanban_chat_notify.ANSWER_METADATA_KEY: "plan-t_1-1"}))
+        self.assertEqual(calls[0][-4:], ["--answer-to", "plan-t_1-1", "--", "the answer"])
         for argv in calls[1:]:
-            self.assertNotIn("--answer", argv)
+            self.assertNotIn("--answer-to", argv)
 
     def test_a_conversation_cards_wake_self_posts_into_the_bridge_session(self):
         # Push-capable, so the notifier still sends the report; but a wake is

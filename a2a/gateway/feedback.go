@@ -239,7 +239,25 @@ func (g *Gateway) feedbackTarget(rec *SessionRecord, taskID string) string {
 	if !ends {
 		return ""
 	}
+	if root, ok := rec.TaskRefFor(id); ok && root.CardsAnswer {
+		// A card's report answers this ask (Notifier.postConversation).
+		return ""
+	}
 	return id
+}
+
+// markCardsAnswer records on taskID's chain root that the chain handed the
+// ask to cards (TaskRef.CardsAnswer).
+func (rec *SessionRecord) markCardsAnswer(taskID string) {
+	root := taskID
+	if ref, ok := rec.TaskRefFor(taskID); ok {
+		root = ref.rootID()
+	}
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == root {
+			rec.Tasks[i].CardsAnswer = true
+		}
+	}
 }
 
 // KeptDays is the bucket's max age in whole days, at least one.
@@ -337,8 +355,8 @@ func (d *feedbackDesk) Note(r FeedbackRating, note string) error {
 		return errFeedbackUnverified
 	}
 	key := feedbackKey(r.TaskID, r.Rater)
-	// Under the rater's lock too: a 👍 between this read and write would
-	// otherwise delete the note this call is about to report kept.
+	// Under the rater's lock too, ordering the note with that rater's taps; the
+	// merge's revision check already keeps a 👍 between read and write from losing it.
 	defer d.lockKey(key)()
 	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
 	defer cancel()

@@ -18,7 +18,12 @@ type feedbackConversations struct {
 	feedbacks []string
 }
 
-func (f *feedbackConversations) AnswerFeedbackTarget(string) string { return f.target }
+func (f *feedbackConversations) AnswerFeedbackTarget(_, answerTo string) string {
+	if answerTo != "plan-1" {
+		return ""
+	}
+	return f.target
+}
 
 func (f *feedbackConversations) PostMessage(conversation string, m OutMessage) (string, error) {
 	f.feedbacks = append(f.feedbacks, m.Feedback)
@@ -27,9 +32,9 @@ func (f *feedbackConversations) PostMessage(conversation string, m OutMessage) (
 
 const testAnswerChat = `{"schema":"kube-agents.chat/v1","headline":"Both pods are up."}`
 
-// The card report the notifier flags as the ask's answer is marked for
-// rating under the conversation's latest ask; any other report, and a keyed
-// post, is not.
+// The card report the notifier flags as an ask's answer is marked for rating
+// under the ask its plan key names, laid out or as text; any other report, a
+// key no ask holds, and a keyed post are not.
 func TestNotifyMarksOnlyTheFlaggedAnswer(t *testing.T) {
 	conv := &feedbackConversations{
 		fakeConversations: &fakeConversations{contexts: map[string]string{testConversation: testContext}, rendersChat: true},
@@ -38,36 +43,50 @@ func TestNotifyMarksOnlyTheFlaggedAnswer(t *testing.T) {
 	n := newTestNotifier(t, &fakeNotifyPoster{})
 	n.SetConversations(conv)
 	for _, req := range []lib.NotifyRequest{
-		{Text: "Both pods are up.", Chat: json.RawMessage(testAnswerChat), Answer: true},
+		{Text: "Both pods are up.", Chat: json.RawMessage(testAnswerChat), AnswerTo: "plan-1"},
 		{Text: "Both pods are up.", Chat: json.RawMessage(testAnswerChat)},
-		{Text: "Both pods are up.", Chat: json.RawMessage(testAnswerChat), Answer: true, Update: "plan"},
+		{Text: "Both pods are up.", Chat: json.RawMessage(testAnswerChat), AnswerTo: "plan-gone"},
+		{Text: "Both pods are up.", Chat: json.RawMessage(testAnswerChat), AnswerTo: "plan-1", Update: "plan"},
+		{Text: "What to do: reply apply.", AnswerTo: "plan-1"},
 	} {
 		req.Conversation, req.ContextID = testConversation, testContext
 		if got := serveJSON(t, n, req); got.Error != "" {
 			t.Fatalf("reply = %+v", got)
 		}
 	}
-	if want := []string{"task-root", "", ""}; len(conv.feedbacks) != len(want) ||
-		conv.feedbacks[0] != want[0] || conv.feedbacks[1] != want[1] || conv.feedbacks[2] != want[2] {
+	// The keyed post is an edit-or-post through PostMessage with no mark;
+	// the text answer's last chunk carries it.
+	want := []string{"task-root", "", "", "", "task-root"}
+	if len(conv.feedbacks) != len(want) {
 		t.Fatalf("feedback marks = %q, want %q", conv.feedbacks, want)
+	}
+	for i := range want {
+		if conv.feedbacks[i] != want[i] {
+			t.Fatalf("feedback marks = %q, want %q", conv.feedbacks, want)
+		}
 	}
 }
 
-// The target is the root of the conversation's latest ask, and none while
-// feedback is off.
-func TestAnswerFeedbackTargetIsTheLatestAsk(t *testing.T) {
+// The target is the root of the ask the plan key is bound to, none for a key
+// no ask holds, and none while feedback is off.
+func TestAnswerFeedbackTargetIsTheAskItsPlanNames(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	origin := completeTurn(t, r, "discord:g1/fb12", "d-1", "the fleet is fine")
 	c := gatewayConversations{g: r.g}
-	if got := c.AnswerFeedbackTarget("discord:g1/fb12"); got != origin.TaskID {
+	// The plan's first mark binds its key to the ask.
+	c.MarkConversation("discord:g1/fb12", "plan-1", MarkState{Ask: "diagnose"})
+	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-1"); got != origin.TaskID {
 		t.Errorf("target = %q, want the ask's root %q", got, origin.TaskID)
 	}
-	if got := c.AnswerFeedbackTarget("discord:g1/none"); got != "" {
+	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-never-marked"); got != "" {
+		t.Errorf("a key no ask holds has target %q, want none", got)
+	}
+	if got := c.AnswerFeedbackTarget("discord:g1/none", "plan-1"); got != "" {
 		t.Errorf("a conversation with no session has target %q, want none", got)
 	}
 	r.g.feedback.Store(nil)
-	if got := c.AnswerFeedbackTarget("discord:g1/fb12"); got != "" {
+	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-1"); got != "" {
 		t.Errorf("feedback off: target = %q, want none", got)
 	}
 }
@@ -123,5 +142,29 @@ func TestATurnThatLeavesCardsRunningIsNotMarked(t *testing.T) {
 	})
 	if got := r.adapter.feedbackMarks(); len(got) != 0 {
 		t.Fatalf("feedback marks = %v, want none on a hand-off acknowledgement", got)
+	}
+}
+
+// A chain that handed the ask to cards anywhere, a delegated child's terminal
+// included, rates none of its relay answers: the wake's reply is not the
+// answer, the card's report is.
+func TestAChainHandedToCardsRatesNoRelayAnswer(t *testing.T) {
+	g := &Gateway{}
+	g.feedback.Store(&feedbackDesk{g: g, ttl: time.Hour})
+	rec := &SessionRecord{Tasks: []TaskRef{
+		{ID: "root", Children: []string{"child"}},
+		{ID: "child", Role: taskRoleChild, RootTaskID: "root"},
+		{ID: "wake", Role: taskRoleWake, RootTaskID: "root"},
+		{ID: "other"},
+	}}
+	if got := g.feedbackTarget(rec, "wake"); got != "root" {
+		t.Fatalf("before any card: wake target = %q, want root", got)
+	}
+	rec.markCardsAnswer("child")
+	if got := g.feedbackTarget(rec, "wake"); got != "" {
+		t.Errorf("the child handed off to cards: wake target = %q, want none", got)
+	}
+	if got := g.feedbackTarget(rec, "other"); got != "other" {
+		t.Errorf("another ask's own answer target = %q, want other", got)
 	}
 }

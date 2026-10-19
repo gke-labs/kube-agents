@@ -308,6 +308,9 @@ _lapsed: OrderedDict[tuple, list] = OrderedDict()
 #: ``(channel, thread, card) -> True`` for every card a note, move or settle
 #: brought to the thread's plan in this process.
 _seen: OrderedDict[tuple, bool] = OrderedDict()
+#: (channel, thread, card) -> the update key of the plan the card's settle
+#: finished: the card's report is that plan's ask's answer (:func:`answer_key`).
+_answers: OrderedDict[tuple, str] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
 
@@ -506,20 +509,17 @@ def _live(row: _Row) -> bool:
     return row.status in (_status.TASK_RUNNING, _status.TASK_PENDING)
 
 
-def thread_settled(sub: dict) -> bool:
-    """Whether no card in the thread still runs, waits on the user or is expected to start.
+def answer_key(sub: dict) -> str:
+    """The update key of the plan this card's settle just finished, or ``""``.
 
-    Read right after a card's terminal event has settled its row (``settle_row``): True
-    then means that card's report is the last one the ask gets, its answer
-    (``kanban_progress_lines``, answer feedback). A child folded into its fan-out's row
-    posts no report, so a fan-out answers once, with its creator's completion.
+    Read right after the card's terminal event has settled its row (``settle_row``): a
+    plan whose last card that was retires with the card recorded (:func:`_retire`), and
+    the card's report is then its ask's answer (``kanban_progress_lines``, answer
+    feedback), sent with the plan's key so the gateway rates it under the ask the plan
+    is bound to. A child folded into its fan-out's row posts no report, so a fan-out
+    answers once, with its creator's completion. Read once: a replayed event gets ``""``.
     """
-    key = _thread(sub)
-    current = _plans.get(key)
-    if current is not None and (current.pending or current.waiting):
-        return False
-    plans = [*_lapsed.get(key, ()), *((current,) if current is not None else ())]
-    return not any(_live(row) for plan in plans for row in plan.rows.values())
+    return _answers.pop((*_thread(sub), str(sub.get("task_id") or "")), "")
 
 
 def _open(row: _Row) -> bool:
@@ -852,9 +852,15 @@ def _settled(plan: _Plan) -> bool:
     return not plan.pending and not plan.rolling and not any(_live(row) for row in plan.rows.values())
 
 
-async def _retire(adapter: Any, key: tuple, plan: _Plan) -> None:
-    """Forget a plan whose cards have all settled, setting it aside if one can still move; else re-arm it."""
+async def _retire(adapter: Any, key: tuple, plan: _Plan, card: str = "") -> None:
+    """Forget a plan whose cards have all settled, setting it aside if one can still move; else re-arm it.
+
+    ``card`` is the card whose settle this is: when it settles the plan, its report
+    answers the plan's ask, recorded for :func:`answer_key` under the plan's key.
+    """
     if _settled(plan):
+        if card and plan.ts:
+            _remember(_answers, (*key, card), plan.ts, SEEN_MAX)
         _disarm(plan)
         if _plans.get(key) is plan:
             _plans.pop(key, None)
@@ -969,7 +975,7 @@ async def _settle_current(
         await _render(adapter, key, plan)
     # A plan that fell back is still forgotten once its cards settle, so the
     # thread's next card tries a plan again.
-    await _retire(adapter, key, plan)
+    await _retire(adapter, key, plan, card)
     return True
 
 
@@ -1184,7 +1190,7 @@ async def _settle(adapter: Any, sub: dict, kind: str, result: str, title: str, o
         # ended without reaching the plan, or beside a fallen-back one, has its
         # plan retired here.
         if opened is None:
-            await _retire(adapter, key, current)
+            await _retire(adapter, key, current, card)
         await _session(adapter, key, opened or current)
     if sender is None and opened is None and plan is None and not _lapsed.get(key):
         # An archive with no row in this process is cleanup of a card that

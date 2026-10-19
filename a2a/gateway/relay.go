@@ -474,6 +474,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if s.Status.Message != nil {
 		terminal = g.readChat(rec.Key, taskID, chatmsg.Terminal, s.Status.Message.Parts)
 	}
+	// A task that handed the ask to cards, a delegated child's included,
+	// leaves the answer to a card's report for the whole chain.
+	toCards := cardsPending(s.Status.State, terminal) || handedOff(s.Status.State, rs.handoff)
+	if toCards {
+		rec.markCardsAnswer(taskID)
+	}
 
 	switch s.Status.State {
 	case lib.StateCompleted:
@@ -496,7 +502,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			// turn that handed the ask to cards, whose result is the hand-off
 			// acknowledgement (the card's report is rated instead,
 			// Notifier.postConversation).
-			if !cardsPending(s.Status.State, terminal) {
+			if !toCards {
 				answer.Feedback = g.feedbackTarget(rec, taskID)
 			}
 		}
@@ -647,7 +653,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if turnsUnread {
 			wakeResult, wakeReason = withTurnsUnread(result), withTurnsUnread(reason)
 		}
-		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true, cardsPending(s.Status.State, terminal) || handedOff(s.Status.State, rs.handoff)); !woken {
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true, toCards); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}

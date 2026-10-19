@@ -1918,13 +1918,19 @@ can turn it into an eval case. The gateway marks the one message that answers th
 (`OutMessage.Feedback`, the root task id of the ask's chain), and it is one of two. When the
 Planning Agent answers itself, it is the completed result of the task whose end is the chain's
 (`observedAs`), never a hand-off line (`handOffEnd`), the same message the `DeliverableObserver`
-is handed. When the turn hands the ask to kanban cards (its terminal mark keeps the ask's kind,
-`cardsPending`), that result is only the acknowledgement and is not marked; the answer is the
-card report the kanban notifier flags with `answer: true` on its conversation notify (the report
-that leaves no card of the ask running, waiting or still to start, so one per ask, a fan-out's
-creator's), which the notify route marks under the conversation's latest ask
-(`latestChainIndex`). Plan rows, progress, a question waiting on the user, notices, a child's own
-result, any other report and a keyed notify are not marked. A text answer chunked under the cap
+is handed. When a task of the chain hands the ask to kanban cards (its terminal mark keeps the
+ask's kind, `cardsPending`, or it published `handoff`; a delegated child's counts), the chain's
+root records it (`CardsAnswer`) and no relay answer in the chain is marked, the acknowledgement
+and a wake's reply included. The answer is then the card report the kanban notifier flags with
+`answer_to` on its conversation notify: the report of the card whose settle finished the ask's
+plan (so one per ask; a fan-out's children fold into their rows and post nothing, so it is the
+creator's), naming that plan's `update` key. The notify route marks it under the ask the key is
+bound to (`notifyChainIndex`, bound by the plan's first mark), laid out or, for a report that
+posts as text (an actionable one), on its last chunk; a key no ask holds is not marked rather than
+guessed at. The notifier keeps the plan in memory, so a card that settles an ask after the agent
+restarted is not flagged and that ask goes unrated. Plan rows, progress, a question waiting on the
+user, notices, any other report, a card failure the wake explains and a keyed notify are not
+marked. A text answer chunked under the cap
 carries the mark on its last chunk. A card answer that also offers a next step or options keeps
 them as its buttons, with the rating controls under them as the last block.
 

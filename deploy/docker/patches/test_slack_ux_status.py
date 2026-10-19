@@ -375,49 +375,44 @@ class _RuntimeCase(unittest.TestCase):
         self.addCleanup(env.stop)
 
 
-class ThreadSettledTest(_RuntimeCase):
-    """Whether a card's settled report is the last its ask gets (answer feedback)."""
+class AnswerKeyTest(_RuntimeCase):
+    """Which card's settle finished its ask's plan: that card's report is the ask's answer."""
 
-    SUB = {"chat_id": CHANNEL, "thread_id": THREAD}
-
-    def _plan(self, *statuses, pending=(), waiting=False):
+    def _plan(self, *statuses, pending=()):
         plan = runtime._Plan(TEAM)
+        plan.ts = "plan-t_0-1"
         for i, status in enumerate(statuses):
             row = runtime._Row(f"t_{i}", "card")
             row.status = status
             plan.rows[row.task_id] = row
         for card in pending:
             plan.pending[card] = True
-        if waiting:
-            plan.waiting[f"t_w"] = True
         runtime._plans[(CHANNEL, THREAD)] = plan
         return plan
 
-    def test_no_plan_is_settled(self):
-        self.assertTrue(runtime.thread_settled(self.SUB))
+    def _sub(self, card):
+        return {"chat_id": CHANNEL, "thread_id": THREAD, "task_id": card}
 
-    def test_every_card_settled_is_settled(self):
-        self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_ERROR)
-        self.assertTrue(runtime.thread_settled(self.SUB))
+    def test_the_card_that_settles_the_plan_answers_it_once(self):
+        plan = self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_COMPLETE)
+        _run(runtime._retire(_Adapter(), (CHANNEL, THREAD), plan, "t_1"))
+        self.assertEqual(runtime.answer_key(self._sub("t_0")), "", "only the card whose settle it was")
+        self.assertEqual(runtime.answer_key(self._sub("t_1")), "plan-t_0-1")
+        self.assertEqual(runtime.answer_key(self._sub("t_1")), "", "a replayed event is not the answer again")
 
-    def test_a_card_running_or_waiting_is_not(self):
-        self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_RUNNING)
-        self.assertFalse(runtime.thread_settled(self.SUB))
-        self._plan(slack_status.TASK_COMPLETE, slack_status.TASK_PENDING)
-        self.assertFalse(runtime.thread_settled(self.SUB))
+    def test_a_plan_with_a_card_left_answers_nothing(self):
+        for statuses, pending in (
+            ((slack_status.TASK_COMPLETE, slack_status.TASK_RUNNING), ()),
+            ((slack_status.TASK_COMPLETE, slack_status.TASK_PENDING), ()),
+            ((slack_status.TASK_COMPLETE,), ("t_next",)),
+        ):
+            plan = self._plan(*statuses, pending=pending)
+            _run(runtime._retire(_Adapter(), (CHANNEL, THREAD), plan, "t_0"))
+            self.assertEqual(runtime.answer_key(self._sub("t_0")), "")
 
-    def test_a_card_expected_but_not_started_is_not(self):
-        self._plan(slack_status.TASK_COMPLETE, pending=("t_next",))
-        self.assertFalse(runtime.thread_settled(self.SUB))
-
-    def test_a_live_card_on_a_set_aside_plan_holds_it(self):
-        old = runtime._Plan(TEAM)
-        row = runtime._Row("t_old", "card")
-        row.status = slack_status.TASK_RUNNING
-        old.rows["t_old"] = row
-        runtime._lapsed[(CHANNEL, THREAD)] = [old]
-        self._plan(slack_status.TASK_COMPLETE)
-        self.assertFalse(runtime.thread_settled(self.SUB))
+    def test_no_plan_answers_nothing(self):
+        # After a restart the plan is gone, and no report is taken for the answer.
+        self.assertEqual(runtime.answer_key(self._sub("t_0")), "")
 
 
 class SessionTest(_RuntimeCase):

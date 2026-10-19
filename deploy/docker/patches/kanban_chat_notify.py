@@ -187,13 +187,14 @@ API_SERVER_KEY_ENV = "API_SERVER_KEY"
 # send()'s metadata (see "Chat messages" above), and the route record's ask.
 CHAT_METADATA_KEY = "kage_chat"
 UPDATE_METADATA_KEY = "kage_update"
-#: Metadata key marking a conversation post as the ask's answer: the delivered
-#: report of the card that settles every card the ask filed. Sent as
-#: ``a2a notify --answer``, so the gateway draws its rating controls on it.
+#: Metadata key marking a conversation post as an ask's answer: the delivered
+#: report of the card that settles every card of the ask's plan, its value that
+#: plan's update key. Sent as ``a2a notify --answer-to <key>``, so the gateway
+#: draws its rating controls on it, under the ask the plan is bound to.
 ANSWER_METADATA_KEY = "kage_answer"
-#: The ``a2a notify`` flags a conversation post and its answer flag ride on.
+#: The ``a2a notify`` flags a conversation post and its answer ride on.
 CONVERSATION_FLAG = "--conversation"
-ANSWER_FLAG = "--answer"
+ANSWER_FLAG = "--answer-to"
 UPDATE_FLAG = "--update"
 CONVERSATION_ASK_KEY = "ask"
 # The chat message's file for `a2a notify --chat-file`: written mode 0600 by
@@ -805,8 +806,9 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         argv += chat_argv
         # Only a conversation post answers an ask; the CLI refuses the flag on
         # a home channel post, which would lose the report.
-        if (metadata or {}).get(ANSWER_METADATA_KEY) and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
-            argv.append(ANSWER_FLAG)
+        answer_to = str((metadata or {}).get(ANSWER_METADATA_KEY) or "").strip()
+        if answer_to and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
+            argv += [ANSWER_FLAG, answer_to]
         argv += ["--", content]
         try:
             return await self._notify(argv, chat_id)
