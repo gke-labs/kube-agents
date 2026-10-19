@@ -31,6 +31,8 @@ scripts/test_ci_eval_nightly.py runs the real shell over the real files and
 asserts it builds the arrays this module reads.
 """
 
+import contextlib
+import io
 import pathlib
 import subprocess
 import sys
@@ -388,6 +390,23 @@ class NightlySortedSectionTest(unittest.TestCase):
             eval_rosters.split_nightly(marker + entry + marker)
         self.assertEqual(eval_rosters.split_nightly(entry + marker + "# why\n" + entry)[:2],
                          (["a-case"], ["a-case"]))
+
+    def test_the_command_prints_the_summary(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(eval_rosters.main(["--summary", "--repetitions", "2"]), 0)
+        got = dict(line.split(": ", 1) for line in out.getvalue().splitlines())
+        matrix = len(eval_rosters.presubmit_cases()) + len(eval_rosters.nightly_cases())
+        self.assertEqual(got["nightly matrix cases"], str(matrix))
+        self.assertEqual(got["nightly matrix units"], str(matrix * 2))
+
+    def test_the_command_refuses_no_flag_and_a_repetitions_below_one(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(eval_rosters.main([]), 2)
+        for bad in ("0", "-1", "x"):
+            with self.subTest(repetitions=bad), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    eval_rosters.main(["--summary", "--repetitions", bad])
 
     def test_the_summary_counts_the_files(self):
         got = eval_rosters.summary(repetitions=3)
