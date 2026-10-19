@@ -551,6 +551,9 @@ const (
 	// The Slack home channel the same route posts to on a Slack-armed
 	// gateway, from slack.homeChannel.
 	a2aSlackHomeChannelEnvVar = "A2A_SLACK_HOME_CHANNEL"
+	// slack.answerFeedback=false, carried to the gateway (a2a/gateway's
+	// envSlackAnswerFeedback): no rating buttons, nothing kept.
+	a2aSlackAnswerFeedbackEnvVar = "A2A_SLACK_ANSWER_FEEDBACK"
 	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
 	// letter and at least two characters after it, as the gateway checks.
 	a2aSlackMinChannelIDLen = 3
@@ -4587,6 +4590,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// served either way.
 		if home := strings.TrimSpace(slack.HomeChannel); home != "" {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackHomeChannelEnvVar, Value: home})
+		}
+		// Answer feedback is on unless the install turns it off; only the
+		// off is rendered, so an install that never set the field keeps the
+		// gateway's env, and its pod, as they were.
+		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
+			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
 	}
 	var chatEnv []corev1.EnvVar

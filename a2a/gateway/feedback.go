@@ -141,6 +141,10 @@ type feedbackDesk struct {
 // The first try is made before it returns, so the relay marks every answer
 // alike from the start on an install that already has the bucket.
 func (g *Gateway) startFeedback(ctx context.Context) {
+	if g.cfg.AnswerFeedbackOff {
+		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback)")
+		return
+	}
 	if g.tryFeedback(ctx, false) {
 		return
 	}

@@ -787,6 +787,9 @@ spec:
       {{- with $integ.slack.homeChannelName }}
       homeChannelName: {{ . | quote }}
       {{- end }}
+      {{- if eq (toString $integ.slack.answerFeedback) "false" }}
+      answerFeedback: false
+      {{- end }}
     {{- end }}
     {{- if $integ.teams.enabled }}
     teams:

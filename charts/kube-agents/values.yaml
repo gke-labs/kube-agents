@@ -1235,6 +1235,10 @@ platformAgent:
       allowedUsers: []
       homeChannel: ""
       homeChannelName: ""
+      # Under spec.mode next, Slack's 👍/👎 buttons under each final answer;
+      # a 👎 keeps its question, answer and note on the install for 30 days.
+      # false hides the buttons and keeps nothing.
+      answerFeedback: true
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.
       # App ID and App Password are read from credentials.secretName under

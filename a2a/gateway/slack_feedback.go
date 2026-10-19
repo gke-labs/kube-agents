@@ -41,7 +41,7 @@ const (
 	slackFeedbackGood       = "Good answer"
 	slackFeedbackBad        = "Bad answer"
 	slackFeedbackTitle      = "What went wrong?"
-	slackFeedbackLabel      = "What was wrong?"
+	slackFeedbackLabel      = "Anything else?"
 	slackFeedbackSubmit     = "Send"
 	slackFeedbackClose      = "Cancel"
 	slackFeedbackKeptLine   = "Your question and this answer are kept on your install for %s so an operator can turn them into a test."

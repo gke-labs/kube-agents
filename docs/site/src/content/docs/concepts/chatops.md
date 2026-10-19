@@ -78,6 +78,8 @@ kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
     /gateway feedback export --since 7d > feedback.tar
 ```
 
+To turn it off, set `spec.integration.slack.answerFeedback: false` in the `PlatformAgent` CR (the chart's `platformAgent.integration.slack.answerFeedback`). Answers then carry no buttons and nothing is kept; buttons already in Slack do nothing when tapped. Ratings kept before you turned it off stay until the bucket drops them.
+
 ### Allowed users
 
 Slack ingress is gated by `SLACK_ALLOWED_USERS`, a comma-separated list of Slack member IDs such as `U0123ABCD`, matched exactly: an email or display name matches nobody. [Slack app setup](/kube-agents/install/slack-app/#allowed-users) says how to find a member ID. Under `spec.mode: today` a message from a member not on the list is ignored with no reply; under `next` the A2A gateway answers once with a notice naming the member's ID, so an admin can add it. Leaving the list empty allows every member of the workspace (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case), which in a shared workspace lets anyone there drive the agent.

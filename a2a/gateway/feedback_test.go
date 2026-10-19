@@ -112,6 +112,32 @@ func TestFeedbackBucketWithoutMaxAgeLeavesFeedbackOff(t *testing.T) {
 	}
 }
 
+func TestAnswerFeedbackTurnedOffMarksNothingWhateverTheBucket(t *testing.T) {
+	bucket := withFeedbackBucket(t, 24*time.Hour)
+	r := startRigWith(t, func(cfg *Config) {
+		bucket(cfg)
+		cfg.AnswerFeedbackOff = true
+	})
+	completeTurn(t, r, "discord:g1/fb10", "d-1", "the fleet is fine")
+	if r.g.feedback.Load() != nil || len(r.adapter.feedbackMarks()) != 0 {
+		t.Fatal("slack.answerFeedback=false must leave feedback off with the bucket there")
+	}
+}
+
+func TestAnswerFeedbackOffIsReadFromItsEnv(t *testing.T) {
+	setBaseEnv(t)
+	for value, off := range map[string]bool{"": false, "true": false, "false": true, " false ": true} {
+		t.Setenv(envSlackAnswerFeedback, value)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.AnswerFeedbackOff != off {
+			t.Errorf("%q: AnswerFeedbackOff = %v, want %v", value, cfg.AnswerFeedbackOff, off)
+		}
+	}
+}
+
 func TestFeedbackTargetIsTheChainsFinalAnswerOnly(t *testing.T) {
 	g := &Gateway{}
 	g.feedback.Store(&feedbackDesk{g: g, ttl: time.Hour})

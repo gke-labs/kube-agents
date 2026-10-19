@@ -299,6 +299,14 @@ type SlackSpec struct {
 	// HomeChannelName is the human-readable name for the home channel.
 	// +optional
 	HomeChannelName string `json:"homeChannelName,omitempty"`
+
+	// AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
+	// each final answer under spec.mode next, and keeps a thumbs-down with
+	// its question, answer and note on the install for 30 days.
+	// False hides the buttons and keeps nothing.
+	// +kubebuilder:default=true
+	// +optional
+	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 }
 
 // TeamsSpec contains the configuration for the Microsoft Teams integration.

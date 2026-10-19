@@ -1931,7 +1931,7 @@ another workspace's member, changes nothing.
 A 👍 is counted and nothing is kept or posted (Slack fills the tapped icon itself); it also
 deletes the rater's 👎 on the same answer, if one is kept. A 👎 is counted and kept with the rated
 answer first, one KV write, then opens a modal on the tap's trigger, which lapses three seconds
-after the tap ("What went wrong?", one optional line of up to 500 characters, and a line telling
+after the tap ("What went wrong?" over one optional line, "Anything else?", of up to 500 characters, and a line telling
 the rater how long their question and the answer are kept, read from the bucket's max age). The
 adapter then reads the conversation up to the rated message (`conversations.replies`, or the last
 10 messages of `conversations.history` for a top-level answer) for the ask, the last message a
@@ -1972,6 +1972,12 @@ holding `task.yaml`, a draft case per [`bench-case-format.md`](bench-case-format
 note with their ids. The draft is for a person to finish and submit; `transcript.md` holds the
 install's data and stays out of the pull request. The install never writes to this repository, and
 no sink files the drafts anywhere.
+
+An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
+operator renders `A2A_SLACK_ANSWER_FEEDBACK=false` on the gateway only for an explicit `false`, so an
+install that never set the field keeps its gateway pod unchanged; the gateway then never looks for
+the bucket, marks no answer and hands the adapter no recorder, so a button already posted is acked
+and does nothing.
 
 ## The console adapter (added 9/23)
 
