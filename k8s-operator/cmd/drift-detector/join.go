@@ -250,6 +250,13 @@ type DriftEvent struct {
 	// joins its own cluster and so always has one; what separates a scope
 	// boundary from a misconfiguration is whether a profile names the cluster.
 	OutOfScope bool
+
+	// Digest is set by the joiner on a backlog record that goes to the daemon's
+	// digest route rather than a card: the daemon advertises the route and the
+	// record is not held out of scope. It is what the DRIFT line's backlog
+	// marker reports, so a backlog record that is still carded (an older
+	// daemon) is not logged as one that is not.
+	Digest bool
 }
 
 // driftEventHandler consumes an enriched record. logDriftEvent is one; with
@@ -468,6 +475,7 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 	case joinSkippedBacklog:
 		j.counts.SkippedBacklog++
 	}
+	event.Digest = j.skipBacklog && record.Backlog && !event.OutOfScope
 
 	j.next(ctx, event)
 }
@@ -839,7 +847,7 @@ func logDriftEvent(_ context.Context, event DriftEvent) {
 	if event.OutOfScope {
 		line += " " + injectHeldOutOfScopeMarker
 	}
-	if record.Backlog {
+	if event.Digest {
 		line += fmt.Sprintf(" %s publish_time=%s", backlogMarker, record.PublishTime.Format(time.RFC3339))
 	}
 

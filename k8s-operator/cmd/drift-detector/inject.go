@@ -266,8 +266,9 @@ type DriftInjectPayload struct {
 	LookupError string `json:"lookup_error,omitempty"`
 
 	// Backlog and PublishTime are set on a record posted to driftBacklogPath.
-	// PublishTime is when the entry reached the topic, which the digest shows
-	// beside Timestamp so a reader can see how late the record was.
+	// PublishTime is when the entry reached the topic; with Timestamp it says
+	// how late the record was. The daemon records neither today: the digest
+	// shows when the rows were recorded.
 	Backlog     bool   `json:"backlog,omitempty"`
 	PublishTime string `json:"publish_time,omitempty"`
 }

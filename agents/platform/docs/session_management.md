@@ -45,7 +45,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record (`POST /v1/drift-backlog`): it starts no turn and is posted only as a line of one digest.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -58,7 +58,8 @@ Three of the four are severities and the fourth is not; `GitOpsDrift` is what dr
 whatever they display as.
 
 The `GitOpsDrift` default of 20 is a judgment, not a measurement. One apply spends one inject for
-each object, because the detector does not combine records. `install.sh` and `upgrade.sh` enable the
+each object, because the detector does not combine live records (late ones are digested and bill
+nothing; see the drift bullets below). `install.sh` and `upgrade.sh` enable the
 detector by default, so this value applies to the installs that these scripts manage. Only changes by
 people alert, so 20 covers a few hand applies a day. A record that the detector cannot join to a live
 object still sends a card with less detail, unless its cluster is outside the install's scope. That
@@ -115,7 +116,7 @@ What the drift branch does differently:
   `Warning` label reaches no reader: it is the `severity` column of the ledger row and a field of
   the suppressed response, and the chat line names no severity at all.
 - **Its `suppressed` is terminal,** for the reason the bullet above gives.
-- **Late records skip it.** A record the detector marks as backlog (it queued while no detector was
+- **Late records skip this route.** A record the detector marks as backlog (it queued while no detector was
   pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
   route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
   starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
@@ -155,7 +156,8 @@ separate variables and refuses an apply that sets `enable_drift_detector` withou
 #### Asking whether the dispatch is there
 
 `GET /healthz` answers `inject_kinds`, the list of kinds the dispatch above understands, and the
-detector probes it at startup and refuses to run if `gitops-drift` is not on it.
+detector probes it at startup and refuses to run if `gitops-drift` is not on it. It also answers
+`features`; the detector uses `POST /v1/drift-backlog` only when `drift-backlog` is on it.
 
 The dispatch is an equality test on `kind`, and a daemon predating it cannot say so: the drift
 payload falls into the event path, where the defaults render it as a `Warning` Pod alert named
@@ -413,9 +415,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 ##### Which columns are migrated, and which are not
 
-`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`
-for `session_id` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
-databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` in place on
+`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog` and
+`principal` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+databases carry `cluster`, `object_uid` and `delivery_error` and gain those three in place on
 startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape

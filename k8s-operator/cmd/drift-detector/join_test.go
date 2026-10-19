@@ -1131,12 +1131,18 @@ func TestJoinSkipsTheLookupForABacklogRecordOnlyWhenTold(t *testing.T) {
 	if c := j.Counts(); c.SkippedBacklog != 1 {
 		t.Errorf("Counts() = %+v, want skipped_backlog=1", c)
 	}
+	if !got.Digest {
+		t.Error("a backlog record bound for the digest route is not marked Digest")
+	}
 
 	getter = &stubGetter{obj: &unstructured.Unstructured{Object: map[string]any{}}}
 	j = newJoiner(joinSet(getter), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
 	j.Handle(context.Background(), record)
 	if got.Outcome != joinEnriched || len(getter.refs) != 1 {
 		t.Errorf("without skipBacklog: outcome=%s lookups=%d, want %s and one", got.Outcome, len(getter.refs), joinEnriched)
+	}
+	if got.Digest {
+		t.Error("a backlog record is marked Digest with no digest route")
 	}
 }
 
@@ -1151,7 +1157,7 @@ func TestJoinStillHoldsAnOutOfScopeBacklogRecord(t *testing.T) {
 	j := newJoiner(joinSet(&stubGetter{}), nil, knownScope(), nil, func(_ context.Context, e DriftEvent) { got = e })
 	j.skipBacklog = true
 	j.Handle(context.Background(), record)
-	if got.Outcome != joinUnreachable || !got.OutOfScope {
-		t.Errorf("outcome=%s out_of_scope=%t, want %s and held", got.Outcome, got.OutOfScope, joinUnreachable)
+	if got.Outcome != joinUnreachable || !got.OutOfScope || got.Digest {
+		t.Errorf("outcome=%s out_of_scope=%t digest=%t, want %s, held, and not digested", got.Outcome, got.OutOfScope, got.Digest, joinUnreachable)
 	}
 }

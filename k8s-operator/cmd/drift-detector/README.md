@@ -25,13 +25,14 @@ The inject is off unless `--daemon-url` is set, and off is the default. With it 
 does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
 local run against a real subscription wants. With it on, each surviving record opens a session and
 posts one payload into it — except one from a cluster outside the install's scope, which is held (the
-rule is a few paragraphs below); `logDriftEvent` still runs first either way, so the `DRIFT` line is
+rule is a few paragraphs below), and one that arrived late, which goes to the daemon's digest route
+with no session ([The backlog](#the-backlog)); `logDriftEvent` still runs first either way, so the `DRIFT` line is
 emitted whether or not a daemon is configured and whether or not the inject lands.
 
 Two things about that are worth knowing before relying on it. A record whose inject fails is
 **acked anyway and never redelivered** — the handler signature returns nothing, so there is no way
-to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` is the only
-remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
+to tell the subscriber to nack, and the `INJECT FAILED` log line naming the `insert_id` (`BACKLOG POST FAILED` for a
+backlog record) is the only remaining trace of the change. And because Pub/Sub delivers at least once while the subscriber acks
 after the handler returns, redelivery is ordinary rather than exceptional: the detector remembers
 the last few thousand `insertId`s it has injected and suppresses a repeat before opening a second
 session, so one redelivered batch does not page a human twice for one change. That set is in memory
@@ -515,7 +516,7 @@ flags are the only place a human states which cluster a credential reaches. The 
 the profile scan, so a run with both sources configured still refuses on a mismatch without first
 minting a token per profile.
 
-Five outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
+Six outcomes, all of them counted in the shutdown line. The table lists them by how a reader meets
 them, not in the order `join` decides them — and one of those decisions is worth knowing on its own:
 the `no_object` test runs before the cluster lookup, so a delete is `no_object` whether or not the
 join has a cluster to read. "The join is off" therefore does not mean "everything is `unreachable`".
@@ -530,13 +531,14 @@ rest collected under a label. Not every entry is a misconfiguration: a project h
 nobody intends to onboard sits on the second line every run, and the detector cannot tell that from
 one whose profile failed to write.
 
-| Outcome       | Means                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enriched`    | The object was read and `owners=` carries its field ownership.                                                                                                                                                                                                                                                                                                                                                                                    |
-| `no_object`   | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                                                                                                                                                                                                                                                  |
-| `gone`        | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                                                                                                                                                                                                                                               |
-| `unreachable` | The record names a live object this process cannot read: a cluster the join has no client for, or any cluster at all when neither source is configured. The shutdown lines name them. When no readable Cluster Agent profile names the cluster the record is outside the install's scope and is logged (`inject=held_out_of_scope`) and not escalated; when one does, or the scope is unknown, it is forwarded and injected as any other outcome. |
-| `failed`      | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                                                                                                                                                                                                                                                                                                                     |
+| Outcome           | Means                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `enriched`        | The object was read and `owners=` carries its field ownership.                                                                                                                                                                                                                                                                                                                                                                                    |
+| `no_object`       | Nothing to fetch: a delete, or a create whose name the API server had not assigned when audited.                                                                                                                                                                                                                                                                                                                                                  |
+| `gone`            | The cluster served the path and answered `NotFound`. The object existed when the call was audited and does not now.                                                                                                                                                                                                                                                                                                                               |
+| `unreachable`     | The record names a live object this process cannot read: a cluster the join has no client for, or any cluster at all when neither source is configured. The shutdown lines name them. When no readable Cluster Agent profile names the cluster the record is outside the install's scope and is logged (`inject=held_out_of_scope`) and not escalated; when one does, or the scope is unknown, it is forwarded and injected as any other outcome. |
+| `failed`          | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                                                                                                                                                                                                                                                                                                                     |
+| `skipped_backlog` | A backlog record the join did not look up, because the daemon takes the digest route and nothing reads its ownership ([The backlog](#the-backlog)). Decided after the delete test and the cluster lookup, so a backlog delete is still `no_object` and a backlog record from an unread cluster is still `unreachable`.                                                                                                                            |
 
 A 404 answers both of the last two, so they are told apart by what the error names rather than by
 its status code: a genuine absence names the group, resource and object that were looked up, while
@@ -661,13 +663,18 @@ because an operator who set `--daemon-url` asked for escalation and the two mode
 indistinguishable in every later line. The error names dropping the flag as the way to get the
 degraded mode deliberately.
 
+The same reply's `features` is read too, and does not gate the start: without `drift-backlog` on it,
+backlog records are sent as cards ([The backlog](#the-backlog)).
+
 ## The backlog
 
 A record that reached the detector late is backlog. The subscriber marks it (`subscriber.backlog`)
 when its message's `publishTime` is earlier than this process's first successful pull, or when it
 waited in the subscription longer than `backlogMaxWait` (30 minutes). The first rule catches
-everything that queued while no detector was pulling: an install, an uninstall, a pod roll. The
-second catches a process that started and then could not pull.
+everything that queued while no detector was pulling: an install, the uninstall before a reinstall
+that keeps the cluster, a pod roll. The test is the publish time, so an install write that reaches
+the topic after the first pull is live. The second catches a process that started and then could not
+pull.
 
 Against a daemon whose `/healthz` lists the `drift-backlog` feature, a backlog record skips the
 live-object join and is posted to `POST /v1/drift-backlog` with no session. The daemon records it,

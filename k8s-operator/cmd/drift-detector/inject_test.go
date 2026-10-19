@@ -1139,6 +1139,7 @@ func backlogEvent(insertID string) DriftEvent {
 	event.Record.PublishTime = time.Date(2026, 9, 21, 10, 30, 5, 0, time.UTC)
 	event.Outcome = joinSkippedBacklog
 	event.Owners = nil
+	event.Digest = true
 	return event
 }
 
@@ -1194,8 +1195,13 @@ func TestInjectSendsABacklogRecordAsACardWhenTheDaemonHasNoDigestRoute(t *testin
 	if handler.backlogRoute {
 		t.Fatal("backlogRoute set against a daemon that advertises no features")
 	}
-
-	handler.Handle(context.Background(), backlogEvent("insert-1"))
+	logs := captureLog(t)
+	carded := backlogEvent("insert-1")
+	carded.Digest = false
+	handler.Handle(context.Background(), carded)
+	if out := logs.String(); strings.Contains(out, backlogMarker) {
+		t.Errorf("a backlog record that was carded is logged with %q:\n%s", backlogMarker, out)
+	}
 
 	if sessions, injects := daemon.counts(); sessions != 1 || injects != 1 {
 		t.Errorf("sessions=%d injects=%d, want 1 and 1", sessions, injects)
@@ -1232,6 +1238,7 @@ func TestInjectHoldsAnOutOfScopeBacklogRecord(t *testing.T) {
 	held := backlogEvent("insert-1")
 	held.Outcome = joinUnreachable
 	held.OutOfScope = true
+	held.Digest = false
 
 	handler.Handle(context.Background(), held)
 

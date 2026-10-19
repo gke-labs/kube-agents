@@ -271,7 +271,7 @@ Each cluster-event alert and each drift alert spends one unit of a daily budget.
 
 [`agents/platform/docs/session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#daily-alert-ceiling) gives the reasons for these defaults and for each bucket.
 
-Drift changes that reach the drift detector late do not spend the `GitOpsDrift` budget. A change is late when it was made while the detector was not running or was starting, for example during an install, an uninstall or a restart of the agent pod, or when it waited more than 30 minutes. The agent posts one "Drift backlog" message for each group of late changes. The message counts the changes by principal and names some of them. Late changes get no triage turn. The feed `GET /v1/intercepted-events` lists them with the status `backlog`.
+Drift changes that reach the drift detector late do not spend the `GitOpsDrift` budget. A change is late when it was made while the detector was not running or was starting, for example during an install, during the uninstall before a reinstall that keeps the cluster, or during a restart of the agent pod, or when it waited more than 30 minutes. The agent posts one "Drift backlog" message for each group of late changes. The message counts the changes by principal and names some of them. Late changes get no triage turn. The feed `GET /v1/intercepted-events` lists them with the status `backlog`.
 
 Set a ceiling in one of these places:
 

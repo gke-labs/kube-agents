@@ -247,7 +247,7 @@ resource "null_resource" "drift_backlog" {
       }
 
       # ---- 2. Stop the detector, publish, kill it ----------------------------
-      mapfile -t pids < <(detector_pids)
+      pids=($(detector_pids))
       if [ "$${#pids[@]}" -ne 1 ]; then
         echo "ERROR: expected one drift-detector process in $DETECTOR_CONTAINER, found $${#pids[@]} ($${pids[*]:-none})." >&2
         echo "       The detector is not enabled on this install, or the container has changed. Excluding the repetition." >&2
@@ -277,7 +277,7 @@ resource "null_resource" "drift_backlog" {
       waited=0
       new_pid=""
       while [ "$waited" -lt "${var.detector_restart_timeout_seconds}" ]; do
-        mapfile -t pids < <(detector_pids)
+        pids=($(detector_pids))
         if [ "$${#pids[@]}" -eq 1 ] && [ "$${pids[0]}" != "$old_pid" ]; then
           new_pid="$${pids[0]}"
           break
