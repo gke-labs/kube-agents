@@ -1,6 +1,6 @@
 """Who a bench case's bugs go to first: its effective owner.
 
-The rule (bench/CONTRIBUTING.md, "Owner"): a case's `owner:` in its
+The rule (bench/CONTRIBUTING.md, "Ownership"): a case's `owner:` in its
 `bench/tasks/<id>/task.yaml` names the person whose bugs it is first. When the
 field is absent, or names someone who is not in the root `OWNERS` file
 (approvers or reviewers), the case falls back to its domain's `owner:` in

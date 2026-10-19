@@ -1114,7 +1114,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         # task_has_spec). A flow-style spec on one line is a valid, loadable
         # spec that the gate cannot see, so the case drops back to the
         # judge-only OutcomeValidity fallback without saying so.
-        if not re.search(r"^verification_spec:\s*$", path.read_text(encoding="utf-8"), re.MULTILINE):
+        if not re.search(r"^verification_spec:\s*$", path.read_text(encoding="utf-8"), re.M):
             problems.append(
                 "declares its 'verification_spec:' inline rather than as a "
                 "block. hack/ci-eval-pr.sh's task_has_spec matches a bare "
