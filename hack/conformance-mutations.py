@@ -2119,6 +2119,26 @@ Mutation(
         "then posts as the install's bot for whatever runs in a session pod",
     ),
     Mutation(
+        "A3-agent-answers-the-board",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aBoardReplySubjects)\n"),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the board reply namespace, so the agent "
+        "container can answer the gateway's board request itself. What it "
+        "answers is drawn on the Slack Home tab of every admitted member",
+    ),
+    Mutation(
+        "A3-session-asks-the-board",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.BoardSubject,\n\t\t},'),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "derive a session pod a publish grant on the board request, so "
+        "whatever runs in a session pod can make the bridge read session-kv "
+        "on its behalf",
+    ),
+    Mutation(
         "A3-session-per-task-wildcard",
         "a2a/authcallout/session.go",
         ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
