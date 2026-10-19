@@ -8561,6 +8561,26 @@ def test_worker_commands_required_run_succeeded_flag():
     assert res_gap_card_miss.status == "fail"
     assert "no worker command matched required pattern(s)" in res_gap_card_miss.reason
 
+    # Conclusive card-log pattern miss beside an uncredited succeeded: true run and capture gaps yields conclusive failure (status="fail").
+    transcript.set(
+        "ok",
+        traj_other,
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_uncredited_card_miss = v_with_pattern.verify(5.0)
+    assert res_gap_uncredited_card_miss.status == "fail"
+    assert "no worker command matched required pattern(s)" in res_gap_uncredited_card_miss.reason
+
+    # Conclusive card-log unrun required_run (succeeded: false) miss beside an uncredited succeeded: true run and capture gaps yields conclusive failure (status="fail").
+    v_with_unrun_fail = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run, WorkerRun(script="other_missing.py", flags=[], succeeded=False)],
+    )
+    res_gap_uncredited_unrun_fail = v_with_unrun_fail.verify(5.0)
+    assert res_gap_uncredited_unrun_fail.status == "fail"
+    assert "no worker command ran other_missing.py across 1 command(s)" in res_gap_uncredited_unrun_fail.reason
+
     # Without succeeded=True (default False), card log alone is credited.
     run_any = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
     v_any = WorkerCommandsVerifier(type="worker_commands", required_runs=[run_any])
@@ -8591,6 +8611,32 @@ def test_worker_commands_succeeded_worker_typed_nothing_grades_as_zero_commands(
     res = v.verify(5.0)
     assert res.status == "fail"
     assert "no worker command ran fleet_upgrade_report.py --readiness across 0 command(s)" in res.reason
+
+
+def test_worker_commands_succeeded_tagged_mcp_beside_card_log_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    mcp = {
+        "agent": "worker",
+        "name": "mcp__gke__get_k8s_resource",
+        "task": "t_1",
+        "args": {"name": "test"},
+        "result": "{}",
+        "status": "completed",
+        "at": 10.0,
+    }
+    # Tagged MCP calls beside non-empty card log with 0 terminal calls in trajectory:
+    # yields status="error" naming that the card log shows commands the trajectory did not carry.
+    transcript.set(
+        "ok",
+        [mcp],
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+    )
+    res = v.verify(5.0)
+    assert res.status == "error"
+    assert "the card log shows commands the trajectory did not carry" in res.reason
 
 
 def test_worker_commands_required_run_succeeded_with_after_result_pattern():

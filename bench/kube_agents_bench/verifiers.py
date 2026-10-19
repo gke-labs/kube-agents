@@ -1858,9 +1858,10 @@ _NO_WORKER_TERMINAL_CALLS_REASON = (
 )
 _NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON = (
     "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
-    "card was delegated, the worker-trajectory capture did not run, or the pod withheld a call's "
-    "arguments, so required run(s) requiring success could not be verified (a worker whose tagged "
-    "calls are all MCP or board calls, with an empty card log, grades as zero commands)"
+    "card was delegated, the worker-trajectory capture did not run, the card log shows commands "
+    "the trajectory did not carry, or the pod withheld a call's arguments, so required run(s) "
+    "requiring success could not be verified (a worker whose tagged calls are all MCP or board calls, "
+    "with an empty card log, grades as zero commands)"
 )
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
@@ -2759,25 +2760,27 @@ class WorkerCommandsVerifier(BaseVerifier):
         uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *traj_missing] if run.succeeded]
         if self.after_result_pattern is not None:
             partial = bool(snap.worker_capture_gaps)
+            conclusive = bool(hits or ran)
+            failed = conclusive or bool((missing or unrun_missing or unrun_failed) and not partial)
         else:
             partial = bool(snap.worker_capture_gaps) and bool(uncredited_succeeded)
+            conclusive = bool(hits or ran or missing or any(not r.succeeded for r in unrun_missing))
+            failed = conclusive or bool((unrun_missing or unrun_failed) and not partial)
 
-        if hits or ran or ((missing or unrun_missing or unrun_failed) and not partial):
+        if failed:
             parts = []
-            if missing:
+            if missing and (not partial or self.after_result_pattern is None):
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s){exempted}{sources}"
                 )
-            if unrun_missing:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
-                if all(run.succeeded for run in unrun_missing) and self.after_result_pattern is not None:
-                    count = len(traj_eligible)
-                    parts.append(f"no worker command ran {named} across {count} command(s)")
-                else:
-                    parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
-            if unrun_failed:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+            unrun_missing_reported = unrun_missing if not partial else [r for r in unrun_missing if not r.succeeded]
+            if unrun_missing_reported:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
+                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+            unrun_failed_reported = unrun_failed if not partial else []
+            if unrun_failed_reported:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
                 parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
             if hits:
                 shown = "; ".join(
