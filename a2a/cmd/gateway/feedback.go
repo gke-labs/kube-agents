@@ -32,9 +32,9 @@ const (
 	feedbackDay           = 24 * time.Hour
 	// feedbackMaxDays bounds a --since in days below time.Duration's
 	// overflow.
-	feedbackMaxDays = int(math.MaxInt64 / int64(feedbackDay))
-	feedbackClientName    = "a2a-gateway-feedback-export"
-	feedbackUsage         = "usage: /gateway feedback export [--since 7d] > feedback.tar"
+	feedbackMaxDays    = int(math.MaxInt64 / int64(feedbackDay))
+	feedbackClientName = "a2a-gateway-feedback-export"
+	feedbackUsage      = "usage: /gateway feedback export [--since 7d] > feedback.tar"
 )
 
 var errFeedbackUsage = errors.New(feedbackUsage)

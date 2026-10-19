@@ -35,10 +35,10 @@ const (
 	// many a draft takes when its short id is already in the export.
 	feedbackCaseIDHash     = 4
 	feedbackCaseIDHashLong = 16
-	feedbackTaskFile   = "task.yaml"
-	feedbackTranscript = "transcript.md"
-	feedbackFileMode   = 0o600
-	feedbackDirMode    = 0o700
+	feedbackTaskFile       = "task.yaml"
+	feedbackTranscript     = "transcript.md"
+	feedbackFileMode       = 0o600
+	feedbackDirMode        = 0o700
 	// feedbackSummaryAskMax clips the ask on a draft's summary line.
 	feedbackSummaryAskMax = 28
 	feedbackNoNote        = "(no note)"

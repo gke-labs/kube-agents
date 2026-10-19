@@ -587,7 +587,7 @@ func (n *Notifier) post(job notifyJob) {
 			job.mark = &MarkState{Ask: mark.Ask, Settle: mark.Settle}
 		}
 	}
-	if job.req.Conversation != "" && (len(job.req.Chat) > 0 || job.req.Update != "") && n.postConversation(job) {
+	if job.req.Conversation != "" && (len(job.req.Chat) > 0 || job.req.Update != "" || job.req.AnswerTo != "") && n.postConversation(job) {
 		return
 	}
 	thread := job.req.Thread
