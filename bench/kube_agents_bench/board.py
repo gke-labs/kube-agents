@@ -454,7 +454,7 @@ class SessionCards:
     the board's subscriptions addressed to it (``"kanban_notify_subs"``).
     ``cards`` maps each id the board knows to its ``status``, and, for the
     ids the read was asked for (``want``), its ``result`` (``tasks.result``)
-    and ``summary`` (the newest non-empty ``task_runs.summary``); ``None``
+    and ``summary`` (the newest ``task_runs.summary``); ``None``
     for the rest. An id in ``card_ids`` and not in ``cards`` is one the board
     has no row for.
     """
