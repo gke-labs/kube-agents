@@ -1590,6 +1590,8 @@ class InfraAddressee(unittest.TestCase):
             self.assertEqual(post_health.gate_issue.infra_addressees(path), ("ivan", "iris"), "a quoted login is the same login")
             path.write_text("infra_owner: \"ivan'\n")
             self.assertEqual(post_health.gate_issue.infra_addressees(path), (None, None), "mismatched quotes are not a login")
+            path.write_text("infra_owner: null\ninfra_backup: False\n")
+            self.assertEqual(post_health.gate_issue.infra_addressees(path), (None, None), "YAML's null and boolean words name no one")
             self.assertEqual(post_health.gate_issue.infra_addressees(pathlib.Path(tmp) / "missing.yaml"), (None, None))
 
 

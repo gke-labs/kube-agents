@@ -92,8 +92,8 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
     """``{part: [night, ...]}``, oldest first, one per date inside the
     window: the newest build of that part that date that was not lost, else
     the newest (a clean re-run rescues its night; a lost re-run does not undo
-    a clean build). A night is ``{date, started, build, job, part, run_url,
-    lost, how, run}``."""
+    a clean build). A night is ``{date, started, finished, build, job, part,
+    run_url, lost, how, run}``."""
     window = window_dates(data, lookback)
     by_part: dict[str, dict[datetime.date, dict]] = {}
     for run in nightly.sorted_nightly_runs(data):
@@ -108,6 +108,7 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
         by_part.setdefault(part, {})[day] = {
             "date": day.isoformat(),
             "started": run.get("started"),
+            "finished": run.get("finished"),
             "build": run.get("build_id"),
             "job": run.get("job") or nightly.DEFAULT_NIGHTLY_JOB,
             "part": part,
@@ -200,6 +201,7 @@ def case_verdicts(data: dict, parts: dict[str, list[dict]], cases: list[str]) ->
             out.setdefault(case, []).append({
                 "date": night["date"],
                 "started": night["started"],
+                "finished": night["finished"],
                 "build": night["build"],
                 "run_url": night["run_url"],
                 "transcript_url": nightly.transcript_url(night["run"], case),

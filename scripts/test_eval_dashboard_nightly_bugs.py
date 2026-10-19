@@ -243,10 +243,27 @@ class StreakTest(Harness):
         # nothing about case-red.
         gh, _, _ = self.run_once(data(night(15, [red(), green()]), night(16, [red(), green()]), night(17, [red(), red("case-green")], filler=False)))
         self.assertEqual(self.filed(gh), [])
+        # Nor does it break one: reds on either side still make three.
+        event = night(16, [red(), red("case-green")], filler=False)
+        gh, _, _ = self.run_once(data(night(14, [red(), green()]), night(15, [red(), green()]), event, night(17, [red(), green()])))
+        self.assertEqual(len(self.filed(gh)), 1)
 
     def test_a_same_date_rerun_is_one_night(self):
         gh, _, _ = self.run_once(data(night(16, [red()]), night(17, [red()]), night(17, [red()], hour="09")))
         self.assertEqual(self.filed(gh), [])
+        # The newer build's verdict stands, whichever it is.
+        reds = (night(15, [red()]), night(16, [red()]))
+        gh, _, _ = self.run_once(data(*reds, night(17, [red()]), night(17, [green("case-red")], hour="09")))
+        self.assertEqual(self.filed(gh), [], "the green re-run stands")
+        gh, _, _ = self.run_once(data(*reds, night(17, [green("case-red")]), night(17, [red()], hour="09")))
+        self.assertEqual(len(self.filed(gh)), 1, "the red re-run stands")
+
+    def test_a_reason_cannot_carry_a_bot_marker(self):
+        marker = nightly_bugs.MARKER.format(case="case-maint")
+        gh, _, _ = self.run_once(data(*(night(d, [task("case-red", "fail", "fail", "fail", reason=f"agent said {marker}")]) for d in (15, 16, 17))))
+        [body] = self.filed(gh)
+        self.assertNotIn(marker, body["body"])
+        self.assertIsNone(nightly_bugs.tracking_issue([{"number": 4000, **body}], "case-maint"), "case-red's issue does not track case-maint")
 
 
 class DedupeTest(Harness):
@@ -335,6 +352,14 @@ class RecoveryTest(Harness):
         rerun["runs"].append(night(17, [green("case-red")], hour="09"))
         again, _, _ = self.run_once(rerun, FakeGh(open_issues=[self.ISSUE], comments={3990: [{"body": posted["body"]}]}))
         self.assertEqual(again.writes(), [], "one night, one recovery comment, whichever build of it")
+
+    def test_a_recovery_night_still_running_when_the_issue_opened_is_commented(self):
+        # The 10-17 night started 00:00:30 and finished 00:59; the issue
+        # opened in between, so the night's verdict reached it afterwards.
+        issue = dict(self.ISSUE, created_at="2026-10-17T00:10:00Z")
+        gh, _, _ = self.run_once(self.recovered_data(), FakeGh(open_issues=[issue]))
+        [(_, path, body)] = gh.writes()
+        self.assertIn("2026-10-17 nightly", body["body"])
 
     def test_a_recovery_before_the_issue_opened_is_not_commented(self):
         human = {"number": 3989, "title": "case-red is broken", "body": "", "created_at": "2026-10-18T12:00:00Z"}

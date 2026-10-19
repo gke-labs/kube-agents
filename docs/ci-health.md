@@ -735,8 +735,8 @@ body, in any letter case, is adopted instead, so a case is filed once and a huma
 too: a fix that merged before the next nightly closes its issue while the
 nights on record are still red, so the case is filed again only after a newer
 failing night. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
-repetition on a graded night after its last failing one and after the issue
-was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
+repetition on a graded night after its last failing one, and that night
+finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
 
 Two infrastructure shapes file an issue labelled `nightly-red`, `Infra` and

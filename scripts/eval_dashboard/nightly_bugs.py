@@ -200,6 +200,8 @@ NIGHT_LINE_NO_LINK = "- {date}: {passed}/{graded} passed{infra}"
 # A reason is quoted as code: it can carry `@login` or `org/repo#N`, which
 # GitHub would otherwise turn into a mention or a cross-reference.
 REASON_LINE = "  - failed: {reason}"
+# What a quoted reason's `<` becomes: SINGLE LEFT-POINTING ANGLE QUOTATION MARK.
+MARKER_SAFE_LT = "\u2039"
 NO_REASON_LINE = "  - (no reason recorded)"
 WHY_CASE_OWNER = "the case's `owner:`"
 WHY_DOMAIN_OWNER = "domain owner; the case's `owner:` is {owner}"
@@ -380,6 +382,7 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                 by_date.setdefault(day, {})[name] = {
                     "date": day.isoformat(),
                     "started": run.get("started"),
+                    "finished": run.get("finished"),
                     "build": run.get("build_id"),
                     "outcome": outcome,
                     "passed": counts["pass"],
@@ -421,8 +424,11 @@ def recovery_night(verdicts: list[dict]) -> dict | None:
 
 
 def quoted(text: str | None) -> str:
-    """``text`` as inline code on one line (REASON_LINE says why)."""
-    return "`" + (text or "").replace("\n", " ").replace("`", "'") + "`"
+    """``text`` as inline code on one line (REASON_LINE says why), with
+    ``<`` swapped for a look-alike so a reason can never carry a bot marker
+    (``<!-- kube-agents-bot:... -->``) that dedupe would read as this
+    issue's."""
+    return "`" + (text or "").replace("\n", " ").replace("`", "'").replace("<", MARKER_SAFE_LT) + "`"
 
 
 def night_block(streak: list[dict]) -> str:
@@ -484,10 +490,13 @@ def tracking_issue(issues: list[dict], case: str, kind: str = KIND_RED) -> dict 
 
 
 def opened_before(issue: dict, night: dict) -> bool:
-    """Whether ``issue`` was opened before ``night``'s run started: only
-    such a night is news to it, a later failure or a recovery."""
-    opened, started = nightly.parse_iso(issue.get("created_at")), nightly.parse_iso(night.get("started"))
-    return bool(opened and started and started > opened)
+    """Whether ``issue`` was opened before ``night``'s run finished (its
+    start when no finish is recorded): only such a night is news to it, a
+    later failure or a recovery. A night still running when the issue opened
+    reached data.json after it, so it counts."""
+    opened = nightly.parse_iso(issue.get("created_at"))
+    ended = nightly.parse_iso(night.get("finished")) or nightly.parse_iso(night.get("started"))
+    return bool(opened and ended and ended > opened)
 
 
 def closed_after(issue: dict | None, night: dict) -> bool:
@@ -530,7 +539,7 @@ class Filer:
         if open_issues is None or closed_issues is None:
             log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
             return result
-        active = {c.get("name") for c in data.get("cases") or [] if isinstance(c, dict) and c.get("nightly_active")}
+        active = set(nightly.expected_cases(data))
         for case, verdicts in sorted(nights.items()):
             fields = task_fields(case, self.repo_root)
             issue = tracking_issue(open_issues, case)

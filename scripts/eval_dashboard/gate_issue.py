@@ -82,6 +82,9 @@ INFRA_BACKUP_KEY = "infra_backup"
 TOP_LEVEL_KEY_RE = r"""^{key}:\s*(["']?)([A-Za-z0-9-]+)\1\s*(?:#.*)?$"""
 INFRA_ADDRESSEE = "Infra owner: @{owner}{backup} (`infra_owner` in docs/designs/domains.yaml)."
 INFRA_BACKUP_NOTE = ", backup @{backup}"
+# Bare words YAML reads as null or a boolean, never as a login: a key set
+# to one of them names no owner.
+YAML_NON_LOGINS = frozenset({"null", "none", "true", "false", "yes", "no", "on", "off"})
 # The issue field GitHub names when it will not assign a login.
 ASSIGNEES_FIELD = "assignees"
 JOB_NAME = "pull-kube-agents-smoke-test"
@@ -277,7 +280,7 @@ def infra_addressees(path: pathlib.Path = DOMAINS_FILE) -> tuple[str | None, str
     except OSError:
         return None, None
     found = [re.search(TOP_LEVEL_KEY_RE.format(key=key), text, re.MULTILINE) for key in (INFRA_OWNER_KEY, INFRA_BACKUP_KEY)]
-    return tuple(m.group(2) if m else None for m in found)
+    return tuple(m.group(2) if m and m.group(2).lower() not in YAML_NON_LOGINS else None for m in found)
 
 
 def names_all(text: str, names: list[str]) -> bool:
