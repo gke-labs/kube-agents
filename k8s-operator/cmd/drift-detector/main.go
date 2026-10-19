@@ -267,8 +267,10 @@ func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onD
 // carries its own project. A --project naming some other project therefore
 // matches no record for this cluster and reports its records unreachable,
 // which is the direction to fail in -- the alternative is enriching one
-// project's records from another's clusters -- and verifyClusterIdentity
-// refuses the mismatch outright where the metadata server can answer.
+// project's records from another's clusters. verifyClusterIdentity refuses the
+// mismatch outright where the metadata server can answer, which is no longer
+// the case inside the gateway Pod: its metadata route is closed, so there the
+// triple is taken on trust (see the README).
 //
 // A function rather than a literal at the one call site because the three
 // fields are adjacent strings assembled from three flags, which is the
@@ -486,8 +488,9 @@ func realMain(argv []string) error {
 	}
 
 	// Fatal error propagated rather than degraded: internal/clusterprofiles
-	// returns one only for a --profiles-dir that is not there, which discovery
-	// runs once against and a restart fixes. Everything survivable has already
+	// returns one only for a --profiles-dir that is not there, or a credential
+	// proxy that cannot be reached or answers with an error about itself, each of
+	// which discovery runs once against and a restart fixes. Everything survivable has already
 	// been logged and recorded in the scan by this point.
 	scan, err := discoverProfileClusters(ctx, f.profilesDir, directlyReached)
 	if err != nil {

@@ -62,6 +62,7 @@ _install_hermes_stubs()
 
 import apply_kanban_chat_notify  # noqa: E402
 import kanban_chat_notify  # noqa: E402
+import kanban_notifier  # noqa: E402
 from gateway.config import Platform  # noqa: E402
 
 ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
@@ -607,6 +608,42 @@ class _Task:
     result: str
 
 
+class FoldsIntoRowTest(unittest.TestCase):
+    """``_folds_into_row`` through its own query, against a board with the ``payload`` column it reads."""
+
+    SUB = {"platform": "slack", "chat_id": "a2a-ctx-1", "thread_id": "slack:C1/1.2", "task_id": "t_c1"}
+
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.executescript(
+            "CREATE TABLE tasks (id TEXT, status TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+            "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
+            "INSERT INTO tasks VALUES ('t_parent', 'running'), ('t_c1', 'done'), ('t_c2', 'running');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_c1', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_c2', 'created', '{\"creator_task_id\": \"t_parent\"}');"
+        )
+        self.conn.execute("INSERT INTO kanban_notify_subs VALUES ('t_parent', 'slack', ?, ?)",
+                          (self.SUB["chat_id"], self.SUB["thread_id"]))
+        flag = mock.patch.object(kanban_notifier, "slack_ux_on", side_effect=lambda p: str(p).lower() == "slack")
+        flag.start()
+        self.addCleanup(flag.stop)
+
+    def test_a_child_beneath_an_open_fan_out_on_slack_folds(self):
+        self.assertTrue(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+    def test_not_once_the_parent_is_done(self):
+        self.conn.execute("UPDATE tasks SET status = 'done' WHERE id = 't_parent'")
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+    def test_not_on_another_thread(self):
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.SUB, thread_id="slack:C1/9.9")))
+
+    def test_not_with_the_flag_off(self):
+        with mock.patch.object(kanban_notifier, "slack_ux_on", return_value=False):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
+
+
 class FoldFanoutTest(unittest.TestCase):
     """A fanned-out child's answer folds into its parent's on the routed path.
 
@@ -683,6 +720,23 @@ class FoldFanoutTest(unittest.TestCase):
     def test_the_answer_is_held_while_the_parent_works(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
         self.assertEqual(self.cursor(), 6, "a hold under the read-only claim writes nothing")
+
+    def test_an_answer_that_folds_into_its_plan_row_delivers_while_the_parent_works(self):
+        # kanban_progress_lines settles the row and posts nothing; a hold would leave the row
+        # running after the parent's answer, since the drop that follows never reaches the plan.
+        claim = self.claim(_Ev(7, "completed", 1900))
+        with mock.patch.object(kanban_chat_notify, "_folds_into_row", return_value=True):
+            self.assertIs(self.fold(claim), claim)
+        self.assertEqual(self.cursor(), 6, "delivered as claimed: the fold writes nothing")
+
+    def test_an_answer_that_folds_into_its_row_is_still_dropped_after_the_parents_posted(self):
+        self.parent("done", completed_event=9, delivered=9)
+        with mock.patch.object(kanban_chat_notify, "_folds_into_row", return_value=True):
+            self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
+
+    def test_no_plan_fold_without_the_slack_flag(self):
+        # This class's thread is Google Chat, which has no plan: the hold stands.
+        self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
 
     def test_a_hold_under_the_committed_claim_rewinds(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))

@@ -2,8 +2,8 @@
 
 Usage: python3 - <home> [--resume] < ci_pause_scheduled_audits.py
 
-hack/ci-eval-pr.sh pipes this into the gateway once per lease, before any unit runs
-(scheduled_audits pause; the EXIT trap runs scheduled_audits resume). The governance watchdogs fire on the clock between 06:20 and
+hack/ci-eval-pr.sh pipes this into the gateway at lease time and again right before
+the fan-out (scheduled_audits pause; the EXIT trap runs scheduled_audits resume). The governance watchdogs fire on the clock between 06:20 and
 09:20 UTC, and a run that writes to the GitOps repository mid-eval is charged to
 whichever cases are running when it lands: `no-github-writes-the-case-did-not-request`
 dates a write, it doesn't attribute it (#2611). The 08:00 networking audit's
@@ -39,8 +39,9 @@ outlives it would otherwise leave five audits off for good.
 
 Prints one line naming what it did. Exit codes, which the caller's retry reads:
 0 done; 1 worth another try (a pause that timed out, a store it couldn't read
-back); 3 decided, so a retry would only repeat it (its inputs are unreadable, or
-Hermes refused a pause or wrote no markers).
+back, a marker still missing after the last round, which is another writer
+still at work); 3 decided, so a retry would only repeat it (its inputs are
+unreadable, or Hermes refused a pause).
 """
 
 import ast
@@ -48,6 +49,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 home = sys.argv[1]
 RESUME = sys.argv[2:] == ["--resume"]
@@ -61,10 +63,15 @@ STAGE_AUDITS = "FIRST_RUN_AUDITS"
 SHIPPED_ROSTER = os.environ.get("PLATFORM_ROSTER_SOURCE", "/opt/platform-template/cron/jobs.json")
 # Absolute, as profile_scaffold.py runs it, so PATH order can't change which binary answers.
 HERMES_BIN = os.environ.get("HERMES_BIN", "/opt/hermes/.venv/bin/hermes")
-# Per call. Five pauses at this bound stay well inside the caller's
-# EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS, so a stalled pause is named here rather than
-# cut off by the caller's timeout before this prints.
+# Per call. A stalled call is named here rather than cut off by the caller's
+# EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS. Every call stalling in every round (5 jobs x
+# PAUSE_ROUNDS) would outlast that bound; the caller then reports the timeout and
+# tries again, which is the right answer to a wedged store anyway.
 HERMES_TIMEOUT_SECONDS = 30
+# Rounds of pause-then-read-back, and the gap between them, for a job a
+# concurrent writer un-paused (see pause()).
+PAUSE_ROUNDS = 4
+PAUSE_ROUND_SLEEP_SECONDS = 3
 PAUSED_STATE = "paused"
 OK, RETRY, DECIDED = 0, 1, 3
 EXCERPT_CHARS = 200
@@ -164,22 +171,41 @@ def pause():
         except OSError as exc:
             print(f"nothing paused: could not write {RECORD}: {exc}")
             return RETRY
+    # Believe the store, not the exit codes, and pause again what it doesn't show.
+    # Another writer can rewrite the store from a copy read before a pause: the
+    # entrypoint's cron merge in a container that is still starting, or a
+    # scheduler tick. Hermes reports success and the marker is gone
+    # (eval-next 2110626938950258691: gcp-networking-fabric-audit, after an
+    # autoscaler scale-down replaced the gateway mid-pause). So the store has to
+    # read clean twice, a round apart, before the pause counts: a writer whose
+    # stale copy lands after the first clean read is caught by the second, and
+    # what it dropped is paused again. A clean read on the last round stands.
     failed, failed_ids, retryable = [], set(), False
-    for jid in targets:
-        again, failure = hermes("pause", jid)
-        retryable |= again
-        if failure:
-            failed.append(failure)
-            failed_ids.add(jid)
-
-    # Believe the store, not the exit codes.
-    try:
-        after = {job["id"]: job for job in jobs_in(ROSTER)}
-    except (OSError, ValueError) as exc:
-        print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
-        return RETRY
+    pending = list(targets)
+    clean_reads = 0
+    for round_no in range(PAUSE_ROUNDS):
+        if round_no:
+            time.sleep(PAUSE_ROUND_SLEEP_SECONDS)
+        for jid in pending:
+            again, failure = hermes("pause", jid)
+            retryable |= again
+            if failure and jid not in failed_ids:
+                failed.append(failure)
+                failed_ids.add(jid)
+        try:
+            after = {job["id"]: job for job in jobs_in(ROSTER)}
+        except (OSError, ValueError) as exc:
+            print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
+            return RETRY
+        pending = [jid for jid in targets if not paused(after.get(jid, {})) and jid not in failed_ids]
+        clean_reads = clean_reads + 1 if not pending else 0
+        if clean_reads == 2 or not targets:
+            break
     done = [jid for jid in targets if paused(after.get(jid, {}))]
-    failed += [f"{jid} (not paused in the store)" for jid in targets if jid not in done and jid not in failed_ids]
+    failed += [f"{jid} (not paused in the store)" for jid in pending]
+    # A marker still missing after the last round is a writer still at work,
+    # not a verdict: the caller settles the gateway, waits and runs this again.
+    retryable |= bool(pending)
     print(
         f"paused {', '.join(done) or 'nothing'}; left {', '.join(left) or 'nothing'}"
         + (f"; FAILED {', '.join(failed)}" if failed else "")

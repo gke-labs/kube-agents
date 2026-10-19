@@ -101,6 +101,7 @@ _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-today",
     "ci-kube-agents-eval-nightly-next-claude",
+    "ci-kube-agents-eval-nightly-gitlab-next",
 )
 _NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
 _OTHER_JOB_NAME = "ci-x"
@@ -222,9 +223,13 @@ _BRIDGE_CONCURRENCY = "6"
 
 
 def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
-    """Run section 4 with `gcloud` stubbed to print its argv, then print the
-    operator.extraEnv values it left for the release. MODE_NEXT_BRIDGE_CONCURRENCY
-    is set as section 2b leaves it under the flag."""
+    """Run section 4 with `gcloud` stubbed to print its argv on stderr, then
+    print the operator.extraEnv values it left for the release.
+    MODE_NEXT_BRIDGE_CONCURRENCY is set as section 2b leaves it under the
+    flag. The stub answers `builds submit` with an id and a log URL on stdout,
+    as --format=value(id,logUrl) does, and `builds describe` with SUCCESS, so
+    the section's poll (#3129) ends on its first turn; the real `timeout`
+    cannot exec a shell function, so it is shimmed to run its command."""
     return run_bash(
         "\n".join(
             [
@@ -235,7 +240,8 @@ def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
                 'export HERMES_AGENT_TAG="v0"',
                 "BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)",
                 "A2A_OPERATOR_ENV_ARGS=()",
-                'gcloud() { printf "%s\\n" "$@"; }',
+                'gcloud() { printf "%s\\n" "$@" >&2; case "$1 $2" in "builds submit") printf "b-1\\tu\\n" ;; "builds describe") echo SUCCESS ;; esac; }',
+                'timeout() { shift 2; "$@"; }',
                 flag_line(mode_next),
                 constants_block(),
                 lifted(*_BUILD_SECTION),
@@ -246,7 +252,7 @@ def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
 
 
 def substitutions(result: subprocess.CompletedProcess) -> str:
-    for line in result.stdout.splitlines():
+    for line in result.stderr.splitlines():
         if line.startswith("--substitutions="):
             return line.partition("=")[2]
     raise AssertionError(f"no --substitutions in:\n{result.stdout}\n{result.stderr}")
@@ -595,7 +601,7 @@ class FlagSetIsNextTest(unittest.TestCase):
 
     def test_the_lane_allow_list_matches_whole_job_names(self) -> None:
         """A prefix, a suffix or a substring of a listed name is not the job:
-        `ci-kube-agents-eval-next-2` or `kube-agents-eval-next` must refuse.
+        `ci-kube-agents-eval-today-2` or `kube-agents-eval-today` must refuse.
         So must a value spelling two adjacent entries with the space between
         them, which a pattern over the joined list would have admitted."""
         guard = prow_guard()

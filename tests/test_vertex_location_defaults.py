@@ -30,7 +30,7 @@ _FULL_INSTALL_MAIN = (
     _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
 )
 _ADMIN_GATEWAY = _REPO_ROOT / "admin_console" / "llm_gateway.py"
-_ADMIN_PAGE = _REPO_ROOT / "admin_console" / "pages" / "llm_gateway.py"
+_ADMIN_PAGE = _REPO_ROOT / "admin_console" / "views" / "llm_gateway.py"
 
 
 class VertexLocationDefaultTest(unittest.TestCase):

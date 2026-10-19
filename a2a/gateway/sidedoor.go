@@ -259,6 +259,16 @@ func (s *sideDoorAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// ShowsTaskStatus answers for the primary's own conversations; a door keeps
+// its rolling line, which its caller reads.
+func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
+	if s.doorFor(conversation) != nil {
+		return false
+	}
+	shower, ok := s.primary.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if s.doorFor(conversation) != nil {
 		return
@@ -358,6 +368,15 @@ func (s *sideDoorAdapter) TurnFinished(conversation string) {
 func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	for _, d := range s.doors {
 		d.Door.SetProbe(probe)
+	}
+}
+
+// SetHome hands the Home tab's admission rule and board reader to the
+// primary, the half with a home view; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	if sink, ok := s.primary.(HomeSink); ok {
+		sink.SetHome(admits, board)
 	}
 }
 

@@ -26,6 +26,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"
 
 import cluster_agent_profile as cap  # noqa: E402
 import terminal_env_pin  # noqa: E402
+import gke_endpoint  # noqa: E402
+
+
+POD_RANGE = "10.92.0.0/14"
+ADMIT_REMEDY = gke_endpoint.REMEDY_ADMIT_POD_RANGE.format(pod_cidr=POD_RANGE)
+
+
+def a_decision(**overrides):
+    """An --internal-ip decision for a same-subnet private cluster, which carries
+    no remedy; override fields per test. `a_blocked_decision` is the shape with
+    something to say."""
+    base = dict(
+        flags=("--internal-ip",), kind=gke_endpoint.KIND_INTERNAL_IP, address="10.10.0.2",
+        same_network=True, authorized_networks=("10.0.0.0/8", "172.16.0.0/12"), remedy="",
+    )
+    base.update(overrides)
+    return gke_endpoint.EndpointDecision(**base)
+
+
+def a_blocked_decision(**overrides):
+    """The public IP kept because the private endpoint's list does not admit the
+    agent's Pod range: the decision the remedy exists for."""
+    base = dict(flags=(), kind=gke_endpoint.KIND_IP, address="203.0.113.10",
+                authorized_networks=("203.0.113.5/32",), remedy=ADMIT_REMEDY)
+    base.update(overrides)
+    return a_decision(**base)
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -193,14 +219,23 @@ class CreateProfileTest(unittest.TestCase):
         self.runs = []
         self.writes_kubeconfig = True
         self._patch(subprocess, "run", self._fake_run)
-        # Whether that command needs --dns-endpoint. Patched explicitly rather
-        # than left to fall out of the fake above: gke_endpoint reads gcloud's
-        # help text to decide the flag exists at all, the fake answers every
+        # Which endpoint that command names. Patched explicitly rather than
+        # left to fall out of the fake above: gke_endpoint reads gcloud's help
+        # text to decide the flag exists at all, the fake answers every
         # command with empty stdout, and the resulting "no flag" would be an
         # accident of the mock rather than a decision the test made. The
         # predicate itself is covered in test_gke_endpoint.py.
-        self.dns_args = []
-        self._patch(cap, "dns_endpoint_args", lambda *a, **k: self.dns_args)
+        self.decision = None
+        self.decision_kwargs = {}
+
+        def decide(*a, **k):
+            self.decision_kwargs = k
+            return self.decision
+
+        self._patch(cap, "endpoint_decision", decide)
+        # Whether the connectivity probe after the scaffold succeeds.
+        self.probe_exit = 0
+        self.probe_stderr = ""
         # The managed terminal pin needs Hermes, which is not installed here; its own
         # behaviour is covered in tests/test_terminal_env_pin.py and at image build.
         self.pinned = []
@@ -226,6 +261,9 @@ class CreateProfileTest(unittest.TestCase):
 
     def _fake_run(self, cmd, **kwargs):
         self.runs.append(cmd)
+        if cmd[:2] == ["kubectl", "version"]:
+            return subprocess.CompletedProcess(
+                cmd, self.probe_exit, "Client Version: v1.33.0\n", self.probe_stderr)
         # Real gcloud writes the file its KUBECONFIG names, and the scaffold
         # checks that it did before calling the profile finished. A fake that
         # exits 0 without writing is a fake of the failure, not of the success.
@@ -363,11 +401,213 @@ class CreateProfileTest(unittest.TestCase):
         # An onboarded cluster whose control plane is only reachable by DNS. The
         # profile's pinned kubeconfig is what the Cluster Agent runs against for
         # its whole life, so the flag has to be present when it is scaffolded.
-        self.dns_args = ["--dns-endpoint"]
+        self.decision = a_decision(flags=("--dns-endpoint",), kind=gke_endpoint.KIND_DNS,
+                                   address="gke-x.gke.goog", same_network=None, remedy="")
 
         self.create()
 
         self.assertEqual(self.get_credentials_argv()[-1], "--dns-endpoint")
+
+    def test_fetches_credentials_over_the_private_endpoint_when_detected(self):
+        self.decision = a_decision()
+        self.create()
+        self.assertEqual(self.get_credentials_argv()[-1], "--internal-ip")
+
+    def test_writes_the_endpoint_decision_as_preflight_readable_bullets(self):
+        self.decision = a_blocked_decision()
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        for key, value in {
+            "endpoint": "ip",
+            "endpoint-address": "203.0.113.10",
+            "authorized-networks": "203.0.113.5/32",
+            "endpoint-remedy": ADMIT_REMEDY,
+        }.items():
+            found = re.findall(rf"^[ \t]*-[ \t]*{key}:[ \t]*(.*)$", user_md, re.MULTILINE)
+            self.assertTrue(found, f"`{key}` is not a `- {key}:` bullet")
+            self.assertEqual(found[0].strip(), value)
+
+    def test_a_decision_without_a_remedy_writes_no_remedy_bullet(self):
+        self.decision = a_decision(authorized_networks=None)
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertIn("- endpoint: internal-ip\n", user_md)
+        self.assertIn("- authorized-networks: unrestricted\n", user_md)
+        self.assertNotIn("endpoint-remedy", user_md)
+
+    def test_the_remedy_bullet_is_framed_as_conditional_for_the_cluster_agent(self):
+        # USER.md is the Cluster Agent's startup context; a remedy written there
+        # for a cluster that answers must not read as an instruction to act.
+        self.decision = a_blocked_decision()
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertIn("only if `kubectl` cannot reach the API server", user_md)
+
+    def test_the_scaffold_asks_for_the_own_cluster_past_any_backoff(self):
+        # One transient failure in a reconcile sweep must not blank the record
+        # of every cluster scaffolded in the following minute.
+        self.decision = a_decision()
+        self.create()
+        self.assertIs(self.decision_kwargs.get("retry_own"), True)
+
+    def test_a_server_answered_timeout_names_no_remedy(self):
+        # "Error from server" fronts every answer the API server gave; a
+        # degraded etcd that timed out was reached, and the list cannot help.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = "Error from server: etcdserver: request timed out\n"
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
+
+    def test_a_provisional_decision_is_not_recorded(self):
+        # The scaffold's own describe of the agent cluster failed; the broker
+        # decides again for the unflagged fetch and may splice --internal-ip,
+        # so a record of this fallback would misstate what the kubeconfig names.
+        self.decision = a_blocked_decision(provisional=True)
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertNotIn("- endpoint", user_md)
+        self.assertNotIn("endpoint-remedy", user_md)
+        self.assertEqual(self.get_credentials_argv()[-1], f"--project={self.PROJECT}")
+
+    def test_a_settled_but_empty_decision_writes_no_endpoint_bullets(self):
+        # A gcloud without --dns-endpoint decides nothing about the cluster:
+        # the answer is settled (no flag) but names no endpoint to record.
+        self.decision = a_decision(flags=(), kind=gke_endpoint.KIND_IP, address="",
+                                   same_network=None, authorized_networks=None)
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertNotIn("- endpoint", user_md)
+
+    def test_no_decision_writes_no_endpoint_bullets(self):
+        self.decision = None
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertNotIn("- endpoint", user_md)
+        self.assertNotIn("authorized-networks", user_md)
+
+    def test_probes_the_cluster_once_after_get_credentials_with_the_request_timeout(self):
+        self.decision = a_decision()
+        self.create()
+        probe = [c for c in self.runs if c[:2] == ["kubectl", "version"]]
+        self.assertEqual(len(probe), 1)
+        self.assertIn(f"--request-timeout={cap.CONNECTIVITY_PROBE_REQUEST_TIMEOUT}", probe[0])
+        # After get-credentials, so the kubeconfig exists to read.
+        self.assertGreater(self.runs.index(probe[0]), self.runs.index(self.get_credentials_argv()))
+
+    def test_the_probe_runs_as_the_login_that_owns_the_kubeconfig(self):
+        """get-credentials writes the kubeconfig as the `agent` login, 0600. The
+        default `hermes` login cannot read it, and the credential-proxy shim
+        then refuses the kubectl with "kubeconfig is unreadable" before any
+        connection is attempted -- seen live on gkedemos. The probe has to run
+        as the same login the Cluster Agent's own kubectl runs as."""
+        self.decision = a_decision()
+        original = cap.sandbox_exec.run
+        principals = {}
+
+        def spy(argv, **kwargs):
+            if argv[:2] == ["kubectl", "version"]:
+                principals["probe"] = kwargs.get("principal", cap.sandbox_exec.SANDBOX_PRINCIPAL)
+            return original(argv, **kwargs)
+
+        self._patch(cap.sandbox_exec, "run", spy)
+        self.create()
+        self.assertEqual(principals.get("probe"), cap.sandbox_exec.TERMINAL_PRINCIPAL)
+
+    def test_a_failed_probe_logs_the_endpoint_and_the_remedy(self):
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = "Client Version: v1.33.0\nUnable to connect to the server: dial tcp 203.0.113.10:443: i/o timeout\n"
+        name = self.create()
+        self.assertEqual(name, self.name, "an unreachable cluster is still a scaffolded profile")
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertIn("203.0.113.5/32", self.stderr)
+        self.assertIn(ADMIT_REMEDY, self.stderr)
+        self.assertIn("dial tcp 203.0.113.10:443: i/o timeout", self.stderr)
+        self.assertNotIn("Client Version", self.stderr)
+
+    def test_the_connection_failure_pattern_matches_the_preflight_copy(self):
+        """cluster_preflight.sh keeps its own CONNECTIVITY_FAILURE_RE for check 5;
+        the two decide the same question and must stay one pattern."""
+        script = (Path(__file__).resolve().parent / "cluster_preflight.sh").read_text()
+        found = re.search(r"^readonly CONNECTIVITY_FAILURE_RE='([^']*)'$", script, re.MULTILINE)
+        self.assertTrue(found, "cluster_preflight.sh no longer declares CONNECTIVITY_FAILURE_RE")
+        self.assertEqual(found.group(1), cap.CONNECTIVITY_FAILURE_RE.pattern)
+        excluded = re.search(r"^readonly NOT_A_CONNECTION_FAILURE_RE='([^']*)'$", script, re.MULTILINE)
+        self.assertTrue(excluded, "cluster_preflight.sh no longer declares NOT_A_CONNECTION_FAILURE_RE")
+        self.assertEqual(excluded.group(1), cap.NOT_A_CONNECTION_FAILURE_RE.pattern)
+
+    def test_a_probe_refused_by_rbac_names_the_endpoint_but_not_the_remedy(self):
+        # A 403 is an IAM answer from a reachable control plane; sending the
+        # operator to authorized networks for it would be wrong.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = ('Error from server (Forbidden): forbidden: User "sa@x.iam.gserviceaccount.com" '
+                             'cannot get path "/version"\n')
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertIn("Forbidden", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
+
+    def test_a_certificate_failure_under_kubectls_generic_prefix_names_no_remedy(self):
+        # kubectl prefixes every transport failure with "Unable to connect to
+        # the server:", x509 and auth-plugin errors included; the list cannot
+        # fix those, so the prefix alone must not earn the remedy.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = ("Unable to connect to the server: x509: certificate signed by unknown authority\n")
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
+
+    def test_a_probe_the_shim_refused_names_no_remedy(self):
+        # "credential proxy unavailable" is the broker being down, not the
+        # cluster's list; the words "connection refused" inside it must not win.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = "credential proxy unavailable: [Errno 111] Connection refused\n"
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
+
+    def test_the_shim_exclusion_matches_the_shims_prefixes_and_not_a_mention(self):
+        # The shim's own messages start "credential proxy:" or "credential proxy
+        # unavailable"; preflight's cap text merely mentions "the credential
+        # proxy's admission wait" and is a real timeout.
+        for shim in ("credential proxy unavailable: [Errno 111] Connection refused",
+                     "credential proxy: kubeconfig is unreadable: /x: [Errno 13] Permission denied",
+                     "credential proxy token unavailable: no token file",
+                     "credential proxy error (HTTP 502): non-JSON response"):
+            self.assertTrue(cap.NOT_A_CONNECTION_FAILURE_RE.search(shim), shim)
+        self.assertFalse(cap.NOT_A_CONNECTION_FAILURE_RE.search(
+            "timed out after 95s, the preflight's cap on one brokered call (the credential proxy's 60s admission wait plus 30s)"))
+
+    def test_a_passing_probe_logs_nothing_about_the_endpoint(self):
+        self.decision = a_decision()
+        self.create()
+        self.assertNotIn("cannot reach", self.stderr)
+
+    def test_a_failed_probe_without_a_decision_still_names_the_failure(self):
+        self.decision = None
+        self.probe_exit = 1
+        self.probe_stderr = "Unable to connect to the server: dial tcp: i/o timeout\n"
+        self.create()
+        self.assertIn("cannot reach the cluster API server", self.stderr)
+        self.assertIn("i/o timeout", self.stderr)
+
+    def test_a_probe_that_times_out_does_not_fail_the_scaffold(self):
+        self.decision = a_decision()
+        original = self._fake_run
+
+        def hanging(cmd, **kwargs):
+            if cmd[:2] == ["kubectl", "version"]:
+                raise subprocess.TimeoutExpired(cmd, cap.CONNECTIVITY_PROBE_TIMEOUT_SECONDS)
+            return original(cmd, **kwargs)
+
+        self._patch(subprocess, "run", hanging)
+        self.assertEqual(self.create(), self.name)
+        self.assertIn("connectivity probe did not finish", self.stderr)
 
     def test_applies_the_cluster_class_overlay_at_scaffold_time(self):
         (self.overlay_dir / "profileclass-cluster.overlay.yaml").write_text(
@@ -458,6 +698,26 @@ class CreateProfileTest(unittest.TestCase):
             script,
             "user_md_field() changed; re-check the USER.md format written by create_profile",
         )
+
+    def test_stamps_target_cluster_identity_into_soul_md(self):
+        """SOUL.md is injected into the Cluster Agent system prompt on turn 1.
+        Stamping the target cluster identity there keeps the agent from spending
+        tool calls searching for USER.md when user_profile_enabled is false."""
+        (self.template / "SOUL.md").write_text(
+            "# Cluster Agent — Soul\n\n---\n\n## 1. Core Truths\n",
+            encoding="utf-8",
+        )
+        self.create()
+        soul = (self.profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("## Target Cluster Identity", soul)
+        self.assertIn(f"- project: {self.PROJECT}", soul)
+        self.assertIn(f"- cluster: {self.CLUSTER}", soul)
+        self.assertIn(f"- location: {self.LOCATION}", soul)
+        # Re-scaffolding is idempotent and does not duplicate the section.
+        self.create()
+        soul_again = (self.profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertEqual(soul_again.count("## Target Cluster Identity"), 1)
+        self.assertEqual(soul_again, soul)
 
 
     # --- telemetry ---
@@ -733,6 +993,57 @@ class ListReadyProfilesTest(unittest.TestCase):
         (p_dir / "config.yaml").mkdir()
         with self.assertRaises(OSError):
             cap.read_cluster_identity(p_dir)
+
+    def test_stamp_soul_identity_branches_and_cli_subcommand(self):
+        p = self.tmp / "cluster-soul"
+        p.mkdir()
+
+        # Missing SOUL.md is a safe no-op
+        cap._stamp_soul_identity(p, "proj-a", "clus-a", "us-central1")
+        self.assertFalse((p / "SOUL.md").exists())
+
+        # Branch 1: Anchor present -> inserts before SOUL_SECTION_1_ANCHOR
+        (p / "SOUL.md").write_text(
+            "# SOUL.md\n\nIntro paragraph.\n\n---\n\n## 1. Core Truths\n\n- Truth 1\n",
+            encoding="utf-8",
+        )
+        cap._stamp_soul_identity(p, "proj-a", "clus-a", "us-central1")
+        first = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            "---\n\n## Target Cluster Identity\n\n- project: proj-a\n- cluster: clus-a\n- location: us-central1\n\n---\n\n## 1. Core Truths",
+            first,
+        )
+
+        # Branch 2: Existing Target Cluster Identity block -> replaces in place without duplicating
+        cap._stamp_soul_identity(p, "proj-b", "clus-b", "europe-west1")
+        replaced = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertEqual(replaced.count("## Target Cluster Identity"), 1)
+        self.assertIn("- project: proj-b\n- cluster: clus-b\n- location: europe-west1\n", replaced)
+        self.assertNotIn("proj-a", replaced)
+
+        # Branch 3: Anchor missing and no existing block -> appends at the end
+        (p / "SOUL.md").write_text("# Custom SOUL without section 1 anchor\n", encoding="utf-8")
+        cap._stamp_soul_identity(p, "proj-c", "clus-c", "asia-east1")
+        appended = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertTrue(
+            appended.endswith(
+                "\n\n---\n\n## Target Cluster Identity\n\n- project: proj-c\n- cluster: clus-c\n- location: asia-east1\n"
+            )
+        )
+
+        # CLI subcommand `stamp-soul --profile-dir` reads config.yaml and stamps a fresh template SOUL.md
+        (p / "SOUL.md").write_text(
+            "# SOUL.md\n\n---\n\n## 1. Core Truths\n\n- Truth 1\n",
+            encoding="utf-8",
+        )
+        (p / "config.yaml").write_text(
+            "cluster_identity:\n  project: proj-cli\n  cluster: clus-cli\n  location: us-east1\n",
+            encoding="utf-8",
+        )
+        args = cap.build_parser().parse_args(["stamp-soul", "--profile-dir", str(p)])
+        cap.cmd_stamp_soul(args)
+        cli_stamped = (p / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("- project: proj-cli\n- cluster: clus-cli\n- location: us-east1\n", cli_stamped)
 
 
 if __name__ == "__main__":

@@ -203,7 +203,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 # A run narrowed on purpose -- `--project-id` or `MONITORED_PROJECT_IDS` --
@@ -1600,7 +1600,7 @@ def main(argv: list[str] | None = None) -> int:
         help="also write the manifest here; it goes to stdout either way",
     )
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     manifest = collect_fleet(args.project_id)
     text = json.dumps(manifest, indent=2)
     if args.output:

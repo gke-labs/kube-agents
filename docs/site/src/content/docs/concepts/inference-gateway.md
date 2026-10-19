@@ -9,14 +9,14 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 ## Choosing a provider
 
-| You want                                            | Use                                                    | Why                                                                                                                                      |
-| --------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastest path with a hosted frontier model           | **LiteLLM → Gemini** (default)                         | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                 |
-| Provider redundancy or A/B                          | **LiteLLM → Gemini + Anthropic + OpenAI**              | LiteLLM handles the router config; agent config is unchanged.                                                                            |
-| Inference billed to your own GCP project            | **LiteLLM → Vertex AI / Model Garden**                 | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                  |
-| Free local prototyping with a consumer subscription | **LiteLLM → ChatGPT subscription** (OAuth device flow) | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription). |
-| Data-locality or air-gapped inference               | **vLLM → Gemma / Llama / Qwen**                        | Runs on a GKE GPU node pool. Higher setup cost, no egress to a hosted provider.                                                          |
-| Deterministic demos / cheap tests                   | **Any of the above + inference-replay proxy**          | Caches responses in a PVC; replays on cache hit.                                                                                         |
+| You want                                            | Use                                                               | Why                                                                                                                                                               |
+| --------------------------------------------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastest path with a hosted frontier model           | **LiteLLM → Gemini** (default)                                    | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                                          |
+| Provider redundancy or A/B                          | **LiteLLM → Gemini + Anthropic + OpenAI**                         | LiteLLM handles the router config; agent config is unchanged.                                                                                                     |
+| Inference billed to your own GCP project            | **LiteLLM → Vertex AI / Model Garden**                            | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                                           |
+| Free local prototyping with a consumer subscription | **LiteLLM → ChatGPT subscription** (OAuth device flow)            | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).                          |
+| Model traffic kept off hosted model providers       | **LiteLLM → your OpenAI-compatible server** (`openai_compatible`) | vLLM, TGI or an internal gateway, in the cluster or on your network. Google APIs stay required. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
+| Deterministic demos / cheap tests                   | **Any of the above + inference-replay proxy**                     | Caches responses in a PVC; replays on cache hit.                                                                                                                  |
 
 ## LiteLLM (hosted models)
 
@@ -44,12 +44,13 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `install.env` and carried into the chart values). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
-| ------------------ | ---------------------------- | ------------------------------------------ |
-| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
-| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                  |
-| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
-| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |
+| `MODEL_PROVIDER`    | Default `MODEL_DEFAULT_NAME` | Notes                                                                                                                                 |
+| ------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `gemini` (default)  | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                                                                                                                |
+| `anthropic`         | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                                                                                                             |
+| `openai`            | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                                                                                                                |
+| `vertex_ai`         | `gemini-3.5-flash`           | No API key — Workload Identity. See below.                                                                                            |
+| `openai_compatible` | none; required               | Optional `OPENAI_COMPATIBLE_API_KEY`. The base URL is required too. See [below](#openai-compatible-endpoints-self-hosted-or-private). |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
@@ -82,6 +83,24 @@ The chart is the only path that renders it: the kustomize dev copy above (`make 
 At the default of `0` nothing is rendered and the gateway config is what it was. The hosted providers above need no value: the agent's requests carry their own `max_tokens`, and a provider with its own output limit answers a value above it with an error rather than a truncated reply. A self-hosted backend such as vLLM, SGLang, TGI or llama.cpp admits a request only if the prompt and `max_tokens` together fit its served window, so a request that asks for more output than the window holds is refused before the model runs. Set the value below that window, leaving the prompt the room it needs.
 
 The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. The agent image pinned today (Hermes `v2026.9.14`) does not send `max_tokens` on agent turns, so this value is the one the agent's requests get, the same as a direct call to the gateway's `/v1/chat/completions` that omits the field. Images built on `v2026.8.19` and earlier sent their own `max_tokens` on every request; on those the client's value won for agent turns and only a request that omitted the field took the configured one.
+
+### Setting the reasoning effort
+
+`litellm.reasoningEffort` is the reasoning effort the gateway asks the model for on a request that names none: `low`, `medium` or `high`. The chart renders it as `reasoning_effort` under every `model_list` alias. With `litellm.modelProvider=vertex_ai` and `litellm.reasoningEffort=high` the first alias reads:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: vertex_ai/gemini-3.5-flash
+      reasoning_effort: "high"
+```
+
+LiteLLM translates the value for each provider. On Gemini 3.x, through `gemini` or `vertex_ai`, it becomes `thinkingConfig.thinkingLevel` on the request to Google. On Claude it becomes adaptive thinking with that effort, and OpenAI and `openai_compatible` servers receive `reasoning_effort` as written. A model that LiteLLM does not treat as a reasoning model, such as `gemini-2.0-flash`, fails every request with `UnsupportedParamsError`, so leave the value empty for one.
+
+At the default, empty, nothing is rendered: the gateway config and its checksum are what they were, and the model thinks at its own default level. The value is a default the gateway supplies, the same as `max_tokens` above: LiteLLM lets a request's own `reasoning_effort` win over the one in `litellm_params`.
+
+The chart is the only path that renders it. The kustomize dev copy carries no `reasoning_effort`, and neither `install.env` nor the Terraform example has a variable for it. Set it through the Terraform example's `extra_helm_values` (`{ litellm = { reasoningEffort = "high" } }`) or with `--set litellm.reasoningEffort=high` on a direct Helm install.
 
 ### Prompt caching
 
@@ -177,15 +196,104 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 A re-run against an existing install reconciles the switch in one `terraform apply` — the gateway's IAM pair, its KSA, and the rolled ConfigMap land together.
 
+## OpenAI-compatible endpoints (self-hosted or private)
+
+`MODEL_PROVIDER=openai_compatible` routes `model-default` to any server that speaks the OpenAI chat-completions API: vLLM, TGI or an internal gateway, in the cluster or on your own network. LiteLLM stays in front of it, so the agent and Hindsight keep calling `inference-gateway` and their config does not change. The provider has no defaults. The model name and the server's base URL are both required, and the render fails without either.
+
+In the chart values:
+
+```yaml
+litellm:
+  modelProvider: openai_compatible
+  modelDefaultName: google/gemma-3-27b-it # the model name the server serves
+  openaiCompatible:
+    apiBase: http://llm-service.models.svc.cluster.local/v1
+    targetPort: 8000
+```
+
+`apiBase` is the server's base URL with its `/v1` path, `http://` or `https://`. `modelDefaultName` is the name the server answers to; vLLM serves the model it loaded under its Hugging Face ID unless it was started with `--served-model-name`.
+
+`install.sh` and the Terraform example carry the same settings. The installer checks them against the chart's rules before it creates anything, and its interactive provider menu and the `--menu` panel offer the provider as a fifth entry:
+
+| `install.env` key                  | Flag                                 | Chart value                                                                    |
+| ---------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------ |
+| `OPENAI_COMPATIBLE_API_BASE`       | `--openai-compatible-api-base`       | `litellm.openaiCompatible.apiBase`                                             |
+| `OPENAI_COMPATIBLE_TARGET_PORT`    | `--openai-compatible-target-port`    | `litellm.openaiCompatible.targetPort`                                          |
+| `OPENAI_COMPATIBLE_EGRESS_CIDRS`   | `--openai-compatible-egress-cidrs`   | `litellm.openaiCompatible.egressCIDRs` (comma-separated in the installer)      |
+| `OPENAI_COMPATIBLE_CA_SECRET_NAME` | `--openai-compatible-ca-secret-name` | `litellm.openaiCompatible.caBundleSecretRef.name` (the key is always `ca.crt`) |
+| `OPENAI_COMPATIBLE_API_KEY`        | `--openai-compatible-api-key`        | key `OPENAI_COMPATIBLE_API_KEY` in `platform-agent-secrets`                    |
+
+The Terraform example's variables are the same names in lower case (`openai_compatible_api_base` and so on), with `model_provider = "openai_compatible"` and `model_default_name`. The install above, through the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --model-provider=openai_compatible \
+  --model-default-name=google/gemma-3-27b-it \
+  --openai-compatible-api-base=http://llm-service.models.svc.cluster.local/v1 \
+  --openai-compatible-target-port=8000
+```
+
+### The API key
+
+The key is optional. The gateway reads it from `OPENAI_COMPATIBLE_API_KEY` in the credentials Secret (`platform-agent-secrets`) and sends it as a bearer token. Without it, requests carry the placeholder `Bearer fake-api-key`, which a server that checks no key ignores. With this provider the gateway pod gets none of the Gemini, OpenAI or Anthropic keys, so no request to your server can carry one of them.
+
+### How the gateway calls the server
+
+Each alias renders as LiteLLM's `hosted_vllm` provider. Despite the name, that is LiteLLM's handler for any OpenAI-compatible server:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: hosted_vllm/google/gemma-3-27b-it
+      api_base: http://llm-service.models.svc.cluster.local/v1
+```
+
+LiteLLM's `openai/` handler would fit the API too, but it falls back to the `OPENAI_API_KEY` environment variable when an entry has no key, which either sends an OpenAI key to your server or fails every request, and it ignores a per-entry `ssl_verify`, so a private CA would have to replace the trust store for every provider at once. `hosted_vllm/` reads only `HOSTED_VLLM_API_KEY`, which the chart fills from the Secret key above, and honours `ssl_verify` on its own entries. It also strips `strict` from tool schemas and drops replayed reasoning content from earlier turns before the request leaves.
+
+The gateway pod also sets `LITELLM_LOCAL_MODEL_COST_MAP=True` for this provider, so LiteLLM uses the model-price table bundled in its image instead of fetching one from GitHub at startup.
+
+### A server behind a private CA
+
+`litellm.openaiCompatible.caBundleSecretRef` names a Secret in the release namespace that holds the PEM bundle signing the server's certificate (under `key`, default `ca.crt`). The chart mounts that key read-only into the gateway pod at `/etc/litellm/openai-compatible-ca/` and points `ssl_verify` on this provider's entries at it. The bundle replaces the public roots for those entries, so it must hold every CA the server's chain needs. Nothing else trusts it: no other entry, no other pod, and no global `SSL_CERT_FILE`. Through the installer, create the Secret first and pass its name:
+
+```bash
+kubectl create secret generic model-server-ca -n kubeagents-system --from-file=ca.crt=./ca.pem
+```
+
+### Egress to the server
+
+The gateway's NetworkPolicy (`litellm-policy`) allows DNS, HTTPS to public addresses, the metadata server and the telemetry collector, and none of the places a private server usually lives. The chart adds one egress rule, derived from `apiBase`:
+
+- **An in-cluster Service** (`<svc>`, `<svc>.<ns>.svc` or `<svc>.<ns>.svc.cluster.local`; a bare `<svc>` means the release namespace). A host with exactly two labels, such as `openrouter.ai`, is a hostname, not `<svc>.<ns>`, and follows the rules below; write an in-cluster Service as `<svc>.<ns>.svc`. The rule admits that namespace on `targetPort`, which is required in this form: NetworkPolicy matches traffic after the Service has translated it to the pod's port, so the Service port in the URL is not enough. The rule names the namespace, not the server's pods, so every pod in that namespace becomes reachable from the gateway on `targetPort`. Run the model server in a namespace of its own rather than the release namespace, which holds the agent and the gateway. If the server's namespace has its own ingress policy, that policy has to admit the gateway's namespace.
+- **A private address outside the cluster**, such as an internal load balancer or an on-premises server over Interconnect or VPN. List its ranges in `egressCIDRs`; the rule admits those CIDRs on the URL's port, or 443 for `https` and 80 for `http` when the URL names none. NetworkPolicy matches addresses and never DNS names, so a hostname needs the ranges it resolves to. Each entry is a CIDR no wider than `/12` (IPv4) or `/48` (IPv6), at most 50 of them, and a range that reaches link-local or metadata addresses (`169.254.0.0/16`, `fe80::/10`, the metadata server's `fd20:ce::/48`) is refused, as is an IPv4-mapped IPv6 block. `egressCIDRs` is ignored for an in-cluster Service.
+- **A public HTTPS endpoint on port 443** needs no rule: the gateway's existing 443 rule already reaches public addresses. A hostname on 443 that resolves to a private address does not ride that rule, because it excludes private ranges; give it `egressCIDRs`. The chart's static copy of that rule excludes `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`, and the operator's copy also excludes `100.64.0.0/10` and `169.254.0.0/16`.
+
+Any other URL with `egressCIDRs` empty fails the render with a message that names `litellm.openaiCompatible.egressCIDRs`.
+
+Use `https` for a server outside the cluster. Over `http`, prompts, which can carry cluster data, and `OPENAI_COMPATIBLE_API_KEY` cross the network unencrypted; the chart accepts it, and both `install.sh` and the chart's install notes (shown by `helm install` and `helm upgrade`) print a warning.
+
+On a default install the operator owns `litellm-policy`, so the chart hands the rule to it as the `kubeagents.x-k8s.io/litellm-upstream-egress` annotation on the `PlatformAgent` ([PlatformAgent CRD](/kube-agents/operator/platformagent-crd/#reconcile-behavior)). The operator checks the value again, and on an invalid one logs `Ignoring invalid annotation value` and adds no rule rather than failing the reconcile; if the gateway cannot reach the server, look there first. With the operator off, the chart's own copy of the policy carries the same rule.
+
+### Context window
+
+A self-hosted server refuses a request whose prompt and `max_tokens` do not fit its served window. Set `litellm.maxTokens` (`MODEL_MAX_TOKENS`) below that window and serve a window large enough for the agent's prompt; [Setting the output-token budget](#setting-the-output-token-budget) has the details.
+
+### What it does not cover
+
+- The kustomize dev copy (`make -C k8s-operator deploy-litellm`) does not carry the provider, and the admin console's provider catalog does not list it. Install through `install.sh`, the Terraform example or the chart.
+- The installer does not deploy a model server. The [vLLM example](#vllm-local-models) is one you apply yourself.
+- A self-hosted model does not make the install offline. The agent still needs Google APIs, and some of its tools reach the internet on their own. [Security and IAM](/kube-agents/reference/security-and-iam/#egress-when-model-data-must-stay-off-hosted-providers) lists each destination, which ones are required, and how to turn off the rest. A fully disconnected cluster is not supported.
+
 ## vLLM (local models)
 
 [vLLM](https://vllm.ai) serves open models with continuous batching, chunked prefill, and prefix caching for high throughput on GPU node pools.
 
 ### What ships
 
-- [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) — Gemma via GKE's official inference tutorial. Requires an accelerator node pool (see `gke-compute-classes` skill).
+- [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) — Gemma 4 26B-A4B through vLLM's OpenAI-compatible server on two L4 GPUs, with a 128k-token context. Requires an accelerator node pool; the README gives the command. It runs in the release namespace, unlike the advice above; its README says what that means for the gateway's egress rule.
 
-vLLM speaks OpenAI-compatible Completions, so LiteLLM can be layered on top (or in front) for routing and observability.
+To put the gateway in front of it, point `litellm.openaiCompatible.apiBase` at its Service, as [OpenAI-compatible endpoints](#openai-compatible-endpoints-self-hosted-or-private) describes; the example's README gives the values.
 
 ## Inference replay
 

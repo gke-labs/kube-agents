@@ -159,7 +159,7 @@ admin_console/
     kubectl_local.py       transitional local-only transport
   clients/
     portal_api.py          typed client used by Streamlit
-  pages/                   Streamlit pages; API clients only
+  views/                   Streamlit pages; API clients only
 ```
 
 The central interface is `ChatService`, not FastAPI and not Streamlit. It owns:

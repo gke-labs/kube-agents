@@ -35,12 +35,12 @@ spec:
       resources: ["jobs", "cronjobs"]
   variables:
   - name: podSpec
-    # Pods carry spec; controllers carry spec.template.spec (CronJob nests one level deeper).
+    # Pods carry spec; controllers carry spec.template.spec; a CronJob has no spec.template
+    # and keeps its pod template at spec.jobTemplate.spec.template.spec, so test it first.
     expression: >-
-      has(object.spec.template) ?
-        (has(object.spec.template.spec) ? object.spec.template.spec :
-          object.spec.jobTemplate.spec.template.spec) :
-        object.spec
+      has(object.spec.jobTemplate) ? object.spec.jobTemplate.spec.template.spec :
+      has(object.spec.template) ? object.spec.template.spec :
+      object.spec
   - name: hasForbiddenNodeSelectorOrAffinity
     expression: >-
       (has(variables.podSpec.nodeSelector) &&

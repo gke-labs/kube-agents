@@ -162,8 +162,9 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`
-against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
+nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
@@ -696,6 +697,14 @@ on `main` is what finds a bad combination, as is the next smoke run that actuall
 Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.
+
+**A pull request on `main` can also carry `Smoke gate` and `Merge labels` statuses.** They
+are the gate checks of a GitHub merge queue that `main` does not use yet, posted by
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml), and each restates something Tide already
+decides: the smoke result (or that the change touches only paths the smoke skips), and the label
+query above. Nothing requires them. Because Tide holds on any posted context
+that is not green, each is posted only when it is green, and a green can go stale until the next
+event. `scripts/merge_gate.py` is the reference for what each one reads.
 
 **`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
 reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because

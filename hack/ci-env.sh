@@ -50,10 +50,47 @@ readonly HELM_DOWNLOAD_RETRIES=5
 # 2 MB per run; the byte cap is the belt for a log with long lines.
 readonly GATEWAY_LOG_TAIL_LINES=20000
 readonly GATEWAY_LOG_MAX_BYTES=$((8 * 1024 * 1024))
-# The failure dump's envoy tail. At 2000 lines a six-hour run came back
-# clipped to its last minutes, without the token failures the log is
-# collected for.
-readonly ENVOY_LOG_TAIL_LINES=20000
+
+# ─── Credential-proxy capture ────────────────────────────────────────────────
+# collect_credential_proxy_evidence keeps two artifacts of every eval run,
+# green ones included: the broker's log tail (envoy-credential-proxy.log, the
+# name the failure dump always used) and one scrape of its Prometheus
+# listener (credential-proxy-metrics.prom). The log used to be taken by the
+# failure dump alone, so a green run kept no record of the broker's admission
+# queue, and nothing in the job read the listener (the chart's PodMonitoring
+# and the operator's usage poller do, on an install that has them): the queue
+# a presubmit run built up was visible only on a run that also failed. The
+# scrape holds the
+# admission-wait histogram, the refusal counter and the slot and budget
+# gauges as the run left them. Taken with `kubectl exec` into the broker
+# container rather than through a port-forward: the listener binds the
+# container's own port, which the collector's pod network does not reach
+# without a tunnel, and the container's python reads the port from the env
+# the operator sets (CREDENTIAL_PROXY_METRICS_PORT), so no copy of it lives
+# here. Bounded like the gateway log: kubectl's line tail (at 2000 lines a
+# six-hour run came back clipped to its last minutes), then a byte cap. The
+# exec is bounded by `timeout` where the runner has one: kubectl's
+# --request-timeout governs plain API calls and not the exec upgrade, so a
+# wedged node tunnel would otherwise hold the EXIT trap.
+readonly CREDENTIAL_PROXY_LOG_TAIL_LINES=20000
+readonly CREDENTIAL_PROXY_LOG_MAX_BYTES=$((8 * 1024 * 1024))
+readonly CREDENTIAL_PROXY_LOG_ARTIFACT="envoy-credential-proxy.log"
+readonly CREDENTIAL_PROXY_METRICS_ARTIFACT="credential-proxy-metrics.prom"
+readonly CREDENTIAL_PROXY_DEPLOYMENT="deployment/platform-agent-credential-proxy"
+readonly CREDENTIAL_PROXY_CONTAINER="envoy-credential-proxy"
+readonly CREDENTIAL_PROXY_REQUEST_TIMEOUT="20s"
+readonly CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS=30
+# timeout(1)'s own status for a command it had to stop. It prints nothing
+# when it does, and kubectl writes nothing on TERM, so the collector appends
+# the note the artifact would otherwise lack.
+readonly CREDENTIAL_PROXY_SCRAPE_TIMEOUT_STATUS=124
+# The scrape, run by the image's `python3` (the proxy image carries one for
+# the Cloud SDK; the broker's own venv interpreter is not on PATH and is not
+# needed, the program is stdlib only). One line, so a test that lifts the
+# readonly constants line by line gets all of it. A missing port variable or
+# a listener that is not up prints its error into the artifact, which then
+# says why it holds no series.
+readonly CREDENTIAL_PROXY_METRICS_SCRAPE='import os, sys, urllib.request; port = os.environ["CREDENTIAL_PROXY_METRICS_PORT"]; sys.stdout.write(urllib.request.urlopen("http://127.0.0.1:%s/metrics" % port, timeout=10).read().decode())'
 
 # ─── LiteLLM log capture ─────────────────────────────────────────────────────
 # collect_litellm_log keeps the inference gateway's log as an artifact of
@@ -203,7 +240,7 @@ ensure_helm() {
 # from a passing run -- exactly backwards for a rate-based gate, whose baseline
 # store is built from green runs on main. The copy is one `cp`, so there is no
 # reason to condition it; the expensive diagnostics (describe pods, gcloud
-# builds list, the controller, LiteLLM and Envoy tails) stay failure-only below.
+# builds list, the controller and auth-sidecar tails) stay failure-only below.
 #
 # Callers must invoke this BEFORE dump_prow_artifacts_on_failure: that function
 # reads `$?` on its first line, so anything running ahead of it must leave the
@@ -286,6 +323,51 @@ collect_litellm_log() {
   "${kctl[@]}" logs -l "${LITELLM_LOG_POD_SELECTOR}" -c "${LITELLM_LOG_CONTAINER}" -n "${ns}" \
     --prefix --ignore-errors --tail="${LITELLM_LOG_TAIL_LINES}" 2>&1 \
     | tail -c "${LITELLM_LOG_MAX_BYTES}" > "${log}" || true
+}
+
+# ─── Credential-proxy evidence (runs on PASS as well as on failure) ──────────
+# The CREDENTIAL_PROXY_ constants above say what and why. Same contract as
+# collect_gateway_log: every command ends in `|| true`, so `$?` is left for
+# the dumper; pinned to AGENT_CLUSTER_CONTEXT for the same reason; once per
+# process, so the eval's capture is the one kept when the trap or the failure
+# dumper calls again after a round trip replaced the pod. An install without
+# the Deployment is a note, not a failure: the note is the log artifact's
+# content, so the file says why it holds nothing, and no scrape is attempted.
+CREDENTIAL_PROXY_EVIDENCE_COLLECTED=""
+collect_credential_proxy_evidence() {
+  [ -z "${CREDENTIAL_PROXY_EVIDENCE_COLLECTED:-}" ] || return 0
+  CREDENTIAL_PROXY_EVIDENCE_COLLECTED=1
+  local artifact_dir="${ARTIFACTS:-/tmp/artifacts}"
+  local ns="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}"
+  local log="${artifact_dir}/${CREDENTIAL_PROXY_LOG_ARTIFACT}"
+  local metrics="${artifact_dir}/${CREDENTIAL_PROXY_METRICS_ARTIFACT}"
+  local kctl=(kubectl)
+  if [ -n "${AGENT_CLUSTER_CONTEXT:-}" ]; then
+    kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
+  fi
+  mkdir -p "${artifact_dir}" || true
+  local found=""
+  if ! found=$("${kctl[@]}" get "${CREDENTIAL_PROXY_DEPLOYMENT}" -n "${ns}" -o name \
+    --request-timeout="${CREDENTIAL_PROXY_REQUEST_TIMEOUT}" 2>&1); then
+    echo "note: no credential-proxy evidence for this run: ${CREDENTIAL_PROXY_DEPLOYMENT} in ${ns} could not be read: ${found//$'\n'/ }" \
+      | tee "${log}" || true
+    return 0
+  fi
+  "${kctl[@]}" logs "${CREDENTIAL_PROXY_DEPLOYMENT}" -c "${CREDENTIAL_PROXY_CONTAINER}" -n "${ns}" \
+    --tail="${CREDENTIAL_PROXY_LOG_TAIL_LINES}" 2>&1 \
+    | tail -c "${CREDENTIAL_PROXY_LOG_MAX_BYTES}" > "${log}" || true
+  local bound=(timeout --foreground "${CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  local scrape_status=0
+  ${bound[@]+"${bound[@]}"} "${kctl[@]}" exec "${CREDENTIAL_PROXY_DEPLOYMENT}" -c "${CREDENTIAL_PROXY_CONTAINER}" -n "${ns}" -- \
+    python3 -c "${CREDENTIAL_PROXY_METRICS_SCRAPE}" > "${metrics}" 2>&1 || scrape_status=$?
+  # A scrape that did not complete leaves whatever reached the file, often
+  # nothing; the note says so, and names the bound when that is what ended it.
+  if [ "${scrape_status}" -ne 0 ]; then
+    local why="exited ${scrape_status}"
+    [ "${scrape_status}" -eq "${CREDENTIAL_PROXY_SCRAPE_TIMEOUT_STATUS}" ] && why="timed out after ${CREDENTIAL_PROXY_SCRAPE_BOUND_SECONDS}s"
+    echo "note: the metrics scrape ${why}; the series above, if any, are what reached this file before that" >> "${metrics}" || true
+  fi
 }
 
 # ─── Agent Pod Watch (the eval's lifetime) ───────────────────────────────────
@@ -536,7 +618,10 @@ dump_prow_artifacts_on_failure() {
     # The gateway capture above reads the pod's default container (platform-agent);
     # a dropped port-forward stream is only visible from the auth sidecar's side.
     kubectl logs deployment/platform-agent-gateway -c agent-api-auth -n "${ns}" --tail=2000 > "${artifact_dir}/agent-api-auth.log" 2>&1 || true
-    kubectl logs deployment/platform-agent-credential-proxy -c envoy-credential-proxy -n "${ns}" --tail="${ENVOY_LOG_TAIL_LINES}" > "${artifact_dir}/envoy-credential-proxy.log" 2>&1 || true
+    # The broker's log and one metrics scrape: the every-run collector, called
+    # here for the same reason as the three above; a process that already
+    # took them keeps that capture.
+    collect_credential_proxy_evidence
     # Konnectivity/tunnel churn shows up as kube-system events, not in "${ns}".
     kubectl get events -n kube-system --sort-by=.lastTimestamp 2>&1 | tail -100 > "${artifact_dir}/kube-system-events.txt" 2>&1 || true
 

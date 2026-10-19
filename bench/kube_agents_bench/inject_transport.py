@@ -206,9 +206,9 @@ ENTRY_STATUS_DONE = "completed"
 # capability -- this record could have shown a tool call -- apart from
 # whether the persona made one, and it is the presence of the marker, not
 # of a call, that retires the scorer's not-applicable rule for checks that
-# read tool calls (``scoring._inject_blind``); the scorer duplicates the
-# literal like the status entry's, and ``test_scoring.py`` asserts the two
-# agree.
+# read the router's calls and not their results (``scoring._inject_blind``); the
+# scorer duplicates the literal like the status entry's, and
+# ``test_scoring.py`` asserts the two agree.
 EVENT_ENTRY_ACTIVITY = "a2a.activity"
 # The probe body's three keys for the trace (``probeReport`` in
 # ``a2a/gateway/inject.go``).

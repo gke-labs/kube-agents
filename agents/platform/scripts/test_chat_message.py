@@ -19,6 +19,12 @@ import slack_presenter as sp
 
 #: The Go port's shared cases (a2a/hermes-bridge/chat.go), whose expected values are this module's.
 BRIDGE_CASES = Path(__file__).resolve().parents[3] / "a2a" / "hermes-bridge" / "testdata" / "chat_cases.json"
+CHAT_CASES = Path(__file__).resolve().parents[3] / "tests" / "conformance" / "chat"
+
+
+def _case(name):
+    """A shared case from tests/conformance/chat/, whose input is the fixture these tests read."""
+    return json.loads((CHAT_CASES / f"{name}.json").read_text(encoding="utf-8"))
 
 
 def _row(task_id, status, **kw):
@@ -57,7 +63,11 @@ class BridgeCasesTest(unittest.TestCase):
         for case in cases["ask_kind"]:
             with self.subTest(ask=case["in"]):
                 self.assertEqual(cm.ask_kind(case["in"]), case["kind"])
+        for case in cases["answer_chat"]:
+            with self.subTest(answer=case["in"][:40]):
+                self.assertEqual(cm.answer_message(case["in"]), case["chat"])
         self.assertGreater(len(cases["split_answer"]), 0)
+        self.assertGreater(len(cases["answer_chat"]), 0)
 
 
 class CommandWordTest(unittest.TestCase):
@@ -84,6 +94,37 @@ class AnswerTest(unittest.TestCase):
         self.assertEqual(cm.answer_message(f"Yes. {long}")["fold"], {"title": "why", "text": long})
         self.assertIsNone(cm.answer_message("Yes. X" + "x" * cm.FOLD_TEXT_MAX))
         self.assertIsNone(cm.answer_message("```\nkubectl get pods\n```"))
+
+    def test_an_answer_asking_which_option_offers_them(self):
+        """The payments-api answer: options as choices, the explanation under why, the question in sight."""
+        chat = cm.answer_message(_case("answer-offers-its-options")["input"]["markdown"])
+        self.assertEqual(chat["headline"], "The payments-api workload is CrashLooping.")
+        self.assertEqual(
+            chat["choices"],
+            [{"text": "Fix the command", "primary": True}, {"text": "Increase the memory limit"},
+             {"text": "Change the workload image and logic"}],
+        )
+        self.assertTrue(chat["detail"].startswith("Due to an OOMKill (exit code 137)"))
+        self.assertTrue(chat["detail"].endswith("Which of these options would you like to proceed with?"))
+        self.assertIn("1. **Fix the command** — If the container's purpose", chat["detail"])
+        self.assertNotIn("## Root Cause", chat["detail"])
+        self.assertEqual(chat["fold"]["title"], "why")
+        self.assertTrue(chat["fold"]["text"].startswith("## Root Cause"))
+        self.assertIn("## Evidence", chat["fold"]["text"])
+        self.assertIn("`sleep infinity`", chat["fold"]["text"], "the options' full text stays under why")
+
+    def test_choices_the_gateway_would_read_as_commands_keep_the_plain_layout(self):
+        chat = cm.answer_message("Two ways.\n\n1. **stop**\n2. **Keep going**\n\nWhich do you want?")
+        self.assertNotIn("choices", chat)
+        self.assertEqual(chat["detail"], "1. **stop**\n2. **Keep going**\n\nWhich do you want?")
+
+    def test_a_detail_keeps_its_markdown(self):
+        md = _case("answer-markdown-detail")["input"]["markdown"]
+        chat = cm.answer_message(md)
+        self.assertEqual(chat["headline"], "checkout-gateway restarts on an OOM.")
+        self.assertIn("## Evidence\n- Last state:", chat["detail"])
+        self.assertIn("  ```yaml\n", chat["detail"])
+        self.assertNotIn("choices", chat)
 
 
 class PlanTest(unittest.TestCase):

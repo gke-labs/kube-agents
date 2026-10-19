@@ -121,7 +121,7 @@ LIST_FIELDS = ("findings", "workloads")
 # Recorded as the ranking card when no cluster was audited and none was filed.
 NO_RANKING = "none"
 GAPS_HEADING = "## Gaps"
-# The no-coverage report goes to chat verbatim; the rest stay in the raw file.
+# The no-coverage report goes to chat as written; the rest stay in the raw file.
 MAX_REPORT_GAPS = 10
 # Placeholders a Cluster Agent writes where a field names more than one object.
 NOT_AN_OBJECT = ("", "multiple", "multiple workloads", "various", "n/a", "none")
@@ -161,7 +161,7 @@ def _read_marker(path: Path) -> dict[str, str]:
 def read_scan_marker(marker: Path, now: float | None = None) -> tuple[str, float] | None:
     """The sweep card's id and when it was filed, from the gate's marker; None without an id.
 
-    The one reader of this marker, for the hand-off and the oobe stage alike. A ``filed_at`` that
+    The one reader of its id and time, for the hand-off and the oobe stage alike. A ``filed_at`` that
     is missing, hand-written, truncated or not epoch seconds (milliseconds, nan, inf) would stop
     every clock that counts from it, so the marker's own age stands in.
     """
@@ -295,6 +295,15 @@ def _provider_managed(namespace: str) -> bool:
     return namespace in PROVIDER_NAMESPACES or namespace.startswith(PROVIDER_NAMESPACE_PREFIXES)
 
 
+def _names_an_object(value: str) -> bool:
+    """Whether a finding's workload or namespace field names one object.
+
+    A placeholder word, or a value with no letter or digit in it ("-", "—"), names none: written as
+    the object, it would give the finding an id the ranking stage refuses.
+    """
+    return value.lower() not in NOT_AN_OBJECT and any(ch.isalnum() for ch in value)
+
+
 def finding_lines(meta: dict) -> list[dict]:
     """The ```findings block lines for one cluster's audit ``metadata``.
 
@@ -315,8 +324,8 @@ def finding_lines(meta: dict) -> list[dict]:
             continue
         workload = _text(finding.get("workload"))
         namespace = _text(finding.get("namespace"))
-        scoped = namespace.lower() not in NOT_AN_OBJECT
-        named = workload.lower() not in NOT_AN_OBJECT
+        scoped = _names_an_object(namespace)
+        named = _names_an_object(workload)
         if named:
             obj = workload
         elif scoped:
@@ -485,14 +494,19 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         gaps.append(f"the hand-off stopped waiting {deadline(state) // SECONDS_PER_MINUTE} minutes after the sweep was filed")
 
     stamp = time.strftime(STAMP_FORMAT, time.gmtime(now if now is not None else time.time()))
+    owned = (
+        "Liveness and readiness probes, requests and limits, HPA, NetworkPolicy and pod security are not "
+        "checked by this scan: the first-run audits own them."
+    )
     out = [
         "# GKE Environment Discovery Report — raw findings",
         "",
         (
             f"First-time environment scan, compiled at {stamp} from the per-cluster audit cards of "
             f"sweep `{sweep['id']}`. It carries every entry the audits filed under `findings`, and the delivered "
-            "report is ranked from those alone; a condition an audit recorded only in a structured field (HPA, "
-            "security context, namespace governance, node autoscaling) is not carried forward."
+            "report is ranked from those alone; a condition an audit recorded only in a structured field (startup "
+            "probe, read-only root filesystem, namespace governance, node autoscaling) is not carried forward. "
+            f"{owned}"
         ),
         "",
         "## Coverage",
@@ -535,22 +549,22 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
         "",
         "## Workloads Inventory",
         "",
-        ("| Cluster | Namespace | Workload Name | Kind | Replicas | Probes (Live/Ready/Startup) "
-        "| Requests/Limits/QoS | Telemetry | NonRoot/ReadOnlyFS/Privileged |"),
-        ("| :------ | :-------- | :------------ | :--- | :------- | :-------------------------- "
-        "| :------------------ | :-------- | :---------------------------- |"),
+    ]
+    out += [
+        "| Cluster | Namespace | Workload Name | Kind | Replicas | Startup Probe | Telemetry | ReadOnlyFS |",
+        "| :------ | :-------- | :------------ | :--- | :------- | :------------ | :-------- | :--------- |",
     ]
     for meta, _ in audits:
         for w in _list(meta.get("workloads")):
             if not isinstance(w, dict):
                 continue
-            out.append(
-                f"| {_cell(meta.get('cluster'))} | {_cell(w.get('namespace'))} | {_cell(w.get('name'))} "
-                f"| {_cell(w.get('kind'))} | {_cell(w.get('replicas'))} "
-                f"| {_flag(w.get('probes'), 'liveness', 'readiness', 'startup')} "
-                f"| {_flag(w.get('resources'), 'requests', 'limits', 'qos')} | {_cell(w.get('telemetry'))} "
-                f"| {_flag(w.get('security_context'), 'run_as_non_root', 'read_only_root_fs', 'privileged')} |"
+            row = f"| {_cell(meta.get('cluster'))} | {_cell(w.get('namespace'))} | {_cell(w.get('name'))} "
+            row += f"| {_cell(w.get('kind'))} | {_cell(w.get('replicas'))} "
+            row += (
+                f"| {_flag(w.get('probes'), 'startup')} | {_cell(w.get('telemetry'))} "
+                f"| {_flag(w.get('security_context'), 'read_only_root_fs')} |"
             )
+            out.append(row)
     lines: list[dict] = []
     out += ["", "## Prioritized SRE Remediation Plan", ""]
     by_area: dict[str, list[str]] = {}
@@ -675,7 +689,8 @@ def _prioritize_body() -> str:
         "Rank the onboarding inventory into the report the user receives. Follow the prioritization "
         f"SOP, reading whichever of these exists:\n{paths}\n\n"
         f"Your only input is `{RAW_PATH}`; write the ranked report to `{REPORT_PATH}`. A separate "
-        "delivery job posts that file to the user with no further model editing: verbatim, or on "
+        "delivery job posts that file to the user with no further model editing: as written, followed by a "
+        "short note on the first-run audits, or on "
         "Slack laid out again by a fixed script. Do not message the user yourself."
     )
 

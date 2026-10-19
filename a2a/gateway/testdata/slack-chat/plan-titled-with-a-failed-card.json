@@ -4,51 +4,45 @@
     "carrier": "notify",
     "blocks": [
       {
-        "tasks": [
-          {
-            "details": {
+        "details": {
+          "elements": [
+            {
               "elements": [
                 {
                   "elements": [
                     {
-                      "elements": [
-                        {
-                          "text": "✓ a",
-                          "type": "text"
-                        }
-                      ],
-                      "type": "rich_text_section"
-                    },
-                    {
-                      "elements": [
-                        {
-                          "text": "◌ b",
-                          "type": "text"
-                        }
-                      ],
-                      "type": "rich_text_section"
+                      "text": "✓ a",
+                      "type": "text"
                     }
                   ],
-                  "style": "bullet",
-                  "type": "rich_text_list"
+                  "type": "rich_text_section"
+                },
+                {
+                  "elements": [
+                    {
+                      "text": "◌ b",
+                      "type": "text"
+                    }
+                  ],
+                  "type": "rich_text_section"
                 }
               ],
-              "type": "rich_text"
-            },
-            "status": "in_progress",
-            "task_id": "t_a",
-            "title": "check payments · b · step 2 ▸",
-            "type": "task_card"
-          },
-          {
-            "status": "error",
-            "task_id": "t_b",
-            "title": "check seeded-b",
-            "type": "task_card"
-          }
-        ],
-        "title": "is it up?",
-        "type": "plan"
+              "style": "bullet",
+              "type": "rich_text_list"
+            }
+          ],
+          "type": "rich_text"
+        },
+        "status": "in_progress",
+        "task_id": "t_a",
+        "title": "check payments · b · step 2 ▸",
+        "type": "task_card"
+      },
+      {
+        "status": "error",
+        "task_id": "t_b",
+        "title": "check seeded-b",
+        "type": "task_card"
       }
     ],
     "attachments": []

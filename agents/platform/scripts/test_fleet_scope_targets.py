@@ -323,6 +323,43 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
             self.assertIsNone(fst.declared_scope_targets(), "HERMES_HOME must not be the key: on the pod it names the profile home")
         self.assertEqual(fst.snapshot_path("/elsewhere"), pathlib.Path("/elsewhere") / fst.SNAPSHOT_FILE)
 
+    # spec.scope.exclude.clusters rides to the collectors (#3081).
+    EXCLUDE_CLUSTERS = {"projects": [], "clusters": [
+        {"projectId": "payments-prod", "location": "us-central1", "clusterName": "lane-b"},
+        {"projectId": "ops-mgmt", "location": "us-east1-b", "clusterName": "kyber-test"},
+    ]}
+    EXCLUDE_ROWS = [{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"},
+            {"id": "payments-prod", "via": ["explicit"], "outcome": "ok", "state": "in-scope"}]
+
+    def test_the_snapshot_declaration_hands_the_excluded_clusters_on(self):
+        self._write(_snapshot(self.EXCLUDE_ROWS, declared=dict(DECLARED, exclude=self.EXCLUDE_CLUSTERS), present=True))
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(targets.excluded_clusters, (("ops-mgmt", "us-east1-b", "kyber-test"), ("payments-prod", "us-central1", "lane-b")))
+        self.assertEqual(
+            targets.collector_args(),
+            "--scope-projects ops-mgmt,payments-prod --scope-exclude-clusters ops-mgmt/us-east1-b/kyber-test,payments-prod/us-central1/lane-b",
+        )
+
+    def test_the_render_answer_hands_the_excluded_clusters_on(self):
+        render = self.home / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": [], "exclude": self.EXCLUDE_CLUSTERS}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(len(targets.excluded_clusters), 2)
+        self.assertIn("--scope-exclude-clusters ops-mgmt/us-east1-b/kyber-test,payments-prod/us-central1/lane-b", targets.collector_args())
+
+    def test_an_entry_admission_would_refuse_is_skipped_so_the_args_still_parse(self):
+        exclude = {"clusters": [*self.EXCLUDE_CLUSTERS["clusters"], {"projectId": "p", "location": "x/y", "clusterName": "c"},
+                                {"projectId": "p", "location": "l"}, "not-a-dict"]}
+        self._write(_snapshot(self.EXCLUDE_ROWS, declared=dict(DECLARED, exclude=exclude), present=True))
+        targets = fst.declared_scope_targets(self.home)
+        self.assertEqual(len(targets.excluded_clusters), 2)
+        fst.fleet_scope_args.parse_scope_exclude_clusters(targets.collector_args().split("--scope-exclude-clusters ")[1])
+
+    def test_no_exclusion_adds_no_flag(self):
+        self._write(_snapshot(self.EXCLUDE_ROWS, present=True))
+        self.assertNotIn("--scope-exclude-clusters", fst.declared_scope_targets(self.home).collector_args())
+
 
 if __name__ == "__main__":
     unittest.main()

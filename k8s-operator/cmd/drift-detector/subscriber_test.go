@@ -22,6 +22,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +31,8 @@ import (
 
 	"google.golang.org/api/option"
 	"google.golang.org/api/pubsub/v1"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
 
 // syncBuffer collects log output written from the goroutine running Run while
@@ -799,6 +803,87 @@ func TestPubsubSourceAckDeadlineReportsTheSubscriptionOnError(t *testing.T) {
 		t.Fatal("AckDeadline returned no error on a 403; the preflight would report a zero deadline as a real one")
 	} else if !strings.Contains(err.Error(), subscriptionID) {
 		t.Errorf("error %q does not name %s", err, subscriptionID)
+	}
+}
+
+// With the credential proxy named in the environment, newPubsubSource sends all
+// four calls to the proxy's Pub/Sub route -- the URL the generated client
+// builds from the endpoint the proxy contract names -- with the projected
+// token, re-read after rotation, and never consults Application Default
+// Credentials (pointed at a missing file here, so a fall back would fail).
+func TestNewPubsubSourceThroughTheBroker(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.Method+" "+r.URL.Path+" "+r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, ":pull"):
+			fmt.Fprint(w, `{"receivedMessages":[{"ackId":"a1","message":{"messageId":"m1","data":"aGk="}}]}`)
+		case r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"name":"projects/p/subscriptions/s","ackDeadlineSeconds":60}`)
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte("token-1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+	t.Setenv(clusterprofiles.BrokerURLEnv, srv.URL)
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, tokenFile)
+
+	ctx := context.Background()
+	source, err := newPubsubSource(ctx, "p", "s")
+	if err != nil {
+		t.Fatalf("newPubsubSource: %v", err)
+	}
+	if _, err := source.AckDeadline(ctx); err != nil {
+		t.Fatalf("AckDeadline: %v", err)
+	}
+	msgs, err := source.Pull(ctx, 10)
+	if err != nil || len(msgs) != 1 || string(msgs[0].Data) != "hi" {
+		t.Fatalf("Pull = %+v, %v; want one message \"hi\"", msgs, err)
+	}
+	if err := os.WriteFile(tokenFile, []byte("token-2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Ack(ctx, []string{"a1"}); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if err := source.Nack(ctx, []string{"a1"}); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+
+	const base = "/v1/watcher/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s"
+	want := []string{
+		"GET " + base + " Bearer token-1",
+		"POST " + base + ":pull Bearer token-1",
+		"POST " + base + ":acknowledge Bearer token-2",
+		"POST " + base + ":modifyAckDeadline Bearer token-2",
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(calls, "\n") != strings.Join(want, "\n") {
+		t.Errorf("calls:\n%s\nwant:\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// Half the pair is a broken install, not a reason to fall back to the pod's own
+// Google identity.
+func TestNewPubsubSourceRefusesHalfABroker(t *testing.T) {
+	t.Setenv(clusterprofiles.BrokerURLEnv, "http://proxy.example.invalid:8765")
+	t.Setenv(clusterprofiles.BrokerTokenFileEnv, "")
+	if _, err := newPubsubSource(context.Background(), "p", "s"); err == nil ||
+		!strings.Contains(err.Error(), clusterprofiles.BrokerTokenFileEnv) {
+		t.Errorf("newPubsubSource error = %v, want one naming %s", err, clusterprofiles.BrokerTokenFileEnv)
 	}
 }
 

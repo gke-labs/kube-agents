@@ -25,7 +25,7 @@ def require_connection() -> DeploymentTarget:
     if target is None:
         st.info("Connect a project and cluster on Connection.")
         st.page_link(
-            "pages/connections.py",
+            "views/connections.py",
             label="Open Connection",
             icon=":material/cable:",
         )

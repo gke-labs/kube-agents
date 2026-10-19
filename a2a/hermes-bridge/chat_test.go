@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nuid"
 
@@ -38,6 +39,10 @@ type chatCases struct {
 		In   string `json:"in"`
 		Kind string `json:"kind"`
 	} `json:"ask_kind"`
+	AnswerChat []struct {
+		In   string          `json:"in"`
+		Chat json.RawMessage `json:"chat"`
+	} `json:"answer_chat"`
 }
 
 func loadChatCases(t *testing.T) chatCases {
@@ -50,7 +55,7 @@ func loadChatCases(t *testing.T) chatCases {
 	if err := json.Unmarshal(raw, &cases); err != nil {
 		t.Fatal(err)
 	}
-	if len(cases.SplitAnswer) == 0 || len(cases.Plain) == 0 || len(cases.AskKind) == 0 {
+	if len(cases.SplitAnswer) == 0 || len(cases.Plain) == 0 || len(cases.AskKind) == 0 || len(cases.AnswerChat) == 0 {
 		t.Fatal("testdata/chat_cases.json has an empty section")
 	}
 	return cases
@@ -80,6 +85,24 @@ func TestAskKindMatchesThePresenter(t *testing.T) {
 	for _, c := range loadChatCases(t).AskKind {
 		if got := askKind(c.In); got != c.Kind {
 			t.Errorf("askKind(%q) = %q, want %q", c.In, got, c.Kind)
+		}
+	}
+}
+
+// The whole answer layout, the clause cut and the options as choices
+// included, is chat_message.answer_message's: null where it posts text.
+func TestAnswerChatMatchesThePresenter(t *testing.T) {
+	for _, c := range loadChatCases(t).AnswerChat {
+		msg, ok := answerChat(c.In)
+		got := []byte("null")
+		if ok {
+			var err error
+			if got, err = json.Marshal(msg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !sameChat(t, lib.Part{Data: got}, c.Chat) {
+			t.Errorf("answerChat(%.60q) = %s\nwant %s", c.In, got, c.Chat)
 		}
 	}
 }
@@ -337,6 +360,129 @@ func TestAPI_ATurnThatFiledCardsKeepsItsAsk(t *testing.T) {
 	}
 }
 
+// A turn that filed kanban cards with its route recorded publishes the
+// handoff artifact ahead of its terminal on a Google Chat conversation, where
+// the terminal's cards mark never fires (cardsSettleTheAsk is Slack with
+// KAGE_SLACK_UX on), so a delegating session hears that the work went to a
+// card rather than reading "on it" as the answer (#3258). No card filed, a
+// failed kanban_create or an unrecorded route: none.
+func TestAPI_ATurnThatFiledCardsPublishesTheHandoff(t *testing.T) {
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct {
+		name, prompt string
+		storeStatus  int
+		want         bool
+	}{
+		{"filed", "diagnose the pod restarts in crash-ns; fan out", http.StatusOK, true},
+		{"failed-call", "diagnose the pod restarts in crash-ns; broken", http.StatusOK, false},
+		{"direct", "is checkout-gateway restarting in seeded-a?", http.StatusOK, false},
+		{"route-refused", "diagnose the pod restarts in crash-ns; fan out", http.StatusBadRequest, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, tc.storeStatus)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				switch {
+				case strings.Contains(tc.prompt, "fan out"):
+					postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+					postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				case strings.Contains(tc.prompt, "broken"):
+					postDeliveryStatus(t, u, shared, c.sessionID, kanbanCreateTool, "call_1", ActivityStatusError)
+				}
+				writeCompletion(w, c.sessionID, "focusing on memory limits")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			submitFrom(t, c, "task-"+tc.name, "ctx-"+tc.name, "gchat:spaces/A/threads/B", tc.prompt)
+			task := waitTerminal(t, c, "task-"+tc.name)
+			if task.State != lib.StateCompleted {
+				t.Fatalf("state = %s, want completed", task.State)
+			}
+			art := task.Artifact(lib.ArtifactHandoff)
+			got := art != nil && len(art.Parts) == 1 && art.Parts[0].Text == lib.HandoffCards
+			if got != tc.want {
+				t.Fatalf("handoff artifact = %+v, want present=%v", art, tc.want)
+			}
+		})
+	}
+}
+
+// The handoff is task-wide, like the cards mark: turn 1 files a card and
+// acks, a queued follow-up answers directly as turn 2, and turn 1's card is
+// still going to report into the conversation, so the terminal still carries
+// the handoff. On Slack with KAGE_SLACK_UX on the mark says the same.
+func TestAPI_AFollowUpAfterACardStillReportsTheHandoff(t *testing.T) {
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	_, url := startServer(t)
+	store := newRouteStore(t, http.StatusOK)
+	release := make(chan struct{})
+	var door atomic.Value
+	var turns atomic.Int32
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if turns.Add(1) == 1 {
+			u := door.Load().(string)
+			postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+			postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+			<-release
+			writeCompletion(w, c.sessionID, "on it: a card is checking")
+			return
+		}
+		writeCompletion(w, c.sessionID, "payments-worker exits: DB_URL is not set")
+	})
+	b := startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.ActivityListen = "127.0.0.1:0"
+		cfg.ActivitySecret = shared
+		cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+	})
+	door.Store(b.ActivityURL())
+	c := gatewayClient(t, url)
+	origin := submitFromEnv(t, c, "task-followup", "ctx-followup", "gchat:spaces/A/threads/B", "diagnose crash-ns")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return turns.Load() == 1 })
+	sendSteer(t, c, origin, "just tell me why it crashes")
+	waitFor(t, 10*time.Second, "follow-up queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || turns.Load() != 2 {
+		t.Fatalf("state %s after %d turns, want completed after 2", task.State, turns.Load())
+	}
+	if art := task.Artifact(lib.ArtifactHandoff); art == nil {
+		t.Fatal("no handoff for a task whose first turn filed a card that is still to report")
+	}
+}
+
+// submitFromEnv is submitFrom returning the submission, for a test that
+// steers it.
+func submitFromEnv(t *testing.T, c *lib.Client, taskID, contextID, conversation, prompt string) *lib.Envelope {
+	t.Helper()
+	var auth map[string]any
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, taskID, "platform")), &auth); err != nil {
+		t.Fatal(err)
+	}
+	auth["audience"] = map[string]any{"conversation": conversation, "kind": "dm"}
+	raw, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID,
+		messagePayload(t, taskID, contextID, prompt), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	if err != nil {
+		t.Fatalf("submission envelope: %v", err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), env); err != nil {
+		t.Fatalf("submission publish: %v", err)
+	}
+	return env
+}
+
 // postDeliveryStatus is postDelivery's closing delivery for a call that ended
 // with status, as hermes reports a failed tool call.
 func postDeliveryStatus(t *testing.T, url, key, sessionID, tool, callID, status string) {
@@ -405,6 +551,14 @@ func TestCardsSettleTheAsk(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// An invalid UTF-8 byte inside an open bracket at the sentence's end is
+// masked at its own width: no write past the buffer, no panic.
+func TestClauseCutSurvivesAnInvalidByteInABracket(t *testing.T) {
+	sentence := strings.Repeat("word ", 40) + "and more (open \xff"
+	splitAnswer(sentence)
+	clauseCut(sentence)
+}
 
 // The presenter's linear-time cases: nothing here retries a line's end from
 // every marker.
