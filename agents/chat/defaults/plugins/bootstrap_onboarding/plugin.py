@@ -122,6 +122,10 @@ REPORT_CHECK_TIMEOUT_SECONDS = 5
 # and knows which platform's conversations the gateway serves.
 CHAT_NOTIFY_PATH = Path("/opt/defaults/scripts/chat_notify.py")
 CHAT_NOTIFY_MODULE = "_kube_agents_chat_notify"
+# The image's hand-off module, whose read_scan_marker is the one reader of the
+# sweep marker's filing time that oobe and the hand-off share.
+BOOTSTRAP_HANDOFF_PATH = Path("/opt/defaults/scripts/bootstrap_handoff.py")
+BOOTSTRAP_HANDOFF_MODULE = "_kube_agents_bootstrap_handoff"
 # The conversation the report goes to under next, read by bootstrap_delivery.py
 # (CONVERSATION_FILE there) and kept after delivery as onboarding's destination.
 # The jobs stay ``deliver: local``: the scheduler cannot post to a gateway
@@ -394,11 +398,17 @@ def _report_ready(data_dir: Path, name: str = REPORT_NAME) -> bool:
 
 
 def _scan_too_old(data_dir: Path) -> bool:
+    """Whether the sweep was filed more than SCAN_MAX_AGE_SECONDS ago, by the clock oobe reads.
+
+    A marker that cannot be read, or a module that cannot be loaded, is not too old.
+    """
     try:
-        filed = (data_dir / SCAN_FILED_MARKER).stat().st_mtime
-    except OSError:
+        handoff = _load_image_module(BOOTSTRAP_HANDOFF_PATH, BOOTSTRAP_HANDOFF_MODULE)
+        filed = handoff.read_scan_marker(data_dir / SCAN_FILED_MARKER)
+    except Exception as e:
+        logger.warning("Could not read %s: %s", SCAN_FILED_MARKER, e)
         return False
-    return time.time() - filed > SCAN_MAX_AGE_SECONDS
+    return filed is not None and time.time() - filed[1] > SCAN_MAX_AGE_SECONDS
 
 
 def _take_priming(data_dir: Path) -> bool:

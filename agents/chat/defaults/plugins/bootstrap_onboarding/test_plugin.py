@@ -33,6 +33,8 @@ BENCH_REPORT = "INVENTORY.bench-done.md"
 REPO_SANDBOX_EXEC = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "sandbox_exec.py"
 # The repository copy of the module the image ships at plugin.CHAT_NOTIFY_PATH.
 REPO_CHAT_NOTIFY = Path(__file__).resolve().parents[4] / "platform" / "scripts" / "chat_notify.py"
+# The repository copy of the module the image ships at plugin.BOOTSTRAP_HANDOFF_PATH.
+REPO_BOOTSTRAP_HANDOFF = Path(__file__).resolve().parents[3] / "scripts" / "bootstrap_handoff.py"
 # A session the hermes-bridge opened for a Slack thread, and the route it recorded for it.
 BRIDGE_SESSION = "a2a-ctx-21f41a7dc20859301d2307b8"
 SLACK_ROUTE = {
@@ -719,6 +721,7 @@ class ConversationPrimingTest(unittest.TestCase):
         self.addCleanup(env.stop)
         for patcher in (
             mock.patch.object(plugin, "CHAT_NOTIFY_PATH", REPO_CHAT_NOTIFY),
+            mock.patch.object(plugin, "BOOTSTRAP_HANDOFF_PATH", REPO_BOOTSTRAP_HANDOFF),
             mock.patch.object(plugin, "_chat_notify", None),
             mock.patch.object(plugin, "_unserved_warned", set()),
         ):
@@ -875,6 +878,18 @@ class ConversationPrimingTest(unittest.TestCase):
         os.utime(marker, (old, old))
         self.assertIsNone(self._bridge_call())
         self._assert_unprimed()
+
+    def test_the_gate_reads_filed_at_before_the_mtime(self):
+        # A copied data volume rewrites the mtime; the marker's own line keeps the filing time.
+        marker = self.data_dir / plugin.SCAN_FILED_MARKER
+        filed = time.time() - plugin.SCAN_MAX_AGE_SECONDS - 60
+        marker.write_text(f"task_id=t_1\nfiled_at={filed}\n", encoding="utf-8")
+        self.assertIsNone(self._bridge_call())
+        self._assert_unprimed()
+        marker.write_text(f"task_id=t_1\nfiled_at={time.time() - 60}\n", encoding="utf-8")
+        old = time.time() - plugin.SCAN_MAX_AGE_SECONDS - 60
+        os.utime(marker, (old, old))
+        self.assertIsNotNone(self._bridge_call())
 
     def test_a_recent_sweep_is_primed(self):
         (self.data_dir / plugin.SCAN_FILED_MARKER).write_text("task_id=t_1\n", encoding="utf-8")
