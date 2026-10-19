@@ -470,7 +470,7 @@ def names_case(issue: dict, case: str, kind: str = KIND_RED) -> bool:
     if markers or kind != KIND_RED:
         return (kind, case) in markers
     pattern = NAME_IN_TEXT_RE.format(name=re.escape(case))
-    return bool(re.search(pattern, f"{issue.get('title') or ''}\n{body}"))
+    return bool(re.search(pattern, f"{issue.get('title') or ''}\n{body}", re.IGNORECASE))
 
 
 def tracking_issue(issues: list[dict], case: str, kind: str = KIND_RED) -> dict | None:
@@ -481,6 +481,13 @@ def tracking_issue(issues: list[dict], case: str, kind: str = KIND_RED) -> dict 
         if (kind, case) in BOT_MARKER_RE.findall(issue.get("body") or ""):
             return issue
     return next((issue for issue in issues if names_case(issue, case, kind)), None)
+
+
+def opened_before(issue: dict, night: dict) -> bool:
+    """Whether ``issue`` was opened before ``night``'s run started: only
+    such a night is news to it, a later failure or a recovery."""
+    opened, started = nightly.parse_iso(issue.get("created_at")), nightly.parse_iso(night.get("started"))
+    return bool(opened and started and started > opened)
 
 
 def closed_after(issue: dict | None, night: dict) -> bool:
@@ -624,8 +631,7 @@ class Filer:
     def note_night(self, kind, field, key, issue, night, what, result) -> None:
         """One comment on an open infra issue for ``night``, when it started
         after the issue was opened."""
-        opened, started = nightly.parse_iso(issue.get("created_at")), nightly.parse_iso(night.get("started"))
-        if not (opened and started and started > opened):
+        if not opened_before(issue, night):
             return
         marker = NIGHT_MARKER.format(kind=kind, field=field, key=key, date=night["date"])
         comment = INFRA_NIGHT_COMMENT.format(marker=marker, date=night["date"], what=what, run_url=night["run_url"])
@@ -658,6 +664,10 @@ class Filer:
         result["filed" if number or self.gh.dry_run else "failed"].append(entry)
 
     def recover_infra(self, kind, field, key, issue, night, what, result) -> None:
+        """One recovery comment, for a clean night after the issue opened:
+        a clean night the issue already lists is not a recovery."""
+        if not opened_before(issue, night):
+            return
         marker = INFRA_RECOVERY_MARKER.format(kind=kind, field=field, key=key, date=night["date"])
         comment = INFRA_RECOVERY_COMMENT.format(marker=marker, what=what, date=night["date"], run_url=night["run_url"])
         done = self.comment_once(issue["number"], marker, comment)
@@ -719,6 +729,10 @@ class Filer:
                 "labels": labels, "nights": [v["date"] for v in streak], "runs": [v["run_url"] for v in streak], "issue": number}
 
     def recover(self, case: str, issue: dict, night: dict) -> dict | None:
+        """Comment once on ``night``'s pass, when the night started after the
+        issue was opened (a human may open one after the case recovered)."""
+        if not opened_before(issue, night):
+            return None
         marker = RECOVERY_MARKER.format(case=case, date=night["date"])
         body = RECOVERY_COMMENT.format(marker=marker, case=case, passed=night["passed"], graded=night["graded"], date=night["date"], run_url=night["run_url"])
         posted = self.comment_once(issue["number"], marker, body)

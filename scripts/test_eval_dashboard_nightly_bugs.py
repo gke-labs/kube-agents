@@ -264,7 +264,7 @@ class DedupeTest(Harness):
         self.assertEqual(gh.writes(), [])
 
     def test_a_case_name_ending_a_sentence_is_a_whole_word(self):
-        for text in ("The nightly keeps failing on case-red.", "fails (see case-red.)", "case-red...", "case-red, again"):
+        for text in ("Case-Red keeps failing", "CASE-RED.", "The nightly keeps failing on case-red.", "fails (see case-red.)", "case-red...", "case-red, again"):
             with self.subTest(text=text):
                 gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[{"number": 3998, "title": "nightly red", "body": text}]))
                 self.assertEqual(gh.writes(), [])
@@ -310,7 +310,7 @@ class DedupeTest(Harness):
 
 
 class RecoveryTest(Harness):
-    ISSUE: typing.ClassVar[dict] = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red")}
+    ISSUE: typing.ClassVar[dict] = {"number": 3990, "title": "Nightly: case-red", "body": nightly_bugs.MARKER.format(case="case-red"), "created_at": "2026-10-16T12:00:00Z"}
 
     def recovered_data(self):
         return data(night(14, [red()]), night(15, [red()]), night(16, [red()]), night(17, [green("case-red")]), night(18, [green("case-red")]))
@@ -335,6 +335,12 @@ class RecoveryTest(Harness):
         rerun["runs"].append(night(17, [green("case-red")], hour="09"))
         again, _, _ = self.run_once(rerun, FakeGh(open_issues=[self.ISSUE], comments={3990: [{"body": posted["body"]}]}))
         self.assertEqual(again.writes(), [], "one night, one recovery comment, whichever build of it")
+
+    def test_a_recovery_before_the_issue_opened_is_not_commented(self):
+        human = {"number": 3989, "title": "case-red is broken", "body": "", "created_at": "2026-10-18T12:00:00Z"}
+        gh, out, _ = self.run_once(self.recovered_data(), FakeGh(open_issues=[human]))
+        self.assertEqual(gh.writes(), [], "the 10-17 pass predates the issue")
+        self.assertNotIn("recovered:", out)
 
     def test_unreadable_comments_are_reported_failed(self):
         _, out, err = self.run_once(self.recovered_data(), FakeGh(open_issues=[self.ISSUE], fail_comments=True))
@@ -544,6 +550,16 @@ class LostJobTest(Harness):
         self.assertEqual(again.writes(), [])
 
 
+    def test_a_clean_night_the_new_issue_already_lists_is_not_a_recovery(self):
+        doc = data(night(15, [], lost=True), night(16, [green()], truncated=True), night(17, [green()]))
+        gh, _, _ = self.run_once(doc)
+        [body] = self.filed(gh, infra=True)
+        self.assertIn("2026-10-17: ran to its verdict", body["body"])
+        issue = {"number": 4000, "title": body["title"], "body": body["body"], "created_at": "2026-10-17T12:00:00Z"}
+        gh, out, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        self.assertEqual(gh.writes(), [])
+        self.assertNotIn("recovered:", out)
+
     def test_a_later_lost_night_is_noted_without_the_threshold_again(self):
         issue = {"number": 3981, "title": "t", "body": f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", "created_at": "2026-10-14T12:00:00Z"}
         doc = data(night(15, [green()]), night(16, [green()]), night(17, [green()], truncated=True))
@@ -620,7 +636,7 @@ class InfraCaseTest(Harness):
         self.assertEqual(self.filed(gh, infra=True), [])
 
     def test_recovery_comments_once_when_the_case_is_graded_again(self):
-        issue = {"number": 3970, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-18T00:00:00Z"}
+        issue = {"number": 3970, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-16T12:00:00Z"}
         doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [red()]), night(18, [green("case-red")]))
         gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
         [(path, comment)] = self.comments(gh)
