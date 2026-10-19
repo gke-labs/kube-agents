@@ -2730,7 +2730,7 @@ def test_a_cleared_rate_limit_rerun_on_inject_remains_graded(
 ) -> None:
     build_session_store(tmp_path, created=[CARD_A])
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
-        conn.execute("UPDATE tasks SET status = 'done', result = 'recovered' WHERE id = ?", (CARD_A,))
+        conn.execute("UPDATE tasks SET status = 'failed', result = 'worker fault' WHERE id = ?", (CARD_A,))
         conn.execute(
             "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'blocked', ?)",
             (
@@ -2739,7 +2739,7 @@ def test_a_cleared_rate_limit_rerun_on_inject_remains_graded(
             ),
         )
         conn.execute(
-            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'done', NULL)",
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'failed', NULL)",
             (CARD_A,),
         )
     monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
@@ -2748,7 +2748,7 @@ def test_a_cleared_rate_limit_rerun_on_inject_remains_graded(
 
     assert not infra(result)
     assert not result.has_errors()
-    assert "recovered" in result.output
+    assert "worker fault" in result.output
 
 
 def test_a_board_that_stops_answering_is_infrastructure(

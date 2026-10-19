@@ -145,7 +145,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -159,6 +159,7 @@ from kube_agents_bench import board, card_wake, gitops, transcript, worker_traje
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     STATUS_TOOL,
+    _json_object,
     delegated_task_ids,
     delivered_results,
     merge_new,
@@ -2552,6 +2553,59 @@ class KubeAgentsHarness(AgentHarness):
         return result
 
     @staticmethod
+    def _extract_board_card_messages(
+        bstate: tuple[dict[str, str], dict[str, str], dict[str, str]],
+        task_id: str,
+    ) -> list[str]:
+        """Summary and error strings for ``task_id`` if the board shows it in a failure status."""
+        bstatuses, bsummaries, berrors = bstate
+        msgs: list[str] = []
+        if bstatuses.get(task_id) in _FAILURE_STATUSES:
+            if task_id in bsummaries:
+                msgs.append(bsummaries[task_id])
+            if task_id in berrors:
+                msgs.append(berrors[task_id])
+        return msgs
+
+    @staticmethod
+    def _extract_trajectory_failure_summaries(
+        trajectory: Iterable[dict[str, Any]],
+        task_ids: Iterable[str],
+    ) -> dict[str, list[str]]:
+        """Scan tool calls in a trajectory for rate-limit summaries of failure cards."""
+        wanted = set(str(t) for t in task_ids)
+        if not wanted:
+            return {}
+        found: dict[str, list[str]] = {}
+        for entry in trajectory:
+            payload = _json_object(entry.get("result"))
+            if not payload:
+                continue
+            shown = payload.get("task")
+            if isinstance(shown, dict):
+                tid = str(shown.get("id"))
+                if tid in wanted:
+                    runs = payload.get("runs")
+                    for r in runs if isinstance(runs, list) else []:
+                        if isinstance(r, dict):
+                            summ = r.get("summary")
+                            if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
+                                found.setdefault(tid, []).append(summ)
+            listed = payload.get("tasks")
+            if isinstance(listed, list):
+                for item in listed:
+                    if isinstance(item, dict):
+                        tid = str(item.get("id"))
+                        if tid in wanted:
+                            runs = item.get("runs")
+                            for r in runs if isinstance(runs, list) else []:
+                                if isinstance(r, dict):
+                                    summ = r.get("summary")
+                                    if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
+                                        found.setdefault(tid, []).append(summ)
+        return found
+
+    @staticmethod
     def _final_board_failures(
         awaited: Sequence[str],
         statuses: Mapping[str, str],
@@ -2578,12 +2632,7 @@ class KubeAgentsHarness(AgentHarness):
 
         bstatuses, bsummaries, berrors = final_bstate
         for t in failure_cards:
-            card_msgs: list[str] = []
-            if bstatuses.get(t) in _FAILURE_STATUSES:
-                if t in bsummaries:
-                    card_msgs.append(bsummaries[t])
-                if t in berrors:
-                    card_msgs.append(berrors[t])
+            card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
             if card_msgs:
                 board_messages.extend(card_msgs)
             elif fallback_messages and t in fallback_messages:
@@ -2858,6 +2907,11 @@ class KubeAgentsHarness(AgentHarness):
         # results. Kept beside the graded trajectory rather than in it.
         observed: list[dict[str, Any]] = list(result.trajectory)
         poll_failure_messages: dict[str, list[str]] = {}
+        failure_awaited = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
+        if failure_awaited:
+            poll_failure_messages.update(
+                self._extract_trajectory_failure_summaries(result.trajectory, failure_awaited)
+            )
         if not outstanding:
             board_messages = self._final_board_failures(awaited, statuses, poll_failure_messages)
             self._settle(
@@ -2912,14 +2966,9 @@ class KubeAgentsHarness(AgentHarness):
                 on_board, bsummaries, berrors = bstate
                 latest.update(on_board)
                 for t in outstanding:
-                    if on_board.get(t) in _FAILURE_STATUSES:
-                        msgs: list[str] = []
-                        if t in bsummaries:
-                            msgs.append(bsummaries[t])
-                        if t in berrors:
-                            msgs.append(berrors[t])
-                        if msgs:
-                            poll_failure_messages[t] = msgs
+                    msgs = self._extract_board_card_messages(bstate, t)
+                    if msgs:
+                        poll_failure_messages[t] = msgs
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
                 ):
@@ -3013,34 +3062,13 @@ class KubeAgentsHarness(AgentHarness):
                 if s in _FAILURE_STATUSES and t not in poll_failure_messages:
                     cstate = board.read_board_state(_agent_shell, [t], _EXEC_TIMEOUT)
                     if cstate is not None:
-                        _, csummaries, cerrors = cstate
-                        msgs: list[str] = []
-                        if t in csummaries:
-                            msgs.append(csummaries[t])
-                        if t in cerrors:
-                            msgs.append(cerrors[t])
+                        msgs = self._extract_board_card_messages(cstate, t)
                         if msgs:
                             poll_failure_messages[t] = msgs
                     if t not in poll_failure_messages:
-                        for entry in turn_new_calls:
-                            res = entry.get("result")
-                            if isinstance(res, str):
-                                try:
-                                    payload = json.loads(res)
-                                except Exception:
-                                    continue
-                            elif isinstance(res, dict):
-                                payload = res
-                            else:
-                                continue
-                            shown = payload.get("task")
-                            if isinstance(shown, dict) and str(shown.get("id")) == t:
-                                runs = payload.get("runs")
-                                for r in runs if isinstance(runs, list) else []:
-                                    if isinstance(r, dict):
-                                        summ = r.get("summary")
-                                        if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
-                                            poll_failure_messages.setdefault(t, []).append(summ)
+                        traj_summaries = self._extract_trajectory_failure_summaries(turn_new_calls, [t])
+                        if t in traj_summaries:
+                            poll_failure_messages[t] = traj_summaries[t]
             _fold_status_turn(
                 result,
                 status_turn,

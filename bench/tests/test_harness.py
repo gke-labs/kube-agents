@@ -2673,6 +2673,110 @@ def test_a_delegated_worker_status_turn_reported_blocked_is_infrastructure(
     assert result.trajectory == []
 
 
+def test_a_delegated_worker_status_turn_board_read_fallback_when_final_read_fails(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports a card blocked and single-card board read records failure error, final exec fallback marks infra."""
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked"},
+                    "runs": [],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            import inspect
+
+            stack_names = {f.function for f in inspect.stack()}
+            if "_final_board_failures" in stack_names:
+                return ""
+            if len(stub_agent.requests) == 2:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {},
+                    "errors": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+                        )
+                    },
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
+
+
+def test_status_turn_non_object_json_tool_result_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A status turn with scalar or array JSON tool results does not raise AttributeError."""
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            {
+                "type": "function_call",
+                "name": "bash",
+                "arguments": json.dumps({"command": "wc -l"}),
+                "call_id": "c_scalar",
+            },
+            {"type": "function_call_output", "call_id": "c_scalar", "output": "12"},
+            {
+                "type": "function_call",
+                "name": "jq",
+                "arguments": json.dumps({"expr": ".items"}),
+                "call_id": "c_array",
+            },
+            {"type": "function_call_output", "call_id": "c_array", "output": "[1, 2, 3]"},
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked"},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        }
+                    ],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+
+
 def test_a_delegated_worker_rate_limit_on_board_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
@@ -2894,6 +2998,51 @@ def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
                 "error": None,
             }
             return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert len(stub_agent.requests) == 1
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+
+
+def test_a_delegated_worker_rate_limit_on_board_early_settle_fallback_when_final_read_fails(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When the opening turn reports a card failed with rate limit in runs and the final exec fails, it marks infra."""
+    stub_agent.turns = [
+        _turn(
+            *_call(
+                "kanban_create",
+                {"title": "subtask"},
+                {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+                "c1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "failed", "result": None},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        }
+                    ],
+                },
+                "c2",
+            ),
+            _text("Investigating."),
+        )
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
         return ""
 
     monkeypatch.setattr(harness, "_agent_shell", _shell)
