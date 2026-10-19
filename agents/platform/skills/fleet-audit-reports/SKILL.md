@@ -63,7 +63,7 @@ Answering "how many criticals are open?" that way spends tens of thousands of to
 When `report_query.py` says a stream has no record, that is the answer: do not search the directory
 for a file it did not find.
 
-`python3 ./skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
+`python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py <subcommand>` prints one small JSON
 object per call.
 
 | Subcommand                          | Answers                                                               |
@@ -106,8 +106,8 @@ object per call.
 **"What did last night's compliance audit find?"**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py show compliance-audit
-python3 ./skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py show compliance-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py findings compliance-audit --severity critical
 ```
 
 `show` gives, under `envelope`, `status`, `findings`, `critical`, `partial`, `ledger_held_open`, the
@@ -119,7 +119,7 @@ human acts — except on a `NO_FORGE` run, which has no issue: the store is the 
 **"What changed since the last run?"**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit
 ```
 
 Defaults to the newest two runs and returns ids and titles under `added` and `resolved`. When
@@ -131,14 +131,14 @@ be findings the ledger already carried — say "found again", not "new". For a w
 ring first and name two stamps, older as `--from` — a reversed pair is refused:
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit
-python3 ./skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit --from <stamp> --to <stamp>
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py runs compliance-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py diff compliance-audit --from <stamp> --to <stamp>
 ```
 
 **"Tell me about that finding."**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py finding compliance-audit <finding-id>
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py finding compliance-audit <finding-id>
 ```
 
 The evidence command and excerpt, the impact, and all three `recommendation` fields. This is the
@@ -147,8 +147,8 @@ expensive call: make it for the finding that was asked about, not for the list.
 **"The issue says findings or commands were omitted — what were they?"**
 
 ```bash
-python3 ./skills/fleet-audit-reports/scripts/report_query.py findings obtainability-audit
-python3 ./skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py findings obtainability-audit
+python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
 ```
 
 The ledger drops its least-severe findings, then its evidence table whole, to stay inside GitHub's
@@ -186,7 +186,7 @@ last run" and "is anything stuck" come back in one call. Coverage questions read
 - **Never read `document` or `ledger_body` whole** to answer a question a subcommand answers.
 - **Never run, publish, or remediate from here.** Dispatching a stream, rewriting a ledger and
   opening remediation pull requests belong to `fleet-audit`
-  ([Running a stream on demand](../fleet-audit/SKILL.md#running-a-stream-on-demand)).
+  ([Running a stream on demand](../fleet-audit/references/on-demand.md#running-a-stream-on-demand)).
 - **Never act on a `running` or `died` stream's lease.** It is `fleet-audit`'s; report the state.
 - **Never quote a count the store did not give you.** The counts are keys; re-deriving one by hand
   from prose is how a stale number reaches a user with the authority of a file read.

@@ -1971,7 +1971,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
-# its roster line 2026-10-14; the presubmit file's last section).
+# its roster line 2026-10-14, demoted back here 2026-10-17, #3120; the
+# presubmit file's last section).
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
 NIGHTLY_TASKS=()
 while IFS= read -r ENTRY; do
@@ -2637,8 +2638,8 @@ if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ]
   exit 1
 fi
 
-# The GitLab lane's list may hold no roster case (two of its three seats are
-# held out), which empties the export by design, like a nightly part: said
+# The GitLab lane's list may hold no roster case (all three of its seats are
+# held out since pdb-remediation-pr's demotion of 2026-10-17, #3120), which empties the export by design, like a nightly part: said
 # in the log, not stopped. After the inject guard, so a lane the guard stops
 # does not also hear this.
 if [ -n "${GITLAB_LANE_DROPPED:-}" ] && [ -z "${BLOCKING_ROSTER_DEFAULT}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
@@ -2796,6 +2797,26 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that now runs the waste collector's sweep (#2386):
+    # the waste audit's band, without the ledger write.
+    cost-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that runs the reliability collector's sweep (#2386):
+    # the audit band, without the ledger write.
+    reliability-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that now runs the stockout collector's sweep (#2386):
+    # the stockout audit's band, without the ledger write.
+    stockout-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that runs the patch audit's collector (#2386): its
+    # upgrade-blocked phase alone has a 420s budget on a fleet with a behind
+    # cluster; the audit band, without the ledger write.
+    upgrade-chat-request-runs-collector) echo 900 ;;
+    # A plain chat request that runs the drift collector (#2386): one card and
+    # one gcloud list per project; priced a little above the consistency probe.
+    drift-chat-request-runs-collector) echo 400 ;;
+    # A plain chat request that runs the AI security collector (#2386) on the
+    # same tofu stack shape as ai-security-planted-model-audit; that case's
+    # hint until this one has a record.
+    ai-security-chat-request-runs-collector) echo 1450 ;;
     # Presubmit again since 2026-09-29, held out (#2013 step 2); nightly-only
     # 2026-09-22 to then (#1023; held out on #1171, closed 2026-09-08, the
     # bar now on #2013 step 3). The canary measured 1002s median, 2074s p90,
@@ -2808,16 +2829,17 @@ unit_cost_hint() {
     # Nightly-only since 2026-09-22 (#1023; held out on #1189). Presubmit
     # before that, priced at the 700 it carried there.
     rca-remediation-pr) echo 700 ;;
-    # On the roster since 2026-10-14 (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
-    # to then. The 2026-09-22 promotion (#1023) was withdrawn before merge:
+    # Nightly-only since 2026-10-17 (demoted on #3120); on the roster 2026-10-14
+    # to then (#2016 step 4); held out from 2026-09-28; nightly 2026-09-15
+    # to 2026-09-28. The 2026-09-22 promotion (#1023) was withdrawn before merge:
     # its record was graded by the check #1780 replaced. Measured 980-1929s
     # across build 2099539376672346112's three repetitions (267-559s in
     # August); median of the September run, kept although the four graded
     # nights of 09-16 to 09-20 ran 420-1153s, until the presubmit record
-    # under pull_request_opened says otherwise. The presubmit's largest hint,
-    # so it launches first in each repetition round; its three repetitions
-    # serialize on the task lock, ~62min at the hint and ~96min at the
-    # measured maximum.
+    # under pull_request_opened says otherwise. While in the presubmit it was
+    # the largest hint, so it launched first in each repetition round; its
+    # three repetitions serialize on the task lock, ~62min at the hint and
+    # ~96min at the measured maximum.
     pdb-remediation-pr) echo 1250 ;;
     # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
     # write (build 2099607409826729984); the crashloop triage takes the
