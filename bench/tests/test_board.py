@@ -137,9 +137,9 @@ STORE_DDL = (
 )
 BOARD_DDL = (
     "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,"
-    " result TEXT, created_at INTEGER)",
+    " result TEXT, created_at INTEGER, block_kind TEXT, last_failure_error TEXT)",
     "CREATE TABLE task_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, profile TEXT,"
-    " status TEXT, summary TEXT, metadata TEXT)",
+    " status TEXT, summary TEXT, metadata TEXT, error TEXT)",
     "CREATE TABLE kanban_notify_subs (task_id TEXT NOT NULL, platform TEXT NOT NULL,"
     " chat_id TEXT NOT NULL, thread_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,"
     " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
@@ -215,15 +215,25 @@ def build_session_store(
 
 
 def set_card(
-    root: Path, tid: str, status: str, *, result: str | None = None, summary: str | None = None
+    root: Path,
+    tid: str,
+    status: str,
+    *,
+    result: str | None = None,
+    summary: str | None = None,
+    block_kind: str | None = None,
+    error: str | None = None,
 ) -> None:
     """Move ``tid`` on the board, as a worker claiming and completing it would."""
     with sqlite3.connect(root / board.BOARD_FILE) as conn:
-        conn.execute("UPDATE tasks SET status = ?, result = ? WHERE id = ?", (status, result, tid))
-        if summary is not None:
+        conn.execute(
+            "UPDATE tasks SET status = ?, result = ?, block_kind = ?, last_failure_error = ? WHERE id = ?",
+            (status, result, block_kind, error, tid),
+        )
+        if summary is not None or error is not None:
             conn.execute(
-                "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', ?, ?)",
-                (tid, status, summary),
+                "INSERT INTO task_runs (task_id, profile, status, summary, error) VALUES (?, 'platform', ?, ?, ?)",
+                (tid, status, summary, error),
             )
 
 
@@ -273,7 +283,13 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
     # Without ``want`` a read carries statuses alone.
     plain = board.read_session_cards(shell, SESSION, 5)
     assert plain is not None
-    assert plain.cards[FRONT] == {"status": "done", "result": None, "summary": None}
+    assert plain.cards[FRONT] == {
+        "status": "done",
+        "result": None,
+        "summary": None,
+        "block_kind": None,
+        "error": None,
+    }
     read = board.read_session_cards(shell, SESSION, 5, want=[FRONT, CHILD], max_want=32)
     assert read is not None and read.session_found
     assert read.total == 2
@@ -283,8 +299,16 @@ def test_a_sessions_creates_name_its_cards_with_their_state(
         "status": "done",
         "result": "three clusters, all healthy",
         "summary": None,
+        "block_kind": None,
+        "error": None,
     }
-    assert read.cards[CHILD] == {"status": "done", "result": None, "summary": "node pool resized"}
+    assert read.cards[CHILD] == {
+        "status": "done",
+        "result": None,
+        "summary": "node pool resized",
+        "block_kind": None,
+        "error": None,
+    }
     shown = json.loads(read.as_shown(CHILD)["result"])
     assert shown == {
         "task": {"id": CHILD, "status": "done", "result": None},

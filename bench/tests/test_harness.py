@@ -2904,7 +2904,7 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_empty_failures)
     msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
-    assert msgs == fallback[t]
+    assert msgs == []
 
     # Branch 3: final read succeeds and has summaries/errors, does not use fallback
     def _shell_with_summary(script: str, timeout: float) -> str:
@@ -2919,6 +2919,103 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(harness, "_agent_shell", _shell_with_summary)
     msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
     assert msgs == ["new summary"]
+
+
+def test_board_card_messages_refuses_non_transient_triage() -> None:
+    t = "t-triage"
+    summ = f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"
+    bstate_nontransient = (
+        {t: "triage"},
+        {t: summ},
+        {},
+        {t: "needs_input"},
+    )
+    assert KubeAgentsHarness._extract_board_card_messages(bstate_nontransient, t) == []
+
+    bstate_transient = (
+        {t: "triage"},
+        {t: summ},
+        {},
+        {t: "transient"},
+    )
+    assert KubeAgentsHarness._extract_board_card_messages(bstate_transient, t) == [summ]
+
+
+def test_extract_trajectory_failure_summaries_branches() -> None:
+    t = "t-1"
+    # Exit 1: task blocked+transient with cleared newest run -> {}
+    traj_cleared = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "blocked", "block_kind": "transient"},
+                "runs": [
+                    {"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: quota exhausted"},
+                    {"summary": None},
+                ],
+            }),
+        }
+    ]
+    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_cleared, [t]) == {}
+
+    # Exit 2: task status failed with cleared newest run -> {}
+    traj_failed_cleared = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "failed"},
+                "runs": [
+                    {"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: quota exhausted"},
+                    {"summary": None},
+                ],
+            }),
+        }
+    ]
+    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_failed_cleared, [t]) == {}
+
+    # Exit 3: tasks list item status failed with rate limit summary -> {t: [summary]}
+    expected_sum = f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"
+    traj_tasks_failed = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {"id": t, "status": "failed", "runs": [{"summary": expected_sum}]},
+                ],
+            }),
+        }
+    ]
+    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_failed, [t]) == {t: [expected_sum]}
+
+    # Exit 4: tasks item blocked without transient -> {}
+    traj_tasks_blocked_nontransient = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {
+                        "id": t,
+                        "status": "blocked",
+                        "block_kind": "needs_input",
+                        "runs": [{"summary": expected_sum}],
+                    },
+                ],
+            }),
+        }
+    ]
+    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_blocked_nontransient, [t]) == {}
+
+    # Exit 5: task triage without transient -> {}
+    traj_task_triage = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "triage", "block_kind": "needs_input"},
+                "runs": [{"summary": expected_sum}],
+            }),
+        }
+    ]
+    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_triage, [t]) == {}
 
 
 def test_gitops_fix_cycle_skipped_on_infra_failure(
@@ -3021,7 +3118,7 @@ def test_a_delegated_worker_cleared_rate_limit_in_trajectory_remains_graded(
                 "kanban_show",
                 {"task_id": _TASK_ID},
                 {
-                    "task": {"id": _TASK_ID, "status": "blocked"},
+                    "task": {"id": _TASK_ID, "status": "blocked", "block_kind": "transient"},
                     "runs": [
                         {
                             "summary": (
