@@ -571,7 +571,7 @@ class UpgradeRunContractTest(unittest.TestCase):
         retag_values just read, when a full upgrade would move the mode. Both
         before their arm raises the apply gate."""
         source = _UPGRADE_SH.read_text()
-        key = '"${PLATFORM_AGENT_MODE:-${UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}}"'
+        key = '"${PLATFORM_AGENT_MODE:-${DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}}"'
         dispatch = source.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
         self.assertNotIn("platform_agent_mode_for", source[source.index('exit "$plan_status"'):dispatch])
         for mode, after, call in (
@@ -601,7 +601,7 @@ class UpgradeRunContractTest(unittest.TestCase):
     def test_the_mode_calls_survive_helpers_from_before_the_next_default(self):
         """A target between spec.mode support and the next default defines the
         notices and DEFAULT_PLATFORM_AGENT_MODE (today there), but not
-        UNRECORDED_PLATFORM_AGENT_MODE. Each mode call, under the script's
+        DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE. Each mode call, under the script's
         strict shell and with an install.env that records no mode, reaches its
         notice with today rather than aborting on an unbound variable."""
         lines = _UPGRADE_SH.read_text().splitlines()
@@ -628,7 +628,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
 source {shlex.quote(str(stub))}
 set -Eeuo pipefail
 trap 'echo "ABORT BANNER" >&2' ERR
-unset PLATFORM_AGENT_MODE UNRECORDED_PLATFORM_AGENT_MODE
+unset PLATFORM_AGENT_MODE DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE
 PLATFORM_AGENT_MODE_NOTICE_UNGATED=ungated
 target_namespace=kubeagents-system PARAM_UPGRADE_MODE=harness RETAG_VALUES_JSON='{{}}'
 {call}
@@ -643,7 +643,7 @@ target_namespace=kubeagents-system PARAM_UPGRADE_MODE=harness RETAG_VALUES_JSON=
     def test_the_mode_calls_skip_an_older_installer_common(self):
         """installer_common.sh is the target tree's: piped, or with --image-tag
         onto a release before spec.mode support, it defines neither notice nor
-        UNRECORDED_PLATFORM_AGENT_MODE. Each mode call site in the plan, the full
+        DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE. Each mode call site in the plan, the full
         arm and both retag arms, lifted as written (with its guard when it has
         one), runs under the script's strict shell against a stub
         installer_common.sh lacking them, and must neither abort nor print
@@ -668,7 +668,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
 source {shlex.quote(str(stub))}
 set -Eeuo pipefail
 trap 'echo "ABORT BANNER" >&2' ERR
-unset PLATFORM_AGENT_MODE UNRECORDED_PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_NOTICE_UNGATED
+unset PLATFORM_AGENT_MODE DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_NOTICE_UNGATED
 target_namespace=kubeagents-system PARAM_UPGRADE_MODE=harness RETAG_VALUES_JSON='{{}}'
 {block}
 echo "reached the end"

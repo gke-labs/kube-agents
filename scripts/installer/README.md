@@ -24,7 +24,7 @@ their own copies:
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
 | `DEFAULT_PLATFORM_AGENT_MODE`                                             | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
-| `UNRECORDED_PLATFORM_AGENT_MODE`                                          | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
+| `DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE`                                  | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |

@@ -89,10 +89,10 @@ class ExistingInstallsKeepTodayTest(unittest.TestCase):
         # mode install.env did not record treats an existing today install as
         # next: it prompts and warns for next, or renders it. upgrade.sh's
         # last-resort fallback is for an install.defaults.env that predates
-        # UNRECORDED_PLATFORM_AGENT_MODE, where the default was still today.
+        # DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE, where the default was still today.
         reads = {
             "install.sh": ['    PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_PLATFORM_AGENT_MODE:-}"'],
-            "upgrade.sh": ["${UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"] * 4,
+            "upgrade.sh": ["${DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"] * 4,
         }
         for path in ("install.sh", "upgrade.sh", "scripts/installer/installer_common.sh"):
             with self.subTest(path=path):
@@ -123,7 +123,7 @@ class CompositionTextTest(unittest.TestCase):
         self.assertIn(f"contains({json.dumps(enum)}, var.platform_agent_mode)".replace('","', '", "'), self.variable)
         # The word an install.env with no mode resolves to is the same; a first
         # install's default (DEFAULT_PLATFORM_AGENT_MODE) is install.sh's alone.
-        self.assertIn('UNRECORDED_PLATFORM_AGENT_MODE="today"', _DEFAULTS.read_text())
+        self.assertIn('DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE="today"', _DEFAULTS.read_text())
 
     def test_platform_agent_is_merged_with_the_mode_only_when_it_is_not_today(self):
         self.assertIn("    platformAgent = merge({\n", self.main_tf)

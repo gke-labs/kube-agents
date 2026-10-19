@@ -515,7 +515,7 @@ change of the new release.
 
 ## What stops during an upgrade
 
-This section describes `spec.mode: today`, the default.
+This section describes `spec.mode: today`, which an install made before `next` became the first-install default keeps.
 
 At the default of one replica, the agent gateway and the credential broker each run one pod with
 the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so chat stops

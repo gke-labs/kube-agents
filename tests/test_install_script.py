@@ -6056,6 +6056,166 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn("--menu takes no --mode", out)
         self.assertNotEqual(proc.returncode, 0)
 
+    def test_the_first_install_check_reads_whether_the_file_exists(self):
+        # Through the real check at parse time, not a hand-set
+        # INSTALL_ENV_FOUND_AT_START: install.sh and install.defaults.env alone
+        # in a directory that is not a checkout, under an empty HOME, so no
+        # install.env is found anywhere.
+        probe = 'echo "FOUND=[$INSTALL_ENV_FOUND_AT_START] FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"'
+        with tempfile.TemporaryDirectory() as tmp:
+            bare = pathlib.Path(tmp) / "bare"
+            home = pathlib.Path(tmp) / "home"
+            bare.mkdir()
+            home.mkdir()
+            shutil.copy(_INSTALL_SH, bare / "install.sh")
+            shutil.copy(_REPO_ROOT / "install.defaults.env", bare / "install.defaults.env")
+            env = self._env({"HOME": str(home)})
+            env.pop("KUBE_AGENTS_INSTALL_ENV", None)
+            first = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{bare / "install.sh"}"\n{probe}\n'],
+                capture_output=True, text=True, env=env, cwd=str(bare), stdin=subprocess.DEVNULL,
+            )
+            self.assertIn("FOUND=[false] FALLBACK=[next]", first.stdout, first.stderr)
+            later = self._run(probe, install_env=self._file(tmp, "PROJECT_ID=p\n"))
+            self.assertIn("FOUND=[true] FALLBACK=[today]", later.stdout, later.stderr)
+
+    # adopt_live_platform_agent_mode with the cluster probe and the CR read
+    # stubbed: $1 of _adopt is gcloud's exit status, $2 the CR read's outcome,
+    # $3 the CR list.
+    _ADOPT = (
+        "export PROJECT_ID=p REGION=r CLUSTER_NAME=c\n"
+        "gcloud() {{ echo \"GCLOUD $*\" >&2; return {status}; }}\n"
+        "gke_dns_endpoint_flag() {{ :; }}\n"
+        "read_platform_agent_install_state() {{ PLATFORM_AGENT_CR_READ='{read}'; "
+        "PLATFORM_AGENT_CR_JSON='{json}'; PLATFORM_AGENT_READ_ERROR='forbidden'; }}\n"
+        "PARAM_DRY_RUN={dry_run}\n"
+        "{pre}\n"
+        'rc=0; adopt_live_platform_agent_mode || rc=$?; '
+        'echo "rc=$rc FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"\n'
+    )
+
+    def _adopt(self, tmp, status=0, read="ok", json_list='{"items":[]}', dry_run="false", pre=":", content=None):
+        # No content is a first install: the file check is pinned above, so
+        # here it is set rather than arranged.
+        if content is None:
+            content = ""
+            pre = f"INSTALL_ENV_FOUND_AT_START=false; resolve_platform_agent_mode_fallback; {pre}"
+        path = self._file(tmp, content)
+        return self._run(
+            self._ADOPT.format(status=status, read=read, json=json_list, dry_run=dry_run, pre=pre),
+            install_env=path,
+        )
+
+    def test_a_cluster_already_running_a_platform_agent_keeps_its_mode(self):
+        # No install.env against a live install (a new checkout, another
+        # machine): the CR's mode, absent being today, not the new default.
+        with tempfile.TemporaryDirectory() as tmp:
+            for json_list, expected in (
+                ('{"items":[{"spec":{}}]}', "today"),
+                ('{"items":[{"spec":{"mode":"today"}}]}', "today"),
+                ('{"items":[{"spec":{"mode":"next"}}]}', "next"),
+            ):
+                with self.subTest(cr=json_list):
+                    proc = self._adopt(tmp, json_list=json_list)
+                    self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
+                    if expected == "today":
+                        self.assertIn("already runs a PlatformAgent on spec.mode today", proc.stdout + proc.stderr)
+
+    def test_a_cluster_with_no_platform_agent_is_a_first_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for status, read in ((1, "ok"), (0, "none"), (0, "ok")):
+                with self.subTest(gcloud=status, read=read):
+                    proc = self._adopt(tmp, status=status, read=read)
+                    self.assertIn("rc=0 FALLBACK=[next]", proc.stdout, proc.stderr)
+
+    def test_a_cr_that_cannot_be_read_is_refused_and_a_dry_run_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for read in ("failed", "no-context"):
+                with self.subTest(read=read):
+                    proc = self._adopt(tmp, read=read)
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=1", proc.stdout, out)
+                    self.assertIn("Pass --mode=today or --mode=next", out)
+                    preview = self._adopt(tmp, read=read, dry_run="true")
+                    self.assertIn("rc=0 FALLBACK=[next]", preview.stdout, preview.stderr)
+                    self.assertIn("an applying run would be refused", preview.stdout + preview.stderr)
+
+    def test_a_chosen_mode_or_an_existing_file_skips_the_cluster_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cr = '{"items":[{"spec":{}}]}'
+            for kwargs, expected in (
+                ({"pre": "PARAM_PLATFORM_AGENT_MODE=next"}, "today"),
+                ({"content": "PROJECT_ID=p\n"}, "today"),
+            ):
+                with self.subTest(**kwargs):
+                    proc = self._adopt(tmp, json_list=cr, **kwargs)
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertNotIn("GCLOUD", proc.stderr)
+            # The explicit --mode, not the fallback, is what applies.
+            proc = self._adopt(tmp, json_list=cr, pre="PARAM_PLATFORM_AGENT_MODE=next")
+            self.assertIn("FALLBACK=[next]", proc.stdout, proc.stderr)
+
+    def test_the_mode_is_adopted_before_the_tfvars_are_generated(self):
+        text = _INSTALL_SH.read_text()
+        adopt = text.index('  adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n')
+        self.assertLess(text.index("  export CLUSTER_NAME=\"$cluster_name\"\n"), adopt)
+        export = text.index('  export PLATFORM_AGENT_MODE="$platform_agent_mode"\n', adopt)
+        self.assertEqual(
+            text[adopt:export].splitlines()[1:],
+            [
+                '  mirrored_first_install_mode "$third_party_registry_prefix"',
+                '  platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"',
+            ],
+        )
+        self.assertLess(export, text.index("    write_tfvars_from_state \"$tfvars_file\" \"$image_tag\"\n", export))
+
+    def test_a_mirrored_first_install_defaults_to_today(self):
+        # next's bus images are not pointed at the mirror, so a first install
+        # that mirrors defaults to today; anything that chose a mode wins.
+        call = "rc=0; mirrored_first_install_mode {prefix} || rc=$?; " 'echo "rc=$rc FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"'
+        first = "INSTALL_ENV_FOUND_AT_START=false; resolve_platform_agent_mode_fallback; "
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "")
+            for pre, prefix, expected in (
+                (first, "mirror.example/third-party", "today"),
+                (first, "''", "next"),
+                (first + "PARAM_PLATFORM_AGENT_MODE=next; ", "mirror.example/third-party", "next"),
+                (first + "PLATFORM_AGENT_MODE_FROM_CR=true; ", "mirror.example/third-party", "next"),
+                ("", "mirror.example/third-party", "today"),
+            ):
+                with self.subTest(pre=pre, prefix=prefix):
+                    proc = self._run(pre + call.format(prefix=prefix), install_env=path)
+                    self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
+                    if pre == first and prefix != "''":
+                        self.assertIn("Pass --mode=next to install next anyway.", proc.stdout + proc.stderr)
+
+    def test_y_refuses_a_switch_nobody_asked_for(self):
+        # Under -y the notice is the last word before the apply; a switch that
+        # came from the fallback rather than --mode, an exported mode or the
+        # key install.env records is refused, and the tfvars that carry it go.
+        text = _INSTALL_SH.read_text()
+        notice = text.index('  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"\n')
+        block = text[notice : text.index("  fi\n", notice)]
+        self.assertIn('[ "$mode_notice_route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ]', block)
+        self.assertIn('[ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ]', block)
+        self.assertIn('[ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ]', block)
+        self.assertIn('rm -f "$tfvars_file"', block)
+        self.assertIn("exit 1", block)
+
+    def test_the_switch_notice_says_whether_it_named_a_switch(self):
+        cases = (
+            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "next", "true"),
+            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "today", "false"),
+            ("", "", "next", "false"),
+        )
+        for record, live, key, expected in cases:
+            with self.subTest(record=record, live=live, key=key):
+                proc = self._run(
+                    f'PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED=stale; announce_platform_agent_mode_switch "{record}" "{live}" {key} ungated >/dev/null; '
+                    'echo "ANNOUNCED=[$PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED]"'
+                )
+                self.assertIn(f"ANNOUNCED=[{expected}]", proc.stdout, proc.stderr)
+
     def test_the_summary_names_the_mode_and_warns_for_next(self):
         text = _INSTALL_SH.read_text()
         summary = text.index('print_step "11. Pre-Flight Configuration Summary"')
@@ -6134,7 +6294,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             block,
         )
         self.assertIn(
-            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
             "        check_scope_container_access || exit 1\n",
             text[:main_start],
         )

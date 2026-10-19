@@ -166,7 +166,10 @@ rendered without one (`helm template`, Argo CD) would move an existing install:
   first install with no `install.env` records `next` when no `--mode` is given
   (`DEFAULT_PLATFORM_AGENT_MODE`), and `install.env.example` sets `next`. A file that assigns no
   mode, typically one written before the key existed by an install that has only run `today`,
-  resolves to `today` (`UNRECORDED_PLATFORM_AGENT_MODE`) in every front door.
+  resolves to `today` (`DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE`) in every front door. A run
+  with no `install.env` and no `--mode` against a cluster that already runs a `PlatformAgent`
+  (a new checkout of a live install) keeps that CR's mode, and refuses when the CR cannot be
+  read; under `-y`, `install.sh` refuses a switch that neither `--mode` nor the file asked for.
 
 A mode switch on a running install is made by editing `PLATFORM_AGENT_MODE`, not by
 passing `--mode`, which is refused when it disagrees with the file, and the run that

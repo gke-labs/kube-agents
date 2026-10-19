@@ -915,7 +915,7 @@ sys.stdout.write((values.get("platformAgent") or {}).get("mode") or sys.argv[1])
 # A mode as the operator reads it: an absent one is today.
 effective_platform_agent_mode() {
   if [ "${1:-}" = "$PLATFORM_AGENT_MODE_UNSET" ]; then
-    printf '%s' "$UNRECORDED_PLATFORM_AGENT_MODE"
+    printf '%s' "$DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE"
   else
     printf '%s' "${1:-}"
   fi
@@ -959,11 +959,13 @@ platform_agent_mode_extra_values_caveat() {
 # that applies it names it first. A key the apply cannot bring the CR to,
 # because the CR carries a mode set outside this installer, is named too.
 # Silent when either value is empty (no CR, no release: a first install),
-# and on a re-apply of the same mode. A read that failed is not empty: the
+# and on a re-apply of the same mode. Sets PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
+# to true when it names a switch, so install.sh -y can refuse one nobody chose. A read that failed is not empty: the
 # front-door call says so itself (announce_platform_agent_mode_for_apply).
 # Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
   local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   [ -n "$record" ] && [ -n "$live" ] || return 0
   from="$(effective_platform_agent_mode "$live")"
   to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
@@ -975,6 +977,7 @@ announce_platform_agent_mode_switch() {
     fi
     return 0
   fi
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
   print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
   if [ "$to" = "next" ]; then
     print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, Google Chat moves from the agent to the A2A gateway."
@@ -1140,7 +1143,7 @@ refuse_next_slack_gateway_settings() {
 # loaded, or what install.sh exported, plus a token the tfvars generator
 # recovered from the live Secret. $1 and $2 are the other's $7 and $8.
 refuse_next_slack_gateway_settings_from_env() {
-  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}" \
+  refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE}" \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
 }
@@ -1214,7 +1217,7 @@ warn_next_home_channel_unset() {
 
 # warn_next_home_channel_unset on the exported keys; $1 is its $6.
 warn_next_home_channel_unset_from_env() {
-  warn_next_home_channel_unset "${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}" \
+  warn_next_home_channel_unset "${PLATFORM_AGENT_MODE:-$DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE}" \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
 }
@@ -1249,6 +1252,7 @@ _platform_agent_mode_unread() {
 # happen, and is said with the scope check's remedy.
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
     PLATFORM_AGENT_READS_HELD_FOR=""
     return 0
@@ -4476,7 +4480,7 @@ write_tfvars_from_state() {
   # regenerate from install.env without install.sh's check, and the variable's
   # validation would otherwise refuse it at plan, naming neither the key nor
   # the file.
-  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}"
+  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE}"
   if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
     print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
     return 1
