@@ -1,5 +1,5 @@
 {
-  "version": "d6d2bbd209fef34e",
+  "version": "6d954a62a5ceca47",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -20,6 +20,7 @@
           "$JS.API.STREAM.CREATE.KV_runtime-state",
           "$JS.API.STREAM.CREATE.KV_session-state",
           "$JS.API.STREAM.CREATE.KV_cap",
+          "$JS.API.STREAM.CREATE.KV_feedback",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -27,6 +28,7 @@
           "$JS.API.STREAM.INFO.KV_runtime-state",
           "$JS.API.STREAM.INFO.KV_session-state",
           "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.STREAM.INFO.KV_feedback",
           "_INBOX.provision.>"
         ],
         "subscribe": [
