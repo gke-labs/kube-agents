@@ -37,6 +37,8 @@ smallest thing that has an identity, so the pod is the boundary a credential get
 taking the identity away from the pod the model's shell lands in is what this design is
 for.
 
+**Since closed:** the gateway now runs as its own unannotated ServiceAccount (`<agent>-gateway-agent`) and its NetworkPolicy opens no metadata path; the annotated one is the broker's alone. The text below is the record of the gap as it stood.
+
 The gateway and the broker still share the annotated ServiceAccount, so the gateway pod
 retains an ambient cloud identity. That is the remaining gap, and it is what
 `spec.security.workloadIdentityFederation` closes: with it configured the broker reads an
@@ -2376,8 +2378,8 @@ the script deleted. An operator back-fills a card with no subscription with the 
 `hermes kanban notify-subscribe`, run in the agent pod.
 
 **Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
-`hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and
-`agents/platform/skills/fleet-audit/SKILL.md:53`. Both spell it
+`hermes cron run <job-id>`, at `agents/platform/AGENTS.md` and
+`agents/platform/skills/fleet-audit/references/on-demand.md`. Both spell it
 `/opt/hermes/.venv/bin/hermes`, which is absent from the sandbox twice over. The other
 matches across `agents/` are either prose mentioning the binary or agent-side processes
 that stay put; `agentplugins/gke-stockout-investigator/scenarios/lib/common.sh:617`
@@ -2568,7 +2570,7 @@ With the proxy gone, the shell in the sandbox, and `automountServiceAccountToken
 already in place, the gateway pod's credential surface is `SESSION_KV_API_KEY` and
 `SESSION_KV_SALT` — and Part A removes those too by putting the Session KV server behind
 its own interface. It keeps the `iam.gke.io/gcp-service-account` annotation on
-`kubeagents-platform-agent`, which is the remaining gap: no process in that pod uses it,
+`kubeagents-platform-agent`, which was the remaining gap (since closed by giving the gateway its own ServiceAccount): no process in that pod uses it,
 but it is still mintable from `169.254.169.254` by anything that gets execution there.
 
 ### Cron jobs that authenticate without a model turn
@@ -2940,6 +2942,8 @@ The broker runs in a pod of its own whether or not `workloadIdentityFederation` 
 configured, and the shell is in the sandbox either way. What federation adds is a credential
 source that is a file in the broker's pod rather than the metadata server answering a
 ServiceAccount two pods share. Without it, two things stay open:
+
+**Since closed:** the gateway now runs as its own unannotated ServiceAccount (`<agent>-gateway-agent`) and its NetworkPolicy opens no metadata path; the annotated one is the broker's alone. The text below is the record of the gap as it stood.
 
 **The gateway pod keeps a cloud identity.** The gateway and the broker both run as
 `kubeagents-platform-agent`, which carries the `iam.gke.io/gcp-service-account` annotation,

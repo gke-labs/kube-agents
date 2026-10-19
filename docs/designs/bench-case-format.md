@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -123,8 +123,9 @@ stands in for the trajectory, and the token, latency and status signals still ap
 a bare YAML boolean, and devops-bench ignores it.
 
 `audit_streams` is for a case whose stack starts real audit runs without grading their
-ledger: a list of the Platform Agent job ids it starts
-(`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
+ledger, or whose agent runs a stream's collector outside a ledger run and so shares that
+stream's scratch state (`upgrade-chat-request-runs-collector`): a list of the Platform Agent
+job ids (`audit_streams: [compliance-audit, stockout-prevention]`). The runner holds each one's stream
 lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
@@ -132,13 +133,15 @@ unit on the stream, which waits for it first (`wait_platform_runs`), so an audit
 run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
 starts. devops-bench ignores the key.
 
-The runner pauses most of the Platform Agent's clock-started audits once per lease, before any
-unit (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
+The runner pauses most of the Platform Agent's clock-started audits at lease time and again
+right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
 four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
 `no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a
 write from one of them mid-eval is still possible. An audit case starts its own run from its
-prompt, which a paused schedule doesn't affect.
+prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
+stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
+charged to the cases.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
@@ -204,7 +207,7 @@ deployment's ready replicas land in a range). A fourth, `fleet_resource_property
 this repository's `resource_property` against the seeded-fleet cluster that carries a
 fixture role, named by `fixture_role:` rather than by cluster.
 
-Ten read what the run produced, from this repository
+Eleven read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer; its `forbidden_patterns`, `required_patterns` and
@@ -233,7 +236,7 @@ entry for every slot it means; its `fixture_roles` names the seeded-fleet
 roles whose clusters the patterns require a line about, each resolved to its slot's own
 credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
 before any role on it is confirmed), and a slot the runner did not reach returns
-`status: "error"`, the cluster being absent from the project rather than missed by the agent), `answer_first` (each delivered card result, raw:
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `report_manifest` (the fenced code blocks in the same text, parsed as YAML: one document of `kind` carries every `fields` value and a label selector that selects every `selects` set and no `excludes` set), `answer_first` (each delivered card result, raw:
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's
@@ -246,9 +249,9 @@ prefix written to the case's GitOps repository since the repetition started; it
 passes on a write, so a case wraps it in `none` to say the agent wrote nothing
 it was not asked for, and the inject lane appends exactly that entry to every
 case it runs), `worker_commands` (regular expressions over the terminal commands
-the delegated workers ran, read from each card's worker log before the harness
-purges it; each of its `exempt_patterns` removes the text it matches from a
-command before the forbidden list reads it, and nothing else, and takes a
+the delegated workers ran, read from the worker log of each card the front agent filed before the harness
+purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory; each of its `exempt_patterns` removes the text it matches from a
+command, a log line or a tagged call alike, before the forbidden list reads it, and nothing else, and takes a
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
 `grep` exempted through its pattern argument so that whatever else shares the
@@ -306,6 +309,12 @@ that got going (running, completed, or ended after its start), each starting onl
 `relay-report` stack's state file and what the Session KV server stored for the report's threads,
 and passes when the route answered `delivered` and every stored post is the report exactly; a
 route that delivered but stored nothing fails, and one whose send registered no thread (outcome unknown) is an error.
+`audit_chat_report_posted`, in its own module (`bench/kube_agents_bench/audit_chat_report.py`), reads
+the `audit-chat-report` stack's state file, what the Session KV server stored for the fired audit
+job's threads since the fire, and the chat report the run's `finish` left on the shell sandbox, and
+passes when the stored post, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`,
+whose record predates the fire, or that did not finish every repository it started fails, and a
+silent run or one that never ended is an error.
 
 Two limits are worth knowing before choosing one. `tool_called` defaults to
 `scope: router`, the delegating turn's calls only — the harness appends the delegated
@@ -323,15 +332,17 @@ And `report_contains` defaults to `scope: final`, the answer the user receives. 
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears
 in quoted material. `worker_commands` reads the route a worker took through its terminal
-commands, not its MCP tool calls, and only for cards the run delegated — a router that
+commands, not its MCP tool calls, and only for cards the run delegated (a card a worker
+filed is read from the trajectory, as far as the capture reached it) — a router that
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
-pass. What it reads is the one-line rendering hermes writes to the card log, not the command
-as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||` arrives as its first
-command plus ` + N command(s)`, and a redirection is dropped, so a pattern never sees a command
-chained behind another, and the quotes stay, so a listed word the command splits with an empty
-quote inside it is one word to the shell and none to the pattern; the command as typed is on the
-trajectory, tagged with the worker's profile, and reading it from there, split into words, is the
-verifier change that closes both gaps. `worker_agents` reads only which profile made the workers' tagged entries, and the
+pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
+log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a pattern
+never sees a command chained behind another, and the quotes stay, so a listed word the command
+splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
+worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
+written against the rendering can miss that card's command behind a `cd … &&` or on a second
+line, and a capture gap on that card does not change the result (#3406). `worker_agents` reads only which profile made the workers' tagged entries, and the
 judged metrics receive those entries as the execution trace.
 
 Every one fails closed. A check that cannot observe its subject returns `status: "error"`,

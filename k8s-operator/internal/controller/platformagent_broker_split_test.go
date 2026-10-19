@@ -239,7 +239,7 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
-		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell",
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell",
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
 	}
 	for name, expected := range want {
@@ -655,6 +655,16 @@ func TestARefusalStillReconcilesTheAgentsNetworkPolicies(t *testing.T) {
 			},
 			reason: reasonForbiddenVolumeMount,
 		},
+		{
+			name: "an override naming the gateway's ServiceAccount",
+			mutate: func(agent *agentv1alpha1.PlatformAgent) {
+				if agent.Spec.Security == nil {
+					agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
+				}
+				agent.Spec.Security.ServiceAccountName = gatewayServiceAccountName(agent)
+			},
+			reason: reasonReservedServiceAccount,
+		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			agent := brokerPodAgent()
@@ -916,7 +926,7 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
-	want := "system:serviceaccount:test-ns:test-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
+	want := "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
 	if got := allowedBrokerCallers(agent); got != want {
 		t.Fatalf("callers = %q, want %q", got, want)
 	}
@@ -982,5 +992,71 @@ func TestTheBrokerPinsTheDriftDetectorsOwnSubscription(t *testing.T) {
 	off := agentWithDriftDetector(&agentv1alpha1.DriftDetectorSpec{Enabled: ptr.To(false)})
 	if _, found := brokerEnvValue(buildCredentialProxyEnv(off), watcherSubscriptionEnvVar); found {
 		t.Errorf("with the detector off the broker must name no subscription, so every Pub/Sub call is refused")
+	}
+}
+
+// TestAnOverrideNamingAnOperatorServiceAccountWritesNoServiceAccount pins that
+// the controller refuses the collision before step 3, with no webhook in
+// front of it: no ServiceAccount of that name is written, and above all not
+// with the broker's Workload Identity annotation, which would hand the gateway
+// the broker's cloud identity.
+func TestAnOverrideNamingAnOperatorServiceAccountWritesNoServiceAccount(t *testing.T) {
+	agent := brokerPodAgent()
+	if agent.Spec.Security == nil {
+		agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
+	}
+	agent.Spec.Security.ServiceAccountName = gatewayServiceAccountName(agent)
+	agent.Spec.Security.ServiceAccountAnnotations = map[string]string{
+		"iam.gke.io/gcp-service-account": "broker@p.iam.gserviceaccount.com",
+	}
+	if msg := ReservedServiceAccountOverride(agent); msg == "" {
+		t.Fatal("the override is not recognised as a collision")
+	}
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("a refusal is a Degraded status, not a reconcile error: %v", err)
+	}
+	sa := &corev1.ServiceAccount{}
+	err := cl.Get(ctx, types.NamespacedName{Name: gatewayServiceAccountName(agent), Namespace: agent.Namespace}, sa)
+	if err == nil {
+		t.Fatalf("a ServiceAccount named %q was written, annotations %v", sa.Name, sa.Annotations)
+	}
+	if !errors.IsNotFound(err) {
+		t.Fatalf("get: %v", err)
+	}
+}
+
+// TestTheManagedEnvPinsTheManagementProjectExceptOnKind pins GKE_PROJECT_ID in
+// the managed .env, which the agent's PVC .env cannot outrank, on a GKE
+// harness; and leaves it out on kind, where the container env carries none.
+func TestTheManagedEnvPinsTheManagementProjectExceptOnKind(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		harness *agentv1alpha1.HarnessSpec
+		want    string
+	}{
+		{"gke", &agentv1alpha1.HarnessSpec{ProjectID: "mgmt-project", Location: "us-east4", ClusterName: "mgmt"}, "GKE_PROJECT_ID=mgmt-project"},
+		{"kind", &agentv1alpha1.HarnessSpec{ProjectID: "kind", Location: "kind", ClusterName: "kind"}, ""},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec:       agentv1alpha1.PlatformAgentSpec{Harness: testCase.harness},
+			}
+			var pinned []string
+			for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+				if strings.HasPrefix(line, "GKE_PROJECT_ID=") {
+					pinned = append(pinned, line)
+				}
+			}
+			switch {
+			case testCase.want == "" && len(pinned) != 0:
+				t.Errorf("kind harness pins %v; the container env carries no project there", pinned)
+			case testCase.want != "" && (len(pinned) != 1 || pinned[0] != testCase.want):
+				t.Errorf("managed .env pins %v, want [%s]", pinned, testCase.want)
+			}
+		})
 	}
 }

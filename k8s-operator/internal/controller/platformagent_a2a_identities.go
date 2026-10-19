@@ -693,19 +693,14 @@ const a2aVerifierUser = "verifier"
 // another agent asks the gateway, which is a task the gateway authors; it does
 // not write another addressee's event stream itself.
 //
-// Keyed on agentServiceAccountName, which spec.security.serviceAccountName can
-// override. Two consequences worth naming. The map entry follows the override
-// (the operator renders both from the same call, so they cannot drift). And an
-// override that collides with another principal's ServiceAccount would put two
-// entries under one key, which validateA2AAuthMapIdentities refuses by returning
-// "duplicate serviceAccount" — buildA2AAuthMapConfigMap fails, and with it the
-// reconcile. Note where that refusal is NOT: the webhook validates
-// spec.security.serviceAccountName against restrictedServiceAccounts only, so
-// the CR is admitted and the operator then wedges on
-// "failed to render the A2A identity map" rather than the apply being
-// rejected. Fail-closed, but the diagnosis is a controller log rather than an
-// admission error. TestPrincipalsAreDistinct holds the default
-// render; TestAnOverriddenServiceAccountThatCollidesIsRefused holds this path.
+// Keyed on gatewayServiceAccountName: the gateway Pod's own ServiceAccount, which
+// the agent container holding the bus token runs as, and which the operator
+// names. spec.security.serviceAccountName names the broker's identity, the one
+// with the cloud binding, so an override there does not reach this map.
+// validateA2AAuthMapIdentities still refuses two entries under one key
+// ("duplicate serviceAccount"). TestPrincipalsAreDistinct holds the default
+// render; TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal holds the
+// override.
 func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	publish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
@@ -723,10 +718,12 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	publish = append(publish, "_INBOX."+a2aAgentBusUser+".>")
 
 	return a2aIdentity{
-		user:           a2aAgentBusUser,
-		account:        a2aAccountApp,
-		auth:           a2aAuthCallout,
-		serviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),
+		user:    a2aAgentBusUser,
+		account: a2aAccountApp,
+		auth:    a2aAuthCallout,
+		// The gateway Pod's ServiceAccount: the agent container that holds the
+		// bus token runs as it. Same grant as before the split, new principal.
+		serviceAccount: a2aServiceAccountName(ns, gatewayServiceAccountName(agent)),
 		comment: "the platform agent container. Reads the whole blackboard and writes three\n" +
 			"topics on it. Beyond that, exactly two things: STREAM.INFO and DIRECT.GET on\n" +
 			"the two TOPICS streams, which carry the blackboard and nothing else, and its\n" +

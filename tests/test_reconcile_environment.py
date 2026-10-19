@@ -293,6 +293,28 @@ class LifecyclePlanTest(unittest.TestCase):
                          "update the sed range when the header comment changes length")
 
 
+class UpgradeArgumentsTest(unittest.TestCase):
+    """The arguments reconcile_environment.sh hands upgrade.sh, built by its own block."""
+
+    def _args(self, **env):
+        text = _RECONCILE_SH.read_text()
+        start = text.index("UPGRADE_ARGS=(--non-interactive)")
+        block = text[start:text.index("\n\n", start)]
+        script = f"set -euo pipefail\nMODE=apply\n{block}\nprintf '%s\\n' \"${{UPGRADE_ARGS[@]}}\""
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env={"PATH": os.environ["PATH"], **env})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.split()
+
+    def test_the_bypass_is_passed_only_when_asked_for(self):
+        self.assertNotIn("--allow-breaking-downgrade", self._args(IMAGE_TAG="0.1.0"))
+        self.assertNotIn("--allow-breaking-downgrade", self._args(IMAGE_TAG="0.1.0", ALLOW_BREAKING_DOWNGRADE="false"))
+        self.assertEqual(
+            self._args(IMAGE_TAG="0.1.0", ALLOW_BREAKING_DOWNGRADE="true"),
+            ["--non-interactive", "--image-tag=0.1.0", "--allow-breaking-downgrade"],
+        )
+
+
 class PlanArtifactSafetyTest(unittest.TestCase):
     """The plan text is published as an artifact and quoted into an issue."""
 
@@ -357,6 +379,32 @@ class ReconcileWorkflowTest(unittest.TestCase):
         checkout = next(step for step in self.job["steps"]
                         if str(step.get("uses", "")).startswith("actions/checkout@"))
         self.assertEqual(checkout["with"]["ref"], "${{ inputs.image_tag }}")
+
+    def test_the_breaking_change_bypass_reaches_the_script_off_by_default(self):
+        """A rollback of an environment across a breaking change needs a way to consent."""
+        triggers = self.doc.get("on") or self.doc.get(True)
+        for trigger in ("workflow_call", "workflow_dispatch"):
+            with self.subTest(trigger=trigger):
+                spec = triggers[trigger]["inputs"]["allow_breaking_downgrade"]
+                self.assertEqual(spec["type"], "boolean")
+                self.assertIs(spec["default"], False)
+        step = next(s for s in self.job["steps"] if s.get("id") == "reconcile")
+        self.assertEqual(step["env"]["ALLOW_BREAKING_DOWNGRADE"], "${{ inputs.allow_breaking_downgrade }}")
+
+    def test_every_deploy_dispatch_can_pass_the_bypass(self):
+        """The deploy workflows' own image_tag dispatch is where a refused rollback is retried."""
+        for name in ("autopush-deploy.yml", "autopush-next-deploy.yml", "staging-deploy.yml"):
+            with self.subTest(workflow=name):
+                doc = _doc(_WORKFLOWS / name)
+                triggers = doc.get("on") or doc.get(True)
+                spec = triggers["workflow_dispatch"]["inputs"]["allow_breaking_downgrade"]
+                self.assertEqual(spec["type"], "boolean")
+                self.assertIs(spec["default"], False)
+                callers = [job for job in doc["jobs"].values()
+                           if str(job.get("uses", "")).startswith("./.github/workflows/reconcile-environment.yml")]
+                self.assertEqual(len(callers), 1)
+                self.assertEqual(callers[0]["with"]["allow_breaking_downgrade"],
+                                 "${{ inputs.allow_breaking_downgrade == true }}")
 
     def test_it_can_read_the_actions_api(self):
         """The in-flight redeploy check is a `gh run list`."""

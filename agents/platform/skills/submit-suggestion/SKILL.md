@@ -31,7 +31,7 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
   the change addresses a fleet-audit finding (it carries a finding id, or an
   `[audit]` ledger issue lists that exact deviation as a finding), the
   **fleet-audit** skill opens that pull request itself, through its `remediate`
-  subcommand — see `skills/fleet-audit/SKILL.md` for the invocation. That path
+  subcommand — see `/opt/data/profiles/platform/skills/fleet-audit/references/remediation.md` for the invocation. That path
   keys the branch on the files the fix touches, so a rerun cannot open a
   duplicate: a live PR is left untouched rather than force-pushed over, and one
   the harness withdrew as stale is re-proposed on the same branch. It applies
@@ -81,7 +81,7 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py pre
 
 _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` or `--repo "acme/fleet" --branch "platform-agent/upgrade-policy-baseline"`)_
 
-In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.5).
+In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3, item 6).
 
 It prints one JSON line. **Keep it — Step 2 works inside its `workspace`.** The
 `workspace` is named for your branch as well as the repository, because
