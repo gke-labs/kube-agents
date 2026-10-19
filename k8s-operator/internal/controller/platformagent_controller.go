@@ -177,6 +177,21 @@ const (
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
 
+	// The condition reporting that the A2A gateway holds a chat backend with
+	// no home channel to post to. Under next the gateway, not the agent, makes
+	// the proactive posts (alerts, drift, scheduled reports), and it arms them
+	// only on a home channel; a reply in a conversation still arrives, so an
+	// install without one looks healthy while every unprompted post is
+	// dropped (#3320). Written only in that state, like EventWatcher, and it
+	// leaves Ready alone: chat works, and some installs want no posts.
+	homeChannelUnsetConditionType = "HomeChannelUnset"
+	homeChannelUnsetReason        = "NoHomeChannel"
+	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
+	// install.env key and what the field holds.
+	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s (spec.mode next) and %[2]s is empty, so the agent's " +
+		"proactive posts -- alerts, drift reports, scheduled reports -- have nowhere to go and are dropped; " +
+		"replies in a conversation still arrive. Set %[2]s (%[3]s in install.env) to %[4]s to deliver them."
+
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
 	// EventWatcher pattern above, and not a Degraded state: the Pod runs, the
@@ -298,6 +313,10 @@ const (
 
 	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 	reasonForbiddenVolumeMount = "ForbiddenVolumeMount"
+	// reasonReservedServiceAccount: spec.security.serviceAccountName names a
+	// ServiceAccount the operator creates for another workload. See
+	// ReservedServiceAccountOverride.
+	reasonReservedServiceAccount = "ReservedServiceAccountName"
 )
 
 var (
@@ -655,8 +674,30 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}()
 	}
 
-	// 3. Reconcile Service Account (with Workload Identity annotation)
+	// 2z. Refuse an override that names one of the operator's own
+	// ServiceAccounts, before step 3 writes it with the broker's Workload
+	// Identity annotation. The webhook refuses it at admission, but the chart
+	// ships the webhook off and it fails open, so this is the check that holds.
+	// The same rescue as the volume refusal below: keep the guardrails, render
+	// no workload.
+	if msg := ReservedServiceAccountOverride(instance); msg != "" {
+		log.Info(msg)
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, workloadNotRendered); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 3. Reconcile Service Account (with Workload Identity annotation): the
+	// broker's. And the gateway's own, which carries none.
 	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileGatewayServiceAccount(ctx, instance); err != nil {
 		return ctrl.Result{}, err
 	}
 	// 3b. Reconcile RBAC (ClusterRole and ClusterRoleBindings)
@@ -1163,6 +1204,13 @@ func (r *PlatformAgentReconciler) reconcileServiceAccount(ctx context.Context, a
 	}
 
 	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, saName, agent.Namespace, annotations, commonLabels(agent), fieldOwner)
+}
+
+// reconcileGatewayServiceAccount mints the gateway Pod's own ServiceAccount,
+// with no annotations, so it resolves to no Google identity. Unconditional:
+// a user-owned spec.security.serviceAccountName is the broker's now.
+func (r *PlatformAgentReconciler) reconcileGatewayServiceAccount(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return ReconcileServiceAccount(ctx, r.Client, r.Scheme, agent, gatewayServiceAccountName(agent), agent.Namespace, nil, commonLabels(agent), fieldOwner)
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
@@ -3200,6 +3248,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	}
 
 	crbMinimal := buildClusterRoleBinding(agent, minimalBindingName, minimalRole.Name)
+	// The gateway's own ServiceAccount takes the same read-only grant: its
+	// agent-api-auth container watches and joins the management cluster with
+	// an in-cluster token. Same rules, a second principal; no new permission.
+	crbMinimal.Subjects = append(crbMinimal.Subjects, gatewaySubject(agent))
 	if err := r.applyManaged(ctx, agent, crbMinimal); err != nil {
 		return fmt.Errorf("failed to reconcile minimal ClusterRoleBinding: %w", err)
 	}
@@ -3214,6 +3266,10 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	}
 
 	localBinding := buildRoleBinding(agent, localBindingName, localRole.Name)
+	// The gateway's drift detector joins audit records by reading the object
+	// they name, PlatformAgents included (cmd/drift-detector/join.go). Same
+	// read-only grant, a second principal.
+	localBinding.Subjects = append(localBinding.Subjects, gatewaySubject(agent))
 	if err := ctrl.SetControllerReference(agent, localBinding, r.Scheme); err != nil {
 		return fmt.Errorf("failed to set controller reference on local RoleBinding: %w", err)
 	}
@@ -3589,7 +3645,7 @@ func setBusProvisionedCondition(agent *agentv1alpha1.PlatformAgent, want bool, j
 	}
 }
 
-// syncA2AConditions keeps the two render-derived conditions true of this
+// syncA2AConditions keeps the render-derived conditions true of this
 // pass on the paths that rendered the stack and then park Degraded
 // (A2AProvisionFailed, ShellSandboxKeysMissing), where updateStatusDegraded
 // is handed the CR and the refusal and nothing else. Without it a dark
@@ -3611,13 +3667,19 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	}
 	want := wantBusProvisioned(agent, a2a)
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
+	// The home-channel advisory rides here too: a rendered stack parked
+	// Degraded still runs a gateway that drops proactive posts, and a bare
+	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
+	homeMsg := homeChannelUnsetMessage(agent)
 	if a2aGatewayConditionCurrent(agent, dark) && busProvisionedConditionCurrent(agent, want) &&
-		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) {
+		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
+		homeChannelUnsetConditionCurrent(agent, homeMsg) {
 		return nil
 	}
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
 		wantLive := wantBusProvisioned(live, a2a)
-		return a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive)
+		return a2aGatewayConditionCurrent(live, dark) && busProvisionedConditionCurrent(live, wantLive) &&
+			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live))
 	}) {
 		return nil
 	}
@@ -3625,6 +3687,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AGatewayCondition(agent, dark, now)
 	setBusProvisionedCondition(agent, want, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
+	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -3907,6 +3970,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	hostPathDroppedMsg := hostPathDroppedMessage(agent, workloadRollIncomplete)
 	hostPathDroppedUnchanged := hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 
+	// The home-channel advisory, from the spec alone, compared on its message
+	// for the same reason EventWatcher's is.
+	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
+	homeChannelUnsetUnchanged := homeChannelUnsetConditionCurrent(agent, homeChannelUnsetMsg)
+
 	// The withheld-gateway condition, same class as EventWatcher and for the
 	// same reason it needs its own term: the flip from dark to rendered can
 	// leave the Ready phase and message exactly as they were (another
@@ -3967,6 +4035,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		(r.usageStatusPruned(agent) || slices.Equal(agent.Status.Usage.ActiveInterfaces, newActiveInterfaces)) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
+		homeChannelUnsetUnchanged &&
 		hostPathDroppedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
@@ -4040,6 +4109,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		})
 	}
 
+	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 
 	setA2AGatewayCondition(agent, a2aGatewayDark, now)
@@ -4107,6 +4177,50 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 // map does not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
+}
+
+// homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
+// spec, or "" when the condition is to be absent: the next stack holds no chat
+// backend, or the one it holds has a home channel. A malformed home channel is
+// not this condition's: the gateway refuses it at start and says so.
+func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent) string {
+	switch {
+	case a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "":
+		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
+			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)")
+	case a2aSlackArmed(agent) && strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "":
+		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
+			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)")
+	}
+	return ""
+}
+
+// homeChannelUnsetConditionCurrent reports whether the HomeChannelUnset
+// condition already says msg, where "" means the condition is to be absent.
+func homeChannelUnsetConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, homeChannelUnsetConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == homeChannelUnsetReason && existing.Message == msg
+}
+
+// setHomeChannelUnsetCondition writes the HomeChannelUnset condition, or
+// removes it when msg is "". The caller does the API write.
+func setHomeChannelUnsetCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, homeChannelUnsetConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               homeChannelUnsetConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             homeChannelUnsetReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
 }
 
 // hostPathDroppedConditionCurrent reports whether the VolumesDropped condition

@@ -84,6 +84,24 @@ At the default of `0` nothing is rendered and the gateway config is what it was.
 
 The value is a default the gateway supplies, not a cap it enforces: LiteLLM lets a request's own `max_tokens` win over the one in `litellm_params`. The agent image pinned today (Hermes `v2026.9.14`) does not send `max_tokens` on agent turns, so this value is the one the agent's requests get, the same as a direct call to the gateway's `/v1/chat/completions` that omits the field. Images built on `v2026.8.19` and earlier sent their own `max_tokens` on every request; on those the client's value won for agent turns and only a request that omitted the field took the configured one.
 
+### Setting the reasoning effort
+
+`litellm.reasoningEffort` is the reasoning effort the gateway asks the model for on a request that names none: `low`, `medium` or `high`. The chart renders it as `reasoning_effort` under every `model_list` alias. With `litellm.modelProvider=vertex_ai` and `litellm.reasoningEffort=high` the first alias reads:
+
+```yaml
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: vertex_ai/gemini-3.5-flash
+      reasoning_effort: "high"
+```
+
+LiteLLM translates the value for each provider. On Gemini 3.x, through `gemini` or `vertex_ai`, it becomes `thinkingConfig.thinkingLevel` on the request to Google. On Claude it becomes adaptive thinking with that effort, and OpenAI and `openai_compatible` servers receive `reasoning_effort` as written. A model that LiteLLM does not treat as a reasoning model, such as `gemini-2.0-flash`, fails every request with `UnsupportedParamsError`, so leave the value empty for one.
+
+At the default, empty, nothing is rendered: the gateway config and its checksum are what they were, and the model thinks at its own default level. The value is a default the gateway supplies, the same as `max_tokens` above: LiteLLM lets a request's own `reasoning_effort` win over the one in `litellm_params`.
+
+The chart is the only path that renders it. The kustomize dev copy carries no `reasoning_effort`, and neither `install.env` nor the Terraform example has a variable for it. Set it through the Terraform example's `extra_helm_values` (`{ litellm = { reasoningEffort = "high" } }`) or with `--set litellm.reasoningEffort=high` on a direct Helm install.
+
 ### Prompt caching
 
 Agent turns are mostly re-sent context: the same system prompt, skills, and conversation tail go up again on every tool call. Anthropic-family models bill that at full price unless the request marks where the reusable prefix ends, and the marks have to be in the request — so when the default model is an Anthropic-family one (`MODEL_PROVIDER=anthropic`, or `vertex_ai` with a `claude-` model), the gateway adds them, via [`cache_control_injection_points`](https://docs.litellm.ai/docs/tutorials/prompt_caching) in its `config.yaml`:
@@ -264,7 +282,7 @@ A self-hosted server refuses a request whose prompt and `max_tokens` do not fit 
 ### What it does not cover
 
 - The kustomize dev copy (`make -C k8s-operator deploy-litellm`) does not carry the provider, and the admin console's provider catalog does not list it. Install through `install.sh`, the Terraform example or the chart.
-- The repository ships no OpenAI-compatible server. The [vLLM example](#vllm-local-models) does not serve the OpenAI API as it ships.
+- The installer does not deploy a model server. The [vLLM example](#vllm-local-models) is one you apply yourself.
 - A self-hosted model does not make the install offline. The agent still needs Google APIs, and some of its tools reach the internet on their own. [Security and IAM](/kube-agents/reference/security-and-iam/#egress-when-model-data-must-stay-off-hosted-providers) lists each destination, which ones are required, and how to turn off the rest. A fully disconnected cluster is not supported.
 
 ## vLLM (local models)
@@ -273,9 +291,9 @@ A self-hosted server refuses a request whose prompt and `max_tokens` do not fit 
 
 ### What ships
 
-- [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) — Gemma via GKE's official inference tutorial. Requires an accelerator node pool (see `gke-compute-classes` skill).
+- [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) — Gemma 4 26B-A4B through vLLM's OpenAI-compatible server on two L4 GPUs, with a 128k-token context. Requires an accelerator node pool; the README gives the command. It runs in the release namespace, unlike the advice above; its README says what that means for the gateway's egress rule.
 
-The example as shipped runs vLLM's demo server (`vllm.entrypoints.api_server`), which does not serve the OpenAI API, so the gateway cannot use it unchanged. To put the gateway in front of vLLM, run vLLM's OpenAI-compatible server (`vllm serve`) and point `litellm.openaiCompatible.apiBase` at it, as [OpenAI-compatible endpoints](#openai-compatible-endpoints-self-hosted-or-private) describes.
+To put the gateway in front of it, point `litellm.openaiCompatible.apiBase` at its Service, as [OpenAI-compatible endpoints](#openai-compatible-endpoints-self-hosted-or-private) describes; the example's README gives the values.
 
 ## Inference replay
 

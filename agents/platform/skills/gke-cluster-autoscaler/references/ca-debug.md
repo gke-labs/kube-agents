@@ -41,6 +41,6 @@
 ## Segregating System Pods (Expert Pattern)
 Symptom: `kube-system` pods (metrics-server, coredns) land on expensive nodes and pin them.
 **Fix:** Segregate via namespace default ComputeClass.
-1. Apply a "cheap" `system-pool` ComputeClass.
-2. Label `kube-system` namespace:
-   `kubectl label ns kube-system cloud.google.com/default-compute-class-non-daemonset=system-pool`
+1. Propose a "cheap" `system-pool` ComputeClass as a pull request.
+2. In the same pull request, label the `kube-system` namespace:
+   `cloud.google.com/default-compute-class-non-daemonset: system-pool`

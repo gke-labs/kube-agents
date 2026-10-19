@@ -13,7 +13,8 @@ repositories that CI pulls from.
 ## The path
 
 1. Write the case under `bench/tasks/<name>/task.yaml`, and its OpenTofu stack, if it has
-   one, under `bench/tf/prebuilt/<name>/`. Both directories are what the rules below scan.
+   one, under `bench/tf/prebuilt/<name>/`. These directories (along with shared modules under
+   `bench/tf/modules/`) are what the rules below scan.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
    about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
 3. Register the case: add its `./tasks/<name>/task.yaml` line to
@@ -61,13 +62,13 @@ stack says in the pull request why neither would do, and stays in the nightly.
 ## Fixture sanitization
 
 A suite that encodes a real environment carries that environment's addresses, names and
-credentials, and a fixture merged here is public. The rule: nothing under `bench/tasks/` or
-`bench/tf/prebuilt/` names a real address, host, cluster, project or credential. Use the
+credentials, and a fixture merged here is public. The rule: nothing under `bench/tasks/`,
+`bench/tf/prebuilt/` or `bench/tf/modules/` names a real address, host, cluster, project or credential. Use the
 RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) for
 addresses, `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` for the cluster the runner provisions, and
 invented names for everything else.
 
-**Check:** `make bench-case-check` and the CI lint scan every text file under those two
+**Check:** `make bench-case-check` and the CI lint scan every text file under those
 directories and fail on a line that carries either:
 
 - an IPv4 literal outside the three documentation ranges. That covers every RFC 1918

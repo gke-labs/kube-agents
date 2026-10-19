@@ -356,13 +356,14 @@ class AdapterForTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "0"}):
             self.assertIs(self.wrap(adapter), adapter)
 
-    def test_an_adapter_not_rendering_rich_blocks_is_kept(self):
+    def test_an_adapter_not_rendering_rich_blocks_folds_nothing_but_drops_the_step_line(self):
         for extra in ({}, {"rich_blocks": True, "markdown_blocks": True}):
             adapter = _Adapter(extra=extra)
             with self.subTest(extra):
-                self.assertIs(self.wrap(adapter), adapter)
-        bare = SimpleNamespace(send=None)
-        self.assertIs(self.wrap(bare), bare)
+                wrapped = self.wrap(adapter)
+                self.assertFalse(wrapped._fold)
+                asyncio.run(wrapped.send(CHANNEL, f"{ANSWER}\n\n[next: scale the pool]", metadata=METADATA))
+                self.assertEqual(adapter.log, [("send", CHANNEL, ANSWER, METADATA)])
 
 
 class SendTest(unittest.TestCase):
@@ -476,6 +477,104 @@ class SendTest(unittest.TestCase):
         self.send(adapter, f"{HEADLINE} Want me to watch it?")
         self.assertEqual([block["type"] for block in adapter.log[0][1]["blocks"]], ["rich_text", "section"])
 
+    def test_a_declared_next_step_is_one_button_after_the_question(self):
+        question = "Want me to scale the pool to 6 nodes?"
+        answer = f"{ANSWER}\n\n{question}\n\n[next: scale the pool to 6 nodes]"
+        adapter = _Adapter()
+        self.send(adapter, answer)
+        post = adapter.log[0][1]
+        self.assertEqual(post["text"], f"mrkdwn({ANSWER}\n\n{question})", "no step line in the text Slack keeps")
+        _headline, fold, after, actions = post["blocks"]
+        self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
+        self.assertEqual(after, _render_blocks(question, adapter.format_message)[0])
+        (button,) = actions["elements"]
+        self.assertEqual(
+            (button["text"]["text"], button["value"], button.get("style"), button["action_id"]),
+            ("scale the pool to 6 nodes", "scale the pool to 6 nodes", None, "kage_answer.choice.0"),
+        )
+        self.assertNotIn("[next:", json.dumps(post["blocks"]))
+
+    def test_a_declared_step_on_an_answer_the_fold_refuses_draws_it_whole(self):
+        # One sentence and a step: nothing follows the lead to fold, so upstream's rendering, then the button.
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, "Checkout is healthy.\n\n[next: check checkout on seeded-b]")
+        whole, actions = adapter.log[0][1]["blocks"]
+        self.assertEqual(whole, _render_blocks("Checkout is healthy.", adapter.format_message)[0])
+        self.assertEqual(actions["elements"][0]["value"], "check checkout on seeded-b")
+
+    def test_a_refused_step_keeps_the_question_unfolded_and_its_line_after_it(self):
+        question = "Want me to scale the pool to 6 nodes?"
+        refused = "[next: " + "scale " * 13 + "the pool]"
+        adapter = _Adapter()
+        self.send(adapter, f"{ANSWER}\n\n{question}\n\n{refused}")
+        post = adapter.log[0][1]
+        _headline, fold, asked = post["blocks"]
+        self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
+        self.assertEqual(asked, _render_blocks(question, adapter.format_message)[0])
+        self.assertNotIn("[next:", json.dumps(post))
+
+    def test_a_fold_that_refuses_a_divider_draws_the_answer_whole_with_its_step(self):
+        # split accepts the answer, but its rest holds a divider, which a fold cannot keep.
+        answer = "All good in seeded-b. Two pods restarted.\n\n---\n\nOne pod restarted.\n\n[next: check seeded-a]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger) as logs:
+            self.send(adapter, answer)
+        # The log says what happened: the fold was refused, and the answer was drawn whole.
+        self.assertIn("the fold is refused", logs.output[0])
+        self.assertIn("posted the answer drawn whole with its step's button", logs.output[-1])
+        blocks = adapter.log[0][1]["blocks"]
+        self.assertIn({"type": "divider"}, blocks)
+        self.assertEqual(blocks[-1]["elements"][0]["value"], "check seeded-a")
+        self.assertNotIn("[next:", json.dumps(adapter.log[0][1]))
+
+    def test_an_answer_drawn_whole_keeps_a_divider(self):
+        # A top-level post may hold any block the plugin renders; only a fold limits the types.
+        answer = "## Summary\n\nAll good in seeded-b.\n\n---\n\nOne pod restarted.\n\n[next: check seeded-a]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, answer)
+        blocks = adapter.log[0][1]["blocks"]
+        self.assertIn({"type": "divider"}, blocks)
+        self.assertEqual(blocks[-1]["elements"][0]["value"], "check seeded-a")
+
+    def test_an_answer_drawn_whole_at_the_block_cap_keeps_the_upstream_post(self):
+        answer = "\n\n".join(f"- item {i}" for i in range(runtime.MESSAGE_BLOCKS_MAX)) + "\n\n[next: check it]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, answer)
+        self.assertEqual(adapter.log, [("send", CHANNEL, answer.rsplit("\n\n", 1)[0], METADATA)])
+
+    def test_options_win_over_a_declared_step_on_an_answer_drawn_whole(self):
+        # split refuses a heading opener; the answer still asks to choose, so no step button is drawn.
+        answer = "## Two ways\n\n1. **Scale it**\n2. **Shed load**\n\nWhich do you want?\n\n[next: scale it]"
+        adapter = _Adapter()
+        with self.assertLogs(runtime.logger):
+            self.send(adapter, answer)
+        self.assertEqual(adapter.log, [("send", CHANNEL, answer.rsplit("\n\n", 1)[0], METADATA)])
+
+    def test_options_win_over_a_declared_step(self):
+        answer = f"{HEADLINE} Two ways.\n\n1. **Scale it**\n2. **Shed load**\n\nWhich do you want?\n\n[next: scale it]"
+        adapter = _Adapter()
+        self.send(adapter, answer)
+        actions = adapter.log[0][1]["blocks"][-1]
+        self.assertEqual([b["value"] for b in actions["elements"]], ["Scale it", "Shed load"])
+
+    def test_outside_a_thread_a_declared_step_stays_as_written(self):
+        adapter = _Adapter()
+        wrapped = runtime.adapter_for(
+            adapter, "slack", SimpleNamespace(kind="completed"), SimpleNamespace(), {"chat_id": CHANNEL}
+        )
+        question = "Want me to scale the pool to 6 nodes?"
+        asyncio.run(wrapped.send(CHANNEL, f"{ANSWER}\n\n{question}\n\n[next: scale the pool]", metadata={}))
+        blocks = adapter.log[0][1]["blocks"]
+        self.assertNotIn("actions", [block["type"] for block in blocks])
+        # The question still posts unfolded, and nothing takes the step's place.
+        _headline, fold, asked = blocks
+        self.assertEqual(fold["child_blocks"], _render_blocks(REST, adapter.format_message))
+        self.assertEqual(asked, _render_blocks(question, adapter.format_message)[0])
+        self.assertNotIn("[next:", json.dumps(adapter.log[0][1]))
+
     def test_a_top_level_chat_posts_without_a_thread(self):
         adapter = _Adapter()
         wrapped = runtime.adapter_for(
@@ -484,6 +583,13 @@ class SendTest(unittest.TestCase):
         asyncio.run(wrapped.send(CHANNEL, ANSWER, metadata={}))
         self.assertNotIn("thread_ts", adapter.log[0][1])
         self.assertEqual([entry[0] for entry in adapter.log], ["chat_postMessage"])
+
+    def test_an_actionable_report_posts_upstream_without_the_step_line(self):
+        report = "Checkout is slow.\n\n**Option A:** scale it\n**Option B:** shed load\n\n[next: apply option A]"
+        adapter = _Adapter()
+        with mock.patch.object(kanban_notifier, "actionable_report", return_value=True), self.assertLogs(runtime.logger):
+            self.send(adapter, report)
+        self.assertEqual(adapter.log, [("send", CHANNEL, report.rsplit("\n\n", 1)[0], METADATA)])
 
     def test_a_refused_answer_takes_the_upstream_send(self):
         adapter = _Adapter()

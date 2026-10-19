@@ -141,6 +141,12 @@ each give the join one cluster's credentials, and with `--project` these two are
 cluster those credentials reach. Omit either and startup refuses the flags rather than joining
 against the wrong cluster.
 
+Startup also tries to confirm that the credentials reach the cluster the flags name. With
+`--in-cluster` it asks the metadata server for the node's project and cluster attributes. Inside the
+gateway Pod that path is closed (the Pod holds no Google identity and its NetworkPolicy does not open
+the metadata server), so the probe times out, the detector logs that the cluster is taken on trust,
+and the join runs on the operator's triple. A kubeconfig run still confirms it from the context name.
+
 **The daemon is loopback-only**, and that decides where this binary can run. `docker-entrypoint.sh`
 starts it with `--host 127.0.0.1 --port 8699`, so `--daemon-url` has nothing to point at from
 outside the agent Pod's network namespace. For a local run against a real install, forward the port
@@ -350,6 +356,14 @@ seven days of Admin Activity logs across three projects, which leaves it open wh
 one at all — so a dry-run write by a person would currently be reported as drift, and the first
 step on it is establishing what the payload looks like rather than writing a rule for a shape
 nobody has seen.
+
+**Coordination objects are not drift.** Tools such as `scripts/live_test_lease.py`
+([`docs/designs/live-test-lease.md`](../../../docs/designs/live-test-lease.md)) create and update the
+`live-test-lease` ConfigMap in `kubeagents-system` under a contributor's own credential during live
+testing. Even though the principal is human and the call mutates cluster state, the object is an
+ephemeral developer mutex and not part of the cluster's declared GitOps state. `isCoordinationResource`
+drops writes to the `live-test-lease` ConfigMap, counting them as `non_declarative` so they are not
+flagged as out-of-band drift or offered for reversion.
 
 **A failed call is not drift.** The audit log records attempts: writes rejected by RBAC, refused by
 admission, or aborted after losing an optimistic-concurrency race. A 24-hour query for failed

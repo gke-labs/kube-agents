@@ -95,6 +95,13 @@ readonly KV_DAEMON_HOST=127.0.0.1
 readonly KV_DAEMON_PORT=8699
 readonly KV_DAEMON_URL="http://${KV_DAEMON_HOST}:${KV_DAEMON_PORT}"
 
+# The agent gateway the daemon starts each triage turn on, on the same loopback
+# (session_kv_server.py's PLATFORM_API_URL default). The watcher waits for it to
+# answer before it watches events: the daemon accepts an inject before it starts
+# the turn, so an event offered while the gateway boots would be recorded as
+# delivered with no triage behind it.
+readonly AGENT_GATEWAY_URL="http://127.0.0.1:8642"
+
 # How long to wait for that daemon to start listening before launching the
 # detector anyway. This container is a native sidecar, so it starts before the
 # platform-agent container the daemon runs in, and the detector's startup check
@@ -606,6 +613,7 @@ start_event_watcher() {
         --metrics-addr="${metrics_addr}" \
         --in-cluster \
         --daemon-url="${KV_DAEMON_URL}" \
+        --gateway-url="${AGENT_GATEWAY_URL}" \
         --token-env=SESSION_KV_API_KEY \
         --owner=platform \
         --reason=Failed,FailedToDrainNode,CrashLoopBackOff,BackOff,ImagePullBackOff,ErrImagePull,OOMKilled,FailedScheduling,TriggeredScaleUp,NotTriggerScaleUp \

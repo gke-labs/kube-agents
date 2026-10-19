@@ -75,11 +75,6 @@ terraform {
 }
 
 locals {
-  # Every kubectl below runs against a kubeconfig this stack fetches for itself
-  # in step 0, never the ambient one -- see that step for why the ambient
-  # current-context is the wrong cluster by the time this apply runs.
-  kubectl = "kubectl --namespace=${var.drift_namespace}"
-
   ns       = var.drift_namespace
   workload = var.workload_name
 
@@ -127,6 +122,11 @@ locals {
   card_wait_timeout         = 300
   poll_interval             = 10
 
+  # What the failure dump prints before tearing the namespace down. This
+  # stack's evidence is a rollout history, so the ReplicaSets matter as much
+  # as the Deployment.
+  failure_resources = "deployments,replicasets,pods"
+
   ci_labels = {
     "managed-by"  = "kube-agents-bench"
     "case"        = "gitops-drift-load-bearing-change-triage"
@@ -140,7 +140,7 @@ resource "null_resource" "load_bearing_change" {
     # Destroy-time provisioners may read only `self`, so everything the
     # teardown names is copied in here -- including the cluster coordinates,
     # because the destroy fetches its own credentials for the same reason
-    # step 0 does and cannot reach `var`.
+    # drift_init does and cannot reach `var`.
     namespace     = local.ns
     host_cluster  = var.host_cluster_name
     host_location = var.host_cluster_location
@@ -167,134 +167,37 @@ resource "null_resource" "load_bearing_change" {
     command     = <<-EOT
       set -euo pipefail
 
-      # ---- 0. Point kubectl at the cluster the agent is on ------------------
-      # Fetched here rather than inherited: devops-bench calls
-      # deployer.get_cluster_info() unconditionally after up(), which shells
-      # `gcloud container clusters get-credentials` with no --kubeconfig, so any
-      # deployer: tofu task earlier in the matrix leaves its own per-run cluster
-      # selected. ../gitops-drift step 0 carries the argument in full.
-      kubeconfig_dir="$(mktemp -d)"
+      # The scaffolding every gitops-drift fixture shares -- the kubeconfig
+      # fetch, the labelled-leftover guard, the healthz probe, the session and
+      # inject exchange and the card poll -- is one file, and the three stacks
+      # that used to carry their own copy now source it. What stays here is the
+      # scenario: three observed rollouts, the assertions on them, and the
+      # payload's values. The module's header documents every variable below.
+      drift_ns="${local.ns}"
+      drift_cluster="${var.host_cluster_name}"
+      drift_location="${var.host_cluster_location}"
+      drift_project_id="${var.project_id}"
+      drift_managed_by="${local.ci_labels["managed-by"]}"
+      drift_leftover_timeout=${local.leftover_delete_timeout}
+      drift_agent_namespace="${var.agent_namespace}"
+      drift_agent_container="${var.agent_container}"
+      drift_agent_deployment="${var.agent_deployment}"
+      drift_daemon_url="${var.daemon_url}"
+      drift_card_wait_timeout=${local.card_wait_timeout}
+      drift_poll_interval=${local.poll_interval}
+      drift_failure_resources="${local.failure_resources}"
 
-      # A plant that fails must not leave ${local.ns} behind: the leftover is
-      # what breaks the NEXT run. The teardown at the bottom of this file
-      # cannot be what prevents it -- Terraform taints a resource whose
-      # create-time provisioner failed and skips destroy-time provisioners on a
-      # tainted resource, so the destroy reports "1 destroyed" without running
-      # a line of it.
-      #
-      # `set +e` is load-bearing: errexit stays in force inside a trap, so the
-      # first command that failed would abort it and skip the delete.
-      planted_ns=""
-      on_exit() {
-        status=$?
-        set +e
-        if [ "$status" -ne 0 ] && [ -n "$planted_ns" ]; then
-          echo "Plant failed (exit $status). State of ${local.ns} before cleanup:" >&2
-          ${local.kubectl} get deployments,replicasets,pods -o wide >&2
-          ${local.kubectl} get events --sort-by=.metadata.creationTimestamp >&2
-          echo "Deleting ${local.ns} so the next run starts from a clean namespace." >&2
-          kubectl delete namespace "${local.ns}" --ignore-not-found --wait=false >&2
-        fi
-        rm -rf "$kubeconfig_dir"
-      }
-      trap on_exit EXIT
+      source "${path.module}/../../modules/drift-inject/drift_inject.sh"
 
-      # A Prow deadline delivers SIGTERM, and bash does not run an EXIT trap
-      # when the shell dies from an untrapped signal -- so without this the
-      # deadline kill leaks the namespace exactly as a failed plant would.
-      trap 'exit 143' TERM INT
+      drift_init
+      drift_clear_namespace
 
-      KUBECONFIG="$kubeconfig_dir/config"
-      export KUBECONFIG
-
-      project="${var.project_id}"
-      if [ -z "$project" ]; then
-        # GCPProvider.resolve_variables injects project_id for every task, so
-        # this is the local-run path rather than the CI one.
-        project="$(gcloud config get-value project 2>/dev/null || true)"
-      fi
-      if [ -z "$project" ]; then
-        echo "ERROR: no project id. Pass -var project_id=... or set a gcloud default project; this stack needs one to fetch credentials for ${var.host_cluster_name}." >&2
-        exit 1
-      fi
-
-      gcloud container clusters get-credentials "${var.host_cluster_name}" \
-        --location "${var.host_cluster_location}" --project "$project" --quiet
-
-      # ---- 0b. Clear what an earlier run left behind ------------------------
-      # This stack is MORE sensitive to a leftover than its siblings, because
-      # its evidence is a rollout history. Against a namespace that already
-      # holds the finished scenario the apply in step 1 would be a no-op, the
-      # patches in steps 3 and 4 would change nothing, no new ReplicaSet would
-      # be cut, and the case would grade an agent on the previous run's events --
-      # which may by then have expired, leaving a scenario with no evidence in
-      # it at all.
-      #
-      # Gated on the label step 1 writes, not on the name alone: this is the
-      # only unconditional namespace delete in the stack and it runs against
-      # the shared cluster the Platform Agent install lives on.
-      if kubectl get namespace "${local.ns}" >/dev/null 2>&1; then
-        # Not swallowed: the enclosing `if` has already proved the namespace
-        # exists, so a failing read here is a transport or RBAC failure and
-        # not an absent label. Swallowed, it becomes an empty value that the
-        # branch below reports as "this stack did not create it" -- a refusal
-        # with the wrong reason, and indistinguishable from a namespace that
-        # genuinely carries no label.
-        leftover_owner="$(kubectl get namespace "${local.ns}" \
-          -o jsonpath='{.metadata.labels.managed-by}')"
-        if [ "$leftover_owner" != "${local.ci_labels["managed-by"]}" ]; then
-          echo "ERROR: ${local.ns} already exists on ${var.host_cluster_name} but is not labelled managed-by=${local.ci_labels["managed-by"]} (found '$leftover_owner'). This stack did not create it, so it will not delete it. Remove it by hand if it is stale." >&2
-          exit 1
-        fi
-        echo "Found a leftover ${local.ns} from an earlier run; deleting it before planting."
-        if ! kubectl delete namespace "${local.ns}" --ignore-not-found --wait=true --timeout=${local.leftover_delete_timeout}s; then
-          echo "ERROR: could not clear the leftover ${local.ns} within ${local.leftover_delete_timeout}s, so this run cannot plant a fresh rollout history. A namespace wedged on a finalizer is the usual cause. Its current state follows." >&2
-          kubectl get namespace "${local.ns}" -o yaml >&2 || true
-          exit 1
-        fi
-      fi
-
-      # ---- 0c. Refuse a daemon that cannot take the record ------------------
-      # A daemon predating the `gitops-drift` dispatch takes the payload down
-      # its event path instead, grades it as a Warning Pod alert for `default/`,
-      # answers 200, and files a card that has nothing to do with drift. Every
-      # objective would then fail against a card that looks plausible in the
-      # transcript, which is the worst way for a fixture to be wrong.
-      #
-      # BEFORE THE PLANT, as gitops-drift-deleted-policy also does. This
-      # reads nothing the plant produces -- only the kubeconfig from step 0
-      # and four plain variables -- and this stack's plant is the expensive
-      # half of the file: three observed rollouts, two of them waiting out a
-      # failure. Probing afterwards would spend those minutes, let the exit
-      # trap tear the namespace back down, and then report a condition that
-      # was knowable in ten seconds.
-      #
-      # The merged ../gitops-drift still probes after its plant, and there it
-      # costs little: that plant is an apply, a patch and two reads with no
-      # wait. It is not a precedent for a stack that waits.
-      pod="deployment/${var.agent_deployment}"
-      exec_in_pod=(kubectl exec "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
-      exec_in_pod_stdin=(kubectl exec -i "$pod" -n "${var.agent_namespace}" -c "${var.agent_container}" --)
-
-      # jq runs inside the pod rather than on the runner: the agent image
-      # installs it, and the Prow runner has no jq in any of hack/'s scripts.
-      # `curl -fsS` and the body captured before jq sees it. Without -f, curl
-      # prints an error body and exits 0 on a 404; and inside `sh -c 'curl |
-      # jq'` the pipeline's status is JQ's, which is 0 on empty input -- so a
-      # connection refused, a wrong daemon_url or a timeout all produced an
-      # empty `kinds` with a zero status, and the branch below blamed the
-      # install's age for a daemon that was simply down. Measured: that
-      # pipeline exits 0 with curl failing.
-      kinds_rc=0
-      kinds="$("$${exec_in_pod[@]}" sh -c 'body="$(curl -fsS --max-time 10 "$1/healthz")" || exit $?; printf "%s" "$body" | jq -r ".inject_kinds[]?"' sh "${var.daemon_url}")" || kinds_rc=$?
-      if [ "$kinds_rc" -ne 0 ]; then
-        echo "ERROR: could not read ${var.daemon_url}/healthz in ${var.agent_container} (exit $kinds_rc); kubectl's or curl's own error is above. This says nothing about which inject kinds the daemon advertises -- it is an exec, RBAC, connection or HTTP failure, and the install may be perfectly current." >&2
-        exit 1
-      fi
-      if ! printf '%s\n' "$kinds" | grep -qxF 'gitops-drift'; then
-        echo "ERROR: the Session KV daemon at ${var.daemon_url} does not advertise the 'gitops-drift' inject kind (it advertises: $kinds). This install predates the drift dispatch, so a record sent to it would be graded as a Warning Pod event and reported back as delivered. Redeploy the agent image before running this case." >&2
-        exit 1
-      fi
+      # This stack is the reason the probe runs before the plant rather than
+      # after: its plant is three observed rollouts, two of them waiting out a
+      # failure, and a daemon that cannot take the record is knowable in ten
+      # seconds. Probing afterwards would spend those minutes, let the exit
+      # trap tear the namespace back down, and then report the condition.
+      drift_require_daemon
 
       # ---- 1. Apply what git declares (revision 1) --------------------------
       # Server-side as ${var.gitops_field_manager}, which is what a GitOps
@@ -309,7 +212,7 @@ resource "null_resource" "load_bearing_change" {
       # Three revisions are planted in all, and the sequence is the story the
       # agent has to read: this one, then the uid the operator tried, then the
       # one they settled for. Steps 2 to 4 lay them down in order.
-      planted_ns=1
+      drift_planted_ns=1
       kubectl create namespace "${local.ns}" --dry-run=client -o yaml | kubectl apply -f -
       kubectl label namespace "${local.ns}" --overwrite \
         managed-by="${local.ci_labels["managed-by"]}" \
@@ -555,193 +458,34 @@ resource "null_resource" "load_bearing_change" {
       echo "Planted ${local.resource_path}: three revisions -- declared (unrunnable), non-root uid (crash-looped), root (healthy)."
 
       # ---- 6. Hand the daemon the record ------------------------------------
-      # The key is read from the pod's own environment inside the exec, never
-      # passed in: SESSION_KV_API_KEY is on this container and a value that
-      # crossed the runner would be one argv away from a CI log.
-      session_id="$("$${exec_in_pod[@]}" sh -c \
-        'curl -sS --max-time 10 -X POST -H "Authorization: Bearer $SESSION_KV_API_KEY" "$1/sessions" | jq -r ".sessionID // empty"' \
-        sh "${var.daemon_url}" || true)"
-      if [ -z "$session_id" ]; then
-        echo "ERROR: the daemon returned no sessionID. A 401 here means SESSION_KV_API_KEY on ${var.agent_container} does not match what the daemon expects; a 503 means it is unset." >&2
-        exit 1
-      fi
+      # Minted before the payload so the id the record carries and the id the
+      # poll matches are the same value by construction.
+      drift_mint_insert_id eval-drift-privilege
 
-      # Minted per apply, and the card poll in step 7 matches on it. That is
-      # what makes the poll run-scoped without a per-run object name.
-      insert_id="eval-drift-privilege-$(date -u +%s)-$RANDOM"
-      changed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # The record the detector would have built. `enriched` and the two
+      # owners are the claim step 5 asserted: one manager holding the declared
+      # spec and one holding the two securityContext fields it took. Every
+      # value crosses as an argument, so none is interpolated into JSON text.
+      drift_build_payload \
+        "${var.drift_principal} patched ${local.resource_path} on cluster ${var.host_cluster_name}, fields owned by ${var.gitops_field_manager}, ${var.drift_field_manager}" \
+        "${var.host_cluster_name}" \
+        "$drift_project" \
+        "${var.host_cluster_location}" \
+        "${var.drift_principal}" \
+        "kubectl/v1.31.0 (linux/amd64)" \
+        "patch" \
+        "io.k8s.apps.v1.deployments.patch" \
+        "$drift_changed_at" \
+        "$drift_insert_id" \
+        "apps" "v1" "${local.ns}" "deployments" "${local.workload}" \
+        "enriched" "false" \
+        "${var.gitops_field_manager}|Apply|.spec.replicas,.spec.selector.matchLabels,.spec.template.spec.containers" \
+        "${var.drift_field_manager}|Update|${local.drifted_path},${local.drifted_user_path}"
 
-      # The payload the detector would have built (payloadForEvent in
-      # k8s-operator/cmd/drift-detector/inject.go). `join: enriched` and the
-      # ownership below are the claim step 5 asserted: two managers, one
-      # holding the declared spec and one holding the field it took.
-      payload_file="$kubeconfig_dir/payload.json"
-      cat > "$payload_file" <<PAYLOAD
-      {
-        "kind": "gitops-drift",
-        "summary": "${var.drift_principal} patched ${local.resource_path} on cluster ${var.host_cluster_name}, fields owned by ${var.gitops_field_manager}, ${var.drift_field_manager}",
-        "cluster": "${var.host_cluster_name}",
-        "project": "$project",
-        "location": "${var.host_cluster_location}",
-        "principal": "${var.drift_principal}",
-        "user_agent": "kubectl/v1.31.0 (linux/amd64)",
-        "verb": "patch",
-        "method_name": "io.k8s.apps.v1.deployments.patch",
-        "timestamp": "$changed_at",
-        "insert_id": "$insert_id",
-        "resource": {
-          "group": "apps",
-          "version": "v1",
-          "namespace": "${local.ns}",
-          "resource": "deployments",
-          "name": "${local.workload}"
-        },
-        "join": "enriched",
-        "owners": [
-          {
-            "manager": "${var.gitops_field_manager}",
-            "operation": "Apply",
-            "paths": [".spec.replicas", ".spec.selector.matchLabels", ".spec.template.spec.containers"]
-          },
-          {
-            "manager": "${var.drift_field_manager}",
-            "operation": "Update",
-            "paths": ["${local.drifted_path}", "${local.drifted_user_path}"]
-          }
-        ],
-        "reconciled": false
-      }
-      PAYLOAD
-
-      # The daemon's envelope carries the payload as a JSON *string*, not as a
-      # nested object (injectMessageRequest in the detector's inject.go). Built
-      # with python rather than by hand so the escaping is the language's
-      # problem and not a quoting bug that surfaces as a 400.
-      envelope_file="$kubeconfig_dir/envelope.json"
-      python3 -c 'import json,sys; sys.stdout.write(json.dumps({"message": open(sys.argv[1]).read()}))' \
-        "$payload_file" > "$envelope_file"
-
-      inject_status="$("$${exec_in_pod_stdin[@]}" sh -c \
-        'curl -sS --max-time 30 -X POST -H "Authorization: Bearer $SESSION_KV_API_KEY" -H "Content-Type: application/json" --data-binary @- "$1" | jq -r ".status // empty"' \
-        sh "${var.daemon_url}/sessions/$session_id/inject" < "$envelope_file" || true)"
-
-      # `suppressed` is a 200. The daemon accepted the record, spent nothing on
-      # it and told nobody, because the day's drift alert ceiling is already
-      # gone -- so no card is ever filed and the case would time out looking
-      # for one.
-      #
-      # This does NOT bite in CI: hack/ci-deploy.sh sets
-      # EVAL_ALERT_DAILY_LIMIT_DRIFT=0 and _alert_daily_limit treats 0 as off,
-      # so an eval install has no drift ceiling at all (the sibling case
-      # gitops-drift-noise-filtered-triage carries the same note). It bites on
-      # a DEV install carrying the shipped default, where this case shares
-      # the bucket with every other drift case -- which is the install the
-      # eval-driven loop runs against, and the one the message below is for.
-      if [ "$inject_status" = "suppressed" ]; then
-        echo "ERROR: the daemon suppressed this record against its daily drift alert ceiling, so no triage card will be filed. This install has already taken its drift alerts for the day -- the other gitops-drift cases spend from the same bucket. Raise ALERT_DAILY_LIMIT_DRIFT or run against a fresh install." >&2
-        exit 1
-      fi
-      if [ "$inject_status" != "injected" ]; then
-        echo "ERROR: the daemon answered '$inject_status' rather than 'injected'. An empty status means the request did not reach the drift route at all." >&2
-        exit 1
-      fi
-      echo "Daemon accepted the drift record (insert_id=$insert_id)."
+      drift_inject_record
 
       # ---- 7. Wait for the card ---------------------------------------------
-      # The inject returns as soon as the daemon has queued the front-door turn,
-      # and that turn -- one kanban_create against the cluster agent scoped to
-      # ${var.host_cluster_name} -- is what puts the card on the board. Without
-      # this wait the agent turn starts first, finds an empty board, and the
-      # case grades a correct agent on a fixture that had not finished.
-      #
-      # Read out of the board's SQLite file rather than from a log line, which
-      # is the one place this stack is coupled to an internal path; there is no
-      # external seam, because the daemon logs to a file inside the pod and the
-      # front door's kanban_create produces no line of its own.
-      #
-      # Matched on the run's own insert id, which _drift_task_body renders into
-      # the card body verbatim as `insertId=<id>` and which survives the
-      # defanging it passes through (_DRIFT_UNSAFE_CHARS_RE removes only
-      # backticks and newlines). Not on the title: the front door composes that
-      # and could reword it, and it carries no id.
-      #
-      # The probe searches every text column rather than naming one, because
-      # the board's schema is upstream Hermes' and is not in this repository to
-      # check a column name against.
-      board_probe="$kubeconfig_dir/board_probe.py"
-      cat > "$board_probe" <<'PROBE'
-      import sqlite3
-      import sys
-
-      BOARD = "file:/opt/data/kanban.db?mode=ro"
-
-      # Read-only URI so the probe cannot create the file, add a journal beside
-      # it, or block the agent writing to it. A board that is not there yet is
-      # a 0, not a traceback: the caller polls.
-      try:
-          conn = sqlite3.connect(BOARD, uri=True)
-          columns = [
-              row[1]
-              for row in conn.execute("PRAGMA table_info(tasks)")
-              if (row[2] or "").upper().startswith("TEXT")
-          ]
-          if not columns:
-              print(0)
-              raise SystemExit(0)
-          needle = "%" + sys.argv[1] + "%"
-          where = " OR ".join(f'"{c}" LIKE ?' for c in columns)
-          found = conn.execute(
-              f"SELECT COUNT(*) FROM tasks WHERE {where}", [needle] * len(columns)
-          ).fetchone()[0]
-          print(found)
-      except sqlite3.Error:
-          print(0)
-      PROBE
-
-      # Resolved rather than assumed: the daemon runs under the Hermes venv's
-      # interpreter, and whether a bare `python3` is also on PATH in this
-      # container is an image detail that should not be what this case fails on.
-      pod_python=""
-      # `import sqlite3`, not `pass`: the probe's own import sits outside its
-      # try block, so an interpreter that satisfies `pass` but has no
-      # _sqlite3 module would be picked, fail on every poll, and surface
-      # 300 seconds later as "the front-door turn filed nothing".
-      for candidate in python3 /opt/hermes/.venv/bin/python3; do
-        if "$${exec_in_pod[@]}" "$candidate" -c 'import sqlite3' >/dev/null 2>&1; then
-          pod_python="$candidate"
-          break
-        fi
-      done
-      if [ -z "$pod_python" ]; then
-        echo "ERROR: no python interpreter found in ${var.agent_container} to read the kanban board with." >&2
-        exit 1
-      fi
-
-      # The count is read into a variable and checked for shape before `-ge`
-      # sees it. `[ "" -ge 1 ]` is a syntax error under errexit, and a kubectl
-      # exec that fails halfway can return partial output as easily as none.
-      elapsed=0
-      while :; do
-        found="$("$${exec_in_pod_stdin[@]}" "$pod_python" - "$insert_id" < "$board_probe" 2>/dev/null || true)"
-        case "$found" in
-          "" | *[!0-9]*) found=0 ;;
-        esac
-        if [ "$found" -ge 1 ]; then
-          break
-        fi
-        if [ "$elapsed" -ge ${local.card_wait_timeout} ]; then
-          echo "ERROR: the daemon accepted the record but no kanban card carrying insert_id=$insert_id appeared within $${elapsed}s. The front-door turn the daemon queued either never ran or filed nothing, so there is no triage for the agent to read." >&2
-          exit 1
-        fi
-        sleep ${local.poll_interval}
-        elapsed=$((elapsed + ${local.poll_interval}))
-      done
-      echo "Triage card for $insert_id appeared after $${elapsed}s."
-
-      # The card then takes minutes to run. Waiting for THAT here would spend
-      # the wait outside the agent turn for no gain; the task's prompt polls the
-      # board with kanban_show instead, which is the read path the product
-      # actually offers.
+      drift_wait_for_card
     EOT
   }
 

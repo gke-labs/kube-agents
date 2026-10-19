@@ -34,9 +34,26 @@ const sessionKindDM = "dm"
 // in a message the adapter marked TopLevel: one that roots a conversation of
 // its own (a top-level Slack DM), so nothing is running in it and the task
 // the user means is in another thread. The notice says where to send it. A
-// thread with nothing running, a question refused at the session cap among
-// them, gets the plain reply: the user is already in the right place.
+// thread with nothing running gets one of the in-thread replies below
+// (nothingRunningNotice or nothingRunningCardNotice): the user is already in
+// the right place.
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
+
+// nothingRunningNotice answers a "stop" in a conversation with no active
+// task. nothingRunningCardNotice is the same answer for a conversation that
+// has run a task before: its turn may have filed a kanban card (the gateway
+// cannot tell whether it did, so the reply says "if"; nor where the card's
+// answer lands, which a console conversation never receives), which ends the
+// turn within seconds but is not a task the gateway holds or can cancel. The
+// card keeps working, so the reply must not read as "nothing is happening"
+// (gke-labs#3263); stopping the card is the follow-up there. A
+// conversation that never ran a task (a first message, or one refused at the
+// session cap) has no card of its own to mention. Both start with the same
+// text, so readers matching "nothing is running" still do.
+const (
+	nothingRunningNotice     = "🤷 nothing is running"
+	nothingRunningCardNotice = "🤷 nothing is running in this conversation. If the agent filed a card for it, that card keeps working until it finishes; stopping a card from chat isn't supported yet."
+)
 
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
@@ -474,6 +491,13 @@ func New(o Options) (*Gateway, error) {
 	// SessionLookup.
 	if sink, ok := o.Adapter.(SessionLookupSink); ok {
 		sink.SetSessionLookup(g.hasSession, o.Config.IdleTTL)
+	}
+	// The Home tab: the allowlist an inbound message is admitted by, and the
+	// agent pod's board read over the bus (slack_home.go, board.go).
+	if sink, ok := o.Adapter.(HomeSink); ok {
+		sink.SetHome(func(member string) (bool, bool) {
+			return g.slackRosterPrincipal(member) != "", g.slackAllowAll && !g.slackAllowed[member]
+		}, busBoardReader(o.Client))
 	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
@@ -927,8 +951,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
 		case msg.TopLevel:
 			g.post(rec.Key, topLevelNothingRunningNotice)
+		case len(rec.Tasks) > 0:
+			g.post(rec.Key, nothingRunningCardNotice)
 		default:
-			g.post(rec.Key, "🤷 nothing is running")
+			g.post(rec.Key, nothingRunningNotice)
 		}
 	case active != nil && !active.Detached:
 		// The one routing decision with no other log line: a new task logs
@@ -1243,7 +1269,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal)); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
