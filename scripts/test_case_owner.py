@@ -107,6 +107,12 @@ class TestEffectiveOwnerOfCase(unittest.TestCase):
         root = self._checkout("id: a-case\n# owner: bob in a comment does not count\ndomain: cost\n")
         self.assertEqual(case_owner.effective_owner_of_case("a-case", root), "Carol")
 
+    def test_a_missing_or_hostile_case_name_is_none(self):
+        root = self._checkout("id: a-case\nowner: bob\ndomain: cost\n")
+        for name in ("renamed-case", "../a-case", "..", "a-case/../a-case", "", None):
+            with self.subTest(name=name):
+                self.assertIsNone(case_owner.effective_owner_of_case(name, root))
+
     def test_a_blank_owner_line_uses_the_domain_owner(self):
         root = self._checkout("id: a-case\nowner:\ndomain: security\n")
         self.assertEqual(case_owner.effective_owner_of_case("a-case", root), "alice")

@@ -46,6 +46,8 @@ _DOMAIN_OWNER = re.compile(r"^\s+owner:\s*([^\s#]+)")
 # [ \t]*, not \s*: a blank `owner:` must not capture the next line.
 _TASK_FIELD = r"^{key}:[ \t]*([^\s#]+)"
 _QUOTES = "'\""
+# A case id as the dashboard reads it from a build log: no slash, no leading dot.
+_CASE_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
 
 
 def parse_domain_owners(text: str) -> dict[str, str]:
@@ -103,8 +105,18 @@ def _task_field(text: str, key: str) -> str | None:
 
 
 def effective_owner_of_case(name: str, repo_root: pathlib.Path = REPO_ROOT) -> str | None:
-    """`effective_owner` for bench/tasks/<name>/task.yaml on the checkout at `repo_root`."""
-    text = (repo_root / TASKS_PATH / name / TASK_FILENAME).read_text()
+    """`effective_owner` for bench/tasks/<name>/task.yaml on the checkout at `repo_root`.
+
+    None for a case that does not exist there (a run of a since-renamed case)
+    or a name that is not a case id, never a crash or a read outside
+    bench/tasks. A checkout with no readable domains.yaml still raises.
+    """
+    if not isinstance(name, str) or not _CASE_NAME.fullmatch(name):
+        return None
+    try:
+        text = (repo_root / TASKS_PATH / name / TASK_FILENAME).read_text()
+    except OSError:
+        return None
     return effective_owner(
         _task_field(text, "owner"),
         _task_field(text, "domain"),
