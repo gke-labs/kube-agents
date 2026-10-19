@@ -51,6 +51,7 @@ import importlib.util
 import inspect
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -127,6 +128,20 @@ skv.CARD_STOP_RESCAN_INTERVAL_SECONDS = 0.0
 PROCS: list[subprocess.Popen] = []
 
 
+class GateAbort(Exception):
+    """A step the rest of the gate depends on failed; its check already says which."""
+
+
+def waited(proc: subprocess.Popen, label: str, seconds: float = 10.0) -> bool:
+    """Wait for `proc` to exit; a timeout is a failed check named `label`, not a traceback."""
+    try:
+        proc.wait(seconds)
+        return True
+    except subprocess.TimeoutExpired:
+        check(label, False, f"pid {proc.pid} still running after {seconds:g} s")
+        return False
+
+
 def fake_worker(task_id: str) -> tuple[subprocess.Popen, int]:
     """A worker started the way `_default_spawn` starts one, with a child of its own."""
     pid_file = TMP / f"{task_id}.child"
@@ -148,7 +163,13 @@ def fake_worker(task_id: str) -> tuple[subprocess.Popen, int]:
     deadline = time.monotonic() + 15
     while not pid_file.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    return proc, int(pid_file.read_text())
+    try:
+        child = int(pid_file.read_text())
+    except (OSError, ValueError) as exc:
+        check(f"the fake worker for {task_id} started its child within 15 s", False,
+              f"{exc}; the worker {'exited ' + str(proc.poll()) if proc.poll() is not None else 'is still running'}")
+        raise GateAbort from None
+    return proc, child
 
 
 def alive(pid: int) -> bool:
@@ -179,10 +200,41 @@ try:
 
     check("the route opens its board connections through connect_tracked", skv._hermes_kanban() == (kb, connect_tracked))
     route_conn = skv._card_stop_connect(connect_tracked, str(DB))
-    pragma_names = [p.split("=")[0] for p in skv.CARD_STOP_BOARD_PRAGMAS]
-    ours = {name: route_conn.execute(f"PRAGMA {name}").fetchone()[0] for name in pragma_names}
-    hermes = {name: conn.execute(f"PRAGMA {name}").fetchone()[0] for name in pragma_names}
-    check("the route's connection carries the PRAGMAs Hermes' connect sets", ours == hermes, f"{ours} != {hermes}")
+    # Every PRAGMA Hermes' connect assigns, read from the two functions that
+    # assign them, so one added upstream is compared too. busy_timeout is the
+    # route's own (3 s, not 120 s), and the WAL setup (journal_mode, in
+    # apply_wal_with_fallback) belongs to the board file, not the connection.
+    from hermes_cli import kanban_db_connect as KC_SRC  # noqa: E402
+
+    assigned = set()
+    for fn in (KC_SRC._open_configured, KC_SRC._sqlite_connect):
+        assigned |= set(re.findall(r"PRAGMA\s+(\w+)\s*=", inspect.getsource(fn)))
+    deliberate = {"busy_timeout", "journal_mode"}
+    compared = sorted(assigned - deliberate)
+    check("Hermes' connect assigns the PRAGMAs this gate knows how to read",
+          {"synchronous", "foreign_keys", "busy_timeout"} <= assigned, str(sorted(assigned)))
+    route_names = sorted(p.split("=")[0] for p in skv.CARD_STOP_BOARD_PRAGMAS)
+    check("the route sets every PRAGMA Hermes' connect sets, except busy_timeout and the WAL setup",
+          route_names == compared, f"route {route_names}, Hermes {compared}")
+    ours = {name: route_conn.execute(f"PRAGMA {name}").fetchone()[0] for name in compared}
+    hermes = {name: conn.execute(f"PRAGMA {name}").fetchone()[0] for name in compared}
+    check("and to the same values on its connection (busy_timeout and WAL setup excepted)", ours == hermes,
+          f"{ours} != {hermes}")
+    # The same, read back over every per-connection PRAGMA SQLite reports, which
+    # also catches one a helper of connect sets under a name the source scan
+    # misses. checkpoint_fullfsync is the WAL setup's (set on macOS only).
+    readable = (
+        "automatic_index", "cache_size", "cache_spill", "cell_size_check", "checkpoint_fullfsync", "defer_foreign_keys",
+        "foreign_keys", "fullfsync", "ignore_check_constraints", "journal_size_limit", "mmap_size", "query_only",
+        "recursive_triggers", "reverse_unordered_selects", "secure_delete", "synchronous", "temp_store",
+        "trusted_schema", "wal_autocheckpoint",
+    )
+    read_back = [name for name in readable if name not in deliberate | {"checkpoint_fullfsync"}]
+    ours_all = {name: route_conn.execute(f"PRAGMA {name}").fetchone()[0] for name in read_back}
+    hermes_all = {name: conn.execute(f"PRAGMA {name}").fetchone()[0] for name in read_back}
+    differ = {name: (ours_all[name], hermes_all[name]) for name in read_back if ours_all[name] != hermes_all[name]}
+    check("every per-connection PRAGMA reads back the same as on Hermes' connection "
+          "(busy_timeout and WAL setup excepted)", not differ, f"route vs Hermes: {differ}")
     check("with the route's busy timeout, not Hermes' 120 s",
           route_conn.execute("PRAGMA busy_timeout").fetchone()[0] == int(skv.CARD_STOP_BUSY_TIMEOUT_S * 1000))
     check("and registered against Hermes' byte-level probes", getattr(route_conn, "_hermes_tracked_path", None) is not None)
@@ -308,8 +360,8 @@ try:
     if os.path.isdir("/proc/self"):
         check("Hermes terminated the running card's worker through the route's signal_fn",
               termination(parent).get("terminated") is True, json.dumps(termination(parent)))
-        worker.wait(10)
-        check("the worker process is gone", worker.poll() is not None)
+        if waited(worker, "the worker process exits within 10 s of the stop"):
+            check("the worker process is gone", worker.poll() is not None)
         deadline = time.monotonic() + 5
         while alive(worker_child) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -347,17 +399,22 @@ try:
         late.kill()
     else:
         swept = skv._sweep_late_worker_pids(conn, [fanned], skv._Budget())
-        late.wait(10)
+        waited(late, "the late worker exits within 10 s of the sweep")
         check("the late worker is killed", late.poll() is not None and not alive(late_child), json.dumps(swept))
         cleared = conn.execute("SELECT worker_pid FROM tasks WHERE id = ?", (fanned,)).fetchone()[0]
         check("its pid is cleared from the archived row", cleared is None, str(cleared))
+except GateAbort:
+    print("  (stopping here: the steps after it depend on it)")
 finally:
     for proc in PROCS:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
-        proc.wait(5)
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            pass
 
 print()
 if FAILURES:
