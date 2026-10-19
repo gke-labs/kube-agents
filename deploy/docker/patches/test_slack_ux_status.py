@@ -1024,6 +1024,20 @@ class PlanTest(_RuntimeCase):
         _run(runtime.settle_row(adapter, _sub(), "unblocked"))
         self.assertEqual(self._tasks(adapter)[0]["status"], "in_progress")
 
+    def test_a_card_with_no_note_that_settles_the_plan_answers_it(self):
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "completed", "1.33.4 = default", "seeded-a"))
+        self.assertNotEqual(runtime.answer_key(_sub()), "", "its report is the ask's answer")
+
+    def test_a_card_that_gives_up_and_is_unblocked_answers_its_ask_once(self):
+        adapter = _Adapter()
+        self._note(adapter, 1, "reading logs")
+        _run(runtime.settle_row(adapter, _sub(), "gave_up", ""))
+        self.assertNotEqual(runtime.answer_key(_sub()), "", "the give-up settles the plan")
+        _run(runtime.settle_row(adapter, _sub(), "unblocked"))
+        _run(runtime.settle_row(adapter, _sub(), "completed", "both pods are up"))
+        self.assertEqual(runtime.answer_key(_sub()), "", "the ask already has its answer")
+
     def test_a_replayed_terminal_event_opens_no_second_row(self):
         adapter = _Adapter()
         for _ in range(2):

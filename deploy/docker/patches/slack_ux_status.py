@@ -311,6 +311,9 @@ _seen: OrderedDict[tuple, bool] = OrderedDict()
 #: (channel, thread, card) -> the update key of the plan the card's settle
 #: finished: the card's report is that plan's ask's answer (:func:`answer_key`).
 _answers: OrderedDict[tuple, str] = OrderedDict()
+#: ``update key -> True`` for every plan that has recorded its answer: an ask is
+#: answered once, so a card that gave up and is unblocked rates only the first report.
+_answered: OrderedDict[str, bool] = OrderedDict()
 #: Lapse tasks in flight, held so the loop does not drop them mid-run.
 _lapsing: set = set()
 
@@ -520,6 +523,13 @@ def answer_key(sub: dict) -> str:
     answers once, with its creator's completion. Read once: a replayed event gets ``""``.
     """
     return _answers.pop((*_thread(sub), str(sub.get("task_id") or "")), "")
+
+
+def _record_answer(key: tuple, card: str, plan_key: str) -> None:
+    """Record the card's report as the answer of the plan keyed ``plan_key``, unless that plan already has one."""
+    if plan_key and plan_key not in _answered:
+        _remember(_answered, plan_key, True, SEEN_MAX)
+        _remember(_answers, (*key, card), plan_key, SEEN_MAX)
 
 
 def _open(row: _Row) -> bool:
@@ -859,8 +869,8 @@ async def _retire(adapter: Any, key: tuple, plan: _Plan, card: str = "") -> None
     answers the plan's ask, recorded for :func:`answer_key` under the plan's key.
     """
     if _settled(plan):
-        if card and plan.ts:
-            _remember(_answers, (*key, card), plan.ts, SEEN_MAX)
+        if card:
+            _record_answer(key, card, plan.ts)
         _disarm(plan)
         if _plans.get(key) is plan:
             _plans.pop(key, None)
@@ -926,9 +936,9 @@ async def _settle_lapsed(
             old.rolling.discard(card)
         row = old.rows.get(card)
         if row is not None and _move(row, kind, result):
-            if done and old.ts and _settled(old):
+            if done and _settled(old):
                 # A set-aside plan this card finishes: its report answers that ask.
-                _remember(_answers, (*key, card), old.ts, SEEN_MAX)
+                _record_answer(key, card, old.ts)
             if row.status == _status.TASK_RUNNING:
                 # Before the render's await, as in deliver_row: an expiry due
                 # during it must not drop the plan the card resumes on.
@@ -1248,7 +1258,7 @@ async def _open_settled(
             # Rolling, as a refused note leaves it, so the plan keeps its wait.
             plan.rolling.add(card)
             plan.waiting.add(card)
-    await _retire(adapter, key, plan)
+    await _retire(adapter, key, plan, card)
     sent = _sessions.get(key)
     if _plan_session(*key) or not (sent and sent[0] == _status.SESSION_PROCESSING):
         # With nothing left to hold, a Planning Agent turn working in the
