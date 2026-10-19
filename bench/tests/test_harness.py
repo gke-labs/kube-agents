@@ -1878,12 +1878,16 @@ def _show_turn(
     body: str = "",
     result: str | None = None,
     call_id: str = "call_show",
+    block_kind: str | None = None,
 ) -> bytes:
+    task_payload: dict[str, Any] = {"id": task_id, "status": status, "result": result}
+    if block_kind is not None:
+        task_payload["block_kind"] = block_kind
     return _turn(
         *_call(
             "kanban_show",
             {"task_id": task_id},
-            {"task": {"id": task_id, "status": status, "result": result}, "runs": []},
+            {"task": task_payload, "runs": []},
             call_id,
         ),
         _text(body or f"Task {task_id} is {status}."),
@@ -3184,6 +3188,70 @@ def test_status_turn_unawaited_card_not_read_via_exec(
     assert not any("unawaited-999" in s for s in exec_scripts)
 
 
+def test_status_turn_batches_and_clamps_board_read_timeout(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports multiple awaited cards in failure statuses, board read is batched and clamped."""
+    task_1 = "task-alpha"
+    task_2 = "task-beta"
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "alpha"}, {"task_id": task_1}, "call_create_1"),
+            *_call("kanban_create", {"title": "beta"}, {"task_id": task_2}, "call_create_2"),
+            _text("Created two tasks."),
+        ),
+        _turn(
+            *_call(
+                "kanban_list",
+                {},
+                {
+                    "tasks": [
+                        {"id": task_1, "status": "blocked", "block_kind": "transient"},
+                        {"id": task_2, "status": "blocked", "block_kind": "transient"},
+                    ]
+                },
+                "call_list",
+            ),
+            _text("Both tasks are blocked."),
+        ),
+    ]
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "10")
+    board_calls: list[tuple[str, float]] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            board_calls.append((script, timeout))
+            # First poll before status turn returns empty; status turn read returns state
+            if len(board_calls) > 1:
+                payload = {
+                    "statuses": {task_1: "blocked", task_2: "blocked"},
+                    "summaries": {
+                        task_1: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {task_1: "transient", task_2: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    # Call 0 is the poll before the status turn (timeout 60s).
+    # Call 1 is the batched status turn read (clamped timeout <= 10s).
+    # Call 2 is the settle-time read.
+    assert len(board_calls) == 3, f"Expected 3 board reads total (1 poll, 1 batched status turn, 1 settle), got {len(board_calls)}"
+    script, recorded_timeout = board_calls[1]
+    assert task_1 in script and task_2 in script
+    assert recorded_timeout <= 10.0
+
+
 def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
@@ -3273,6 +3341,112 @@ def test_a_cleared_rate_limit_card_evicted_from_poll_fallback_remains_graded(
                     "error": None,
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert worker_failure in result.output
+
+
+def test_a_failure_status_card_with_empty_messages_evicted_from_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a poll-captured rate-limit card later polls in a failure status with empty messages,
+
+    it is evicted from poll_failure_messages. If final board read fails, the stale rate-limit
+    message is not handed to _settle and the run remains graded with the worker's failure.
+    """
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(_text("still investigating 1")),
+        _turn(_text("still investigating 2")),
+        _turn(_text("still investigating 3")),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                payload = {
+                    "statuses": {_TASK_ID: "failed"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in err for err in result.errors)
+    assert any("agent reported no status for 3 turns running" in err for err in result.errors)
+
+
+def test_a_non_transient_failure_card_on_status_turn_evicts_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a poll-captured rate-limit card is reported on a status turn with non-transient block_kind,
+
+    it is evicted from poll_failure_messages even if the intermediate poll failed. If the final board
+    read fails, the stale rate-limit message does not reach _settle and the run remains graded.
+    """
+    worker_failure = "Worker blocked: missing authorization token."
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(_text("checking card")),
+        _show_turn(
+            "blocked",
+            body=worker_failure,
+            result=worker_failure,
+            call_id="call_show_blocked",
+            block_kind="needs_input",
+        ),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Intermediate poll and subsequent reads fail.
             return ""
         return ""
 
