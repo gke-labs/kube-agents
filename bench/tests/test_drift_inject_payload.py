@@ -155,6 +155,27 @@ class BuildPayload(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.build("enriched", "false", "argocd-controller|Apply")
 
+    def test_a_pipe_in_the_manager_does_not_become_the_operation(self):
+        """The field managers are unvalidated `var` strings at the call sites.
+
+        Splitting from the left made `argo|cd|Apply|.spec.replicas` parse as
+        manager `argo`, operation `cd`, and `Apply|.spec.replicas` as a path:
+        three parts, accepted, and a record naming an owner the agent cannot
+        find on the live object.
+        """
+        doc = self.build("enriched", "false", "argo|cd|Apply|.spec.replicas")
+        owner = doc["owners"][0]
+        self.assertEqual(owner["manager"], "argo|cd")
+        self.assertEqual(owner["operation"], "Apply")
+        self.assertEqual(owner["paths"], [".spec.replicas"])
+
+    def test_an_empty_part_in_an_owner_spec_is_refused(self):
+        for spec in ("|Apply|.spec.replicas", "argocd-controller||.spec.replicas",
+                     "argocd-controller|Apply|"):
+            with self.subTest(spec=spec):
+                with self.assertRaises(SystemExit):
+                    self.build("enriched", "false", spec)
+
     def test_every_scalar_lands_under_its_own_key(self):
         """Placement, so a reordering of SCALARS cannot pass unnoticed."""
         doc = self.build("enriched", "false")

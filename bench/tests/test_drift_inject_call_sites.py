@@ -42,8 +42,16 @@ PREBUILT = REPO_ROOT / "bench" / "tf" / "prebuilt"
 
 # The call and its backslash continuations, up to the first unescaped newline.
 CALL = re.compile(r"^\s*drift_build_payload\s*\\\n((?:.*\\\n)*.*)$", re.M)
-# A Terraform interpolation, replaced so shlex sees one opaque word.
+# A Terraform interpolation. Rewritten to a token that KEEPS THE EXPRESSION,
+# not to one opaque placeholder: most arguments at these call sites are
+# interpolations, so collapsing them all to the same word makes every swap
+# between two of them invisible -- which is the swap this file exists to
+# catch, and which an earlier version of it could not see.
 INTERPOLATION = re.compile(r"\$\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}")
+
+
+def _token(match):
+    return "TF_" + re.sub(r"[^A-Za-z0-9_.]", "_", match.group(0)[2:-1])
 
 # Position of each argument in build_payload.py's contract, after the output
 # path that drift_build_payload supplies itself.
@@ -70,7 +78,7 @@ def call_arguments(stack):
     match = CALL.search(text)
     assert match is not None, f"{stack} has no drift_build_payload call"
     body = match.group(1).replace("\\\n", " ")
-    return shlex.split(INTERPOLATION.sub("TFVAL", body))
+    return shlex.split(INTERPOLATION.sub(_token, body))
 
 
 def named(stack):
@@ -144,7 +152,13 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
                 self.assertEqual(fields["join"], "enriched")
                 self.assertEqual(len(owners), 2)
                 managers = [spec.split("|", 1)[0] for spec in owners]
-                self.assertEqual(managers, ["TFVAL", "TFVAL"])
+                self.assertEqual(
+                    managers,
+                    ["TF_var.gitops_field_manager", "TF_var.drift_field_manager"],
+                    "the GitOps manager owns the declared spec and the drift "
+                    "manager the field it took; swapping them inverts the story "
+                    "the card tells",
+                )
                 for spec in owners:
                     self.assertEqual(
                         len(spec.split("|")), 3, f"{spec!r} is not manager|operation|paths"
@@ -162,6 +176,44 @@ class EveryStackPassesWhatItsCaseNeeds(unittest.TestCase):
         for stack in self.STACKS:
             with self.subTest(stack=stack):
                 self.assertGreater(len(call_arguments(stack)), 0)
+
+    def test_each_interpolated_scalar_is_the_expression_its_field_wants(self):
+        """The swap this file exists for: two adjacent free-form strings.
+
+        `location`, `principal`, `cluster`, `namespace` and the object name are
+        all interpolations, so nothing about their *values* distinguishes them
+        at this layer. Swapping any two ships a record whose card reports the
+        change on cluster `us-east4` at location `platform-agent-host`, which
+        no deterministic check sees and a judge reads as the agent being wrong.
+        """
+        expected = {
+            "gitops-drift": {
+                "cluster": "TF_var.host_cluster_name",
+                "location": "TF_var.host_cluster_location",
+                "principal": "TF_var.drift_principal",
+                "namespace": "TF_local.ns",
+                "name": "TF_local.workload",
+            },
+            "gitops-drift-deleted-policy": {
+                "cluster": "TF_var.host_cluster_name",
+                "location": "TF_var.host_cluster_location",
+                "principal": "TF_var.drift_principal",
+                "namespace": "TF_local.ns",
+                "name": "TF_local.policy",
+            },
+            "gitops-drift-load-bearing": {
+                "cluster": "TF_var.host_cluster_name",
+                "location": "TF_var.host_cluster_location",
+                "principal": "TF_var.drift_principal",
+                "namespace": "TF_local.ns",
+                "name": "TF_local.workload",
+            },
+        }
+        for stack, fields_expected in expected.items():
+            fields, _ = named(stack)
+            for field, value in fields_expected.items():
+                with self.subTest(stack=stack, field=field):
+                    self.assertEqual(fields[field], value)
 
 
 if __name__ == "__main__":

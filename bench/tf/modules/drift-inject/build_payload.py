@@ -90,11 +90,19 @@ def build(argv):
     # the shape that does not occur.
     owners = []
     for spec in values[2:]:
-        parts = spec.split("|", OWNER_PARTS - 1)
-        if len(parts) != OWNER_PARTS:
+        # Split from the RIGHT, and refuse an empty part. Splitting from the
+        # left absorbs a `|` in the manager into the operation: the field
+        # managers are unvalidated `var` strings, so `argo|cd` would parse as
+        # three parts and go out as manager `argo`, operation `cd`, and the
+        # real operation glued to the front of the first path -- a record
+        # naming an owner the agent cannot find on the live object, which is
+        # the fiction every stack's assertion exists to prevent. Paths may not
+        # contain `|`; managers may, and now say so rather than being absorbed.
+        parts = spec.rsplit("|", OWNER_PARTS - 1)
+        if len(parts) != OWNER_PARTS or not all(p.strip() for p in parts):
             raise SystemExit(
                 f"build_payload: owner spec {spec!r} is not "
-                f"'<manager>|<operation>|<path,path>'."
+                f"'<manager>|<operation>|<path,path>' with all three present."
             )
         manager, operation, paths = parts
         owners.append(
