@@ -47,10 +47,9 @@ That record wins over a job origin. The run then never prints the report, since 
 cannot reach a gateway conversation: it checks before the claim that this child's env carries the
 bus address, a bus identity and the gateway's platform, posts the report
 and the audits note with ``a2a notify --conversation``, marks the findings shown only once the post
-landed, and releases the claim when the attempt was not confirmed posted (on the card path anything
-short of a post, since the next attempt's update key edits a card that landed; on the text path an
-exit 1), or when a claim outlives the longest post with no outcome recorded, to try again after a
-wait, up to
+landed, and releases the claim to try again after a wait (on the card path for anything short of a
+post, since the next attempt's update key edits a card that landed; on the text path for
+``NOT_POSTED``; on either for a claim that outlives the longest post with no outcome), up to
 ``CONVERSATION_MAX_ATTEMPTS`` (``CONVERSATION_ATTEMPTS_FILE`` records why). So on that path a claim
 is one attempt rather than the delivery, and the marks follow the post rather than the claim.
 Then only the audits note below is printed, as a second message; any failure prints the
@@ -253,8 +252,9 @@ AUDITS_NO_HOME_SENTENCE = (
 CONVERSATION_FILE = "onboarding_conversation.json"
 CONVERSATION_ALIGNED_MARKER = ".user_aligned_conversation"
 CONVERSATION_KEYS = ("platform", "conversation", "context_id")
-# This stage's record of the conversation path: the posts that released the claim, and why the
-# report is not out yet. Stderr from a run that exits 0 is dropped, so this is where that shows.
+# This stage's record of the conversation path: the attempts that released the claim and when the
+# last one did, and why the report is not out yet. Stderr from a run that exits 0 is dropped, so
+# this is where that shows.
 CONVERSATION_ATTEMPTS_FILE = ".bootstrap_conversation_attempts.json"
 ATTEMPTS_COUNT = "attempts"
 ATTEMPTS_REASON = "last_reason"
@@ -343,7 +343,10 @@ def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
     count = _attempt_count(record) + (1 if counted else 0)
     if not counted and record.get(ATTEMPTS_REASON) == reason:
         return  # the same block as the last tick's: no write each minute
-    record.update({ATTEMPTS_COUNT: count, ATTEMPTS_REASON: reason, ATTEMPTS_AT: time.time()})
+    record.update({ATTEMPTS_COUNT: count, ATTEMPTS_REASON: reason})
+    if counted:
+        # Only a counted attempt starts the wait before the next one.
+        record[ATTEMPTS_AT] = time.time()
     if counted and count >= CONVERSATION_MAX_ATTEMPTS:
         _log_to_stage(data_dir, f"the report was not posted after {count} attempts and now waits: {reason}")
     target = data_dir / CONVERSATION_ATTEMPTS_FILE

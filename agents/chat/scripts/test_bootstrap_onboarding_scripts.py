@@ -566,6 +566,14 @@ class DeliveryToConversationTest(unittest.TestCase):
                 self.assertEqual(self._attempts()["attempts"], 0)
                 self.assertIn("the report waits", self._attempts()["last_reason"])
 
+    def test_a_block_does_not_restart_the_wait_after_an_attempt(self):
+        record = {"attempts": 1, "last_reason": "refused", "last_at": 1000.0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"NATS_URL": ""}):
+            self._run()
+        self.assertEqual(self._attempts()["last_at"], 1000.0)
+        self.assertIn("NATS_URL", self._attempts()["last_reason"])
+
     def test_the_same_block_is_not_rewritten_each_tick(self):
         with mock.patch.dict(os.environ, {"NATS_URL": ""}):
             self._run()
