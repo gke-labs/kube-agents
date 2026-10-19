@@ -436,7 +436,8 @@ the part of the table's `configuration/webhook` cell before the slash; the webho
 follow it after a slash, never stand in for it.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
-repository's deprecation section too, with its source line, and state the floor and target the
-scan used. Recommend the upgrade path and the manifest migrations; do not run either. Cite no CVE
+repository's deprecation section too, with its source line copied word for word
+(`repo manifests as of <sha>`, not a rewording such as "at commit <sha>"), and state the floor
+and target the scan used. Recommend the upgrade path and the manifest migrations; do not run either. Cite no CVE
 identifiers: there is no vulnerability feed here, and every finding is version currency,
 readiness or a declared API version.

@@ -100,6 +100,7 @@ _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test-next",
     "ci-kube-agents-eval-next",
     "ci-kube-agents-eval-nightly-next-claude",
+    "ci-kube-agents-eval-nightly-gitlab-next",
 )
 _NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
 _OTHER_JOB_NAME = "ci-x"

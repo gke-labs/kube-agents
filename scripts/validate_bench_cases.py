@@ -278,6 +278,12 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "gitops-drift-no-repository-triage": (
+        "#3313: needs an install with no usable GitOps repository (a PlatformAgent "
+        "whose spec.integration.repositories is empty); every CI eval install "
+        "registers one, so no CI tier can run it; run it by hand against such an "
+        "install"
+    ),
     "fleet-cost-without-forge-keeps-the-report": (
         "#2419: needs an install with no forge (a PlatformAgent with no "
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
@@ -319,85 +325,6 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
-    ),
-}
-
-# Cases that claim no domain because no row in domains.yaml describes them.
-# "Covers nothing, and we checked" is a real answer; an absent field is not,
-# because a domain with no case reports as uncovered and a case with no slug
-# can stay green for months while the report shows the gap.
-KNOWN_NO_DOMAIN = {
-    "observability-watcher-scrape-state": (
-        "a question about the agent's own observability, whether the event "
-        "watcher's metrics are scraped and what proves it, graded on the "
-        "delegation, the worker's read of the PodMonitoring and the final "
-        "answer; reads the agent's own install, not the fleet, and no "
-        "domains.yaml row describes the agent's own observability"
-    ),
-    "platform-worker-refuses-shipped-skill-edit": (
-        "a skill-governance refusal graded on the worker's card result and on "
-        "its skill_manage calls (none may succeed); reads no fleet, and no "
-        "domains.yaml row describes skill or self-modification governance"
-    ),
-    "vcs-forge-cli-request-uses-the-verbs": (
-        "a read-only forge question that names gh, graded on the route the "
-        "worker took to the answer (the version-control verbs, not a forge "
-        "CLI); like vcs-history-only-fact, no domains.yaml row describes "
-        "repository access"
-    ),
-    "vcs-history-only-fact": (
-        "a repository-history question graded on the answer and on the route "
-        "the worker took to it (the version-control verbs, never a credentialed "
-        "clone or gh from the sandbox); no domains.yaml row describes "
-        "repository access"
-    ),
-    "vcs-issue-resolver-triage": (
-        "the github-issue-resolver skill end to end -- poll, claim, "
-        "investigate, transition -- graded on the route the resolver took to "
-        "the forge and on the triage it produced; no domains.yaml row "
-        "describes issue triage, and incident-triage names the event-fired "
-        "autoops journey rather than this one"
-    ),
-    "vcs-review-feedback-read-back": (
-        "a second revision put on an existing proposal's branch and read back "
-        "from the forge before it is described, graded on the route the worker "
-        "took to the read-back; rca-remediation-pr owns the remediation "
-        "journey -- a proposed fix landing as a pull request -- and this case "
-        "proposes no fix"
-    ),
-    "vcs-spent-branch-reuse": (
-        "a second proposal opened under a branch name whose first proposal "
-        "was closed, graded on the branch the pull request came from; like "
-        "vcs-review-feedback-read-back it proposes no fix, and "
-        "rca-remediation-pr owns the remediation journey"
-    ),
-    "gpu-stress-test-diagnosis": (
-        "a chat-prompted post-incident RCA, not the event-fired autoops triage "
-        "that incident-triage names; no domains.yaml row describes it"
-    ),
-    "knowledge-grounding-sources-probe": (
-        "a grounded-knowledge citation probe: a pure GKE documentation "
-        "question graded on the persona's Sources contract; it reads no "
-        "fleet and no domains.yaml row describes knowledge retrieval"
-    ),
-    "platform-worker-shell-edit-of-shipped-skill": (
-        "a shell-sandbox integrity case: a worker told to edit a shipped skill "
-        "from its terminal, graded on the sandbox's copy still matching the "
-        "image; it reads no fleet and no domains.yaml row describes skill or "
-        "sandbox integrity"
-    ),
-    "alert-config-terraform-promql-probe": (
-        "a skill-guidance probe: a Terraform alert policy written from the "
-        "gke-alert-configuration skill, graded on its PromQL condition, metric "
-        "and label; it reads no fleet and no domains.yaml row describes "
-        "alert authoring"
-    ),
-    "observability-trace-latency-brokered": (
-        "the agent's own observability skill: its trace latency helper run to "
-        "completion through the credential broker's relay, graded on the report "
-        "and on the route the worker took (no access token fetched or pasted); "
-        "it reads the install's own traces, not a fleet, and no domains.yaml "
-        "row describes the agent observing itself"
     ),
 }
 
@@ -982,13 +909,11 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     # is invisible to the count that decides whether a domain is covered.
     domain = spec.get("domain")
     if domain is None:
-        if name not in KNOWN_NO_DOMAIN:
-            problems.append(
-                "declares no 'domain:'. Claim a slug from "
-                "docs/designs/domains.yaml, or add a reviewed KNOWN_NO_DOMAIN "
-                "entry in scripts/validate_bench_cases.py saying why no row "
-                "describes this case"
-            )
+        problems.append(
+            "declares no 'domain:'. Claim a slug from docs/designs/domains.yaml; "
+            "if no row there describes this case, add one (with its owner, "
+            "backup and meaning) in the same change"
+        )
     elif not isinstance(domain, str):
         problems.append(f"claims domain {domain!r}, which is not a slug string")
     elif domain not in known_domains():
@@ -1487,7 +1412,6 @@ def stale_allowlist_entries() -> list[str]:
     stale = []
     for label, entries in (
         ("KNOWN_UNREGISTERED", KNOWN_UNREGISTERED),
-        ("KNOWN_NO_DOMAIN", KNOWN_NO_DOMAIN),
         ("KNOWN_JUDGE_ONLY", KNOWN_JUDGE_ONLY),
         ("FIXTURE_NOT_READY", FIXTURE_NOT_READY),
     ):

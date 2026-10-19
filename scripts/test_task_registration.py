@@ -1212,13 +1212,13 @@ class TestTheAllowlistsAndTheSweep(unittest.TestCase):
         # test_the_exclusion_lists_do_not_rot passes on a clean tree whether or
         # not this function does anything; this is what proves it does.
         with unittest.mock.patch.dict(
-            validator.KNOWN_NO_DOMAIN, {"deleted-case": "gone"}, clear=False
+            validator.KNOWN_UNREGISTERED, {"deleted-case": "gone"}, clear=False
         ):
             stale = validator.stale_allowlist_entries()
-        self.assertIn("KNOWN_NO_DOMAIN: deleted-case", stale)
+        self.assertIn("KNOWN_UNREGISTERED: deleted-case", stale)
 
-    def test_all_four_allowlists_are_swept(self):
-        for name in ("KNOWN_UNREGISTERED", "KNOWN_NO_DOMAIN", "KNOWN_JUDGE_ONLY", "FIXTURE_NOT_READY"):
+    def test_all_three_allowlists_are_swept(self):
+        for name in ("KNOWN_UNREGISTERED", "KNOWN_JUDGE_ONLY", "FIXTURE_NOT_READY"):
             with self.subTest(allowlist=name):
                 with unittest.mock.patch.dict(
                     getattr(validator, name), {"deleted-case": "gone"}, clear=False
