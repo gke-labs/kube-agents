@@ -5801,7 +5801,7 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
-            if [ "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" = "next" ]; then
+            if [ "${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}" = "next" ]; then
               prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
                 google_chat_home_channel "$google_chat_home_channel"
             else
@@ -6660,7 +6660,7 @@ main() {
     fi
     chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
-    if [ "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" != "next" ]; then
+    if [ "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" != "next" ]; then
       prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
         google_chat_home_channel "$google_chat_home_channel"
       return 0

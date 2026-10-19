@@ -84,6 +84,28 @@ class ExistingInstallsKeepTodayTest(unittest.TestCase):
         example = (_REPO_ROOT / "install.env.example").read_text()
         self.assertIn("\nPLATFORM_AGENT_MODE=next\n", example)
 
+    def test_only_install_shs_first_install_resolver_reads_the_new_install_default(self):
+        # A front door that falls back to DEFAULT_PLATFORM_AGENT_MODE for a
+        # mode install.env did not record treats an existing today install as
+        # next: it prompts and warns for next, or renders it. upgrade.sh's
+        # last-resort fallback is for an install.defaults.env that predates
+        # UNRECORDED_PLATFORM_AGENT_MODE, where the default was still today.
+        reads = {
+            "install.sh": ['    PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_PLATFORM_AGENT_MODE:-}"'],
+            "upgrade.sh": ["${UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"] * 4,
+        }
+        for path in ("install.sh", "upgrade.sh", "scripts/installer/installer_common.sh"):
+            with self.subTest(path=path):
+                lines = [
+                    line
+                    for line in (_REPO_ROOT / path).read_text().splitlines()
+                    if "$DEFAULT_PLATFORM_AGENT_MODE" in line or "${DEFAULT_PLATFORM_AGENT_MODE" in line
+                ]
+                expected = reads.get(path, [])
+                self.assertEqual(len(lines), len(expected), lines)
+                for line, needle in zip(lines, expected):
+                    self.assertIn(needle, line)
+
     def test_the_operator_reads_an_absent_mode_as_today(self):
         text = _MODE_GO.read_text()
         self.assertIn("if agent == nil || agent.Spec.Mode == nil {\n\t\treturn ModeToday, nil", text)

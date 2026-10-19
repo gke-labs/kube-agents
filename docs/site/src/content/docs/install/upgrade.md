@@ -273,8 +273,9 @@ list, add the entry to that list, because Helm replaces a list as a whole. See
 
 ## Switching `spec.mode`
 
-`next` is an unsupported development stack. To move a running install between `today` and
-`next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
+A first install runs `next`; `today` is the previous stack, kept as a rollback. An `install.env`
+that sets no `PLATFORM_AGENT_MODE` resolves to `today`, so upgrading an install made before `next`
+became the default leaves it on `today`. To move a running install between `today` and `next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
 `install.sh`. The operator and harness modes re-apply the values the release recorded, so they do
 not switch. Preview a full upgrade with `upgrade.sh --plan` first; a run that switches says so
 before it applies.

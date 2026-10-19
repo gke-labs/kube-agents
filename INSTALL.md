@@ -1462,7 +1462,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
 
 When the checks in the entry above pass and a message still gets no reply, follow it to the component that should answer.
 
-- Find out which component answers chat. An empty result, or `today`, is the default mode; `next` puts Google Chat on the A2A gateway when it is enabled, and Slack otherwise:
+- Find out which component answers chat. An empty result means `today`, the same as `today` itself; `next` puts Google Chat on the A2A gateway when it is enabled, and Slack otherwise:
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
   ```

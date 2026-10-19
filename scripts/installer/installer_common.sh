@@ -1214,7 +1214,7 @@ warn_next_home_channel_unset() {
 
 # warn_next_home_channel_unset on the exported keys; $1 is its $6.
 warn_next_home_channel_unset_from_env() {
-  warn_next_home_channel_unset "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+  warn_next_home_channel_unset "${PLATFORM_AGENT_MODE:-$UNRECORDED_PLATFORM_AGENT_MODE}" \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
 }
