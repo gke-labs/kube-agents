@@ -69,8 +69,8 @@ python3 "$HERMES_HOME"/scripts/gitops_preflight.py --repo "<owner>/<repo>"
 Run the first form before anything else, and the second once you know which
 repository the change goes to. `REGISTERED: ...` (exit 0) means go on. Any
 other line (`NO_REGISTERED_REPO`, `REPO_UNREACHABLE`, `STATE_UNREADABLE`,
-`BROKER_UNAVAILABLE`)
-is the stop: block with that line as the reason and change nothing. Do not
+`BROKER_UNAVAILABLE`) is the stop: block with that line as the reason and
+change nothing. Do not
 read the registry another way, check it again, or look for a repository
 anywhere else.
 
