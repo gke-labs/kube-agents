@@ -240,11 +240,12 @@ def local_shell(root: Path, monkeypatch: pytest.MonkeyPatch, on_read=None):
     reads = []
 
     def shell(script: str, timeout: float) -> str:
-        if board.SESSION_CARDS_PRESENT not in script:
+        if board.SESSION_CARDS_PRESENT not in script and board.BOARD_PRESENT not in script:
             return ""
-        reads.append(script)
-        if on_read is not None:
-            on_read(len(reads))
+        if board.SESSION_CARDS_PRESENT in script:
+            reads.append(script)
+            if on_read is not None:
+                on_read(len(reads))
         proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, check=False)
         assert proc.returncode == 0, proc.stderr
         return proc.stdout
@@ -402,3 +403,46 @@ def test_read_board_state_returns_summaries_and_errors(tmp_path: Path) -> None:
     assert statuses == {FRONT: "failed"}
     assert summaries == {FRONT: "API retries exhausted"}
     assert errors == {FRONT: "HTTP 429 TPM quota exhausted"}
+
+
+def test_read_board_state_newest_run_without_summary_clears_older_summary(tmp_path: Path) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            (FRONT, "failed", None),
+        )
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            (FRONT, "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429", "rate_limit"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, NULL, NULL)",
+            (FRONT,),
+        )
+    reply = _run_script(tmp_path, [FRONT])
+    got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
+    assert got is not None
+    statuses, summaries, errors = got
+    assert statuses == {FRONT: "failed"}
+    assert summaries == {}
+
+
+def test_read_session_cards_newest_run_without_summary_does_not_return_older_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'blocked', ?)",
+            (FRONT, "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'failed', NULL)",
+            (FRONT,),
+        )
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT])
+    assert read is not None
+    assert read.cards[FRONT]["summary"] is None
+

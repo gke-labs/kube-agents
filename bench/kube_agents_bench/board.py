@@ -341,9 +341,9 @@ if out["error"] is None:
             if has_table(board, "task_runs") and "summary" in columns(board, "task_runs"):
                 for tid in wanted:
                     row = board.execute(
-                        "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
-                        "AND summary != '' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
-                    if row:
+                        "SELECT summary FROM task_runs WHERE task_id = ? "
+                        "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+                    if row and row[0]:
                         out["cards"][tid]["summary"] = row[0]
         board.close()
     except sqlite3.Error as exc:
