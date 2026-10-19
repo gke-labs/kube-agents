@@ -1918,12 +1918,12 @@ every Cluster Agent profile's cluster and any cluster a finding names, with the 
 kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
 store. Waiting on you is the adapter's own record: the open question of each conversation whose
 latest verified asker is the viewer, so it is per member and the rest is the install's, and it holds
-only questions posted since the gateway started. One snapshot serves every open for 30 seconds. A
+only questions posted since the gateway started. One snapshot serves every open for 30 seconds, and a failed read for 5; one republish pass runs at a time, from one read. A
 member who opened the tab in the last ten minutes is published to again, ten seconds after a burst
 of changes: a card's plan moving or a mark changing reads the board again, a question asked or
 answered recomputes who is waiting and reads the board only once the snapshot has aged out. At
 most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
-when allow-all is what admits the member, their `users.info` team being the bot's; anyone else gets one line and no read of the board.
+when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
 A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
 
 ## The console adapter (added 9/23)

@@ -137,6 +137,26 @@ class BoardSnapshotTest(unittest.TestCase):
         self.assertEqual(got[0], {"url": url, "number": 41, "title": "Raise the limit", "opened_at": "2026-10-16T12:50:00+00:00"})
         self.assertEqual(len({p["url"] for p in got}), len(got))
 
+    def test_a_malformed_row_is_skipped_not_fatal(self):
+        kb = kanban_db()
+        kb.executemany(
+            "INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?)",
+            [("t1", "Good", "platform", "running", STARTED, STARTED), ("t2", "Bad", "platform", "running", "noon", "noon")],
+        )
+        good = json.dumps({"url": "https://github.com/a/b/pull/1", "number": 1, "title": "ok"})
+        kb.executemany(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+            [
+                ("t1", "pr_opened", good, STARTED),
+                ("t1", "pr_opened", json.dumps({"url": ["x"], "number": 2}), STARTED + 1),
+                ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/3", "number": "three"}), STARTED + 2),
+                ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/4", "number": 4}), 1e30),
+            ],
+        )
+        board = self.snap(kb)
+        self.assertEqual([c["title"] for c in board["running"]], ["Good"])
+        self.assertEqual([p["number"] for p in board["prs"]], [1])
+
     def test_no_kanban_board_is_an_empty_board_not_an_error(self):
         got = self.snap(None)
         self.assertEqual((got["running"], got["prs"]), ([], []))

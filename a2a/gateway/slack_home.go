@@ -28,6 +28,10 @@ const (
 	// slackHomeBoardFresh is how long one snapshot serves every open: once a
 	// read has landed, a burst of members opening the tab costs no more.
 	slackHomeBoardFresh = 30 * time.Second
+	// slackHomeBoardErrorFresh is how long a failed read stands for every
+	// open and republish, so a bridge outage costs one request per window
+	// rather than one per member.
+	slackHomeBoardErrorFresh = 5 * time.Second
 	// slackHomeBoardTimeout bounds one board read, the request and the
 	// bridge's SQLite reads behind it.
 	slackHomeBoardTimeout = 5 * time.Second
@@ -120,6 +124,7 @@ type slackHome struct {
 	admits  HomeAdmits
 	board   BoardReader
 	cached  *lib.Board
+	readErr error
 	readAt  time.Time
 	viewers map[string]time.Time
 	// askers is each conversation's latest verified asker, whom its open
@@ -131,6 +136,10 @@ type slackHome struct {
 	// not only recompute who is waiting on what.
 	refetch bool
 	timer   *time.Timer
+	// dirty is a change that arrived while a republish was armed or
+	// running: the running pass rearms the timer when it ends, so passes
+	// never overlap and no change is lost.
+	dirty bool
 }
 
 var _ HomeSink = (*SlackAdapter)(nil)
@@ -154,19 +163,30 @@ func (s *SlackAdapter) homeOpened(ev *slackevents.AppHomeOpenedEvent) {
 	if !armed {
 		return
 	}
-	s.goSession(func() { s.publishHome(ev.User, true) })
+	s.goSession(func() { s.publishHome(ev.User, false) })
 }
 
-// publishHome draws member's Home tab and publishes it. note records them as
-// a viewer to republish to on a change; a republish passes false.
-func (s *SlackAdapter) publishHome(member string, note bool) {
+// publishHome draws member's Home tab and publishes it. An open is admitted
+// here and records the member as a viewer; a republish goes only to viewers,
+// who were admitted when they opened it, so it asks nothing again. A member
+// whose admission could not be decided (users.info failed under allow-all)
+// is published nothing: the tab stays as it was rather than claiming they
+// are not allowed.
+func (s *SlackAdapter) publishHome(member string, republish bool) {
 	view := slack.HomeTabViewRequest{Type: slack.VTHomeTab}
-	if !s.homeAdmitted(member) {
+	admitted, decided := true, true
+	if !republish {
+		admitted, decided = s.homeAdmitted(member)
+	}
+	switch {
+	case !decided:
+		return
+	case !admitted:
 		view.Blocks = slack.Blocks{BlockSet: []slack.Block{
 			slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, slackHomeDenied, false, false), nil, nil),
 		}}
-	} else {
-		if note {
+	default:
+		if !republish {
 			s.noteViewer(member)
 		}
 		board, err := s.homeBoard()
@@ -184,50 +204,55 @@ func (s *SlackAdapter) publishHome(member string, note bool) {
 // homeAdmitted is the allowlist, and under allow-all the member's workspace
 // being the bot's: allow-all admits anyone who can open the app, and a Slack
 // Connect member of another organisation is not anyone. A listed member is
-// the install's own word and needs no users.info (nor users:read).
-func (s *SlackAdapter) homeAdmitted(member string) bool {
+// the install's own word and needs no users.info (nor users:read). decided is
+// false when that lookup failed, which says nothing either way.
+func (s *SlackAdapter) homeAdmitted(member string) (admitted, decided bool) {
 	s.home.mu.Lock()
 	admits := s.home.admits
 	s.home.mu.Unlock()
 	if admits == nil {
-		return false
+		return false, true
 	}
-	admitted, byAllowAll := admits(member)
-	if !admitted {
-		return false
+	ok, byAllowAll := admits(member)
+	if !ok {
+		return false, true
 	}
 	if !byAllowAll {
-		return true
+		return true, true
 	}
 	user, err := s.api.GetUserInfo(member)
 	if err != nil {
-		s.log.Warn("slack: home tab member lookup failed; showing no fleet data", "member", member, "err", err)
-		return false
+		s.log.Warn("slack: home tab member lookup failed; publishing nothing", "member", member, "err", err)
+		return false, false
 	}
-	return s.teamID != "" && user.TeamID == s.teamID
+	return s.teamID != "" && user.TeamID == s.teamID, true
 }
 
 // homeBoard is the cached snapshot, read again once it is older than
-// slackHomeBoardFresh or a change invalidated it.
+// slackHomeBoardFresh or a change invalidated it. A failed read is cached
+// too, for slackHomeBoardErrorFresh.
 func (s *SlackAdapter) homeBoard() (*lib.Board, error) {
 	s.home.mu.Lock()
-	if s.home.cached != nil && time.Since(s.home.readAt) < slackHomeBoardFresh {
+	age := time.Since(s.home.readAt)
+	switch {
+	case s.home.cached != nil && age < slackHomeBoardFresh:
 		b := s.home.cached
 		s.home.mu.Unlock()
 		return b, nil
+	case s.home.readErr != nil && age < slackHomeBoardErrorFresh:
+		err := s.home.readErr
+		s.home.mu.Unlock()
+		return nil, err
 	}
 	read := s.home.board
 	s.home.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), slackHomeBoardTimeout)
 	defer cancel()
 	b, err := read(ctx)
-	if err != nil {
-		return nil, err
-	}
 	s.home.mu.Lock()
-	s.home.cached, s.home.readAt = b, time.Now()
+	s.home.cached, s.home.readErr, s.home.readAt = b, err, time.Now()
 	s.home.mu.Unlock()
-	return b, nil
+	return b, err
 }
 
 func (s *SlackAdapter) noteViewer(member string) {
@@ -309,16 +334,29 @@ func (s *SlackAdapter) homeChanged(refetch bool) {
 	}
 	s.home.refetch = s.home.refetch || refetch
 	if s.home.timer != nil {
+		s.home.dirty = true
 		return
 	}
 	s.home.timer = time.AfterFunc(slackHomeRefreshDebounce, s.republishHome)
 }
 
+// republishHome publishes to every recent viewer, from one board read. The
+// timer stays set until the pass ends, so a change during it marks dirty and
+// the pass rearms the timer rather than starting a second pass alongside.
 func (s *SlackAdapter) republishHome() {
+	defer func() {
+		s.home.mu.Lock()
+		defer s.home.mu.Unlock()
+		s.home.timer = nil
+		if s.home.dirty && len(s.home.viewers) > 0 {
+			s.home.dirty = false
+			s.home.timer = time.AfterFunc(slackHomeRefreshDebounce, s.republishHome)
+		}
+	}()
 	s.home.mu.Lock()
-	s.home.timer = nil
+	s.home.dirty = false
 	if s.home.refetch {
-		s.home.cached = nil
+		s.home.cached, s.home.readErr = nil, nil
 	}
 	s.home.refetch = false
 	s.pruneViewersLocked(time.Now())
@@ -328,7 +366,7 @@ func (s *SlackAdapter) republishHome() {
 	}
 	s.home.mu.Unlock()
 	for _, m := range viewers {
-		s.publishHome(m, false)
+		s.publishHome(m, true)
 	}
 }
 

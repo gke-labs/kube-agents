@@ -187,6 +187,38 @@ func TestSlackHomeCountsTheWholeFleetPastTheCap(t *testing.T) {
 	}
 }
 
+// Under allow-all, a users.info failure decides nothing: the tab is left as
+// it was, never told it is not allowed; and a republish to a member who was
+// admitted when they opened it asks users.info nothing again.
+func TestSlackHomeAnUndecidedMemberIsPublishedNothing(t *testing.T) {
+	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
+	api.users["UX"] = &slack.User{ID: "UX", TeamID: "T1"}
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "UX", Tab: "home"})
+	if len(api.views) != 1 || !strings.Contains(viewText(t, api.views[0].view), "header: Fleet") {
+		t.Fatalf("views = %+v", api.views)
+	}
+	calls := api.userInfoCalls
+	a.republishHome()
+	if api.userInfoCalls != calls || len(api.views) != 2 {
+		t.Errorf("republish: users.info calls %d -> %d, views %d", calls, api.userInfoCalls, len(api.views))
+	}
+	delete(api.users, "UX")
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "UX", Tab: "home"})
+	if len(api.views) != 2 {
+		t.Errorf("a failed lookup published %q", viewText(t, api.views[len(api.views)-1].view))
+	}
+}
+
+// A failed read stands for a few seconds, so an outage is one request.
+func TestSlackHomeCachesAFailedRead(t *testing.T) {
+	a, api, reads := homeAdapter(t, nil, errors.New("nothing answers"))
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	if len(api.views) != 2 || *reads != 1 {
+		t.Errorf("views=%d reads=%d, want 2 views from 1 failed read", len(api.views), *reads)
+	}
+}
+
 func TestSlackHomeIgnoresOtherTabsAndAnUnarmedAdapter(t *testing.T) {
 	a, api, _ := homeAdapter(t, homeBoardFixture(), nil)
 	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "messages"})
@@ -250,6 +282,34 @@ func TestSlackHomeRepublishesToRecentViewersOnAChange(t *testing.T) {
 	a.republishHome()
 	if len(api.views) != 2 {
 		t.Errorf("republished to a viewer past the TTL")
+	}
+}
+
+// A change that lands while a pass is running starts no second pass beside
+// it; the pass rearms the timer when it ends.
+func TestSlackHomeAChangeDuringAPassRearmsInsteadOfOverlapping(t *testing.T) {
+	a, _, _ := homeAdapter(t, homeBoardFixture(), nil)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	a.SetHome(func(m string) (bool, bool) { return m == "U1", false }, func(context.Context) (*lib.Board, error) {
+		a.homeChanged(true) // a card moves mid-pass
+		a.home.mu.Lock()
+		running := a.home.timer
+		a.home.mu.Unlock()
+		if running == nil {
+			t.Error("the timer was cleared while the pass ran, so a second pass could start beside it")
+		}
+		return homeBoardFixture(), nil
+	})
+	a.home.mu.Lock()
+	a.home.timer = time.AfterFunc(time.Hour, func() {})
+	a.home.refetch = true
+	a.home.mu.Unlock()
+	a.republishHome()
+	a.home.mu.Lock()
+	rearmed := a.home.timer
+	a.home.mu.Unlock()
+	if rearmed == nil || !rearmed.Stop() {
+		t.Fatal("the change during the pass was dropped")
 	}
 }
 

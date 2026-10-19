@@ -45,9 +45,11 @@ RUNNING_MAX = 5
 PRS_MAX = 5
 STATUS_RUNNING = "running"
 PR_OPENED_KIND = "pr_opened"
+# What a malformed row (a hand-written payload, a text timestamp) raises on the
+# way into the wire shape; that row is skipped.
+ROW_ERRORS = (TypeError, ValueError, OverflowError)
 CONFIG_NAME = "config.yaml"
 IDENTITY_KEY = "cluster_identity"
-CRITICAL = "critical"
 
 
 class BoardError(Exception):
@@ -114,7 +116,10 @@ def running(kanban: sqlite3.Connection, identities: dict[str, str]) -> list[dict
     ).fetchall()
     out = []
     for title, assignee, started, created in rows:
-        card = {"title": title or "", "started_at": _iso(started if started is not None else created)}
+        try:
+            card = {"title": str(title or ""), "started_at": _iso(started if started is not None else created)}
+        except ROW_ERRORS:
+            continue  # a malformed row costs its own line, not the board
         if assignee in identities:
             card["cluster"] = identities[assignee]
         out.append(card)
@@ -134,17 +139,19 @@ def prs(kanban: sqlite3.Connection) -> list[dict]:
             data = json.loads(payload) if isinstance(payload, str) else payload
         except ValueError:
             continue
-        if not isinstance(data, dict) or not data.get("url") or data["url"] in seen:
+        if not isinstance(data, dict) or not isinstance(data.get("url"), str) or not data["url"] or data["url"] in seen:
             continue
-        seen.add(data["url"])
-        out.append(
-            {
-                "url": str(data["url"]),
+        try:
+            row = {
+                "url": data["url"],
                 "number": int(data.get("number") or 0),
                 "title": str(data.get("title") or ""),
                 "opened_at": _iso(created),
             }
-        )
+        except ROW_ERRORS:
+            continue  # a malformed row costs its own line, not the board
+        seen.add(data["url"])
+        out.append(row)
         if len(out) == PRS_MAX:
             break
     return out
