@@ -57,8 +57,8 @@ BRIDGE_CARRIERS = frozenset({"progress", "terminal"})
 CHAT_ID = "a2a-ctx-1"
 THREAD = "slack:C1/1.2"
 HEADER = "@platform "
-#: What a clipped headline ends with, ``slack_presenter.ELLIPSIS``.
-ELLIPSIS = "…"
+#: What a clipped headline ends with.
+ELLIPSIS = chat_message._presenter.ELLIPSIS
 #: The mrkdwn marker around today's bold headline.
 BOLD = "*"
 

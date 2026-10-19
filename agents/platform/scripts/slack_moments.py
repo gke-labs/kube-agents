@@ -264,11 +264,8 @@ OPTIONS_MAX = _presenter.BUTTONS_PER_ROW
 DETAIL_MAX = 2000
 #: The shortest headline a cut at a word may leave (:func:`_word_cut`): a code span, link
 #: or bold run across the limit would otherwise leave "Should I scale…", so the cut is
-#: made at a character instead. A code span's characters are masked with ``CODE_MASK``
-#: while markers are counted, and a span cut in two is closed and reopened with backticks.
+#: made at a character instead.
 WORD_CUT_MIN = _presenter.HEADLINE_MAX // 2
-CODE_MASK = "x"
-BACKTICK = "`"
 #: Bold in a context line: ``**text**`` between word boundaries with no ``*`` inside,
 #: which mrkdwn would read as a marker. ``__x__`` stays text, so a ``__init__.py`` in a
 #: path or url keeps its characters.
@@ -623,7 +620,9 @@ def _headline_cut(line: str) -> tuple[str, str]:
     sentence, after = line, ""
     if len(_headline_text(line)) > _presenter.HEADLINE_MAX:
         lead, body = _presenter.split_lead(line, cut=False)
-        if lead:
+        links = len(_presenter.MD_LINK.findall(line))
+        # A sentence end inside a link's label ("[Fix A. Part 2](…)") would split the link.
+        if lead and len(_presenter.MD_LINK.findall(lead)) + sum(len(_presenter.MD_LINK.findall(b)) for b in body) == links:
             sentence, after = lead, "\n".join(body)
     head, rest = sentence, ""
     if len(_headline_text(sentence)) > _presenter.HEADLINE_MAX:
@@ -631,7 +630,7 @@ def _headline_cut(line: str) -> tuple[str, str]:
         head, rest = cut or _word_cut(sentence)
     shown: list[str] = []
     for link in _presenter.MD_LINK.finditer(head):
-        if link.group(0) not in shown and link.group(0) not in after:
+        if link.group(0) not in shown and link.group(0) not in rest and link.group(0) not in after:
             shown.append(link.group(0))
     text = " ".join(part for part in (rest, after) if part)
     return head, "\n".join(part for part in (" ".join(shown), text) if part)
@@ -651,7 +650,7 @@ def _word_cut(sentence: str) -> tuple[str, str]:
     links = [link.span() for link in _presenter.MD_LINK.finditer(sentence)]
     masked = list(sentence)
     for start, end, _opener in spans:
-        masked[start:end] = CODE_MASK * (end - start)
+        masked[start:end] = _presenter.CODE_FILLER * (end - start)
     plain = "".join(masked)
     space = char = None
     i, linked = 1, 0
@@ -681,26 +680,28 @@ def _word_cut(sentence: str) -> tuple[str, str]:
 
 
 def _cut_at(sentence: str, i: int, spans: Sequence[tuple[int, int, int]], plain: str) -> tuple[str, str] | None:
-    """``sentence`` split before index ``i``, a code span or bold run open there closed on
-    the left and reopened on the right; None inside a marker or an open italic run.
-    ``plain`` is ``sentence`` with its code spans masked."""
+    """``sentence`` split before index ``i``, a code span, italic or bold run open there
+    closed on the left and reopened on the right; None inside a marker, or right after
+    the opener of a run, which would leave it empty. ``plain`` is ``sentence`` with its code
+    spans masked."""
     closers, openers = "", ""
     for start, end, opener in spans:
         if start < i < end:
             if not start + opener < i < end - opener:
                 return None
-            closers, openers = BACKTICK * opener, BACKTICK * opener
+            closers, openers = _presenter.BACKTICK * opener, _presenter.BACKTICK * opener
     head = plain[:i]
-    for marker in _presenter.BOLD_MARKERS:
-        if plain[i - 1 : i + 1] == marker:
-            return None
-        if head.count(marker) % 2:
-            closers, openers = closers + marker, marker + openers
-    # A lone italic marker this head opens, as clause_cut counts them, and the rest closes;
-    # one nothing closes is literal.
-    if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head) and closer.search(plain, i)
-           for marker, (opener, closer) in _presenter.ITALIC_EDGES.items()):
+    if any(plain[i - 1 : i + 1] == marker for marker in _presenter.BOLD_MARKERS):
         return None
+    # A run is open when this head opens it at a word's edge and the rest closes it, as
+    # _first_sentence counts them; an in-word "2**30" or a marker nothing closes is text.
+    runs = [(marker, edges, head.replace(marker * 2, "").count(marker)) for marker, edges in _presenter.ITALIC_EDGES.items()]
+    runs += [(marker, edges, head.count(marker)) for marker, edges in _presenter.BOLD_EDGES.items()]
+    for marker, (opener, closer), count in runs:
+        if count % 2 and opener.search(plain[: i + 1]) and closer.search(plain, i):
+            if head.rstrip().endswith(marker):
+                return None
+            closers, openers = closers + marker, marker + openers
     return sentence[:i].rstrip() + closers, openers + sentence[i:].lstrip()
 
 

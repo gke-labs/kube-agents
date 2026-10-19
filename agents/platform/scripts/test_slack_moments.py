@@ -659,12 +659,48 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(head.removesuffix(p.ELLIPSIS) + " " + rest[0].removeprefix(p.ELLIPSIS), question)
 
     def test_a_run_across_the_limit_leaves_a_full_headline_not_a_stub(self):
-        for run in (f"`{'x' * 150}`", f"**{'bold ' * 30}**", f"[{'label ' * 25}](https://example.com/a)"):
+        for run in (f"`{'x' * 150}`", f"**{'bold ' * 29}bold**", f"[{'label ' * 25}](https://example.com/a)"):
             question = f"Should I scale {run} now or wait until the on-call engineer has read the logs?"
             with self.subTest(run=run[:8]):
                 head, rest, _ = m._question(question, True)
                 self.assertGreaterEqual(len(head), m.WORD_CUT_MIN, head)
+                if run.startswith("**"):
+                    self.assertTrue(head.endswith(f"**{p.ELLIPSIS}") and rest[0].startswith(f"{p.ELLIPSIS}**"), (head, rest))
                 self.assertTrue(head.endswith(p.ELLIPSIS) and rest[0].lstrip("[").find(p.ELLIPSIS) >= 0, (head, rest))
+
+    def test_an_in_word_double_star_is_text_not_a_bold_run_to_close(self):
+        question = (
+            "Should I raise the memory limit of checkout-gateway in seeded-reliability to 2**30 bytes, or leave it and "
+            "scale the deployment down to zero replicas while I read the OOMKill events and the limits on each container?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertEqual((head + rest[0]).count("**"), 1, (head, rest))
+
+    def test_an_italic_run_across_the_limit_is_closed_and_reopened(self):
+        question = f"Should I keep _{'the long italic run here ' * 7}for good_ or not?"
+        head, rest, _ = m._question(question, True)
+        self.assertGreaterEqual(len(head), m.WORD_CUT_MIN, head)
+        self.assertTrue(head.endswith(f"_{p.ELLIPSIS}") and rest[0].startswith(f"{p.ELLIPSIS}_"), (head, rest))
+
+    def test_a_sentence_end_inside_a_link_label_does_not_split_the_link(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = (
+            f"Should I merge [Raise checkout-gateway memory limit. Part 2]({url}) before the freeze, given that the "
+            "pipeline has been red since the image bump and the on-call engineer asked for a decision?"
+        )
+        link = f"[Raise checkout-gateway memory limit. Part 2]({url})"
+        head, rest, _ = m._question(question, True)
+        self.assertTrue(head.startswith(f"Should I merge {link} before the freeze") and head.endswith(p.ELLIPSIS), head)
+        self.assertEqual(rest[0].split("\n")[0], link)
+
+    def test_a_headline_link_the_cut_rest_repeats_is_not_added_again(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = (
+            f"Should I merge [PR #412]({url}) now, since the pipeline has been red since the image bump and the on-call "
+            f"engineer asked for a decision today, or close [PR #412]({url}) and reopen it later?"
+        )
+        _head, rest, _ = m._question(question, True)
+        self.assertEqual(rest[0].count(f"[PR #412]({url})"), 1, rest)
 
     def test_a_headline_link_opens_the_detail_once(self):
         url = "https://github.com/acme/gitops/pull/412"
