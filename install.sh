@@ -690,7 +690,9 @@ Flags for AI Agents & Automation:
                                 namespace, so changing it is for CI and second installs
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
                                 openai_compatible (a server speaking the OpenAI chat
-                                completions API: vLLM, TGI, an internal gateway)
+                                completions API: vLLM, TGI, an internal gateway) |
+                                sap (SAP AI Core) | any other LiteLLM provider slug, with
+                                --model-default-name and --litellm-env-secret
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
@@ -4637,11 +4639,19 @@ openai_compatible_model_for_run() {
 # The sixth provider entry: SAP AI Core or any other LiteLLM provider slug,
 # with its credentials in a Secret the operator creates. Asks the slug, the
 # model (prefilled with the slug's default when there is one, or with the
-# model already pinned for that same slug) and the Secret's name. $1..$3 the
+# model already pinned for that same slug) and the Secret's name. A typo is
+# asked again only while someone can answer: without a controlling tty, or
+# under --non-interactive, prompt_read answers with the default every time,
+# so the function returns 1 instead of waiting for a better answer that
+# cannot come, and the caller stops or goes back to its menu. $1..$3 the
 # names of the caller's provider, model and Secret-name variables.
 prompt_litellm_env_secret_provider() {
   local provider_var="$1" model_var="$2" secret_name_var="$3"
   local provider_was="${!provider_var}" model_was="${!model_var}" provider="" model=""
+  local can_retry=true
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] || ! has_controlling_tty; then
+    can_retry=false
+  fi
   # A table provider other than sap is not this entry's: start at sap.
   provider="$provider_was"
   if is_table_model_provider "$provider" && [ "$provider" != "sap" ]; then
@@ -4653,6 +4663,7 @@ prompt_litellm_env_secret_provider() {
       break
     fi
     print_error "'${provider}' is not a LiteLLM provider slug (lowercase letters, digits and underscores); openai_compatible has its own entry."
+    [ "$can_retry" = "true" ] || return 1
   done
   model="$(default_model_for_provider "$provider")"
   if [ "$provider" = "$provider_was" ] && [ -n "$model_was" ]; then
@@ -4662,6 +4673,7 @@ prompt_litellm_env_secret_provider() {
     prompt_read "Model name the provider serves" model "$model"
     [ -z "$model" ] || break
     print_error "A model name is required: the installer has no default for ${provider}."
+    [ "$can_retry" = "true" ] || return 1
   done
   prompt_read "Secret in the agent's namespace holding the provider's credentials (you create it)" "$secret_name_var" "${!secret_name_var}"
   printf -v "$provider_var" '%s' "$provider"
@@ -5890,7 +5902,9 @@ run_menu_system() {
               openai_compatible_api_key openai_compatible_ca_secret_name
             ;;
           6)
-            prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name
+            # Back to the menu on an answer nobody can correct; the provider
+            # is unchanged.
+            prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || continue
             ;;
         esac
         ;;
@@ -6964,7 +6978,7 @@ main() {
           openai_compatible_api_key openai_compatible_ca_secret_name
         ;;
       6)
-        prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name
+        prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || exit 1
         ;;
     esac
   fi

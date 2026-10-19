@@ -340,7 +340,7 @@ An agent given that prompt, or reading this file on its own, follows these steps
    their credentials from a Secret the operator creates in the agent's namespace and names with
    `--litellm-env-secret` (the SAP service key under `AICORE_SERVICE_KEY`; a slug outside the menu
    also needs `--model-default-name`); the same flag carries an `openai_compatible` gateway's OAuth2
-   client credentials. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#openai-compatible-endpoints-self-hosted-or-private)
+   client credentials. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#a-credentials-secret-for-the-gateway)
    has every setting. For a GitOps repository on
    GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
    [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
@@ -1165,8 +1165,9 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 # For MODEL_PROVIDER=vertex_ai also export PROJECT_ID, LITELLM_KSA_NAME,
 # LITELLM_GSA_NAME, VERTEX_PROJECT_ID, and VERTEX_LOCATION — the vertex overlay
 # renders the gateway's Workload Identity ServiceAccount from them.
-# MODEL_PROVIDER=openai_compatible is not available here; install through
-# install.sh, the Terraform example or the Helm chart for it.
+# MODEL_PROVIDER=openai_compatible, sap and the gateway's credentials Secret
+# are not available here; install through install.sh, the Terraform example
+# or the Helm chart for them.
 make deploy-litellm
 
 # Deploy GitHub Integration (requires pre-provisioned Cloud KMS key and pre-created credentials secret)
@@ -1479,6 +1480,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
   ```
 - **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
   ```
@@ -1488,6 +1490,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).
   - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
   - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply more than 30 minutes after the thread's last task, is not a turn (a reply under one of the bot's own posts, such as an alert, is the exception). Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+
 - **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \

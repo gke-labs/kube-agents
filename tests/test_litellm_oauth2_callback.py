@@ -19,8 +19,10 @@ import importlib.util
 import json
 import pathlib
 import shutil
+import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -79,10 +81,23 @@ def _load_hook():
     return module
 
 
+def _throwaway_ca(directory: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path] | None:
+    """A self-signed certificate for 127.0.0.1 and its key, or None without openssl."""
+    if not shutil.which("openssl"):
+        return None
+    cert, key = directory / "ca.pem", directory / "key.pem"
+    proc = subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-keyout", str(key),
+         "-out", str(cert), "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+        capture_output=True, text=True, check=False,
+    )
+    return (cert, key) if proc.returncode == 0 else None
+
+
 class _TokenEndpoint:
     """A client_credentials token endpoint on localhost that records what it was asked."""
 
-    def __init__(self, client_id="svc", client_secret="s3cr3t", expires_in=3600, status=200):
+    def __init__(self, client_id="svc", client_secret="s3cr3t", expires_in=3600, status=200, tls=None):
         self.requests: list[dict] = []
         outer = self
 
@@ -114,9 +129,16 @@ class _TokenEndpoint:
                 self.wfile.write(payload)
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        scheme = "http"
+        if tls is not None:
+            cert, key = tls
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+            scheme = "https"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/oauth/token"
+        self.url = f"{scheme}://127.0.0.1:{self.server.server_address[1]}/oauth/token"
 
     def close(self):
         self.server.shutdown()
@@ -124,19 +146,26 @@ class _TokenEndpoint:
 
 
 class _Router:
-    def __init__(self, models: dict[str, list[str]]):
+    def __init__(self, models: dict[str, list[str]], ssl_verify: dict[str, str] | None = None):
         self.models = models
+        self.ssl_verify = ssl_verify or {}
 
     def get_model_list(self, model_name: str):
-        return [{"litellm_params": {"model": m}} for m in self.models.get(model_name, [])]
+        params = [{"litellm_params": {"model": m}} for m in self.models.get(model_name, [])]
+        for p in params:
+            if model_name in self.ssl_verify:
+                p["litellm_params"]["ssl_verify"] = self.ssl_verify[model_name]
+        return params
 
 
+_CA_PATH = "/etc/litellm/openai-compatible-ca/ca.crt"
 _ROUTER = _Router({
     "model-default": ["hosted_vllm/some-org/some-model"],
     "hermes-agent": ["hosted_vllm/some-org/some-model"],
+    "private-ca": ["hosted_vllm/some-org/some-model"],
     "gemini": ["gemini/gemini-3.5-flash"],
     "mixed": ["hosted_vllm/x", "openai/gpt-5.4"],
-})
+}, ssl_verify={"private-ca": _CA_PATH})
 
 
 class TestHook(unittest.TestCase):
@@ -226,6 +255,68 @@ class TestHook(unittest.TestCase):
         self.assertNotIn("api_key", out)
         self.assertEqual(len([line for line in logs.output if "inactive" in line]), 1)
 
+    def test_a_server_behind_a_private_ca_adds_its_bundle_to_the_token_endpoint_roots(self):
+        # The chart sets ssl_verify on the alias's deployments for a private
+        # CA; the hook trusts that file beside the system roots, so a public
+        # identity provider still verifies. The bundle is loaded into the
+        # context rather than given as cafile, which would drop the roots; a
+        # missing file is a token-request failure before anything is sent.
+        self.assertEqual(self.hook.ca_bundle_of(self.hook.hosted_vllm_deployments("private-ca", _ROUTER)), _CA_PATH)
+        self.assertEqual(self.hook.ca_bundle_of(self.hook.hosted_vllm_deployments("model-default", _ROUTER)), "")
+        self.assertEqual(self.hook.ca_bundle_of([{"ssl_verify": True}, {"ssl_verify": False}]), "")
+        real = self.hook.ssl.create_default_context
+        contexts = []
+
+        def building(*args, **kwargs):
+            context = real(*args, **kwargs)
+            contexts.append((kwargs, context))
+            return context
+
+        with mock.patch.object(self.hook.ssl, "create_default_context", side_effect=building):
+            with self.assertRaises(RuntimeError) as failed:
+                self._run({"model": "private-ca"})
+        self.assertIn("token request failed", str(failed.exception))
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0][0], {}, "the bundle must not be passed as cafile, which replaces the system roots")
+        self.assertEqual(self.endpoint.requests, [], "a context that could not be built must not reach the endpoint")
+
+    def test_a_private_ca_token_endpoint_verifies_with_the_bundle_and_the_system_roots_stay(self):
+        # The positive half of the CA change, over real TLS: the token endpoint
+        # on a throwaway CA verifies when the alias's ssl_verify names that CA,
+        # fails without it, and the context that verified it still carries the
+        # system roots (one more certificate than a default context, whatever
+        # that count is on this machine), so a public identity provider behind
+        # a private-CA gateway keeps working.
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = _throwaway_ca(pathlib.Path(tmp))
+            if ca is None:
+                self.skipTest("openssl is not available to mint a throwaway CA")
+            endpoint = _TokenEndpoint(tls=ca)
+            self.addCleanup(endpoint.close)
+            env = dict(self.env, **{self.hook.TOKEN_URL_ENV: endpoint.url})
+            router = _Router({"model-default": ["hosted_vllm/m"], "private-ca": ["hosted_vllm/m"]},
+                             ssl_verify={"private-ca": str(ca[0])})
+            real = self.hook.ssl.create_default_context
+            contexts = []
+
+            def building(*args, **kwargs):
+                context = real(*args, **kwargs)
+                contexts.append(context)
+                return context
+
+            instance = self.hook.proxy_handler_instance
+            with mock.patch.dict(self.hook.os.environ, env), mock.patch.object(self.hook, "_router", return_value=router), \
+                    mock.patch.object(self.hook.ssl, "create_default_context", side_effect=building):
+                with self.assertRaises(RuntimeError) as unverified:
+                    asyncio.run(instance.async_pre_call_hook(None, None, {"model": "model-default"}, "completion"))
+                verified = asyncio.run(instance.async_pre_call_hook(None, None, {"model": "private-ca"}, "completion"))
+            self.assertIn("CERTIFICATE_VERIFY_FAILED", str(unverified.exception))
+            self.assertEqual(verified["api_key"], "tok-1")
+            self.assertEqual(len(contexts), 1)
+            # cert_store_stats counts every loaded certificate; get_ca_certs
+            # would skip a throwaway certificate minted without the CA flag.
+            self.assertEqual(contexts[0].cert_store_stats()["x509"], real().cert_store_stats()["x509"] + 1)
+
     def test_a_token_url_without_client_credentials_is_a_configuration_error(self):
         with self.assertRaises(ValueError) as err:
             self._run({"model": "model-default"}, env={self.hook.TOKEN_URL_ENV: self.endpoint.url})
@@ -239,7 +330,10 @@ class TestHook(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("litellm"), "litellm is not installed")
 class TestWithLiteLLM(unittest.TestCase):
-    def test_the_proxy_loads_it_by_its_callbacks_string_and_the_router_hands_the_key_through(self):
+    def test_the_proxy_loads_it_by_its_callbacks_string_and_it_sets_the_key_on_the_request(self):
+        # The hand-through itself (route_request -> Router.acompletion with
+        # the request's api_key winning over the deployment's) is LiteLLM's
+        # code, read at the pinned tag rather than driven here.
         import litellm.proxy.proxy_server as proxy_server
         from litellm import Router
         from litellm.proxy.types_utils.utils import get_instance_fn

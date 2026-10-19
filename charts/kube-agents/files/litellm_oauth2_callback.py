@@ -21,11 +21,17 @@ names:
 
 The token request is a form POST through urllib in a worker thread, so the
 proxy's event loop is not held. It leaves the pod under the gateway's egress
-rules, so the token URL has to be reachable the way the server is: a public
-address on 443, or inside litellm.openaiCompatible.egressCIDRs. A response
-without expires_in is kept for DEFAULT_TOKEN_LIFETIME_SECONDS. A failed
-exchange raises, so the request that needed the token fails with that error
-rather than leaving without a credential, and the next request tries again.
+rules, which open the server's address and port and nothing else private, so
+the token URL has to be reachable where the server is: a public address on
+443, an address inside litellm.openaiCompatible.egressCIDRs on the apiBase
+URL's port, or the server's own namespace on its targetPort. It is verified
+against the system roots plus the server's own CA bundle when the alias's
+deployments carry an ssl_verify path (litellm.openaiCompatible.caBundleSecretRef),
+so a gateway on a private CA can still use a public identity provider. A
+response without expires_in is kept for
+DEFAULT_TOKEN_LIFETIME_SECONDS. A failed exchange raises, so the request that
+needed the token fails with that error rather than leaving without a
+credential, and the next request tries again.
 
 The chart renders this file into the litellm-config ConfigMap only for
 openai_compatible with litellm.envFromSecret set;
@@ -39,6 +45,7 @@ import base64
 import json
 import logging
 import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -78,6 +85,9 @@ MODEL_KEY = "model"
 REQUEST_CREDENTIAL_KEY = "api_key"
 DEPLOYMENT_PARAMS_KEY = "litellm_params"
 DEPLOYMENT_MODEL_KEY = "model"
+# The per-deployment CA bundle path the chart sets for a server behind a
+# private CA; a boolean here is LiteLLM's own on/off and not a path.
+DEPLOYMENT_SSL_VERIFY_KEY = "ssl_verify"
 # The proxy leaves the root logger at WARNING and this logger has no handler
 # of its own; the fetch and renew lines are the sign the hook is at work.
 LOG_LEVEL = logging.INFO
@@ -127,8 +137,13 @@ def settings_from_env(environ: Any = None) -> dict[str, str] | None:
     }
 
 
-def fetch_token(settings: dict[str, str]) -> tuple[str, float]:
-    """Blocking: run the client_credentials grant; return the token and its lifetime in seconds."""
+def fetch_token(settings: dict[str, str], ca_bundle: str = "") -> tuple[str, float]:
+    """Blocking: run the client_credentials grant; return the token and its lifetime in seconds.
+
+    ``ca_bundle`` is a PEM file trusted for the token endpoint beside the
+    system roots: the server's own bundle, so a token endpoint on the same
+    private CA verifies, and one on a public CA still does.
+    """
     form = {"grant_type": GRANT_TYPE}
     if settings["scope"]:
         form["scope"] = settings["scope"]
@@ -143,11 +158,20 @@ def fetch_token(settings: dict[str, str]) -> tuple[str, float]:
         settings["token_url"], data=urllib.parse.urlencode(form).encode(), headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(request, timeout=TOKEN_REQUEST_TIMEOUT_SECONDS) as response:
+        # The default context loads the system roots; the bundle is added to
+        # them rather than given as cafile, which would replace them. A
+        # missing or unreadable bundle fails here, before anything is sent.
+        context = None
+        if ca_bundle:
+            context = ssl.create_default_context()
+            context.load_verify_locations(cafile=ca_bundle)
+        with urllib.request.urlopen(request, timeout=TOKEN_REQUEST_TIMEOUT_SECONDS, context=context) as response:
             body = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"oauth2: the token endpoint answered {exc.code} {exc.reason}") from None
-    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+    except (OSError, TimeoutError, ValueError) as exc:
+        # URLError is an OSError: a refused connection, a failed name lookup
+        # and a certificate the bundle does not sign all arrive here.
         raise RuntimeError(f"oauth2: the token request failed: {exc}") from None
     token = body.get(ACCESS_TOKEN_KEY) if isinstance(body, dict) else None
     if not isinstance(token, str) or not token:
@@ -159,7 +183,7 @@ def fetch_token(settings: dict[str, str]) -> tuple[str, float]:
     return token, lifetime
 
 
-async def bearer_for(settings: dict[str, str], cache: TokenCache) -> str:
+async def bearer_for(settings: dict[str, str], cache: TokenCache, ca_bundle: str = "") -> str:
     """The cached token while it is safe to send, otherwise a fresh one; one fetch at a time."""
     if cache.usable():
         return cache.token
@@ -168,7 +192,7 @@ async def bearer_for(settings: dict[str, str], cache: TokenCache) -> str:
             return cache.token
         verb = "renewed" if cache.token else "fetched"
         try:
-            token, lifetime = await asyncio.to_thread(fetch_token, settings)
+            token, lifetime = await asyncio.to_thread(fetch_token, settings, ca_bundle)
         except Exception as exc:  # noqa: BLE001 - the request that needed the token gets the error
             logger.warning("oauth2: %s; the request fails and the next one tries again", exc)
             raise
@@ -179,27 +203,38 @@ async def bearer_for(settings: dict[str, str], cache: TokenCache) -> str:
         return token
 
 
-def routes_to_hosted_vllm(model_name: str, router: Any) -> bool:
-    """Whether every deployment ``router`` serves ``model_name`` with is a hosted_vllm one.
+def hosted_vllm_deployments(model_name: str, router: Any) -> list[dict]:
+    """The litellm_params of every deployment ``router`` serves ``model_name`` with, when all are hosted_vllm.
 
-    False when the alias cannot be resolved: the request then goes out as it
-    was, and the hook says once that it is blind.
+    Empty when the alias cannot be resolved or any deployment is another
+    provider's: the request then goes out as it was, and the hook says once
+    when it is blind.
     """
     if router is None:
         _warn_blind("no LiteLLM router to resolve aliases with")
-        return False
+        return []
     if not model_name:
-        return False
+        return []
     try:
         deployments = router.get_model_list(model_name=model_name) or []
     except Exception as exc:  # noqa: BLE001 - an unresolvable alias is left alone
         _warn_blind(f"the router could not resolve {model_name!r} ({exc})")
-        return False
-    models = [(d.get(DEPLOYMENT_PARAMS_KEY) or {}).get(DEPLOYMENT_MODEL_KEY, "") for d in deployments]
+        return []
+    params = [d.get(DEPLOYMENT_PARAMS_KEY) or {} for d in deployments]
+    models = [p.get(DEPLOYMENT_MODEL_KEY, "") for p in params]
     if not models or not any(models):
         _warn_blind(f"the router returned no deployment model for {model_name!r}")
-        return False
-    return all(str(m).startswith(HOSTED_VLLM_PREFIX) for m in models)
+        return []
+    if not all(str(m).startswith(HOSTED_VLLM_PREFIX) for m in models):
+        return []
+    return params
+
+
+def ca_bundle_of(deployments: list[dict]) -> str:
+    """The ssl_verify path the deployments share, or "" for the system roots."""
+    paths = {p.get(DEPLOYMENT_SSL_VERIFY_KEY) for p in deployments}
+    paths = {p for p in paths if isinstance(p, str) and p}
+    return paths.pop() if len(paths) == 1 else ""
 
 
 def _warn_blind(reason: str) -> None:
@@ -231,9 +266,10 @@ class OAuth2ClientCredentials(CustomLogger):
         settings = settings_from_env()
         if settings is None:
             return data
-        if not routes_to_hosted_vllm(data.get(MODEL_KEY, ""), _router()):
+        deployments = hosted_vllm_deployments(data.get(MODEL_KEY, ""), _router())
+        if not deployments:
             return data
-        data[REQUEST_CREDENTIAL_KEY] = await bearer_for(settings, _cache)
+        data[REQUEST_CREDENTIAL_KEY] = await bearer_for(settings, _cache, ca_bundle_of(deployments))
         return data
 
 

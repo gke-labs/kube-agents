@@ -1395,6 +1395,31 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("P=sap S=sap-aicore", proc.stdout)
 
+    def test_the_slug_prompt_gives_up_without_a_tty_instead_of_looping(self):
+        # Without a tty prompt_read answers with the default every time, so a
+        # prompt that waited for a valid answer would never return; the
+        # function returns 1 and leaves the caller's variables alone. Interactive,
+        # a typo is asked again (the pty case lives with the other prompt tests).
+        cmd = (
+            'source_provisioning_helpers "$PWD" >/dev/null; '
+            'PARAM_NON_INTERACTIVE="false"; has_controlling_tty() { return 1; }; '
+            'model_provider="v-llm"; model_default_name="m"; litellm_env_secret_name="s"; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC=${rc:-0} P=$model_provider M=$model_default_name S=$litellm_env_secret_name"; '
+            'model_provider="azure"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC2=${rc:-0} P2=$model_provider M2=[$model_default_name]"; '
+            'model_provider="sap"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC3=${rc:-0} P3=$model_provider M3=$model_default_name"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertIn("RC=1 P=v-llm M=m S=s", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("is not a LiteLLM provider slug", proc.stdout + proc.stderr)
+        self.assertIn("RC2=1 P2=azure M2=[]", proc.stdout)
+        self.assertIn("A model name is required", proc.stdout + proc.stderr)
+        self.assertIn("RC3=0 P3=sap M3=anthropic--claude-4.5-sonnet", proc.stdout)
+
     def test_validate_openai_compatible_inputs_refuses_what_the_chart_or_operator_would(self):
         # The chart cannot render without these, and the operator drops the
         # whole egress rule over one bad CIDR, so the installer stops before
