@@ -15,7 +15,7 @@ Noticing that replicas sit in one zone is only the first half of the diagnosis. 
 
 ## Step 1: Run `leeway report`
 
-Ensure your cluster credentials are active and run `leeway report` in JSON mode:
+Ensure your cluster credentials are active and run `leeway report` in JSON mode (using `--kubeconfig` when targeting a named kubeconfig file):
 
 ```bash
 gcloud container clusters get-credentials <cluster_name> --location <cluster_location> --project <project_id>
@@ -25,6 +25,17 @@ leeway report --namespace <namespace> --format json
 
 # Scan all non-system namespaces on the cluster:
 leeway report --format json
+```
+
+If `leeway` is not installed in the current sandbox image (`! command -v leeway >/dev/null 2>&1`), collect the equivalent node-zone, pod-placement, controller-constraint, PVC, and scheduler-event evidence directly with read-only `kubectl` commands:
+
+```bash
+kubectl get nodes -L topology.kubernetes.io/zone
+kubectl get pods -n <namespace> -o wide
+kubectl get deploy,statefulset -n <namespace> -o yaml
+kubectl get pvc -n <namespace>
+kubectl get storageclass -o yaml
+kubectl get events -n <namespace> --field-selector reason=FailedScheduling
 ```
 
 ### Key Fields in `leeway report --format json`
@@ -46,15 +57,15 @@ leeway report --format json
 
 For every skewed workload (`zoneSkew > 1` or `maxZoneShare >= 0.8` on a multi-zone cluster), classify the root cause using `leeway report` and confirming `kubectl` reads:
 
-1. **Scheduling Misconfiguration:**
+1. **Scheduling Misconfiguration (e.g., `zone-pinned-api`):**
    - `pendingPods == 0`, `runningPods == replicas`, `maxZoneShare == 1.0`.
    - `constraints` shows `whenUnsatisfiable: "ScheduleAnyway"` and/or `requiredZoneAffinityValues` restricting placement to one zone.
    - Recommend removing or widening the single-zone `nodeAffinity` / `nodeSelector` and tightening `whenUnsatisfiable` to `DoNotSchedule` when strict spread is required.
-2. **Zone-Pinned Storage (Volume):**
-   - `StatefulSet` or PVC-backed workload with `volumeClaimStorageClasses` populated, `pendingPods == 0`, and all pods in one zone.
+2. **Zone-Pinned Storage (Volume) (e.g., `zone-bound-store`):**
+   - `StatefulSet` or PVC-backed workload with `volumeClaimStorageClasses` populated (e.g., `seeded-zonal-pd`), `pendingPods == 0`, and all pods in one zone.
    - Confirm with `kubectl get pvc -n <namespace>` and `kubectl get storageclass <storage_class_name> -o yaml` whether `allowedTopologies` or zonal persistent disks bind the replicas to one zone.
    - Recommend storage migration or a regional `StorageClass` (not a pod-template spread constraint edit).
-3. **Node Capacity Starvation:**
+3. **Node Capacity Starvation (e.g., `capacity-starved-worker`):**
    - `pendingPods > 0` and `runningPods >= 1`, with running pods concentrated in the zone that still has headroom.
    - Confirm with `kubectl describe pod <pending_pod_name> -n <namespace>` that `Pending` pods fail scheduling on `Insufficient cpu` or `Insufficient memory` in the starved zone.
    - Recommend adding capacity in the starved zone, rebalancing competing workloads, or right-sizing CPU/memory requests (not editing `topologySpreadConstraints`).

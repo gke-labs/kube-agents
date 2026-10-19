@@ -23,7 +23,7 @@ Noticing that replicas sit in one zone is only the first half of the diagnosis. 
 
 If a recent daily topology watch report exists on disk at `/opt/data/leeway/reports/<cluster>/latest.json`, read it first to inspect the latest fleet snapshot.
 
-To collect live topology distribution evidence against one or more clusters, authenticate kubeconfig for the target cluster(s) and run `leeway report`:
+To collect live topology distribution evidence against a cluster from the sandbox, authenticate kubeconfig for the target cluster and run `leeway report` (passing `--kubeconfig` when targeting a named kubeconfig file or `--clusters <project>/<location>/<cluster>` when targeting a GKE cluster identifier, since `--clusters` takes `<project>/<location>/<cluster>` triples rather than kubeconfig context names):
 
 ```bash
 gcloud container clusters get-credentials <cluster_name> --location <cluster_location> --project <project_id>
@@ -31,16 +31,28 @@ gcloud container clusters get-credentials <cluster_name> --location <cluster_loc
 # Scan a specific namespace in the current kubeconfig context:
 leeway report --namespace <namespace> --format json
 
-# Scan all non-system namespaces in the current kubeconfig context:
-leeway report --format json
+# Scan all non-system namespaces in a specific cluster kubeconfig file:
+leeway report --kubeconfig "$HERMES_HOME/.kubeconfigs/<cluster>.yaml" --format json
 
-# Scan multiple kubeconfig contexts in parallel:
-leeway report --clusters <context_a>,<context_b> --format json
+# Or target a GKE cluster triple directly (invokes gcloud get-credentials under the hood):
+leeway report --clusters <project_id>/<cluster_location>/<cluster_name> --namespace <namespace> --format json
+```
+
+If `leeway` is not installed in the current sandbox image (`! command -v leeway >/dev/null 2>&1`), collect the equivalent node-zone, pod-placement, controller-constraint, PVC, and scheduler-event evidence directly with read-only `kubectl` commands:
+
+```bash
+kubectl get nodes -L topology.kubernetes.io/zone
+kubectl get pods -n <namespace> -o wide
+kubectl get deploy,statefulset -n <namespace> -o yaml
+kubectl get pvc -n <namespace>
+kubectl get storageclass -o yaml
+kubectl get events -n <namespace> --field-selector reason=FailedScheduling
 ```
 
 ### Reading `leeway report --format json` Output
 
 Each `clusters[]` entry in the JSON report contains:
+
 - `zoneCount` and `nodeCount`: the cluster's available failure domains and nodes (`nodes[]` maps each node to its `zone`). A single-zone cluster (`zoneCount == 1`) cannot spread pods across zones by construction.
 - `zoneSkewScore` and `hostSkewScore`: cluster-wide health scores (`0`–`100`, where `100` is balanced).
 - `workloads[]`: per-workload distribution records for controllers with `replicas > 1`:
@@ -59,11 +71,11 @@ Each `clusters[]` entry in the JSON report contains:
 
 For every skewed workload (`zoneSkew > 1` or `maxZoneShare >= 0.8` on a cluster with `zoneCount >= 2`), classify its cause using the decision matrix below before proposing any remediation:
 
-| Cause Category | Signature in `leeway report` & Kubernetes | Confirming Read-Only Checks | Correct Remediation |
-| :--- | :--- | :--- | :--- |
-| **1. Scheduling Misconfiguration** | `pendingPods == 0`, `runningPods == replicas`, `maxZoneShare == 1.0`. `constraints` shows `whenUnsatisfiable: "ScheduleAnyway"` on `topology.kubernetes.io/zone` and/or `requiredZoneAffinityValues` pinning a single zone. | Inspect the workload's `spec.template.spec.topologySpreadConstraints` and `spec.template.spec.affinity.nodeAffinity`. Verify that no PVCs or `Pending` pods are involved. | **Manifest edit:** remove or widen the single-zone `nodeAffinity` / `nodeSelector` to cover all cluster zones, and set `whenUnsatisfiable: DoNotSchedule` if strict zonal spread is required. |
-| **2. Zone-Pinned Storage (Volume)** | Workload is a `StatefulSet` (or mounts RWO PVCs) with `volumeClaimStorageClasses` populated, `pendingPods == 0`, and all pods running in one zone. | Check the `PersistentVolumeClaim` and `StorageClass` (`kubectl get pvc -n <namespace>` and `kubectl get storageclass <storage_class_name> -o yaml`). Look for `allowedTopologies` pinning `topology.gke.io/zone` to one zone or zonal `pd.csi.storage.gke.io` disks bound in a single zone. | **Storage migration:** provision a regional `StorageClass` or migrate volume state across zones. Warn that editing `topologySpreadConstraints` to `DoNotSchedule` without migrating the zonal PVCs will break scheduling (`VolumeNodeAffinityConflict`). |
-| **3. Node Capacity Starvation** | `pendingPods > 0` and `runningPods >= 1`, with all running pods in one zone (`maxZoneShare == 1.0`). `topologySpreadConstraints` may already be present (`ScheduleAnyway`). | Inspect the `Pending` pods and node allocatable capacity (`kubectl get pods -n <namespace> -o wide` and `kubectl describe pod <pending_pod_name> -n <namespace>`). Confirm `FailedScheduling` events citing `Insufficient cpu` or `Insufficient memory` in the starved zone (often caused by node size asymmetry or competing zone-pinned workloads). | **Capacity or sizing change:** add node capacity in the starved zone, enable autoscaling, rebalance competing workloads in the full zone, or right-size container CPU/memory requests. Do **not** blame or edit the workload's `topologySpreadConstraints`. |
+| Cause Category                                                    | Signature in `leeway report` & Kubernetes                                                                                                                                                                                   | Confirming Read-Only Checks                                                                                                                                                                                                                                                                                                                           | Correct Remediation                                                                                                                                                                                                                                         |
+| :---------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. Scheduling Misconfiguration** (e.g., `zone-pinned-api`)      | `pendingPods == 0`, `runningPods == replicas`, `maxZoneShare == 1.0`. `constraints` shows `whenUnsatisfiable: "ScheduleAnyway"` on `topology.kubernetes.io/zone` and/or `requiredZoneAffinityValues` pinning a single zone. | Inspect the workload's `spec.template.spec.topologySpreadConstraints` and `spec.template.spec.affinity.nodeAffinity`. Verify that no PVCs or `Pending` pods are involved.                                                                                                                                                                             | **Manifest edit:** remove or widen the single-zone `nodeAffinity` / `nodeSelector` to cover all cluster zones, and set `whenUnsatisfiable: DoNotSchedule` if strict zonal spread is required.                                                               |
+| **2. Zone-Pinned Storage (Volume)** (e.g., `zone-bound-store`)    | Workload is a `StatefulSet` (or mounts RWO PVCs) with `volumeClaimStorageClasses` populated (e.g., `seeded-zonal-pd`), `pendingPods == 0`, and all pods running in one zone.                                                | Check the `PersistentVolumeClaim` and `StorageClass` (`kubectl get pvc -n <namespace>` and `kubectl get storageclass <storage_class_name> -o yaml`). Look for `allowedTopologies` pinning `topology.gke.io/zone` to one zone or zonal `pd.csi.storage.gke.io` disks bound in a single zone.                                                           | **Storage migration:** provision a regional `StorageClass` or migrate volume state across zones. Warn that editing `topologySpreadConstraints` to `DoNotSchedule` without migrating the zonal PVCs will break scheduling (`VolumeNodeAffinityConflict`).    |
+| **3. Node Capacity Starvation** (e.g., `capacity-starved-worker`) | `pendingPods > 0` and `runningPods >= 1`, with all running pods in one zone (`maxZoneShare == 1.0`). `topologySpreadConstraints` may already be present (`ScheduleAnyway`).                                                 | Inspect the `Pending` pods and node allocatable capacity (`kubectl get pods -n <namespace> -o wide` and `kubectl describe pod <pending_pod_name> -n <namespace>`). Confirm `FailedScheduling` events citing `Insufficient cpu` or `Insufficient memory` in the starved zone (often caused by node size asymmetry or competing zone-pinned workloads). | **Capacity or sizing change:** add node capacity in the starved zone, enable autoscaling, rebalance competing workloads in the full zone, or right-size container CPU/memory requests. Do **not** blame or edit the workload's `topologySpreadConstraints`. |
 
 ### Confirming Commands
 
@@ -84,6 +96,7 @@ kubectl get storageclass <storage_class_name> -o yaml
 ## Step 3: Report Blast Radius & Remediate Safely
 
 In your report, always state for each skewed workload:
+
 1. **Workload identity:** `kind/name` and `namespace` (plus cluster name in multi-cluster checks).
 2. **Blast radius:** per-zone running pod breakdown (e.g., `2/2` running replicas in `<zone_a>`, `0` in `<zone_b>` — `100%` single-zone blast radius if `<zone_a>` fails; plus any `Pending` replica count).
 3. **Attributed root cause:** explicitly distinguish scheduling configuration (`ScheduleAnyway` / single-zone `nodeAffinity`), zone-pinned storage (`PersistentVolumeClaim` / `StorageClass` `allowedTopologies`), or node capacity starvation (`Pending` pods with `Insufficient cpu` or `Insufficient memory`).

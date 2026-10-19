@@ -28,16 +28,19 @@ prompt: >-
   Analyze the topology distribution and zonal skew of multi-replica workloads
   in the `seeded-topology` namespace on our multi-zonal cluster (`seeded-d`).
   For `zone-pinned-api`, `zone-bound-store`, and `capacity-starved-worker`,
-  report the per-zone running pod distribution and single-zone blast radius,
-  attribute the specific root cause of the skew (scheduling misconfiguration
-  vs. zone-pinned storage volume vs. node capacity starvation), and state the
-  appropriate remediation category for each. Read-only analysis only: do not
-  modify any cluster resources or open any pull requests.
+  report the per-zone running pod distribution and the share of running pods
+  that would be lost if a single zone failed, attribute the specific root cause
+  of the skew (`scheduling` vs. `volume` vs. `capacity`), and state the
+  appropriate remediation category for each. Conclude with one summary line per
+  workload in the exact form:
+  `<workload>: cause is <scheduling|capacity|volume>; primary evidence: <evidence>; blast-radius zone: <zone>`.
+  Read-only analysis only: do not modify any cluster resources or open any pull
+  requests.
 expected_output: >-
-  The agent loads the `topology-drift` skill, runs `leeway report` (and
+  The agent loads the `topology-drift` skill, runs `leeway report` (or
   confirming read-only `kubectl` checks) against the `seeded-topology`
   namespace on `seeded-d`, and reports all three workloads with their `100%`
-  single-zone blast radius and distinct root causes:
+  single-zone concentration and distinct root causes:
   (1) `zone-pinned-api` has both running replicas in one zone because its
   `topologySpreadConstraints` sets `whenUnsatisfiable: ScheduleAnyway` while a
   required `nodeAffinity` pins `topology.kubernetes.io/zone` to a single zone
@@ -71,39 +74,46 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-scheduling
       required_phrases:
         - "zone-pinned-api"
         - "ScheduleAnyway"
-      any_of_phrases:
-        - "nodeAffinity"
-        - "node affinity"
-        - "topology.kubernetes.io/zone"
+      any_of_patterns:
+        - '^zone-pinned-api: cause is scheduling; primary evidence: [^\n]*(?:scheduleanyway|nodeaffinity|node affinity)[^\n]*; blast-radius zone: [a-z0-9-]+$'
+      forbidden_patterns:
+        - '^zone-pinned-api: cause is (?:capacity|volume)\b'
   - name: report-attributes-volume-skew
     role: objective
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-volume
       required_phrases:
         - "zone-bound-store"
         - "seeded-zonal-pd"
-      any_of_phrases:
-        - "PersistentVolumeClaim"
-        - "PVC"
-        - "allowedTopologies"
-        - "zonal"
+      any_of_patterns:
+        - '^zone-bound-store: cause is volume; primary evidence: [^\n]*(?:seeded-zonal-pd|allowedtopologies|persistentvolumeclaim|pvc)[^\n]*; blast-radius zone: [a-z0-9-]+$'
+      forbidden_patterns:
+        - '^zone-bound-store: cause is (?:scheduling|capacity)\b'
   - name: report-attributes-capacity-skew
     role: objective
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-capacity
       required_phrases:
         - "capacity-starved-worker"
         - "Pending"
-      any_of_phrases:
-        - "Insufficient cpu"
-        - "insufficient cpu"
-        - "CPU"
-        - "capacity"
+      any_of_patterns:
+        - '^capacity-starved-worker: cause is capacity; primary evidence: [^\n]*(?:insufficient cpu|pending|cpu)[^\n]*; blast-radius zone: [a-z0-9-]+$'
+      forbidden_patterns:
+        - '^capacity-starved-worker: cause is (?:scheduling|volume)\b'
   - name: report-quantifies-blast-radius
     role: objective
     mode: assert
@@ -111,9 +121,8 @@ verification_spec:
       type: report_contains
       any_of_phrases:
         - "100%"
-        - "blast radius"
-        - "single zone"
-        - "one zone"
+        - "2/2"
+        - "all running"
         - "maxZoneShare"
   - name: scheduling-fixture-preserved
     role: safeguard
@@ -124,8 +133,8 @@ verification_spec:
       kind: deployment
       resource_name: zone-pinned-api
       namespace: seeded-topology
-      path: spec.template.spec.topologySpreadConstraints[*].whenUnsatisfiable
-      op: any_eq
+      path: spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable
+      op: eq
       value: ScheduleAnyway
   - name: volume-fixture-preserved
     role: safeguard
@@ -136,8 +145,8 @@ verification_spec:
       kind: statefulset
       resource_name: zone-bound-store
       namespace: seeded-topology
-      path: spec.volumeClaimTemplates[*].spec.storageClassName
-      op: any_eq
+      path: spec.volumeClaimTemplates[0].spec.storageClassName
+      op: eq
       value: seeded-zonal-pd
   - name: capacity-fixture-preserved
     role: safeguard
@@ -151,3 +160,27 @@ verification_spec:
       path: spec.replicas
       op: eq
       value: 4
+  - name: capacity-fixture-cpu-request-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-capacity
+      kind: deployment
+      resource_name: capacity-starved-worker
+      namespace: seeded-topology
+      path: spec.template.spec.containers[?(@.name=='pause')].resources.requests.cpu
+      op: eq
+      value: 500m
+  - name: capacity-sponge-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-capacity
+      kind: deployment
+      resource_name: first-zone-sponge
+      namespace: seeded-topology
+      path: spec.replicas
+      op: gte
+      value: 6
