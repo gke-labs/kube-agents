@@ -2136,8 +2136,8 @@ uid 1000's own files what uid 1000 can already do. The commands are `/bin/ls` an
 contain a slash, and a non-interactive shell does not expand aliases.
 
 The same job takes an inventory of each sandbox profile home (#2989). Hermes cron runs
-start in the profile home, so a worker's loose files land beside the skills and config
-on a volume nothing sweeps, and a later session that lists the home cannot tell them
+started in the sandbox's unwritable login home, so a run's scratch went wherever it could
+write, often the profile home, beside the skills and config on a volume nothing sweeps, and a later session that lists the home cannot tell them
 from what the product put there. Every top-level entry the product doesn't create in that
 kind of home (the mirror's skeleton everywhere; the image-staged trees and database
 placeholders in the platform home; the identity and kubeconfig in a cluster home), checked

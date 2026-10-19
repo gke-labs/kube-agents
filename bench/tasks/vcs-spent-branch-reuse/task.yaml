@@ -54,10 +54,11 @@
 # deletes both branches before the next repetition of a case that requests a
 # pull request, as rca-remediation-pr's header describes.
 #
-# No `domain:`, for the reason vcs-review-feedback-read-back gives: it grades
-# the version-control path of the remediation journey, not a fix.
+# Domain source-control, for the reason vcs-review-feedback-read-back gives: it
+# grades the version-control path of the remediation journey, not a fix.
 id: vcs-spent-branch-reuse
 name: A second proposal under a branch name whose first proposal was closed
+domain: source-control
 prompt: >-
   Do all of the following as ONE delegated task, in order — do not split it
   across several tasks.

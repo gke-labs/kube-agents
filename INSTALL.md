@@ -621,6 +621,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
    - If you left `GOOGLE_CHAT_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its space the home channel, where scheduled reports post. To send them to a team space instead, send the first message there, or run `/sethome` there afterwards.
+   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and drops them while it is empty. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash

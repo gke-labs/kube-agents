@@ -550,6 +550,15 @@ booleans and therefore settles it outright on a deployed pod), then `CONFIG_PATH
 profile's — then per-platform environment signals for an install neither file
 describes.
 
+An install with no chat route gets no send at all: when the managed scope turns
+every platform off and nothing routes one through the gateway — a `next` install
+whose only chat platform is held by the gateway with no home channel, or an
+install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
+platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
+channel (`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
+exists when no platform can be named.
+
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the
 relay fans out to every platform anyway (see "What this costs" below).
