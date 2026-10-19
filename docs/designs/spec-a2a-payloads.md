@@ -635,6 +635,8 @@ table in markdown is text, never a table (use `fold.table`).
 | `plan`     | `title` plain, at most 256. `items`: at most 20, each with `id` (opaque, 1-64 characters, unique in the plan), `title` (plain, at most 256), `status`, `steps` (at most 6 plain lines, at most 300 each), `stepCount` (how many steps the item has had, kept or not), `note` (plain, at most 300) and `result` (plain, at most 256). `note`, `result` and `stepCount` are already folded into `title`; they ride beside it for a backend that shows them as their own fields (a task card's details and output). `status` is `pending` (queued), `in_progress`, `complete` or `error`.                                                                                                                                                                                                                                                                                                           |
 | `mark`     | Reaction state for the user message that started the work (below): `ask`, a token of 1-16 characters of `[a-z0-9-]` naming the kind of ask, and `settle`, one of `done`, `blocked` or `failed`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
+A choice may also carry `next: true`, which marks a finished answer's optional next step: a click arrives as the `choices` rule says, but nothing waits on it, so a renderer never reads a typed reply as its answer.
+
 Block order is fixed so every renderer agrees: headline and note, detail, rows, after, fold,
 then the buttons, choices before links. In `progress` the `plan` follows the headline and
 takes the place of the rows. The caps on headline, row text and row detail, button
@@ -725,7 +727,12 @@ first sentence as `headline`, cut at a clause when it runs past the headline's c
 as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
 to five listed options to take carries them as `choices`, its opening paragraph, each
 option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
-by the rule `slack_moments.answer_choices` applies under `today`),
+by the rule `slack_moments.answer_choices` applies under `today`; an answer that instead
+declares its one next step on a last line of its own, `[next: <label>]`, carries that
+step as its only choice, `next` and not `primary`, and leaves the line out of `headline`, `detail`
+and `fold`, by `slack_moments.next_step`'s rule; the line is plumbing, so the text fallback
+leaves it out too (`slack_moments.visible_text`, the bridge's `visibleText`), and a renderer
+without buttons shows the answer alone),
 the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
 `kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on and its conversation route recorded,
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the
@@ -754,8 +761,9 @@ stands), it posts each notify's text, a later `update` of the same key included.
 
 - **The text fallback is the answer.** It stands alone, because a consumer that is not a
   chat renderer (another agent, the eval, an older gateway) reads only it. The chat
-  message lays out the same content and adds no fact the text lacks. A chat message with
-  no text fallback is invalid, except the terminal mark-only one above.
+  message lays out the same content and adds no fact the text lacks, except an answer's
+  next step (`next`), an optional follow-up the text's own offer, if any, already makes. A
+  chat message with no text fallback is invalid, except the terminal mark-only one above.
 - **The renderer validates, then renders or falls back.** A chat message that breaks a rule
   above (an unknown `schema`, a cap exceeded, a `tone` or `status` outside its set, an
   unsafe url, a `reply` that doesn't contain its `text`) is dropped whole and the

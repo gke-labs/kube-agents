@@ -15,8 +15,9 @@
 # ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
 # ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
 # cases that request a pull request, on a second project (the variable's
-# comment in the script says why). The budget below prices the whole matrix
-# on one job, as it ran before that split.
+# comment in the script says why). EVAL_NIGHTLY_PART=main-a and main-b halve
+# the main part again, for two jobs on two projects (#3384). The budget below
+# prices the whole matrix on one job, as it ran before that split.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -416,6 +417,12 @@
 # infra-lock chain. It sits below, after not-found-target-stops-as-failure,
 # and makes this file ninety-six cases (288 units) of a hundred-and-eight-case,
 # 324-unit matrix with the presubmit file's twelve, counted from the lists.
+#
+# 2026-10-14 adds scale-request-proposes-pr: one case, three units, deployer:
+# noop at the 200s default, about 10 serial minutes, outside the infra-lock
+# chain. It sits below, after upgrades-audit-reports-upgrade-blocked, and
+# makes this file ninety-seven cases (291 units) of a hundred-and-nine-case,
+# 327-unit matrix with the presubmit file's twelve, counted from the lists.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1014,6 +1021,16 @@
 # and a registered GitOps repository), which the eval fleet's has.
 ./tasks/upgrades-audit-reports-upgrade-blocked/task.yaml
 
+# An implicit write request: "scale this deployment", no command named. The
+# mirrored gke-* skills used to answer it with patch_k8s_resource or kubectl
+# scale (#2937's skills sweep); the case grades that no worker ran a kubectl
+# write and that the run ends in a proposal (the scaled manifest, inline or as
+# a pull request, which its pull_request_opened leaf requests, so it runs in
+# the writers part) or, on an install with no registered GitOps repository,
+# in the preflight's stop. Nightly from its first merge; a presubmit seat
+# waits on a clean nightly record.
+./tasks/scale-request-proposes-pr/task.yaml
+
 # A /session turn that delegates a cluster question ends in one wake's answer,
 # not in the delegation depth bound (#2819). Real only on the next lane's
 # inject transport, where the gateway routes /session to a session pod; on
@@ -1152,6 +1169,12 @@
 # created another way (#2937). The pool's clusters carry no Config Connector.
 ./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml
 
+# A Cluster Agent runs its gke-workload-security audit script from the path
+# the skill names: graded on a Cluster Agent doing the work, running
+# /opt/data/scripts/audit_cluster.sh against seeded-a, and no result showing
+# the script missing.
+./tasks/cluster-agent-security-audit-script/task.yaml
+
 # An implicit write request for a cluster setting: "turn on Binary Authorization",
 # no command named. The mirrored gke-platform-security skill used to answer it
 # with gcloud container clusters update (#2937's skills sweep); the case
@@ -1162,3 +1185,31 @@
 # the preflight's stop. Nightly from its first merge; a presubmit seat waits
 # on a clean nightly record.
 ./tasks/cluster-setting-request-proposes-pr/task.yaml
+
+# A fleet search's per-cluster cards complete on the clusters that don't have
+# the workload, rather than waiting for it (#2978). Worker-scope checks, so it
+# grades on the api lanes; fixture no-pdb-workload on seeded-a.
+./tasks/fanout-absent-cluster-cards-complete/task.yaml
+
+# The front door's reply to a blocked card declares the one next step on a
+# last line of its own, `[next: <label>]`, which Slack draws as a button
+# (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
+# planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
+# turn and no worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-failure-reply-declares-next-step/task.yaml
+
+# A card's answer with one obvious next step declares it on a last line of
+# its own, `[next: <label>]`, which Slack draws as a button (the report-format
+# stanza in deploy/docker/patches/kanban_report_format.py). Read-only against
+# the crashloop-workload fixture; one card, nothing changed.
+./tasks/chat-answer-declares-next-step/task.yaml
+
+# Mock 03's shape: an answer whose offer is about a workload the user did
+# not ask about declares no next step (the report-format stanza). Read-only
+# against the no-pdb-workload and crashloop-workload fixtures; one card.
+./tasks/chat-answer-tangent-offer-declares-no-step/task.yaml
+
+# #3371: a zonal seeded cluster asked about by its region must be found, not
+# declared absent. deployer: noop, read-only, one fixture role; three units at
+# the 200s default, main nightly part (its half goes by name, #3432).
+./tasks/fleet-zonal-cluster-named-by-region/task.yaml
