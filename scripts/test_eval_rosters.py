@@ -199,6 +199,9 @@ ADDED_AFTER_THE_MOVE = [
     "cluster-agent-security-audit-script",  # a Cluster Agent runs its audit script from the path its skill names, #3402
     "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
     "fanout-absent-cluster-cards-complete",  # a fleet search's per-cluster cards complete, #2978
+    "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
+    "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
+    "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -432,6 +435,9 @@ INJECT_LANE_EXCLUDED = [
     "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
     "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
+    "chat-failure-reply-declares-next-step",  # #2039: grades the front door's reply to a blocked card's wake; a card-wake replay
+    "chat-answer-declares-next-step",  # #2039: grades the worker's answer under the door's one card; same door
+    "chat-answer-tangent-offer-declares-no-step",  # the same
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
@@ -460,6 +466,9 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
     "chat-question-asked-to-choose-pauses": "nightly",
+    "chat-failure-reply-declares-next-step": "nightly",
+    "chat-answer-declares-next-step": "nightly",
+    "chat-answer-tangent-offer-declares-no-step": "nightly",
 }
 
 
