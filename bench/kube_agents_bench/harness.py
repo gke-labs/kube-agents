@@ -1898,20 +1898,18 @@ class KubeAgentsHarness(AgentHarness):
                 # transport, so this is the run class, not an answer.
                 return _infra_failure(str(exc))
 
-        if result.metadata.get("infra_failure"):
-            return result
-
         # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
         # request, and the cluster the verifiers grade only changes once that
         # PR has merged and Argo has synced it. Hold the run open for that, or
         # for the evidence it will not happen; the outcome is recorded in
         # metadata["gitops"] and, in the pilot, not scored. Never fatal: a poll
         # failure must not turn a finished agent run into a crashed one.
-        try:
-            gitops.await_fix_cycle(result, since=getattr(self, "_run_started_at", None))
-        except Exception as exc:  # noqa: BLE001 - recorded, never raised past here
-            _log.error("gitops wait failed: %s", exc)
-            result.metadata.setdefault("gitops", {})["error"] = str(exc)
+        if not result.metadata.get("infra_failure"):
+            try:
+                gitops.await_fix_cycle(result, since=getattr(self, "_run_started_at", None))
+            except Exception as exc:  # noqa: BLE001 - recorded, never raised past here
+                _log.error("gitops wait failed: %s", exc)
+                result.metadata.setdefault("gitops", {})["error"] = str(exc)
 
         # One lookup, after the last turn: the session row is cumulative over
         # the conversation, so it supersedes the summed envelopes outright.
@@ -2586,11 +2584,15 @@ class KubeAgentsHarness(AgentHarness):
                 tid = str(shown.get("id"))
                 if tid in wanted:
                     runs = payload.get("runs")
-                    for r in runs if isinstance(runs, list) else []:
-                        if isinstance(r, dict):
-                            summ = r.get("summary")
+                    if isinstance(runs, list):
+                        if runs and isinstance(runs[-1], dict):
+                            summ = runs[-1].get("summary")
                             if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
-                                found.setdefault(tid, []).append(summ)
+                                found[tid] = [summ]
+                            else:
+                                found.pop(tid, None)
+                        else:
+                            found.pop(tid, None)
             listed = payload.get("tasks")
             if isinstance(listed, list):
                 for item in listed:
@@ -2598,11 +2600,15 @@ class KubeAgentsHarness(AgentHarness):
                         tid = str(item.get("id"))
                         if tid in wanted:
                             runs = item.get("runs")
-                            for r in runs if isinstance(runs, list) else []:
-                                if isinstance(r, dict):
-                                    summ = r.get("summary")
+                            if isinstance(runs, list):
+                                if runs and isinstance(runs[-1], dict):
+                                    summ = runs[-1].get("summary")
                                     if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
-                                        found.setdefault(tid, []).append(summ)
+                                        found[tid] = [summ]
+                                    else:
+                                        found.pop(tid, None)
+                                else:
+                                    found.pop(tid, None)
         return found
 
     @staticmethod
@@ -2966,9 +2972,12 @@ class KubeAgentsHarness(AgentHarness):
                 on_board, bsummaries, berrors = bstate
                 latest.update(on_board)
                 for t in outstanding:
-                    msgs = self._extract_board_card_messages(bstate, t)
-                    if msgs:
-                        poll_failure_messages[t] = msgs
+                    if on_board.get(t) not in _FAILURE_STATUSES:
+                        poll_failure_messages.pop(t, None)
+                    else:
+                        msgs = self._extract_board_card_messages(bstate, t)
+                        if msgs:
+                            poll_failure_messages[t] = msgs
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
                 ):
@@ -3059,7 +3068,9 @@ class KubeAgentsHarness(AgentHarness):
             fresh_reported = reported_statuses(turn_new_calls)
             latest.update(fresh_reported)
             for t, s in fresh_reported.items():
-                if s in _FAILURE_STATUSES and t not in poll_failure_messages:
+                if s not in _FAILURE_STATUSES:
+                    poll_failure_messages.pop(t, None)
+                elif t in outstanding and t not in poll_failure_messages:
                     cstate = board.read_board_state(_agent_shell, [t], _EXEC_TIMEOUT)
                     if cstate is not None:
                         msgs = self._extract_board_card_messages(cstate, t)
