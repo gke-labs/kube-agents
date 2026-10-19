@@ -2738,17 +2738,34 @@ def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
     """When a worker hit rate limit in an earlier poll but the re-run finishes done, it remains graded."""
     stub_agent.turns = [
         _create_turn(),
+        _show_turn("running"),
         _show_turn("done", body="All pods recovered.", result="All pods recovered."),
     ]
+    reads = []
 
     def _shell(script: str, timeout: float) -> str:
         if board.BOARD_PRESENT in script:
-            payload = {
-                "statuses": {_TASK_ID: "done"},
-                "summaries": {_TASK_ID: "All pods recovered."},
-                "errors": {},
-                "error": None,
-            }
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "error": None,
+                }
+            else:
+                payload = {
+                    "statuses": {_TASK_ID: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "error": None,
+                }
             return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
         return ""
 
@@ -2758,6 +2775,93 @@ def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
 
     assert not result.has_errors()
     assert result.output.endswith("All pods recovered.")
+
+
+def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A worker rate limit on the board when the opening turn already reports failure marks infra without status turns."""
+    stub_agent.turns = [
+        _turn(
+            *_call(
+                "kanban_create",
+                {"title": "subtask"},
+                {"ok": True, "task_id": _TASK_ID, "status": "ready"},
+                "c1",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {"task": {"id": _TASK_ID, "status": "failed", "result": None}, "runs": []},
+                "c2",
+            ),
+            _text("Investigating."),
+        )
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        "HTTP 429 quota exhausted"
+                    )
+                },
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert len(stub_agent.requests) == 1
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
+
+
+def test_a_delegated_worker_rate_limit_on_board_fallback_when_final_read_fails(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When the final board read fails, fallback to poll failure summary marks infra."""
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("blocked"),
+    ]
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.output == ""
 
 
 def test_settle_on_answer_turn_records_worker_failure_without_infra_marker() -> None:
@@ -3851,6 +3955,37 @@ def test_a_card_wake_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra
     assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
     assert "HTTP 502" in result.errors[0]
     assert len(stub_agent.requests) == 2
+    assert result.output == _FINAL_TEXT
+    assert _archived(scripts)
+
+
+def test_a_card_wake_answer_turn_with_worker_rate_limit_preserves_wake_reply(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+) -> None:
+    """A worker rate limit on an answer turn records the failure on errors while preserving the wake reply."""
+    scripts: list[str] = []
+    base_shell = _replay_shell(scripts)
+
+    def shell(script: str, timeout: float) -> str:
+        if "stat -c" in script and _TASK_ID in script:
+            return (
+                f"{harness._LOG_PRESENT} 2026-01-01 100\n"
+                "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 quota exhausted\n"
+            )
+        return base_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    stub_agent.turns = [
+        _turn(_text(_FINAL_TEXT)),
+        _create_turn(),
+        _show_turn("done"),
+    ]
+
+    result = KubeAgentsHarness().run(_REPLAY_PROMPT)
+
+    assert result.has_errors()
+    assert harness.INFRA_FAILURE_MARKER not in result.errors[0]
+    assert any("delegated worker failed (rate_limit)" in err for err in result.errors)
     assert result.output == _FINAL_TEXT
     assert _archived(scripts)
 

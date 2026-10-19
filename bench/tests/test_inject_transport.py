@@ -2695,6 +2695,32 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     assert "rate_limit" in result.errors[0]
 
 
+def test_a_cleared_rate_limit_rerun_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[CARD_A])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("UPDATE tasks SET status = 'done', result = 'recovered' WHERE id = ?", (CARD_A,))
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'blocked', ?)",
+            (
+                CARD_A,
+                "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, summary) VALUES (?, 'platform', 'done', NULL)",
+            (CARD_A,),
+        )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert not result.has_errors()
+    assert "recovered" in result.output
+
+
 def test_a_board_that_stops_answering_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

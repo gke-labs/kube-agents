@@ -145,7 +145,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -2548,6 +2548,45 @@ class KubeAgentsHarness(AgentHarness):
                 return _infra_failure(str(exc))
         return result
 
+    @staticmethod
+    def _final_board_failures(
+        awaited: Sequence[str],
+        statuses: Mapping[str, str],
+        fallback_messages: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[str]:
+        """Read summary and error from the board for any awaited cards in failure statuses.
+
+        When the board read fails or the card is no longer in a failure status (for instance,
+        if it was unblocked after being reported blocked), falls back to the most recent
+        failure summary/error seen during polling.
+        """
+        failure_cards = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
+        if not failure_cards:
+            return []
+        board_messages: list[str] = []
+        final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
+        if final_bstate is None:
+            _log.warning("kanban board could not be read for failure cards: %s", ", ".join(failure_cards))
+            if fallback_messages:
+                for t in failure_cards:
+                    if t in fallback_messages:
+                        board_messages.extend(fallback_messages[t])
+            return board_messages
+
+        bstatuses, bsummaries, berrors = final_bstate
+        for t in failure_cards:
+            card_msgs: list[str] = []
+            if bstatuses.get(t) in _FAILURE_STATUSES:
+                if t in bsummaries:
+                    card_msgs.append(bsummaries[t])
+                if t in berrors:
+                    card_msgs.append(berrors[t])
+            if card_msgs:
+                board_messages.extend(card_msgs)
+            elif fallback_messages and t in fallback_messages:
+                board_messages.extend(fallback_messages[t])
+        return board_messages
+
     def _await_delegated_cards(
         self,
         result: AgentResult,
@@ -2726,11 +2765,8 @@ class KubeAgentsHarness(AgentHarness):
         # checks that could read them are set aside on inject records anyway.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
-        board_messages = [
-            str(c.get("summary") or "")
-            for c in read.cards.values()
-            if c.get("status") in _FAILURE_STATUSES and c.get("summary")
-        ]
+        settled_statuses = {t: _status(t) for t in awaited}
+        board_messages = self._final_board_failures(awaited, settled_statuses)
         self._settle(
             result,
             observed,
@@ -2814,18 +2850,7 @@ class KubeAgentsHarness(AgentHarness):
         # results. Kept beside the graded trajectory rather than in it.
         observed: list[dict[str, Any]] = list(result.trajectory)
         if not outstanding:
-            failure_cards = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
-            board_messages: list[str] = []
-            if failure_cards:
-                final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
-                if final_bstate is not None:
-                    bstatuses, bsummaries, berrors = final_bstate
-                    for t in failure_cards:
-                        if bstatuses.get(t) in _FAILURE_STATUSES:
-                            if t in bsummaries:
-                                board_messages.append(bsummaries[t])
-                            if t in berrors:
-                                board_messages.append(berrors[t])
+            board_messages = self._final_board_failures(awaited, statuses)
             self._settle(
                 result,
                 observed,
@@ -2847,6 +2872,7 @@ class KubeAgentsHarness(AgentHarness):
         # card: a board reading never retires a card from ``outstanding``,
         # because only a status turn can carry the card's result back.
         latest: dict[str, str] = dict(statuses)
+        poll_failure_messages: dict[str, list[str]] = {}
         while outstanding:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2877,6 +2903,15 @@ class KubeAgentsHarness(AgentHarness):
             if bstate is not None:
                 on_board, bsummaries, berrors = bstate
                 latest.update(on_board)
+                for t in outstanding:
+                    if on_board.get(t) in _FAILURE_STATUSES:
+                        msgs: list[str] = []
+                        if t in bsummaries:
+                            msgs.append(bsummaries[t])
+                        if t in berrors:
+                            msgs.append(berrors[t])
+                        if msgs:
+                            poll_failure_messages[t] = msgs
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
                 ):
@@ -3001,18 +3036,7 @@ class KubeAgentsHarness(AgentHarness):
         # the run stopped.
         if outstanding and timed_out:
             _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
-        failure_cards = [t for t in awaited if latest.get(t) in _FAILURE_STATUSES]
-        board_messages: list[str] = []
-        if failure_cards:
-            final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
-            if final_bstate is not None:
-                bstatuses, bsummaries, berrors = final_bstate
-                for t in failure_cards:
-                    if bstatuses.get(t) in _FAILURE_STATUSES:
-                        if t in bsummaries:
-                            board_messages.append(bsummaries[t])
-                        if t in berrors:
-                            board_messages.append(berrors[t])
+        board_messages = self._final_board_failures(awaited, latest, poll_failure_messages)
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.
