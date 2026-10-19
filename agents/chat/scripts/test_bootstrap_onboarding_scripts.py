@@ -1673,13 +1673,6 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.d = Path(self._tmp.name)
-        # The install manages o/r on github.com.
-        self.managed = types.SimpleNamespace(
-            is_github_host=lambda host: host.lower() == "github.com", get_managed_repos=lambda: ["o/r"]
-        )
-        patcher = mock.patch.dict(sys.modules, {"gitops_workspace": self.managed})
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     @staticmethod
     def _slug_table() -> set[str]:
@@ -1838,58 +1831,23 @@ class FirstRunAuditsTest(unittest.TestCase):
             else:
                 conn.execute("INSERT INTO executions VALUES (?, 'completed', ?)", (audit, stamp(claimed_at)))
 
-    def _document(self, audit: str, response: str, saved_at: float) -> None:
-        """The document the scheduler saves for a run, under the profile's cron/output/<job>/."""
-        out = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / "output" / audit
-        out.mkdir(parents=True, exist_ok=True)
-        doc = out / f"{int(saved_at)}.md"
-        doc.write_text(f"# Cron Job: {audit}\n\n## Prompt\n\nSee https://x.test/o/r/issues/99\n\n## Response\n\n{response}\n",
-                       encoding="utf-8")
-        os.utime(doc, (saved_at, saved_at))
-
     def _finished_chain(self, outcome: str | None) -> dict:
         """All four audits marked and completed after their marks, each run's delivery ending ``outcome``."""
         now = time.time()
         marks = {a: now - 3600 + i * 600 for i, a in enumerate(oobe.FIRST_RUN_AUDITS)}
-        for i, audit in enumerate(oobe.FIRST_RUN_AUDITS):
+        for audit in oobe.FIRST_RUN_AUDITS:
             self._run(audit, marks[audit] + 30, outcome)
-            self._document(
-                audit,
-                f"Let's format the final response.\n- **Ledger Issue:** [Audit #{i + 1}](https://github.com/o/r/issues/{i + 1})",
-                marks[audit] + 90,
-            )
         return {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_MARKS: marks, oobe.STATE_DONE: True}
 
-    def test_audits_that_finished_before_a_home_channel_are_listed_with_their_ledgers(self):
+    def test_audits_that_finished_before_a_home_channel_are_listed(self):
         note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
         self.assertIn("which have run: `fleet-wide-cost-analysis`", note)
         self.assertNotIn("have started", note)
+        # The ran note promises no home-channel post while summaries are missing.
+        self.assertNotIn("Each posts a summary to the home channel", note)
         self.assertIn("but their summaries were not posted to the chat: "
-                      "`fleet-wide-cost-analysis` (findings: https://github.com/o/r/issues/1), "
-                      "`compliance-audit` (findings: https://github.com/o/r/issues/2), "
-                      "`obtainability-audit` (findings: https://github.com/o/r/issues/3), "
-                      "`stockout-prevention` (findings: https://github.com/o/r/issues/4).", note)
-        # Only the link is taken from the run's message; its prose and the prompt's links are not.
-        self.assertNotIn("Let's format", note)
-        self.assertNotIn("issues/99", note)
-
-    def test_a_link_on_the_ledger_line_wins_over_an_earlier_one(self):
-        now = time.time()
-        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
-        self._document("compliance-audit", "Upstream bug https://github.com/k/k/issues/5 applies.\n"
-                       "- **Ledger Issue:** https://github.com/o/r/issues/3", now - 500)
-        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
-                           oobe.STATE_DONE: True})
-        self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/3)", note)
-
-    def test_an_earlier_issue_whose_number_prefixes_the_ledger_s_is_not_the_ledger(self):
-        now = time.time()
-        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
-        self._document("compliance-audit", "Related: https://github.com/o/r/issues/1\n"
-                       "- **Ledger Issue:** https://github.com/o/r/issues/12", now - 500)
-        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
-                           oobe.STATE_DONE: True})
-        self.assertIn("`compliance-audit` (findings: https://github.com/o/r/issues/12)", note)
+                      "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`. "
+                      "Ask me for any of these reports.", note)
 
     def test_a_run_going_at_the_mark_counts_by_its_finish(self):
         now = time.time()
@@ -1918,40 +1876,15 @@ class FirstRunAuditsTest(unittest.TestCase):
                 self.assertIn("which have run: `compliance-audit`.", note)
                 self.assertIn("were not posted to the chat: `compliance-audit`", note)
 
-    def test_a_link_outside_the_managed_repositories_is_not_the_ledger(self):
-        now = time.time()
-        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
-        self._document("compliance-audit", "- **Ledger Issue:** https://example.test/o/r/issues/3\n"
-                       "Ledger: https://github.com/someone/else/issues/4", now - 500)
-        state = {oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
-                 oobe.STATE_DONE: True}
-        self.assertTrue(self._note(state).endswith("were not posted to the chat: `compliance-audit`. Ask me for any of these reports."))
-
-    def test_no_link_when_the_managed_repositories_cannot_be_read(self):
-        now = time.time()
-        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
-        self._document("compliance-audit", "- **Ledger Issue:** https://github.com/o/r/issues/3", now - 500)
-        def unreadable():
-            raise OSError("no list")
-        self.managed.get_managed_repos = unreadable
-        with contextlib.redirect_stderr(io.StringIO()):
-            note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
-                               oobe.STATE_DONE: True})
-        self.assertIn("were not posted to the chat: `compliance-audit`.", note)
-        self.assertNotIn("issues/3", note)
-
     def test_a_later_silent_run_does_not_hide_the_lost_summary(self):
         # Day 2: the first run's summary was refused; the next scheduled run found nothing new.
         now = time.time()
         self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
-        self._document("compliance-audit", "- **Ledger Issue:** https://github.com/o/r/issues/3", now - 86400 + 90)
         for outcome in ("suppressed", None):
             self._run("compliance-audit", now - 600, outcome)
-        self._document("compliance-audit", "[SILENT]", now - 500)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 86400 - 60},
                            oobe.STATE_DONE: True})
-        # The link is the lost run's, from the document saved during it, not the newest document.
-        self.assertIn("were not posted to the chat: `compliance-audit` (findings: https://github.com/o/r/issues/3)", note)
+        self.assertIn("were not posted to the chat: `compliance-audit`.", note)
 
     def test_delivered_summaries_are_not_listed(self):
         for outcome in ("delivered", "suppressed", None):
@@ -1966,17 +1899,9 @@ class FirstRunAuditsTest(unittest.TestCase):
         state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
         self._run("compliance-audit", time.time() - 10, "delivered")
         note = self._note(state)
-        self.assertNotIn("`compliance-audit` (findings", note)
-        self.assertIn("`stockout-prevention` (findings", note)
-
-    def test_an_undelivered_audit_with_no_document_for_its_run_is_named_without_a_link(self):
-        now = time.time()
-        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
-        # A document from an earlier run: its link may not be this run's ledger.
-        self._document("compliance-audit", "https://github.com/o/r/issues/7", now - 86400)
-        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
-                           oobe.STATE_DONE: True})
-        self.assertTrue(note.endswith("were not posted to the chat: `compliance-audit`. Ask me for any of these reports."))
+        unposted = note.partition("not posted to the chat:")[2]
+        self.assertNotIn("`compliance-audit`", unposted)
+        self.assertIn("`stockout-prevention`", unposted)
 
     def test_a_run_from_before_the_mark_is_not_the_first_run(self):
         now = time.time()
@@ -1993,6 +1918,8 @@ class FirstRunAuditsTest(unittest.TestCase):
                            oobe.STATE_DONE: True})
         self.assertIn("which have run: `compliance-audit`.", note)
         self.assertNotIn("not posted", note)
+        # The stage log says why no unposted summary can be named; stderr is dropped on exit 0.
+        self.assertIn("no delivery_outcome column", (self.d / oobe.STAGE_LOG).read_text())
 
     def test_an_unreadable_store_keeps_the_note_it_had(self):
         cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
@@ -2002,6 +1929,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
         self.assertIn("which have started:", note)
         self.assertNotIn("not posted", note)
+        self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
 
     def test_the_text_delivery_carries_the_undelivered_summaries(self):
         oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
@@ -2015,7 +1943,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             contextlib.redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(bootstrap_delivery.main(self.d), 0)
-        self.assertIn("`stockout-prevention` (findings: https://github.com/o/r/issues/4)", out.getvalue())
+        self.assertIn("`stockout-prevention`. Ask me for any of these reports.", out.getvalue())
 
     def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],

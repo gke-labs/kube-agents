@@ -599,30 +599,6 @@ class CallSiteTest(unittest.TestCase):
         # Gated on the case writing a ledger at all.
         self.assertIn('if [ -n "${audit_id}" ]; then', unit)
 
-    def test_a_case_that_grades_its_declared_streams_resets_each_inside_their_locks(self):
-        # oobe-late-first-message grades no ledger but needs each of its four
-        # first-run audits to post a summary, which an audit with an open
-        # ledger and nothing new does not; each declared stream is reset, after
-        # the stream locks and the wait for a run the install started, before
-        # the unit launches.
-        unit = lifted("run_one_unit")
-        stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
-        wait = unit.index('wait_platform_runs "${name} rep ${rep}" "${streams}"')
-        gate = unit.index('if resets_declared_streams "${name}"; then')
-        reset = unit.index('reset_audit_ledgers "${name} rep ${rep}" "${s}"', gate)
-        launch = unit.index("uv run devops-bench")
-        self.assertLess(stream_lock, wait)
-        self.assertLess(wait, gate)
-        self.assertLess(gate, reset)
-        self.assertLess(reset, launch)
-        self.assertLess(unit.index('release_inflight_note "${name} rep ${rep}" "${s}"', gate), reset)
-        body = lifted("resets_declared_streams")
-        answer = lambda case: run_bash(f"{body}\nresets_declared_streams {case}").returncode  # noqa: E731
-        self.assertEqual(answer("oobe-late-first-message"), 0)
-        for case in ("oobe-first-run-audits", "compliance-declared-intent-no-finding", "bootstrap-discovery-fanout"):
-            with self.subTest(case=case):
-                self.assertNotEqual(answer(case), 0)
-
     def test_a_ledger_writing_unit_holds_its_stream_lock_from_before_the_reset_until_the_run_returns(self):
         # Two cases grade fleet-consistency-drift; their task locks differ, so
         # without this one lane's reset closes the other lane's live ledger

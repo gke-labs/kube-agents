@@ -48,8 +48,8 @@ marker by ``_audits_note``: the report's scan leaves the workload checks to thos
 on an install whose kept marker records an older stage's no-repository skip, where the scan ran
 them), and a short report would otherwise read as a healthy fleet. An audit the stage started or
 adopted whose summary failed to deliver, as every one that finished before anyone opened the chat
-does for want of a home channel, is named with its ledger link (``_undelivered_audits``). The text
-path appends it to the report; the
+does for want of a home channel, is named (``_undelivered_audits``). The text path appends it to
+the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
@@ -83,7 +83,6 @@ never delivered from here.
 import contextlib
 import json
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -221,8 +220,7 @@ AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
 # Every audit the chain started has completed its run, so "have started" would be stale.
 AUDITS_FINISHED_NOTE = (
     "Workload checks (probes, requests and limits, autoscaling, NetworkPolicy, pod security) come "
-    "from the first-run audits, which have run: {audits}. Each posts a summary to the home channel "
-    "when it finds something new."
+    "from the first-run audits, which have run: {audits}."
 )
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
@@ -231,24 +229,10 @@ AUDITS_UNDELIVERED_NOTE = (
     "These finished, but their summaries were not posted to the chat: {audits}. "
     "Ask me for any of these reports."
 )
-AUDITS_LEDGER_NOTE = "`{audit}` (findings: {url})"
 
 # The scheduler's record of where a run's final message went (Hermes cron/executions.db).
 DELIVERY_OUTCOME_COLUMN = "delivery_outcome"
 DELIVERY_FAILED = "failed"
-# Where the scheduler saves each run's document, under the profile's cron directory, and the
-# heading its final message sits under.
-CRON_OUTPUT_DIR = "output"
-CRON_OUTPUT_SUFFIX = ".md"
-RESPONSE_HEADING = "## Response"
-# A document is the run's when it was saved between the run's claim and this long after its finish.
-OUTPUT_SLACK_SECONDS = 300
-# The ledger issue a fleet audit links in its summary (fleet-audit skill, `finish`). The summary is
-# the model's prose and can cite other issues, so a link on a line that names the ledger wins.
-LEDGER_URL_RE = re.compile(r"https://[^\s()<>\[\]]+/issues/\d+")
-LEDGER_WORD = "ledger"
-# The parts a managed ledger issue's URL must have (_managed_issue).
-MANAGED_ISSUE_RE = re.compile(r"https://(?P<host>[A-Za-z0-9.-]+)/(?P<repo>[\w.-]+/[\w.-]+)/issues/\d+")
 # A run that posted nothing on purpose: the scheduler's suppressed outcomes, or none recorded.
 SILENT_OUTCOMES = ("suppressed", "suppressed_acked", None)
 
@@ -691,7 +675,7 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
         note = AUDITS_NONE_RAN_NOTE
     if not_run:
         note = f"{note} {AUDITS_NOT_RUN_NOTE.format(audits=', '.join(not_run))}"
-    undelivered = _undelivered_audits(data_dir, finished, runs)
+    undelivered = _undelivered_audits(finished, runs)
     return f"{note} {AUDITS_UNDELIVERED_NOTE.format(audits=', '.join(undelivered))}" if undelivered else note
 
 
@@ -699,10 +683,14 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
     """``job -> [(claimed_at, finished_at, delivery_outcome), ...]`` for the completed runs of ``jobs``, oldest first.
 
     Empty when the Platform Agent's cron store cannot be read: the note then says what it said
-    before, rather than holding the report back.
+    before, rather than holding the report back, and the stage log says why (Hermes drops this
+    run's stderr when it exits 0).
     """
     ledger = data_dir / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / oobe.EXECUTIONS_DB
-    if not jobs or not ledger.is_file():
+    if not jobs:
+        return {}
+    if not ledger.is_file():
+        _stage_note(data_dir, f"no {ledger}, so the audits note names no unposted summary")
         return {}
     placeholders = ",".join("?" * len(jobs))
     try:
@@ -711,6 +699,11 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
         )
         try:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+            if DELIVERY_OUTCOME_COLUMN not in columns:
+                _stage_note(
+                    data_dir,
+                    f"{ledger} has no {DELIVERY_OUTCOME_COLUMN} column, so the audits note names no unposted summary",
+                )
             outcome = DELIVERY_OUTCOME_COLUMN if DELIVERY_OUTCOME_COLUMN in columns else "NULL"
             finished = oobe.FINISHED_AT_COLUMN if oobe.FINISHED_AT_COLUMN in columns else "NULL"
             rows = conn.execute(
@@ -721,7 +714,7 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
         finally:
             conn.close()
     except sqlite3.Error as e:
-        sys.stderr.write(f"bootstrap_delivery: cannot read {ledger}: {e}\n")
+        _stage_note(data_dir, f"cannot read {ledger}, so the audits note names no unposted summary: {e}")
         return {}
     runs: dict[str, list[tuple[float, float | None, str | None]]] = {}
     for job_id, claimed, finished_at, delivery in rows:
@@ -737,10 +730,8 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
     return runs
 
 
-def _undelivered_audits(
-    data_dir: Path, audits: list[str], runs: dict[str, list[tuple[float, float | None, str | None]]]
-) -> list[str]:
-    """The audits whose latest run that tried to post its summary failed, each with its ledger link when it has one.
+def _undelivered_audits(audits: list[str], runs: dict[str, list[tuple[float, float | None, str | None]]]) -> list[str]:
+    """The audits whose latest run that tried to post its summary failed.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
     it, and nothing posts it later; this delivery is the first message that user reads. Any other
@@ -751,60 +742,18 @@ def _undelivered_audits(
     out = []
     for audit in audits:
         tried = [run for run in runs.get(audit, ()) if run[2] not in SILENT_OUTCOMES]
-        if not tried or tried[-1][2] != DELIVERY_FAILED:
-            continue
-        claimed, finished, _ = tried[-1]
-        url = _ledger_url(data_dir, audit, claimed, finished)
-        out.append(AUDITS_LEDGER_NOTE.format(audit=audit, url=url) if url else f"`{audit}`")
+        if tried and tried[-1][2] == DELIVERY_FAILED:
+            out.append(f"`{audit}`")
     return out
 
 
-def _ledger_url(data_dir: Path, audit: str, claimed_at: float, finished_at: float | None) -> str | None:
-    """The ledger issue linked in the final message of ``audit``'s run claimed at ``claimed_at``.
-
-    The run's message is the document the scheduler saved between its claim and a little after
-    its finish. Only the link is taken from it, and only a link to an issue in a repository the
-    install manages: the rest is the model's prose, which can carry its working notes, and a link
-    the audit read elsewhere is not its ledger.
-    """
-    output_dir = data_dir / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / CRON_OUTPUT_DIR / audit
-    latest = (finished_at if finished_at is not None else claimed_at) + OUTPUT_SLACK_SECONDS
+def _stage_note(data_dir: Path, message: str) -> None:
+    """One line in the oobe stage log, which an operator reads; best effort."""
     try:
-        docs = [
-            p for p in output_dir.iterdir()
-            if p.is_file() and p.suffix == CRON_OUTPUT_SUFFIX and claimed_at <= p.stat().st_mtime <= latest
-        ]
-        if not docs:
-            return None
-        text = max(docs, key=lambda p: p.stat().st_mtime).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    response = text.rpartition(RESPONSE_HEADING)[2]
-    candidates = [m.group(0) for m in LEDGER_URL_RE.finditer(response) if _managed_issue(m.group(0))]
-    ledger_lines = [line for line in response.splitlines() if LEDGER_WORD in line.lower()]
-    named = [url for url in candidates if any(url in LEDGER_URL_RE.findall(line) for line in ledger_lines)]
-    return (named or candidates or [None])[0]
-
-
-def _managed_issue(url: str) -> bool:
-    """Whether ``url`` is an issue in a repository the install manages, on its GitHub host.
-
-    False when the managed list cannot be read, so the note names the audit without a link.
-    """
-    match = MANAGED_ISSUE_RE.fullmatch(url)
-    if not match:
-        return False
-    try:
-        import gitops_workspace  # beside this script in the pod
-
-        if not gitops_workspace.is_github_host(match.group("host")):
-            return False
-        managed = {repo.lower() for repo in gitops_workspace.get_managed_repos()}
-    except Exception as e:  # noqa: BLE001 - no link is the safe answer
-        sys.stderr.write(f"bootstrap_delivery: cannot read the managed repositories: {e}\n")
-        return False
-    repo = match.group("repo").lower()
-    return repo in managed or f"{match.group('host').lower()}/{repo}" in managed
+        with oobe._open_stage_log(data_dir) as log:
+            log.write(f"bootstrap_delivery: {message}\n")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: {message} (and the stage log could not be written: {e})\n")
 
 
 def _list(value) -> list:

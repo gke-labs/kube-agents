@@ -13,8 +13,7 @@ clean close by repetition 2 leaves repetition 3 a different start than 1.
 This closes those issues so the next `start` finds none and opens a fresh
 ledger. hack/ci-eval-pr.sh calls it twice: once when the lease begins, for
 every audit stream, and once per repetition of an audit case, for that stream
-alone (for each declared stream of a case its resets_declared_streams names),
-under the case's task lock. Every repetition therefore audits from an
+alone, under the case's task lock. Every repetition therefore audits from an
 empty ledger; the price is one closed issue per repetition in a repository
 that exists to be written to.
 

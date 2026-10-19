@@ -390,14 +390,7 @@ class CallSiteTest(unittest.TestCase):
     def test_the_release_runs_per_unit_and_nowhere_else(self):
         src = SCRIPT.read_text(encoding="utf-8")
         calls = re.findall(r"^\s*release_inflight_note .*$", src, re.MULTILINE)
-        # The graded stream's, and each declared stream's for a case resets_declared_streams names.
-        self.assertEqual(
-            calls,
-            [
-                '    release_inflight_note "${name} rep ${rep}" "${audit_id}"',
-                '      release_inflight_note "${name} rep ${rep}" "${s}"',
-            ],
-        )
+        self.assertEqual(calls, ['    release_inflight_note "${name} rep ${rep}" "${audit_id}"'])
         # Defined after the ledger reset it sits beside, before the matrix;
         # its constants with the script's other readonly ones, above both.
         self.assertLess(src.index("reset_audit_ledgers() {"), src.index("release_inflight_note() {"))

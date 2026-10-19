@@ -63,9 +63,8 @@ locals {
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
   # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs three
   # audits and claims the fourth (one to 45 minutes each). The runner holds the onboarding
-  # state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's deadline
-  # (STATE_LOCK_HOLD_SECONDS) from the longest-holding stack on it, so a change here that makes
-  # own_wait plus chain_wait the longest changes that too.
+  # state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's deadline from
+  # own_wait plus chain_wait (STATE_LOCK_HOLD_SECONDS), so a change here changes that too.
   own_wait = 3600
   # arm.py prints this when the image ships no oobe job.
   no_job = "ships no oobe job"
