@@ -44,7 +44,7 @@
 # So the planted change and the planted record are two halves of one fixture and
 # they have to agree: step 1 makes the change real -- the Deployment is applied
 # by one field manager and its replica count taken by another, in managedFields,
-# on the live object -- and step 3 sends the record that change would have
+# on the live object -- and step 2 sends the record that change would have
 # produced. The card tells the agent to read the live object before concluding
 # anything, and when it does it finds exactly what the record describes.
 #
@@ -99,7 +99,7 @@ resource "null_resource" "drift" {
     # Destroy-time provisioners may read only `self`, so everything the
     # teardown needs is copied in here -- including the cluster coordinates,
     # because the destroy has to fetch its own credentials for the same reason
-    # step 0 does and cannot reach `var`.
+    # drift_init does and cannot reach `var`.
     namespace     = local.ns
     host_cluster  = var.host_cluster_name
     host_location = var.host_cluster_location

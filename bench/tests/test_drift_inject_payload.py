@@ -34,6 +34,7 @@ its own comments that sending `[]` would be "the shape that does not occur".
 """
 
 import importlib.util
+import re
 import json
 import unittest
 from pathlib import Path
@@ -160,6 +161,49 @@ class BuildPayload(unittest.TestCase):
         for name, value in zip(self.builder.SCALARS, SCALARS):
             with self.subTest(field=name):
                 self.assertEqual(doc[name], value)
+
+    def test_the_shell_probes_for_the_kind_the_payload_stamps(self):
+        """`DRIFT_INJECT_KIND` and `KIND` are the same string in two files.
+
+        `drift_require_daemon` refuses a daemon that does not advertise
+        `DRIFT_INJECT_KIND`; this builder stamps `KIND`. If they ever disagree
+        the probe passes a daemon for a kind the record does not carry, which
+        is the failure that comment calls the worst way for a fixture to be
+        wrong -- the daemon takes the payload down its event path, answers
+        200, and files a card about something else.
+        """
+        shell = (BUILDER.parent / "drift_inject.sh").read_text(encoding="utf-8")
+        declared = re.search(r'^DRIFT_INJECT_KIND="([^"]*)"', shell, re.M)
+        self.assertIsNotNone(declared, "DRIFT_INJECT_KIND is gone or reshaped")
+        self.assertEqual(declared.group(1), self.builder.KIND)
+
+    def test_the_script_itself_writes_the_file_the_shell_expects(self):
+        """Exercise `main`, not just `build`.
+
+        Every other test calls `build` directly, so `main`'s `out = argv[0]` /
+        `build(argv)` split is not covered: were it `main(sys.argv)` instead of
+        `main(sys.argv[1:])`, every field would shift by one and the payload
+        would be written to whatever path the summary happens to be -- and all
+        of them would still pass.
+        """
+        import subprocess
+        import sys
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "payload.json"
+            result = subprocess.run(
+                [sys.executable, str(BUILDER), str(out), *SCALARS, *RESOURCE, "enriched", "false"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(out.is_file(), f"{out} was not written; stderr: {result.stderr}")
+            doc = json.loads(out.read_text())
+        self.assertEqual(doc["kind"], "gitops-drift")
+        self.assertEqual(doc["summary"], SCALARS[0])
+        self.assertEqual(doc["insert_id"], SCALARS[-1])
+        self.assertEqual(doc["resource"]["name"], RESOURCE[-1])
 
     def test_a_value_that_would_break_hand_built_json_survives(self):
         """The quoting hazard the builder exists to remove.

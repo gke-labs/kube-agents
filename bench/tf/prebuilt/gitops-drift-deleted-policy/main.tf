@@ -109,15 +109,15 @@ locals {
   # appears in seconds when the daemon is working and never when it is not.
   # Anything past a minute is already the failure; the ceiling only decides
   # how long the run pays before saying so.
-  # What the failure dump prints before tearing the namespace down. The
-  # NetworkPolicy is the object this scenario is about, so omitting it would
-  # leave the dump silent on the only thing worth seeing.
-  failure_resources = "deployments,networkpolicies,pods"
-
   leftover_delete_timeout = 180
   workload_ready_timeout  = 180
   card_wait_timeout       = 300
   card_poll_interval      = 10
+
+  # What the failure dump prints before tearing the namespace down. The
+  # NetworkPolicy is the object this scenario is about, so omitting it would
+  # leave the dump silent on the only thing worth seeing.
+  failure_resources = "deployments,networkpolicies,pods"
 
   ci_labels = {
     "managed-by"  = "kube-agents-bench"
@@ -132,7 +132,7 @@ resource "null_resource" "deleted_policy" {
     # Destroy-time provisioners may read only `self`, so everything the
     # teardown names is copied in here -- including the cluster coordinates,
     # because the destroy fetches its own credentials for the same reason
-    # step 0 does and cannot reach `var`.
+    # drift_init does and cannot reach `var`.
     namespace     = local.ns
     host_cluster  = var.host_cluster_name
     host_location = var.host_cluster_location

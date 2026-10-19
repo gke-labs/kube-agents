@@ -115,17 +115,17 @@ locals {
   #
   # card_wait_timeout: the front-door turn is one kanban_create, so the card
   # appears in seconds when the daemon is working and never when it is not.
-  # What the failure dump prints before tearing the namespace down. This
-  # stack's evidence is a rollout history, so the ReplicaSets matter as much
-  # as the Deployment.
-  failure_resources = "deployments,replicasets,pods"
-
   leftover_delete_timeout   = 180
   failure_observe_timeout   = 240
   crashloop_observe_timeout = 300
   rollout_ready_timeout     = 240
   card_wait_timeout         = 300
   poll_interval             = 10
+
+  # What the failure dump prints before tearing the namespace down. This
+  # stack's evidence is a rollout history, so the ReplicaSets matter as much
+  # as the Deployment.
+  failure_resources = "deployments,replicasets,pods"
 
   ci_labels = {
     "managed-by"  = "kube-agents-bench"
@@ -140,7 +140,7 @@ resource "null_resource" "load_bearing_change" {
     # Destroy-time provisioners may read only `self`, so everything the
     # teardown names is copied in here -- including the cluster coordinates,
     # because the destroy fetches its own credentials for the same reason
-    # step 0 does and cannot reach `var`.
+    # drift_init does and cannot reach `var`.
     namespace     = local.ns
     host_cluster  = var.host_cluster_name
     host_location = var.host_cluster_location

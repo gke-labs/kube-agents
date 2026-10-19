@@ -17,13 +17,20 @@
 # sourced fragment, so the drift_* names it reads are set by its caller
 # (SC2154) and the ones it sets are read by its caller (SC2034). The contract
 # is under "Required of the caller" and "Set by drift_init" below.
-# bench/upgrade-scenarios/scenarios/09.sh carries the same directive for the
-# same shape.
+# bench/upgrade-scenarios/scenarios/09.sh carries the SC2034 half for the same
+# shape; the SC2154 half is this file's, because it reads as well as writes.
 
-# The scaffolding every gitops-drift fixture needs around its own plant.
+# The scaffolding a gitops-drift fixture needs around its own plant -- for the
+# three stacks that hand the record straight to the Session KV daemon:
+# gitops-drift, gitops-drift-deleted-policy and gitops-drift-load-bearing.
+#
+# gitops-drift-noise is NOT one of them. It publishes to Pub/Sub and drives the
+# real detector, so only step 0 is common ground, and it still carries its own
+# copy of that -- with different semantics, refusing a leftover namespace where
+# this clears one. A change to the guard or the fetch here does not reach it.
 #
 # Sourced from a stack's `local-exec`, which keeps one copy on disk rather than
-# pasting 300 lines into every rendered plan:
+# the whole library in every rendered plan:
 #
 #   source "${path.module}/../../modules/drift-inject/drift_inject.sh"
 #
@@ -31,11 +38,16 @@
 # and gitops-fix-cycle both take `source = "../../modules/cluster"` -- and
 # gitops-fix-cycle runs `${path.module}/scripts/setup.sh` as a command, so a
 # script beside the stack is an established shape here. Sourcing rather than
-# inlining the text with `file()` also keeps `shellcheck -x` able to follow the
-# call, and avoids a dedent hazard: a `${file(...)}` interpolation placed at a
-# smaller indent than the heredoc body sets the `<<-EOT` dedent to zero and
-# leaves every embedded heredoc terminator indented, which is an unterminated
-# heredoc and no check in this repository catches it.
+# inlining the text with `file()` avoids a dedent hazard: a `${file(...)}`
+# interpolation placed at a smaller indent than the heredoc body sets the
+# `<<-EOT` dedent to zero and leaves every embedded heredoc terminator
+# indented, which is an unterminated heredoc.
+# bench/tests/test_tf_heredoc_renders.py is what catches that.
+#
+# This directory is outside the fixture sanitization scan -- SANITIZED_ROOTS in
+# scripts/validate_bench_cases.py is bench/tasks and bench/tf/prebuilt only --
+# so nothing here may carry a real project, cluster, address or principal.
+# Every such value belongs to the caller and arrives as a variable.
 #
 # Defines functions and a handful of DRIFT_* constants, and runs nothing, so it
 # may be sourced before or after the caller's own assignments. The caller then
@@ -67,11 +79,20 @@
 #                             is about; a stack that leaves this at the default
 #                             prints nothing about its own subject.
 #
-# Set by drift_init and owned by this library: drift_kubeconfig_dir,
-# drift_project, drift_exec_in_pod, drift_exec_in_pod_stdin. The caller reads
-# them; reassigning drift_project after drift_init changes what the payload
-# reports. Set by the caller when its plant creates the namespace:
-# drift_planted_ns=1, which arms the failure-path cleanup.
+# Set by this library and reserved to it. The caller reads them; reassigning
+# one changes what the payload reports or what the poll looks for.
+#   drift_init              drift_kubeconfig_dir, drift_project,
+#                           drift_exec_in_pod, drift_exec_in_pod_stdin
+#   drift_mint_insert_id    drift_insert_id, drift_changed_at
+#   drift_build_payload     drift_payload_file
+#
+# Set by the caller when its plant creates the namespace: drift_planted_ns=1,
+# which arms the failure-path cleanup. It is guarded rather than unconditional
+# because the EXIT trap is armed before KUBECONFIG is exported -- an early
+# failure would otherwise delete against whatever cluster the ambient context
+# points at -- and because drift_clear_namespace exits non-zero on a namespace
+# this stack did not label, where deleting would undo the one refusal it
+# exists to make.
 
 DRIFT_DEFAULT_FAILURE_RESOURCES="deployments,replicasets,pods"
 # Resolved rather than assumed: the daemon runs under the Hermes venv's
@@ -81,6 +102,14 @@ DRIFT_POD_PYTHON_CANDIDATES="python3 /opt/hermes/.venv/bin/python3"
 DRIFT_HEALTHZ_TIMEOUT=10
 DRIFT_SESSION_TIMEOUT=10
 DRIFT_INJECT_TIMEOUT=30
+# The same string as build_payload.py's KIND, and it has to be: this is the
+# kind drift_require_daemon demands the daemon advertise, that one is the kind
+# the payload stamps. A pair that disagrees leaves the probe approving a daemon
+# for a kind the record does not carry -- the failure drift_require_daemon's
+# own comment calls the worst way for a fixture to be wrong. Held together by a
+# test rather than by reading one from the other at run time, which would put a
+# python call and an import path on the critical path of every apply to save
+# one literal: bench/tests/test_drift_inject_payload.py asserts they match.
 DRIFT_INJECT_KIND="gitops-drift"
 DRIFT_SIGTERM_EXIT=143
 DRIFT_ENVELOPE_FILE="envelope.json"
@@ -101,6 +130,10 @@ DRIFT_MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # container clusters get-credentials` with no --kubeconfig, so any deployer:
 # tofu task earlier in the matrix leaves its own per-run cluster selected.
 drift_init() {
+  # A directory, not `mktemp` on its own: get-credentials refuses to load an
+  # existing empty file, so it warns, writes a dated `.backup` beside it that
+  # nothing then cleans up, and prints a WARNING that reads like a failure in a
+  # CI log. Handing it a path that does not exist yet skips all three.
   drift_kubeconfig_dir="$(mktemp -d)"
   drift_failure_resources="${drift_failure_resources:-$DRIFT_DEFAULT_FAILURE_RESOURCES}"
 
@@ -171,14 +204,17 @@ drift_clear_namespace() {
 
   # Not swallowed: the check above has already proved the namespace exists, so a
   # failing read here is a transport or RBAC failure and not an absent label.
-  # Swallowed, it becomes an empty value that the branch below reports as "this
-  # stack did not create it" -- a refusal with the wrong reason, and
-  # indistinguishable from a namespace that genuinely carries no label.
+  # Swallowed with `|| true`, it becomes an empty value that the branch below
+  # reports as "this stack did not create it" -- a refusal with the wrong
+  # reason, and indistinguishable from a namespace that genuinely carries no
+  # label. Left unswallowed, errexit aborts on the read itself with kubectl's
+  # own stderr, so the branch below is only ever reached by a namespace that
+  # was read successfully and carries the wrong label.
   local leftover_owner
   leftover_owner="$(kubectl get namespace "$drift_ns" \
     -o jsonpath='{.metadata.labels.managed-by}')"
   if [ "$leftover_owner" != "$drift_managed_by" ]; then
-    echo "ERROR: $drift_ns already exists on $drift_cluster but is not labelled managed-by=$drift_managed_by (found '$leftover_owner'). This stack did not create it, so it will not delete it -- an RBAC or API failure on the label read lands here too. Remove it by hand if it is stale." >&2
+    echo "ERROR: $drift_ns already exists on $drift_cluster but is not labelled managed-by=$drift_managed_by (found '$leftover_owner'). This stack did not create it, so it will not delete it. Remove it by hand if it is stale." >&2
     exit 1
   fi
   echo "Found a leftover $drift_ns from an earlier run; deleting it before planting."
