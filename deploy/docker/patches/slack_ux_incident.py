@@ -88,6 +88,10 @@ try:
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
 try:
+    import slack_moments as _moments
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
+try:
     import chat_message as _chat
 except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
     _chat = None
@@ -572,6 +576,9 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         if not actionable_report(result):
             return adapter
         report = clip_handoff(str(result).strip(), RESULT_LIMIT)
+        if _moments is not None:
+            # A declared next step is never shown; the alert's options are its buttons.
+            report = _moments.visible_text(report) or report
         if len(report) > FOLD_TEXT_MAX:
             return adapter
         chat_id = str(sub.get("chat_id") or "").strip()
