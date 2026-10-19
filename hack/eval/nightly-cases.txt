@@ -1209,6 +1209,11 @@
 # against the no-pdb-workload and crashloop-workload fixtures; one card.
 ./tasks/chat-answer-tangent-offer-declares-no-step/task.yaml
 
+# #3371: a zonal seeded cluster asked about by its region must be found, not
+# declared absent. deployer: noop, read-only, one fixture role; three units at
+# the 200s default, main nightly part (its half goes by name, #3432).
+./tasks/fleet-zonal-cluster-named-by-region/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.

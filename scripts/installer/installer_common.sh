@@ -168,6 +168,16 @@ readonly HELM_LOCK_POLL_INTERVAL_DEFAULT=10
 # Timeout for rolling back a stuck pending release to the last healthy revision.
 readonly HELM_ROLLBACK_TIMEOUT_DEFAULT="2m"
 
+# ─── Cloud KMS Propagation Defaults ───────────────────────────────────────────
+# Defaults for Cloud KMS resource creation retry across the first-enablement
+# propagation window. Matching lifecycle.sh:203-204 without colliding with exported
+# variables or lifecycle.sh re-declarations.
+readonly KMS_API_PROPAGATION_DEFAULT_ATTEMPTS=5
+readonly KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS=60
+# Cloud KMS answers some requests with 403 for a few minutes after a project's
+# first enablement. Declared without readonly so sourcing lifecycle.sh does not collide.
+KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+
 # ─── Chart contract ───────────────────────────────────────────────────────────
 # Names the kube-agents chart fixes and the front doors address by name: the
 # Helm release, the operator and agent Deployments, and the Secret the agent's
@@ -1879,6 +1889,74 @@ tf_state_bucket() {
 tf_state_prefix() {
   local cluster="${1:-${CLUSTER_NAME:-}}"
   echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${cluster}}"
+}
+
+# ─── Cloud KMS ─────────────────────────────────────────────────────────────────
+# Cloud KMS answers some requests with 403 "Google Cloud KMS API has not been
+# used in project <n> before or it is disabled" for a few minutes after a
+# project's FIRST enablement -- which is the enablement install.sh performs
+# seconds before creating the key ring and key.
+
+_sanitize_kms_int() {
+  local val="$1" default_val="$2" min_val="${3:-0}" name="${4:-}"
+  if [ -z "$val" ]; then
+    echo "$default_val"
+    return 0
+  fi
+  if [[ "$val" =~ ^[0-9]{1,9}$ ]] && [ "$val" -ge "$min_val" ]; then
+    echo "$val"
+  else
+    if [ -n "$name" ]; then
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      else
+        echo -e "  ⚠ ${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      fi
+    fi
+    echo "$default_val"
+  fi
+}
+
+# Retries a Cloud KMS command on Cloud KMS's first-enablement 403
+# (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
+# for a few minutes after being enabled. Output of the command is preserved and
+# echoed on completion; retry warnings are printed to stderr.
+retry_kms_create() {
+  local max_attempts
+  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-}" "$KMS_API_PROPAGATION_DEFAULT_ATTEMPTS" 0 "KMS_API_PROPAGATION_ATTEMPTS")"
+  local wait_seconds
+  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-}" "$KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS" 0 "KMS_API_PROPAGATION_WAIT_SECONDS")"
+  local attempt=1 status=0 output=""
+  while :; do
+    output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        if type print_warning >/dev/null 2>&1; then
+          print_warning "Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        else
+          echo -e "  ⚠ Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        fi
+        [ -n "$output" ] && printf '%s\n' "$output"
+        return "$status"
+      fi
+      attempt=$((attempt + 1))
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        print_warning "Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      else
+        echo -e "  ⚠ Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        echo -e "  ⚠ Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      fi
+      sleep "$wait_seconds"
+      continue
+    fi
+    [ -n "$output" ] && printf '%s\n' "$output"
+    return "$status"
+  done
 }
 
 # The basename of the first ENABLED version of a Cloud KMS key, or nothing.

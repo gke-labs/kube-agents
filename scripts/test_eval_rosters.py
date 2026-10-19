@@ -202,6 +202,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
     "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
+    "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
     "chat-voice-capabilities-names-cluster-agents",  # "what can you do?" names a cluster agent by its cluster, #3082
 ]
 # Taken back out of the nightly file after registering there, each with a
