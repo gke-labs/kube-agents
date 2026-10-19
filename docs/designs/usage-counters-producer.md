@@ -67,8 +67,9 @@ interval the controller already uses for the RBAC re-probe and the pruned-status
 the same reasoning: one status write per interval is a cost nobody notices) it lists the
 `PlatformAgent`s from the cache and, for each:
 
-1. lists the pods the policies select, in the CR's namespace: `app: <name>-gateway` for the
-   gateway, twice, once per listener on that pod; `app: <name>-a2a-gateway` for the A2A gateway a `next`
+1. lists the pods the policies select, in the CR's namespace, once per distinct selector and
+   from the API server rather than the cache: `app: <name>-gateway` for the gateway, read as two
+   targets off one list, one per listener on that pod; `app: <name>-a2a-gateway` for the A2A gateway a `next`
    install runs, which selects no pod elsewhere; and for the broker the two labels `credentialProxySelector` returns,
    `app: <name>-credential-proxy` and `kubeagents.x-k8s.io/component: credential-proxy`. When
    `eventWatcherEnabled` is false for the CR, the gateway pods' watcher target is left out: the entrypoint

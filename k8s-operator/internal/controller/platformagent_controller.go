@@ -4483,12 +4483,14 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // difference between a cache that scales with the install and one that scales
 // with the cluster it runs on.
 //
-// What it costs instead, per agent and in steady state: 48 lists an hour from
-// the usage poll (four selectors, every usageCountersPollInterval) and five
-// more per reconcile while the agent is not Ready, each one namespace-scoped
-// and label-selected server-side. controller-runtime leaves client-side rate
-// limiting off (cfg.QPS = -1, API Priority and Fairness instead), so these
-// queue behind nothing of the operator's own.
+// What it costs instead, per agent and in steady state: 36 lists an hour from
+// the usage poll (its four groups share three distinct selectors, every
+// usageCountersPollInterval), one per reconcile while the CR has plugins, and
+// three more per reconcile while the agent is not Ready — five of those where
+// the A2A stack renders. Each is namespace-scoped and label-selected
+// server-side, and controller-runtime leaves client-side rate limiting off
+// (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
+// nothing of the operator's own.
 //
 // Nil falls back to the cached client, which is what tests supply.
 func (r *PlatformAgentReconciler) podReader() client.Reader {
@@ -4572,21 +4574,28 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	}
 
 	pods := make([]corev1.Pod, 0)
+	// A read that failed is not a selector that matched nothing, and since
+	// podReader goes to the API server it can now fail for a reason outside this
+	// install: an apiserver rollout, a 429. Skipping the selector is still right
+	// -- this pass reports the faults it could see, and the caller discards a
+	// "Provisioning" answer rather than writing it over a phase it already has --
+	// but a silent skip leaves an operator reading a message that went vague for
+	// no visible reason. One line per pass rather than one per selector, because
+	// the causes above take every selector down together and this function runs
+	// on a 30s requeue while an agent is not Ready.
+	var unread error
+	unreadSelectors := 0
 	for _, selector := range selectors {
 		podList := &corev1.PodList{}
-		// A read that failed is not a selector that matched nothing, and since
-		// podReader goes to the API server it can now fail for a reason outside
-		// this install: an apiserver rollout, a 429. Skipping the selector is
-		// still right -- this pass reports the faults it could see, and the
-		// caller discards a "Provisioning" answer rather than writing it over a
-		// phase it already has -- but a silent skip leaves an operator reading a
-		// message that went vague for no visible reason, so say it happened.
 		if err := r.podReader().List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
-			logf.FromContext(ctx).Error(err, "could not list the agent's pods for the status scan; this pass names no fault found on them",
-				"selector", selector)
+			unread, unreadSelectors = err, unreadSelectors+1
 			continue
 		}
 		pods = append(pods, podList.Items...)
+	}
+	if unread != nil {
+		logf.FromContext(ctx).Error(unread, "could not list the agent's pods for the status scan; this pass names no fault found on them",
+			"selectorsUnread", unreadSelectors, "selectorsTried", len(selectors))
 	}
 	if len(pods) == 0 {
 		return phase, reason, message

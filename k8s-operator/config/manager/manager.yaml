@@ -140,16 +140,20 @@ spec:
           # Memory here is the manager's cache, and the cache holds one entry
           # per object in the CLUSTER, not per install: every informer it
           # starts is cluster-wide, Owns() included (it filters events by
-          # owner, it does not scope the watch). Measured on a 3-node install,
-          # the store is 3.7 MiB of live heap over 675 objects of twelve kinds
-          # and the process 33 MiB of RSS, so this limit carries roughly an
-          # order of magnitude more of them. Pods are not among the cached
-          # kinds: they outnumber the rest and are read live (podReader,
-          # #3493). Deployments, StatefulSets, Services and PVCs are, and
-          # those do grow with the cluster's workloads, a Deployment carrying
-          # a whole pod template -- so a cluster with thousands of them is the
-          # case to raise this for. Keep in step with
-          # charts/kube-agents/values.yaml's operator.resources.
+          # owner, it does not scope the watch). Pods are the one kind kept
+          # out of it, read live instead because they outnumber the rest
+          # (podReader, #3493). What stays is every other kind the controller
+          # Owns() or Watches(): Deployments, StatefulSets, Services,
+          # ServiceAccounts, ConfigMaps, PVCs, NetworkPolicies,
+          # PodDisruptionBudgets, the four RBAC kinds and this operator's own
+          # CRDs. The first four of those grow with the cluster's workloads, a
+          # Deployment carrying a whole pod template, so a cluster with
+          # thousands of them is the case to raise this for.
+          #
+          # Sized from a measurement rather than the Kubebuilder scaffold it
+          # replaces: on a 3-node install the store holds 675 objects in
+          # 3.7 MiB of live heap, in a process of 22 MiB RSS. Keep in step
+          # with charts/kube-agents/values.yaml's operator.resources.
           resources:
             limits:
               cpu: 500m

@@ -8,6 +8,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -17,7 +18,8 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// Every Pod this operator reads is read live, through podReader. Nothing in
+// Every Pod this operator reads is read live, through podReader or through the
+// identical reader() the usage poller's own file carries. Nothing in
 // SetupWithManager watches Pods, so a single cached Pod read is what starts
 // their informer, and that informer is cluster-wide however narrow the read
 // that started it: client.InNamespace filters a cached List after the fact
@@ -111,19 +113,35 @@ func TestThePluginFailureScanReadsPodsLive(t *testing.T) {
 	}
 }
 
-// A read that failed is not an install with no plugin failures: the statuses
-// updatePluginStatuses writes are all derived from it, so a failing plugin
-// would be written Ready/Applied and the patch would re-enqueue the agent to
-// undo it on the next pass. The error has to reach the caller.
-func TestThePluginFailureScanReportsAReadItCouldNotMake(t *testing.T) {
+// A read that failed is not an install with no plugin failures: every status
+// updatePluginStatuses writes is derived from that map, so an empty one on a
+// refused read writes Ready/Applied over a plugin that is not, and the patch
+// re-enqueues the agent through the AgentPlugin watch to undo it next pass.
+// Both halves are pinned here, because the error reaching the caller is only
+// useful if the caller acts on it.
+func TestAPluginStatusIsNotWrittenFromAPodReadThatFailed(t *testing.T) {
 	agent := podReadAgent()
 	plugin := &agentv1alpha1.AgentPlugin{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: agent.Namespace},
 		Spec:       agentv1alpha1.AgentPluginSpec{Image: "example.com/demo:v1"},
+		Status: agentv1alpha1.AgentPluginStatus{
+			Phase: "Degraded",
+			Conditions: []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             pluginFailureReasonImagePull,
+				Message:            "Plugin image pull failed",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
 	}
 	scheme := setupScheme()
 	refusing := interceptor.NewClient(
-		fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build(),
+		fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(agent, plugin).
+			WithStatusSubresource(&agentv1alpha1.AgentPlugin{}).
+			Build(),
 		interceptor.Funcs{
 			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 				if _, ok := list.(*corev1.PodList); ok {
@@ -133,10 +151,24 @@ func TestThePluginFailureScanReportsAReadItCouldNotMake(t *testing.T) {
 			},
 		})
 	r := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: scheme}
+	ctx := context.Background()
 
-	failures, err := r.detectPluginFailures(context.Background(), agent, []*agentv1alpha1.AgentPlugin{plugin})
+	failures, err := r.detectPluginFailures(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin})
 	if err == nil {
 		t.Fatalf("a refused Pod list returned no error, so the caller reads %v as 'every plugin is applied'", failures)
+	}
+
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, true)
+
+	live := &agentv1alpha1.AgentPlugin{}
+	if err := refusing.Get(ctx, client.ObjectKeyFromObject(plugin), live); err != nil {
+		t.Fatalf("reading the AgentPlugin back: %v", err)
+	}
+	if live.Status.Phase != "Degraded" {
+		t.Errorf("the plugin is %q after a pass that could not read the pods, want %q left standing", live.Status.Phase, "Degraded")
+	}
+	if cond := meta.FindStatusCondition(live.Status.Conditions, "Ready"); cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Errorf("the plugin's Ready condition is %+v, want the False it carried: a failed read wrote a readiness claim", cond)
 	}
 }
 
@@ -184,8 +216,9 @@ func TestTheA2AProvisionReportReadsPodsLive(t *testing.T) {
 	}
 }
 
-// The usage poller: four Pod lists per agent, every usageCountersPollInterval,
-// for as long as the operator runs.
+// The usage poller: three Pod lists per agent — one per distinct selector
+// behind its four target groups — every usageCountersPollInterval, for as long
+// as the operator runs.
 func TestTheUsageCounterPollerReadsPodsLive(t *testing.T) {
 	agent := podReadAgent()
 	pod := gatewayPodWaiting(agent, platformAgentContainerName, "")

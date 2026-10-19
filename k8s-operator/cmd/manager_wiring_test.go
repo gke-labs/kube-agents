@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"testing"
 )
 
@@ -16,12 +17,18 @@ import (
 // Delete either and every other test in the repository still passes, which is
 // what this one is for. It reads main.go rather than running it, because
 // main() dials a cluster and calls os.Exit.
+// The value matters as much as the field: Cache: cache.Options{} is a manager
+// with no transform, and APIReader: mgr.GetClient() is podReader serving every
+// Pod read from the cache again. Both would satisfy an assertion that only
+// looked for the field name.
 const (
 	mainSourceFile           = "main.go"
 	managerOptionsType       = "ctrl.Options"
 	managerCacheField        = "Cache"
+	managerCacheValue        = "controller.ManagerCacheOptions()"
 	reconcilerType           = "controller.PlatformAgentReconciler"
 	reconcilerAPIReaderField = "APIReader"
+	reconcilerAPIReaderValue = "mgr.GetAPIReader()"
 )
 
 func TestMainHandsTheManagerItsCacheAndTheReconcilerALiveReader(t *testing.T) {
@@ -34,23 +41,29 @@ func TestMainHandsTheManagerItsCacheAndTheReconcilerALiveReader(t *testing.T) {
 	for _, tc := range []struct {
 		literal string
 		field   string
+		value   string
 		why     string
 	}{
-		{managerOptionsType, managerCacheField,
-			"the manager is built with controller-runtime's default cache, which keeps the managedFields of every cached object"},
-		{reconcilerType, reconcilerAPIReaderField,
+		{managerOptionsType, managerCacheField, managerCacheValue,
+			"the manager is built with a cache that keeps the managedFields of every cached object"},
+		{reconcilerType, reconcilerAPIReaderField, reconcilerAPIReaderValue,
 			"podReader falls back to the cached client, so every Pod read starts a cluster-wide Pod informer"},
 	} {
-		if !literalSetsField(file, tc.literal, tc.field) {
+		got, set := literalField(file, tc.literal, tc.field)
+		if !set {
 			t.Errorf("%s in %s sets no %s: %s", tc.literal, mainSourceFile, tc.field, tc.why)
+			continue
+		}
+		if got != tc.value {
+			t.Errorf("%s in %s sets %s to %s, want %s: %s", tc.literal, mainSourceFile, tc.field, got, tc.value, tc.why)
 		}
 	}
 }
 
-// literalSetsField reports whether some composite literal of the named type in
-// file assigns the named field.
-func literalSetsField(file *ast.File, typeName, field string) bool {
-	found := false
+// literalField returns the rendered value some composite literal of the named
+// type in file assigns to the named field, and whether it assigns it at all.
+func literalField(file *ast.File, typeName, field string) (string, bool) {
+	value, found := "", false
 	ast.Inspect(file, func(n ast.Node) bool {
 		lit, ok := n.(*ast.CompositeLit)
 		if !ok || literalTypeName(lit.Type) != typeName {
@@ -62,13 +75,13 @@ func literalSetsField(file *ast.File, typeName, field string) bool {
 				continue
 			}
 			if key, ok := kv.Key.(*ast.Ident); ok && key.Name == field {
-				found = true
+				value, found = types.ExprString(kv.Value), true
 				return false
 			}
 		}
 		return true
 	})
-	return found
+	return value, found
 }
 
 // literalTypeName renders a composite literal's type as `package.Name`, the
