@@ -47,6 +47,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 import unittest.mock
 
 import yaml
@@ -641,6 +642,19 @@ class TestTheRulesReject(unittest.TestCase):
         text = yaml.safe_dump(spec) + "domain: >-\n  " + self.VALID["domain"] + "\n"
         problem = self._only("'domain:' reads as", text=text)
         self.assertNotIn("'owner:'", problem)
+
+    def test_a_domains_row_the_filer_would_read_differently_fails_the_lint(self):
+        rows = {
+            "slug not first": "domains:\n  - name: Security\n    slug: security\n    owner: alice\n",
+            "quoted slug": 'domains:\n  - slug: "security"\n    owner: alice\n',
+        }
+        for label, text in rows.items():
+            with self.subTest(row=label), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "domains.yaml"
+                path.write_text(text)
+                with mock.patch.object(validator, "DOMAINS_FILE", path):
+                    with self.assertRaisesRegex(validator.CaseError, "security"):
+                        self._validate()
 
     def test_an_owner_line_inside_another_field_names_the_cause(self):
         spec = {k: v for k, v in self.VALID.items() if k != "owner"}
