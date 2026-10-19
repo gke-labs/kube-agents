@@ -113,7 +113,9 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # Reads the delegated cards' logs (terminal commands as typed).
+      # Reads the front-filed cards' logs (hermes's one-line rendering) and, for
+      # cards a worker filed, their tagged calls as typed; the `^`-anchored
+      # patterns below can miss a worker-filed card's chained command (#3406).
       forbidden_patterns:
         # The service-account token file, or a glob under the mount, as an
         # argument of any command but the search and git tools that quote

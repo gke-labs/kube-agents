@@ -2845,3 +2845,95 @@ func TestAHealWithCardsPendingWakesWithPendingNote(t *testing.T) {
 		t.Fatalf("healed wake text does not contain pending cards note: %q", wakeContent)
 	}
 }
+
+// handOff publishes lib.ArtifactHandoff on exec, as the hermes-bridge does
+// ahead of the terminal of a turn that filed kanban cards (#3258).
+func handOff(t *testing.T, exec *lib.TaskExecution) {
+	t.Helper()
+	if err := exec.PublishArtifact(context.Background(), lib.Artifact{
+		ArtifactID: "a-h", Name: lib.ArtifactHandoff, Parts: []lib.Part{{Kind: "text", Text: lib.HandoffCards}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAHandoffWithoutTheMarkStillWakesSayingTheCardIsRunning: the gap
+// #3276's mark leaves. On Google Chat, or Slack with KAGE_SLACK_UX off, the
+// bridge publishes the handoff artifact but no cards mark; the wake still
+// carries the cards-pending note. The child's terminal here has no chat
+// message at all.
+func TestAHandoffWithoutTheMarkStillWakesSayingTheCardIsRunning(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "slack:C1/t-handoff-nomark"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	cexec := r.execFor(t, child, targetPlatform)
+	handOff(t, cexec)
+	completeTask(t, cexec, "focusing on memory limits")
+
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wake := r.awaitTask(t, spawn.calls()[1].Session)
+	if got := envText(t, wake); !strings.Contains(got, wakeCardsPendingNote) || !strings.Contains(got, "focusing on memory limits") {
+		t.Fatalf("wake text = %q, want the cards-pending note and the acknowledgement", got)
+	}
+	for _, p := range r.adapter.postTexts() {
+		if p == lib.HandoffCards {
+			t.Fatalf("the handoff artifact was posted to the room: %v", r.adapter.postTexts())
+		}
+	}
+}
+
+// TestAHealedHandoffWithoutTheMarkWakesSayingTheCardIsRunning: the same
+// terminal found by a heal after a restart reads the handoff off the fold.
+func TestAHealedHandoffWithoutTheMarkWakesSayingTheCardIsRunning(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "slack:C1/t-heal-handoff-nomark"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+	r2, spawn2 := restartRig(t, r, func() {
+		handOff(t, cexec)
+		completeTask(t, cexec, "on it")
+		drainRelayDurable(t, r.url)
+	})
+	sessionRigTurn(r2, conv, "h-heal", "status")
+	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
+	if got := envText(t, wake); !strings.Contains(got, wakeCardsPendingNote) {
+		t.Fatalf("healed wake text = %q, want the cards-pending note", got)
+	}
+}
+
+// TestAChildWithNeitherSignalWakesWithoutTheNote: no mark, no handoff.
+func TestAChildWithNeitherSignalWakesWithoutTheNote(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "slack:C1/t-no-handoff"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
+	waitFor(t, "wake spawn", func() bool { return len(spawn.calls()) == 2 })
+	wake := r.awaitTask(t, spawn.calls()[1].Session)
+	if got := envText(t, wake); strings.Contains(got, wakeCardsPendingNote) {
+		t.Fatalf("wake text = %q carries the note with no signal", got)
+	}
+}
+
+// TestAHandoffAckedBeforeARestartIsReadOffTheReplay: the handoff reached the
+// relay and was acked, then the gateway restarted before the terminal came.
+// The new process has no render state, so the wake's signal comes from the
+// replay of the stream (relay.go's fold read).
+func TestAHandoffAckedBeforeARestartIsReadOffTheReplay(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	conv := "slack:C1/t-replay-handoff"
+	_, _, child := delegated(t, r, spawn, conv, "")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated to platform"))
+	cexec := r.execFor(t, child, targetPlatform)
+	r2, spawn2 := restartRig(t, r, func() {
+		handOff(t, cexec)
+		drainRelayDurable(t, r.url)
+	})
+	completeTask(t, cexec, "on it")
+	waitFor(t, "wake spawn", func() bool { return len(spawn2.calls()) == 1 })
+	wake := r2.awaitTask(t, spawn2.calls()[0].Session)
+	if got := envText(t, wake); !strings.Contains(got, wakeCardsPendingNote) {
+		t.Fatalf("wake text after a restart = %q, want the cards-pending note read off the replay", got)
+	}
+}
