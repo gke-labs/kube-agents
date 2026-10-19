@@ -407,11 +407,23 @@ class AssigneeTest(Harness):
         self.assertEqual(attempt["assignees"], ["alice"])
         self.assertIn("failed: case-red", out)
 
-    def test_a_refused_write_is_reported_failed_not_filed(self):
+    def test_a_failed_write_is_reported_failed_not_filed_and_not_called_a_refusal(self):
         _, out, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(fail_writes=True))
         self.assertIn("(live): filed 0,", out)
         self.assertIn("1 failed", out)
-        self.assertIn("failed: case-red", out)
+        self.assertIn(f"  failed: case-red ({nightly_bugs.FAILED_NOTE})", out)
+        self.assertNotIn("refused", out)
+
+    def test_a_domain_with_no_owner_says_so_instead_of_mentioning_unknown(self):
+        domains = self.root / "docs" / "designs" / "domains.yaml"
+        domains.write_text(domains.read_text().replace("    owner: carol\n", ""))
+        gh, out, _ = self.run_once(data(*(night(d, [red("case-maint")]) for d in (15, 16, 17))))
+        [issue] = self.filed(gh)
+        self.assertNotIn("assignees", issue)
+        self.assertNotIn("@unknown", issue["body"])
+        self.assertIn("No domain owner in `docs/designs/domains.yaml`.", issue["body"])
+        self.assertIn("**Unassigned** (`docs/designs/domains.yaml` names no owner for `capacity`).", issue["body"])
+        self.assertNotIn("mention @None", out)
 
     def test_a_refused_case_owner_falls_back_to_the_domain_owner(self):
         gh, out, err = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(refuse_assignees=("alice",)))
@@ -556,6 +568,13 @@ class LostJobTest(Harness):
         self.assertNotIn("assignees", issue)
         self.assertNotIn("@unknown", issue["body"])
         self.assertIn("names no `infra_owner`", issue["body"])
+
+    def test_an_infra_case_issue_in_a_domain_with_no_owner_mentions_no_one(self):
+        domains = self.root / "docs" / "designs" / "domains.yaml"
+        domains.write_text(domains.read_text().replace("    owner: carol\n", ""))
+        filer = nightly_bugs.Filer(None, self.root)
+        self.assertEqual(filer.infra_domain_owner("capacity"), "no owner in `docs/designs/domains.yaml`")
+        self.assertEqual(filer.infra_domain_owner("security"), "owner @sam")
 
 
 class InfraCaseTest(Harness):

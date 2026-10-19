@@ -78,7 +78,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 INFRA_OWNER_KEY = "infra_owner"
 INFRA_BACKUP_KEY = "infra_backup"
-TOP_LEVEL_KEY_RE = r"^{key}:\s*([A-Za-z0-9-]+)\s*(?:#.*)?$"
+# The login bare or in one pair of quotes, as YAML admits it.
+TOP_LEVEL_KEY_RE = r"""^{key}:\s*(["']?)([A-Za-z0-9-]+)\1\s*(?:#.*)?$"""
 INFRA_ADDRESSEE = "Infra owner: @{owner}{backup} (`infra_owner` in docs/designs/domains.yaml)."
 INFRA_BACKUP_NOTE = ", backup @{backup}"
 # The issue field GitHub names when it will not assign a login.
@@ -276,7 +277,7 @@ def infra_addressees(path: pathlib.Path = DOMAINS_FILE) -> tuple[str | None, str
     except OSError:
         return None, None
     found = [re.search(TOP_LEVEL_KEY_RE.format(key=key), text, re.MULTILINE) for key in (INFRA_OWNER_KEY, INFRA_BACKUP_KEY)]
-    return tuple(m.group(1) if m else None for m in found)
+    return tuple(m.group(2) if m else None for m in found)
 
 
 def names_all(text: str, names: list[str]) -> bool:

@@ -167,13 +167,19 @@ ISSUE_BODY_MAX_CHARS = 65536
 REASONS_PER_NIGHT = 3
 REASON_MAX_CHARS = nightly.REASON_MAX_CHARS
 UNKNOWN = "unknown"
+# The domain owner in an issue body; a domain with no owner on record is
+# said so rather than @-mentioning an account named "unknown".
+DOMAIN_OWNER_LINE = "Domain owner: @{owner}{backup}."
+NO_DOMAIN_OWNER_LINE = "No domain owner in `docs/designs/domains.yaml`."
+INFRA_DOMAIN_OWNER = "owner @{owner}"
+INFRA_NO_DOMAIN_OWNER = "no owner in `docs/designs/domains.yaml`"
 
 TITLE = "Nightly: {case} fails every run, {nights} nights in a row"
 BODY = """\
 {marker}
 `{case}` failed every graded repetition on its last {nights} graded nightly nights. Domain: **{domain_name}** (`{domain}`).
 
-{addressee} Domain owner: @{domain_owner}{backup}.
+{addressee} {domain_owner}
 
 **Nights** (newest first; a night cut off at the job deadline, a night where nothing was graded, and a night where nearly every case failed are skipped, not counted)
 
@@ -219,7 +225,7 @@ Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.
 INFRA_CASE_TITLE = "Nightly infra: {case} kept from running {nights} nights in a row"
 INFRA_CASE_BODY = """\
 {marker}
-`{case}` graded nothing on its last {nights} nights where its part of the nightly (`{job}`) ran to its verdict: every repetition was classified as infrastructure (`classify.py`), or the run recorded no line for the case. Domain: `{domain}` (owner @{domain_owner}).
+`{case}` graded nothing on its last {nights} nights where its part of the nightly (`{job}`) ran to its verdict: every repetition was classified as infrastructure (`classify.py`), or the run recorded no line for the case. Domain: `{domain}` ({domain_owner}).
 
 {addressee}
 
@@ -261,6 +267,10 @@ INFRA_REFUSED = "**Unassigned:** GitHub refused @{owner}, the infra owner in `do
 JOB_RECOVERED = "The {part} part (`{job}`) ran to its verdict"
 CASE_RECOVERED = "`{case}` was graded"
 WHY_INFRA_OWNER = "infra owner"
+# A `failed` entry: a call that failed for a reason other than a refused
+# assignee (which moves on to the next attempt), or comments that could not
+# be read.
+FAILED_NOTE = "a GitHub call failed: a timeout, a 5xx, a 403, or comments that could not be read; nothing more written for it this tick, retried next tick"
 WHY_NO_INFRA_OWNER = "`docs/designs/domains.yaml` names no `infra_owner`"
 
 
@@ -437,8 +447,7 @@ def render_issue(case: str, domain: str, domain_row: dict, assignee: str | None,
         domain=domain,
         domain_name=domain_row.get("name") or domain,
         addressee=(ASSIGNED if assignee else UNASSIGNED).format(assignee=assignee, why=why),
-        domain_owner=domain_row.get("owner") or UNKNOWN,
-        backup=f" (backup @{backup})" if backup else "",
+        domain_owner=DOMAIN_OWNER_LINE.format(owner=domain_row["owner"], backup=f" (backup @{backup})" if backup else "") if domain_row.get("owner") else NO_DOMAIN_OWNER_LINE,
         nights_block=night_block(streak),
         nightly_url=NIGHTLY_URL,
     )
@@ -595,10 +604,14 @@ class Filer:
                 body = functools.partial(
                     INFRA_CASE_BODY.format,
                     marker=BOT_MARKER.format(kind=KIND_INFRA, field=KEY_CASE, key=case), case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS,
-                    job=job, domain=domain, domain_owner=(self.domains.get(domain) or {}).get("owner") or UNKNOWN,
+                    job=job, domain=domain, domain_owner=self.infra_domain_owner(domain),
                     nights_block="\n".join(INFRA_CASE_LINE.format(date=v["date"], reason=quoted(v["reason"]), run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
                     nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
                 self.file_infra(KIND_INFRA, case, streak[-1], title, body, streak, closed_issues, result)
+
+    def infra_domain_owner(self, domain: str) -> str:
+        owner = (self.domains.get(domain) or {}).get("owner")
+        return INFRA_DOMAIN_OWNER.format(owner=owner) if owner else INFRA_NO_DOMAIN_OWNER
 
     def addressee(self, refused: bool = False) -> str:
         """The infra issue's assignment line; ``refused`` when GitHub would
@@ -730,13 +743,14 @@ def summary(result: dict, dry_run: bool) -> str:
     for f in result["filed"]:
         issue = f" #{f['issue']}" if f["issue"] else ""
         who = f"assign @{f['assignee']}" if f["assignee"] else "unassigned"
-        lines.append(f"  file{issue}: {f['case']} [{', '.join(f['labels'])}] {who} ({f['why']}); mention @{f['mention']}; nights {', '.join(f['nights'])}")
+        mention = f"; mention @{f['mention']}" if f["mention"] else ""
+        lines.append(f"  file{issue}: {f['case']} [{', '.join(f['labels'])}] {who} ({f['why']}){mention}; nights {', '.join(f['nights'])}")
         lines.extend(f"    {url}" for url in f["runs"] if url)
     lines += [f"  recovered: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["recovered"]]
     lines += [f"  new night: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["noted"]]
     lines += [f"  tracked: {t['case']} by #{t['issue']}{' (closed after its newest red night)' if t.get('closed') else ''}" for t in result["tracked"]]
     lines += [f"  skipped: {s['case']} ({s['why']})" for s in result["skipped"]]
-    lines += [f"  failed: {f['case']} (the GitHub write was refused; retried next tick)" for f in result["failed"]]
+    lines += [f"  failed: {f['case']} ({FAILED_NOTE})" for f in result["failed"]]
     return "\n".join(lines)
 
 
