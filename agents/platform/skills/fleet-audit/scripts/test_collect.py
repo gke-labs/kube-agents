@@ -8291,6 +8291,8 @@ class TestIsAiWorkload(unittest.TestCase):
             "GEMINI_API_KEY",
             "COHERE_API_KEY",
             "MISTRAL_API_KEY",
+            # LiteLLM's hosted_vllm handler: the gateway's only key under openai_compatible.
+            "HOSTED_VLLM_API_KEY",
             "HF_TOKEN",
             "HUGGING_FACE_HUB_TOKEN",
             "REPLICATE_API_TOKEN",
