@@ -170,18 +170,6 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "upstream google/skills text; both rules fire on the Artifact Registry host",
     ),
     (
-        "agents/platform/skills/gke-batch-hpc/SKILL.md",
-        "# Install Kueue\n"
-        "kubectl apply --server-side -f"
-        " https://github.com/kubernetes-sigs/kueue/releases/latest/download/manifests.yaml",
-    ): (frozenset({"kubectl_apply_remote"}), "upstream google/skills text"),
-    (
-        "agents/platform/skills/gke-batch-hpc/SKILL.md",
-        "# Install MPI Operator\n"
-        "kubectl apply -f"
-        " https://raw.githubusercontent.com/kubeflow/mpi-operator/master/deploy/v2beta1/mpi-operator.yaml",
-    ): (frozenset({"kubectl_apply_remote"}), "upstream google/skills text"),
-    (
         "agents/platform/skills/gke-workload-identity/SKILL.md",
         "# Token endpoint via the hardcoded metadata IP (a healthy path returns a token).\n"
         "kubectl exec {pod_name} -n {namespace} -- \\\n"
