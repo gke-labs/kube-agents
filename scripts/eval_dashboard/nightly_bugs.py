@@ -9,7 +9,8 @@ is the nightly's counterpart of ``gate_issue.py``::
 
     a case failed every graded repetition on its last STREAK_NIGHTS graded nights
     and its task.yaml does not carry `expected_fail: true`
-    and no OPEN issue labelled `nightly-red` already names it
+    and no OPEN issue labelled `nightly-red` already names it,
+    and none was closed after the streak's newest night
     -> file one, labelled `nightly-red`, `domain:<slug>` and `needs-triage`,
        assigned per the hybrid rule below
 
@@ -85,8 +86,11 @@ OWNERS_FILE = pathlib.Path("OWNERS")
 OWNERS_LISTS = ("approvers", "reviewers")
 # task.yaml `owner:` values that name no person: the domain owner answers.
 OWNER_PLACEHOLDERS = frozenset({"maintainers"})
-# The top-level task.yaml keys read here, line-scanned like collect.task_domain.
-TASK_KEY_RE = r"^{key}:\s*([^\s#]+)\s*(?:#.*)?$"
+# The top-level task.yaml keys read here, and the domains.yaml row keys.
+TASK_OWNER_KEY = "owner"
+TASK_DOMAIN_KEY = "domain"
+TASK_EXPECTED_FAIL_KEY = "expected_fail"
+DOMAIN_ROW_KEYS = ("name", "owner", "backup")
 CASE_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 # How many graded nights in a row a case must fail every repetition on.
@@ -103,12 +107,21 @@ LABEL = "nightly-red"
 TRIAGE_LABEL = "needs-triage"
 DOMAIN_LABEL = "domain:{slug}"
 OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
+# Closed ones too, updated since the window's first night: a bug closed
+# after the streak's newest night has seen this streak, so it is not filed
+# again until a newer failing night (a fix that merged before the next
+# nightly closes its issue, and the streak on record is still red).
+CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&since={{since}}&per_page=100"
+# `since` in UTC with a Z: a `+00:00` offset would reach GitHub as a space.
+GITHUB_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 ISSUES_PATH = "issues"
 COMMENTS_PATH = "issues/{number}/comments"
 COMMENTS_READ_PATH = "issues/{number}/comments?per_page=100"
 # The bot's issue carries this, so it re-finds its own whatever the title
-# has been edited to; a human's issue is adopted when its title or body
-# names the case as a whole word.
+# has been edited to; an issue without one (a human's) is adopted when its
+# title or body names the case as a whole word. A bot issue is matched on
+# its marker alone: its body quotes failure reasons, which can name another
+# case.
 MARKER = "<!-- kube-agents-bot:nightly-red case={case} -->"
 MARKER_RE = re.compile(r"<!-- kube-agents-bot:nightly-red case=([A-Za-z0-9._-]+) -->")
 # One recovery comment per recovery: keyed by the night that recovered.
@@ -169,19 +182,22 @@ def log(message: str) -> None:
 
 def task_fields(case: str, repo_root: pathlib.Path) -> dict | None:
     """``{owner, domain, expected_fail}`` from the case's task.yaml, ``None``
-    when the case has no task.yaml on this checkout (renamed or deleted)."""
+    when the case has no readable task.yaml on this checkout (renamed or
+    deleted). ``expected_fail`` is a YAML boolean, as bench-gate reads it."""
     if not CASE_NAME_RE.fullmatch(case or ""):
         return None
-    try:
-        text = (repo_root / TASKS_DIR / case / TASK_FILE).read_text()
-    except OSError:
+    path = repo_root / TASKS_DIR / case / TASK_FILE
+    if not path.is_file():
+        return None
+    doc = load_yaml(path)
+    if not doc:
         return None
 
-    def field(key):
-        found = re.search(TASK_KEY_RE.format(key=key), text, re.MULTILINE)
-        return found.group(1).strip("'\"") if found else None
+    def text(key):
+        value = doc.get(key)
+        return str(value) if value is not None else None
 
-    return {"owner": field("owner"), "domain": field("domain"), "expected_fail": field("expected_fail") == "true"}
+    return {"owner": text(TASK_OWNER_KEY), "domain": text(TASK_DOMAIN_KEY), "expected_fail": doc.get(TASK_EXPECTED_FAIL_KEY) is True}
 
 
 def load_yaml(path: pathlib.Path) -> dict:
@@ -198,7 +214,7 @@ def load_domains(repo_root: pathlib.Path) -> dict[str, dict]:
     out = {}
     for row in load_yaml(repo_root / DOMAINS_FILE).get("domains") or []:
         if isinstance(row, dict) and isinstance(row.get("slug"), str):
-            out[row["slug"]] = {key: row.get(key) for key in ("name", "owner", "backup")}
+            out[row["slug"]] = {key: row.get(key) for key in DOMAIN_ROW_KEYS}
     return out
 
 
@@ -261,6 +277,7 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                         reasons.append(reason)
                 by_date.setdefault(day, {})[name] = {
                     "date": day.isoformat(),
+                    "started": run.get("started"),
                     "build": run.get("build_id"),
                     "outcome": outcome,
                     "passed": counts["pass"],
@@ -337,21 +354,30 @@ def render_issue(case: str, domain: str, domain_row: dict, assignee: str, why: s
 
 
 def names_case(issue: dict, case: str) -> bool:
+    """The bot's issue by its marker; one without a marker by the case
+    named as a whole word in its title or body."""
     body = issue.get("body") or ""
-    if case in MARKER_RE.findall(body):
-        return True
+    markers = MARKER_RE.findall(body)
+    if markers:
+        return case in markers
     pattern = NAME_IN_TEXT_RE.format(name=re.escape(case))
     return bool(re.search(pattern, f"{issue.get('title') or ''}\n{body}"))
 
 
-def tracking_issue(open_issues: list[dict], case: str) -> dict | None:
-    """The open `nightly-red` issue naming the case: the bot's own by
-    marker first, else a human's naming it."""
-    issues = [i for i in open_issues if isinstance(i, dict) and not i.get("pull_request") and i.get("number")]
+def tracking_issue(issues: list[dict], case: str) -> dict | None:
+    """The `nightly-red` issue among ``issues`` that names the case: the
+    bot's own by marker first, else a human's naming it."""
+    issues = [i for i in issues if isinstance(i, dict) and not i.get("pull_request") and i.get("number")]
     for issue in issues:
         if case in MARKER_RE.findall(issue.get("body") or ""):
             return issue
     return next((issue for issue in issues if names_case(issue, case)), None)
+
+
+def closed_after(issue: dict | None, night: dict) -> bool:
+    """Whether a closed issue was closed after ``night``'s run started."""
+    closed, started = nightly.parse_iso((issue or {}).get("closed_at")), nightly.parse_iso(night.get("started"))
+    return bool(closed and started and closed > started)
 
 
 class Filer:
@@ -364,6 +390,9 @@ class Filer:
     def open_issues(self) -> list[dict] | None:
         return self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
 
+    def closed_issues(self, since: str) -> list[dict] | None:
+        return self.gh.call("GET", self.gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True)
+
     def commented(self, number: int, marker: str) -> bool | None:
         comments = self.gh.call("GET", self.gh.path(COMMENTS_READ_PATH.format(number=number)), paginate=True)
         if comments is None:
@@ -371,34 +400,44 @@ class Filer:
         return any(marker in (c.get("body") or "") for c in comments if isinstance(c, dict))
 
     def run(self, data: dict) -> dict:
-        """One pass: ``{filed, recovered, tracked, skipped}``, each a list of
-        what was (or, dry, would be) done. Nothing is written when the open
-        issues cannot be read: a dedupe that cannot see is not a dedupe."""
-        result = {"filed": [], "recovered": [], "tracked": [], "skipped": []}
+        """One pass: ``{filed, recovered, tracked, skipped, failed}``, each a
+        list of what was (or, dry, would be) done. Nothing is written when
+        the issues cannot be read: a dedupe that cannot see is not a dedupe."""
+        result = {"filed": [], "recovered": [], "tracked": [], "skipped": [], "failed": []}
+        nights = graded_nights(data)
+        starts = [nightly.parse_iso(v.get("started")) for vs in nights.values() for v in vs]
+        since = min((t for t in starts if t), default=None)
         open_issues = self.open_issues()
-        if open_issues is None:
-            log("warning: could not list the open nightly-red issues; nothing filed or commented this pass")
+        closed_issues = self.closed_issues(since.strftime(GITHUB_TIME_FORMAT)) if since else []
+        if open_issues is None or closed_issues is None:
+            log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
             return result
         active = {c.get("name") for c in data.get("cases") or [] if isinstance(c, dict) and c.get("nightly_active")}
-        for case, verdicts in sorted(graded_nights(data).items()):
+        for case, verdicts in sorted(nights.items()):
             fields = task_fields(case, self.repo_root)
             issue = tracking_issue(open_issues, case)
             streak = red_streak(verdicts)
             if streak:
-                if fields is None or case not in active:
+                closed = tracking_issue([i for i in closed_issues if closed_after(i, streak[-1])], case)
+                if fields is None:
+                    result["skipped"].append({"case": case, "why": "no readable task.yaml on this checkout"})
+                elif case not in active:
                     result["skipped"].append({"case": case, "why": "not on this checkout's nightly matrix"})
                 elif fields["expected_fail"]:
                     result["skipped"].append({"case": case, "why": "expected_fail: true"})
                 elif issue:
                     result["tracked"].append({"case": case, "issue": issue["number"]})
+                elif closed:
+                    result["tracked"].append({"case": case, "issue": closed["number"], "closed": True})
                 else:
-                    result["filed"].append(self.file(case, fields, streak))
+                    filed = self.file(case, fields, streak)
+                    result["filed" if filed["issue"] or self.gh.dry_run else "failed"].append(filed)
                 continue
             recovered = recovery_night(verdicts)
             if recovered and issue:
                 done = self.recover(case, issue, recovered)
                 if done:
-                    result["recovered"].append(done)
+                    result["recovered" if done["ok"] or self.gh.dry_run else "failed"].append(done)
         return result
 
     def file(self, case: str, fields: dict, streak: list[dict]) -> dict:
@@ -413,9 +452,15 @@ class Filer:
         created = self.gh.call("POST", self.gh.path(ISSUES_PATH), payload)
         if created is None and assignee and not self.gh.dry_run:
             # A login GitHub will not assign (not a collaborator) refuses the
-            # whole issue; file it unassigned, with the @-mentions intact.
-            log(f"warning: filing {case} assigned to {assignee} failed; retrying unassigned")
-            created = self.gh.call("POST", self.gh.path(ISSUES_PATH), {key: value for key, value in payload.items() if key != "assignees"})
+            # whole issue; file it unassigned, with the @-mentions intact --
+            # unless the failed call created it after all (a timeout, a 5xx
+            # after the write), which the marker finds.
+            landed = tracking_issue(self.open_issues() or [], case)
+            if landed:
+                created = landed
+            else:
+                log(f"warning: filing {case} assigned to {assignee} failed; retrying unassigned")
+                created = self.gh.call("POST", self.gh.path(ISSUES_PATH), {key: value for key, value in payload.items() if key != "assignees"})
         number = created.get("number") if isinstance(created, dict) else None
         if number:
             log(f"nightly bug: filed #{number} for {case}")
@@ -428,8 +473,8 @@ class Filer:
         if already is None or already:
             return None
         body = RECOVERY_COMMENT.format(marker=marker, case=case, passed=night["passed"], graded=night["graded"], date=night["date"], run_url=night["run_url"])
-        self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=issue["number"])), {"body": body})
-        return {"case": case, "issue": issue["number"], "night": night["date"], "run": night["run_url"]}
+        posted = self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=issue["number"])), {"body": body})
+        return {"case": case, "issue": issue["number"], "night": night["date"], "run": night["run_url"], "ok": posted is not None}
 
 
 # --------------------------------------------------------------------------
@@ -442,7 +487,7 @@ def summary(result: dict, dry_run: bool) -> str:
     head = (
         f"nightly bugs ({'dry run' if dry_run else 'live'}): {verb} {len(result['filed'])}, "
         f"{commented} {len(result['recovered'])} recovered, "
-        f"{len(result['tracked'])} already tracked, {len(result['skipped'])} skipped"
+        f"{len(result['tracked'])} already tracked, {len(result['skipped'])} skipped, {len(result['failed'])} failed"
     )
     lines = [head]
     for f in result["filed"]:
@@ -450,8 +495,9 @@ def summary(result: dict, dry_run: bool) -> str:
         lines.append(f"  file{issue}: {f['case']} [{', '.join(f['labels'])}] assign @{f['assignee']} ({f['why']}); mention @{f['mention']}; nights {', '.join(f['nights'])}")
         lines.extend(f"    {url}" for url in f["runs"] if url)
     lines += [f"  recovered: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["recovered"]]
-    lines += [f"  tracked: {t['case']} by #{t['issue']}" for t in result["tracked"]]
+    lines += [f"  tracked: {t['case']} by #{t['issue']}{' (closed after its newest red night)' if t.get('closed') else ''}" for t in result["tracked"]]
     lines += [f"  skipped: {s['case']} ({s['why']})" for s in result["skipped"]]
+    lines += [f"  failed: {f['case']} (the GitHub write was refused; retried next tick)" for f in result["failed"]]
     return "\n".join(lines)
 
 

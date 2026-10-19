@@ -628,7 +628,7 @@ commented on is never commented on twice. The watermark and the comment ids
 live in `gate-comment-state.json` beside `health.json`; a first tick with no
 state looks back one hour. Posting uses the workflow's own `GITHUB_TOKEN`
 through `gh api` (the job holds `pull-requests: write` and `issues: write` for
-this and the tracking issue). A failure to post is a warning; the run is
+this, the tracking issue and the nightly bug). A failure to post is a warning; the run is
 retried next tick and the job never reds for it. `--dry-run` prints the
 comments instead.
 
@@ -714,9 +714,13 @@ domain's `owner:` in
 [`docs/designs/domains.yaml`](designs/domains.yaml). A login GitHub refuses to
 assign files the issue unassigned, with the mentions intact.
 
-An open `nightly-red` issue that carries the case's marker, or names the case as
-a whole word in its title or body, is adopted instead, so a case is filed once
-and a human's issue wins. When a case with an open issue passes every graded
+An open `nightly-red` issue that carries the case's marker, or (for an issue
+without a marker, a human's) names the case as a whole word in its title or
+body, is adopted instead, so a case is filed once and a human's issue wins. A
+`nightly-red` issue for the case closed after the streak's newest night counts
+too: a fix that merged before the next nightly closes its issue while the
+nights on record are still red, so the case is filed again only after a newer
+failing night. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, the bot comments with
 that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.

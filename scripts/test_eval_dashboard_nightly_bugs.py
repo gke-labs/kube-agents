@@ -21,6 +21,8 @@ import tempfile
 import typing
 import unittest
 
+import yaml
+
 from eval_dashboard import nightly_bugs
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
@@ -30,7 +32,9 @@ REPO = "gke-labs/kube-agents"
 ISSUES = f"repos/{REPO}/issues"
 FAIL_REASON = "VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: required phrases absent"
 STORM_REASON = "agent run failed: http 429 RESOURCE_EXHAUSTED"
-CASES = ["case-red", "case-red-extended", "case-maint", "case-outsider", "case-reviewer", "case-noowner", "case-xfail", "case-green"]
+CASES = ["case-red", "case-red-extended", "case-maint", "case-outsider", "case-reviewer", "case-noowner", "case-xfail", "case-xfail-cap", "case-green"]
+WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci-health.yml"
+STEP_NAME = "File bugs for persistent nightly failures (dry run unless armed)"
 
 
 def rep(n, result, reason=None):
@@ -79,12 +83,16 @@ class FakeGh:
     """A `gh api` runner: open issues and per-issue comments for reads, a
     freshly numbered object for writes; records every call."""
 
-    def __init__(self, open_issues=(), comments=None, fail_list=False, refuse_assignees=False):
+    def __init__(self, open_issues=(), closed_issues=(), comments=None, fail_list=False, fail_closed=False, refuse_assignees=False, lands_then_fails=False, fail_writes=False):
         self.calls = []
         self.open_issues = list(open_issues)
+        self.closed_issues = list(closed_issues)
         self.comments = comments or {}
         self.fail_list = fail_list
+        self.fail_closed = fail_closed
         self.refuse_assignees = refuse_assignees
+        self.lands_then_fails = lands_then_fails
+        self.fail_writes = fail_writes
         self.next_number = 4000
 
     def __call__(self, argv, input=None, **kwargs):
@@ -94,12 +102,22 @@ class FakeGh:
         if method == "GET" and "/comments" in path:
             number = int(path.split("/issues/")[1].split("/")[0])
             return GhResult(stdout="\n".join(json.dumps(c) for c in self.comments.get(number, [])))
+        if method == "GET" and "state=closed" in path:
+            if self.fail_closed:
+                return GhResult(rc=1, stderr="HTTP 502")
+            return GhResult(stdout="\n".join(json.dumps(i) for i in self.closed_issues))
         if method == "GET":
             if self.fail_list:
                 return GhResult(rc=1, stderr="HTTP 502")
             return GhResult(stdout="\n".join(json.dumps(i) for i in self.open_issues))
+        if self.fail_writes:
+            return GhResult(rc=1, stderr="HTTP 403")
         if self.refuse_assignees and body and body.get("assignees"):
             return GhResult(rc=1, stderr="HTTP 422: Validation Failed (assignees)")
+        if self.lands_then_fails and body and body.get("assignees"):
+            # The write landed and the call still failed (a timeout, a 5xx).
+            self.open_issues.append({"number": 4100, "title": body["title"], "body": body["body"]})
+            return GhResult(rc=1, stderr="HTTP 504")
         number = self.next_number
         self.next_number += 1
         return GhResult(stdout=json.dumps({"number": number, "html_url": f"https://github.com/{REPO}/issues/{number}"}))
@@ -164,9 +182,10 @@ class StreakTest(Harness):
         self.assertEqual(len(self.filed(gh)), 1, "three full reds after it do file")
 
     def test_expected_fail_case_is_skipped(self):
-        gh, out, _ = self.run_once(data(*(night(d, [red("case-xfail")]) for d in (15, 16, 17))))
+        gh, out, _ = self.run_once(data(*(night(d, [red("case-xfail"), red("case-xfail-cap")]) for d in (15, 16, 17))))
         self.assertEqual(gh.writes(), [])
         self.assertIn("skipped: case-xfail (expected_fail: true)", out)
+        self.assertIn("skipped: case-xfail-cap (expected_fail: true)", out, "any YAML spelling of true")
 
     def test_case_off_the_nightly_matrix_is_skipped(self):
         gh, out, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17)), inactive=("case-red",)))
@@ -240,10 +259,30 @@ class DedupeTest(Harness):
         again, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[{"number": 4000, "title": body["title"], "body": body["body"]}]))
         self.assertEqual(again.writes(), [])
 
-    def test_unreadable_open_issues_write_nothing(self):
-        gh, _, err = self.run_once(self.THREE_RED(), FakeGh(fail_list=True))
+    def test_unreadable_issues_write_nothing(self):
+        for gh in (FakeGh(fail_list=True), FakeGh(fail_closed=True)):
+            gh, _, err = self.run_once(self.THREE_RED(), gh)
+            self.assertEqual(gh.writes(), [])
+            self.assertIn("could not list the nightly-red issues", err)
+
+    def test_a_bug_closed_after_the_newest_red_night_is_not_filed_again(self):
+        marker = nightly_bugs.MARKER.format(case="case-red")
+        # Closed on the 17th after that night's run started (a fix merged).
+        closed = {"number": 3996, "title": "t", "body": marker, "closed_at": "2026-10-17T12:00:00Z"}
+        gh, out, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
         self.assertEqual(gh.writes(), [])
-        self.assertIn("could not list the open nightly-red issues", err)
+        self.assertIn("tracked: case-red by #3996 (closed after its newest red night)", out)
+        reads = [p for m, p, _ in gh.calls if m == "GET" and "state=closed" in p]
+        self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&since=2026-10-15T00:00:30Z&per_page=100"])
+        # A newer failing night after the close files again.
+        later = data(*(night(d, [red(), green()]) for d in (15, 16, 17, 18)))
+        gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh)), 1)
+
+    def test_another_cases_bot_issue_quoting_this_case_is_not_a_match(self):
+        other = {"number": 3995, "title": "Nightly: case-maint fails every run", "body": nightly_bugs.MARKER.format(case="case-maint") + "\nreason: see case-red too"}
+        gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[other]))
+        self.assertEqual(len(self.filed(gh)), 1)
 
 
 class RecoveryTest(Harness):
@@ -312,6 +351,18 @@ class AssigneeTest(Harness):
         self.assertEqual(by_case["case-noowner"]["assignees"], ["sam"])
         self.assertIn("domain:security", by_case["case-outsider"]["labels"])
 
+    def test_a_write_that_landed_before_failing_is_not_filed_twice(self):
+        gh, out, err = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(lands_then_fails=True))
+        self.assertEqual(len(self.filed(gh)), 1, "no unassigned retry: the marker found the issue")
+        self.assertNotIn("retrying unassigned", err)
+        self.assertIn("file #4100: case-red", out)
+
+    def test_a_refused_write_is_reported_failed_not_filed(self):
+        _, out, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(fail_writes=True))
+        self.assertIn("(live): filed 0,", out)
+        self.assertIn("1 failed", out)
+        self.assertIn("failed: case-red", out)
+
     def test_an_unassignable_login_files_unassigned(self):
         gh, _, err = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(refuse_assignees=True))
         attempts = self.filed(gh)
@@ -334,6 +385,35 @@ class DryRunTest(Harness):
     def test_dry_run_and_live_are_exclusive(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             nightly_bugs.parse_args(["--data", "x", "--dry-run", "--live"])
+
+
+class WorkflowSwitchTest(unittest.TestCase):
+    """ci-health.yml's step is the only thing that arms the writes: run its
+    shell with each switch setting and a `python3` that prints its argv."""
+
+    def mode(self, live, mute):
+        workflow = yaml.safe_load(WORKFLOW.read_text())
+        steps = workflow["jobs"]["refresh-and-adjudicate"]["steps"]
+        [step] = [s for s in steps if s.get("name") == STEP_NAME]
+        self.assertTrue(step.get("continue-on-error"), "never reds the tick")
+        self.assertNotIn("if", step, "runs every tick, dry when unarmed")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = pathlib.Path(tmp) / "python3"
+            fake.write_text('#!/bin/sh\necho "$@"\n')
+            fake.chmod(0o755)
+            env = {"PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}", "NIGHTLY_BUGS_LIVE": live, "CI_HEALTH_MUTE": mute}
+            proc = subprocess.run(["bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.split()[-1]
+
+    def test_only_an_armed_unmuted_switch_goes_live(self):
+        self.assertEqual(self.mode("true", "false"), "--live")
+        self.assertEqual(self.mode("false", "false"), "--dry-run")
+        self.assertEqual(self.mode("True", "false"), "--dry-run")
+        self.assertEqual(self.mode("true", "true"), "--dry-run", "the mute switch disarms it")
+
+    def test_the_switch_defaults_off(self):
+        self.assertIn("NIGHTLY_BUGS_LIVE: ${{ vars.NIGHTLY_BUGS_LIVE || 'false' }}", WORKFLOW.read_text())
 
 
 class RunAsAScript(Harness):
