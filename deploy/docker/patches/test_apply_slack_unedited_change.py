@@ -69,7 +69,7 @@ class ApplierTest(unittest.TestCase):
         apply(root)
         patched = (root / RELATIVE).read_text()
         self.assertIn(GUARD_ANCHOR + "        # " + MARKER, patched)
-        self.assertIn('_kage_edited == (event.get("previous_message") or {}).get("edited")', patched)
+        self.assertIn('_kage_before.get("ts") == _kage_edited.get("ts")', patched)
 
     def test_a_second_apply_is_refused(self):
         root = stage()
@@ -101,7 +101,7 @@ class VerifierTest(unittest.TestCase):
         apply(root)
         path = root / RELATIVE
         path.write_text(path.read_text().replace(
-            ' or _kage_edited == (event.get("previous_message") or {}).get("edited")', ""))
+            'isinstance(_kage_before, dict) and _kage_before.get("ts") == _kage_edited.get("ts")', "False"))
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
         self.assertTrue(any("parent edited earlier" in f for f in failures), failures)

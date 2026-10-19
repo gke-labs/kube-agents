@@ -19,8 +19,12 @@ opening ask runs a second time.
 Slack marks an edited message with an ``edited`` object, and keeps it: a
 message edited once carries the same ``edited`` on every later change, and the
 envelope's ``previous_message`` carries it too. So a change is an edit only
-when the message's ``edited`` differs from ``previous_message``'s; with no
-``previous_message`` to compare, when it has one at all. A metadata change, a
+when the message's ``edited.ts`` differs from ``previous_message``'s; with no
+``previous_message`` (or a malformed one) to compare, when it has ``edited`` at
+all. That fallback is the one gap left: a once-edited parent's metadata change
+delivered without ``previous_message`` still replays. Slack documents
+``previous_message`` on every ``message_changed``, so the gap is not closed with
+a heuristic that could drop a real edit. A metadata change, a
 link unfurl and a bot-side rewrite of another message are not edits. The
 insertion returns None for a change that is not, after upstream's processed-ts
 check, so the edit-to-mention case keeps its single turn and everything
@@ -65,7 +69,10 @@ GUARD_PATCHED = GUARD_ANCHOR + (
     f"        # {MARKER}: not an edit unless `edited` is new (Slack keeps it once set);\n"
     "        # reply metadata, an unfurl or a bot rewrite would replay a thread's opening ask after a restart.\n"
     '        _kage_edited = updated_message.get("edited")\n'
-    '        if not isinstance(_kage_edited, dict) or _kage_edited == (event.get("previous_message") or {}).get("edited"):\n'
+    '        _kage_before = event.get("previous_message")\n'
+    '        _kage_before = _kage_before.get("edited") if isinstance(_kage_before, dict) else None\n'
+    "        if not isinstance(_kage_edited, dict) or (\n"
+    '                isinstance(_kage_before, dict) and _kage_before.get("ts") == _kage_edited.get("ts")):\n'
     "            return None\n"
 )
 

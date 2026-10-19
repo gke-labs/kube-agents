@@ -8,8 +8,8 @@ the real ``adapter.py`` text against a stand-in adapter whose processed-ts map
 is empty, as it is after a restart:
 
 - a thread parent's change with reply metadata and no ``edited`` returns None;
-- so does one for a parent edited earlier, whose ``edited`` is unchanged from
-  ``previous_message``'s;
+- so does one for a parent edited earlier, whose ``edited.ts`` is unchanged
+  from ``previous_message``'s;
 - a user's edit, a second edit, and an edit with no ``previous_message`` still
   return the normalized message;
 - a change to a message already routed to the agent still returns None.
@@ -85,6 +85,9 @@ SECOND_EDIT = {**USER_EDIT, "previous_message": {**USER_EDIT["previous_message"]
 #: A user's edit delivered without previous_message: `edited` alone decides.
 BARE_EDIT = {k: v for k, v in USER_EDIT.items() if k != "previous_message"}
 
+#: A user's edit whose previous_message is malformed: treated as absent, not raised on.
+MALFORMED_PREVIOUS_EDIT = {**USER_EDIT, "previous_message": "garbled"}
+
 
 def fail(msg: str) -> None:
     FAILURES.append(msg)
@@ -137,7 +140,8 @@ def main() -> int:
             if got is not None and got is not RAISED:
                 fail(why)
         for event, what in ((USER_EDIT, "a user's edit"), (SECOND_EDIT, "a second edit"),
-                            (BARE_EDIT, "an edit with no previous_message")):
+                            (BARE_EDIT, "an edit with no previous_message"),
+                            (MALFORMED_PREVIOUS_EDIT, "an edit with a malformed previous_message")):
             got = run(text, event)
             if got is not RAISED and (not isinstance(got, dict) or got.get("ts") != ROOT_TS):
                 fail(f"{what} is not routed as the edited message: {got!r}")
