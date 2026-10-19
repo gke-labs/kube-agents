@@ -722,9 +722,10 @@ ConfigMap changed, the checksum did not, the Deployment did not roll. The
 gateway mounts this with subPath, and a subPath ConfigMap mount never receives
 in-place updates, so the running pod would have kept the old file indefinitely.
 
-Takes a dict of provider, model, callbacks, and maxTokens (optional; 0 or
-absent renders no max_tokens), plus apiBase and sslVerify (optional; absent
-renders neither key), which only openai_compatible passes.
+Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
+renders no max_tokens) and reasoningEffort (optional; empty or absent renders
+no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
+neither key), which only openai_compatible passes.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
@@ -738,6 +739,18 @@ renders neither key), which only openai_compatible passes.
   ceiling on one that does; values.yaml says what that means for the agent.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
+{{- /*
+  reasoning_effort on every alias when .reasoningEffort is set, and no key at
+  all otherwise, for the same reason as max_tokens above: the default render
+  and its checksum stay what they were. LiteLLM translates the OpenAI-style
+  value per provider (thinkingLevel on Gemini 3.x through gemini or vertex_ai,
+  adaptive thinking on Claude, reasoning_effort as-is on OpenAI and
+  hosted_vllm), and, like max_tokens, it is what a request that names no
+  reasoning_effort gets: a request's own value wins. The schema limits it to
+  low, medium and high, which LiteLLM maps on all three; "minimal" is left out
+  because Vertex AI refuses it on Gemini 3.x Flash (see the auxiliary block in
+  deploy/shared/defaults/config.yaml).
+*/}}
 {{- /*
   Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
   with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
@@ -778,6 +791,9 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
       {{- if $claude }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
@@ -793,6 +809,9 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
       {{- if $claude }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
@@ -807,6 +826,9 @@ model_list:
       {{- end }}
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
+      {{- end }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
       {{- end }}
       {{- if $claude }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
