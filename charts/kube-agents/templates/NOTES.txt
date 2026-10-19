@@ -55,7 +55,7 @@ pod-local Session KV server rejects every request, and identity pseudonyms are
 not stable across restarts. See the chart README.
 {{- end }}
 
-For GCP access, bind your Google Service Account to the agent's KSA
+For GCP access, bind your Google Service Account to the credential broker's KSA
 "{{ .Values.platformAgent.security.serviceAccountName }}" via Workload Identity
 (see the chart README).
 
