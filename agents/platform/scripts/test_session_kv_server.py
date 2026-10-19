@@ -6756,11 +6756,15 @@ class TestCardStop(unittest.TestCase):
 
         marker = session_kv_server.CARD_STOP_WORKER_TASK_ENV
         self.card("t_run", "running", session=self.SESSION, pid=9000)
-        signals = self._fake_proc({9000: (9000, {marker: "t_run"}), 9001: (9000, {marker: "t_run"})})
+        table = {9000: (9000, {marker: "t_run"}), 9001: (9000, {marker: "t_run"})}
+        signals = self._fake_proc(table)
         real = self.kanban.archive_task
 
         def commits_then_raises(conn, task_id, **kwargs):
-            real(conn, task_id, **kwargs)
+            real(conn, task_id, **kwargs)  # signal_fn has signalled 9000 and 9001 by now
+            # An ssh client the worker started as it died: only the sweep after
+            # the archive can reach it.
+            table[9002] = (9000, {marker: "t_run"})
             raise RuntimeError("recompute_ready: database is locked")
 
         self.kanban.archive_task = commits_then_raises
@@ -6768,7 +6772,8 @@ class TestCardStop(unittest.TestCase):
         self.assertEqual(self.stopped_ids(body), ["t_run"])
         self.assertIn("database is locked", body["stopped"][0]["note"])
         self.assertEqual(body["failed"], [])
-        self.assertEqual(sorted(pid for pid, sig in signals if sig == signal.SIGTERM), [9000, 9001])
+        self.assertEqual(sorted(pid for pid, sig in signals if sig == signal.SIGTERM), [9000, 9001, 9002])
+        self.assertEqual(body["stopped"][0]["worker"]["signalled"], 3)
 
     def test_a_worker_spawned_seconds_after_the_rescans_is_still_killed(self):
         import signal
@@ -6832,6 +6837,93 @@ class TestCardStop(unittest.TestCase):
         self.assertEqual([entry["id"] for entry in body["pending"]], ["t_child"])
         self.assertEqual([entry["id"] for entry in body["failed"]], ["t_parent"])
         self.assertNotIn("t_parent", [task_id for task_id, _ in self.archived])
+
+    def test_cards_queued_behind_a_hanging_archive_are_failed_not_pending(self):
+        """`pending` promises an archive that will finish. A card queued behind
+        a hanging one never starts: it is a deadline miss, and the straggler
+        thread does not archive it after the answer either."""
+        self._queued_behind_a_hanging_archive(reserve=0.1)
+
+    def test_the_closed_gate_alone_keeps_the_straggler_from_starting(self):
+        # A reserve the budget always grants: only the gate stands between the
+        # straggler and the queued cards once the route has answered.
+        self._queued_behind_a_hanging_archive(reserve=-1000.0)
+
+    def _queued_behind_a_hanging_archive(self, reserve):
+        import threading
+
+        release = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(lambda: (release.set(), finished.wait(10)))
+        real = self.kanban.archive_task
+
+        def hangs(conn, task_id, **kwargs):
+            if task_id != "t_a":
+                return real(conn, task_id, **kwargs)
+            release.wait(30)
+            try:
+                return real(conn, task_id, **kwargs)
+            finally:
+                finished.set()
+
+        self.kanban.archive_task = hangs
+        for i, task_id in enumerate(("t_a", "t_b", "t_c")):
+            self.card(task_id, "ready", session=self.SESSION, created=i)
+        for p in (
+            patch.object(session_kv_server, "_card_stop_clock", time.monotonic),
+            patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 1.5),
+            patch.object(session_kv_server, "CARD_STOP_ARCHIVE_RESERVE_S", reserve),
+            patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        body = self.stop().json()
+        self.assertEqual([entry["id"] for entry in body["pending"]], ["t_a"])
+        self.assertEqual(sorted(entry["id"] for entry in body["failed"]), ["t_b", "t_c"])
+        self.assertTrue(all("deadline" in entry["error"] for entry in body["failed"]))
+        # Let the straggler finish t_a, then check it started nothing else.
+        release.set()
+        self.assertTrue(finished.wait(10))
+        time.sleep(0.3)
+        self.assertEqual([task_id for task_id, _ in self.archived], ["t_a"])
+        self.assertEqual((self.status("t_b"), self.status("t_c")), ("ready", "ready"))
+
+    def test_a_running_card_queued_for_a_worker_thread_is_failed_not_pending(self):
+        import threading
+
+        release = threading.Event()
+        finished = threading.Event()
+        self.addCleanup(lambda: (release.set(), finished.wait(10)))
+        real = self.kanban.archive_task
+
+        def hangs(conn, task_id, **kwargs):
+            if task_id != "t_stuck":
+                return real(conn, task_id, **kwargs)
+            release.wait(30)
+            try:
+                return real(conn, task_id, **kwargs)
+            finally:
+                finished.set()
+
+        self.kanban.archive_task = hangs
+        self.card("t_stuck", "running", session=self.SESSION, created=1)
+        self.card("t_queued", "running", session=self.SESSION, created=2)
+        for p in (
+            patch.object(session_kv_server, "_card_stop_clock", time.monotonic),
+            patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 1.5),
+            patch.object(session_kv_server, "CARD_STOP_ARCHIVE_RESERVE_S", 0.1),
+            patch.object(session_kv_server, "CARD_STOP_RESCAN_ROUNDS", 0),
+            patch.object(session_kv_server, "CARD_STOP_PARALLEL", 1),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        body = self.stop().json()
+        self.assertEqual([entry["id"] for entry in body["pending"]], ["t_stuck"])
+        self.assertEqual([entry["id"] for entry in body["failed"]], ["t_queued"])
+        release.set()
+        self.assertTrue(finished.wait(10))
+        time.sleep(0.3)
+        self.assertEqual(self.status("t_queued"), "running")
 
     def test_the_tree_collection_stops_at_the_deadline(self):
         self.card("t_root", "ready", session=self.SESSION)

@@ -10,6 +10,7 @@ import os
 import hashlib
 import re
 import signal
+import threading
 import sqlite3
 import subprocess
 import tempfile
@@ -5229,18 +5230,48 @@ def _archived_mid_claim(conn: sqlite3.Connection, task_id: str, prior_status: st
     return prior_status == "running" or (row is not None and row[0] is not None)
 
 
+class _StartGate:
+    """Which archives have started, and the point after which none may.
+
+    The route closes it when it stops waiting. A worker thread asks to start
+    each archive under the same lock, so when the route answers, every card is
+    either started (`pending` if it has not landed: it will finish) or never
+    will be (`failed`, a deadline miss), and a straggler thread starts nothing
+    after the answer.
+    """
+
+    def __init__(self, budget: _Budget) -> None:
+        self.budget = budget
+        self.lock = threading.Lock()
+        self.closed = False
+        self.started: set[str] = set()
+
+    def start(self, task_id: str) -> bool:
+        with self.lock:
+            if self.closed or not self.budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+                return False
+            self.started.add(task_id)
+            return True
+
+    def close(self) -> set[str]:
+        """Close the gate; the ids that started, which is final from here."""
+        with self.lock:
+            self.closed = True
+            return set(self.started)
+
+
 def _archive_card_on_own_connection(
-    kanban_db, connect_tracked, board: str, task_id: str, budget: _Budget
+    kanban_db, connect_tracked, board: str, task_id: str, budget: _Budget, gate: _StartGate
 ) -> tuple[str, Dict[str, Any]]:
     """Phase 2: one running card, on a worker thread with its own connection."""
-    if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+    if not gate.start(task_id):
         return "deadline", {}
     with closing(_card_stop_connect(connect_tracked, board)) as conn:
         return _archive_card(kanban_db, conn, task_id, budget)
 
 
 def _archive_in_order(
-    kanban_db, connect_tracked, board: str, ids: Sequence[str], budget: _Budget, out: list
+    kanban_db, connect_tracked, board: str, ids: Sequence[str], budget: _Budget, out: list, gate: _StartGate
 ) -> None:
     """Phase 1: the cards that are not running, in order, on one worker thread.
 
@@ -5249,7 +5280,7 @@ def _archive_in_order(
     """
     with closing(_card_stop_connect(connect_tracked, board)) as conn:
         for task_id in ids:
-            if not budget.allows(CARD_STOP_ARCHIVE_RESERVE_S):
+            if not gate.start(task_id):
                 out.append((task_id, "deadline", {}))
                 continue
             try:
@@ -5350,6 +5381,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     # Every archive runs here, and the route never waits on this pool past the
     # deadline; `shutdown(wait=False)` below leaves a straggler to finish.
     pool = ThreadPoolExecutor(max_workers=CARD_STOP_PARALLEL)
+    gate = _StartGate(budget)
 
     def record(task_id: str, outcome: str, entry: Any, card: Dict[str, Any]) -> None:
         pending.pop(task_id, None)
@@ -5398,7 +5430,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         running = [i for i in order if tree.cards[i]["status"] == "running"]
         if idle:
             landed: list = []
-            phase1 = pool.submit(_archive_in_order, kanban_db, connect_tracked, board, idle, budget, landed)
+            phase1 = pool.submit(_archive_in_order, kanban_db, connect_tracked, board, idle, budget, landed, gate)
             try:
                 phase1.result(timeout=max(0.0, budget.left()))
             except FutureTimeout:
@@ -5407,14 +5439,21 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
                 for task_id in idle:
                     record(task_id, "raised", exc, tree.cards[task_id])
                 landed = []
+            started = gate.close() if not phase1.done() else None
             done = set()
             for task_id, outcome, entry in list(landed):
                 record(task_id, outcome, entry, tree.cards[task_id])
                 done.add(task_id)
-            if not phase1.done():
+            if started is not None:
+                # Only an archive that started is still coming; the rest never will.
                 for task_id in idle:
-                    if task_id not in done:
+                    if task_id in done:
+                        continue
+                    if task_id in started:
                         still_running(task_id, tree.cards[task_id])
+                    else:
+                        budget.hit = True
+                        record(task_id, "deadline", {}, tree.cards[task_id])
                 # Phase 2 never starts over a phase 1 still archiving: a running
                 # parent archived first would promote its children.
                 for task_id in running:
@@ -5422,18 +5461,20 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
                 return fresh
         if running:
             futures = {
-                task_id: pool.submit(_archive_card_on_own_connection, kanban_db, connect_tracked, board, task_id, budget)
+                task_id: pool.submit(_archive_card_on_own_connection, kanban_db, connect_tracked, board, task_id, budget, gate)
                 for task_id in running
             }
             futures_wait(futures.values(), timeout=max(0.0, budget.left()))
+            started = gate.close() if not all(f.done() for f in futures.values()) else set()
             for task_id, future in futures.items():
                 card = tree.cards[task_id]
                 if not future.done():
-                    if future.cancel():
+                    future.cancel()
+                    if task_id in started:
+                        still_running(task_id, card)
+                    else:
                         record(task_id, "deadline", {}, card)
                         budget.hit = True
-                    else:
-                        still_running(task_id, card)
                     continue
                 try:
                     record(task_id, *future.result(), card)
@@ -5484,6 +5525,7 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
                 _card_stop_sleep(CARD_STOP_LATE_PID_INTERVAL_SECONDS)
                 after_first_pass("the late-pid watch", lambda: sweep_late(conn, sorted(watch)))
     finally:
+        gate.close()  # a straggler starts nothing after the answer
         pool.shutdown(wait=False, cancel_futures=True)
     result["stopped"] = list(stopped.values())
     result["settled"] = list(settled.values())
