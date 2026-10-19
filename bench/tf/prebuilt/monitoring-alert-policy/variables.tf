@@ -16,6 +16,19 @@
 # raises on a task.yaml variable it does not declare, so this file and
 # bench/tasks/monitoring-alert-policy-read/task.yaml are a matched pair.
 
+# The deployer reads cluster_name and cluster_location from the outputs, so
+# the stack hands back the host cluster the runner injects. The policy itself
+# is project-scoped and names no cluster.
+variable "host_cluster_name" {
+  type        = string
+  description = "Name of the cluster the Platform Agent runs in"
+}
+
+variable "host_cluster_location" {
+  type        = string
+  description = "Region or zone of host_cluster_name"
+}
+
 variable "project_id" {
   type        = string
   description = "GCP project of the kube-agents install; the alert policy is created there"

@@ -68,3 +68,11 @@ resource "google_monitoring_alert_policy" "fixture" {
 output "policy_name" {
   value = google_monitoring_alert_policy.fixture.name
 }
+
+output "cluster_name" {
+  value = var.host_cluster_name
+}
+
+output "cluster_location" {
+  value = var.host_cluster_location
+}
