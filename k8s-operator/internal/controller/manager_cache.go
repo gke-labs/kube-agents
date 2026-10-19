@@ -22,8 +22,9 @@ import (
 
 // ManagerCacheOptions is the cache the manager is built with. It is a
 // function rather than a literal in main.go so that what the operator holds
-// in memory is pinned by a test (manager_cache_test.go) rather than by
-// reading the wiring.
+// in memory has somewhere to be documented and somewhere to be tested
+// (manager_cache_test.go); that main.go passes it at all is pinned
+// separately, in cmd's manager_wiring_test.go.
 //
 // Every informer this manager starts is cluster-wide, and that is a
 // deliberate reading of the alternatives rather than an oversight (#3493):
@@ -52,9 +53,11 @@ func ManagerCacheOptions() cache.Options {
 		// Stripping it on the way into the store is upstream's own
 		// suggestion for this, and it is safe for the read-modify-write
 		// paths here because ObjectMeta.ManagedFields is omitempty: a nil
-		// slice is left out of the request body, and an absent field leaves
-		// the server's own entries alone (an explicit empty list would reset
-		// them). Annotations are left as they are for the opposite reason —
+		// slice is left out of the request body, and the server keeps its own
+		// entries for a field the request does not carry. (It keeps them for
+		// an explicit empty list too — clearing the field takes a list holding
+		// one empty entry — so neither shape resets ownership from here.)
+		// Annotations are left as they are for the opposite reason —
 		// kubectl.kubernetes.io/last-applied-configuration is the other bulk
 		// field, but an Update built from a cached copy without it would
 		// delete it from the live object.

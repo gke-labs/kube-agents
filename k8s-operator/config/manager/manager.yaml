@@ -139,14 +139,16 @@ spec:
             periodSeconds: 10
           # Memory here is the manager's cache, and the cache holds one entry
           # per object in the CLUSTER, not per install: every informer it
-          # starts is cluster-wide. Measured on a 3-node install (761 cached
-          # objects over twelve kinds) the store is 3.7 MiB of live heap and
-          # the process 33 MiB of RSS; the kinds that remain cached --
-          # ConfigMaps, ServiceAccounts, ClusterRoles, RoleBindings -- grow
-          # with the cluster's namespaces rather than its workloads, so the
-          # limit is sized for roughly an order of magnitude more of them.
-          # Pods, the one kind that grows with workloads, are read live
-          # (podReader) and not cached at all (#3493). Keep in step with
+          # starts is cluster-wide, Owns() included (it filters events by
+          # owner, it does not scope the watch). Measured on a 3-node install,
+          # the store is 3.7 MiB of live heap over 675 objects of twelve kinds
+          # and the process 33 MiB of RSS, so this limit carries roughly an
+          # order of magnitude more of them. Pods are not among the cached
+          # kinds: they outnumber the rest and are read live (podReader,
+          # #3493). Deployments, StatefulSets, Services and PVCs are, and
+          # those do grow with the cluster's workloads, a Deployment carrying
+          # a whole pod template -- so a cluster with thousands of them is the
+          # case to raise this for. Keep in step with
           # charts/kube-agents/values.yaml's operator.resources.
           resources:
             limits:

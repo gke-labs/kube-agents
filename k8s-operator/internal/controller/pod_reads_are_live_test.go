@@ -21,9 +21,9 @@ import (
 // SetupWithManager watches Pods, so a single cached Pod read is what starts
 // their informer, and that informer is cluster-wide however narrow the read
 // that started it: client.InNamespace filters a cached List after the fact
-// (#3493). Pods are the largest kind in most clusters, so one such read turns
-// the operator's resident set from "the installs it runs" into "the cluster it
-// runs on", against a 128Mi limit that predates every watch here.
+// (#3493). Pods outnumber every other kind in most clusters, so one such read
+// turns the operator's resident set from "the installs it runs" into "the
+// cluster it runs on".
 //
 // The fake client cannot show that growth -- its store is already in memory --
 // so these tests do what the Secret test next door does: they give the
@@ -74,7 +74,7 @@ func gatewayPodWaiting(agent *agentv1alpha1.PlatformAgent, container, reason str
 	}
 }
 
-// The phase scan: up to six selectors per reconcile, every one of them a Pod
+// The phase scan: up to five selectors per reconcile, every one of them a Pod
 // list, on every agent on the install.
 func TestTheStatusPodScanReadsPodsLive(t *testing.T) {
 	agent := podReadAgent()
@@ -102,9 +102,41 @@ func TestThePluginFailureScanReadsPodsLive(t *testing.T) {
 	}}
 	r, _ := podReadRig(t, agent, pod)
 
-	failures := r.detectPluginFailures(context.Background(), agent, []*agentv1alpha1.AgentPlugin{plugin})
+	failures, err := r.detectPluginFailures(context.Background(), agent, []*agentv1alpha1.AgentPlugin{plugin})
+	if err != nil {
+		t.Fatalf("the plugin scan could not read the gateway's pods: %v", err)
+	}
 	if got, ok := failures[plugin.Name]; !ok || got.reason != pluginFailureReasonImagePull {
 		t.Errorf("failures[%q] = %+v (present %v), want reason %q; the scan found no pod", plugin.Name, got, ok, pluginFailureReasonImagePull)
+	}
+}
+
+// A read that failed is not an install with no plugin failures: the statuses
+// updatePluginStatuses writes are all derived from it, so a failing plugin
+// would be written Ready/Applied and the patch would re-enqueue the agent to
+// undo it on the next pass. The error has to reach the caller.
+func TestThePluginFailureScanReportsAReadItCouldNotMake(t *testing.T) {
+	agent := podReadAgent()
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: agent.Namespace},
+		Spec:       agentv1alpha1.AgentPluginSpec{Image: "example.com/demo:v1"},
+	}
+	scheme := setupScheme()
+	refusing := interceptor.NewClient(
+		fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build(),
+		interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*corev1.PodList); ok {
+					return fmt.Errorf("the API server refused the list")
+				}
+				return c.List(ctx, list, opts...)
+			},
+		})
+	r := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: scheme}
+
+	failures, err := r.detectPluginFailures(context.Background(), agent, []*agentv1alpha1.AgentPlugin{plugin})
+	if err == nil {
+		t.Fatalf("a refused Pod list returned no error, so the caller reads %v as 'every plugin is applied'", failures)
 	}
 }
 

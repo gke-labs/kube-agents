@@ -4477,11 +4477,19 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 // API server for the same reason a2aReader is. No Owns() or Watches() names
 // Pods, so a cached Pod read is what starts their informer — and it starts a
 // cluster-wide one: client.InNamespace on a cached List filters the store after
-// the fact, it does not scope the watch. This operator reads a handful of its
-// own pods per agent, a few times an hour, and the cached client would hold
-// every Pod in the cluster to serve that (#3493). Pods are the largest kind in
-// most clusters, so this one reader is the difference between a cache that
-// scales with the install and one that scales with the cluster it runs on.
+// the fact, it does not scope the watch. The cached client would hold every Pod
+// in the cluster to serve reads of a handful of this install's own (#3493), and
+// Pods outnumber every other kind in most clusters, so this one reader is the
+// difference between a cache that scales with the install and one that scales
+// with the cluster it runs on.
+//
+// What it costs instead, per agent and in steady state: 48 lists an hour from
+// the usage poll (four selectors, every usageCountersPollInterval) and five
+// more per reconcile while the agent is not Ready, each one namespace-scoped
+// and label-selected server-side. controller-runtime leaves client-side rate
+// limiting off (cfg.QPS = -1, API Priority and Fairness instead), so these
+// queue behind nothing of the operator's own.
+//
 // Nil falls back to the cached client, which is what tests supply.
 func (r *PlatformAgentReconciler) podReader() client.Reader {
 	if r.APIReader != nil {
@@ -4566,7 +4574,16 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	pods := make([]corev1.Pod, 0)
 	for _, selector := range selectors {
 		podList := &corev1.PodList{}
+		// A read that failed is not a selector that matched nothing, and since
+		// podReader goes to the API server it can now fail for a reason outside
+		// this install: an apiserver rollout, a 429. Skipping the selector is
+		// still right -- this pass reports the faults it could see, and the
+		// caller discards a "Provisioning" answer rather than writing it over a
+		// phase it already has -- but a silent skip leaves an operator reading a
+		// message that went vague for no visible reason, so say it happened.
 		if err := r.podReader().List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+			logf.FromContext(ctx).Error(err, "could not list the agent's pods for the status scan; this pass names no fault found on them",
+				"selector", selector)
 			continue
 		}
 		pods = append(pods, podList.Items...)
@@ -5388,7 +5405,16 @@ func evaluatePluginReadiness(
 func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin, imageVolumeSupported bool) {
 	now := metav1.Now()
 	seenNames := make(map[string]bool)
-	pluginFailures := r.detectPluginFailures(ctx, agent, plugins)
+	pluginFailures, err := r.detectPluginFailures(ctx, agent, plugins)
+	if err != nil {
+		// Every status below is derived from that read: with no failures to
+		// find, a plugin stuck in ImagePullBackOff is written Ready/Applied,
+		// and the patch re-enqueues the agent through the AgentPlugin watch so
+		// the next pass undoes it. Leave the statuses standing for this pass
+		// instead; the requeue brings the scan back.
+		logf.FromContext(ctx).Error(err, "could not read the gateway's pods, so no AgentPlugin status is written this pass")
+		return
+	}
 
 	for _, plugin := range plugins {
 		original := plugin.DeepCopy()
@@ -5446,16 +5472,22 @@ func logPluginCondition(plugin *agentv1alpha1.AgentPlugin, condition metav1.Cond
 
 // detectPluginFailures maps plugin name to its detected failure when the agent pod
 // cannot pull the plugin image or when staging the plugin via init container fails.
-func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) map[string]pluginFailure {
+//
+// The error is the pod read's, and it is returned rather than folded into an
+// empty map because the two mean opposite things to the caller: no failures is
+// "every plugin is applied", which is a claim, and a read that did not happen
+// supports no claim at all. The read goes to the API server (podReader), so it
+// can fail for a reason outside this install.
+func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) (map[string]pluginFailure, error) {
 	failures := map[string]pluginFailure{}
 	if len(plugins) == 0 {
-		return failures
+		return failures, nil
 	}
 
 	podList := &corev1.PodList{}
 	if err := r.podReader().List(ctx, podList, client.InNamespace(agent.Namespace),
 		client.MatchingLabels{"app": agent.Name + "-gateway"}); err != nil {
-		return failures
+		return failures, fmt.Errorf("listing the gateway's pods for the plugin scan: %w", err)
 	}
 
 	for _, pod := range podList.Items {
@@ -5514,7 +5546,7 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 			}
 		}
 	}
-	return failures
+	return failures, nil
 }
 
 func isPluginStagingContainer(name string) bool {
@@ -5548,9 +5580,11 @@ func formatStagingFailureMessage(exitCode int32, termMsg string, pluginImage str
 }
 
 // detectPluginImageFailures maps plugin name to the kubelet's message when the agent's
-// pod cannot pull that plugin's image.
+// pod cannot pull that plugin's image. A read that failed yields no entries, which is
+// why nothing in the reconcile path uses this: updatePluginStatuses needs to tell that
+// case from an install with no failures, and does.
 func (r *PlatformAgentReconciler) detectPluginImageFailures(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) map[string]string {
-	all := r.detectPluginFailures(ctx, agent, plugins)
+	all, _ := r.detectPluginFailures(ctx, agent, plugins)
 	images := map[string]string{}
 	for name, f := range all {
 		if f.reason == pluginFailureReasonImagePull {

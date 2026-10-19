@@ -195,14 +195,14 @@ operator:
     failurePolicy: Ignore
   # Memory here is the manager's cache, and the cache holds one entry per
   # object in the cluster, not per install: every informer it starts is
-  # cluster-wide. Measured on a 3-node install (761 cached objects over twelve
-  # kinds) the store is 3.7 MiB of live heap and the process 33 MiB of RSS;
-  # the kinds that stay cached — ConfigMaps, ServiceAccounts, ClusterRoles,
-  # RoleBindings — grow with the cluster's namespaces rather than its
-  # workloads, so the limit is sized for roughly an order of magnitude more of
-  # them. Pods, the one kind that grows with workloads, are read live and not
-  # cached. Raise both on a cluster with very many namespaces; the operator is
-  # one pod per install. Kept in step with k8s-operator/config/manager.
+  # cluster-wide. Measured on a 3-node install, the store is 3.7 MiB of live
+  # heap over 675 objects of twelve kinds and the process 33 MiB of RSS, so
+  # this limit carries roughly an order of magnitude more of them. Pods are
+  # not among the cached kinds — they outnumber the rest and are read live —
+  # but Deployments, StatefulSets, Services, ConfigMaps, ServiceAccounts,
+  # PVCs and the four RBAC kinds are. Raise both on a cluster carrying
+  # thousands of those, a Deployment being the largest of them; the operator
+  # is one pod per install. Kept in step with k8s-operator/config/manager.
   resources:
     limits:
       cpu: 500m
