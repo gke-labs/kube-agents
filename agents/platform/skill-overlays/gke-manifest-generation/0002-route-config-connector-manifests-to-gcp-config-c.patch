@@ -1,7 +1,7 @@
 Subject: Route Config Connector manifests to gcp-config-connector
 
-Why: the frontmatter description is what the router reads, and it has to route Config Connector manifests to gcp-config-connector, a skill this repository has and upstream does not. The description is a folded YAML scalar, so the sentence is replaced.
-Local-Issue: #1344 (fixed in #1370)
+Why: the frontmatter description is what the router reads, and it has to route Config Connector manifests to gcp-config-connector, a skill this repository has and upstream does not. A new cluster is a Config Connector create too, not a gke-cluster-creation call (#2937). The description is a folded YAML scalar, so the sentence is replaced.
+Local-Issue: #1344 (fixed in #1370), #2937
 Upstream-Issue: none (specific to this repository)
 Retire-When: never; gcp-config-connector is this repository's skill
 
@@ -13,7 +13,7 @@ diff --git a/SKILL.md b/SKILL.md
    category: Containers
  description: >-
 -  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning (use gke-cluster-creation).
-+  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), cluster infrastructure provisioning (use gke-cluster-creation), or Google Cloud resources as Config Connector manifests (use gcp-config-connector).
++  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), Google Cloud resources as Config Connector manifests, a new cluster included (use gcp-config-connector), or cluster shape and template advice (use gke-cluster-creation).
  ---
  
  # GKE Manifest Generation Skill

@@ -196,8 +196,9 @@ verification_spec:
       # `env A=b $G add`). The
       # patterns show whether this case's worker hit the refusal. What keeps
       # the skills from teaching the variable form again is the image build's
-      # check_skill_commands.py, which runs the shell blocks of their SKILL.md
-      # files through Tirith, and for inline code
+      # check_skill_commands.py, which runs the shell blocks of every document
+      # of the agent image's skills (deploy/docker/skill_documents.py) through
+      # Tirith, and for inline code
       # tests/test_skill_inline_commands.py and the stockout plugin's
       # test_skill_commands.py. Those read the skill's own
       # text, so they see a chain's later commands, but their patterns miss

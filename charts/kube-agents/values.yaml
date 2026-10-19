@@ -956,8 +956,10 @@ platformAgent:
     # Bounds the Job itself (image pull, scheduling) above that wait.
     activeDeadlineSeconds: 300
   security:
-    # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
-    # binding must target this KSA (see the chart README); the default matches
+    # Kubernetes ServiceAccount the credential broker pod runs as; the agent
+    # gateway pod runs as its own unannotated `<name>-gateway-agent`, which the
+    # operator creates. The Workload Identity binding must target this KSA (see
+    # the chart README); the default matches
     # PLATFORM_AGENT_KSA_NAME in scripts/installer/common.sh.
     # Ownership: with serviceAccountAnnotations set, the OPERATOR creates and
     # manages the KSA; with no annotations, the operator treats it as
