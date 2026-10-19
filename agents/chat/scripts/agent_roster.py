@@ -81,6 +81,46 @@ def _responsibilities(home: Path) -> str:
     return _summarize_soul(home)
 
 
+# The keys of the cluster_identity block a Cluster Agent's config.yaml carries
+# (agents/platform/scripts/cluster_agent_profile.py, _inject_cluster_identity).
+_IDENTITY_BLOCK = "cluster_identity:"
+_IDENTITY_KEYS = ("cluster", "project", "location")
+
+
+def _cluster_identity(home: Path) -> dict[str, str]:
+    """The cluster a Cluster Agent's profile targets, from its config.yaml, or {}.
+
+    The profile name is a sanitized, sometimes truncated-and-hashed assignee id,
+    not a name to show a person, and the cluster name cannot be read back out of
+    it (project, cluster and location may all hold hyphens). The scaffold stamps
+    the real identity into config.yaml; reading it here gives the front door the
+    name to say. A line scan rather than a YAML load, because this module is
+    stdlib-only (it runs ahead of every front-door turn and in the MCP server):
+    the block is the scaffold's own `yaml.safe_dump` output, top-level key then
+    two-space-indented scalars.
+    """
+    try:
+        cfg = home / "config.yaml"
+        if not cfg.is_file():
+            return {}
+        lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    identity: dict[str, str] = {}
+    inside = False
+    for line in lines:
+        if not inside:
+            inside = line.rstrip() == _IDENTITY_BLOCK
+            continue
+        if not line.startswith("  ") or line.startswith("   "):
+            break
+        key, sep, value = line.strip().partition(":")
+        value = value.strip().strip("'\"")
+        if sep and key in _IDENTITY_KEYS and value:
+            identity[key] = value
+    return identity if identity.get("cluster") else {}
+
+
 def discover(base: Path | None = None) -> list[dict[str, str]] | None:
     """Enumerate every routable specialist profile (all profiles except `default`).
 
@@ -107,7 +147,9 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
         try:
             if not p.is_dir() or p.name == SELF_PROFILE:
                 continue
-            agents.append({"name": p.name, "responsibilities": _responsibilities(p)})
+            agent = {"name": p.name, "responsibilities": _responsibilities(p)}
+            agent.update({f"cluster_{k}": v for k, v in _cluster_identity(p).items()})
+            agents.append(agent)
         except OSError as e:
             log(f"skipping unreadable profile {p.name}: {e}")
     return agents
@@ -147,18 +189,35 @@ def format_roster(agents: list[dict[str, str]] | None) -> str | None:
     # Distinct specialists first, then the shared-role fleets — the front door routes to a
     # named specialist far more often than to a specific cluster. The undescribed trail
     # both: they are the least useful entries to route from.
+    # The name a person reads beside the assignee id, when the profile records
+    # its cluster (a Cluster Agent does): "the <cluster> cluster agent".
+    shown = {a["name"]: _identity_note(a) for a in agents}
+
     blocks: list[str] = []
     for desc, names in sorted(groups.items(), key=lambda kv: len(kv[1])):
         if len(names) == 1:
-            blocks.append(f"- {names[0]}: {desc}")
+            blocks.append(f"- {names[0]}{shown[names[0]]}: {desc}")
             continue
-        listed = "\n".join(f"  - {n}" for n in names)
+        listed = "\n".join(f"  - {n}{shown[n]}" for n in names)
         blocks.append(
             f"The following {len(names)} agents share one role — pick the one whose cluster "
             f"you need:\n{listed}\n  Shared role: {desc}"
         )
-    blocks.extend(f"- {name}: {NO_DESCRIPTION}" for name in undescribed)
+    blocks.extend(f"- {name}{shown[name]}: {NO_DESCRIPTION}" for name in undescribed)
     return "\n\n".join(blocks)
+
+
+def _identity_note(agent: dict[str, str]) -> str:
+    """" (the <cluster> cluster agent; project <p>, location <l>)", or "" without one.
+
+    Set apart from the assignee id by a space and parentheses, so the id stays
+    the exact token the footer tells the caller to copy.
+    """
+    cluster = agent.get("cluster_cluster", "")
+    if not cluster:
+        return ""
+    where = ", ".join(f"{k} {agent[f'cluster_{k}']}" for k in ("project", "location") if agent.get(f"cluster_{k}"))
+    return f" (the {cluster} cluster agent" + (f"; {where}" if where else "") + ")"
 
 
 def render(base: Path | None = None) -> str | None:
