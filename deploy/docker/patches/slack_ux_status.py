@@ -1231,7 +1231,8 @@ async def _open_settled(
     if not (key[0] and key[1] and card and _drawable(adapter)):
         return None
     plan = _plans.get(key)
-    if plan is None:
+    created = plan is None
+    if created:
         plan = _Plan(str(sub.get("team_id") or ""))
         await _keep(adapter, key, plan)
     elif plan.fallback:
@@ -1258,7 +1259,9 @@ async def _open_settled(
             # Rolling, as a refused note leaves it, so the plan keeps its wait.
             plan.rolling.add(card)
             plan.waiting.add(card)
-    await _retire(adapter, key, plan, card)
+    # A plan this card starts has no ask behind it (a restart, a lapse): its key would
+    # bind to the conversation's latest ask, so the report goes unrated.
+    await _retire(adapter, key, plan, "" if created else card)
     sent = _sessions.get(key)
     if _plan_session(*key) or not (sent and sent[0] == _status.SESSION_PROCESSING):
         # With nothing left to hold, a Planning Agent turn working in the

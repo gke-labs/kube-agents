@@ -1026,8 +1026,15 @@ class PlanTest(_RuntimeCase):
 
     def test_a_card_with_no_note_that_settles_the_plan_answers_it(self):
         adapter = _Adapter()
+        _run(runtime.expect_cards(adapter, CHANNEL, TEAM, THREAD, {"t_a": True}))
         _run(runtime.settle_row(adapter, _sub(), "completed", "1.33.4 = default", "seeded-a"))
         self.assertNotEqual(runtime.answer_key(_sub()), "", "its report is the ask's answer")
+
+    def test_a_card_that_starts_its_own_plan_answers_nothing(self):
+        # After a restart no plan holds the ask; a new plan's key would bind to the latest ask.
+        adapter = _Adapter()
+        _run(runtime.settle_row(adapter, _sub(), "completed", "1.33.4 = default", "seeded-a"))
+        self.assertEqual(runtime.answer_key(_sub()), "")
 
     def test_a_card_that_gives_up_and_is_unblocked_answers_its_ask_once(self):
         adapter = _Adapter()
