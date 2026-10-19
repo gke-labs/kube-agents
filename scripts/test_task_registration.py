@@ -1108,6 +1108,22 @@ class TestTheSanitizer(unittest.TestCase):
         )
         self.assertTrue(found.startswith("tf/prebuilt/stack/main.tf:1:"), found)
 
+    def test_a_module_file_is_scanned(self):
+        found = self._only(
+            "IPv4 literal 10.0.0.1",
+            {
+                "tasks/case/task.yaml": "ok: 192.0.2.1\n",
+                "tf/modules/drift-inject/main.tf": 'ip = "10.0.0.1"\n',
+            },
+        )
+        self.assertTrue(found.startswith("tf/modules/drift-inject/main.tf:1:"), found)
+
+    def test_sanitized_roots_includes_modules_dir(self):
+        self.assertEqual(
+            validator.SANITIZED_ROOTS,
+            (validator.TASKS_DIR, validator.PREBUILT_DIR, validator.MODULES_DIR),
+        )
+
     def test_dot_directories_and_local_tofu_artefacts_are_skipped(self):
         files = {
             "stack/.terraform/x.txt": "10.0.0.1\n",
