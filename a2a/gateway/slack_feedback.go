@@ -79,6 +79,10 @@ type slackViewPayload struct {
 		TeamID string `json:"team_id"`
 	} `json:"user"`
 	View struct {
+		// ID and Hash name one submission of one view, the same across a
+		// Socket Mode redelivery.
+		ID              string `json:"id"`
+		Hash            string `json:"hash"`
 		CallbackID      string `json:"callback_id"`
 		PrivateMetadata string `json:"private_metadata"`
 		State           struct {
@@ -163,19 +167,42 @@ func slackRatedOptions(m OutMessage) ([]slack.MsgOption, error) {
 }
 
 // slackRatedTextOptions is a text-only answer's last chunk with the rating
-// controls: the text as one section, the controls under it.
+// controls: the text as sections, each under a section's cap (escaping can
+// take a chunk past one), and the controls under them.
 func slackRatedTextOptions(m OutMessage) ([]slack.MsgOption, error) {
 	text := toMrkdwn(m.Text)
-	if utf8.RuneCountInString(text) > slackChatSectionMax {
+	var blocks []map[string]any
+	for _, part := range slackSectionParts(text) {
+		blocks = append(blocks, map[string]any{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": part}})
+	}
+	if len(blocks) >= slackChatBlocksMax {
 		return nil, fmt.Errorf("%w: %w", ErrLayoutRefused, errSlackChatTooLarge)
 	}
-	set, err := slackRawBlocks([]map[string]any{
-		{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}},
-		slackFeedbackBlock(m.Feedback)})
+	set, err := slackRawBlocks(append(blocks, slackFeedbackBlock(m.Feedback)))
 	if err != nil {
 		return nil, err
 	}
 	return []slack.MsgOption{slack.MsgOptionText(text, false), slack.MsgOptionBlocks(set...)}, nil
+}
+
+// slackSectionParts cuts text into pieces of at most slackChatSectionMax
+// code points, at a line break where one falls in the second half of a
+// piece.
+func slackSectionParts(text string) []string {
+	var parts []string
+	r := []rune(text)
+	for len(r) > slackChatSectionMax {
+		cut := slackChatSectionMax
+		for i := slackChatSectionMax - 1; i > slackChatSectionMax/2; i-- {
+			if r[i] == '\n' {
+				cut = i + 1
+				break
+			}
+		}
+		parts = append(parts, string(r[:cut]))
+		r = r[cut:]
+	}
+	return append(parts, string(r))
 }
 
 // feedbackClick handles a tap on the rating controls: never a turn.
@@ -265,6 +292,10 @@ func (s *SlackAdapter) feedbackNote(raw json.RawMessage) {
 		return
 	}
 	if s.otherWorkspace(p.User.TeamID) {
+		return
+	}
+	// At-least-once: a redelivered Send must not thank the rater twice.
+	if p.View.ID != "" && s.alreadySeen(slackFeedbackSeenPrefix+p.View.ID+"/"+p.View.Hash) {
 		return
 	}
 	note := strings.TrimSpace(p.View.State.Values[slackFeedbackNoteID][slackFeedbackNoteID].Value)

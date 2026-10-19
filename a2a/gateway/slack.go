@@ -233,8 +233,8 @@ type SlackAdapter struct {
 	// first use.
 	ux *slackUX
 
-	// feedback is the gateway's answer-feedback recorder, under s.mu; nil
-	// until handed over, and then no rating controls are drawn.
+	// feedback is the gateway's answer-feedback recorder, under s.mu; until
+	// it is handed over, no rating controls are drawn.
 	// feedbackAPI is the Web API answer feedback calls
 	// (slack_feedback.go); nil in a test that does not fake it.
 	feedback    FeedbackRecorder

@@ -42,7 +42,25 @@ const (
 	// feedbackSummaryAskMax clips the ask on a draft's summary line.
 	feedbackSummaryAskMax = 28
 	feedbackNoNote        = "(no note)"
+	// feedbackNoAsk stands in for an ask the session record no longer held
+	// when the answer was rated (past AskTTL, or a reaped session).
+	feedbackNoAsk = "TODO: the question was no longer on record when this answer was rated; take it from the conversation"
+
+	// The characters JSON writes raw and YAML refuses in a stream.
+	yamlDEL     = '\u007f'
+	yamlC1First = '\u0080'
+	yamlC1Last  = '\u009f'
 )
+
+// yamlUnprintable escapes DEL and the C1 controls inside a double-quoted
+// scalar.
+var yamlUnprintable = func() *strings.Replacer {
+	var pairs []string
+	for r := yamlDEL; r <= yamlC1Last; r++ {
+		pairs = append(pairs, string(r), fmt.Sprintf("\\u%04x", r))
+	}
+	return strings.NewReplacer(pairs...)
+}()
 
 // ExportFeedback writes every 👎 kept in the last since (all of them when
 // since is zero) to w as a tar of draft eval cases, and a line per draft to
@@ -129,14 +147,14 @@ func feedbackCaseYAML(id string, rec FeedbackRecord) string {
 	b.WriteString("# exchange that was rated.\n#\n")
 	fmt.Fprintf(&b, "# Rated %s. What the rater said was wrong:\n", rec.RatedAt.UTC().Format(feedbackRatedDateForm))
 	for _, line := range strings.Split(note, "\n") {
-		b.WriteString("#   " + line + "\n")
+		b.WriteString("#   " + yamlComment(line) + "\n")
 	}
 	b.WriteString("#\n# Before submitting: make the prompt install-neutral (a cluster the\n")
 	b.WriteString("# install named becomes a fixture role or {{CLUSTER_NAME}}), and leave\n")
 	b.WriteString("# transcript.md out of the pull request: it holds the install's data.\n")
 	fmt.Fprintf(&b, "id: %s\n", id)
 	fmt.Fprintf(&b, "name: %s\n", yamlString("TODO: what a right answer does"))
-	fmt.Fprintf(&b, "prompt: %s\n", yamlString(rec.Ask))
+	fmt.Fprintf(&b, "prompt: %s\n", yamlString(feedbackAskOrTODO(rec)))
 	fmt.Fprintf(&b, "expected_output: %s\n", yamlString("TODO: what a right answer says. The rater said: "+note))
 	b.WriteString("infrastructure:\n  deployer: noop\nvalidated: false\n\n")
 	b.WriteString("# TODO: a slug from docs/designs/domains.yaml.\n# domain:\n\n")
@@ -162,17 +180,39 @@ func feedbackTranscriptMD(rec FeedbackRecord) string {
 		fmt.Fprintf(&b, "- Context: `%s`\n", rec.ContextID)
 	}
 	fmt.Fprintf(&b, "- Conversation: `%s`, message `%s`\n\n", rec.Conversation, rec.MessageID)
-	b.WriteString("## The ask\n\n" + rec.Ask + "\n\n## The rated answer\n\n" + rec.Answer + "\n")
+	b.WriteString("## The ask\n\n" + feedbackAskOrTODO(rec) + "\n\n## The rated answer\n\n" + rec.Answer + "\n")
 	return b.String()
 }
 
-// yamlString is s as a YAML double-quoted scalar.
+// yamlString is s as a YAML double-quoted scalar. JSON's escaping is YAML's
+// but for DEL and the C1 controls, which JSON writes raw and YAML refuses
+// anywhere in a stream; those are escaped too.
 func yamlString(s string) string {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(s)
-	return strings.TrimSuffix(buf.String(), "\n")
+	return yamlUnprintable.Replace(strings.TrimSuffix(buf.String(), "\n"))
+}
+
+// yamlComment is s fit for a YAML comment line: the characters YAML refuses
+// in a stream dropped, and line breaks left to the caller.
+func yamlComment(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == yamlDEL || (r >= yamlC1First && r <= yamlC1Last) || r == '\r' {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// feedbackAskOrTODO is the record's ask, or a TODO saying it was not on
+// record, so a draft never ships an empty prompt as if it were the ask.
+func feedbackAskOrTODO(rec FeedbackRecord) string {
+	if strings.TrimSpace(rec.Ask) == "" {
+		return feedbackNoAsk
+	}
+	return rec.Ask
 }
 
 // clipWords is s on one line, clipped to n code points with an ellipsis.

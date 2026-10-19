@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -40,7 +41,9 @@ const (
 
 	// The caps on what a 👎 keeps, so one rating cannot grow the bucket
 	// past what it is sized for: the ask, the answer and the note clipped
-	// in bytes, at a rune boundary (truncateRunes).
+	// in bytes, at a rune boundary (truncateRunes). The ask arrives already
+	// held to the session record's copy (wakeAskCap), so its cap here is a
+	// backstop.
 	feedbackAskMax    = 4000
 	feedbackAnswerMax = 16000
 	feedbackNoteMax   = 2000
@@ -136,6 +139,18 @@ type FeedbackSink interface {
 type feedbackDesk struct {
 	g   *Gateway
 	ttl time.Duration
+	// keys serialises the ratings on one answer by one rater, so a 👍
+	// tapped while that rater's 👎 is still being written waits for it and
+	// then takes it back, instead of finding nothing to take back.
+	keys sync.Map // feedbackKey -> *sync.Mutex
+}
+
+// lockKey takes the rating lock for key and returns its release.
+func (d *feedbackDesk) lockKey(key string) func() {
+	m, _ := d.keys.LoadOrStore(key, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // startFeedback turns answer feedback on (tryFeedback), or, when it cannot
@@ -246,6 +261,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 		return fmt.Errorf("feedback bucket: %w", err)
 	}
 	key := feedbackKey(r.TaskID, r.Rater)
+	defer d.lockKey(key)()
 	if r.Rating != FeedbackDown {
 		// A 👍 keeps nothing, and takes back the rater's 👎 if there is one.
 		// Looked up first: a KV delete writes a marker whether or not the
@@ -269,10 +285,13 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	// and the context id joins the rating to the stream's copy of the
 	// conversation; both best effort, since a reaped session has neither.
 	contextID, ask := "", ""
-	if session, err := g.reg.Get(ctx, r.Conversation); err == nil && session != nil {
+	if session, err := g.reg.Get(ctx, r.Conversation); err != nil {
+		g.log.Warn("answer feedback: the session record could not be read; the 👎 is kept without its ask", "conversation", r.Conversation, "err", err)
+	} else if session != nil {
 		contextID = session.ContextID
 		if root, ok := session.TaskRefFor(r.TaskID); ok {
-			ask = strings.Join(strings.Fields(root.Request), " ")
+			// As written, line breaks kept: a pasted manifest stays one.
+			ask = root.Request
 		}
 	}
 	// Merged, not replaced: re-rating keeps the note already there.

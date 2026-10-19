@@ -334,6 +334,22 @@ func TestExportSinceSkipsOlderRatings(t *testing.T) {
 	}
 }
 
+func TestFeedbackDraftEscapesWhatYAMLRefusesAndMarksAMissingAsk(t *testing.T) {
+	got := feedbackCaseYAML("feedback-20261016-abcd", FeedbackRecord{Ask: "it\u0092s broken\u007f", Note: "bad\u0085 note\r", RatedAt: time.Now()})
+	for _, r := range got {
+		if r == '\u007f' || (r >= '\u0080' && r <= '\u009f') || r == '\r' {
+			t.Fatalf("draft carries %U, which YAML refuses:\n%s", r, got)
+		}
+	}
+	if !strings.Contains(got, `\u0092`) {
+		t.Errorf("the ask's C1 character must be escaped, not dropped:\n%s", got)
+	}
+	empty := feedbackCaseYAML("feedback-20261016-abcd", FeedbackRecord{RatedAt: time.Now()})
+	if !strings.Contains(empty, "prompt: "+yamlString(feedbackNoAsk)) || !strings.Contains(feedbackTranscriptMD(FeedbackRecord{}), feedbackNoAsk) {
+		t.Errorf("a draft with no ask on record must say so:\n%s", empty)
+	}
+}
+
 func TestFeedbackCaseYAMLQuotesTheAsk(t *testing.T) {
 	got := feedbackCaseYAML("feedback-20261016-abcd", FeedbackRecord{Ask: `say "hi": now` + "\n# not a comment", RatedAt: time.Now()})
 	if !strings.Contains(got, `prompt: "say \"hi\": now\n# not a comment"`) {

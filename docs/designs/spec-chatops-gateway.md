@@ -1925,8 +1925,8 @@ The Slack adapter draws the mark as Slack's own feedback buttons: a `context_act
 one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the message's last
 block, inside its side bar when it has one (an attachment draws after every top-level block, and
 Slack draws the block there too, seen live). The block's id carries the task id
-(`kage.feedback.<task>`). A text chunk carrying the mark is posted as one `section` and the block;
-a chunk Slack refuses posts as text. Every other backend ignores the mark. A tap is never a turn,
+(`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. Every other backend ignores the mark. A tap is never a turn,
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
@@ -1938,13 +1938,16 @@ on the tap's trigger, which lapses three seconds after the tap ("What went wrong
 optional field, "Anything else?", of up to 500 characters, and a line telling the rater how long
 their question and the answer are kept, read from the bucket's max age); a write that fails opens
 nothing. The gateway takes the ask from the session record: the human message that started the
-rated chain (`TaskRef.Request` on the root entry, until `AskTTL` clears it), so a later message in
-the thread, or another person's, is never taken for it, and the adapter reads nothing of the
-thread. The answer is the rated message's text, which for a text answer longer than one chunk is
+rated chain (`TaskRef.Request` on the root entry, as written and held to its 1 KiB cap, until
+`AskTTL` clears it), so a later message in the thread, or another person's, is never taken for
+it, and the adapter reads nothing of the thread; a draft whose ask was no longer on record says so
+in its `prompt` rather than shipping an empty one. The answer is the rated message's text, which for a text answer longer than one chunk is
 its last chunk. Send writes the note into the kept 👎 and posts "Thanks. I kept this answer for
 your team to review." to the rater alone (`chat.postEphemeral`) in the thread; with no 👎 kept (a
 👍 took it back) it keeps nothing and posts nothing. Cancel keeps the 👎 without a note. A note and
-a re-rating merge under the record's revision (`mergeFeedback`), so neither loses the other's part.
+a re-rating merge under the record's revision (`mergeFeedback`), so neither loses the other's part,
+and the ratings on one answer by one rater run one at a time, so a 👍 tapped while the 👎 is still
+being written takes it back. A redelivered Send (Socket Mode is at-least-once) is handled once.
 No new scope: `chat:write` covers the ephemeral line, and `views.open` takes only the trigger.
 
 A kept 👎 is a JSON record in the `feedback` KV bucket, one key per answer and rater

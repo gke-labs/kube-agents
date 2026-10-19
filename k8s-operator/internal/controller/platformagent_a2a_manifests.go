@@ -2983,9 +2983,9 @@ $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --re
 # the exchange it rated (a2a/gateway/feedback.go). User content, so the max
 # age is the retention: NATS drops a rating 30 days after it was given, and
 # the gateway refuses to keep ratings in a bucket without one. Only the
-# gateway's user reads or writes it. 64MiB holds a few hundred ratings at
-# their caps and thousands at a typical size; past it the write is refused,
-# and the rating is counted but not kept.
+# gateway's user reads or writes it. 64MiB holds about three thousand ratings
+# at their caps (ask, answer and note, about 22KB) and more at a typical
+# size; past it the write is refused, and the rating is counted but not kept.
 $NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
 
 # TASKS older than this render: the limits the create above could not apply.

@@ -46,15 +46,12 @@ func (f *fakeRecorder) Note(r FeedbackRating, note string) error {
 	return f.noteErr
 }
 
-// fakeFeedbackAPI records the modal, the ephemeral line, and answers the
-// thread read with replies.
+// fakeFeedbackAPI records the modal and the ephemeral line.
 type fakeFeedbackAPI struct {
 	mu         sync.Mutex
 	views      []slack.ModalViewRequest
 	triggers   []string
 	ephemerals []string
-	replies    []slack.Message
-	history    []slack.Message
 }
 
 func (f *fakeFeedbackAPI) OpenViewContext(_ context.Context, triggerID string, view slack.ModalViewRequest) (*slack.ViewResponse, error) {
@@ -74,18 +71,6 @@ func (f *fakeFeedbackAPI) PostEphemeralContext(_ context.Context, channelID, use
 	defer f.mu.Unlock()
 	f.ephemerals = append(f.ephemerals, channelID+" "+userID+" "+values.Get("thread_ts")+" "+values.Get("text"))
 	return "1.0", nil
-}
-
-func (f *fakeFeedbackAPI) GetConversationRepliesContext(_ context.Context, _ *slack.GetConversationRepliesParameters) ([]slack.Message, bool, string, error) {
-	return f.replies, false, "", nil
-}
-
-func (f *fakeFeedbackAPI) GetConversationHistoryContext(_ context.Context, _ *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
-	return &slack.GetConversationHistoryResponse{Messages: f.history}, nil
-}
-
-func threadMsg(ts, user, bot, text string) slack.Message {
-	return slack.Message{Msg: slack.Msg{Timestamp: ts, User: user, BotID: bot, Text: text}}
 }
 
 func newFeedbackSlackAdapter() (*SlackAdapter, *fakeRecorder, *fakeFeedbackAPI) {
@@ -170,8 +155,35 @@ func TestSlackRatedTextAnswerIsASectionAndTheButtons(t *testing.T) {
 	if !strings.Contains(blocks, `"type":"section"`) || !strings.Contains(blocks, slackContextActionsBlock) {
 		t.Errorf("blocks = %s", blocks)
 	}
-	if _, err := slackRatedOptions(OutMessage{Text: strings.Repeat("x", slackChatSectionMax+1), Feedback: "t"}); err == nil {
-		t.Error("a chunk past a section's cap must be refused, so the gateway posts it as text")
+	// Escaping can take a chunk past one section's cap; it posts as more
+	// sections in the same message, the controls still last.
+	long, err := slackRatedOptions(OutMessage{Text: strings.Repeat("<a> & ", 400), Feedback: "t"})
+	if err != nil {
+		t.Fatalf("an escaped chunk past one section must still carry the controls: %v", err)
+	}
+	blocks, _ = sentBlocks(t, long)
+	var got []map[string]any
+	if err := json.Unmarshal([]byte(blocks), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) < 3 || got[len(got)-1]["type"] != slackContextActionsBlock {
+		t.Errorf("blocks = %d, want two or more sections then the controls", len(got))
+	}
+}
+
+func TestSlackRedeliveredNoteThanksOnce(t *testing.T) {
+	a, rec, api := newFeedbackSlackAdapter()
+	var p map[string]any
+	if err := json.Unmarshal(notePayload(t, "stale"), &p); err != nil {
+		t.Fatal(err)
+	}
+	view := p["view"].(map[string]any)
+	view["id"], view["hash"] = "V1", "h1"
+	raw, _ := json.Marshal(p)
+	a.interactive(raw)
+	a.interactive(raw)
+	if len(rec.notes) != 1 || len(api.ephemerals) != 1 {
+		t.Errorf("notes = %d ephemerals = %d; a redelivered Send is handled once", len(rec.notes), len(api.ephemerals))
 	}
 }
 
@@ -206,11 +218,6 @@ func TestSlackUpRatingIsRecordedAndIsNoTurn(t *testing.T) {
 
 func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 	a, rec, api := newFeedbackSlackAdapter()
-	api.replies = []slack.Message{
-		threadMsg("40.0", "U1", "", "<@UBOT> why is payments-api crashing?"),
-		threadMsg("45.0", "UBOT", "B1", "checking seeded-a."),
-		threadMsg("50.0", "UBOT", "B1", "*It is OOMKilled.*"),
-	}
 	viewsAtRate := -1
 	rec.onRate = func() { viewsAtRate = len(api.views) }
 	if _, ok := a.interactive(ratingPayload(t, "U1", FeedbackDown)); ok {
