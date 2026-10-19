@@ -1756,31 +1756,27 @@ def test_the_marker_classifies_the_run_as_infra(results_json: Any) -> None:
     assert _classify(path, "noop").outcome == "infra"
 
 
-def test_a_scored_record_with_worker_rate_limit_in_trajectory_is_infra(results_json: Any) -> None:
+def test_a_scored_record_with_worker_rate_limit_infra_marker_is_infra(results_json: Any) -> None:
     path = results_json(
         AgentResult(
             output="blocked",
-            trajectory=[
-                {
-                    "name": "worker_exec",
-                    "result": "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429",
-                }
-            ],
+            trajectory=[],
+            errors=[f"{harness.INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit)"],
         ),
         scores={"OutcomeValidity": 0.0},
     )
     assert _classify(path, "opentofu").outcome == "infra"
 
 
-def test_a_scored_record_with_429_quota_exhausted_in_output_is_infra(results_json: Any) -> None:
+def test_a_scored_record_with_429_in_output_is_still_graded(results_json: Any) -> None:
     path = results_json(
         AgentResult(
-            output="The platform agent hit HTTP 429: TPM quota exhausted",
+            output="The platform agent diagnosed: upstream returned HTTP 429: TPM quota exhausted",
             trajectory=[],
         ),
-        scores={"OutcomeValidity": 0.0},
+        scores={"OutcomeValidity": 0.9},
     )
-    assert _classify(path, "opentofu").outcome == "infra"
+    assert _classify(path, "opentofu").outcome != "infra"
 
 
 def test_an_ordinary_scored_record_is_still_graded(results_json: Any) -> None:
@@ -2665,30 +2661,29 @@ def test_a_delegated_worker_429_log_is_infrastructure_not_an_answer(
     assert result.trajectory == []
 
 
-def test_a_delegated_worker_rate_limit_in_trajectory_is_infrastructure(
+def test_a_delegated_worker_rate_limit_on_board_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """When worker trajectory entries log rate_limit, mark the rep as infrastructure."""
+    """When a card on the kanban board reports rate_limit failure, mark the rep as infrastructure."""
     stub_agent.turns = [
         _create_turn(),
-        _show_turn("done", body="done", result="done"),
+        _show_turn("done", body="Worker failed.", result="Worker failed."),
     ]
 
     def _shell(script: str, timeout: float) -> str:
-        if worker_trajectory.CAPTURE_PRESENT in script:
+        if board.BOARD_PRESENT in script:
             payload = {
-                "calls": [
-                    {
-                        "name": "exec",
-                        "result": "HTTP 429 TPM quota exhausted (failure_reason=rate_limit)",
-                        "status": "error",
-                    }
-                ],
-                "cards": [_TASK_ID],
-                "errors": [],
-                "unread": [],
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        'HTTP 429 ... "TPM quota exhausted"'
+                    )
+                },
+                "error": None,
             }
-            return f"{worker_trajectory.CAPTURE_PRESENT}\n{json.dumps(payload)}\n"
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
         return ""
 
     monkeypatch.setattr(harness, "_agent_shell", _shell)
@@ -2702,25 +2697,21 @@ def test_a_delegated_worker_rate_limit_in_trajectory_is_infrastructure(
     assert result.trajectory == []
 
 
-def test_an_agent_output_reporting_worker_rate_limit_is_infrastructure(
+def test_an_agent_output_reporting_429_remains_graded(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """When the front agent relays that a worker hit rate_limit, mark the rep as infrastructure."""
+    """When the agent diagnoses an upstream 429 in its answer, it remains graded and not infra."""
+    answer = "The upstream service returned HTTP 429 Too Many Requests: rate limit exceeded."
     stub_agent.turns = [
         _create_turn(),
-        _show_turn(
-            "done",
-            body="The platform agent failed: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 TPM quota exhausted",
-        ),
+        _show_turn("done", body=answer, result=answer),
     ]
     monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
 
     result = KubeAgentsHarness().run("Find the root cause.")
 
-    assert result.has_errors()
-    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
-    assert "rate_limit" in result.errors[0]
-    assert result.output == ""
+    assert not result.has_errors()
+    assert result.output.endswith(answer)
 
 
 def test_a_status_turn_502_recovers_through_a_fresh_tunnel(

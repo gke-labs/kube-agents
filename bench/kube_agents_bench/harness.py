@@ -648,15 +648,6 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
         return match.group(1)
     if _RATE_LIMIT_REASON_PREFIX in text:
         return "rate_limit"
-    lower_text = text.lower()
-    if "http 429" in lower_text and (
-        "quota exhausted" in lower_text
-        or "rate limit" in lower_text
-        or "retries exhausted" in lower_text
-    ):
-        return "rate_limit"
-    if "tpm quota exhausted" in lower_text:
-        return "rate_limit"
     return None
 
 
@@ -2883,7 +2874,7 @@ class KubeAgentsHarness(AgentHarness):
             try:
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
-                if exc.failure_reason in _INFRA_FAILURE_REASONS:
+                if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
                     _purge_card_state(awaited, _EXEC_TIMEOUT)
                     raise _DelegationTransportExhausted(
                         f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
@@ -3069,24 +3060,6 @@ class KubeAgentsHarness(AgentHarness):
                     infra_reason = reason
                     infra_detail = f"worker transcript for {tid} logged {reason}"
                     break
-
-        if not infra_reason:
-            for entry in (*observed, *result.trajectory):
-                for val in (entry.get("result"), entry.get("content")):
-                    if isinstance(val, str):
-                        reason = _extract_infra_failure_reason(val)
-                        if reason:
-                            infra_reason = reason
-                            infra_detail = f"trajectory entry logged {reason}: {val[:200]}"
-                            break
-                if infra_reason:
-                    break
-
-        if not infra_reason and result.output:
-            reason = _extract_infra_failure_reason(result.output)
-            if reason:
-                infra_reason = reason
-                infra_detail = f"agent output logged {reason}"
 
         if not infra_reason and board_messages:
             for text in board_messages:

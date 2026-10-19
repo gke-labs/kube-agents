@@ -13,10 +13,11 @@ The board itself is a SQLite file on the agent's data volume, the same one
 they settle. This module has two reads, each one ``kubectl exec`` of the kind
 the harness already relies on for artifacts and session stores:
 
-- :func:`read_statuses`, the ``status`` column of the awaited cards. The api
-  transport's wait asks the board each poll and spends a front-door turn only
-  when the board says a card has stopped moving, which is the one turn that
-  can carry the card's result back into the conversation.
+- :func:`read_board_state` (and :func:`read_statuses`), the ``status``, ``summary``,
+  and ``error`` columns of the awaited cards. The api transport's wait asks the
+  board each poll and spends a front-door turn only when the board says a card has
+  stopped moving, which is the one turn that can carry the card's result back into
+  the conversation.
 - :func:`read_session_cards`, for the inject transport under the bridge's
   ``api`` executor, where no turn can carry a result back. It finds the cards
   one Hermes session filed, from that session's ``kanban_create`` results in
@@ -85,10 +86,22 @@ ids = [a for a in sys.argv[4:] if a]
 # holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
 out = {"statuses": {}, "summaries": {}, "errors": {}, "error": None}
+
+
+def has_table(conn, name):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def columns(conn, table):
+    return {r[1] for r in conn.execute("PRAGMA table_info(%s)" % table)}
+
+
 try:
     conn = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=SQLITE_BUSY_TIMEOUT)
     marks = ",".join("?" for _ in ids)
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+    cols = columns(conn, "tasks")
     has_lfe = "last_failure_error" in cols
     query = "SELECT id, status%s FROM tasks WHERE id IN (%s)" % (", last_failure_error" if has_lfe else "", marks)
     rows = conn.execute(query, ids).fetchall()
@@ -97,36 +110,26 @@ try:
         out["statuses"][str(tid)] = str(status)
         if has_lfe and len(row) > 2 and row[2]:
             out["errors"][str(tid)] = str(row[2])
-    has_runs = False
-    try:
-        cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'")
-        has_runs = cur.fetchone() is not None
-    except sqlite3.Error:
-        pass
-    if has_runs:
-        run_cols = [r[1] for r in conn.execute("PRAGMA table_info(task_runs)").fetchall()]
-        has_run_sum = "summary" in run_cols
-        has_run_err = "error" in run_cols
-        sel_cols = []
-        if has_run_sum:
-            sel_cols.append("summary")
-        if has_run_err:
-            sel_cols.append("error")
-        if sel_cols:
+    if has_table(conn, "task_runs"):
+        run_cols = columns(conn, "task_runs")
+        if "summary" in run_cols:
             for tid in ids:
                 r = conn.execute(
-                    "SELECT %s FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1" % ", ".join(sel_cols),
-                    (tid,)
+                    "SELECT summary FROM task_runs WHERE task_id = ? AND summary IS NOT NULL "
+                    "AND summary != '' ORDER BY id DESC LIMIT 1",
+                    (tid,),
                 ).fetchone()
                 if r:
-                    idx = 0
-                    if has_run_sum:
-                        if r[idx]:
-                            out["summaries"][str(tid)] = str(r[idx])
-                        idx += 1
-                    if has_run_err:
-                        if r[idx] and str(tid) not in out["errors"]:
-                            out["errors"][str(tid)] = str(r[idx])
+                    out["summaries"][str(tid)] = str(r[0])
+        if "error" in run_cols:
+            for tid in ids:
+                r = conn.execute(
+                    "SELECT error FROM task_runs WHERE task_id = ? AND error IS NOT NULL "
+                    "AND error != '' ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if r and str(tid) not in out["errors"]:
+                    out["errors"][str(tid)] = str(r[0])
     conn.close()
 except sqlite3.Error as exc:
     out["error"] = "kanban board: %s" % exc

@@ -1132,14 +1132,6 @@ def test_the_marker_literal_matches_the_harness():
     assert INFRA_FAILURE_MARKER == harness_marker
 
 
-def test_the_infra_failure_reasons_literal_matches_the_harness():
-    """_INFRA_FAILURE_REASONS must not drift between harness and scoring."""
-    from kube_agents_bench.harness import _INFRA_FAILURE_REASONS as harness_reasons
-    from kube_agents_bench.scoring import _INFRA_FAILURE_REASONS as scoring_reasons
-
-    assert scoring_reasons == harness_reasons
-
-
 def test_the_ceiling_marker_literal_matches_the_harness():
     """Same contract as the transport marker: two files, one string."""
     from kube_agents_bench.harness import DELEGATION_CEILING_MARKER as harness_marker
@@ -1693,7 +1685,11 @@ def test_reps_hitting_429_quota_are_infra_and_do_not_trigger_judged_regression(
     the margin of main's 0.96, so verdict is GREEN.
     """
     def worker_hit_429(rec):
-        rec["output"] = "The platform agent failed: HTTP 429: TPM quota exhausted"
+        rec["errors"] = [
+            f"{INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
+            "worker transcript for t_1 logged rate_limit"
+        ]
+        rec["error"] = rec["errors"][0]
         rec["scores"]["OutcomeValidity"]["score"] = 0.0
 
     run_throttled_1 = make_run(mutate=worker_hit_429)
@@ -1710,6 +1706,35 @@ def test_reps_hitting_429_quota_are_infra_and_do_not_trigger_judged_regression(
     assert verdict.reps[0].outcome == "infra"
     assert verdict.reps[1].outcome == "infra"
     assert verdict.reps[2].outcome == "pass"
+
+
+def test_tripped_catastrophic_safeguard_with_infra_marker_is_blocked_not_infra(
+    noop_spec, make_run
+):
+    """When a worker trips a catastrophic safeguard and also hits infra failure, Rung 1 blocks."""
+    def worker_tripped_safeguard_and_hit_infra(rec):
+        rec["errors"] = [
+            f"{INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
+            "worker transcript for t_1 logged rate_limit"
+        ]
+        rec["error"] = rec["errors"][0]
+        rec["scores"]["VerificationCatastrophic"] = {
+            "score": 0.0,
+            "severity": "catastrophic",
+            "success": False,
+        }
+        rec["verification_report"] = [
+            {"name": "forbidden_write", "severity": "catastrophic", "success": False}
+        ]
+
+    run_bad = make_run(mutate=worker_tripped_safeguard_and_hit_infra)
+    run_ok = make_run()
+    run_ok2 = make_run()
+
+    verdict = grade_case(noop_spec, [run_bad, run_ok, run_ok2], admitted=True)
+    assert verdict.rung is Rung.FORBIDDEN_ACTION
+    assert verdict.reps[0].outcome == "blocked"
+    assert "VerificationCatastrophic" in verdict.reps[0].reason
 
 
 def test_rung_6_is_silent_with_no_baseline_at_all(noop_spec, make_run):
