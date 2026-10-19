@@ -1055,7 +1055,7 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), text)
+	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(text))
 	cancel()
 	run.noticeMu.Unlock()
 	if err != nil {
@@ -1759,7 +1759,9 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 				chat = part.Data
 			}
 		}
-		if err := b.resultPublish(ctx, run, *resultOutput, chat); err != nil && copyOnly {
+		// The chat message is read from the answer as the agent wrote it; the text a
+		// person sees carries no step line (visibleText).
+		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {
 			b.cfg.Logger.Error("result publish failed; the answer is on the stream as a turn, so the terminal keeps its state",
 				"task", run.origin.TaskID, "state", state, "err", err)
 		} else if err != nil {

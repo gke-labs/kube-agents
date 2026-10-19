@@ -337,6 +337,32 @@ func TestSlackAnswersOpenQuestion(t *testing.T) {
 	}
 }
 
+// An answer whose only choice is its next step asks nothing: a typed reply
+// does not answer it, and posting it leaves a question already open in
+// place. A message with any other choice is still the open question.
+func TestSlackNextStepIsNoOpenQuestion(t *testing.T) {
+	a, _ := newUXSlackAdapter(&fakeSlackAPI{})
+	conv := "slack:C1/40.0"
+	reply := InboundMessage{Conversation: conv, Text: "are the node pools autoscaling?"}
+	step := OutMessage{Text: "seeded-c is behind.", Chat: &chatmsg.Message{Schema: chatmsg.Schema,
+		Headline: "seeded-c is behind.", Choices: []chatmsg.Choice{{Text: "upgrade plan for seeded-c", Next: true}}}}
+	a.trackQuestion(conv, "60.0", step)
+	if a.answersOpenQuestion(reply) {
+		t.Fatal("an answer's next step is no question a typed reply answers")
+	}
+	a.noteQuestion(conv, slackQuestion{channel: "C1", ts: "50.0"})
+	a.trackQuestion(conv, "61.0", step)
+	a.mu.Lock()
+	open := a.uxLocked().questions[conv].ts
+	a.mu.Unlock()
+	if open != "50.0" {
+		t.Errorf("open question = %q, want the card's question 50.0 kept", open)
+	}
+	if asksQuestion(step.Chat.Choices) || !asksQuestion([]chatmsg.Choice{{Text: "A"}, {Text: "B", Next: true}}) {
+		t.Error("asksQuestion: only choices that are all next steps ask nothing")
+	}
+}
+
 // A card asking again on the same message (its update key) is a fresh
 // question: the earlier answer does not block its buttons.
 func TestSlackReaskedQuestionTakesAClick(t *testing.T) {
