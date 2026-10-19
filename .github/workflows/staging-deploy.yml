@@ -31,6 +31,11 @@ on:
           - "fail"
           - "ignore"
           - "defer"
+      allow_breaking_downgrade:
+        description: "Let a move to an older image_tag continue across a commit marked as a breaking change"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -83,6 +88,8 @@ jobs:
       mode: "apply"
       image_tag: ${{ needs.resolve-commit.outputs.commit_sha }}
       lease_policy: ${{ needs.resolve-commit.outputs.lease_policy }}
+      # Null on the automatic triggers, which only ever move forward.
+      allow_breaking_downgrade: ${{ inputs.allow_breaking_downgrade == true }}
     secrets: inherit
 
   verify-deploy:

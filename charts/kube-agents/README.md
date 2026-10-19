@@ -5,9 +5,10 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 ## Prerequisites
 
 - Kubernetes 1.29+ (GKE Autopilot or Standard) — the credential proxy is a native sidecar, and `SidecarContainers` is beta and on by default from 1.29 (alpha and off in 1.28, GA in 1.33)
-- A Google Service Account (GSA) with a Workload Identity binding to the agent's
-  Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
-  namespace by default (`platformAgent.security.serviceAccountName`):
+- A Google Service Account (GSA) with a Workload Identity binding to the credential
+  broker's Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
+  namespace by default (`platformAgent.security.serviceAccountName`). The agent
+  gateway runs as its own `<name>-gateway-agent`, which holds no cloud identity:
 
   ```bash
   gcloud iam service-accounts add-iam-policy-binding <GSA>@<PROJECT>.iam.gserviceaccount.com \
@@ -221,7 +222,11 @@ uses Workload Identity, and `openai_compatible`, whose key is optional (both bel
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. On a Claude model the gateway
+needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`
+(`low`/`medium`/`high`, default empty, meaning none) puts a `reasoning_effort`
+under every alias the same way; LiteLLM maps it to `thinkingLevel` on Gemini 3.x
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-reasoning-effort)).
+On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
 and only a Claude model gets the prompt-caching breakpoints
@@ -827,7 +832,7 @@ granted by hand.
 
 ### ServiceAccount ownership
 
-Exactly one owner creates the agent's KSA, depending on
+Exactly one owner creates the broker's KSA, depending on
 `platformAgent.security.serviceAccountAnnotations`:
 
 - **Annotations set** (the Workload Identity case): the **operator** creates

@@ -198,8 +198,15 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
-# The design document a spec.mode switch points the operator at.
-readonly PLATFORM_AGENT_MODE_SWITCH_DOC="docs/designs/spec-mode-switch.md"
+# The A2A gateway Deployment that holds Slack under spec.mode next, and its
+# container.
+# shellcheck disable=SC2034  # read by print_instructions_slack.sh
+readonly PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT="platform-agent-a2a-gateway"
+# shellcheck disable=SC2034  # read by print_instructions_slack.sh
+readonly PLATFORM_AGENT_A2A_GATEWAY_CONTAINER="gateway"
+# The operator's page for a spec.mode switch, which links the design document
+# (docs/designs/spec-mode-switch.md) for what the switch changes inside.
+readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode"
 # The Slack app setup page's allowlist section, which says how to find a
 # member ID; refuse_next_slack_gateway_settings points at it.
 readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"

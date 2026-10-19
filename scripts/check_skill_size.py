@@ -16,8 +16,9 @@ down to 15% of the context window for a model with less than about 170k
 tokens. A document over the limit is split: a short ``SKILL.md`` that says when
 to open each part, and the parts under ``references/``.
 
-Checked: every Markdown file in a shipped skill directory, except under its
-``scripts/``. Standard library only, so it runs in CI and in a bare clone.
+Checked: every document of every shipped skill, as
+``deploy/docker/skill_documents.py`` defines both. Standard library only, so it
+runs in CI and in a bare clone.
 
 Usage::
 
@@ -30,6 +31,12 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# The image build copies skill_documents.py beside check_skill_commands.py, so it
+# lives in deploy/docker rather than here.
+SKILL_DOCUMENTS_DIR = REPO / "deploy" / "docker"
+sys.path.insert(0, str(SKILL_DOCUMENTS_DIR))
+
+from skill_documents import shipped_skill_documents  # noqa: E402
 
 # Hermes' cap on one tool result (DEFAULT_RESULT_SIZE_CHARS in tools/budget_config.py at the
 # pinned tag). The limit below must stay under half of it, for the reasons in the docstring.
@@ -37,36 +44,11 @@ HERMES_RESULT_CAP_CHARS = 100_000
 # Characters, as Hermes counts the result: len() of the decoded text.
 LIMIT_CHARS = 40_000
 
-# The skill trees that ship in an image or a plugin. `.agents/skills` and
-# `third_party/google-skills` are not opened through `skill_view` by a deployed
-# agent: the first is for coding agents working on this repository, the second
-# is the upstream copy the shipped `gke-*` skills are generated from.
-SKILL_ROOT_GLOBS = (
-    "agents/*/skills",
-    "a2a/persona/*/skills",
-    "agentplugins/*/files/skills",
-)
-SKILL_FILE = "SKILL.md"
-DOC_GLOB = "*.md"
-SCRIPTS_DIR = "scripts"
-
-
-def skill_documents(repo: Path) -> list[Path]:
-    """Every Markdown file a deployed agent can open through `skill_view`."""
-    out: list[Path] = []
-    for pattern in SKILL_ROOT_GLOBS:
-        for root in sorted(repo.glob(pattern)):
-            for skill in sorted(p.parent for p in root.glob(f"*/{SKILL_FILE}")):
-                for doc in sorted(skill.rglob(DOC_GLOB)):
-                    if SCRIPTS_DIR not in doc.relative_to(skill).parts:
-                        out.append(doc)
-    return out
-
 
 def oversized(repo: Path, limit: int = LIMIT_CHARS) -> list[tuple[Path, int]]:
     """The documents longer than `limit` characters, with their lengths."""
     found = []
-    for doc in skill_documents(repo):
+    for doc in shipped_skill_documents(repo):
         size = len(doc.read_text(encoding="utf-8"))
         if size > limit:
             found.append((doc, size))
@@ -74,7 +56,7 @@ def oversized(repo: Path, limit: int = LIMIT_CHARS) -> list[tuple[Path, int]]:
 
 
 def main() -> int:
-    docs = skill_documents(REPO)
+    docs = shipped_skill_documents(REPO)
     over = oversized(REPO)
     for doc, size in over:
         print(
