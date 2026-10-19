@@ -65,12 +65,17 @@ RUN apt-get update && \
       wget && \
     rm -rf /var/lib/apt/lists/*
 
-# The credential-free utility CLIs, at the versions the agent image carried
-# before #737 moved them here. This is now their only home — deploy/docker's
-# step 2 says so and its guard enforces it — so a version bump has one place to
-# happen. k9s did not come across: it is a full-screen terminal UI, and every
-# command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
-# it could not run even if a skill asked for it. Nothing in agents/ does.
+# The credential-free utility CLIs: yq and helm (at the versions the agent
+# image carried before #737 moved them here) plus leeway for GKE capacity,
+# spot, and zonal topology-skew diagnostics. This is their only home —
+# deploy/docker's step 2 says so and its guard enforces it — so a version bump
+# has one place to happen. leeway holds no credentials of its own; inside the
+# sandbox it runs via `--clusters <project>/<location>/<cluster>` or
+# `--kubeconfig $HERMES_HOME/.kubeconfigs/<cluster>.yaml`, delegating cluster
+# reads to the sandbox's `kubectl` credential-proxy shim (`KUBECTL_READ_VERBS`).
+# k9s did not come across: it is a full-screen terminal UI, and every command
+# here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
+# could not run even if a skill asked for it. Nothing in agents/ does.
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
     chmod +x /usr/local/bin/yq && \
