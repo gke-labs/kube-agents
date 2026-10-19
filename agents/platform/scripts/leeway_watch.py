@@ -18,20 +18,24 @@ Which clusters. Target clusters are resolved on the agent pod:
    (`GCP_PROJECT_ID`) together with every project a Cluster Agent profile's
    `cluster_identity` names; with neither, the sandbox's `gcloud config
    get-value project`; and with nothing at all the tick fails closed rather
-   than enumerate every project the credential can list. Each project is swept
-   via `leeway report --topology-tier-c-signals --clusters-from <project>`.
+   than enumerate every project the credential can list. When Cluster Agent
+   profiles on the gateway pod name a project's `<project>/<location>/<cluster>`
+   triples, those triples are passed via `leeway report --clusters` so the
+   sandbox run uses the `kubectl` credential-proxy shim directly; otherwise the
+   project is swept via `leeway report --topology-tier-c-signals --clusters-from
+   <project>`.
 
 Where it runs. `leeway` is baked into `agent-sandbox` at `/usr/local/bin/leeway`
-and routes GCP Container API discovery and Kubernetes object reads through the
-sandbox's `credential-proxy` shims (`CREDENTIAL_PROXY_URL`). `leeway_watch.py`
-invokes `leeway report` in the sandbox through `sandbox_exec.run` and parses
-the `leeway.report/v1alpha1` JSON document from stdout.
+and routes Kubernetes object reads through the sandbox's `kubectl`
+`credential-proxy` shim (`CREDENTIAL_PROXY_URL`). `leeway_watch.py` invokes
+`leeway report` in the sandbox through `sandbox_exec.run` and parses the
+`leeway.report/v1alpha1` JSON document from stdout.
 
 State ledger and 7-day reminder gate. Under `<profile home>/leeway/`:
-- `ledger.json`: tracks each active finding by key
-  (`<cluster>/<namespace>/<kind>/<name>/<topologyKey>`) with `first_seen`,
-  `last_report_at`, `suspected_cause`, `severity`, `tier`, `max_domain_share`,
-  and `observed_skew`.
+- `ledger.json`: tracks each active finding by its six-part key
+  (`<cluster>/<namespace>/<subject_kind>/<subject_name>/<topology_key>/<finding_kind>`)
+  with `first_seen`, `last_report_at`, `suspected_cause`, `severity`, `tier`,
+  `max_domain_share`, and `observed_skew`.
 - `reports/<timestamp>.md` and `reports/<timestamp>.json` (with `latest.md` and
   `latest.json` symlinks, keeping the newest 10 pairs): written whenever at
   least one finding is due.
@@ -98,6 +102,8 @@ CSV_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
 PROFILES_DIR = "profiles"
 IDENTITY_PROJECT_KEY = "project"
+IDENTITY_LOCATION_KEY = "location"
+IDENTITY_CLUSTER_KEY = "cluster"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 NO_PROJECT_DETAIL = (
@@ -121,12 +127,30 @@ BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before {target} could run"
 SCAN_CUT_SHORT_DETAIL = "leeway scan for {target} cut short by the tick budget"
 SCAN_FAILED_DETAIL = "leeway scan for {target} failed: {error}"
 
-# `leeway.report/v1alpha1` schema vocabulary.
+# Partial-scan error kinds (used as deduplication signature keys so rotating
+# project names do not re-page every day for the same underlying condition).
+ERROR_KIND_BUDGET_EXHAUSTED = "budget_exhausted"
+ERROR_KIND_CUT_SHORT = "cut_short"
+ERROR_KIND_TIMEOUT = "timeout"
+ERROR_KIND_SCAN_FAILED = "scan_failed"
+ERROR_KIND_CLUSTER_ERROR = "cluster_error"
+
+# `leeway.report/v1alpha1` schema vocabulary and normalization defaults.
 SCHEMA_VERSION_VALUE = "leeway.report/v1alpha1"
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
 CLUSTER_KEY_SEPARATOR = "/"
 CLUSTER_WIDE_NAMESPACE = "_cluster"
+DEFAULT_SUBJECT_KIND_CLUSTER = "Cluster"
+DEFAULT_SUBJECT_KIND_COMPUTE_CLASS = "ComputeClass"
+DEFAULT_UNKNOWN = "unknown"
+DEFAULT_DOMAIN_UNKNOWN = "?"
+DEFAULT_FINDING_KIND_DRIFT = "leeway.placement_drift"
+DEFAULT_FINDING_KIND_RANK = "leeway.rank_cascade"
+DEFAULT_TOPOLOGY_KEY_COMPUTE_CLASS = "compute-class"
+DEFAULT_SEVERITY = "warning"
+DEFAULT_DISPLAY_NA = "n/a"
+DEFAULT_CLUSTER_SCAN_FAILED = "cluster scan failed"
 
 # A2A blackboard topic (`a2a.topics.agent.platform.topology-skew`).
 NATS_URL_ENV = "NATS_URL"
@@ -243,14 +267,14 @@ def explicit_clusters() -> list[str]:
     return sorted({c.strip() for c in raw.split(CSV_SEPARATOR) if c.strip()})
 
 
-def roster_projects() -> set[str]:
-    """The projects the Cluster Agent profiles' identities name."""
+def roster_clusters_by_project() -> dict[str, list[str]]:
+    """Map each project to its sorted `<project>/<location>/<cluster>` triples from Cluster Agent profiles."""
     from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity
 
     base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
     if not base.is_dir():
-        return set()
-    found: set[str] = set()
+        return {}
+    by_proj: dict[str, set[str]] = {}
     for home in base.iterdir():
         if home.name in RESERVED_PROFILES or not home.is_dir():
             continue
@@ -258,9 +282,21 @@ def roster_projects() -> set[str]:
             identity = read_cluster_identity(home)
         except Exception:  # noqa: BLE001
             identity = None
-        if identity and identity.get(IDENTITY_PROJECT_KEY):
-            found.add(identity[IDENTITY_PROJECT_KEY])
-    return found
+        if not identity:
+            continue
+        proj = str(identity.get(IDENTITY_PROJECT_KEY) or "").strip()
+        loc = str(identity.get(IDENTITY_LOCATION_KEY) or "").strip()
+        cluster = str(identity.get(IDENTITY_CLUSTER_KEY) or "").strip()
+        if proj:
+            by_proj.setdefault(proj, set())
+            if loc and cluster:
+                by_proj[proj].add(CLUSTER_KEY_SEPARATOR.join([proj, loc, cluster]))
+    return {proj: sorted(triples) for proj, triples in by_proj.items()}
+
+
+def roster_projects() -> set[str]:
+    """The projects the Cluster Agent profiles' identities name."""
+    return set(roster_clusters_by_project().keys())
 
 
 def projects() -> list[str]:
@@ -366,15 +402,39 @@ def merge_reports(reports: list[dict[str, Any]], now: datetime) -> dict[str, Any
 # --- findings extraction & gate ----------------------------------------------
 
 
+def _int(value: object, default: int = 0) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(value: object, default: float = 0.0) -> float:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value if v is not None and str(v).strip()]
+
+
 def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[str, Any]:
     """Normalize a single topology_findings entry with its canonical ledger key."""
     subject = finding.get("subject") if isinstance(finding.get("subject"), dict) else {}
     ns = str(subject.get("namespace") or CLUSTER_WIDE_NAMESPACE)
-    s_kind = str(subject.get("kind") or "Cluster")
-    s_name = str(subject.get("name") or finding.get("kind") or "unknown")
-    replicas = int(subject.get("replicas") or 0)
-    topo_key = str(finding.get("topologyKey") or "unknown")
-    f_kind = str(finding.get("kind") or "leeway.placement_drift")
+    s_kind = str(subject.get("kind") or DEFAULT_SUBJECT_KIND_CLUSTER)
+    s_name = str(subject.get("name") or finding.get("kind") or DEFAULT_UNKNOWN)
+    replicas = _int(subject.get("replicas"), 0)
+    topo_key = str(finding.get("topologyKey") or DEFAULT_UNKNOWN)
+    f_kind = str(finding.get("kind") or DEFAULT_FINDING_KIND_DRIFT)
     key = CLUSTER_KEY_SEPARATOR.join([cluster, ns, s_kind, s_name, topo_key, f_kind])
 
     score = finding.get("score") if isinstance(finding.get("score"), dict) else {}
@@ -385,68 +445,68 @@ def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[st
     for d in domains:
         if not isinstance(d, dict):
             continue
-        d_name = str(d.get("domain") or "?")
-        actual = int(d.get("actual") or 0)
+        d_name = str(d.get("domain") or DEFAULT_DOMAIN_UNKNOWN)
+        actual = _int(d.get("actual"), 0)
         if actual > max_actual:
             max_actual = actual
         total_actual += actual
         domain_parts.append(f"{d_name}: {actual}")
     denom = replicas if replicas > 0 else total_actual
-    max_share = float(score.get("maxDomainShare") or (max_actual / denom if denom > 0 else 0.0))
+    raw_share = score.get("maxDomainShare")
+    fallback_share = max_actual / denom if denom > 0 else 0.0
+    max_share = _float(raw_share, fallback_share) if raw_share is not None else fallback_share
     blast_pct = round(max_share * 100)
-    blast_radius = f"{max_actual}/{denom} ({blast_pct}%)" if denom > 0 else "n/a"
+    blast_radius = f"{max_actual}/{denom} ({blast_pct}%)" if denom > 0 else DEFAULT_DISPLAY_NA
 
     remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
     return {
         "key": key,
-        "category": "topology",
         "cluster": cluster,
         "kind": f_kind,
         "namespace": ns,
         "subject_kind": s_kind,
         "subject_name": s_name,
-        "replicas": replicas,
         "topology_key": topo_key,
         "tier": str(finding.get("tier") or ""),
-        "severity": str(finding.get("severity") or "warning"),
-        "suspected_cause": str(finding.get("suspectedCause") or "unknown"),
-        "contributing_factors": list(finding.get("contributingFactors") or []),
-        "observed_skew": int(score.get("observedSkew") or 0),
+        "severity": str(finding.get("severity") or DEFAULT_SEVERITY),
+        "suspected_cause": str(finding.get("suspectedCause") or DEFAULT_UNKNOWN),
+        "contributing_factors": _str_list(finding.get("contributingFactors")),
+        "observed_skew": _int(score.get("observedSkew"), 0),
         "max_domain_share": round(max_share, 4),
-        "distribution_display": ", ".join(domain_parts) if domain_parts else "n/a",
+        "distribution_display": ", ".join(domain_parts) if domain_parts else DEFAULT_DISPLAY_NA,
         "blast_radius_display": blast_radius,
         "remediation": {
             "kind": str(remediation.get("kind") or ""),
             "summary": str(remediation.get("summary") or ""),
             "yaml": str(remediation.get("yaml") or ""),
         },
-        "raw": finding,
     }
 
 
 def normalize_rank_finding(cluster: str, finding: dict[str, Any]) -> dict[str, Any]:
     """Normalize a single rank_findings entry with its canonical ledger key."""
-    cc_name = str(finding.get("computeClass") or "unknown")
-    f_kind = str(finding.get("kind") or "leeway.rank_cascade")
-    key = CLUSTER_KEY_SEPARATOR.join([cluster, CLUSTER_WIDE_NAMESPACE, "ComputeClass", cc_name, f_kind])
-    remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
+    cc_name = str(finding.get("computeClass") or DEFAULT_UNKNOWN)
+    f_kind = str(finding.get("kind") or DEFAULT_FINDING_KIND_RANK)
     active_rank = finding.get("activeRank")
-    floor_share = float(finding.get("floorShare") or 0.0)
+    topo_key = f"rank:{active_rank}" if active_rank is not None else DEFAULT_TOPOLOGY_KEY_COMPUTE_CLASS
+    key = CLUSTER_KEY_SEPARATOR.join(
+        [cluster, CLUSTER_WIDE_NAMESPACE, DEFAULT_SUBJECT_KIND_COMPUTE_CLASS, cc_name, topo_key, f_kind]
+    )
+    remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
+    floor_share = _float(finding.get("floorShare"), 0.0)
     return {
         "key": key,
-        "category": "compute_class",
         "cluster": cluster,
         "kind": f_kind,
         "namespace": CLUSTER_WIDE_NAMESPACE,
-        "subject_kind": "ComputeClass",
+        "subject_kind": DEFAULT_SUBJECT_KIND_COMPUTE_CLASS,
         "subject_name": cc_name,
-        "replicas": int(finding.get("unreadyPods") or 0),
-        "topology_key": f"rank:{active_rank}" if active_rank is not None else "compute-class",
+        "topology_key": topo_key,
         "tier": str(finding.get("tier") or ""),
-        "severity": str(finding.get("severity") or "warning"),
-        "suspected_cause": str(finding.get("suspectedCause") or "unknown"),
-        "contributing_factors": list(finding.get("contributingFactors") or []),
-        "observed_skew": int(active_rank or 0),
+        "severity": str(finding.get("severity") or DEFAULT_SEVERITY),
+        "suspected_cause": str(finding.get("suspectedCause") or DEFAULT_UNKNOWN),
+        "contributing_factors": _str_list(finding.get("contributingFactors")),
+        "observed_skew": _int(active_rank, 0),
         "max_domain_share": round(floor_share, 4),
         "distribution_display": f"activeRank={active_rank}, floorShare={round(floor_share * 100)}%",
         "blast_radius_display": f"floorShare {round(floor_share * 100)}%",
@@ -455,7 +515,6 @@ def normalize_rank_finding(cluster: str, finding: dict[str, Any]) -> dict[str, A
             "summary": str(remediation.get("summary") or ""),
             "yaml": str(remediation.get("yaml") or ""),
         },
-        "raw": finding,
     }
 
 
@@ -481,7 +540,7 @@ def extract_findings(report: dict[str, Any]) -> tuple[dict[str, dict[str, Any]],
                     norm = normalize_rank_finding(cluster, rf)
                     findings[norm["key"]] = norm
         else:
-            cluster_errors[cluster] = str(cr.get("error") or "cluster scan failed")
+            cluster_errors[cluster] = str(cr.get("error") or DEFAULT_CLUSTER_SCAN_FAILED)
     return findings, ok_clusters, cluster_errors
 
 
@@ -529,18 +588,25 @@ def format_name_list(names: list[str], limit: int = MAX_NAMES_IN_LINE) -> str:
 # --- ledger & report persistence ---------------------------------------------
 
 
+def empty_ledger() -> dict[str, Any]:
+    return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, FINDINGS_KEY: {}}
+
+
 def load_ledger(home: Path) -> dict[str, Any]:
     path = home / LEDGER_FILE_NAME
-    if not path.is_file():
-        return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, FINDINGS_KEY: {}}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, FINDINGS_KEY: {}}
-    if not isinstance(data, dict):
-        return {LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION, FINDINGS_KEY: {}}
-    if not isinstance(data.get(FINDINGS_KEY), dict):
-        data[FINDINGS_KEY] = {}
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return empty_ledger()
+    except OSError as exc:
+        raise RuntimeError(f"ledger at {path} could not be read ({exc}); refusing to overwrite it") from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"ledger at {path} is not valid JSON ({exc}); refusing to overwrite it") from None
+    if not isinstance(data, dict) or (FINDINGS_KEY in data and not isinstance(data.get(FINDINGS_KEY), dict)):
+        raise RuntimeError(f"ledger at {path} is not this job's ledger; refusing to overwrite it")
+    data.setdefault(FINDINGS_KEY, {})
     data[LEDGER_SCHEMA_KEY] = LEDGER_SCHEMA_VERSION
     return data
 
@@ -760,13 +826,15 @@ def sweep_fleet(
     ledger: dict[str, Any],
     now: datetime,
     deadline: float,
-) -> tuple[dict[str, Any], dict[str, str], dict[str, str], set[str]]:
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str], dict[str, str], set[str], set[str]]:
     """Run `leeway report` across configured clusters or projects."""
     clusters = explicit_clusters()
     project_runs = dict(ledger.get(PROJECT_RUNS_KEY) or {})
     scan_errors: dict[str, str] = {}
+    error_kinds: dict[str, str] = {}
     reports: list[dict[str, Any]] = []
     scanned_projects: set[str] = set()
+    explicit_targets: set[str] = set(clusters)
 
     if clusters:
         target_label = ",".join(clusters)
@@ -775,25 +843,36 @@ def sweep_fleet(
             raise RuntimeError(BUDGET_EXHAUSTED_DETAIL.format(target=target_label))
         rep = run_leeway_report(CLUSTERS_FLAG, target_label, timeout=min(PROJECT_TIMEOUT_SECONDS, remaining))
         reports.append(rep)
-        return merge_reports(reports, now), project_runs, scan_errors, scanned_projects
+        return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, explicit_targets
 
+    known_triples_by_proj = roster_clusters_by_project()
     target_projects = order_by_least_recent(projects(), project_runs)
     for proj in target_projects:
         remaining = int(deadline - time.monotonic())
         if remaining < MIN_PROJECT_RUN_SECONDS:
             scan_errors[proj] = BUDGET_EXHAUSTED_DETAIL.format(target=proj)
+            error_kinds[proj] = ERROR_KIND_BUDGET_EXHAUSTED
             continue
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
+        triples = known_triples_by_proj.get(proj) or []
+        flag = CLUSTERS_FLAG if triples else CLUSTERS_FROM_FLAG
+        value = ",".join(triples) if triples else proj
         try:
-            rep = run_leeway_report(CLUSTERS_FROM_FLAG, proj, timeout=timeout)
+            rep = run_leeway_report(flag, value, timeout=timeout)
         except SandboxTimedOut:
             if timeout < PROJECT_TIMEOUT_SECONDS:
                 scan_errors[proj] = SCAN_CUT_SHORT_DETAIL.format(target=proj)
+                error_kinds[proj] = ERROR_KIND_CUT_SHORT
             else:
                 scan_errors[proj] = TIMED_OUT_DETAIL.format(seconds=timeout)
+                error_kinds[proj] = ERROR_KIND_TIMEOUT
+                project_runs[proj] = iso(now)
             continue
         except Exception as exc:  # noqa: BLE001
             scan_errors[proj] = SCAN_FAILED_DETAIL.format(target=proj, error=f"{type(exc).__name__}: {exc}")
+            error_kinds[proj] = ERROR_KIND_SCAN_FAILED
+            if timeout == PROJECT_TIMEOUT_SECONDS:
+                project_runs[proj] = iso(now)
             continue
         reports.append(rep)
         scanned_projects.add(proj)
@@ -803,7 +882,7 @@ def sweep_fleet(
         reasons = "; ".join(f"{k}: {v}" for k, v in sorted(scan_errors.items()))
         raise RuntimeError(reasons)
 
-    return merge_reports(reports, now), project_runs, scan_errors, scanned_projects
+    return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, explicit_targets
 
 
 def can_retire_finding(
@@ -813,17 +892,27 @@ def can_retire_finding(
     cluster_errors: dict[str, str],
     scanned_projects: set[str],
     scan_errors: dict[str, str],
+    explicit_targets: set[str] | None = None,
 ) -> bool:
     """Return True when a prior finding's absence is backed by a clean read."""
     cluster = str(prior_entry.get("cluster") or key.split(CLUSTER_KEY_SEPARATOR, 1)[0])
-    if cluster in ok_clusters:
-        return True
-    if cluster in cluster_errors:
+    bare_cluster = cluster.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1]
+    error_bare = {c.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for c in cluster_errors}
+    if cluster in cluster_errors or bare_cluster in error_bare:
         return False
-    # If the cluster was not in the report at all, retire only when its project
-    # was cleanly scanned (meaning the cluster was deleted or is no longer in scope).
+    ok_bare = {c.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for c in ok_clusters}
+    if cluster in ok_clusters or bare_cluster in ok_bare:
+        return True
+    targets = explicit_targets or set()
+    target_bare = {c.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for c in targets}
+    if targets and (cluster in targets or bare_cluster in target_bare) and not scan_errors:
+        return True
+    # If the cluster was not in the report at all, retire when its project was
+    # cleanly scanned or when the entire sweep succeeded with zero scan/cluster errors.
     proj = cluster.split(CLUSTER_KEY_SEPARATOR, 1)[0] if CLUSTER_KEY_SEPARATOR in cluster else ""
     if proj and proj in scanned_projects and proj not in scan_errors:
+        return True
+    if not targets and scanned_projects and not scan_errors and not cluster_errors:
         return True
     return False
 
@@ -832,11 +921,13 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     moment = now or now_utc()
     home = watch_home()
     days = refresh_days()
-    ledger = load_ledger(home)
     deadline = time.monotonic() + TICK_BUDGET_SECONDS
 
     try:
-        report, project_runs, scan_errors, scanned_projects = sweep_fleet(ledger, moment, deadline)
+        ledger = load_ledger(home)
+        report, project_runs, scan_errors, error_kinds, scanned_projects, explicit_targets = sweep_fleet(
+            ledger, moment, deadline
+        )
     except Exception as exc:  # noqa: BLE001
         detail = f"{type(exc).__name__}: {exc}"
         for line in record_tick_failure(home, detail, dry_run=dry_run):
@@ -848,11 +939,15 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
 
     active_findings, ok_clusters, cluster_errors = extract_findings(report)
     all_errors: dict[str, str] = {**scan_errors, **cluster_errors}
+    all_error_kinds: dict[str, str] = {
+        **error_kinds,
+        **{c: ERROR_KIND_CLUSTER_ERROR for c in cluster_errors},
+    }
 
-    # Partial-scan announcement gate (keyed by error targets so transient text
-    # jitter does not re-page every day, and recovery is announced once).
+    # Partial-scan announcement gate (keyed by error kinds so rotating project
+    # names or transient text jitter do not re-page every day, and recovery is announced once).
     announced = dict(ledger.get(ANNOUNCED_KEY) or {})
-    partial_sig = sorted(all_errors.keys())
+    partial_sig = sorted(set(all_error_kinds.values()))
     if partial_sig:
         if announced.get(ANNOUNCED_PARTIAL_KEY) != partial_sig:
             reasons = "; ".join(f"{k}: {v}" for k, v in sorted(all_errors.items()))
@@ -906,7 +1001,9 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     for key, prior in sorted(prior_findings.items()):
         if key in active_findings or not isinstance(prior, dict):
             continue
-        if can_retire_finding(key, prior, ok_clusters, cluster_errors, scanned_projects, scan_errors):
+        if can_retire_finding(
+            key, prior, ok_clusters, cluster_errors, scanned_projects, scan_errors, explicit_targets
+        ):
             retired_labels.append(short_finding_label(prior))
         else:
             next_findings[key] = prior
@@ -997,7 +1094,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Run the fleet scan and gate without writing reports or modifying the ledger.",
     )
     args = parser.parse_args(argv)
-    return tick(dry_run=args.dry_run)
+    try:
+        return tick(dry_run=args.dry_run)
+    except WriteFailed as exc:
+        print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=str(exc)))
+        return WRITE_FAILED_EXIT
+    except Exception as exc:  # noqa: BLE001
+        detail = f"{type(exc).__name__}: {exc}"
+        for line in record_tick_failure(watch_home(), detail, dry_run=args.dry_run):
+            print(line)
+        return 0
 
 
 if __name__ == "__main__":

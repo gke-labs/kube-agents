@@ -315,8 +315,137 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertIn("--text", a2a_calls[0])
         self.assertIn("--data", a2a_calls[0])
 
+    def test_corrupt_ledger_refuses_to_overwrite_and_announces_failure_once(self) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        ledger_path = self.home / watch.LEDGER_FILE_NAME
+        ledger_path.write_text("{corrupt json", encoding="utf-8")
+
+        c_clean = {"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": []}
+        code1, out1 = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], T0)), now=T0)
+        self.assertEqual(code1, 0)
+        self.assertIn("refusing to overwrite it", out1)
+        self.assertEqual(ledger_path.read_text(encoding="utf-8"), "{corrupt json")
+
+        # Second tick with the same corrupt ledger is suppressed by the failure marker.
+        code2, out2 = self.run_tick(
+            lambda *a, **kw: completed_json(make_report([c_clean], T0 + timedelta(days=1))),
+            now=T0 + timedelta(days=1),
+        )
+        self.assertEqual(code2, 0)
+        self.assertEqual(out2, "")
+
+    def test_defensive_normalizers_handle_non_numeric_and_null_fields(self) -> None:
+        weird_topo = {
+            "kind": None,
+            "subject": {"kind": None, "namespace": None, "name": None, "replicas": "not-an-int"},
+            "topologyKey": None,
+            "score": {"maxDomainShare": "not-a-float", "observedSkew": "bad"},
+            "domains": [{"domain": None, "actual": "bad"}],
+            "contributingFactors": "not-a-list",
+        }
+        norm_t = watch.normalize_topology_finding("p1/us-central1/c1", weird_topo)
+        self.assertEqual(norm_t["observed_skew"], 0)
+        self.assertEqual(norm_t["max_domain_share"], 0.0)
+        self.assertEqual(norm_t["contributing_factors"], [])
+
+        weird_rank = {
+            "kind": None,
+            "computeClass": None,
+            "activeRank": "bad",
+            "floorShare": "bad",
+            "contributingFactors": [None, "factor-a"],
+        }
+        norm_r = watch.normalize_rank_finding("p1/us-central1/c1", weird_rank)
+        self.assertEqual(norm_r["observed_skew"], 0)
+        self.assertEqual(norm_r["max_domain_share"], 0.0)
+        self.assertEqual(norm_r["contributing_factors"], ["factor-a"])
+
+    def test_failing_project_at_full_timeout_is_stamped_so_tail_projects_rotate(self) -> None:
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
+            def fake_run(argv, **kw):
+                target = argv[-1]
+                if target == "p1":
+                    return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="p1 broken")
+                return completed_json(make_report([{"cluster": "p2/us-central1/c2", "status": "ok"}], T0))
+
+            code, out = self.run_tick(fake_run, now=T0)
+            self.assertEqual(code, 0)
+            self.assertIn("leeway watch: the fleet scan was partial (1 error(s))", out)
+            ledger = watch.load_ledger(self.home)
+            self.assertEqual(ledger[watch.PROJECT_RUNS_KEY].get("p1"), watch.iso(T0))
+            self.assertEqual(ledger[watch.PROJECT_RUNS_KEY].get("p2"), watch.iso(T0))
+
+    def test_partial_scan_deduplicates_by_error_kind_across_rotating_projects(self) -> None:
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
+            # Day 0: p1 succeeds, p2 fails with scan_failed -> announces partial scan.
+            def day0_run(argv, **kw):
+                if argv[-1] == "p2":
+                    return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="err")
+                return completed_json(make_report([{"cluster": "p1/us-central1/c1", "status": "ok"}], T0))
+
+            _, out0 = self.run_tick(day0_run, now=T0)
+            self.assertIn("leeway watch: the fleet scan was partial", out0)
+
+            # Day 1: p1 fails with scan_failed, p2 succeeds -> error kind is still ["scan_failed"], so silent!
+            t1 = T0 + timedelta(days=1)
+
+            def day1_run(argv, **kw):
+                if argv[-1] == "p1":
+                    return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="err")
+                return completed_json(make_report([{"cluster": "p2/us-central1/c2", "status": "ok"}], t1))
+
+            _, out1 = self.run_tick(day1_run, now=t1)
+            self.assertEqual(out1, "")
+
+    def test_retires_resolved_finding_in_clusters_mode_and_with_bare_cluster_names(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {watch.CLUSTERS_ENV: "p1/us-central1/seeded-d", watch.PROJECTS_ENV: ""},
+            clear=False,
+        ):
+            # Day 0: report uses bare cluster name "seeded-d" with a finding.
+            c_skewed = {
+                "cluster": "seeded-d",
+                "status": "ok",
+                "topology_findings": [make_topology_finding()],
+            }
+            self.run_tick(lambda *a, **kw: completed_json(make_report([c_skewed], T0)), now=T0)
+
+            # Day 1: clean scan in --clusters mode with empty topology_findings retires the finding.
+            t1 = T0 + timedelta(days=1)
+            c_clean = {"cluster": "seeded-d", "status": "ok", "topology_findings": []}
+            code, out = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], t1)), now=t1)
+            self.assertEqual(code, 0)
+            self.assertIn("retired from the watch", out)
+
 
 class DiscoveryTests(unittest.TestCase):
+    def test_project_with_roster_profile_triples_uses_clusters_flag(self) -> None:
+        seen_argv: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen_argv.append(list(argv))
+            return completed_json(make_report([{"cluster": "p1/us-central1/c1", "status": "ok"}]))
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {
+                watch.WATCH_HOME_ENV: tmp,
+                watch.CLUSTERS_ENV: "",
+                watch.PROJECTS_ENV: "p1",
+            },
+            clear=False,
+        ), mock.patch.object(
+            watch,
+            "roster_clusters_by_project",
+            return_value={"p1": ["p1/us-central1/c1", "p1/us-east1/c2"]},
+        ), mock.patch.object(watch.sandbox_exec, "run", side_effect=fake_run):
+            watch.tick(now=T0)
+
+        self.assertEqual(
+            seen_argv,
+            [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-central1/c1,p1/us-east1/c2"]],
+        )
     def test_explicit_clusters_env_passes_clusters_flag(self) -> None:
         seen_argv: list[list[str]] = []
 
