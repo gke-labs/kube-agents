@@ -40,7 +40,6 @@
 id: compute-class-canary-active-migration-pdb-probe
 name: A canary under ComputeClass active migration is guarded by a version-scoped PDB, not a pod-template annotation
 
-owner: GinnyJI
 domain: capacity
 
 prompt: >-

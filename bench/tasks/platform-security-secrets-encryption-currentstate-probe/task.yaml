@@ -20,7 +20,6 @@
 id: platform-security-secrets-encryption-currentstate-probe
 name: Secrets encryption is proven complete by databaseEncryption.currentState
 
-owner: GinnyJI
 domain: security
 
 prompt: >-

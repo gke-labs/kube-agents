@@ -21,8 +21,6 @@ id: alert-config-terraform-promql-probe
 name: GKE memory alert in Terraform uses PromQL, the cAdvisor limit and the skill label
 domain: observability
 
-owner: GinnyJI
-
 prompt: >-
   Write a Terraform alerting policy that pages me when any container in the
   namespace checkout on my GKE cluster prod-1 stays above 90% of its memory

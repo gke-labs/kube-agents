@@ -264,15 +264,19 @@ class TestEveryTaskIsValid(unittest.TestCase):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
 
-    def test_every_task_names_an_owner(self):
+    def test_every_task_owner_is_a_person_in_owners(self):
         for needle, guidance in (
             (
-                "declares no 'owner:'",
-                "These cases name nobody to answer when they flake -- see "
-                "bench/CONTRIBUTING.md:",
+                "is no longer allowed",
+                "These cases still say 'owner: maintainers'; delete the line -- "
+                "see bench/CONTRIBUTING.md:",
+            ),
+            (
+                "is not in the root OWNERS file",
+                "These cases name an owner who is not in OWNERS:",
             ),
             ("leading at sign", "These cases write the owner as a mention:"),
-            ("neither a GitHub login", "These cases carry an owner that is not a login:"),
+            ("is not a GitHub login (", "These cases carry an owner that is not a login:"),
         ):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
@@ -466,7 +470,6 @@ class TestTheValidatorItself(unittest.TestCase):
             "id": "made-up-case",
             "name": "A case",
             "domain": "security",
-            "owner": "maintainers",
             "fixtures": ["rbac-overgrant"],
             "verification_spec": [
                 {
@@ -516,7 +519,6 @@ class TestTheRulesReject(unittest.TestCase):
         "id": "made-up-case",
         "name": "A case",
         "domain": "security",
-        "owner": "maintainers",
         "fixtures": ["rbac-overgrant"],
         "verification_spec": [
             {
@@ -620,8 +622,17 @@ class TestTheRulesReject(unittest.TestCase):
         # value, which would be a traceback instead of a finding.
         self._only("is not a slug string", domain=["security", "cost"])
 
-    def test_a_missing_owner_is_rejected(self):
-        self._only("declares no 'owner:'", owner=DELETE)
+    def test_a_missing_owner_passes(self):
+        # Optional: the case's bugs go to its domain's owner.
+        self.assertEqual(self._validate(owner=DELETE), [])
+
+    def test_the_retired_maintainers_owner_is_rejected(self):
+        for owner in ("maintainers", "Maintainers"):
+            with self.subTest(owner=owner):
+                self._only("is no longer allowed", owner=owner)
+
+    def test_an_owner_not_in_owners_is_rejected(self):
+        self._only("is not in the root OWNERS file", owner="some-one1")
 
     def test_an_owner_with_a_leading_at_sign_is_rejected(self):
         self._only("leading at sign", owner="@someone")
@@ -631,13 +642,17 @@ class TestTheRulesReject(unittest.TestCase):
         # shapes a contributor is likely to write; GitHub accepts none of them.
         for owner in ("someone@example.com", "Some One", "some--one", "-someone"):
             with self.subTest(owner=owner):
-                self._only("neither a GitHub login", owner=owner)
+                self._only("is not a GitHub login (", owner=owner)
 
     def test_an_owner_that_is_not_a_string_is_rejected(self):
         self._only("is not a GitHub login string", owner=["a", "b"])
 
-    def test_a_login_owner_passes(self):
-        self.assertEqual(self._validate(owner="some-one1"), [])
+    def test_a_login_in_owners_passes(self):
+        login = sorted(validator.root_owners())[0]
+        # GitHub logins are case-insensitive, so the case of OWNERS does not bind.
+        for owner in (login, login.upper()):
+            with self.subTest(owner=owner):
+                self.assertEqual(self._validate(owner=owner), [])
 
     # -- audit_streams --
 
@@ -867,7 +882,6 @@ class TestTheRulesReject(unittest.TestCase):
             text=(
                 "id: made-up-case\n"
                 "domain: security\n"
-                "owner: maintainers\n"
                 "verification_spec: [{name: n, role: objective, "
                 "check: {type: report_contains, required_phrases: [x]}}]\n"
             ),

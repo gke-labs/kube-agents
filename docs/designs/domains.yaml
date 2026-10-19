@@ -10,7 +10,8 @@
 # Each row carries, besides `slug`, `name` and `journey`:
 #   owner    the GitHub login (no at sign) who answers for the domain's cases
 #            as a set: what is covered, what is missing, what a red means.
-#            A case's own `owner:` still answers when that case flakes.
+#            A case's own `owner:`, when set, is first for that case's bugs;
+#            without one the case falls to this owner (bench/CONTRIBUTING.md).
 #   backup   the GitHub login who covers when the owner is out; not the owner.
 #   meaning  one plain sentence saying what the domain checks, for a reader
 #            who does not know the code.

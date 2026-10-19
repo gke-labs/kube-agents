@@ -6,8 +6,8 @@ run the agent, score, read the log. Most of the mistakes are static. A domain
 slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
 nothing; a fixture role the seeded fleet does not define is a case addressing
 a defect that was never planted; a check with no assertion is a check that
-cannot fail; a case no roster file under `hack/eval/` names never runs; a case with no
-`owner:` has nobody to answer when it flakes; a fixture carrying a real
+cannot fail; a case no roster file under `hack/eval/` names never runs; an
+`owner:` outside `OWNERS` sends a case's bugs to someone who may have left; a fixture carrying a real
 address or a credential is a leak the moment it merges. None of those needs a
 cluster to find.
 
@@ -47,6 +47,7 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import case_owner  # noqa: E402
 import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -77,11 +78,11 @@ FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # to name a role differently, which fixture_catalog_disagreements() enforces.
 ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
-# The `owner:` field, from bench/CONTRIBUTING.md. A GitHub login, bare, or
-# this literal for a case the OWNERS approvers answer for. Bare because the
-# field is a name to look up, not a mention: a task.yaml is quoted into
-# issues and pull-request comments, where a leading at sign pages someone.
-OWNER_MAINTAINERS = "maintainers"
+# The optional `owner:` field, from bench/CONTRIBUTING.md: a GitHub login in
+# the root OWNERS file, written bare because the field is a name to look up,
+# not a mention -- a task.yaml is quoted into issues and pull-request
+# comments, where a leading at sign pages someone. Absent, the case's bugs go
+# to its domain's owner (scripts/case_owner.py).
 # GitHub's own login rule: alphanumerics and single interior hyphens, at most
 # 39 characters, so a stray e-mail address or a display name is rejected
 # before a reviewer has to spot it.
@@ -558,6 +559,11 @@ def known_domains() -> set[str]:
     return {d["slug"] for d in data.get("domains") or []}
 
 
+def root_owners() -> frozenset[str]:
+    """Lower-cased logins in the root OWNERS file's approvers and reviewers."""
+    return case_owner.load_root_owners()
+
+
 # `{cluster:<slot>}` in a report_contains pattern, as bench/kube_agents_bench/
 # verifiers.py's _CLUSTER_PLACEHOLDER reads it (this script does not import
 # the bench package, so the regex is restated here; the verifier owns it).
@@ -922,30 +928,39 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "not define"
         )
 
-    # The owner. Demotion (docs/eval-gate-roster.md) files an issue against a
-    # flaking case, and this field is who that issue goes to. devops-bench
-    # discards the key, so like `domain` it is enforced here or nowhere.
-    owner = spec.get("owner")
-    if owner is None:
-        problems.append(
-            "declares no 'owner:'. Name the GitHub login (without the at sign) "
-            f"that answers when this case flakes, or {OWNER_MAINTAINERS!r} for "
-            "a case the OWNERS approvers own -- see bench/CONTRIBUTING.md"
-        )
-    elif not isinstance(owner, str) or not owner:
-        problems.append(f"'owner:' {owner!r} is not a GitHub login string")
-    elif owner.startswith("@"):
-        problems.append(
-            f"owner {owner!r} carries a leading at sign; write the login bare, "
-            "so a task.yaml quoted into an issue names someone rather than "
-            "paging them"
-        )
-    elif owner != OWNER_MAINTAINERS and not GITHUB_LOGIN.fullmatch(owner):
-        problems.append(
-            f"owner {owner!r} is neither a GitHub login (letters, digits and "
-            "single hyphens, at most 39 characters) nor the literal "
-            f"{OWNER_MAINTAINERS!r}"
-        )
+    # The owner, optional. A case's bugs go to it first, and to the domain's
+    # owner in docs/designs/domains.yaml when it is absent or names someone
+    # not in OWNERS (scripts/case_owner.py). devops-bench discards the key, so
+    # like `domain` it is enforced here or nowhere.
+    if "owner" in spec:
+        owner = spec["owner"]
+        if not isinstance(owner, str) or not owner:
+            problems.append(f"'owner:' {owner!r} is not a GitHub login string")
+        elif owner.startswith("@"):
+            problems.append(
+                f"owner {owner!r} carries a leading at sign; write the login bare, "
+                "so a task.yaml quoted into an issue names someone rather than "
+                "paging them"
+            )
+        elif case_owner.is_retired_owner(owner):
+            problems.append(
+                f"'owner: {owner}' is no longer allowed: it names nobody. Delete "
+                "the line and the case's bugs go to its domain's owner in "
+                "docs/designs/domains.yaml, or name the person whose bugs this "
+                "case is -- see bench/CONTRIBUTING.md"
+            )
+        elif not GITHUB_LOGIN.fullmatch(owner):
+            problems.append(
+                f"owner {owner!r} is not a GitHub login (letters, digits and "
+                "single hyphens, at most 39 characters)"
+            )
+        elif not case_owner.is_listed_owner(owner, root_owners()):
+            problems.append(
+                f"owner {owner!r} is not in the root OWNERS file (approvers or "
+                "reviewers), so the case falls back to its domain's owner in "
+                "docs/designs/domains.yaml; drop the 'owner:' line or name "
+                "someone listed there"
+            )
 
     # The audit streams a case drives without grading their ledger. The runner
     # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an
@@ -1099,7 +1114,7 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
         # task_has_spec). A flow-style spec on one line is a valid, loadable
         # spec that the gate cannot see, so the case drops back to the
         # judge-only OutcomeValidity fallback without saying so.
-        if not re.search(r"^verification_spec:\s*$", path.read_text(encoding="utf-8"), re.M):
+        if not re.search(r"^verification_spec:\s*$", path.read_text(encoding="utf-8"), re.MULTILINE):
             problems.append(
                 "declares its 'verification_spec:' inline rather than as a "
                 "block. hack/ci-eval-pr.sh's task_has_spec matches a bare "
