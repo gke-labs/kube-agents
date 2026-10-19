@@ -32,14 +32,8 @@ Managed Kubernetes platform on Google Cloud. Defaults to Autopilot mode unless S
 1. **Private Autopilot Clusters:**
    * Use `--enable-private-nodes` for private node IP addresses.
    * Use `--enable-private-endpoint` to disable public IP access to the control plane.
-   * Restrict control plane access with `--enable-master-authorized-networks` and `--master-authorized-networks=CIDR_BLOCK`:
-     ```bash
-     gcloud container clusters create-auto CLUSTER_NAME --region=REGION \
-       --enable-private-nodes \
-       --enable-private-endpoint \
-       --enable-master-authorized-networks \
-       --master-authorized-networks=CIDR_BLOCK
-     ```
+   * Restrict control plane access with `--enable-master-authorized-networks` and `--master-authorized-networks=CIDR_BLOCK`.
+   * These are cluster settings, proposed as a pull request in Config Connector YAML on the cluster's `ContainerCluster` through `gcp-config-connector` (`spec.privateClusterConfig.enablePrivateNodes`, `spec.privateClusterConfig.enablePrivateEndpoint`, `spec.masterAuthorizedNetworksConfig.cidrBlocks`). The broker refuses `gcloud` writes.
 
 2. **Workload Identity (IAM Binding):**
    * Never mount raw GCP Service Account JSON keys in Pods; open `gke-workload-identity/SKILL.md` for KSA/GSA setup.
