@@ -67,7 +67,8 @@ Env:
   GITOPS_MERGE_CHECK     comma-separated check-run names whose failure means the
                          repository rejected the PR (default ``check``, the job the
                          pilot repositories' merge-on-green workflow runs)
-  BENCH_GITHUB_TOKEN or GITHUB_TOKEN, else GITOPS_TOKEN_FILE   GitHub read token
+  BENCH_GITHUB_TOKEN_FILE, BENCH_GITHUB_TOKEN or GITHUB_TOKEN, else GITOPS_TOKEN_FILE
+                         GitHub read token
 """
 
 from __future__ import annotations
@@ -87,7 +88,7 @@ from typing import Any
 
 from devops_bench.agents import AgentResult
 
-from kube_agents_bench.verifiers import LEDGER_TOKEN_ENV_VARS
+from kube_agents_bench import forges
 
 _log = logging.getLogger(__name__)
 
@@ -138,9 +139,11 @@ def repo_slug(url: str) -> str:
 
 
 def _github_token(env: Mapping[str, str]) -> str:
-    for name in LEDGER_TOKEN_ENV_VARS:
-        if env.get(name):
-            return env[name].strip()
+    # The renewed grading token first (forges.GITHUB_TOKEN_FILE_ENV_VAR), then
+    # the variables: a fix cycle can run past the hour the unit's token lasts.
+    token = forges.read_token(forges.FORGE_GITHUB, env)
+    if token:
+        return token.strip()
     token_file = env.get("GITOPS_TOKEN_FILE")
     if token_file:
         path = Path(os.path.expanduser(token_file))

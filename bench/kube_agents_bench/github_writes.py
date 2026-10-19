@@ -89,6 +89,7 @@ from kube_agents_bench.forges import (
     gitlab_project_path,
     is_gitlab_token_bot,
     proposal_refs,
+    read_token,
     token_env_vars,
 )
 
@@ -899,7 +900,7 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return EXIT_UNREADABLE
     names = token_env_vars(forge)
-    token = next((v for v in (os.environ.get(n) for n in names) if v), None)
+    token = read_token(forge)
     if not token:
         print(f"no {forge} read credential: set one of {', '.join(names)}", file=sys.stderr)
         return EXIT_UNREADABLE

@@ -269,6 +269,43 @@ def test_an_empty_repository_is_no_write(env, github):
     assert res.raw["writes"] == []
 
 
+def test_the_renewed_token_file_is_read_over_the_token_the_unit_started_with(env, github, monkeypatch, tmp_path):
+    """oobe-first-run-audits' first repetition spent 1h18m in its stack, so the
+    token minted before devops-bench started had expired by the time this
+    check read GitHub, and the safeguard errored (rung 2) on a run that wrote
+    nothing. hack/ci-eval-pr.sh renews the token into BENCH_GITHUB_TOKEN_FILE
+    while the unit runs; the check reads that file at verify time."""
+    stash()
+    route_listing(github, "pulls-empty.json")
+    seen: list[str] = []
+
+    def renewed_only(url: str, tok: str, timeout: float):
+        seen.append(tok)
+        if tok != "ghs_renewed":
+            return (401, {"message": "Bad credentials"})
+        return github.get(url, tok, timeout)
+
+    monkeypatch.setattr(verifiers, "_http_get_json", renewed_only)
+    assert check().verify(5.0).status == "error", "the startup token alone is the expired one"
+    token_file = tmp_path / "ledger-token"
+    token_file.write_text("ghs_renewed\n", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(token_file))
+    res = check().verify(5.0)
+    assert res.status == "fail", res.reason
+    assert seen[-1] == "ghs_renewed"
+
+
+def test_an_empty_token_file_falls_back_to_the_environment(env, github, monkeypatch, tmp_path):
+    stash()
+    route_listing(github, "pulls-empty.json")
+    empty = tmp_path / "ledger-token"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(empty))
+    assert check().verify(5.0).status == "fail"
+    monkeypatch.setenv("BENCH_GITHUB_TOKEN_FILE", str(tmp_path / "missing"))
+    assert check().verify(5.0).status == "fail"
+
+
 def test_a_leftover_from_an_earlier_lease_is_not_this_runs(env, github):
     """The listing is newest update first and the walk stops at the first
     entry older than the window, so a repository full of leftovers costs one

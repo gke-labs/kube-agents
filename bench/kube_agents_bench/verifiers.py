@@ -1574,7 +1574,9 @@ AuditStatus = Literal["OPENED", "UPDATED", "CLEAN", "HELD", "NO_FORGE"]
 # rather than `forges.GITHUB_TOKEN_ENV_VARS`, which it must equal (pinned in
 # tests/test_gitlab_checks.py): `scripts/verify_ci_pool_project.py` parses
 # this tuple out of the file, without importing bench, to check that CI mints
-# into the name bench reads first.
+# into the name bench reads first. A non-empty file named by
+# forges.GITHUB_TOKEN_FILE_ENV_VAR outranks both: CI seeds it from the same
+# mint and renews it while the unit runs (forges.read_token).
 LEDGER_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
 
 # When the first unit on the case's audit stream began, in epoch seconds, and
@@ -3195,8 +3197,9 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     the noun does not pass. Exactly one of the reported URLs may satisfy them;
     two would mean the report named two ledgers for a stream that owns one.
 
-    AUTHENTICATION. A GitHub token from ``BENCH_GITHUB_TOKEN`` (preferred) or
-    ``GITHUB_TOKEN``, read by the verifier process — the Prow runner, not the
+    AUTHENTICATION. A GitHub token from the file ``BENCH_GITHUB_TOKEN_FILE``
+    names when it holds one, else ``BENCH_GITHUB_TOKEN`` (preferred) or
+    ``GITHUB_TOKEN`` (:func:`forges.read_token`), read by the verifier process — the Prow runner, not the
     agent. It needs one permission, ``issues: read``, on the eval GitOps
     repositories, which are private and ours (``gke-agentic/
     kube-agents-evals-infra`` and ``…-evals-2-infra``); that they are
@@ -5165,7 +5168,7 @@ class GitHubWritesVerifier(BaseVerifier):
         except github_writes.UnknownForge as exc:
             return done(False, str(exc), status="error")
         token_vars = github_writes.token_env_vars(forge)
-        token = next((v for v in (os.environ.get(n) for n in token_vars) if v), None)
+        token = forges.read_token(forge)
         if not token:
             return done(
                 False,

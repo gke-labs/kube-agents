@@ -291,6 +291,15 @@ def test_token_file_fallback(tmp_path: Any) -> None:
     assert gh.headers["Authorization"] == "Bearer filetoken"
 
 
+def test_the_renewed_grading_token_outranks_the_startup_one(tmp_path: Any) -> None:
+    renewed = tmp_path / "ledger-token"
+    renewed.write_text("renewedtoken\n")
+    env = ENV | {"BENCH_GITHUB_TOKEN_FILE": str(renewed)}
+    gh = FakeGitHub(pulls=[[]])
+    _run(env, gh, [])
+    assert gh.headers["Authorization"] == "Bearer renewedtoken"
+
+
 @pytest.mark.parametrize(
     ("url", "slug"),
     [

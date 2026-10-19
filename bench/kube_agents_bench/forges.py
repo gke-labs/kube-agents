@@ -48,6 +48,7 @@ import re
 import ssl
 import urllib.parse
 from collections.abc import Mapping
+from pathlib import Path
 
 __all__ = [
     "FORGES",
@@ -60,6 +61,7 @@ __all__ = [
     "GITHUB_DEFAULT_HOST",
     "GITHUB_HOST_ENV_VAR",
     "GITHUB_TOKEN_ENV_VARS",
+    "GITHUB_TOKEN_FILE_ENV_VAR",
     "GITLAB_AGENT_LOGIN_ENV_VAR",
     "GITLAB_DEFAULT_HOST",
     "GITLAB_HOST_ENV_VAR",
@@ -127,6 +129,14 @@ _GITLAB_TOKEN_BOT_RE = re.compile(r"^(project|group)_\d+_bot(_[0-9a-f]+|\d+)?$")
 #: read-scoped installation token ``hack/ci-eval-pr.sh`` mints; GitLab's is a
 #: group or project access token with ``read_api`` and the Reporter role.
 GITHUB_TOKEN_ENV_VARS = ("BENCH_GITHUB_TOKEN", "GITHUB_TOKEN")
+#: A file holding the GitHub grading credential, read on every call and
+#: preferred over GITHUB_TOKEN_ENV_VARS while it holds one. The minted
+#: installation token lasts an hour from just before devops-bench starts, and
+#: a unit whose stack runs longer than that (oobe-first-run-audits' first
+#: repetition waits out a fresh install's own first-run stage) would grade
+#: with a dead one; hack/ci-eval-pr.sh writes the token here and renews it
+#: while the unit runs, which an environment variable read at startup cannot.
+GITHUB_TOKEN_FILE_ENV_VAR = "BENCH_GITHUB_TOKEN_FILE"
 GITLAB_TOKEN_ENV_VARS = ("BENCH_GITLAB_TOKEN",)
 
 # One path segment of a GitLab project path: a group, a subgroup or the
@@ -181,7 +191,19 @@ def token_env_vars(forge: str) -> tuple[str, ...]:
 
 
 def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | None:
+    """The grading credential: GITHUB_TOKEN_FILE_ENV_VAR's file on GitHub when
+    it holds one, else the first of :func:`token_env_vars` that is set. An
+    unreadable or empty file falls back to the variables, which hold the
+    token the unit started with."""
     env = _env(environ)
+    token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
+    if forge != FORGE_GITLAB and token_file:
+        try:
+            token = Path(token_file).read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+        if token:
+            return token
     return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
 
 
