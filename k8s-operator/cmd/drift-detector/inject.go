@@ -805,7 +805,9 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 	injectCtx, cancelInject := context.WithTimeout(ctx, perRecordInjectBudget)
 	defer cancelInject()
 
-	if record.Backlog && h.backlogRoute {
+	// event.Digest, set by the joiner from the same route this handler holds,
+	// so the DRIFT line's backlog marker and the route taken are one decision.
+	if event.Digest {
 		if err := h.sendBacklog(injectCtx, payloadForEvent(event)); err != nil {
 			h.counts.Failed++
 			log.Printf("%s: BACKLOG POST FAILED for insert_id=%s cluster=%s resource=%s; the record was acked and will not be redelivered: %v",

@@ -841,9 +841,10 @@ func logDriftEvent(_ context.Context, event DriftEvent) {
 		line += fmt.Sprintf(" lookup_error=%q", event.LookupError)
 	}
 	// Appended here, where the DRIFT line is built, rather than by the inject
-	// handler that acts on the flag: the line is identical with the inject on
-	// and off, and the marker says what the handler will do with the record,
-	// which is the fact an operator reading only DRIFT lines needs.
+	// handler that acts on the flag: the marker says what the handler will do
+	// with the record, which is the fact an operator reading only DRIFT lines
+	// needs. The out-of-scope marker reads the same with the inject on and off;
+	// the backlog marker appears only with a daemon that takes the digest.
 	if event.OutOfScope {
 		line += " " + injectHeldOutOfScopeMarker
 	}

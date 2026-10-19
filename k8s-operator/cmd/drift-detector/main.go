@@ -538,10 +538,10 @@ func realMain(argv []string) error {
 	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected)
 	join.skipBacklog = injectHandler.backlogRoute
 
-	// Said at startup, because the difference between the two modes is invisible
-	// in every later line: a run with the inject off emits exactly the DRIFT
-	// lines a run with it on does, and only the shutdown tally distinguishes
-	// them. An operator who expected escalation and did not get it should find
+	// Said at startup, because the difference between the two modes is nearly
+	// invisible in every later line: a run with the inject off emits the DRIFT
+	// lines a run with it on does, less the backlog marker and the
+	// skipped_backlog join, and only the shutdown tally distinguishes them. An operator who expected escalation and did not get it should find
 	// the reason at launch rather than after the first change goes unreported.
 	if inject == nil {
 		log.Printf("%s: no --daemon-url; %s injects are disabled and drift will be logged only, not escalated to anyone", commandName, injectKindDrift)

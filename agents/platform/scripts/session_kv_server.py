@@ -724,8 +724,8 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # (published before its process first pulled, or after waiting longer than its
 # max wait; `subscriber.backlog` in the detector). They arrive on
 # `POST /v1/drift-backlog`, write a ledger row with `backlog` set, spend no
-# quota, start no turn, and are posted as one digest. An install, the uninstall
-# before a reinstall that keeps the cluster, and a pod roll each queue such a burst under the installer's own account, and
+# quota, start no turn, and are posted as one digest. An install and a pod roll
+# each queue such a burst under the installer's own account, and
 # triaging it one card at a time spent the day's drift budget on kube-agents'
 # own objects.
 #
@@ -4339,7 +4339,7 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     noun = "change" if len(rows) == 1 else "changes"
     return (
         f"{DRIFT_BACKLOG_EMOJI} **Drift backlog:** {len(rows)} {noun} reached drift detection late "
-        f"(made while it was starting or not pulling, or waiting over "
+        f"(they queued before it started pulling, or waited over "
         f"{DRIFT_BACKLOG_MAX_WAIT_TEXT}), so they are listed here instead of triaged one card each.\n"
         f"By principal: {principals}\n"
         f"Including: {objects}\n"

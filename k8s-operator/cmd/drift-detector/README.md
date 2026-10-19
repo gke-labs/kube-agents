@@ -26,7 +26,7 @@ does everything else and stops at the `DRIFT` log line, which is how it ran befo
 local run against a real subscription wants. With it on, each surviving record opens a session and
 posts one payload into it — except one from a cluster outside the install's scope, which is held (the
 rule is a few paragraphs below), and one that arrived late, which goes to the daemon's digest route
-with no session ([The backlog](#the-backlog)); `logDriftEvent` still runs first either way, so the `DRIFT` line is
+with no session when the daemon advertises one ([The backlog](#the-backlog)); `logDriftEvent` still runs first either way, so the `DRIFT` line is
 emitted whether or not a daemon is configured and whether or not the inject lands.
 
 Two things about that are worth knowing before relying on it. A record whose inject fails is
@@ -540,7 +540,7 @@ one whose profile failed to write.
 | `failed`          | Any other lookup error: RBAC, a network fault, a timeout, an API group or version the cluster does not serve.                                                                                                                                                                                                                                                                                                                                     |
 | `skipped_backlog` | A backlog record the join did not look up, because the daemon takes the digest route and nothing reads its ownership ([The backlog](#the-backlog)). Decided after the delete test and the cluster lookup, so a backlog delete is still `no_object` and a backlog record from an unread cluster is still `unreachable`.                                                                                                                            |
 
-A 404 answers both of the last two, so they are told apart by what the error names rather than by
+A 404 answers both `gone` and `failed`, so they are told apart by what the error names rather than by
 its status code: a genuine absence names the group, resource and object that were looked up, while
 a refusal of the path names nothing. Without the distinction a CRD uninstalled — or a served
 version retired — between the audited write and the lookup would be reported `gone`, which says the
@@ -671,8 +671,7 @@ backlog records are sent as cards ([The backlog](#the-backlog)).
 A record that reached the detector late is backlog. The subscriber marks it (`subscriber.backlog`)
 when its message's `publishTime` is earlier than this process's first successful pull, or when it
 waited in the subscription longer than `backlogMaxWait` (30 minutes). The first rule catches
-everything that queued while no detector was pulling: an install, the uninstall before a reinstall
-that keeps the cluster, a pod roll. The test is the publish time, so an install write that reaches
+everything that queued while no detector was pulling: an install, a pod roll. The test is the publish time, so an install write that reaches
 the topic after the first pull is live. The second catches a process that started and then could not
 pull.
 

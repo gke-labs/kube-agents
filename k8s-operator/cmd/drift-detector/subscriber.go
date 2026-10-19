@@ -622,8 +622,7 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 //
 // Two rules, because they catch different things. Published before this
 // process's first successful pull: everything that queued while no detector
-// was pulling -- an install, the uninstall before a reinstall that keeps the
-// cluster, a pod roll -- whatever its age. The test is the publish time, not
+// was pulling -- an install, a pod roll -- whatever its age. The test is the publish time, not
 // the change time: an install write that reaches the topic after the first
 // pull is live. Waited longer than backlogAge: a process that started
 // and then could not pull for a while (an IAM grant still propagating, a
