@@ -78,7 +78,7 @@ kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
     /gateway feedback export --since 7d > feedback.tar
 ```
 
-To turn it off, set `spec.integration.slack.answerFeedback: false` in the `PlatformAgent` CR (the chart's `platformAgent.integration.slack.answerFeedback`). Answers then carry no buttons and nothing is kept; buttons already in Slack do nothing when tapped. Ratings kept before you turned it off stay until the bucket drops them.
+To turn it off, set `spec.integration.slack.answerFeedback: false` in the `PlatformAgent` CR, or the chart's `platformAgent.integration.slack.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={slack={answerFeedback=false}}}}'`. Answers then carry no buttons and nothing is kept. Tapping a button already in Slack still highlights it, but nothing is counted or kept and no box opens. Ratings kept before you turned it off stay until the bucket drops them.
 
 ### Allowed users
 

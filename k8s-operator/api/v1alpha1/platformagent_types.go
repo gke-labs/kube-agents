@@ -302,7 +302,7 @@ type SlackSpec struct {
 
 	// AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
 	// each final answer under spec.mode next, and keeps a thumbs-down with
-	// its question, answer and note on the install for 30 days.
+	// its question, answer and note on the install for the feedback bucket's max age (30 days as provisioned).
 	// False hides the buttons and keeps nothing.
 	// +kubebuilder:default=true
 	// +optional

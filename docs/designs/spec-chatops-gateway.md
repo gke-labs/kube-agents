@@ -1976,8 +1976,8 @@ no sink files the drafts anywhere.
 An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
 operator renders `A2A_SLACK_ANSWER_FEEDBACK=false` on the gateway only for an explicit `false`, so an
 install that never set the field keeps its gateway pod unchanged; the gateway then never looks for
-the bucket, marks no answer and hands the adapter no recorder, so a button already posted is acked
-and does nothing.
+the bucket, marks no answer and hands the adapter no recorder, so a tap on a button already posted
+is acked and changes nothing (Slack still fills the tapped icon; no box opens).
 
 ## The console adapter (added 9/23)
 
