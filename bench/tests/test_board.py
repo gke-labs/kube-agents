@@ -405,6 +405,52 @@ def test_read_board_state_returns_summaries_and_errors(tmp_path: Path) -> None:
     assert errors == {FRONT: "HTTP 429 TPM quota exhausted"}
 
 
+def test_read_board_state_returns_error_from_task_runs_when_last_failure_error_is_null(tmp_path: Path) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            (FRONT, "failed", None),
+        )
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            (FRONT, None, "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"),
+        )
+    reply = _run_script(tmp_path, [FRONT])
+    got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
+    assert got is not None
+    statuses, summaries, errors = got
+    assert statuses == {FRONT: "failed"}
+    assert summaries == {}
+    assert errors == {FRONT: "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"}
+
+
+def test_read_board_state_newest_run_without_error_clears_older_error(tmp_path: Path) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            (FRONT, "failed", None),
+        )
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            (FRONT, None, "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, NULL, NULL)",
+            (FRONT,),
+        )
+    reply = _run_script(tmp_path, [FRONT])
+    got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
+    assert got is not None
+    statuses, summaries, errors = got
+    assert statuses == {FRONT: "failed"}
+    assert summaries == {}
+    assert errors == {}
+
+
 def test_read_board_state_newest_run_without_summary_clears_older_summary(tmp_path: Path) -> None:
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")

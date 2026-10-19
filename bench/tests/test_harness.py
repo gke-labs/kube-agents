@@ -2915,6 +2915,135 @@ def test_gitops_fix_cycle_skipped_on_infra_failure(
     assert result.has_errors()
     assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     assert not called
+    assert result.metadata.get("session_id") == _SESSION_ID
+    assert stub_agent.session_lookups == [f"/api/sessions/{_SESSION_ID}"]
+
+
+def test_infra_failure_preserves_token_canonicalisation_and_worker_fold(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a run is marked as infra failure, session tokens and worker tokens are preserved and folded."""
+    from kube_agents_bench.worker_trajectory import WorkerCapture
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        'HTTP 429 ... "TPM quota exhausted"'
+                    )
+                },
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    monkeypatch.setattr(
+        worker_trajectory,
+        "capture",
+        lambda *args, **kwargs: WorkerCapture(
+            entries=[],
+            summary={"tasks": {_TASK_ID: "worker-session"}},
+            tokens={"cluster": {"input_tokens": 50, "output_tokens": 25}},
+            unbilled=[],
+        ),
+    )
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert result.metadata.get("session_id") == _SESSION_ID
+    assert "front_door" in result.tokens
+    assert result.tokens["workers"]["input"] == 50
+    assert result.tokens["workers"]["output"] == 25
+    assert result.tokens["workers"]["total"] == 75
+    assert result.tokens["total"] == _SESSION_ROW["session"]["input_tokens"] + _SESSION_ROW["session"]["output_tokens"] + _SESSION_ROW["session"]["cache_read_tokens"] + _SESSION_ROW["session"]["cache_write_tokens"] + 75
+
+
+def test_a_delegated_worker_cleared_rate_limit_in_trajectory_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a card re-runs after a rate-limit and the newest run summary is cleared in trajectory, it remains graded."""
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked"},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        },
+                        {
+                            "summary": None,
+                        },
+                    ],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert f"Task {_TASK_ID} is blocked." in result.output
+
+
+def test_status_turn_unawaited_card_not_read_via_exec(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports an unawaited card as blocked, board read exec is not attempted for it."""
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_list",
+                {},
+                {
+                    "tasks": [
+                        {"id": _TASK_ID, "status": "in_progress"},
+                        {"id": "unawaited-999", "status": "blocked"},
+                    ]
+                },
+                "call_list",
+            ),
+            _text(f"Task {_TASK_ID} is in progress."),
+        ),
+        _show_turn("done"),
+    ]
+
+    exec_scripts: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        exec_scripts.append(script)
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert not any("unawaited-999" in s for s in exec_scripts)
 
 
 def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
