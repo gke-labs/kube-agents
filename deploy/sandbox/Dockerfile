@@ -77,7 +77,12 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
     tar -xzf /tmp/helm.tar.gz -C /tmp && \
     mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
-    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH} && \
+    curl -sSLf --retry 5 --retry-all-errors -o /tmp/leeway.tar.gz "https://github.com/go-steer/leeway/releases/download/v0.1.3/leeway_v0.1.3_linux_${ARCH}.tar.gz" && \
+    tar -xzf /tmp/leeway.tar.gz -C /usr/local/bin leeway && \
+    chmod +x /usr/local/bin/leeway && \
+    rm -f /tmp/leeway.tar.gz && \
+    /usr/local/bin/leeway version
 
 # In the agent container `python3` resolves through PATH into the Hermes venv,
 # so a shell command there gets these for free; here python3 is the bare base
