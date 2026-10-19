@@ -23,7 +23,7 @@ const (
 	boardMaxReply = 256 << 10
 	// errBoardNoBridge is what a request nothing answers means: the agent
 	// pod's bridge is down or not yet started.
-	errBoardNoBridge = "nothing answers the board route; the agent pod's bridge is not running"
+	errBoardNoBridge = "nothing answers the board route; the agent pod's bridge is not running, or has no session-kv key and never bound the route"
 )
 
 // busBoardReader reads the board over client's connection.

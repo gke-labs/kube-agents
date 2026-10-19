@@ -32,6 +32,8 @@ const (
 // It returns the subscription to stop, or nil when nothing was bound.
 func (b *Bridge) serveBoard() lib.Subscription {
 	if b.cfg.RouteURL == "" || strings.TrimSpace(b.cfg.RouteKey) == "" {
+		b.cfg.Logger.Info("board route not bound: no session-kv URL or key; the Slack Home tab will show no board",
+			"env", RouteKeyEnv)
 		return nil
 	}
 	sub, err := b.c.SubscribeCore(lib.BoardSubject, b.answerBoard)

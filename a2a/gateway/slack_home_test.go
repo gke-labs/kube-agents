@@ -290,27 +290,33 @@ func TestSlackHomeRepublishesToRecentViewersOnAChange(t *testing.T) {
 func TestSlackHomeAChangeDuringAPassRearmsInsteadOfOverlapping(t *testing.T) {
 	a, _, _ := homeAdapter(t, homeBoardFixture(), nil)
 	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	preset := time.AfterFunc(time.Hour, func() {})
+	defer preset.Stop()
 	a.SetHome(func(m string) (bool, bool) { return m == "U1", false }, func(context.Context) (*lib.Board, error) {
 		a.homeChanged(true) // a card moves mid-pass
 		a.home.mu.Lock()
-		running := a.home.timer
+		timer, dirty := a.home.timer, a.home.dirty
 		a.home.mu.Unlock()
-		if running == nil {
-			t.Error("the timer was cleared while the pass ran, so a second pass could start beside it")
+		if timer != preset {
+			t.Error("a timer was armed mid-pass, so a second pass could run beside this one")
+		}
+		if !dirty {
+			t.Error("the change during the pass was not marked dirty")
 		}
 		return homeBoardFixture(), nil
 	})
 	a.home.mu.Lock()
-	a.home.timer = time.AfterFunc(time.Hour, func() {})
+	a.home.timer = preset
 	a.home.refetch = true
 	a.home.mu.Unlock()
 	a.republishHome()
 	a.home.mu.Lock()
 	rearmed := a.home.timer
 	a.home.mu.Unlock()
-	if rearmed == nil || !rearmed.Stop() {
-		t.Fatal("the change during the pass was dropped")
+	if rearmed == nil || rearmed == preset {
+		t.Fatal("the change during the pass was dropped instead of rearming a new pass")
 	}
+	rearmed.Stop()
 }
 
 func TestSlackHomeMarkAndQuestionChangesArmARepublish(t *testing.T) {

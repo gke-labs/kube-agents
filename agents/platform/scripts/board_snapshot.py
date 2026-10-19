@@ -36,9 +36,7 @@ PROFILES_DIR = Path(HERMES_HOME) / "profiles"
 # The fleet-audit skill's scripts, scaffolded into the platform profile; the
 # report store's reader (report_status) and the stream titles (audit_report)
 # live there.
-FLEET_AUDIT_SCRIPTS = Path(
-    os.environ.get("FLEET_AUDIT_SCRIPTS_DIR") or PROFILES_DIR / "platform" / "skills" / "fleet-audit" / "scripts"
-)
+FLEET_AUDIT_SCRIPTS = PROFILES_DIR / "platform" / "skills" / "fleet-audit" / "scripts"
 
 CLUSTERS_MAX = 15
 RUNNING_MAX = 5
@@ -46,8 +44,15 @@ PRS_MAX = 5
 STATUS_RUNNING = "running"
 PR_OPENED_KIND = "pr_opened"
 # What a malformed row (a hand-written payload, a text timestamp) raises on the
-# way into the wire shape; that row is skipped.
-ROW_ERRORS = (TypeError, ValueError, OverflowError)
+# way into the wire shape; that row is skipped. OSError is gmtime() refusing a
+# year past a C int, which datetime.fromtimestamp documents alongside the rest.
+ROW_ERRORS = (TypeError, ValueError, OverflowError, OSError)
+# The range of the Go ints the wire shape decodes into (a2a/lib/board.go); a
+# number outside it would fail the gateway's decode of the whole board.
+WIRE_INT_MIN = -(1 << 63)
+WIRE_INT_MAX = (1 << 63) - 1
+# Joins a project and a cluster when a cluster name repeats across projects.
+PROJECT_CLUSTER_SEP = "/"
 CONFIG_NAME = "config.yaml"
 IDENTITY_KEY = "cluster_identity"
 
@@ -63,12 +68,30 @@ def _iso(epoch: float | None) -> str | None:
     return datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
 
 
-def cluster_identities(profiles_dir: Path | None = None) -> dict[str, str]:
-    """Profile name -> cluster name, for every profile stamped with a ``cluster_identity``."""
+def _wire_int(value: Any) -> int:
+    """``value`` as an int the wire shape's Go int holds; raises ValueError otherwise."""
+    if isinstance(value, bool):
+        raise ValueError("a boolean is not a number")
+    n = int(value or 0)
+    if not WIRE_INT_MIN <= n <= WIRE_INT_MAX:
+        raise ValueError(f"{n} is outside the wire int range")
+    return n
+
+
+def _rfc3339(value: Any) -> str:
+    """An ISO timestamp with its zone, re-emitted in UTC; raises ValueError for anything else."""
+    stamp = datetime.fromisoformat(str(value))
+    if stamp.tzinfo is None:
+        raise ValueError(f"{value!r} names no zone")
+    return stamp.astimezone(timezone.utc).isoformat()
+
+
+def cluster_identities(profiles_dir: Path | None = None) -> dict[str, tuple[str, str]]:
+    """Profile name -> (project, cluster), for every profile stamped with a ``cluster_identity``."""
     import yaml  # lazy, like cluster_agent_profile's reader
 
     profiles_dir = profiles_dir or PROFILES_DIR
-    out: dict[str, str] = {}
+    out: dict[str, tuple[str, str]] = {}
     if not profiles_dir.is_dir():
         return out
     for home in sorted(profiles_dir.iterdir()):
@@ -81,34 +104,47 @@ def cluster_identities(profiles_dir: Path | None = None) -> dict[str, str]:
             continue
         identity = data.get(IDENTITY_KEY) if isinstance(data, dict) else None
         if isinstance(identity, dict) and identity.get("cluster"):
-            out[home.name] = str(identity["cluster"])
+            out[home.name] = (str(identity.get("project") or ""), str(identity["cluster"]))
     return out
 
 
-def clusters(findings: list[dict], roster: list[str]) -> list[dict]:
+def cluster_labels(keys: set[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """Each (project, cluster) as the board names it: the cluster, or project/cluster where the name repeats."""
+    projects: dict[str, set[str]] = {}
+    for project, cluster in keys:
+        projects.setdefault(cluster, set()).add(project)
+    return {
+        (project, cluster): f"{project}{PROJECT_CLUSTER_SEP}{cluster}" if len(projects[cluster]) > 1 else cluster
+        for project, cluster in keys
+    }
+
+
+def clusters(findings: list[dict], roster: set[tuple[str, str]], labels: dict[tuple[str, str], str]) -> list[dict]:
     """One row per cluster, worst first: the managed fleet plus any cluster a finding names.
 
     ``findings`` is the open queue in rank order, so the first finding seen for
     a cluster is its top one. Clusters with findings sort by their top
-    finding's rank; clean ones follow by name.
+    finding's rank; clean ones follow by name. A cluster is its (project,
+    cluster) pair, the findings queue's own key, so two projects' ``prod`` are
+    two rows.
     """
-    rows: dict[str, dict] = {}
-    order: list[str] = []
+    rows: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
     for f in findings:
-        name = f.get("cluster") or ""
-        if not name:
+        key = (str(f.get("project") or ""), str(f.get("cluster") or ""))
+        if not key[1]:
             continue
-        if name not in rows:
-            rows[name] = {"name": name, "findings": 0, "severity": f.get("severity") or "", "top": f.get("title") or ""}
-            order.append(name)
-        rows[name]["findings"] += 1
-    for name in sorted(set(roster) - set(rows)):
-        rows[name] = {"name": name, "findings": 0}
-        order.append(name)
-    return [rows[name] for name in order]
+        if key not in rows:
+            rows[key] = {"name": labels[key], "findings": 0, "severity": f.get("severity") or "", "top": f.get("title") or ""}
+            order.append(key)
+        rows[key]["findings"] += 1
+    for key in sorted(roster - set(rows), key=lambda k: labels[k]):
+        rows[key] = {"name": labels[key], "findings": 0}
+        order.append(key)
+    return [rows[key] for key in order]
 
 
-def running(kanban: sqlite3.Connection, identities: dict[str, str]) -> list[dict]:
+def running(kanban: sqlite3.Connection, identities: dict[str, tuple[str, str]], labels: dict[tuple[str, str], str]) -> list[dict]:
     rows = kanban.execute(
         "SELECT title, assignee, started_at, created_at FROM tasks WHERE status = ? "
         "ORDER BY COALESCE(started_at, created_at) DESC LIMIT ?",
@@ -121,7 +157,7 @@ def running(kanban: sqlite3.Connection, identities: dict[str, str]) -> list[dict
         except ROW_ERRORS:
             continue  # a malformed row costs its own line, not the board
         if assignee in identities:
-            card["cluster"] = identities[assignee]
+            card["cluster"] = labels[identities[assignee]]
         out.append(card)
     return out
 
@@ -144,7 +180,7 @@ def prs(kanban: sqlite3.Connection) -> list[dict]:
         try:
             row = {
                 "url": data["url"],
-                "number": int(data.get("number") or 0),
+                "number": _wire_int(data.get("number")),
                 "title": str(data.get("title") or ""),
                 "opened_at": _iso(created),
             }
@@ -158,22 +194,30 @@ def prs(kanban: sqlite3.Connection) -> list[dict]:
 
 
 def last_audit(projection: dict, name_of: Callable[[str], str]) -> dict | None:
-    """The newest finished run across every stream and repository in report_status's projection."""
+    """The newest finished run across every stream and repository in report_status's projection.
+
+    Each run is normalised to the wire shape first; one whose fields will not
+    (a zoneless or unparsable ``finished_at``, a non-numeric issue) is skipped.
+    """
     best: dict | None = None
     for audit_id, stream in (projection.get("streams") or {}).items():
         for repo in (stream.get("repos") or {}).values():
             latest = repo.get("latest")
             if not isinstance(latest, dict) or not latest.get("finished_at") or latest.get("findings") is None:
                 continue
-            if best is None or latest["finished_at"] > best["finished_at"]:
-                best = {
-                    "name": name_of(audit_id),
-                    "findings": latest["findings"],
-                    "critical": latest.get("critical") or 0,
-                    "issue_url": latest.get("issue_url") or "",
-                    "issue": latest.get("issue_number") or 0,
-                    "finished_at": latest["finished_at"],
+            try:
+                run = {
+                    "name": str(name_of(audit_id)),
+                    "findings": _wire_int(latest["findings"]),
+                    "critical": _wire_int(latest.get("critical")),
+                    "issue_url": str(latest.get("issue_url") or ""),
+                    "issue": _wire_int(latest.get("issue_number")),
+                    "finished_at": _rfc3339(latest["finished_at"]),
                 }
+            except ROW_ERRORS:
+                continue
+            if best is None or run["finished_at"] > best["finished_at"]:
+                best = run
     return best
 
 
@@ -211,7 +255,9 @@ def snapshot(
     except sqlite3.Error as exc:
         raise BoardError(f"the findings queue could not be read: {exc}") from None
     identities = cluster_identities(profiles_dir)
-    fleet = clusters(findings, sorted(set(identities.values())))
+    roster = set(identities.values())
+    labels = cluster_labels(roster | {(str(f.get("project") or ""), str(f.get("cluster") or "")) for f in findings})
+    fleet = clusters(findings, roster, labels)
     board: dict[str, Any] = {
         "generated_at": now.astimezone(timezone.utc).isoformat(),
         "clusters": fleet[:CLUSTERS_MAX],
@@ -221,7 +267,7 @@ def snapshot(
     }
     if kanban is not None:
         try:
-            board["running"] = running(kanban, identities)
+            board["running"] = running(kanban, identities, labels)
             board["prs"] = prs(kanban)
         except sqlite3.Error as exc:
             raise BoardError(f"the kanban board could not be read: {exc}") from None

@@ -5567,6 +5567,13 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         self.assertEqual(body["audit"], audit)
         self.assertIn("clusters", body)
 
+    def test_board_an_unreadable_source_is_a_503(self):
+        with patch.object(
+            session_kv_server.board_snapshot, "snapshot", side_effect=session_kv_server.board_snapshot.BoardError("gone")
+        ):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 503, resp.text)
+
     def test_board_with_no_kanban_board_yet_is_empty(self):
         with patch.object(session_kv_server.board_snapshot, "default_audit", lambda: None), patch.object(
             session_kv_server.board_snapshot, "PROFILES_DIR", self.root / "profiles"

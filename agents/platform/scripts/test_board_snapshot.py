@@ -97,6 +97,22 @@ class BoardSnapshotTest(unittest.TestCase):
         self.assertEqual(len(board["clusters"]), board_snapshot.CLUSTERS_MAX)
         self.assertEqual(board["cluster_count"], board_snapshot.CLUSTERS_MAX + 7)
 
+    def test_a_cluster_name_two_projects_share_is_two_rows(self):
+        for project in ("p1", "p2"):
+            home = self.profiles / f"ca-{project}-prod"
+            home.mkdir()
+            (home / "config.yaml").write_text(f"cluster_identity:\n  project: {project}\n  cluster: prod\n  location: l\n")
+        f1 = finding("prod", "payments-api crashlooping", "critical")
+        f2 = dict(finding("prod", "no PDB on checkout", "minor"), project="p2")
+        f1["project"] = "p1"
+        findings_queue.register_findings(self.session, [f1, f2])
+        board = self.snap()
+        names = [c["name"] for c in board["clusters"]]
+        self.assertEqual(names[:2], ["p1/prod", "p2/prod"])
+        self.assertEqual(board["clusters"][0]["findings"], 1)
+        self.assertEqual(board["cluster_count"], 4)
+        self.assertIn("seeded-a", names)
+
     def test_a_closed_finding_is_not_open(self):
         findings_queue.register_findings(self.session, [finding("seeded-a", "gone", "critical")])
         self.session.execute("UPDATE findings SET state = 'resolved'")
@@ -151,6 +167,8 @@ class BoardSnapshotTest(unittest.TestCase):
                 ("t1", "pr_opened", json.dumps({"url": ["x"], "number": 2}), STARTED + 1),
                 ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/3", "number": "three"}), STARTED + 2),
                 ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/4", "number": 4}), 1e30),
+                ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/5", "number": 5}), 1.79e18),
+                ("t1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/6", "number": 1e30}), STARTED + 3),
             ],
         )
         board = self.snap(kb)
@@ -201,6 +219,23 @@ class BoardSnapshotTest(unittest.TestCase):
             },
         )
         self.assertIsNone(board_snapshot.last_audit({"streams": {}}, str))
+
+    def test_an_audit_run_the_wire_shape_cannot_hold_is_skipped(self):
+        def stream(**latest):
+            return {"repos": {"a/b": {"latest": dict({"findings": 1, "critical": 0}, **latest)}}}
+
+        projection = {
+            "streams": {
+                "ring-stamp": stream(finished_at="20261016T102400.000000Z"),
+                "zoneless": stream(finished_at="2026-10-17T10:24:00"),
+                "string-issue": stream(finished_at="2026-10-18T10:24:00+00:00", issue_number="231x"),
+                "good": stream(finished_at="2026-10-15T06:24:00-04:00", issue_number=231),
+            }
+        }
+        got = board_snapshot.last_audit(projection, str)
+        # The ring stamp parses with its zone and is re-emitted in RFC 3339; the newer
+        # zoneless and non-numeric runs are skipped.
+        self.assertEqual((got["name"], got["finished_at"], got["issue"]), ("ring-stamp", "2026-10-16T10:24:00+00:00", 0))
 
     def test_the_audit_lands_on_the_board(self):
         audit = {"name": "n", "findings": 0, "critical": 0, "issue_url": "", "issue": 0, "finished_at": "2026-10-16T10:24:00+00:00"}
