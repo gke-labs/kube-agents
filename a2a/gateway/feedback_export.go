@@ -46,10 +46,15 @@ const (
 	// when the answer was rated (past AskTTL, or a reaped session).
 	feedbackNoAsk = "TODO: the question was no longer on record when this answer was rated; take it from the conversation"
 
-	// The characters JSON writes raw and YAML refuses in a stream.
-	yamlDEL     = '\u007f'
-	yamlC1First = '\u0080'
-	yamlC1Last  = '\u009f'
+	// The characters JSON writes raw and YAML refuses in a stream, and the
+	// two Unicode separators YAML reads as line breaks.
+	yamlDEL      = '\u007f'
+	yamlC1First  = '\u0080'
+	yamlC1Last   = '\u009f'
+	yamlNonchar1 = '\ufffe'
+	yamlNonchar2 = '\uffff'
+	yamlLineSep  = '\u2028'
+	yamlParaSep  = '\u2029'
 )
 
 // yamlUnprintable escapes DEL and the C1 controls inside a double-quoted
@@ -57,6 +62,9 @@ const (
 var yamlUnprintable = func() *strings.Replacer {
 	var pairs []string
 	for r := yamlDEL; r <= yamlC1Last; r++ {
+		pairs = append(pairs, string(r), fmt.Sprintf("\\u%04x", r))
+	}
+	for _, r := range []rune{yamlNonchar1, yamlNonchar2} {
 		pairs = append(pairs, string(r), fmt.Sprintf("\\u%04x", r))
 	}
 	return strings.NewReplacer(pairs...)
@@ -196,10 +204,16 @@ func yamlString(s string) string {
 }
 
 // yamlComment is s fit for a YAML comment line: the characters YAML refuses
-// in a stream dropped, and line breaks left to the caller.
+// in a stream, and the ones it reads as a line break (which would end the
+// comment and make the rest of the note YAML), dropped; tabs kept, and
+// line feeds left to the caller.
 func yamlComment(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r == yamlDEL || (r >= yamlC1First && r <= yamlC1Last) || r == '\r' {
+		switch {
+		case r == '\t':
+			return r
+		case r < ' ', r == yamlDEL, r >= yamlC1First && r <= yamlC1Last,
+			r == yamlLineSep, r == yamlParaSep, r == yamlNonchar1, r == yamlNonchar2:
 			return -1
 		}
 		return r

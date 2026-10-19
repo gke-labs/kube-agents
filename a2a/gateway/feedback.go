@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,9 @@ const (
 	// tried again (mergeFeedback); two writers race at most.
 	feedbackRecorderDeadline = 10 * time.Second
 	feedbackMergeAttempts    = 5
+	// feedbackLockStripes is how many locks the ratings are serialised on
+	// (feedbackDesk.lockKey).
+	feedbackLockStripes = 64
 
 	// feedbackRetryInterval is how often the gateway looks again for a
 	// feedback bucket it did not find at start: on an upgrade the provision
@@ -139,16 +143,20 @@ type FeedbackSink interface {
 type feedbackDesk struct {
 	g   *Gateway
 	ttl time.Duration
-	// keys serialises the ratings on one answer by one rater, so a 👍
+	// stripes serialise the ratings on one answer by one rater, so a 👍
 	// tapped while that rater's 👎 is still being written waits for it and
-	// then takes it back, instead of finding nothing to take back.
-	keys sync.Map // feedbackKey -> *sync.Mutex
+	// then takes it back, instead of finding nothing to take back. Striped
+	// by the key's hash rather than one lock per key, so the set stays
+	// fixed however many answers are rated; two unrelated ratings sharing
+	// a stripe only wait for each other.
+	stripes [feedbackLockStripes]sync.Mutex
 }
 
 // lockKey takes the rating lock for key and returns its release.
 func (d *feedbackDesk) lockKey(key string) func() {
-	m, _ := d.keys.LoadOrStore(key, &sync.Mutex{})
-	mu := m.(*sync.Mutex)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	mu := &d.stripes[h.Sum32()%feedbackLockStripes]
 	mu.Lock()
 	return mu.Unlock
 }
@@ -254,14 +262,16 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 		return errFeedbackUnverified
 	}
 	g.metrics.answerRated(r.Platform, r.Rating)
+	key := feedbackKey(r.TaskID, r.Rater)
+	// Locked before the deadline starts, so waiting on the rater's previous
+	// tap does not spend this one's budget.
+	defer d.lockKey(key)()
 	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
 	defer cancel()
 	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
 		return fmt.Errorf("feedback bucket: %w", err)
 	}
-	key := feedbackKey(r.TaskID, r.Rater)
-	defer d.lockKey(key)()
 	if r.Rating != FeedbackDown {
 		// A 👍 keeps nothing, and takes back the rater's 👎 if there is one.
 		// Looked up first: a KV delete writes a marker whether or not the

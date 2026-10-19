@@ -344,6 +344,15 @@ func TestFeedbackDraftEscapesWhatYAMLRefusesAndMarksAMissingAsk(t *testing.T) {
 	if !strings.Contains(got, `\u0092`) {
 		t.Errorf("the ask's C1 character must be escaped, not dropped:\n%s", got)
 	}
+	ansi := feedbackCaseYAML("feedback-20261016-abcd", FeedbackRecord{Ask: "x\uffff", Note: "\x1b[31mred\x1b[0m\u2028id: injected", RatedAt: time.Now()})
+	for _, line := range strings.Split(ansi, "\n") {
+		if strings.HasPrefix(line, "id: injected") {
+			t.Errorf("a line separator in the note ended its comment:\n%s", ansi)
+		}
+	}
+	if strings.ContainsAny(ansi, "\x1b\u2028\uffff") {
+		t.Errorf("draft carries ESC, U+2028 or U+FFFF raw:\n%s", ansi)
+	}
 	empty := feedbackCaseYAML("feedback-20261016-abcd", FeedbackRecord{RatedAt: time.Now()})
 	if !strings.Contains(empty, "prompt: "+yamlString(feedbackNoAsk)) || !strings.Contains(feedbackTranscriptMD(FeedbackRecord{}), feedbackNoAsk) {
 		t.Errorf("a draft with no ask on record must say so:\n%s", empty)
