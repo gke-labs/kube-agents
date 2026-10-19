@@ -150,6 +150,7 @@ type slackAPI interface {
 	RemoveReaction(name string, item slack.ItemRef) error
 	GetUserInfo(user string, options ...slack.GetUserInfoOption) (*slack.User, error)
 	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
+	PublishView(userID string, view slack.HomeTabViewRequest, hash string) (*slack.ViewResponse, error)
 }
 
 // SlackAdapter is the first real mapped-identity backend. Transport is
@@ -232,6 +233,12 @@ type SlackAdapter struct {
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
 	ux *slackUX
+
+	// workspaceURL is the bot's workspace as auth.test names it
+	// ("https://acme.slack.com/"), the root of a message's permalink; home is
+	// the Home tab's state (slack_home.go).
+	workspaceURL string
+	home         slackHome
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -661,15 +668,22 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			}
 			switch inner := e.InnerEvent.Data.(type) {
 			case *slackevents.MessageEvent:
-				if msg, ok := s.inbound(ctx, inner); ok {
+				var parent string
+				if evt.Request != nil {
+					parent = slackParentUserID(evt.Request.Payload)
+				}
+				if msg, ok := s.inboundEvent(ctx, inner, parent); ok {
 					// Recorded before the handoff, so the gateway's word on
 					// the sender always finds it (InboundVerified).
 					s.notePending(msg)
 					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}
-			case *slackevents.AssistantThreadStartedEvent, *slackevents.AppHomeOpenedEvent:
+			case *slackevents.AssistantThreadStartedEvent:
 				s.suggestPrompts(inner)
+			case *slackevents.AppHomeOpenedEvent:
+				s.suggestPrompts(inner)
+				s.homeOpened(inner)
 			}
 		}
 	}()
@@ -1046,7 +1060,10 @@ func (s *SlackAdapter) alreadySeen(key string) bool {
 // @mention), and the next reply asks again. With no lookup wired (an
 // embedder that offers none) a miss is a false; there is nothing to ask.
 //
-// Nothing is derived from the root message, and that is deliberate. The
+// Nothing about a session thread is derived from the root message, and that
+// is deliberate. (A reply under the bot's own post is a separate rule,
+// decided in inboundEvent from the root's author, and it makes no session
+// thread either.) The
 // root can say that someone mentioned the bot; it cannot say that the
 // gateway verified them and started a task, and only the latter makes a
 // session thread. So a channel ask's own thread becomes a session thread
@@ -1211,6 +1228,7 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	s.botUserID = auth.UserID
 	s.teamID = auth.TeamID
+	s.workspaceURL = auth.URL
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID, "team", auth.TeamID)
 	if auth.TeamID == "" {
 		// foreignSender fails closed without it, so a message that names any
@@ -1262,14 +1280,38 @@ func (s *SlackAdapter) otherWorkspace(team string) bool {
 // conversation; a channel
 // message must mention the bot, and the ask's own ts becomes the session
 // thread's root (Slack threads are implicit); a thread reply is a turn when
-// it mentions the bot or the thread is already a session thread — one the
-// gateway has started a task in, which a mention alone does not make it,
+// it mentions the bot, the thread's root is the bot's own post (an alert or
+// another home-channel post; read from the event, see inboundEvent), or the thread is
+// already a session thread — one the gateway has started a task in, which a
+// mention alone does not make it,
 // the channel ask's own thread included: the gateway starting the task
 // there does (TaskStarted), the same as for any other thread, and a channel
 // mention from an unverified sender roots nothing. Everything else — bots,
 // our own posts, edits and other subtypes, redeliveries, and a sender from
 // another workspace — is not a turn.
 func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent) (InboundMessage, bool) {
+	return s.inboundEvent(ctx, m, "")
+}
+
+// slackParentUserID is the thread root's author on a thread reply, from the
+// raw Events API payload: Slack sends it as event.parent_user_id, and
+// slackevents.MessageEvent has no field for it. Empty on anything else, and
+// on a payload that does not parse, which reads as "not known".
+func slackParentUserID(payload json.RawMessage) string {
+	var envelope struct {
+		Event struct {
+			ParentUserID string `json:"parent_user_id"`
+		} `json:"event"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &envelope) != nil {
+		return ""
+	}
+	return envelope.Event.ParentUserID
+}
+
+// inboundEvent is inbound with the thread root's author, when the event
+// carried one (slackParentUserID).
+func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageEvent, parentUserID string) (InboundMessage, bool) {
 	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
 		return InboundMessage{}, false
@@ -1348,12 +1390,22 @@ func (s *SlackAdapter) inbound(ctx context.Context, m *slackevents.MessageEvent)
 		// bare mention as a reply.
 		return InboundMessage{}, false
 	}
-	if isReply && !mentioned && !s.isSessionThread(ctx, m.Channel, threadTS) {
+	// A reply under one of the bot's own posts is addressed to it, mention or
+	// not: an alert, or any other chat.notify post the bot roots in the home
+	// channel, starts a thread no task started, so it is never a session
+	// thread, and its
+	// replies used to vanish without a log line (gke-labs/kube-agents#3246).
+	// Same rule as the today path's Slack adapter (_bot_authored_thread_root,
+	// upstream #63530), and like it, durable: Slack says who rooted the
+	// thread on every reply, so a restart or an expired mark changes nothing.
+	botRooted := isReply && parentUserID != "" && parentUserID == s.botUserID
+	if isReply && !mentioned && !botRooted && !s.isSessionThread(ctx, m.Channel, threadTS) {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{
 		Conversation: slackConversationID(m.ChannelType, m.Channel, threadTS),
 		Kind:         "group",
+		Unaddressed:  botRooted && !mentioned,
 		AuthorID:     m.User,
 		MessageID:    m.TimeStamp,
 		// Decoded last, after the mention match and strip above: both key on

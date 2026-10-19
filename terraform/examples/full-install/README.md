@@ -61,6 +61,14 @@ install without the interview.
   development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
   `install.env`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
+  `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
+  `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.
+  A key that is not set keeps the default in the agent image. Each apply that
+  changes the env list that the chart renders replaces the `PlatformAgent`'s
+  `spec.deployment.env`, and entries added to the CR by hand are lost. Set
+  those through `platformAgent.deployment.env` in `extra_helm_values`. The
+  [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+  gives the buckets, the defaults and a sizing method.
 - Two `random_password` values added to that Secret rather than asked for:
   `SESSION_KV_API_KEY`, the bearer token for the pod-local Session KV server,
   and `SESSION_KV_SALT`, the HMAC salt that pseudonymises chat identities.
@@ -85,6 +93,17 @@ install without the interview.
   `enable_drift_detector = true` alongside it, the
   `spec.harness.driftDetector.enabled` field that starts the consumer. See
   [Drift audit-log ingress](#drift-audit-log-ingress).
+- Optionally (`model_provider = "openai_compatible"`) a server speaking the OpenAI
+  chat-completions API (vLLM, TGI, an internal gateway), reached through the
+  gateway. No GCP resource: the composition passes the chart
+  `litellm.openaiCompatible` from `openai_compatible_api_base` (the base URL
+  including `/v1`), `openai_compatible_target_port` (the server pod's port, for
+  an in-cluster Service), `openai_compatible_egress_cidrs` (the private ranges
+  any other host is reached at; none for a public endpoint on 443) and
+  `openai_compatible_ca_secret_name` (a Secret you create holding the CA under
+  `ca.crt`), and puts `openai_compatible_api_key`, when set, in the credentials
+  Secret as `OPENAI_COMPATIBLE_API_KEY`. `model_default_name` has no default for
+  it; the plan fails without it or the base URL.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -749,7 +768,7 @@ with the created topic/subscription — restrict access with
 
 With `enable_github_minter = true`, set `github_repo` to your primary GitOps repository (in `owner/repo` or GitHub URL format). Additional GitOps repositories within the same organization can also be registered in the ConfigMap by cluster administrators.
 
-For a GitOps repository on a GitHub Enterprise Server, `github_repo` must be `owner/name` on the instance, not a URL: the composition reads a github.com URL only. The forge itself is declared in `extra_helm_values`, in a `ghes.auto.tfvars` file beside `terraform.tfvars`; keep all of `extra_helm_values` in that one file, because Terraform does not merge a variable across files. The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network, because the composition has no network or subnetwork variable: an instance reachable only from another VPC or a Shared VPC needs a cluster created in that VPC and `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
+For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the instance's hostname and `github_repo` to `owner/name` on the instance (not a URL: the composition reads a github.com URL only). The composition then declares the `github` forge at that host in `spec.integration.forges`, with the owner as its namespace, and the repository as its `gitops` repository, with no `github` alias; the chart points the token minter at `https://<host>/api/v3`. A host where GitHub runs its own services (`github.com`, `githubusercontent.com`, `ghe.com` and the like) or `gitlab.com` is refused. When a private CA signed the instance's certificate, set `github_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`: the broker trusts it for that host only, and the minter trusts it for all of its calls and reads it when it starts, so restart the minter after the Secret changes (`install.sh --gitops-ca-file` creates the Secret and restarts the minter). The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network, because the composition has no network or subnetwork variable: an instance reachable only from another VPC or a Shared VPC needs a cluster created in that VPC and `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
 
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
 

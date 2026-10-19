@@ -243,7 +243,9 @@ def _platform_script_dirs() -> tuple[str, ...]:
 # the reconcile's snapshot themselves): the flags, their parsing and the note
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
-# the install could not read, recorded as a coverage gap. Without them the
+# the install could not read, recorded as a coverage gap;
+# `--scope-exclude-clusters` names the clusters spec.scope.exclude.clusters
+# leaves out, dropped from the listing unread (#3081). Without them the
 # collector enumerates every project the identity can list, which is right on
 # a checkout and on an install that declares no scope; on a sandbox whose
 # operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
@@ -254,7 +256,7 @@ for _shared_dir in _platform_script_dirs():
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 # What that same target stands for when the operator narrowed the scope on
@@ -789,6 +791,7 @@ def enumerate_clusters(project: str, *, run: RunFn = default_run) -> tuple[list[
         return [], [], f"clusters list returned non-JSON: {exc}"[:ERROR_EXCERPT_CHARS]
     if not isinstance(clusters, list):
         return [], [], "clusters list returned JSON that is not a list"
+    clusters = declared_scope.drop_excluded(project, clusters)
     running = []
     for c in clusters:
         if c.get("status") not in AUDITABLE_STATUSES:
@@ -5992,7 +5995,7 @@ AI_ACCELERATOR_KEY_RE = re.compile(r"nvidia\.com/gpu|google\.com/tpu")
 # no model server anywhere.
 AI_PROVIDER_CREDENTIAL_ENV_RE = re.compile(
     r"^(OPENAI|ANTHROPIC|GEMINI|COHERE|MISTRAL|TOGETHER|GROQ|PERPLEXITY|DEEPSEEK|"
-    r"FIREWORKS|ANYSCALE|AZURE_OPENAI|VERTEXAI|XAI|WANDB)_API_KEY$"
+    r"FIREWORKS|ANYSCALE|AZURE_OPENAI|VERTEXAI|XAI|HOSTED_VLLM|WANDB)_API_KEY$"
     r"|^(HF|HUGGING_FACE_HUB|HUGGINGFACE)_(TOKEN|API_TOKEN)$"
     r"|^REPLICATE_API_TOKEN$",
     re.IGNORECASE,
@@ -10271,7 +10274,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and

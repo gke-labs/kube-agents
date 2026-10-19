@@ -1134,6 +1134,15 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         # The scope keys for the same reason: the generator's triple check and
         # terraform's variable validation both run on the destroy path.
+        # The openai_compatible endpoint too: the generator validates it, and an
+        # openai_compatible provider with its endpoint blanked would be refused,
+        # so the provider is reset as well.
+        endpoint_at = text.find('export OPENAI_COMPATIBLE_API_BASE="" OPENAI_COMPATIBLE_TARGET_PORT="" OPENAI_COMPATIBLE_EGRESS_CIDRS="" OPENAI_COMPATIBLE_CA_SECRET_NAME=""')
+        self.assertNotEqual(endpoint_at, -1, "uninstall.sh must blank the OPENAI_COMPATIBLE_* keys")
+        self.assertLess(endpoint_at, call_at)
+        provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
+        self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
+        self.assertLess(provider_at, call_at)
         scope_at = text.find('export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_MAX_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
         self.assertNotEqual(scope_at, -1, "uninstall.sh must blank the SCOPE_* keys")
         self.assertLess(scope_at, call_at)
@@ -1155,6 +1164,20 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')
         self.assertNotEqual(pool_at, -1, "uninstall.sh must blank the SCOPED_SA_POOL_* keys")
         self.assertLess(pool_at, call_at)
+        # And the daily alert ceilings: the generator refuses a value that is
+        # not a whole number, and a teardown must not stop on it. The names
+        # come from the generator's own list, so a key added there and not
+        # here fails this test.
+        keys_match = re.search(
+            r'^readonly ALERT_DAILY_LIMIT_KEYS="([^"]+)"$',
+            _INSTALLER_COMMON.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(keys_match, "installer_common.sh must define ALERT_DAILY_LIMIT_KEYS")
+        alert_export = "export " + " ".join(f'{key}=""' for key in keys_match.group(1).split())
+        alert_at = text.find(alert_export)
+        self.assertNotEqual(alert_at, -1, f"uninstall.sh must blank every ALERT_DAILY_LIMIT_* key: {alert_export}")
+        self.assertLess(alert_at, call_at)
 
 
 class UninstallSummaryDisclosureTest(unittest.TestCase):

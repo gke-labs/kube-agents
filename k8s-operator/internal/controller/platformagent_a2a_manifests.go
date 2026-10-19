@@ -558,7 +558,9 @@ const (
 	// the platform whose gateway conversations a card reports back to. Its own
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
-	// and so needs one.
+	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
+	// gateway_platform) reads it too, to name the platform whose home channel
+	// is missing when it refuses a report.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
@@ -6088,7 +6090,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Nine reads answer it instead of walking every object
+	// cost for a no-op. Ten reads answer it instead of walking every object
 	// in the teardown sequence:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an

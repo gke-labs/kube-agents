@@ -247,6 +247,7 @@ Pick one at least:
 - `GEMINI_API_KEY` (recommended default; get one at [aistudio.google.com](https://aistudio.google.com)).
 - `ANTHROPIC_API_KEY`.
 - `OPENAI_API_KEY`.
+- `OPENAI_COMPATIBLE_API_KEY`, for an OpenAI-compatible server you run (`openai_compatible`), and only if that server checks a key. See [Inference gateway](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private).
 
 Or route one of these keys through a self-hosted LiteLLM gateway — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a Gemini API-key template.
 
@@ -263,7 +264,7 @@ The declarative workflow routes infrastructure mutations through pull requests v
   - **Option 1 (Automated import via `install.sh`):** Provide `--github-pem-path="/path/to/app-private-key.pem"` during install. `install.sh` creates the KMS key, runs the Minty CLI to import the key, and you can delete the local `.pem` file immediately after. Needs Go 1.21+ on the installer host — the Minty CLI asks for Go 1.24, and 1.21 onwards downloads that toolchain on demand. Distribution packages are often older (Debian 12 ships 1.19, Ubuntu 22.04 ships 1.18); `install.sh` checks before it builds and tells you if yours cannot work. This is unrelated to the Go version needed to build the operator.
   - **Option 2 (Pre-provisioned Ahead-Of-Time):** Pre-provision the KMS key and import the private key upfront following the [upstream guide](https://github.com/abcxyz/github-token-minter#readme) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) (recommended for CI/CD and release pipelines). `install.sh` detects the existing `ENABLED` version and skips `.pem` handling.
 
-**A GitOps repository on a GitHub Enterprise Server** needs the App on the instance, a network path from the cluster to the instance, and the Terraform + Helm method, because `install.sh` cannot install it yet: see [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+**A GitOps repository on a GitHub Enterprise Server** needs the App on the instance, a network path from the cluster to the instance on port 443, and, for a private CA, the CA's PEM file for `--gitops-ca-file`. `install.sh` installs it with `--gitops-host`: see [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
 
 See [Deploy → Token minter](/kube-agents/deploy/token-minter/) and the upstream [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter#readme) guide for complete setup details.
 

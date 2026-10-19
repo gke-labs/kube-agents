@@ -154,7 +154,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 SCOPED_RUN_NOTE = (
@@ -1224,6 +1224,7 @@ def enumerate_clusters(project: str, *, run: RunFn) -> tuple[list[dict], list[di
     # the project as holding no cluster.
     if not isinstance(clusters, list) or not all(isinstance(c, dict) for c in clusters):
         raise RuntimeError("cluster enumeration returned JSON that is not a list of clusters")
+    clusters = declared_scope.drop_excluded(project, clusters)
     running = [
         {
             "name": c["name"],
@@ -5558,6 +5559,15 @@ def _bare_cluster_name(entry: dict) -> str:
     return entry.get("name", "").rsplit(QUALIFIED_TARGET_SEPARATOR, 1)[-1]
 
 
+# Appended to a project's limitations when the install excludes some of its
+# clusters: they count among the unread above, by design rather than failure.
+EXCLUDED_CLUSTERS_NOTE = (
+    "{named} in this project are excluded by the install's spec.scope.exclude.clusters and were not "
+    "read on purpose: the checks above that need every cluster's objects count them as unread, so "
+    "nothing they own is reported as abandoned."
+)
+
+
 def _known_clusters(clusters: list[dict]) -> tuple[set[str], set[tuple[str, str | None]]]:
     """A project's cluster names, and its (name, location) pairs, whatever their status."""
     return (
@@ -5574,6 +5584,14 @@ def _unread_names(known: set[tuple[str, str | None]], collected: set[tuple[str, 
     when two clusters share a name and only one was read, the name counts as
     unread, which skips the read one's disks rather than flag the other's."""
     return frozenset(name for name, _ in known - collected)
+
+
+def _only_excluded_unread(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]], dropped: list[tuple[str, str]]) -> bool:
+    """Whether every cluster this project left unread is one the install
+    excludes (#3081). On (name, location) pairs: a failed read of a cluster
+    that shares an excluded one's name in another location is not an
+    exclusion, and its limitation must keep saying it could not be read."""
+    return bool(dropped) and (known - collected) <= set(dropped)
 
 
 def _unread_labels(known: set[tuple[str, str | None]], collected: set[tuple[str, str | None]]) -> list[str]:
@@ -5901,7 +5919,7 @@ def forwarding_rules_argv(project: str) -> list[str]:
     return ["gcloud", "compute", "forwarding-rules", "list", "--project", project, "--format", "json"]
 
 
-def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True) -> dict | None:
+def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict, *, run: RunFn, now: datetime, known_clusters: set[str] | None = None, forwarding_rules: tuple[object | None, Run] | None = None, unread_clusters: frozenset[str] = frozenset(), clusters_read: int | None = None, unread_labels: list[str] | None = None, announce: bool = True, excluded: list[str] | None = None, only_excluded_unread: bool | None = None) -> dict | None:
     # `--filter=-users:*` and not `"--filter", "-users:*"`: a filter value
     # starting with `-` reads as a flag to gcloud's own argument parser, which
     # then rejects the command for the argument it thinks is missing
@@ -6018,6 +6036,11 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
     compute_ok = not compute_disabled and not compute_failed
     disks_judged = compute_ok and not none_read
     unread_named = ", ".join(sorted(unread_clusters) if unread_labels is None else unread_labels)
+    # Every cluster left unread is one the install excludes: no read failed.
+    # The caller decides on (name, location) pairs, since `unread_clusters` is
+    # reduced to names and a failed read of a same-named cluster in another
+    # location must not read as an exclusion; by name only when not told.
+    only_excluded = only_excluded_unread if only_excluded_unread is not None else bool(excluded) and set(unread_clusters) <= set(excluded)
     candidates = [_emit("unattached-disk", h) for h in check_unattached_disk(disks_parsed, fleet_facts["pv_handles"], now=now, known_clusters=known_clusters, unread_clusters=unread_clusters)] if disks_judged else []
     # §3.5 clears an address any Service or Ingress annotation names, and
     # `referenced_addresses` holds only the read clusters' annotations, so an
@@ -6070,19 +6093,30 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
         # would turn every load balancer it serves into a false positive. The
         # unreadable clusters are their own manifest entries, carrying the
         # stderr that explains each one.
-        entry["limitations"] = (
-            "orphan-lb was not evaluated for this project: §3.6 compares "
-            "forwarding rules against the Service names of every cluster in "
-            "the project, and at least one of them could not be read, so a "
-            "rule that cluster's Services reference would read as orphaned. "
-            "See this project's cluster "
-            "entries in this manifest for the reason each one failed."
-        )
+        if only_excluded:
+            # Every cluster left unread is one the install excludes: there is no
+            # failed entry to point at, and EXCLUDED_CLUSTERS_NOTE below names them.
+            entry["limitations"] = (
+                "orphan-lb was not evaluated for this project: §3.6 compares "
+                "forwarding rules against the Service names of every cluster in "
+                "the project, and the clusters the install excludes were not "
+                "read, so a rule their Services reference would read as orphaned."
+            )
+        else:
+            entry["limitations"] = (
+                "orphan-lb was not evaluated for this project: §3.6 compares "
+                "forwarding rules against the Service names of every cluster in "
+                "the project, and at least one of them could not be read, so a "
+                "rule that cluster's Services reference would read as orphaned. "
+                "See this project's cluster "
+                "entries in this manifest for the reason each one failed."
+            )
     if not disks_judged and compute_ok:
         disk_gap = (
-            "unattached-disk was not evaluated for this project: none of its clusters "
-            f"({unread_named}) could be read, so no disk can be "
-            "cleared against a live PersistentVolume."
+            "unattached-disk was not evaluated for this project: "
+            + (f"its clusters ({unread_named}) are all excluded by spec.scope.exclude.clusters and were not read"
+               if only_excluded else f"none of its clusters ({unread_named}) could be read")
+            + ", so no disk can be cleared against a live PersistentVolume."
         )
         entry["limitations"] = f"{entry['limitations']} {disk_gap}" if entry.get("limitations") else disk_gap
     elif unread_clusters and compute_ok:
@@ -6101,14 +6135,23 @@ def collect_project_compute(project: str, all_reachable: bool, fleet_facts: dict
             + " could name one, so an address they hold would read as idle."
         )
         entry["limitations"] = f"{entry['limitations']} {address_gap}" if entry.get("limitations") else address_gap
+    if excluded and compute_ok:
+        # The sentences above say "could not be read"; these were left unread
+        # on purpose, and a reader must not go looking for a failed read.
+        excluded_note = EXCLUDED_CLUSTERS_NOTE.format(named=", ".join(excluded))
+        entry["limitations"] = f"{entry['limitations']} {excluded_note}" if entry.get("limitations") else excluded_note
     unevaluated = {}
     if compute_failed:
         unevaluated.update({slug: compute_error for slug in COMPUTE_CHECKS})
     elif not all_reachable and not compute_disabled:
-        unevaluated["orphan-lb"] = "a cluster in this project could not be read, so its Services are unknown"
-        unevaluated["idle-address"] = "a cluster in this project could not be read, so its Service and Ingress address annotations are unknown"
+        unread_why = "is excluded by spec.scope.exclude.clusters or could not be read" if excluded else "could not be read"
+        unevaluated["orphan-lb"] = f"a cluster in this project {unread_why}, so its Services are unknown"
+        unevaluated["idle-address"] = f"a cluster in this project {unread_why}, so its Service and Ingress address annotations are unknown"
     if not disks_judged and compute_ok:
-        unevaluated["unattached-disk"] = "none of this project's clusters could be read"
+        unevaluated["unattached-disk"] = (
+            "this project's clusters are all excluded by spec.scope.exclude.clusters" if only_excluded
+            else "none of this project's clusters could be read" + (" (some are excluded by spec.scope.exclude.clusters)" if excluded else "")
+        )
     if reg_parsed is None and not registry_disabled:
         unevaluated["registry-no-cleanup"] = (
             f"`gcloud artifacts repositories list` failed (rc={reg_result.rc})"
@@ -6332,7 +6375,12 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
             known_by_project[p] = None
             enumeration_failed[p] = error
             continue
-        known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running)
+        # A cluster the scope excludes was dropped from the listing unread, but
+        # it still owns this project's disks, forwarding rules and addresses:
+        # known and never collected, so its disks are skipped and the checks
+        # that need every cluster's Services are withheld, not judged (#3081).
+        excluded = [{"name": name, "location": location} for name, location in declared_scope.dropped.get(p, [])]
+        known_by_project[p], known_pairs_by_project[p] = _known_clusters(running + not_running + excluded)
         forwarding_rules[p] = rules
         if traffic is not None:
             lb_traffic[p] = traffic
@@ -6414,6 +6462,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         # and pinned the run `partial`.
         all_reachable = (
             not skipped_by_project.get(p)
+            and not declared_scope.dropped.get(p)
             and all(entry["outcome"] == "collected" for entry, _ in group)
         )
         fleet_facts = empty_fleet_facts()
@@ -6428,7 +6477,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
         known_pairs = known_pairs_by_project.get(p, set())
         collected = collected_by_project.get(p, set())
 
-        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected))
+        return collect_project_compute(p, all_reachable, fleet_facts, run=replay, now=now, known_clusters=known_by_project.get(p), forwarding_rules=forwarding_rules.get(p), unread_clusters=_unread_names(known_pairs, collected), clusters_read=len(known_pairs & collected), unread_labels=_unread_labels(known_pairs, collected), excluded=sorted(name for name, _ in declared_scope.dropped.get(p, [])), only_excluded_unread=_only_excluded_unread(known_pairs, collected, declared_scope.dropped.get(p, [])))
 
     cluster_entries: list[dict] = []
     project_entries: list[dict] = []
@@ -6525,7 +6574,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     workspace = Path(args.workspace) if args.workspace else None
     if workspace is not None and not workspace.is_dir():
         # Loud, and not fatal. A typo here would otherwise annotate nothing and

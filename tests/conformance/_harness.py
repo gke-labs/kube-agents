@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
@@ -111,6 +112,12 @@ SOURCES: dict[str, Source] = {
         "agents/platform/skills/fleet-audit/scripts/audit_report.py",
         ("def _ident(", "def _cell(", "def trim_command(", "def trim_excerpt("),
     ),
+    # B2 imports this module and drives `enqueue_action` over the label space,
+    # and greps it for the one allowed auto-merge call.
+    "merge_gate": Source(
+        "scripts/merge_gate.py",
+        ("def enqueue_action(", "enablePullRequestAutoMerge", "HOLD_LABELS"),
+    ),
     "credential_proxy": Source(
         "agents/platform/scripts/credential_proxy.py",
         (
@@ -130,6 +137,18 @@ SOURCES: dict[str, Source] = {
     "mcp_policy": Source(
         "agents/platform/scripts/mcp_policy.py",
         ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
+    ),
+    # C1 imports this module: what the broker relays for the gateway's
+    # watchers under the watcher role.
+    "watcher_policy": Source(
+        "agents/platform/scripts/watcher_policy.py",
+        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX", "def project_cluster("),
+    ),
+    # C1 holds the operator's copy of the drift detector's default
+    # subscription to the detector's own.
+    "drift_detector_main_go": Source(
+        "k8s-operator/cmd/drift-detector/main.go",
+        ("defaultSubscriptionName =",),
     ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
@@ -169,7 +188,8 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath ="),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
+         "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",

@@ -53,6 +53,17 @@ ARG ENVOY_VERSION=v1.39.1
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
+# tirith, the command scanner Hermes runs before a terminal command. Pinned and
+# checksum-verified here, and put on PATH in the image (the a2a-tools stage), so
+# Hermes' tools/tirith_security finds it on PATH and never downloads the "latest"
+# release into each profile's $HERMES_HOME/bin: that was 38 MiB per scaffolded
+# Cluster Agent profile, 6.5 GiB of a 10 GiB data volume at 209 clusters
+# (gke-labs#3325). Bump the version and both sums together, from the release's
+# checksums.txt, and the same three in deploy/docker/check_skill_commands.py:
+# deploy/docker/test_check_skill_commands.py holds the two copies equal.
+ARG TIRITH_VERSION=v0.4.2
+ARG TIRITH_SHA256_AMD64=efa6bf414a83dba385d4f13137e8677f850ced9102fe74ebb14c72f31df0dc77
+ARG TIRITH_SHA256_ARM64=c550b1bfb0c8c872ab3421cd6ef756f260f7cf4981a18cedd49f141fa2d77569
 # Declared here as well as in the `platform` stage that consumes it, so the
 # credential-proxy build -- which shares deploy/docker/cloudbuild.yaml and is
 # therefore handed the same --build-arg -- does not warn about an argument no
@@ -113,6 +124,29 @@ COPY a2a/ /workspace/a2a/
 WORKDIR /workspace/a2a
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+
+# tirith joins a2a in /workspace/bin, so agent-base copies both with the one
+# COPY it already has and the image gains no layer. The download is verified
+# against the pinned sum for the target architecture before anything is kept.
+FROM a2a-builder AS a2a-tools
+ARG TARGETARCH
+ARG TIRITH_VERSION
+ARG TIRITH_SHA256_AMD64
+ARG TIRITH_SHA256_ARM64
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) triple=x86_64-unknown-linux-gnu; sum="${TIRITH_SHA256_AMD64}" ;; \
+        arm64) triple=aarch64-unknown-linux-gnu; sum="${TIRITH_SHA256_ARM64}" ;; \
+        *) echo "no tirith build pinned for ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    for attempt in 1 2 3 4 5; do \
+        wget -qO /tmp/tirith.tar.gz "https://github.com/sheeki03/tirith/releases/download/${TIRITH_VERSION}/tirith-${triple}.tar.gz" && break; \
+        [ "$attempt" -lt 5 ] || exit 1; sleep "$attempt"; \
+    done; \
+    echo "${sum}  /tmp/tirith.tar.gz" | sha256sum -c -; \
+    mkdir /tmp/tirith; tar -xzf /tmp/tirith.tar.gz -C /tmp/tirith tirith; \
+    install -m 0755 /tmp/tirith/tirith /workspace/bin/tirith; \
+    rm -rf /tmp/tirith /tmp/tirith.tar.gz
 
 FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 
@@ -427,6 +461,22 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     grep -q "describe=_format_tirith_description" /opt/hermes/tools/approval.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
+
+# Cron: a run directory per agent run (gke-labs/kube-agents#2989). A job with
+# no workdir (all of ours) started its terminal in the sandbox's unwritable
+# login home, so a run that needed scratch made its own on the shared volume,
+# the profile home among it, where it stayed and became a later run's input. The patch
+# records <hermes home>/cron/runs/<job>_<execution> as the run's tool-layer cwd;
+# the session cwd, and so context-file loading, is unchanged, and script jobs
+# keep their cwd. kanban_workspace_gc.py prunes old run directories.
+COPY deploy/docker/patches/apply_cron_run_workdir.py \
+     deploy/docker/patches/verify_cron_run_workdir.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-run-workdir/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.py /opt/hermes && \
+    grep -q "kube-agents patch: cron run workdir" /opt/hermes/cron/scheduler.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/verify_cron_run_workdir.py /opt/hermes && \
+    rm -rf /tmp/cron-run-workdir
 
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
 # Must run after cron_tirith_scan: anchors into tools/approval.py at the point
@@ -1346,6 +1396,13 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # (.svc, .cluster.local) now classifies as a cloud endpoint; a real .local host
 # stays local. The configs' providers.custom block sets the timeouts. See the module docstring in
 # deploy/docker/patches/apply_cluster_dns_not_local.py.
+#
+# cgroup_memory_sample rides it too: sample_memory() read the node's
+# /proc/meminfo, so the kanban dispatcher's memory guard limited fan-out to one
+# worker per tick whenever an Autopilot node sat under 15% available, while the
+# agent's container used a few percent of its own limit. The sample now uses the
+# container's cgroup v2 limit when one is set. See the module docstring in
+# deploy/docker/patches/apply_cgroup_memory_sample.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py \
      deploy/docker/patches/rate_limit_retry_delay.py \
      deploy/docker/patches/permission_refusal_stop.py \
@@ -1366,6 +1423,8 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_ssh_shared_master.py \
      deploy/docker/patches/apply_cluster_dns_not_local.py \
      deploy/docker/patches/verify_cluster_dns_not_local.py \
+     deploy/docker/patches/apply_cgroup_memory_sample.py \
+     deploy/docker/patches/verify_cgroup_memory_sample.py \
      deploy/docker/patches/verify_policy_refusal_hint.py \
      deploy/docker/patches/apply_permission_refusal_stop.py \
      deploy/docker/patches/verify_permission_refusal_stop.py \
@@ -1379,6 +1438,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_api_failure_reason_header.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_ssh_shared_master.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cluster_dns_not_local.py /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_cgroup_memory_sample.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_permission_refusal_stop.py /opt/hermes && \
     grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
     grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
@@ -1396,6 +1456,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     grep -q 'def close_master(self):' /opt/hermes/tools/environments/ssh.py && \
     grep -q '"ServerAliveInterval=15", "-o", "ServerAliveCountMax=3"' /opt/hermes/tools/environments/ssh.py && \
     grep -q 'kube-agents patch: cluster-dns-not-local' /opt/hermes/agent/model_metadata.py && \
+    grep -q 'kube-agents patch: cgroup-memory-sample' /opt/hermes/gateway/lifecycle_ledger.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1404,6 +1465,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_api_failure_reason_header.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_ssh_shared_master.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_cluster_dns_not_local.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_cgroup_memory_sample.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_policy_refusal_hint.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_permission_refusal_stop.py && \
     rm -rf /tmp/kanban-guardrail-exit
@@ -1545,6 +1607,16 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # turn can still answer.
 # See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
+# kanban_fanout_reaper: a per-cluster card a platform worker fanned out (to a
+# Cluster Agent, with no parents, in one burst with a sibling) that has run 30 minutes
+# is stopped and settled with a result saying it didn't finish on its cluster, so
+# a child waiting on a workload its cluster doesn't have can't hold a worker
+# slot for hours (#2978). Heartbeats don't matter; cards a person filed are
+# never touched. It hooks the dispatcher's reclaim phase right after
+# enforce_max_runtime, which is anchored on upstream's line, after the
+# kanban-scheduling stage's edits to the same file.
+# See the module docstring in deploy/docker/patches/kanban_fanout_reaper.py.
+#
 # kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
 # record, the `queued` events) is in the kanban-scheduling stage above, which
@@ -1559,6 +1631,28 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # above, whose lines it does not share. The _WAKE_KINDS grep repeats the one in
 # the kanban-progress stage: a queued notice must never cost an LLM turn.
 # See the module docstring in deploy/docker/patches/kanban_priority.py.
+#
+# kanban_ended_run: a block from outside a card's run stops the run's worker,
+# and a worker whose run is over is told so (#2947). Upstream's block_task ends
+# the run but leaves the process running (archive_task stops it), and a refused
+# kanban_complete reports the card's last_failure_error, an earlier run's text
+# telling the worker to verify and complete again. On the rehearsal an operator
+# blocked a card mid-run and its worker retried for 41 minutes. block_task is
+# wrapped so a block with no expected_run_id on a running card stops its
+# host-local worker the way archive does and comments on the card;
+# kanban_complete and kanban_block answer an ended run with one latched,
+# terminal refusal before any gate runs. Runs after children_settled, whose
+# gates sit below the _worker_guard line this inserts after.
+# See the module docstring in deploy/docker/patches/kanban_ended_run.py.
+#
+# kanban_self_copy: a Platform Agent worker can't file a card for `platform`
+# that would run alongside it. On eval-next a platform card delegated
+# "propose the manifest" to its own profile and then did it anyway, and the
+# person got two pull requests (#3164). kanban_create refuses such a card
+# unless the creator's own card is in its parents (platform SOUL section 0's
+# queued follow-up, which runs after the creator finishes), and the
+# kanban_scheduling repair never releases such a follow-up early.
+# See the module docstring in deploy/docker/patches/kanban_self_copy.py.
 #
 # credential-redaction: a kanban worker that pasted a GCP access token into a
 # curl left it in plaintext on the PVC (#603). Upstream already redacts
@@ -1607,11 +1701,20 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_wake_guard.py \
      deploy/docker/patches/apply_kanban_wake_guard.py \
      deploy/docker/patches/verify_kanban_wake_guard.py \
+     deploy/docker/patches/kanban_fanout_reaper.py \
+     deploy/docker/patches/apply_kanban_fanout_reaper.py \
+     deploy/docker/patches/verify_kanban_fanout_reaper.py \
      deploy/docker/patches/kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_chat_notify.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_priority.py \
      deploy/docker/patches/verify_kanban_priority.py \
+     deploy/docker/patches/kanban_ended_run.py \
+     deploy/docker/patches/apply_kanban_ended_run.py \
+     deploy/docker/patches/verify_kanban_ended_run.py \
+     deploy/docker/patches/kanban_self_copy.py \
+     deploy/docker/patches/apply_kanban_self_copy.py \
+     deploy/docker/patches/verify_kanban_self_copy.py \
      deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
@@ -1676,6 +1779,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
     grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
     grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \
+    cp /tmp/latency-patches/kanban_fanout_reaper.py /opt/hermes/tools/kanban_fanout_reaper.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_fanout_reaper.py /opt/hermes && \
+    grep -qF '_kanban_reap_overdue_fanout(conn)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
     grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
@@ -1685,6 +1791,16 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '+ ("heartbeat", "pr_opened") + ("queued",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -qF '_EVENT_FORMATTERS["queued"] = _kanban_format_queued' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    cp /tmp/latency-patches/kanban_ended_run.py /opt/hermes/tools/kanban_ended_run.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_ended_run.py /opt/hermes && \
+    test "$(grep -c '_kanban_refuse_ended_run(tid, _kanban_ended_run_connect)' /opt/hermes/tools/kanban_tools.py)" = "2" && \
+    test "$(grep -c '_kanban_ended_run_refusal(tid, conn) or' /opt/hermes/tools/kanban_tools.py)" = "2" && \
+    test "$(grep -c '_kanban_waiting_parent_refusal(tid, conn) or' /opt/hermes/tools/kanban_tools.py)" = "1" && \
+    grep -qF 'block_task = _kanban_stop_worker_on_external_block(' /opt/hermes/hermes_cli/kanban_db.py && \
+    grep -qF 'lines.extend(_kanban_saved_result_banner(conn, task_id))' /opt/hermes/hermes_cli/kanban_db.py && \
+    cp /tmp/latency-patches/kanban_self_copy.py /opt/hermes/tools/kanban_self_copy.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_self_copy.py /opt/hermes && \
+    test "$(grep -c '_kanban_refuse_self_copy(self_task, assignee, parents)' /opt/hermes/tools/kanban_tools.py)" = "1" && \
     install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_credential_redaction.py /opt/hermes && \
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
@@ -1706,7 +1822,10 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_self_copy.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
     rm -rf /tmp/latency-patches
@@ -1899,8 +2018,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # of the pod, on a pod that stays Ready while it does.
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /workspace/drift-detector /usr/local/bin/
 
-# The a2a CLI, ungated (see the a2a-builder stage for why that is safe).
-COPY --from=a2a-builder --chmod=0755 /workspace/bin/a2a /usr/local/bin/a2a
+# The a2a CLI, ungated (see the a2a-builder stage for why that is safe), and the
+# pinned tirith (see the a2a-tools stage).
+COPY --from=a2a-tools --chmod=0755 /workspace/bin/a2a /workspace/bin/tirith /usr/local/bin/
 
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
@@ -1923,6 +2043,7 @@ CMD ["hermes", "gateway", "run"]
 #   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
 #                   /opt/cluster-template (see scripts/cluster_agent_profile.py).
 FROM agent-base AS platform
+ARG TIRITH_VERSION
 
 # Base trees this stage never writes to normalize first — including the
 # plugin tree's root-ownership barrier — so the ~150MB copy-up layer caches
@@ -1937,12 +2058,17 @@ FROM agent-base AS platform
 # a part of. Cost is not the reason either way: a find/chmod over a tree whose
 # modes are already correct exports a ~4kB layer, since BuildKit diffs the
 # result rather than the syscall.
+#
+# The same layer checks that the pinned tirith is what PATH resolves, so Hermes
+# never installs a per-profile copy (gke-labs#3325).
 RUN set -eu; \
     for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
-    chown -R root:root /opt/hermes/plugins
+    chown -R root:root /opt/hermes/plugins; \
+    [ "$(command -v tirith)" = /usr/local/bin/tirith ]; \
+    tirith --version | grep -qx "tirith ${TIRITH_VERSION#v}"
 
 # --- Chat Agent (the `default` profile) ---
 # Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
@@ -2075,16 +2201,17 @@ COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 # left. See the
 # module docstring for what a failure here means.
 #
-# check_skill_commands.py rides along the same way. It runs every shell block
-# in the SKILL.md files and references/*.md pages of the image's three skill
-# trees through Hermes' Tirith scan, which is why the Cluster Agent template is
+# check_skill_commands.py rides along the same way, with skill_documents.py,
+# which it imports. It runs every shell block in the skill documents of the
+# image's three skill trees through Hermes' Tirith scan, which is why the Cluster Agent template is
 # copied above this block rather than below it.
-# It downloads the Tirith release it pins; see its module docstring.
+# It scans with the image's pinned tirith (--tirith-bin), the binary that ships.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
      deploy/docker/merge_configs.py \
      deploy/docker/patches/verify_slack_relay_registry_contract.py \
      deploy/docker/check_skill_commands.py \
+     deploy/docker/skill_documents.py \
      /tmp/platform-config/
 RUN /opt/hermes/.venv/bin/python3 /tmp/platform-config/merge_configs.py /tmp/platform-config/base.yaml /tmp/platform-config/config.yaml && \
     cp /tmp/platform-config/base.yaml /opt/platform-template/config.yaml && \
@@ -2098,6 +2225,7 @@ assert caps.max_subagents == 50, 'overlay clobbered max_subagents: %r' % caps.ma
 assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r' % cfg.get('agent', {}).get('max_turns')" && \
     cd /opt/hermes && PYTHONPATH=/opt/defaults/scripts /opt/hermes/.venv/bin/python3 /tmp/platform-config/verify_slack_relay_registry_contract.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/platform-config/check_skill_commands.py \
+        --tirith-bin /usr/local/bin/tirith \
         agents/platform/skills=/opt/platform-template/skills \
         agents/cluster/skills=/opt/cluster-template/skills \
         a2a/persona/platform/skills=/opt/a2a-template/skills && \

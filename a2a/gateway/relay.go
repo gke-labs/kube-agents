@@ -79,6 +79,10 @@ type relayState struct {
 	// with it unset reads the fold for a request this process never saw
 	// (relayTerminal).
 	sawDelegate bool
+	// handoff is set once the task published lib.ArtifactHandoff: it handed
+	// work to kanban cards that report into the conversation themselves
+	// (#3258).
+	handoff bool
 	// local is set when this gateway started the task (startTaskWith), so
 	// every event of it reached this process's relay: an event acked and
 	// lost before its batch takes a crash, and a restart starts the task's
@@ -249,6 +253,9 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 // rolling-line edit; posts always happen.
 func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relayItem, render bool) {
 	env := item.env
+	if g.sessionForTask(ctx, env.TaskID) != rec.Key {
+		return
+	}
 	rs := g.relayFor(env.TaskID)
 
 	switch env.Kind {
@@ -353,6 +360,10 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 		notice := g.readChat(rec.Key, taskID, chatmsg.Notice, a.Artifact.Parts)
 		g.postMessage(rec.Key, OutMessage{Text: notice.Fallback, Chat: layoutOf(notice)})
 		g.markFrom(rec, taskID, notice)
+	case lib.ArtifactHandoff:
+		// The task handed its work to kanban cards (#3258); read with the
+		// terminal's mark by a delegated child's wake, never rendered.
+		rs.handoff = rs.handoff || lastTextPart(a.Artifact.Parts) == lib.HandoffCards
 	case lib.ArtifactDelegate:
 		// A request to the gateway, never rendered to chat.
 		rs.sawDelegate = true
@@ -420,6 +431,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if task.Artifact(lib.ArtifactDelegate) != nil {
 				evidence = delegateSeen
 			}
+			// A handoff acked and lost to a restart before the terminal
+			// was processed is still on the stream (#3258).
+			if foldHandedOff(task) {
+				rs.handoff = true
+			}
 			if needDelegate {
 				g.runFoldedDelegate(ctx, rec, rs, taskID, addressee, task)
 			}
@@ -477,7 +493,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// post IS the answer. The replay above is skipped for the same
 		// backends, so reaching here with an empty result costs nothing.
 		if !isConsoleConversation(rec.Key) {
-			g.postMessage(rec.Key, answer)
+			if ref.TerminalObserved && result == completedNonTextResult {
+				// The heal already posted the status card; skip completedNonTextResult.
+			} else {
+				g.postMessage(rec.Key, answer)
+			}
 		}
 		g.markFrom(rec, taskID, answerChat)
 	case lib.StateFailed:
@@ -605,7 +625,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// chain's (observedAs): a turn that delegated and a child end quietly,
 	// and the root's one terminal comes from the wake or, when none runs,
 	// from observeChildEnd below.
-	g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	if !ref.TerminalObserved {
+		g.observeEnded(rec, taskID, s.Status.State, source, reason)
+	}
 
 	// A delegated child's end wakes the session that asked.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild {
@@ -615,7 +637,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if turnsUnread {
 			wakeResult, wakeReason = withTurnsUnread(result), withTurnsUnread(reason)
 		}
-		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true); !woken {
+		if woken, why := g.wakeSession(ctx, rec, ref, s.Status.State, turns, wakeResult, wakeReason, true, cardsPending(s.Status.State, terminal) || handedOff(s.Status.State, rs.handoff)); !woken {
 			g.observeChildEnd(rec, ref, s.Status.State, source, reason, why)
 		}
 	}

@@ -21,7 +21,17 @@ project today) or ``gitlab``. The forge decides four things and nothing
 else lives here: the grading credential's environment variable, which web
 URLs in a reply point at an issue or a proposal of the repository, the API
 root those resolve against, and how the agent's own writes are told from a
-person's on GitLab, where no ``[bot]`` suffix marks them.
+person's on GitLab, where no ``[bot]`` suffix marks them. One more setting
+applies to every forge: ``BENCH_FORGE_CA_FILE``, a CA certificate the checks
+trust in addition to the system CAs, for an API host that a private CA
+signed.
+
+A GitHub Enterprise Server install is ``BENCH_FORGE=github`` with
+``BENCH_GITHUB_HOST`` set to its host. The reply's URLs must then be on that
+host, and a github.com URL names nothing. The API the checks read stays
+api.github.com unless ``BENCH_GITHUB_API_ROOT`` names another: the eval's
+GHES host is a forwarding proxy to github.com (``hack/ghes-proxy``), so the
+data is there.
 
 A GitLab repository is its project's full path, ``group/subgroup/project``,
 as deep as the groups nest; GitLab's issue and merge-request web URLs put
@@ -32,17 +42,23 @@ well as ``/-/issues/<iid>``.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
+import ssl
 import urllib.parse
 from collections.abc import Mapping
 
 __all__ = [
     "FORGES",
+    "FORGE_CA_FILE_ENV_VAR",
     "FORGE_ENV_VAR",
     "FORGE_GITHUB",
     "FORGE_GITLAB",
     "GITHUB_API_ROOT",
+    "GITHUB_API_ROOT_ENV_VAR",
+    "GITHUB_DEFAULT_HOST",
+    "GITHUB_HOST_ENV_VAR",
     "GITHUB_TOKEN_ENV_VARS",
     "GITLAB_AGENT_LOGIN_ENV_VAR",
     "GITLAB_DEFAULT_HOST",
@@ -50,6 +66,9 @@ __all__ = [
     "GITLAB_TOKEN_ENV_VARS",
     "UnknownForge",
     "forge_name",
+    "forge_ssl_context",
+    "github_api_root",
+    "github_host",
     "gitlab_agent_login",
     "gitlab_api_root",
     "gitlab_host",
@@ -68,6 +87,19 @@ FORGE_GITLAB = "gitlab"
 FORGES = (FORGE_GITHUB, FORGE_GITLAB)
 
 GITHUB_API_ROOT = "https://api.github.com"
+#: The GitHub host the reply's URLs are on: github.com, or a GitHub
+#: Enterprise Server's host. It names the web host only; the API stays
+#: GITHUB_API_ROOT unless GITHUB_API_ROOT_ENV_VAR is set.
+GITHUB_HOST_ENV_VAR = "BENCH_GITHUB_HOST"
+GITHUB_DEFAULT_HOST = "github.com"
+#: The GitHub REST API root the checks read, ``https://<host>[:port][/path]``,
+#: when it is not api.github.com: for example the GHES proxy's
+#: ``https://<host>/api/v3``.
+GITHUB_API_ROOT_ENV_VAR = "BENCH_GITHUB_API_ROOT"
+#: A PEM CA certificate file the checks trust in addition to the system CAs,
+#: for a forge API that a private CA signed: a self-managed GitLab, or the
+#: GHES proxy through BENCH_GITHUB_API_ROOT.
+FORGE_CA_FILE_ENV_VAR = "BENCH_FORGE_CA_FILE"
 #: The GitLab instance, ``gitlab.com`` unless a self-managed one is named.
 GITLAB_HOST_ENV_VAR = "BENCH_GITLAB_HOST"
 GITLAB_DEFAULT_HOST = "gitlab.com"
@@ -103,12 +135,13 @@ _SEGMENT = r"[A-Za-z0-9_.][A-Za-z0-9_.-]*"
 # GitHub's two, kept to the segment shape they have always matched: an owner
 # or a name starts with a letter or a digit.
 _GITHUB_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
-_GITHUB_ISSUE_URL_RE = re.compile(
-    rf"https://github\.com/({_GITHUB_SEGMENT}/{_GITHUB_SEGMENT})/issues/(\d+)", re.IGNORECASE
-)
-_GITHUB_PULL_URL_RE = re.compile(
-    rf"https://github\.com/({_GITHUB_SEGMENT}/{_GITHUB_SEGMENT})/pull/(\d+)", re.IGNORECASE
-)
+
+
+def _github_url_re(host: str, kind: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"https://{re.escape(host)}/({_GITHUB_SEGMENT}/{_GITHUB_SEGMENT})/{kind}/(\d+)",
+        re.IGNORECASE,
+    )
 
 
 class UnknownForge(ValueError):
@@ -131,10 +164,14 @@ def forge_name(environ: Mapping[str, str] | None = None) -> str:
             f"{FORGE_ENV_VAR}={name!r} is not a forge this check reads "
             f"({', '.join(FORGES)}); this check could not be evaluated"
         )
+    # Refused here, where every check already turns UnknownForge into an
+    # error, rather than at whichever later read first builds a URL.
     if name == FORGE_GITLAB:
-        # Refused here, where every check already turns UnknownForge into an
-        # error, rather than at whichever later read first builds a URL.
         gitlab_host(environ)
+    else:
+        github_host(environ)
+        github_api_root(environ)
+    forge_ssl_context(environ)
     return name
 
 
@@ -165,6 +202,84 @@ def gitlab_host(environ: Mapping[str, str] | None = None) -> str:
     return host
 
 
+def github_host(environ: Mapping[str, str] | None = None) -> str:
+    """The GitHub host from ``BENCH_GITHUB_HOST``, ``github.com`` when unset,
+    lower-cased; refused as :class:`UnknownForge` when it is not a bare
+    hostname, as ``gitlab_host`` refuses one."""
+    host = (_env(environ).get(GITHUB_HOST_ENV_VAR) or GITHUB_DEFAULT_HOST).strip().lower()
+    if not _HOST_RE.match(host):
+        raise UnknownForge(
+            f"{GITHUB_HOST_ENV_VAR}={host!r} is not a bare hostname (no scheme, path "
+            "or port, e.g. ghes.example.com); this check could not be evaluated"
+        )
+    return host
+
+
+_API_ROOT_RE = re.compile(
+    r"^https://[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::\d{1,5})?(?:/[A-Za-z0-9._~%-]+)*\Z"
+)
+
+
+def github_api_root(environ: Mapping[str, str] | None = None) -> str:
+    """The GitHub REST API root the checks read: ``BENCH_GITHUB_API_ROOT``
+    without a trailing slash, else api.github.com, whatever
+    ``BENCH_GITHUB_HOST`` says. Refused as :class:`UnknownForge` when it is
+    not an https URL with no query or fragment: the read credential goes to
+    whatever it names."""
+    raw = (_env(environ).get(GITHUB_API_ROOT_ENV_VAR) or "").strip()
+    if not raw:
+        return GITHUB_API_ROOT
+    root = raw.rstrip("/")
+    valid = bool(_API_ROOT_RE.match(root))
+    if valid:
+        # The regex takes up to five digits; urllib refuses a port over 65535,
+        # and the read would then fail with an error that names no setting.
+        try:
+            urllib.parse.urlsplit(root).port
+        except ValueError:
+            valid = False
+    if not valid:
+        raise UnknownForge(
+            f"{GITHUB_API_ROOT_ENV_VAR}={raw!r} is not an https URL with a host and an "
+            "optional port and path (e.g. https://ghes.example.com/api/v3); this check "
+            "could not be evaluated"
+        )
+    return root
+
+
+@functools.lru_cache(maxsize=8)
+def _ssl_context_for(path: str) -> ssl.SSLContext:
+    # A server certificate loads as well as a CA does, and then every read
+    # fails on a chain it cannot build, with an error that names no setting.
+    # get_ca_certs() lists only CA:TRUE certificates, so an empty context that
+    # loaded the file and lists none got no CA from it.
+    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    probe.load_verify_locations(cafile=path)
+    if not probe.get_ca_certs():
+        raise ValueError("it holds no CA certificate (CA:TRUE); give the CA, for example ca.crt, not the server's tls.crt")
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=path)
+    return context
+
+
+def forge_ssl_context(environ: Mapping[str, str] | None = None) -> ssl.SSLContext | None:
+    """The TLS context for forge API reads: the system CAs plus the one in
+    ``BENCH_FORGE_CA_FILE``, or None (urllib's default) when it is unset.
+    Refused as :class:`UnknownForge` when the file cannot be read as a CA
+    certificate: a check that silently dropped it would fail every read with
+    a certificate error that names no setting."""
+    path = (_env(environ).get(FORGE_CA_FILE_ENV_VAR) or "").strip()
+    if not path:
+        return None
+    try:
+        return _ssl_context_for(os.path.abspath(os.path.expanduser(path)))
+    except (OSError, ssl.SSLError, ValueError) as exc:
+        raise UnknownForge(
+            f"{FORGE_CA_FILE_ENV_VAR}={path!r} cannot be read as a PEM CA certificate "
+            f"({exc}); this check could not be evaluated"
+        ) from exc
+
+
 def gitlab_agent_login(environ: Mapping[str, str] | None = None) -> str:
     return (_env(environ).get(GITLAB_AGENT_LOGIN_ENV_VAR) or "").strip()
 
@@ -179,7 +294,7 @@ def is_gitlab_token_bot(user: Mapping[str, object]) -> bool:
 
 def web_host(forge: str, environ: Mapping[str, str] | None = None) -> str:
     """The host a reply's URLs must be on: how a reason names the forge."""
-    return gitlab_host(environ) if forge == FORGE_GITLAB else "github.com"
+    return gitlab_host(environ) if forge == FORGE_GITLAB else github_host(environ)
 
 
 def gitlab_api_root(environ: Mapping[str, str] | None = None) -> str:
@@ -212,17 +327,21 @@ def issue_refs(
     text: str, forge: str, environ: Mapping[str, str] | None = None
 ) -> list[tuple[str, int]]:
     """``(repository, number)`` for every issue web URL ``text`` carries in
-    full on the forge, first appearance first, each once."""
+    full on the forge, first appearance first, each once. On GitHub the URL
+    must be on ``BENCH_GITHUB_HOST``: on a GitHub Enterprise Server run a
+    github.com URL names nothing, so an agent that wrote to github.com, and
+    not to the instance, fails the check."""
     if forge == FORGE_GITLAB:
         return _refs(_gitlab_url_re(gitlab_host(environ), "issues|work_items"), text)
-    return _refs(_GITHUB_ISSUE_URL_RE, text)
+    return _refs(_github_url_re(github_host(environ), "issues"), text)
 
 
 def proposal_refs(
     text: str, forge: str, environ: Mapping[str, str] | None = None
 ) -> list[tuple[str, int]]:
     """``(repository, number)`` for every pull request (GitLab: merge
-    request) web URL ``text`` carries in full on the forge."""
+    request) web URL ``text`` carries in full on the forge, on
+    ``BENCH_GITHUB_HOST`` for GitHub as :func:`issue_refs` reads it."""
     if forge == FORGE_GITLAB:
         return _refs(_gitlab_url_re(gitlab_host(environ), "merge_requests"), text)
-    return _refs(_GITHUB_PULL_URL_RE, text)
+    return _refs(_github_url_re(github_host(environ), "pull"), text)

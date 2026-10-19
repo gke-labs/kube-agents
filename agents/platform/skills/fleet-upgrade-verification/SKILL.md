@@ -30,15 +30,14 @@ Neither reads versions against a target.
 ## Run the report
 
 ```bash
-./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
+/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py \
   <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> \
   [--project <project>]... [--cluster <location>/<name>... | --rollout-in-progress] [--target-version <version>] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
   --output /opt/data/scratch/fleet_versions.json
 ```
 
-The path is relative to the profile home, `/opt/data/profiles/platform`; from any other working
-directory use the absolute path, `/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py`.
+The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py`).
 
 - `--cluster` is repeatable and, when given, restricts the report to those clusters, as
   `<location>/<name>` or a bare name and in no other form: each half is a GKE name, lowercase
@@ -355,7 +354,7 @@ error (exit 2).
 ## Scan the GitOps manifests
 
 ```bash
-./skills/fleet-upgrade-verification/scripts/api_deprecation_scan.py \
+/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/api_deprecation_scan.py \
   --versions /opt/data/scratch/fleet_versions.json --target-version <version> \
   [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations.json
 ```
@@ -437,7 +436,8 @@ the part of the table's `configuration/webhook` cell before the slash; the webho
 follow it after a slash, never stand in for it.
 Say what the operator has to change before the upgrade can proceed; do not change it, and do not
 propose deleting an exclusion. When the question is a target version's readiness, paste each
-repository's deprecation section too, with its source line, and state the floor and target the
-scan used. Recommend the upgrade path and the manifest migrations; do not run either. Cite no CVE
+repository's deprecation section too, with its source line copied word for word
+(`repo manifests as of <sha>`, not a rewording such as "at commit <sha>"), and state the floor
+and target the scan used. Recommend the upgrade path and the manifest migrations; do not run either. Cite no CVE
 identifiers: there is no vulnerability feed here, and every finding is version currency,
 readiness or a declared API version.

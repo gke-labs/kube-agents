@@ -18,6 +18,7 @@
 # see docs/designs/bench-case-format.md.
 id: "gpu-stress-test-diagnosis"
 name: "gpu-stress-test-diagnosis"
+domain: cluster-debugging
 
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: maintainers
@@ -105,11 +106,10 @@ documentation:
       - text: "HPA max-replica saturation"
         critical: true
 
-# No domain: claim, deliberately. incident-triage means the autoops path --
-# an event fired by k8s-event-watcher triggers UNPROMPTED triage -- and this
-# task is a chat-prompted post-incident RCA: different trigger, different
-# journey, no row in docs/designs/domains.yaml. A task with no domain claim
-# covers nothing, which is the truth of it.
+# Domain cluster-debugging, not incident-triage. incident-triage means the
+# autoops path -- an event fired by k8s-event-watcher triggers UNPROMPTED
+# triage -- and this task is a chat-prompted post-incident RCA: a diagnosis of
+# a broken workload, read-only, which is cluster-debugging's meaning.
 
 # Exact checks, run by devops-bench's deterministic engine after the agent
 # finishes. The prose expected_output above stays: it feeds the judge, and the

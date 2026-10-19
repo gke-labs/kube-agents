@@ -33,11 +33,13 @@ import os
 import shutil
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import types
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1498,6 +1500,69 @@ class ScanGateTest(unittest.TestCase):
         self.assertIsNone(parse("kanban create: board unavailable"))
 
 
+class ExcludedClustersParagraphTest(unittest.TestCase):
+    """#3081: the sweep is told which clusters the install excludes, so its
+    "audit every cluster with no Cluster Agent" does not reach exactly those.
+    Read as the fleet_scope tool reads them: the snapshot, else the render."""
+
+    EXCLUDE = {"projects": [], "clusters": [
+        {"projectId": "ka-test", "location": "us-central1", "clusterName": "lane-b"},
+        {"projectId": "ka-test", "location": "us-east1-b", "clusterName": "kyber-test"},
+        {"projectId": "ka-test", "location": "us-central1"},
+    ]}
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("KUBEAGENTS_SCOPE_FILE", None)
+
+    def _dir(self, snapshot=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        data_dir = Path(tmp.name)
+        if snapshot is not None:
+            (data_dir / bootstrap_scan_gate.SCOPE_SNAPSHOT_NAME).write_text(snapshot, encoding="utf-8")
+        return data_dir
+
+    def _snapshot(self, exclude):
+        return json.dumps({"declared": {"projects": [], "folders": [], "organizations": [], "sharedVpcHosts": [],
+                                        "metricsScopes": [], "exclude": exclude},
+                           "projects": [{"id": "ka-test", "via": ["management"], "outcome": "ok", "state": "in-scope"}],
+                           "present": True, "boundary": True})
+
+    def test_the_excluded_clusters_are_named_and_kept_out_of_step_3(self):
+        data_dir = self._dir(self._snapshot(self.EXCLUDE))
+        paragraph = bootstrap_scan_gate._excluded_clusters_paragraph(data_dir)
+        self.assertIn("`ka-test/us-central1/lane-b`, `ka-test/us-east1-b/kyber-test`", paragraph)
+        self.assertIn("do not audit them in Step 3", paragraph)
+        self.assertNotIn("ka-test/us-central1`", paragraph)
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir), \
+                mock.patch.object(bootstrap_scan_gate, "cluster_agents", return_value=[]):
+            self.assertIn(paragraph, bootstrap_scan_gate._task_body())
+
+    def test_with_no_snapshot_the_render_s_exclusions_are_named(self):
+        # The gate files the sweep without a snapshot when it gives up on the
+        # reconcile; the operator's render still names the exclusions.
+        data_dir = self._dir()
+        render = data_dir / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": [], "exclude": self.EXCLUDE}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_FILE": str(render)}):
+            paragraph = bootstrap_scan_gate._excluded_clusters_paragraph(data_dir)
+        self.assertIn("`ka-test/us-central1/lane-b`", paragraph)
+
+    def test_an_unreadable_render_sends_the_worker_to_the_tool(self):
+        data_dir = self._dir()
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_FILE": str(data_dir / "absent.json")}):
+            paragraph = bootstrap_scan_gate._excluded_clusters_paragraph(data_dir)
+        self.assertIn("could not be read", paragraph)
+        self.assertIn("`fleet_scope`", paragraph)
+
+    def test_no_scope_or_no_exclusion_names_nothing(self):
+        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._dir()), "")
+        self.assertEqual(bootstrap_scan_gate._excluded_clusters_paragraph(self._dir(self._snapshot({"projects": [], "clusters": []}))), "")
+
+
 class ScopeGapParagraphTest(unittest.TestCase):
     """The sweep is told which projects in scope the reconcile could not list."""
 
@@ -1627,7 +1692,6 @@ class FirstRunAuditsTest(unittest.TestCase):
         """The note for oobe's ``state``."""
         if state is not None:
             oobe.write_state(self.d, state)
-        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
         return bootstrap_delivery._audits_note(self.d, no_coverage)
 
     def _skipped(self, reason: str) -> None:
@@ -1659,6 +1723,32 @@ class FirstRunAuditsTest(unittest.TestCase):
                     self._note(),
                     f"The first-run audits did not run: {reason}. {bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
                 )
+
+    def test_a_skip_an_older_stage_recorded_for_no_repository_says_the_report_covers_them(self):
+        # Kept through an upgrade: that build's scan ran the audits' workload checks itself.
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=900\n", encoding="utf-8")
+        self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
+        self.assertEqual(
+            self._note(),
+            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"{bootstrap_delivery.AUDITS_COVERED_NOTE}",
+        )
+        # A report no cluster's audit reached covers nothing, whatever the older stage recorded.
+        self.assertEqual(
+            self._note(no_coverage=True),
+            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"{bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE}",
+        )
+
+    def test_a_sweep_filed_after_an_older_skip_does_not_say_the_report_covers_them(self):
+        # Onboarding repeated with the stage's marker kept: the new scan left those checks to the audits.
+        self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep2\nfiled_at=2000\n", encoding="utf-8")
+        self.assertEqual(
+            self._note(),
+            f"The first-run audits did not run: {bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}. "
+            f"{bootstrap_delivery.AUDITS_NOT_COVERED_NOTE}",
+        )
 
     def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
         self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
@@ -1726,6 +1816,134 @@ class FirstRunAuditsTest(unittest.TestCase):
                 self.assertIn("Not run: `fleet-wide-cost-analysis` (", note)
                 self.assertNotIn("now running", note)
                 self.assertNotIn("which have started", note)
+
+    def _run(self, audit: str, claimed_at: float, outcome: str | None, columns: bool = True) -> None:
+        """A completed run of ``audit`` in the Platform Agent's cron store, ending a minute after its claim."""
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True, exist_ok=True)
+        extra = ", finished_at TEXT, delivery_outcome TEXT" if columns else ""
+        with sqlite3.connect(cron / oobe.EXECUTIONS_DB) as conn:
+            conn.execute(f"CREATE TABLE IF NOT EXISTS executions (job_id TEXT, status TEXT, claimed_at TEXT{extra})")
+            stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()  # noqa: E731
+            if columns:
+                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?, ?, ?)",
+                             (audit, stamp(claimed_at), stamp(claimed_at + 60), outcome))
+            else:
+                conn.execute("INSERT INTO executions VALUES (?, 'completed', ?)", (audit, stamp(claimed_at)))
+
+    def _finished_chain(self, outcome: str | None) -> dict:
+        """All four audits marked and completed after their marks, each run's delivery ending ``outcome``."""
+        now = time.time()
+        marks = {a: now - 3600 + i * 600 for i, a in enumerate(oobe.FIRST_RUN_AUDITS)}
+        for audit in oobe.FIRST_RUN_AUDITS:
+            self._run(audit, marks[audit] + 30, outcome)
+        return {oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_MARKS: marks, oobe.STATE_DONE: True}
+
+    def test_audits_that_finished_before_a_home_channel_are_listed(self):
+        note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        self.assertIn("which have run: `fleet-wide-cost-analysis`", note)
+        self.assertNotIn("have started", note)
+        # The ran note promises no home-channel post while summaries are missing.
+        self.assertNotIn("Each posts a summary to the home channel", note)
+        self.assertIn("but their summaries were not posted to the chat: "
+                      "`fleet-wide-cost-analysis`, `compliance-audit`, `obtainability-audit`, `stockout-prevention`. "
+                      "Ask me for any of these reports.", note)
+
+    def test_a_run_going_at_the_mark_counts_by_its_finish(self):
+        now = time.time()
+        # Claimed before the mark, finished after it: the stage took it as the audit's answer.
+        self._run("compliance-audit", now - 960, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 930},
+                           oobe.STATE_DONE: True})
+        self.assertIn("which have run: `compliance-audit`.", note)
+        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
+    def test_a_suppressed_acked_run_is_silent(self):
+        now = time.time()
+        self._run("compliance-audit", now - 1200, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 600, "suppressed_acked")
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 1300},
+                           oobe.STATE_DONE: True})
+        self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
+    def test_a_mark_that_is_not_a_number_reads_as_no_mark(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, bootstrap_delivery.DELIVERY_FAILED)
+        for mark in ("1790000000", None, [1]):
+            with self.subTest(mark=mark):
+                note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": mark},
+                                   oobe.STATE_DONE: True})
+                self.assertIn("which have run: `compliance-audit`.", note)
+                self.assertIn("were not posted to the chat: `compliance-audit`", note)
+
+    def test_a_later_silent_run_does_not_hide_the_lost_summary(self):
+        # Day 2: the first run's summary was refused; the next scheduled run found nothing new.
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        for outcome in ("suppressed", None):
+            self._run("compliance-audit", now - 600, outcome)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 86400 - 60},
+                           oobe.STATE_DONE: True})
+        self.assertIn("were not posted to the chat: `compliance-audit`.", note)
+
+    def test_delivered_summaries_are_not_listed(self):
+        for outcome in ("delivered", "suppressed", None):
+            with self.subTest(outcome=outcome):
+                self._tmp.cleanup()
+                self.d.mkdir()
+                note = self._note(self._finished_chain(outcome))
+                self.assertIn("which have run:", note)
+                self.assertNotIn("not posted", note)
+
+    def test_a_later_run_that_delivered_clears_an_earlier_failure(self):
+        state = self._finished_chain(bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", time.time() - 10, "delivered")
+        note = self._note(state)
+        unposted = note.partition("not posted to the chat:")[2]
+        self.assertNotIn("`compliance-audit`", unposted)
+        self.assertIn("`stockout-prevention`", unposted)
+
+    def test_a_run_from_before_the_mark_is_not_the_first_run(self):
+        now = time.time()
+        self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("which have started: `compliance-audit`.", note)
+        self.assertNotIn("not posted", note)
+
+    def test_a_store_without_the_outcome_column_lists_nothing(self):
+        now = time.time()
+        self._run("compliance-audit", now - 600, None, columns=False)
+        note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
+                           oobe.STATE_DONE: True})
+        self.assertIn("which have run: `compliance-audit`.", note)
+        self.assertNotIn("not posted", note)
+        # The stage log says why no unposted summary can be named; stderr is dropped on exit 0.
+        self.assertIn("no delivery_outcome column", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_an_unreadable_store_keeps_the_note_it_had(self):
+        cron = self.d / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR
+        cron.mkdir(parents=True)
+        (cron / oobe.EXECUTIONS_DB).write_text("not a database", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
+        self.assertIn("which have started:", note)
+        self.assertNotIn("not posted", note)
+        self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
+
+    def test_the_text_delivery_carries_the_undelivered_summaries(self):
+        oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
+        (self.d / INVENTORY).write_text("# Report\n", encoding="utf-8")
+        (self.d / ALIGNED).touch()
+        (self.d / SCAN_FILED).write_text("task_id=t_sweep\nfiled_at=1\n", encoding="utf-8")
+        out = io.StringIO()
+        with (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertIn("`stockout-prevention`. Ask me for any of these reports.", out.getvalue())
 
     def test_a_chain_under_way_names_a_held_audit_as_not_run(self):
         note = self._note({oobe.STATE_FIRED: ["fleet-wide-cost-analysis"],

@@ -43,7 +43,7 @@ Every Chat message carries session context (space ID, user, thread) that flows t
 
 ## Inline Console links
 
-`SOUL.md §5` requires the agent, whenever it's discussing telemetry, tracing, logs, or debugging, to generate clickable Cloud Console links using the active project ID. The URL templates live in [`agents/platform/docs/gcp-console-links.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/gcp-console-links.md) — a shared runtime reference baked into the agent image at `/opt/defaults/docs/` — covering Logs Explorer, Trace Explorer, Metrics Explorer, and the GKE Workloads console. The agent substitutes the runtime project ID and formats the links as Markdown so they render clickable in Chat.
+`SOUL.md §5` requires the agent, whenever it's discussing telemetry, tracing, logs, or debugging, to generate clickable Cloud Console links using the active project ID. The URL templates live in [`agents/platform/docs/gcp-console-links.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/gcp-console-links.md) — a shared runtime reference baked into the agent image at `/opt/defaults/docs/` and inlined directly into `SOUL.md §5` — covering Logs Explorer, Trace Explorer, Metrics Explorer, and the GKE Workloads console. The agent substitutes the runtime project ID and formats the links as Markdown so they render clickable in Chat.
 
 ## Auditing the agent itself
 

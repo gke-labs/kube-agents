@@ -18,7 +18,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -1455,5 +1457,174 @@ func TestBuildLiteLLMNetworkPolicy_CollectorNamespaceAnnotation(t *testing.T) {
 				t.Errorf("expected a non-DNS-1123 AnnotationOTLPCollectorNamespace to be dropped, but found OTLP egress port %d", p.Port.IntVal)
 			}
 		}
+	}
+}
+
+func litellmAgentWithAnnotations(annotations map[string]string) *agentv1alpha1.PlatformAgent {
+	return &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test-agent",
+			Namespace:   "test-ns",
+			Annotations: annotations,
+		},
+	}
+}
+
+func TestBuildLiteLLMNetworkPolicy_UpstreamEgressAnnotation(t *testing.T) {
+	profile := netpolProfile{
+		Generated:     true,
+		DNSClusterIPs: []string{"10.96.0.10"},
+	}
+	baseline := buildLiteLLMNetworkPolicy(litellmAgentWithAnnotations(nil), profile).Spec.Egress
+
+	namespaceRule := networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(8000)},
+		To: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{labelMetadataName: "vllm"},
+			},
+		}},
+	}
+	cidrRule := networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(443)},
+		To: []networkingv1.NetworkPolicyPeer{
+			{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.0/24"}},
+			{IPBlock: &networkingv1.IPBlock{CIDR: "10.20.30.40/32"}},
+			{IPBlock: &networkingv1.IPBlock{CIDR: "fd00:1::/64"}},
+		},
+	}
+
+	validCases := []struct {
+		name  string
+		value string
+		want  networkingv1.NetworkPolicyEgressRule
+	}{
+		{"namespace form", `{"namespace":"vllm","port":8000}`, namespaceRule},
+		{"cidrs form, deduped and sorted, bare address widened to /32", `{"cidrs":["fd00:1::/64","10.20.30.40","10.0.0.0/24","10.0.0.0/24"],"port":443}`, cidrRule},
+		{"whitespace around the value and entries", "  {\"cidrs\":[\" 10.0.0.0/24 \",\"10.20.30.40/32\",\"fd00:1::/64\"],\"port\":443}\n", cidrRule},
+	}
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := litellmAgentWithAnnotations(map[string]string{AnnotationLiteLLMUpstreamEgress: tc.value})
+			egress := buildLiteLLMNetworkPolicy(agent, profile).Spec.Egress
+			if len(egress) != len(baseline)+1 {
+				t.Fatalf("expected %d egress rules (baseline plus the upstream rule), got %d", len(baseline)+1, len(egress))
+			}
+			if !reflect.DeepEqual(egress[:len(baseline)], baseline) {
+				t.Errorf("expected the baseline rules to be unchanged, got %+v", egress[:len(baseline)])
+			}
+			if got := egress[len(egress)-1]; !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("upstream rule mismatch:\n got  %+v\n want %+v", got, tc.want)
+			}
+		})
+	}
+
+	tooMany := make([]string, maxLiteLLMUpstreamCIDRs+1)
+	for i := range tooMany {
+		tooMany[i] = fmt.Sprintf(`"10.0.%d.0/24"`, i)
+	}
+
+	invalidCases := []struct {
+		name   string
+		value  string
+		reason string
+	}{
+		{"absent", "", ""},
+		{"whitespace only", "   ", ""},
+		{"invalid JSON", `{"namespace":"vllm","port":`, "not valid JSON"},
+		{"not an object", `"vllm:8000"`, "not valid JSON"},
+		{"unknown field", `{"namespace":"vllm","port":8000,"host":"vllm.vllm.svc"}`, "unknown field"},
+		{"content after the value", `{"namespace":"vllm","port":8000}{}`, "content after the first JSON value"},
+		{"both forms", `{"namespace":"vllm","cidrs":["10.0.0.0/24"],"port":8000}`, "exactly one of namespace or cidrs"},
+		{"neither form", `{"port":8000}`, "exactly one of namespace or cidrs"},
+		{"empty cidrs", `{"cidrs":[],"port":443}`, "1 to 50 entries"},
+		{"too many cidrs", `{"cidrs":[` + strings.Join(tooMany, ",") + `],"port":443}`, "1 to 50 entries"},
+		{"bad namespace uppercase", `{"namespace":"VLLM","port":8000}`, "not a DNS-1123 label"},
+		{"bad namespace leading dash", `{"namespace":"-vllm","port":8000}`, "not a DNS-1123 label"},
+		{"namespace with inner whitespace", `{"namespace":" vllm ","port":8000}`, "not a DNS-1123 label"},
+		{"port missing", `{"namespace":"vllm"}`, "outside 1-65535"},
+		{"port 0", `{"namespace":"vllm","port":0}`, "outside 1-65535"},
+		{"port 70000", `{"namespace":"vllm","port":70000}`, "outside 1-65535"},
+		{"port negative", `{"cidrs":["10.0.0.0/24"],"port":-1}`, "outside 1-65535"},
+		{"port as string", `{"namespace":"vllm","port":"8000"}`, "not valid JSON"},
+		{"not a CIDR", `{"cidrs":["vllm.internal"],"port":443}`, "not a CIDR or address"},
+		{"link-local CIDR", `{"cidrs":["169.254.0.0/16"],"port":443}`, "link-local range"},
+		{"range overlapping link-local", `{"cidrs":["169.240.0.0/12"],"port":443}`, "link-local range"},
+		{"metadata /32", `{"cidrs":["169.254.169.254/32"],"port":80}`, "link-local range"},
+		{"metadata daemon address", `{"cidrs":["169.254.169.252"],"port":988}`, "link-local range"},
+		{"IPv6 metadata address", `{"cidrs":["fd20:ce::254/128"],"port":80}`, "metadata server address fd20:ce::254"},
+		{"IPv6 link-local", `{"cidrs":["fe80::/64"],"port":443}`, "link-local range fe80::/10"},
+		{"IPv4-mapped metadata", `{"cidrs":["::ffff:169.254.169.254/128"],"port":80}`, "link-local range"},
+		{"too-wide IPv4 prefix", `{"cidrs":["10.0.0.0/8"],"port":443}`, "broader than /12"},
+		{"too-wide IPv6 prefix", `{"cidrs":["fd00::/16"],"port":443}`, "broader than /12"},
+		{"all addresses", `{"cidrs":["0.0.0.0/0"],"port":443}`, "broader than /12"},
+		{"one bad entry among good ones", `{"cidrs":["10.0.0.0/24","169.254.169.254/32"],"port":443}`, "link-local range"},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := litellmAgentWithAnnotations(map[string]string{AnnotationLiteLLMUpstreamEgress: tc.value})
+			egress := buildLiteLLMNetworkPolicy(agent, profile).Spec.Egress
+			if !reflect.DeepEqual(egress, baseline) {
+				t.Errorf("expected annotation %q to be ignored, got egress %+v", tc.value, egress)
+			}
+			if tc.reason == "" {
+				return
+			}
+			_, err := parseLiteLLMUpstreamEgress(strings.TrimSpace(tc.value))
+			if err == nil || !strings.Contains(err.Error(), tc.reason) {
+				t.Errorf("expected refusal containing %q, got %v", tc.reason, err)
+			}
+		})
+	}
+}
+
+func TestReconcileLiteLLMNetworkPolicy_UpstreamEgressAnnotation(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := litellmAgentWithAnnotations(map[string]string{
+		AnnotationLiteLLMUpstreamEgress: `{"namespace":"vllm","port":8000}`,
+	})
+	litellmDep := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "litellm",
+			Namespace: "test-ns",
+			UID:       types.UID("litellm-test-uid"),
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, litellmDep).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	profile := netpolProfile{
+		Generated:     true,
+		DNSClusterIPs: []string{"10.96.0.10"},
+	}
+
+	ctx := context.Background()
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, profile); err != nil {
+		t.Fatalf("reconcileLiteLLMNetworkPolicy failed: %v", err)
+	}
+
+	var netpol networkingv1.NetworkPolicy
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: "test-ns", Name: "litellm-policy"}, &netpol); err != nil {
+		t.Fatalf("expected litellm-policy to exist, got error: %v", err)
+	}
+	found := false
+	for _, rule := range netpol.Spec.Egress {
+		if len(rule.Ports) != 1 || rule.Ports[0].Port == nil || rule.Ports[0].Port.IntVal != 8000 ||
+			rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
+			continue
+		}
+		if len(rule.To) == 1 && rule.To[0].NamespaceSelector != nil &&
+			rule.To[0].NamespaceSelector.MatchLabels[labelMetadataName] == "vllm" && rule.To[0].PodSelector == nil {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected the applied litellm-policy to carry TCP 8000 egress to namespace vllm, got %+v", netpol.Spec.Egress)
 	}
 }

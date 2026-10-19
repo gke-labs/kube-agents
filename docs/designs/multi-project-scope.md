@@ -173,6 +173,17 @@ Rules:
   `custom` role set to exclude the management cluster by that variable; a scope that silently
   ended the exclusion would recreate the one profile they were told to prevent. The places that
   name the variable as the opt-out (§8) change with it.
+- **`exclude.clusters` bounds fleet answers and the per-cluster audits, not only the roster.** Decided 2026-10-15
+  (#3081). An excluded cluster gets no Cluster Agent. The platform MCP server's `fleet_scope` tool
+  lists it under `excluded_clusters` and hands the collectors `--scope-exclude-clusters`, which
+  drop it from their listing before reading anything. It is not a coverage gap, because the
+  operator left it out on purpose. The onboarding sweep card names it so Step 3 does not audit it
+  by hand, and the Platform Agent's fan-out gives it no card. Among what still covers it is the
+  daily upgrade-readiness watch (#3026): it runs the report with `--project` flags and no
+  exclusion, so its report covers excluded clusters on purpose. The same report script run by the
+  agent gets the exclusion with `fleet_scope`'s arguments and leaves them out. The networking audit still counts its subnet usage (its pods hold real IPs) and the GCE audit
+  still lists its node VMs. Output from the third-party `gke` MCP server's `list_clusters` is not filtered.
+  Per-tool result filtering would belong in a brokered MCP relay (#2940).
 - **Resolution is deterministic.** The resolved project set is sorted by ID before it is written
   anywhere (listing follows the fill order above), so two runs against an unchanged fleet produce byte-identical snapshots (§5) and an
   unchanged roster.
@@ -403,7 +414,7 @@ follow the selector type:
 `scope_roles` is a fixed allowlist of read roles intersected with `project_roles`, never
 `project_roles` itself, and it is what every grant outside the host project carries, whether the
 project was named or reached through a container. The allowlist is `container.clusterViewer`,
-`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer`, and
+`container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer` and
 `iam.securityReviewer`: the read roles in the list the composition binds, `local.read_only_roles`
 in `terraform/examples/full-install/main.tf`, which the module default (`variable "project_roles"`
 in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection matters on the
@@ -419,7 +430,14 @@ plan when `scope.projects`, `scope.folders`, `scope.organizations`, `scope.share
 but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
 
 The default roles outside the allowlist are outside it by design, and so is any role a later
-change adds to the default list that is not a read role. `roles/iam.serviceAccountUser` is
+change adds to the default list that is not a read role. `roles/cloudtrace.user` is the case in
+point: Google's Trace User role carries create, delete and update on analysis-report tasks and
+trace scopes beside `traces.get` and `traces.list`, no predefined Trace role grants the two reads
+alone, and the observability helpers that need the reads look at the host project's own traces
+through the broker's `GET`-only relay, so the role is bound at home and nowhere else (a token minted
+on the annotated ServiceAccount itself, which the gateway Pod and an `AgentPlugin` can do, carries
+its console permissions in the host project with every other role on the identity).
+`roles/iam.serviceAccountUser` is
 `iam.serviceAccounts.actAs`, held so the agent can run jobs as service accounts in its own project;
 inherited across a folder it would let the one agent identity act as every service account in every
 project beneath, including ones created tomorrow. `roles/mcp.toolUser` lets the agent call the GKE
@@ -548,7 +566,7 @@ works. Each is listed with whether it blocks the first phase or follows it: `1` 
 | `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`                                                                                                                        | Delegation needs `--project` from the requester; #953 asks for enumeration first                                                                                                                                                                                                                                                  | 1     |
 | `k8s-operator/cmd/drift-detector`                                                                                                                                                | The `managedFields` join dropped every Cluster Agent profile whose cluster was outside `--project`; it now registers every profile, so a cross-project fleet's clusters are joined once their projects' records reach the subscription                                                                                            | done  |
 | `terraform/modules/drift-pubsub`                                                                                                                                                 | One log sink in `var.project_id`; other projects' audit logs needed a sink each into the host topic, which `source_projects` now creates for every project the declaration lists (`scope_export_projects`: `scope.projects` and the selectors' members, never a container's Asset-Inventory members)                              | done  |
-| Fleet-audit SOPs (the `gke-cost-*` skills take the project from their caller)                                                                                                    | Queried "the project" for quotas, recommendations, and IAM, then every project the identity could list; the SOPs now call the platform MCP server's `fleet_scope` tool first and pass its resolved set to the collectors (`--scope-projects`, `--scope-unread`), listing only on an install that declares none                    | done  |
+| Fleet-audit SOPs (the `gke-cost-*` skills take the project from their caller)                                                                                                    | Queried "the project" for quotas, recommendations, and IAM, then every project the identity could list; the SOPs now call the platform MCP server's `fleet_scope` tool first and pass its resolved set to the collectors (the `--scope-*` flags, cluster exclusions included), listing only on an install that declares none      | done  |
 | `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                       | "sweeps the project"; now "sweeps every project in scope"                                                                                                                                                                                                                                                                         | done  |
 | `docs/site/src/content/docs/reference/security-and-iam.md:80`                                                                                                                    | "reads Kubernetes objects in **every** cluster in the project" becomes "in every cluster in the scope"                                                                                                                                                                                                                            | done  |
 | `docs/site/src/content/docs/reference/credential-isolation.md:205`                                                                                                               | Described the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; the page now says the override is pinned empty in the managed `.env`                                                                                                                                            | done  |
@@ -582,8 +600,8 @@ The architecture documents move from "its one project" to "its declared scope":
 
 What does not change: read-only stays read-only. Every grant outside the host project carries the
 `scope_roles` allowlist of §6 and nothing else; the non-viewer roles in `project_roles`
-(`iam.serviceAccountUser`, `mcp.toolUser`, and whatever a `custom` set adds) stay in the host
-project, and nothing here grants a write anywhere. What does change is how much one credential can
+(`iam.serviceAccountUser`, `mcp.toolUser`, `cloudtrace.user`, and whatever a `custom` set adds)
+stay in the host project, and nothing here grants a write anywhere. What does change is how much one credential can
 read. The
 agent's service account carries `roles/container.viewer`, which "lets an identity read Kubernetes
 objects in every cluster in the project" (`kube-agents-iam/main.tf:30-31`); bound on a folder it

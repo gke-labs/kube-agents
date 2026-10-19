@@ -8,7 +8,8 @@ location     = "us-central1"
 api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 
 # Model-provider credential(s) — set at least one so the agent can run, unless
-# model_provider = "vertex_ai" (see below), which needs none.
+# model_provider = "vertex_ai" or "openai_compatible" (see below), which need
+# none.
 # Empty keys are omitted from the Secret.
 # NOTE: all keys above and below end up in plaintext in the Terraform state
 # (and in the in-cluster Secret) — keep the state in a protected backend.
@@ -102,6 +103,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Output tokens the gateway asks for on a request that names none; 0 renders
 # nothing. For a self-hosted backend whose prompt and output share one window.
 # model_max_tokens   = 0
+# Daily alert ceilings. A key that is not set keeps the image default, and 0
+# removes the cap. A change here replaces hand edits to the PlatformAgent's
+# env. See variables.tf.
+# alert_daily_limits = {
+#   warning = 15
+#   drift   = 30
+# }
 # Redaction of every request body the gateway forwards to the provider; off by
 # default. ip_action is pseudonym, mask or off. See variables.tf.
 # litellm_redaction = {
@@ -124,10 +132,29 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # API and grant the gateway's service account roles/aiplatform.user by hand.
 # vertex_manage_serving_project = true
 
+# A server speaking the OpenAI chat-completions API (vLLM, TGI, an internal
+# gateway) instead — see variables.tf. No defaults: the model and the base URL
+# are required. An in-cluster Service needs the server pod's port; any other
+# host needs the private ranges it is reached at, unless it is a public
+# endpoint on 443. The CA Secret holds a PEM CA under ca.crt; create it first.
+# model_provider                   = "openai_compatible"
+# model_default_name               = "some-org/some-model"
+# openai_compatible_api_base       = "http://llm-service.models.svc.cluster.local/v1"
+# openai_compatible_target_port    = 8000
+# openai_compatible_egress_cidrs   = []
+# openai_compatible_ca_secret_name = ""
+# openai_compatible_api_key        = ""
+
 
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).
 # enable_github_minter = true
 # github_repo          = "my-github-org/my-repo"
+# On a GitHub Enterprise Server: its hostname, github_repo as owner/name on the
+# instance, and the App created there. The Secret holding a private CA under
+# the key `ca.crt` (install.sh writes it from --gitops-ca-file); restart the
+# minter after the Secret changes.
+# gitops_host           = "github.example.com"
+# github_ca_secret_name = "github-forge-ca"
 
 # Or a GitOps project on GitLab instead (no GitHub App, no minter). The token is
 # never a variable: create Secret gitlab_token_secret_name, key `token`, in the

@@ -43,7 +43,8 @@ their own copies:
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
 | `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
-| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
+| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`  |
+| `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                  |
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
@@ -329,7 +330,28 @@ which used to replace the Secret and restart every pod holding it.
 
 ### The GitOps forge
 
-`GITOPS_FORGE` is `github` (the default) or `gitlab`. A GitLab install records these keys:
+`GITOPS_FORGE` is `github` (the default) or `gitlab`. A github.com install records none of the
+forge keys. A GitHub Enterprise Server install (`--gitops-host` with the github forge) records
+these keys, beside `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, which name the repository and
+the App on the instance:
+
+| Key                | Value                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`     | `github`                                                                                                     |
+| `GITOPS_HOST`      | The instance's hostname                                                                                      |
+| `GITOPS_CA_SECRET` | The name of the Secret that holds a private CA (default `github-forge-ca`); set only with `--gitops-ca-file` |
+
+`upgrade.sh` and `uninstall.sh` render the same forge from these keys. The generator writes
+`gitops_host` and `github_ca_secret_name` into `terraform.tfvars`, and the composition declares the
+github forge at that host. After the apply, `install.sh` writes the CA file into the Secret and
+restarts the token minter, which reads the CA when it starts. `--gitops-host=github.com` switches the
+install back to github.com and drops the three keys. The App and its KMS key belong to one GitHub
+host: a switch between github.com and an instance needs the other host's App and a new KMS key
+(`install.sh` refuses a change of host that keeps the recorded `GITHUB_APP_ID` or key), as
+[Switch between github.com and a GitHub Enterprise Server](../../INSTALL.md#switch-between-githubcom-and-a-github-enterprise-server)
+describes.
+
+A GitLab install records these keys:
 
 | Key                   | Value                                                                                                        |
 | --------------------- | ------------------------------------------------------------------------------------------------------------ |
@@ -342,14 +364,23 @@ which used to replace the Secret and restart every pod holding it.
 The token, and the paths of the token file and the CA file, are never recorded.
 `GITLAB_TOKEN_FILE` and `GITOPS_CA_FILE` in the environment act like `--gitlab-token-file` and
 `--gitops-ca-file` for one run, and are never recorded either. One difference: with gitlab.com as
-the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag.
+the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag. With
+github.com, it refuses both.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
 - A run that you decline, or that ends with `--generate-only`, does not change them in an existing
   file.
-- A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`. A switch back to
-  GitHub drops the GitLab keys.
+- A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`, and a recorded
+  GitHub Enterprise Server host and CA Secret. A switch back to GitHub drops the GitLab keys.
+- A run on GitHub that changes the GitHub host or the CA Secret rewrites `GITOPS_ORG`,
+  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys. It keeps
+  `GITHUB_PEM_PATH` (the path, never the key): the path this run uses (from `--github-pem-path` or
+  the PEM prompt), or else the recorded one. A move to another GitHub host does not keep the
+  recorded path, because it is the old App's key: give the new App's key with
+  `--github-pem-path`, or export `GITHUB_PEM_PATH` for the run when `install.env` records no
+  path (a recorded line wins over the shell). A run that does not need the file (the KMS key already has an `ENABLED`
+  version and the file is gone) records no path.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
 
@@ -630,9 +661,24 @@ done
 
 The grants left in the unreachable project are orphaned, not revoked. A `custom` permission set
 made of custom IAM roles cannot declare a scope: a custom IAM role is never carried into scoped
-projects (only the six predefined read roles in `scope.tf`'s allowlist are, those of them the host
+projects (only the predefined read roles in `scope.tf`'s allowlist are, those of them the host
 project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
 `roles/container.clusterViewer` or `roles/container.viewer`.
+
+### Daily alert ceilings
+
+`ALERT_DAILY_LIMIT_CRITICAL`, `ALERT_DAILY_LIMIT_WARNING`, `ALERT_DAILY_LIMIT_INFO` and
+`ALERT_DAILY_LIMIT_DRIFT` set the daily alert ceilings. `write_tfvars_from_state` writes each key
+that is set into `alert_daily_limits`, and the chart renders it into the `PlatformAgent`'s
+`spec.deployment.env`. An empty key is not written, so the agent image keeps its default for that
+bucket. For this reason, `install.defaults.env` has no entry for these keys. The generator refuses a
+value that is not a whole number of 0 or more, and names the key. `install.sh` records all four
+keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
+value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
+apply these keys. The operator and harness modes of `upgrade.sh` use the values that the release
+recorded. But each `upgrade.sh` run calls the generator before it selects the mode, so a bad value
+stops the run in every mode. The [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+gives the buckets, the defaults, and what happens to entries added to the CR by hand.
 
 ### Cluster adoption and component toggles
 

@@ -18,6 +18,24 @@ metadata:
       name: platformagent
       uid: ""
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway-agent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -129,6 +147,9 @@ subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent
     namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
+    namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -185,6 +206,9 @@ subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent
     namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
+    namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -240,7 +264,7 @@ roleRef:
   name: kubeagents:leader:kubeagents-system:platformagent
 subjects:
   - kind: ServiceAccount
-    name: kubeagents-platform-agent
+    name: platformagent-gateway-agent
     namespace: kubeagents-system
 ---
 apiVersion: v1
@@ -342,6 +366,7 @@ data:
     KUBEAGENTS_MODE=today
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
+    GKE_PROJECT_ID=example-project
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
     GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
@@ -1034,7 +1059,9 @@ spec:
             - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+            - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
+              value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1629,6 +1656,10 @@ spec:
                   key: SESSION_KV_API_KEY
                   name: platform-agent-secrets
                   optional: true
+            - name: WATCHER_BROKER_URL
+              value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
+            - name: WATCHER_BROKER_TOKEN_FILE
+              value: /var/run/secrets/kubeagents/watcher-proxy/token
             - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
@@ -1687,6 +1718,9 @@ spec:
               readOnly: true
             - mountPath: /opt/data
               name: platform-agent-data-vol
+            - mountPath: /var/run/secrets/kubeagents/watcher-proxy
+              name: watcher-credential-proxy-token
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsGroup: 10000
@@ -1694,7 +1728,7 @@ spec:
         runAsUser: 10000
         seccompProfile:
           type: RuntimeDefault
-      serviceAccountName: kubeagents-platform-agent
+      serviceAccountName: platformagent-gateway-agent
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:
@@ -1771,6 +1805,14 @@ spec:
             sources:
               - serviceAccountToken:
                   audience: kubeagents-credential-proxy-chat
+                  expirationSeconds: 3600
+                  path: token
+        - name: watcher-credential-proxy-token
+          projected:
+            defaultMode: 256
+            sources:
+              - serviceAccountToken:
+                  audience: kubeagents-credential-proxy-watcher
                   expirationSeconds: 3600
                   path: token
         - name: sandbox-ssh-secret
@@ -1887,20 +1929,6 @@ spec:
             cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
-    - ports:
-        - port: 80
-          protocol: TCP
-      to:
-        - ipBlock:
-            cidr: 169.254.169.254/32
-    - ports:
-        - port: 988
-          protocol: TCP
-      to:
-        - ipBlock:
-            cidr: 169.254.169.252/32
-        - ipBlock:
-            cidr: 169.254.169.254/32
     - ports:
         - port: 80
           protocol: TCP

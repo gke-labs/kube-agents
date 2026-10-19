@@ -18,8 +18,8 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
-bar the two on `"all"`. That routes the report through the
+The entry ships `deliver: "chat"`, as every report-producing entry on the roster does.
+That routes the report through the
 relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
@@ -56,7 +56,15 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 
 The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
+`spec.mode: next` `/sethome` does not reach the gateway, so for the platform the gateway holds the CR
+field is the only way. The operator renders the Google Chat field into the gateway as
+`A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
+`spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
+only chat platform is the gateway's and has no home channel gets no send at all: the error names the
+platform and the field, as in
+`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`.
+A malformed home channel gets the same refusal without the platform. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
 so an install without a home channel loses those events entirely rather than seeing them late.
@@ -318,25 +326,27 @@ The filter is an environment variable on the agent container:
 | ------------------------ | ----------------------------------------- | ------------------------------------------------- |
 | `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing. |
 
-Set it the way the alert ceiling's `ALERT_DAILY_LIMIT_*` are set — on the `PlatformAgent` CR, under
-`spec.deployment.env`:
+Set it through the chart value `platformAgent.deployment.env`, which the chart renders into the
+`PlatformAgent` CR's `spec.deployment.env`. On the Terraform install, put the same block in
+`extra_helm_values`. Do not edit the CR by hand. Each apply that changes the list that the chart
+renders replaces the full list on the CR, and the hand edit is lost.
 
 ```yaml
-spec:
+platformAgent:
   deployment:
     env:
       - name: EOD_EXCLUDE_NAMESPACES
         value: kube-system,kube-public,kube-node-lease,istio-system
 ```
 
-**The CR is the only route that works, and this is why.** Environment on that container is rendered
-by the operator and filtered through `safeSandboxEnvOverrides`, an allowlist — a name that is not on
-it is dropped with no error, no event and no status condition, so the edit appears to succeed and
-changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the Deployment with `kubectl set env` is not
-a shortcut: it mutates `spec.template`, so it rolls the pod, and the next reconcile re-renders the
-Deployment from the CR and reverts it.
+**The CR's `spec.deployment.env` is the only source that works, and this is why.** Environment on
+that container is rendered by the operator and filtered through `safeSandboxEnvOverrides`, an
+allowlist — a name that is not on it is dropped with no error, no event and no status condition, so
+the edit appears to succeed and changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the
+Deployment with `kubectl set env` is not a shortcut: it mutates `spec.template`, so it rolls the
+pod, and the next reconcile re-renders the Deployment from the CR and reverts it.
 
-Applying the CR change rolls the pod, and the next tick after it comes up uses the new value. The
+A change to the value rolls the pod, and the next tick after it comes up uses the new value. The
 script re-reads it on every run, so nothing further is needed once the pod is up. No value can fail
 the run: `excluded_namespaces()` is a `getenv`, a `split(",")` and a `strip()`, with no parse step
 to reject anything and no fallback behind it. That matters here because this job's stdout is the

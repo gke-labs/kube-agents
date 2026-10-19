@@ -156,6 +156,18 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
 KNOWN_UNREGISTERED = {
+    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
+    # as the stack cases below: a `stack:` case runs alone on lock-infra
+    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
+    # chain is already at or past the 480m deadline on cost hints alone.
+    "gitops-drift-deleted-policy-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
+    "gitops-drift-load-bearing-change-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
@@ -172,6 +184,16 @@ KNOWN_UNREGISTERED = {
         "#2755: stack case held out of the nightly until runner Compute "
         "permission, a scheduled plant sweep and infra-lock room land"
     ),
+    # The chat-route twin of the case above (#2386): it plants the same stack
+    # and is held out of the nightly for the same #2755 preconditions. It is a
+    # regression guard (main already passes it, 3 of 3 on a dev install), run
+    # by hand on a dev install until then. The entry goes when
+    # the case joins hack/eval/nightly-cases.txt, with the 900s audit-band
+    # unit_cost_hint.
+    "networking-chat-request-runs-collector": (
+        "#2755: stack case held out of the nightly until runner Compute "
+        "permission, a scheduled plant sweep and infra-lock room land"
+    ),
     # It grades what a chat channel received, and every CI install deploys with
     # GOOGLE_CHAT_ENABLED and SLACK_ENABLED false (hack/ci-deploy.sh), so the
     # relay posts nowhere there and the case can only fail. Run by hand against
@@ -179,6 +201,17 @@ KNOWN_UNREGISTERED = {
     # entry goes when an eval lane has a chat platform.
     "chat-relay-posts-report-as-written": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
+    "fleet-audit-chat-report-is-the-report": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
+    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
+    # it. No eval lane deploys either, so it runs by hand with the recipe in
+    # its header. The entry goes when a lane deploys both.
+    "ghes-pdb-remediation-pr": (
+        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
+        "run by hand with the recipe in the case header"
     ),
 }
 
@@ -195,6 +228,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "scope-excluded-cluster-not-listed": (
+        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
+        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
+        "cluster exclusion and the case cannot patch the CR for a run"
+    ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
         "every pool project (fleet re-apply); no pool project has a rule opening a "
@@ -240,6 +278,17 @@ FIXTURE_NOT_READY = {
         "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
         "can run it; run it by hand against such an install"
     ),
+    "gitops-drift-no-repository-triage": (
+        "#3313: needs an install with no usable GitOps repository (a PlatformAgent "
+        "whose spec.integration.repositories is empty); every CI eval install "
+        "registers one, so no CI tier can run it; run it by hand against such an "
+        "install"
+    ),
+    "fleet-cost-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
         "service account can read, declared in the install's spec.scope.projects (or an "
@@ -257,6 +306,11 @@ FIXTURE_NOT_READY = {
         "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
         "(fleet re-apply); no pool project runs a VM whose startup script fails"
     ),
+    "gce-chat-request-runs-collector": (
+        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
+        "(fleet re-apply), as gce-startup-script-failure does; until then it runs by "
+        "hand on a dev install with the VM planted"
+    ),
     "obtainability-major-pdb-auto-pr": (
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
@@ -271,78 +325,6 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
-    ),
-}
-
-# Cases that claim no domain because no row in domains.yaml describes them.
-# "Covers nothing, and we checked" is a real answer; an absent field is not,
-# because a domain with no case reports as uncovered and a case with no slug
-# can stay green for months while the report shows the gap.
-KNOWN_NO_DOMAIN = {
-    "observability-watcher-scrape-state": (
-        "a question about the agent's own observability, whether the event "
-        "watcher's metrics are scraped and what proves it, graded on the "
-        "delegation, the worker's read of the PodMonitoring and the final "
-        "answer; reads the agent's own install, not the fleet, and no "
-        "domains.yaml row describes the agent's own observability"
-    ),
-    "platform-worker-refuses-shipped-skill-edit": (
-        "a skill-governance refusal graded on the worker's card result and on "
-        "its skill_manage calls (none may succeed); reads no fleet, and no "
-        "domains.yaml row describes skill or self-modification governance"
-    ),
-    "vcs-forge-cli-request-uses-the-verbs": (
-        "a read-only forge question that names gh, graded on the route the "
-        "worker took to the answer (the version-control verbs, not a forge "
-        "CLI); like vcs-history-only-fact, no domains.yaml row describes "
-        "repository access"
-    ),
-    "vcs-history-only-fact": (
-        "a repository-history question graded on the answer and on the route "
-        "the worker took to it (the version-control verbs, never a credentialed "
-        "clone or gh from the sandbox); no domains.yaml row describes "
-        "repository access"
-    ),
-    "vcs-issue-resolver-triage": (
-        "the github-issue-resolver skill end to end -- poll, claim, "
-        "investigate, transition -- graded on the route the resolver took to "
-        "the forge and on the triage it produced; no domains.yaml row "
-        "describes issue triage, and incident-triage names the event-fired "
-        "autoops journey rather than this one"
-    ),
-    "vcs-review-feedback-read-back": (
-        "a second revision put on an existing proposal's branch and read back "
-        "from the forge before it is described, graded on the route the worker "
-        "took to the read-back; rca-remediation-pr owns the remediation "
-        "journey -- a proposed fix landing as a pull request -- and this case "
-        "proposes no fix"
-    ),
-    "vcs-spent-branch-reuse": (
-        "a second proposal opened under a branch name whose first proposal "
-        "was closed, graded on the branch the pull request came from; like "
-        "vcs-review-feedback-read-back it proposes no fix, and "
-        "rca-remediation-pr owns the remediation journey"
-    ),
-    "gpu-stress-test-diagnosis": (
-        "a chat-prompted post-incident RCA, not the event-fired autoops triage "
-        "that incident-triage names; no domains.yaml row describes it"
-    ),
-    "knowledge-grounding-sources-probe": (
-        "a grounded-knowledge citation probe: a pure GKE documentation "
-        "question graded on the persona's Sources contract; it reads no "
-        "fleet and no domains.yaml row describes knowledge retrieval"
-    ),
-    "platform-worker-shell-edit-of-shipped-skill": (
-        "a shell-sandbox integrity case: a worker told to edit a shipped skill "
-        "from its terminal, graded on the sandbox's copy still matching the "
-        "image; it reads no fleet and no domains.yaml row describes skill or "
-        "sandbox integrity"
-    ),
-    "alert-config-terraform-promql-probe": (
-        "a skill-guidance probe: a Terraform alert policy written from the "
-        "gke-alert-configuration skill, graded on its PromQL condition, metric "
-        "and label; it reads no fleet and no domains.yaml row describes "
-        "alert authoring"
     ),
 }
 
@@ -385,7 +367,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "any_of_patterns",
         "forbidden_patterns",
+        "required_patterns",
     ),
+    # The parsed manifest's fields and selector are the assertion; `kind` alone
+    # only names what to look for.
+    "report_manifest": ("fields", "selects", "excludes"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
@@ -440,6 +426,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
+    # This repository, agent-pod- and sandbox-reading. No field: whether every
+    # post a fired audit run produced is the report its `finish` rendered is the
+    # whole assertion.
+    "audit_chat_report_posted": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
@@ -919,13 +909,11 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     # is invisible to the count that decides whether a domain is covered.
     domain = spec.get("domain")
     if domain is None:
-        if name not in KNOWN_NO_DOMAIN:
-            problems.append(
-                "declares no 'domain:'. Claim a slug from "
-                "docs/designs/domains.yaml, or add a reviewed KNOWN_NO_DOMAIN "
-                "entry in scripts/validate_bench_cases.py saying why no row "
-                "describes this case"
-            )
+        problems.append(
+            "declares no 'domain:'. Claim a slug from docs/designs/domains.yaml; "
+            "if no row there describes this case, add one (with its owner, "
+            "backup and meaning) in the same change"
+        )
     elif not isinstance(domain, str):
         problems.append(f"claims domain {domain!r}, which is not a slug string")
     elif domain not in known_domains():
@@ -1424,7 +1412,6 @@ def stale_allowlist_entries() -> list[str]:
     stale = []
     for label, entries in (
         ("KNOWN_UNREGISTERED", KNOWN_UNREGISTERED),
-        ("KNOWN_NO_DOMAIN", KNOWN_NO_DOMAIN),
         ("KNOWN_JUDGE_ONLY", KNOWN_JUDGE_ONLY),
         ("FIXTURE_NOT_READY", FIXTURE_NOT_READY),
     ):

@@ -1099,6 +1099,62 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
 
     # Empty reads as unset, so a developer's own exported value cannot stand in.
+    _ALERT_DAILY_LIMITS_UNSET = {
+        "ALERT_DAILY_LIMIT_CRITICAL": "",
+        "ALERT_DAILY_LIMIT_WARNING": "",
+        "ALERT_DAILY_LIMIT_INFO": "",
+        "ALERT_DAILY_LIMIT_DRIFT": "",
+    }
+
+    def _alert_daily_limits_block(self, content):
+        match = re.search(r"^alert_daily_limits = (\{\}|\{\n(?:  .*\n)*\})$", content, re.MULTILINE)
+        self.assertIsNotNone(match, content)
+        return match.group(1)
+
+    def test_tfvars_carry_no_alert_daily_limits_when_none_is_set(self):
+        # An empty key keeps the image default, so nothing reaches the chart.
+        content = self._tfvars({"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET},
+                               describe_stub="printf '\\n'; exit 0")
+        self.assertEqual(self._alert_daily_limits_block(content), "{}")
+
+    def test_tfvars_carry_only_the_alert_daily_limits_that_are_set(self):
+        content = self._tfvars(
+            {"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET,
+             "ALERT_DAILY_LIMIT_CRITICAL": "50", "ALERT_DAILY_LIMIT_DRIFT": "20"},
+            describe_stub="printf '\\n'; exit 0",
+        )
+        self.assertEqual(
+            self._alert_daily_limits_block(content),
+            "{\n  critical = 50\n  drift = 20\n}",
+        )
+
+    def test_tfvars_carry_an_alert_daily_limit_of_zero(self):
+        # 0 removes the cap for that bucket, so it is a value, not an empty key.
+        content = self._tfvars(
+            {"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET, "ALERT_DAILY_LIMIT_WARNING": "0"},
+            describe_stub="printf '\\n'; exit 0",
+        )
+        self.assertEqual(self._alert_daily_limits_block(content), "{\n  warning = 0\n}")
+
+    def test_tfvars_refuse_an_alert_daily_limit_that_is_not_a_whole_number(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator is the check that reaches it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for key in self._ALERT_DAILY_LIMITS_UNSET:
+                for value in ("ten", "-1"):
+                    with self.subTest(key=key, value=value):
+                        proc = self._run(
+                            f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                            env={"API_SERVER_KEY": "k", **self._ALERT_DAILY_LIMITS_UNSET, key: value},
+                            describe_stub="printf '\\n'; exit 0",
+                        )
+                        self.assertIn("rc=1", proc.stdout, proc.stderr)
+                        self.assertIn(key, proc.stderr + proc.stdout)
+                        self.assertIn("install.env", proc.stderr + proc.stdout)
+                        self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    # Empty reads as unset, so a developer's own exported value cannot stand in.
     _REDACTION_UNSET = {
         "LITELLM_REDACTION_ENABLED": "",
         "LITELLM_REDACTION_IP_ACTION": "",
@@ -1632,7 +1688,7 @@ class InstallerCommonTest(unittest.TestCase):
                 proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
                 for line in expect:
                     self.assertIn(line, proc.stdout)
-                self.assertIn("docs/designs/spec-mode-switch.md", proc.stdout)
+                self.assertIn("https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode", proc.stdout)
 
     def test_an_ungated_switch_does_not_offer_run_again(self):
         # upgrade.sh's full arm, the menu's apply and install.sh -y apply with
@@ -2369,6 +2425,112 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("Credentials omitted", content)
             # The TF_VAR_* channel carries them instead.
             self.assertIn("tfvar=k1", proc.stdout)
+
+    # ── openai_compatible ────────────────────────────────────────────────────
+
+    _OPENAI_COMPATIBLE_ENV = {
+        "API_SERVER_KEY": "k",
+        "MODEL_PROVIDER": "openai_compatible",
+        "MODEL_DEFAULT_NAME": "some-org/some-model",
+        "OPENAI_COMPATIBLE_API_BASE": "http://10.8.0.12:8000/v1",
+        "OPENAI_COMPATIBLE_TARGET_PORT": "",
+        "OPENAI_COMPATIBLE_EGRESS_CIDRS": "10.8.0.0/24, 10.9.0.0/24",
+        "OPENAI_COMPATIBLE_CA_SECRET_NAME": "llm-ca",
+        "OPENAI_COMPATIBLE_API_KEY": "oc-key",
+    }
+
+    def test_tfvars_carries_the_openai_compatible_lines_for_that_provider(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? tfvar=$TF_VAR_openai_compatible_api_key"',
+                env=self._OPENAI_COMPATIBLE_ENV,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('model_provider     = "openai_compatible"', content)
+            self.assertIn('openai_compatible_api_base       = "http://10.8.0.12:8000/v1"', content)
+            # Empty is the variable's "unset", 0, not a bare word HCL refuses.
+            self.assertIn("openai_compatible_target_port    = 0\n", content)
+            self.assertIn('openai_compatible_egress_cidrs   = ["10.8.0.0/24", "10.9.0.0/24"]', content)
+            self.assertIn('openai_compatible_ca_secret_name = "llm-ca"', content)
+            self.assertIn('openai_compatible_api_key = "oc-key"', content)
+            self.assertIn("tfvar=oc-key", proc.stdout)
+
+    def test_tfvars_writes_a_service_target_port_as_a_number(self):
+        env = dict(self._OPENAI_COMPATIBLE_ENV,
+                   OPENAI_COMPATIBLE_API_BASE="http://llm.models.svc.cluster.local/v1",
+                   OPENAI_COMPATIBLE_TARGET_PORT="8000", OPENAI_COMPATIBLE_EGRESS_CIDRS="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("openai_compatible_target_port    = 8000\n", content)
+            self.assertIn("openai_compatible_egress_cidrs   = []", content)
+
+    def test_tfvars_leaves_the_openai_compatible_lines_out_for_any_other_provider(self):
+        # Every other install's file stays byte for byte what it was (the
+        # gitlab_forge goldens hold that), even with the keys in the environment.
+        env = dict(self._OPENAI_COMPATIBLE_ENV, MODEL_PROVIDER="gemini", MODEL_DEFAULT_NAME="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("openai_compatible", dest.read_text())
+
+    def test_tfvars_keeps_the_openai_compatible_key_off_disk_when_persist_secrets_off(self):
+        env = dict(self._OPENAI_COMPATIBLE_ENV, PERSIST_SECRETS_ON_DISK="false")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$? tfvar=$TF_VAR_openai_compatible_api_key"',
+                env=env,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertNotIn("oc-key", content)
+            self.assertNotIn("openai_compatible_api_key", content)
+            self.assertIn('openai_compatible_api_base       = "http://10.8.0.12:8000/v1"', content)
+            self.assertIn("tfvar=oc-key", proc.stdout)
+
+    def test_tfvars_generation_refuses_an_openai_compatible_install_the_chart_cannot_render(self):
+        # upgrade.sh regenerates from install.env without install.sh's
+        # interview, so the generator holds the same line.
+        for overrides, message in (
+            ({"MODEL_DEFAULT_NAME": ""}, "has no default model"),
+            ({"OPENAI_COMPATIBLE_API_BASE": ""}, "needs the server's base URL"),
+            ({"OPENAI_COMPATIBLE_EGRESS_CIDRS": ""}, "set --openai-compatible-egress-cidrs"),
+            ({"OPENAI_COMPATIBLE_TARGET_PORT": "http"}, "is not a port"),
+        ):
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=dict(self._OPENAI_COMPATIBLE_ENV, **overrides),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists())
+
+    def test_tfvars_generation_recovers_the_openai_compatible_key_from_live_secret(self):
+        # PERSIST_SECRETS_ON_DISK=false on an earlier run left install.env
+        # without the key; an adoption re-install must not drop it.
+        recovered_b64 = "cmVjb3ZlcmVkLWtleQ=="  # base64("recovered-key")
+        kubectl_stub = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config current-context"*) printf "gke_test-project_us-central1_test-cluster" ;;\n'
+            f'  *"get secret platform-agent-secrets"*"{{.data.OPENAI_COMPATIBLE_API_KEY}}"*) printf "%s" "{recovered_b64}" ;;\n'
+            "  *) exit 1 ;;\n"
+            "esac\n"
+        )
+        env = dict(self._OPENAI_COMPATIBLE_ENV, OPENAI_COMPATIBLE_API_KEY="")
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env, kubectl_script=kubectl_stub)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('openai_compatible_api_key = "recovered-key"', dest.read_text())
 
     def test_google_chat_home_channel_written_to_tfvars(self):
         with tempfile.TemporaryDirectory() as out_dir:
@@ -5233,6 +5395,67 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
+
+
+class NextHomeChannelUnsetWarningTest(unittest.TestCase):
+    """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
+    gateway makes the proactive posts and arms them only on a home channel,
+    so a chat backend the gateway holds with none drops every alert while
+    conversations keep working. The front doors warn, never refuse, and the
+    closing summary says it again. The backend follows the operator's
+    a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
+
+    def _run(self, mode="next", slack="true", chat="false", slack_home="", chat_home="", flags=False, summary=False):
+        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, slack_home, chat_home) + (("flags",) if flags else ()))
+        script = (
+            'print_info() { echo "INFO: $*"; }\n'
+            'print_warning() { echo "WARN: $*"; }\n'
+            'print_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; warn_next_home_channel_unset {args} || rc=$?; echo "rc=$rc key=$NEXT_HOME_CHANNEL_UNSET_KEY"\n'
+            + (f'print_next_home_channel_unset_summary {"flags" if flags else ""}\n' if summary else "")
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+
+    def test_next_slack_without_a_home_channel_warns_and_names_the_key(self):
+        proc = self._run()
+        self.assertIn("rc=0 key=SLACK_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", proc.stdout)
+        self.assertIn("drop every one of them", proc.stdout)
+        self.assertIn("HomeChannelUnset", proc.stdout)
+        self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", proc.stdout)
+        self.assertIn("slack-app/#home-channel", proc.stdout)
+
+    def test_next_chat_without_a_home_channel_names_the_chat_key(self):
+        proc = self._run(slack="false", chat="true")
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
+
+    def test_chat_holds_the_gateway_when_both_are_on(self):
+        # Slack stays on the today path then, so only Chat's home counts.
+        self.assertIn("key=GOOGLE_CHAT_HOME_CHANNEL", self._run(chat="true", slack_home="C0123ABCD").stdout)
+        self.assertEqual(self._run(chat="true", chat_home="spaces/AAA").stdout, "rc=0 key=\n")
+
+    def test_flags_name_the_flag(self):
+        self.assertIn("install.env or --slack-home-channel", self._run(flags=True).stdout)
+        self.assertIn("install.env or --google-chat-home-channel", self._run(slack="false", chat="true", flags=True).stdout)
+
+    def test_silent_when_nothing_is_dropped(self):
+        for kw in ({"slack_home": "C0123ABCD"}, {"slack_home": "  ", "mode": "today"}, {"mode": "today"},
+                   {"slack": "false"}, {"slack": "false", "chat": "true", "chat_home": "spaces/AAA"}):
+            with self.subTest(**kw):
+                self.assertEqual(self._run(**kw).stdout, "rc=0 key=\n")
+
+    def test_a_blank_home_channel_counts_as_unset(self):
+        self.assertIn("key=SLACK_HOME_CHANNEL", self._run(slack_home="   ").stdout)
+
+    def test_the_summary_repeats_it_last(self):
+        proc = self._run(summary=True)
+        lines = [l for l in proc.stdout.splitlines() if l]
+        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
+        self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
+        self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
 
 if __name__ == "__main__":
     unittest.main()

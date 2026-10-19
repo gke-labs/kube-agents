@@ -14,6 +14,10 @@
 # for `helm uninstall` to act on, and Helm then refuses to adopt them on the
 # project's next lease (#1006). Step 4 names the kinds the label cannot reach.
 #
+# Step 0 asks Boskos whether the project is still this run's before any of
+# it: a run that outlived its lease finds its project free or leased to
+# another run, and whatever is installed there is not its to remove (#3129).
+#
 # One step is conditional. The CRD delete runs when a release record outlives
 # Step 1, which needs its CRDs or the next lease can neither uninstall nor
 # upgrade over it (#1172). The agent's leftover pull requests are not this
@@ -67,10 +71,26 @@ readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
 
 # Endpoint and owner convention the Prow wrapper leases with
 # (BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}", oss-test-infra
-# prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml), so the
-# heartbeat below arms itself with no wrapper change. If the convention ever
-# changes, beats 401 — one loud daemon line, harmless to the teardown.
+# prow/prowjobs/gke-labs/kube-agents/*.yaml), so the heartbeat below arms
+# itself with no wrapper change. If the convention ever changes, every beat
+# is a 401 and Step 0 refuses every teardown; the convention is what to fix.
 readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
+# Step 0: how long to wait for a definitive answer from the heartbeat, and the
+# two answers that are one. A 200 proves the lease is still this run's; a 401
+# is ranch's OwnerNotMatch, the lease is not. Anything else (000 when the curl
+# times out, a 5xx while Boskos restarts) is asked again at the next beat.
+# Without an answer a Prow teardown refuses, because a wrong proceed costs
+# another run's install. The budget outlasts the wrapper's own heartbeat
+# (`boskosctl heartbeat --period=30s --retries=8` exits after nine failed
+# beats in a row, about 270 s, and the wrapper then stops the job), so on the
+# opening sweep, where that heartbeat is running, Boskos either answers or the
+# job is stopped: the sweep never skips silently and leaves a killed
+# predecessor's objects for the deploy. At the ceiling the wrapper's heartbeat
+# is already stopped and a refusal leaves this run's objects for the next
+# job's opening sweep.
+readonly LEASE_CHECK_WAIT_SECONDS="${CI_TEARDOWN_LEASE_CHECK_WAIT_SECONDS:-330}"
+readonly BOSKOS_OWNED_HTTP="200"
+readonly BOSKOS_OWNER_MISMATCH_HTTP="401"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}" || exit 1
@@ -118,9 +138,51 @@ if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
   export BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"
   export BOSKOS_OWNER_NAME="${BOSKOS_OWNER_NAME:-${JOB_NAME}-${BUILD_ID}}"
 fi
+BEAT_CODES_DIR="$(mktemp -d)"
+export BOSKOS_HEARTBEAT_CODES_FILE="${BEAT_CODES_DIR}/beat-codes"
 "${SCRIPT_DIR}/boskos_heartbeat.sh" &
 HEARTBEAT_PID=$!
-trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true' EXIT
+trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true; rm -rf "${BEAT_CODES_DIR}"' EXIT
+
+# Step 0: is the project still this run's? The daemon's beats say. On
+# 2026-10-15 four runs held six hours in their image build outlived the
+# wrapper heartbeat's default 5h timeout; Boskos's reaper freed their
+# projects, other runs leased two of them and installed, and at the ceiling
+# the dead runs' teardowns heartbeated 401, logged "continuing", and
+# uninstalled the new tenants' releases, CRDs and volumes (#3129). A 401 here
+# is that signal: the project is free or another run's now, and the next
+# tenant's own opening sweep takes whatever this run left. Only the daemon's
+# answers are read; nothing here is a second Boskos client.
+LEASE_ANSWER=""
+LEASE_CODES_SEEN=""
+for ((tick = 0; tick < LEASE_CHECK_WAIT_SECONDS; tick++)); do
+  LEASE_CODES_SEEN=""
+  if [ -s "${BOSKOS_HEARTBEAT_CODES_FILE}" ]; then
+    while read -r code; do
+      LEASE_CODES_SEEN="${LEASE_CODES_SEEN}${LEASE_CODES_SEEN:+ }${code}"
+      if [ "${code}" = "${BOSKOS_OWNED_HTTP}" ] || [ "${code}" = "${BOSKOS_OWNER_MISMATCH_HTTP}" ]; then
+        LEASE_ANSWER="${code}"
+        break
+      fi
+    done <"${BOSKOS_HEARTBEAT_CODES_FILE}"
+  fi
+  [ -n "${LEASE_ANSWER}" ] && break
+  # A daemon that exited without a beat was disabled (outside Prow, where
+  # there is no lease to check): run the teardown as before.
+  if ! kill -0 "${HEARTBEAT_PID}" 2>/dev/null && [ -z "${LEASE_CODES_SEEN}" ]; then
+    LEASE_ANSWER="disabled"
+    break
+  fi
+  sleep 1
+done
+if [ "${LEASE_ANSWER}" = "${BOSKOS_OWNER_MISMATCH_HTTP}" ]; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos answered ${LEASE_ANSWER} (owner mismatch; beats: ${LEASE_CODES_SEEN}), so ${PROJECT_ID} is no longer this run's lease (free, or leased to another run) and whatever is installed there is not this run's to remove (#3129) ==="
+  exit 0
+fi
+if [ -z "${LEASE_ANSWER}" ]; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Teardown skipped: Boskos gave no definitive answer on ${PROJECT_ID} within ${LEASE_CHECK_WAIT_SECONDS}s (beats: ${LEASE_CODES_SEEN:-none}); refusing rather than risk removing another run's install; what is left here waits for the next opening sweep (#3129) ==="
+  exit 0
+fi
 
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleaning Up GKE Resources ==="
@@ -262,7 +324,7 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kub
 # stay reachable on every path through the script — steps before it end in
 # `|| true`, run as `if` conditions, or feed finish_step, and there is no
 # `set -e`; the only early exits are the two must-not-delete-the-wrong-cluster
-# guards above. A failed kind is real, though: on 2026-09-01 the VAP delete
+# guards and Step 0's not-our-lease refusal above. A failed kind is real, though: on 2026-09-01 the VAP delete
 # was skipped because API discovery failed against a down control plane, and
 # the old unconditional ✓ hid it.
 SWEEP_SELECTOR="app.kubernetes.io/part-of=kube-agents"

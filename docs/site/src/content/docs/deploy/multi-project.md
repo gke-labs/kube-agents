@@ -94,7 +94,8 @@ into the scheduled audits: a role granted by hand in another project widened
 them before they followed the scope, and on an installer-made install, which
 always carries a `spec.scope` block, it no longer does. `SCOPE_EXCLUDE_PROJECTS` and
 `SCOPE_EXCLUDE_CLUSTERS` (`project/location/cluster`) declare exclusions the
-same way; a project a `SCOPE_EXCLUDE_PROJECTS` entry names, or a glob there
+same way, and an excluded cluster is left out of fleet answers and the per-cluster audits as well as getting no
+Cluster Agent; a project a `SCOPE_EXCLUDE_PROJECTS` entry names, or a glob there
 matches, gets no drift sink. To keep a project in the scope and out of the
 export, add
 `TF_VAR_drift_pubsub_source_exclude_projects=<project id>` to `install.env`: the
@@ -280,7 +281,7 @@ On an install made with `install.sh`:
    stopped exporting before the grant goes; the reconciler retires the project's Cluster
    Agent profiles over two clean runs, and the scheduled audits drop the
    project on their next run after the reconciler's next hourly run has rewritten the scope snapshot; an excluded cluster loses its profile on the
-   next run.
+   next run, and fleet answers and the per-cluster audits leave it out from then on.
 2. Revoke any binding you made by hand. A folder-level grant cannot be revoked
    for one project alone; move the project out of the folder or grant per
    project instead.

@@ -242,9 +242,10 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
-  # the credentials Secret — except vertex_ai, which authenticates with
-  # Workload Identity instead.
+  # gemini, anthropic, openai, vertex_ai, openai_compatible. The provider's API
+  # key must exist in the credentials Secret — except vertex_ai, which
+  # authenticates with Workload Identity instead, and openai_compatible, whose
+  # key (OPENAI_COMPATIBLE_API_KEY) is optional; see openaiCompatible below.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   # A Claude model (anthropic, or vertex_ai with a claude-* name) gets
@@ -262,6 +263,15 @@ litellm:
   # inference-gateway page, "Setting the output-token budget". Chart-only;
   # the kustomize dev base carries no such key.
   maxTokens: 0
+  # Reasoning effort the gateway asks for on a request that names none,
+  # rendered as reasoning_effort under every model_list alias: low, medium or
+  # high. Empty leaves the key out, so the rendered config and its rollout
+  # checksum are what they were and the model uses its own default. LiteLLM
+  # translates it per provider; on Gemini 3.x it becomes thinkingLevel. What
+  # it maps to, and when a request's own value wins, is on the site's
+  # inference-gateway page, "Setting the reasoning effort". Chart-only; the
+  # kustomize dev base carries no such key.
+  reasoningEffort: ""
   # modelProvider: vertex_ai only. The gateway calls
   # projects/<projectId>/locations/<location> as a GSA reached through Workload
   # Identity, so the chart always creates this KSA — no operator reconciles it.
@@ -278,6 +288,40 @@ litellm:
     # region here for either reason.
     projectId: ""
     location: ""
+  # modelProvider: openai_compatible only: any server speaking the OpenAI
+  # chat-completions API (vLLM, TGI, an internal gateway), self-hosted or
+  # private. Nothing here has a default, and modelDefaultName is required too:
+  # it is the model name the server serves. The gateway reaches the server
+  # through LiteLLM's hosted_vllm handler and sends the optional
+  # OPENAI_COMPATIBLE_API_KEY from the credentials Secret as the bearer token;
+  # it never sends the gemini, anthropic or openai keys to this server. Set
+  # maxTokens above for a small-context server. The egress rule is derived
+  # from apiBase: the chart adds it to the static litellm-policy and stamps it
+  # on the PlatformAgent as kubeagents.x-k8s.io/litellm-upstream-egress for the
+  # operator's copy.
+  openaiCompatible:
+    # The server's OpenAI-compatible base URL, including /v1. Required.
+    apiBase: ""
+    # The server pod's port. Required when apiBase names an in-cluster Service
+    # (<svc>, <svc>.<ns>.svc, <svc>.<ns>.svc.cluster.local; a two-label host
+    # such as openrouter.ai is a hostname, not <svc>.<ns>): NetworkPolicy
+    # matches after Service translation, so the Service port is not enough.
+    targetPort: null
+    # Private destinations the gateway may reach the server at, when apiBase is
+    # not an in-cluster Service (an internal load balancer, an on-prem address).
+    # Each a CIDR no broader than /12 (IPv4) or /48 (IPv6); refused if it
+    # overlaps link-local or metadata addresses. Ignored for an in-cluster
+    # Service. A public endpoint on port 443 needs none: the gateway's existing
+    # 443 rule already reaches public addresses. Any other host outside the
+    # cluster (a private or IPv6 address, or a hostname on another port) needs
+    # them, because a NetworkPolicy cannot name a DNS name.
+    egressCIDRs: []
+    # Optional Secret holding a CA bundle (PEM) that signs the server's TLS
+    # certificate. Trusted for this endpoint only; every other upstream keeps
+    # the public roots.
+    caBundleSecretRef:
+      name: ""
+      key: "ca.crt"
   # Keep in step with the kustomize base
   # (k8s-operator/config/integrations/litellm/base/deployment.yaml), which is
   # the dev copy of this gateway.
@@ -595,11 +639,14 @@ platformAgent:
   mode: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
-  # "PlatformAgent annotations"). Two of them the chart also derives from
+  # "PlatformAgent annotations"). Three of them the chart also derives from
   # values: litellm.networkPolicy=false stamps
-  # kubeagents.x-k8s.io/enable-litellm-network-policy: "false", and
+  # kubeagents.x-k8s.io/enable-litellm-network-policy: "false",
   # telemetry.collectorNamespace stamps
-  # kubeagents.x-k8s.io/otlp-collector-namespace. When the chart stamps a key,
+  # kubeagents.x-k8s.io/otlp-collector-namespace, and
+  # litellm.modelProvider=openai_compatible stamps
+  # kubeagents.x-k8s.io/litellm-upstream-egress from litellm.openaiCompatible
+  # (unless the endpoint is public on port 443). When the chart stamps a key,
   # an entry here that disagrees with it fails the render; otherwise the entry
   # passes through, except that with litellm.otel=true an otlp-collector-namespace
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
@@ -627,6 +674,30 @@ platformAgent:
   # --api-versions monitoring.googleapis.com/v1/PodMonitoring to see the
   # default render.
   podMonitoring: null
+  # Prometheus Operator ServiceMonitors and headless metrics Services for the agent's
+  # pods. Tri-state: null (default) renders them when the cluster serves
+  # monitoring.coreos.com/v1/ServiceMonitor; true renders them unconditionally; false
+  # disables. Pass --api-versions monitoring.coreos.com/v1/ServiceMonitor to helm template.
+  serviceMonitor: null
+  # Additional labels to merge into rendered ServiceMonitor metadata.labels (e.g. release: kube-prometheus-stack).
+  serviceMonitorLabels: {}
+  # VictoriaMetrics Operator VMPodScrapes for the agent's pods. Tri-state: null
+  # (default) renders them when the cluster serves
+  # operator.victoriametrics.com/v1beta1/VMPodScrape; true renders them unconditionally;
+  # false disables. Pass --api-versions operator.victoriametrics.com/v1beta1/VMPodScrape
+  # to helm template.
+  vmPodScrape: null
+  # Additional labels to merge into rendered VMPodScrape metadata.labels.
+  vmPodScrapeLabels: {}
+  # Namespace where Prometheus Operator or VictoriaMetrics scrapers run.
+  # When set, the chart renders NetworkPolicies admitting ingress on the agent's
+  # metrics ports (9095, 9097, 8766, 9096) from this namespace. The gateway
+  # admitting policy also carries baseline rules for the agent API (8642/8643),
+  # the GMP collector in gke-gmp-system (9095/9097), and the operator poller
+  # (9095/9097 assuming operator.enabled: true in the chart release namespace),
+  # isolating inbound traffic on the gateway pod to this explicit peer set when
+  # operator network policies are disabled.
+  monitoringScraperNamespace: ""
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
@@ -776,6 +847,25 @@ platformAgent:
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
     env: []
+    # The daily alert ceilings, one per bucket: critical, warning, info and
+    # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in
+    # spec.deployment.env. A key that you do not set keeps the default in the
+    # agent image. 0 removes the cap for that bucket. The counter is
+    # fleet-wide and resets at 00:00 UTC.
+    #
+    #   alertDailyLimits:
+    #     warning: 15
+    #     drift: 30
+    #
+    # An entry with the same name in env above wins over the key here. A
+    # valueFrom entry for a key that is set fails the render, because the
+    # operator forwards only literal values.
+    #
+    # Each apply that changes the env list that the chart renders replaces
+    # the full env list on the CR. Entries that you added to the CR by hand
+    # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
+    # buckets and a sizing method.
+    alertDailyLimits: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests; 1 CPU,
@@ -866,8 +956,10 @@ platformAgent:
     # Bounds the Job itself (image pull, scheduling) above that wait.
     activeDeadlineSeconds: 300
   security:
-    # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
-    # binding must target this KSA (see the chart README); the default matches
+    # Kubernetes ServiceAccount the credential broker pod runs as; the agent
+    # gateway pod runs as its own unannotated `<name>-gateway-agent`, which the
+    # operator creates. The Workload Identity binding must target this KSA (see
+    # the chart README); the default matches
     # PLATFORM_AGENT_KSA_NAME in scripts/installer/common.sh.
     # Ownership: with serviceAccountAnnotations set, the OPERATOR creates and
     # manages the KSA; with no annotations, the operator treats it as

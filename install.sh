@@ -369,6 +369,20 @@ bootstrap_install_env() {
   # shellcheck disable=SC1090
   . "$file"
   set +a
+  # Whether the file records a GitHub App: the App belongs to the GitHub host
+  # the file records, so validate_github_forge_flags refuses to carry it to
+  # another host. Read from the file, not the variable, which the shell can
+  # also set.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_ID=[\"']?[0-9]" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_APP="true"
+  fi
+  # The same for the App's private key path. The file is sourced after the
+  # shell's environment, so GITHUB_PEM_PATH is the file's value when the file
+  # assigns it; when it does not, the value is one the shell exported for this
+  # run, which counts as given, like --github-pem-path.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_PEM_PATH=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_PEM_PATH="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -423,6 +437,14 @@ PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+# openai_compatible: the server's base URL, the server pod's port (an
+# in-cluster Service), the private ranges it is reached at (anything else),
+# the Secret holding a CA that signs its certificate, and its optional key.
+PARAM_OPENAI_COMPATIBLE_API_BASE="${OPENAI_COMPATIBLE_API_BASE:-}"
+PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+PARAM_OPENAI_COMPATIBLE_API_KEY="${OPENAI_COMPATIBLE_API_KEY:-}"
 PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
 PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
 PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
@@ -450,6 +472,29 @@ PARAM_GITOPS_CA_FILE_FROM_FLAG="false"
 # that contradicts it.
 PARAM_GITOPS_HOST_FROM_FLAG="false"
 PARAM_GITHUB_APP_FROM_FLAG="false"
+# The forge and host install.env records, before any flag changes them. A
+# GitHub Enterprise Server host is recorded with GITOPS_FORGE=github, a
+# self-managed GitLab host with GITOPS_FORGE=gitlab, so a host is kept only
+# for the forge that recorded it. The GitHub App and its KMS key belong to one
+# GitHub host too: validate_github_forge_flags refuses a change of host that
+# keeps the recorded App or key (INSTALL_ENV_RECORDS_GITHUB_APP).
+PARAM_GITOPS_RECORDED_FORGE="${GITOPS_FORGE:-}"
+PARAM_GITOPS_RECORDED_HOST="${GITOPS_HOST:-}"
+PARAM_RECORDED_KMS_KEYRING="${KMS_KEYRING:-}"
+PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
+# The App ID install.env records, for the same check: a move of GitHub host
+# needs another App ID, given by --github-app-id (PARAM_GITHUB_APP_ID_FROM_FLAG,
+# which --github-pem-path does not set).
+PARAM_RECORDED_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
+# The private key path install.env records, and whether --github-pem-path gave
+# this run's: on a move of GitHub host the recorded path is the old App's key.
+# Only a path the file records (INSTALL_ENV_RECORDS_GITHUB_PEM_PATH): a path
+# exported in the shell is this run's.
+PARAM_RECORDED_GITHUB_PEM_PATH=""
+if [ "${INSTALL_ENV_RECORDS_GITHUB_PEM_PATH:-false}" = "true" ]; then
+  PARAM_RECORDED_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+fi
+PARAM_GITHUB_PEM_PATH_FROM_FLAG="false"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -568,6 +613,11 @@ PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
 PARAM_PLATFORM_AGENT_MODE_PASSED="false"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
+# Whether --model-default-name was typed: a switch to openai_compatible does not
+# carry over a model install.env pinned for another provider.
+PARAM_MODEL_DEFAULT_NAME_PASSED="false"
+# The interview answer that clears a recorded optional openai_compatible value.
+readonly OPENAI_COMPATIBLE_CLEAR_ANSWER="-"
 # Empty takes DEFAULT_MODEL_MAX_TOKENS (0, no budget) in the tfvars generator,
 # as an empty MODEL_DEFAULT_NAME takes the provider's default model.
 PARAM_MODEL_MAX_TOKENS="${MODEL_MAX_TOKENS:-}"
@@ -627,13 +677,16 @@ Flags for AI Agents & Automation:
                                 stack. Recorded in install.env as PLATFORM_AGENT_MODE when
                                 the file sets none; one that sets it differently refuses
                                 the flag, so change that key instead
-                                (a mode switch: docs/designs/spec-mode-switch.md)
+                                (a mode switch: the upgrade guide's
+                                "Switching spec.mode" section)
                                 (default: DEFAULT_PLATFORM_AGENT_MODE, currently today)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
                                 namespace, so changing it is for CI and second installs
-  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
+  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
+                                openai_compatible (a server speaking the OpenAI chat
+                                completions API: vLLM, TGI, an internal gateway)
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
@@ -664,6 +717,24 @@ Flags for AI Agents & Automation:
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
+  --openai-compatible-api-base=URL
+                                openai_compatible only: the server's base URL including
+                                /v1. Required, as is --model-default-name: no defaults
+  --openai-compatible-target-port=N
+                                openai_compatible only: the server pod's port, required
+                                when the URL names an in-cluster Service (<svc>,
+                                <svc>.<namespace>.svc, <svc>.<namespace>.svc.cluster.local);
+                                the gateway's NetworkPolicy matches it, not the Service port
+  --openai-compatible-egress-cidrs=LIST
+                                openai_compatible only: comma-separated private ranges the
+                                server is reached at, required when the URL is not an
+                                in-cluster Service, unless it is a public endpoint on 443
+  --openai-compatible-ca-secret-name=NAME
+                                openai_compatible only: Secret in the agent's namespace
+                                holding the PEM CA that signs the server's certificate,
+                                under the key ca.crt; trusted for this server only
+  --openai-compatible-api-key=KEY
+                                openai_compatible only: the server's API key (optional)
   --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
   --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
                                 DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
@@ -671,16 +742,27 @@ Flags for AI Agents & Automation:
   --gitops-forge=FORGE          Forge holding the GitOps repo: github or gitlab (default: github).
                                 For gitlab, --gitops-repo is the project's full path
                                 (group/subgroup/project) and --gitops-org is not used
-  --gitops-host=HOST            Self-managed GitLab hostname (default: gitlab.com)
+  --gitops-host=HOST            The forge's hostname. With github: a GitHub Enterprise Server
+                                hostname (default: github.com). --gitops-org and --gitops-repo
+                                are then on that host, and the GitHub App must be created
+                                there. github.com itself switches a recorded GitHub
+                                Enterprise Server install back to github.com. A host under
+                                github.com, githubusercontent.com, ghe.com or another
+                                domain that GitHub operates is refused. With gitlab: a
+                                self-managed GitLab hostname (default: gitlab.com)
   --gitlab-token-file=PATH      File holding the GitLab access token (scopes: api,
                                 write_repository); read into the Kubernetes Secret after the
                                 apply and never stored. Without it the installer prompts, or,
                                 non-interactively, leaves the Secret for you to create
   --gitlab-token-secret=NAME    Kubernetes Secret holding the GitLab token
                                 (default: gitlab-forge-token)
-  --gitops-ca-file=PATH         PEM CA that signed a self-managed GitLab's certificate (a private
-                                CA). Read into Secret gitlab-forge-ca after the apply; the
-                                broker trusts it for the GitLab host only
+  --gitops-ca-file=PATH         PEM CA that signed the certificate of a self-managed GitLab or a
+                                GitHub Enterprise Server (a private CA); needs --gitops-host.
+                                Read after the apply into Secret gitlab-forge-ca (GitLab) or
+                                github-forge-ca (GitHub Enterprise Server). The credential
+                                broker trusts it for that host only. On GitHub Enterprise
+                                Server the token minter trusts it too, for all of its calls,
+                                and the installer restarts the minter so it reads the CA
   --github-app-id=ID            Numeric GitHub App ID for GitOps token minter
   --github-pem-path=PATH        Local path to downloaded GitHub App private key (.pem)
   --kms-keyring=KEYRING         Cloud KMS Keyring Name for token minter (default: DEFAULT_KMS_KEYRING,
@@ -709,7 +791,9 @@ Flags for AI Agents & Automation:
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave
                                 unmanaged
   --scope-exclude-clusters=TRIPLES
-                                Clusters to leave unmanaged, each as project/location/cluster
+                                Clusters to leave unmanaged and out of fleet answers and
+                                the per-cluster audits, each as
+                                project/location/cluster
   --scoped-sa-pool-enabled[=BOOL]
                                 Arm the scoped service account pool: one reader service
                                 account per project in scope, which the credential broker
@@ -963,7 +1047,7 @@ parse_args() {
         shift ;;
       --agent-namespace=*) PARAM_AGENT_NAMESPACE="${1#*=}"; shift ;;
       --model-provider=*) PARAM_MODEL_PROVIDER="${1#*=}"; shift ;;
-      --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
+      --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; PARAM_MODEL_DEFAULT_NAME_PASSED="true"; shift ;;
       --model-max-tokens=*) PARAM_MODEL_MAX_TOKENS="${1#*=}"; shift ;;
       --litellm-redaction|--litellm-redaction=*)
         PARAM_LITELLM_REDACTION_ENABLED="$(flag_bool_value "$1")"
@@ -980,6 +1064,11 @@ parse_args() {
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
+      --openai-compatible-api-base=*) PARAM_OPENAI_COMPATIBLE_API_BASE="${1#*=}"; shift ;;
+      --openai-compatible-target-port=*) PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${1#*=}"; shift ;;
+      --openai-compatible-egress-cidrs=*) PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${1#*=}"; shift ;;
+      --openai-compatible-ca-secret-name=*) PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${1#*=}"; shift ;;
+      --openai-compatible-api-key=*) PARAM_OPENAI_COMPATIBLE_API_KEY="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
@@ -988,7 +1077,7 @@ parse_args() {
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
-      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_PEM_PATH_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
@@ -1821,13 +1910,28 @@ warn_unrecorded_interview_answers() {
   local interview_keys=(GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
+    OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
   read_recorded_install_env_values "$file" "${interview_keys[@]}"
+  # A file written for another provider never records the OPENAI_COMPATIBLE_*
+  # keys (bootstrap_install_env_file writes them for openai_compatible only),
+  # so a switch to it must name them anyway: without them the next run stops in
+  # validate_openai_compatible_inputs, contradicting the remedy printed here.
+  local switched_to_openai_compatible=false
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ] && install_env_records_key "$file" MODEL_PROVIDER &&
+    [ "$(recorded_install_env_value "$file" MODEL_PROVIDER)" != "openai_compatible" ]; then
+    switched_to_openai_compatible=true
+  fi
   for key in "${interview_keys[@]}"; do
-    install_env_records_key "$file" "$key" || continue
+    if ! install_env_records_key "$file" "$key"; then
+      if [ "$switched_to_openai_compatible" = "true" ] && [[ "$key" == OPENAI_COMPATIBLE_* ]]; then
+        drifted="${drifted}${drifted:+ }${key}"
+      fi
+      continue
+    fi
     recorded="$(recorded_install_env_value "$file" "$key")"
     case "$key" in
       MEMORY) current="${PARAM_MEMORY:-}" ;;
@@ -2056,11 +2160,14 @@ record_github_gitops_keys() {
 }
 
 # One of the two GitOps exceptions to "an existing install.env is never
-# rewritten" (record_github_gitops_keys above is the other): the GitOps forge. upgrade.sh and the Day-2 menu render from the file alone, so a
-# forge this run chose and the file does not record would be reverted to
-# GitHub by the next of them -- the alias back in the CR, the GitLab forge
-# gone, nothing saying why. So when the file's forge differs from this run's,
-# or this run's is GitLab, the forge keys and the repository coordinates they
+# rewritten" (record_github_gitops_keys above is the other): the GitOps forge.
+# upgrade.sh and the Day-2 menu render from the file alone, so a forge this
+# run chose and the file does not record would be reverted by the next of
+# them -- the alias back in the CR, the GitLab or GitHub Enterprise Server
+# forge gone, nothing saying why. A GitHub Enterprise Server is a forge of its
+# own here: the github forge at a host. So when the file's forge or GitHub
+# host differs from this run's, or this run's forge is GitLab, or the CA
+# Secret changed, the forge keys and the repository coordinates they
 # qualify are rewritten in place (those lines only; every other line is kept
 # as written). The token and its source are never among them.
 record_gitops_forge_keys() {
@@ -2068,12 +2175,20 @@ record_gitops_forge_keys() {
   [ -f "$file" ] || return 0
   [ "${PARAM_DRY_RUN:-false}" = "true" ] && return 0
   local current="${GITOPS_FORGE:-github}" recorded=""
-  read_recorded_install_env_values "$file" GITOPS_FORGE
+  read_recorded_install_env_values "$file" GITOPS_FORGE GITOPS_HOST GITOPS_CA_SECRET
   if install_env_records_key "$file" GITOPS_FORGE; then
     recorded="$(recorded_install_env_value "$file" GITOPS_FORGE)"
   fi
   [ -z "$recorded" ] && recorded="github"
-  [ "$current" = "gitlab" ] || [ "$recorded" != "$current" ] || return 0
+  # The GitHub host: empty for github.com, which records no forge keys.
+  local current_host="" recorded_host=""
+  [ "$current" = "github" ] && current_host="${GITOPS_HOST:-}"
+  [ "$recorded" = "github" ] && recorded_host="$(recorded_install_env_value "$file" GITOPS_HOST)"
+  if [ "$current" = "github" ] && [ "$recorded" = "github" ]; then
+    [ "$current_host" = "$recorded_host" ] &&
+      [ "$(recorded_install_env_value "$file" GITOPS_CA_SECRET)" = "${GITOPS_CA_SECRET:-}" ] &&
+      return 0
+  fi
   if [ "$recorded" = "gitlab" ] && [ "$current" = "gitlab" ]; then
     read_recorded_install_env_values "$file" GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_REPO GITOPS_CA_SECRET
     if [ "$(recorded_install_env_value "$file" GITOPS_HOST)" = "${GITOPS_HOST:-}" ] &&
@@ -2084,11 +2199,17 @@ record_gitops_forge_keys() {
     fi
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
-  # run's validator would refuse the pair.
+  # run's validator would refuse the pair. GITHUB_PEM_PATH too: a GitLab
+  # install has no App. The GitHub branch below writes it back.
   local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
+  # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
+  # switch of host names the new App's key (--kms-key), and the next
+  # upgrade.sh must render that key and not the old App's.
+  [ "$current" = "github" ] && keys+=(KMS_KEYRING KMS_KEY)
   local tmp="${file}.tmp.$$"
   ( umask 077; : >"$tmp" )
   grep -E -v "^[[:space:]]*(export[[:space:]]+)?($(IFS='|'; echo "${keys[*]}"))=" "$file" >"$tmp" || true
+  local label="$current"
   if [ "$current" = "gitlab" ]; then
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
@@ -2096,13 +2217,30 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   else
+    if [ -n "$current_host" ]; then
+      label="GitHub Enterprise Server ${current_host}"
+      write_env_var "$tmp" GITOPS_FORGE "github"
+      write_env_var "$tmp" GITOPS_HOST "$current_host"
+      write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
+    fi
     write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
     write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
+    write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
+    write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+    # The path of the App's private key, never the key: the path this run
+    # uses (--github-pem-path, the PEM prompt, or the path install.env
+    # recorded). A rewrite of the forge keys must not drop a key the operator
+    # keeps: a later run reads the path from here when it must import the key
+    # again, for example after the KMS key version is disabled. Written only
+    # when set, so a file that recorded none gets no empty line.
+    if [ -n "${GITHUB_PEM_PATH:-}" ]; then
+      write_env_var "$tmp" GITHUB_PEM_PATH "$GITHUB_PEM_PATH"
+    fi
   fi
   chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$file"
-  print_info "Recorded the GitOps forge (${current}) and its repository in ${file}, so upgrade.sh renders the same forge."
+  print_info "Recorded the GitOps forge (${label}) and its repository in ${file}, so upgrade.sh renders the same forge."
   # The recorded-value cache read the file before this rewrite.
   RECORDED_INSTALL_ENV_FILE=""
 }
@@ -2647,9 +2785,24 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  # The daily alert ceilings, recorded even when empty. An empty key keeps the
+  # image default, and the line shows where to set the ceiling. A value that
+  # was exported only for this run then also applies on the next upgrade.sh.
+  local alert_key
+  for alert_key in $ALERT_DAILY_LIMIT_KEYS; do
+    write_env_var "$tmp" "$alert_key" "${!alert_key:-}"
+  done
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
+  # Only for this provider, so every other install's file stays as it was.
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ]; then
+    write_env_var "$tmp" OPENAI_COMPATIBLE_API_BASE "${OPENAI_COMPATIBLE_API_BASE:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_TARGET_PORT "${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_EGRESS_CIDRS "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+    write_env_var "$tmp" OPENAI_COMPATIBLE_CA_SECRET_NAME "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+    write_secret_env_var "$tmp" OPENAI_COMPATIBLE_API_KEY "${OPENAI_COMPATIBLE_API_KEY:-}"
+  fi
   write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
   write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
@@ -2690,6 +2843,12 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" GITOPS_FORGE "gitlab"
     write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST:-}"
     write_env_var "$tmp" GITLAB_TOKEN_SECRET "${GITLAB_TOKEN_SECRET:-}"
+    write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
+  elif [ -n "${GITOPS_HOST:-}" ]; then
+    # A GitHub Enterprise Server: the forge, its host and the CA Secret's
+    # name. A github.com install records none of them, as before.
+    write_env_var "$tmp" GITOPS_FORGE "github"
+    write_env_var "$tmp" GITOPS_HOST "${GITOPS_HOST}"
     write_env_var "$tmp" GITOPS_CA_SECRET "${GITOPS_CA_SECRET:-}"
   fi
   write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
@@ -3051,7 +3210,8 @@ resolve_shared_defaults() {
   # install.env that records a GitHub org or App -- so the interview asks only
   # when nothing has said. A re-run of a GitHub install sees no new question.
   PARAM_GITOPS_FORGE_GIVEN="false"
-  if [ -n "${PARAM_GITOPS_FORGE:-}" ] || [ -n "${PARAM_GITOPS_ORG:-}" ] || [ -n "${PARAM_GITHUB_APP_ID:-}" ]; then
+  if [ -n "${PARAM_GITOPS_FORGE:-}" ] || [ -n "${PARAM_GITOPS_ORG:-}" ] || [ -n "${PARAM_GITHUB_APP_ID:-}" ] ||
+    [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" = "true" ]; then
     PARAM_GITOPS_FORGE_GIVEN="true"
   fi
   PARAM_GITOPS_FORGE="${PARAM_GITOPS_FORGE:-$DEFAULT_GITOPS_FORGE}"
@@ -3560,7 +3720,7 @@ write_json_report() {
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "${GITOPS_REPO:-}" ]; then
     report_gitops_repo="$(gitlab_repo_url)"
   elif [ -n "${github_org:-}" ] && [ -n "${github_repo:-}" ]; then
-    report_gitops_repo="https://github.com/${github_org}/${github_repo}"
+    report_gitops_repo="https://${GITOPS_HOST:-github.com}/${github_org}/${github_repo}"
   fi
 
   cat << EOF > "$report_file"
@@ -3705,6 +3865,14 @@ print_generate_only_handoff() {
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
+  # A GitHub Enterprise Server's private CA: a run that applies writes the
+  # Secret and restarts the minter after the apply; this route does neither.
+  if [ "${GITOPS_FORGE:-github}" != "gitlab" ] && [ -n "${GITOPS_HOST:-}" ] && [ -n "${GITOPS_CA_SECRET:-}" ]; then
+    local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+    echo -e "${C_BOLD}4. After the apply, the GitHub Enterprise Server CA (any cluster):${C_RESET}"
+    echo -e "    kubectl create secret generic ${GITOPS_CA_SECRET} -n ${ns} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
+    echo -e "    kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${ns}"
+  fi
 }
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
@@ -4427,6 +4595,62 @@ validate_platform_agent_mode() {
   return 1
 }
 
+# The openai_compatible questions, shared by step 7 and the Day-2 menu: the
+# model, the base URL, then the server pod's port or the CIDRs, whichever the
+# URL needs, and the optional key and CA Secret. Each argument names the
+# variable that holds an answer; its current value is the prompt's default.
+# validate_openai_compatible_inputs judges the answers afterwards.
+# The model name step 7 starts from. A model install.env pinned for another
+# provider is not this server's, so on a switch to openai_compatible with no
+# --model-default-name it starts empty and the check that follows stops the
+# run instead of asking the server for the old provider's model. Only a
+# recorded other provider counts: with none, a MODEL_DEFAULT_NAME given in the
+# environment is this run's own answer.
+# $1 the provider, $2 the model so far, $3 whether --model-default-name was
+# typed, $4 the recorded MODEL_PROVIDER.
+openai_compatible_model_for_run() {
+  local provider="${1:-}" model="${2:-}" passed="${3:-false}" recorded="${4:-}"
+  if [ "$provider" = "openai_compatible" ] && [ -n "$recorded" ] &&
+    [ "$recorded" != "openai_compatible" ] && [ "$passed" != "true" ]; then
+    model=""
+  fi
+  printf '%s\n' "$model"
+}
+
+prompt_openai_compatible_settings() {
+  local model_var="$1" api_base_var="$2" target_port_var="$3" egress_cidrs_var="$4"
+  local api_key_var="$5" ca_name_var="$6" host_port="" host=""
+  prompt_read "Model name the server serves (no default)" "$model_var" "${!model_var:-}"
+  prompt_read "Server base URL including /v1 (e.g. http://<svc>.<namespace>.svc.cluster.local/v1)" "$api_base_var" "${!api_base_var:-}"
+  if host_port="$(openai_compatible_url_host_port "${!api_base_var:-}")"; then
+    host="${host_port% *}"
+  fi
+  # Each URL shape reads one of the two egress values and ignores the other.
+  # Clear the one it does not ask for, so a value kept from an earlier URL
+  # cannot fail validation behind a prompt that is never shown.
+  if [ -n "$host" ] && [ -n "$(openai_compatible_service_namespace "$host")" ]; then
+    printf -v "$egress_cidrs_var" '%s' ""
+    prompt_read "Server pod port (the gateway's NetworkPolicy matches it, not the Service port)" "$target_port_var" "${!target_port_var:-}"
+  elif [ -n "$host" ]; then
+    printf -v "$target_port_var" '%s' ""
+    prompt_read "Private ranges the server is reached at, comma-separated CIDRs (empty only for a public endpoint on 443; ${OPENAI_COMPATIBLE_CLEAR_ANSWER} clears a recorded value)" "$egress_cidrs_var" "${!egress_cidrs_var:-}"
+  fi
+  # The label keeps a recorded key off the screen.
+  # No clear answer for the key: write_tfvars_from_state recovers an empty key
+  # from the live Secret, so clearing it here would not stick. A key a server
+  # no longer checks is harmless; remove it from the Secret to drop it.
+  prompt_read "Server API key (optional)" "$api_key_var" "${!api_key_var:-}" true "${!api_key_var:+the current key}"
+  prompt_read "Secret holding a CA, under ca.crt, that signs the server's certificate (optional; ${OPENAI_COMPATIBLE_CLEAR_ANSWER} clears a recorded name)" "$ca_name_var" "${!ca_name_var:-}"
+  # prompt_read keeps a recorded value on an empty answer, so an endpoint that
+  # no longer needs one of these optional values says so with the clear answer.
+  local optional_var
+  for optional_var in "$egress_cidrs_var" "$ca_name_var"; do
+    if [ "${!optional_var:-}" = "$OPENAI_COMPATIBLE_CLEAR_ANSWER" ]; then
+      printf -v "$optional_var" '%s' ""
+    fi
+  done
+}
+
 # Validates explicit values for existing-cluster opt-in flags (loud like --enable-gvisor)
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
@@ -4526,7 +4750,8 @@ gitlab_repo_url() {
   printf 'https://%s/%s' "${GITOPS_HOST:-gitlab.com}" "${GITOPS_REPO:-}"
 }
 
-# Checks the GitLab inputs, and that a GitHub install was given none of them.
+# Checks the forge inputs: the GitLab ones, the GitHub Enterprise Server ones,
+# and that each forge was given none of the other's.
 validate_gitops_forge_flags() {
   case "${PARAM_GITOPS_FORGE:-github}" in
     github|gitlab) ;;
@@ -4535,34 +4760,42 @@ validate_gitops_forge_flags() {
       return 1
       ;;
   esac
-  if [ "${PARAM_GITOPS_FORGE:-github}" != "gitlab" ]; then
-    # A host install.env recorded for a GitLab install is that install's, not
-    # this run's: a switch back to GitHub drops it.
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ]; then
-      print_info "Dropping the recorded GitLab host '${PARAM_GITOPS_HOST}': this run's GitOps forge is GitHub."
+  local forge="${PARAM_GITOPS_FORGE:-github}"
+  # A host and a CA Secret that install.env recorded for the other forge are
+  # that install's, not this run's: a switch of forge drops them. A host given
+  # by flag is this run's and is judged below.
+  # Only a forge the file names: a file with no GITOPS_FORGE records no host,
+  # and a host the interview just asked for is this run's.
+  local recorded_forge="${PARAM_GITOPS_RECORDED_FORGE:-}"
+  if [ -n "$recorded_forge" ] && [ "$recorded_forge" != "$forge" ]; then
+    local recorded_label="GitLab" forge_label="GitLab"
+    [ "$recorded_forge" = "gitlab" ] || recorded_label="GitHub Enterprise Server"
+    [ "$forge" = "gitlab" ] || forge_label="GitHub"
+    if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ "${PARAM_GITOPS_HOST_FROM_FLAG:-false}" != "true" ] &&
+      [ "$PARAM_GITOPS_HOST" = "${PARAM_GITOPS_RECORDED_HOST:-}" ]; then
+      print_info "Dropping the recorded ${recorded_label} host '${PARAM_GITOPS_HOST}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_HOST=""
     fi
     if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
-      print_info "Dropping the recorded GitLab CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitOps forge is GitHub."
+      print_info "Dropping the recorded ${recorded_label} CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitOps forge is ${forge_label}."
       PARAM_GITOPS_CA_SECRET=""
     fi
-    if [ -n "${PARAM_GITOPS_HOST:-}" ] || [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] || [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
-      print_error "--gitops-host, --gitlab-token-file and --gitops-ca-file apply only with --gitops-forge=gitlab."
-      return 1
-    fi
-    return 0
+  fi
+  if [ "$forge" != "gitlab" ]; then
+    validate_github_forge_flags
+    return
   fi
   if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
     if ! [[ "$PARAM_GITOPS_HOST" =~ $GITLAB_HOST_RE ]]; then
       print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${PARAM_GITOPS_HOST}')."
       return 1
     fi
-    case "$PARAM_GITOPS_HOST" in
-      github.com|*.github.com|githubusercontent.com|*.githubusercontent.com)
-        print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
-        return 1
-        ;;
-    esac
+    # Every domain where GitHub runs its own services, as the operator's
+    # gitlab provider refuses them (the github provider's ReservedDomains).
+    if [[ "$PARAM_GITOPS_HOST" =~ $GITHUB_RESERVED_HOST_RE ]]; then
+      print_error "'${PARAM_GITOPS_HOST}' is a GitHub host, not a GitLab one."
+      return 1
+    fi
   fi
   if [ -n "${PARAM_GITHUB_APP_ID:-}" ] || [ -n "${PARAM_GITHUB_PEM_PATH:-}" ]; then
     if [ "${PARAM_GITHUB_APP_FROM_FLAG:-false}" = "true" ]; then
@@ -4647,6 +4880,15 @@ validate_gitops_forge_flags() {
       PARAM_GITOPS_CA_SECRET=""
     fi
   fi
+  validate_gitops_ca_inputs "${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}"
+}
+
+# The checks a private CA's inputs get on either forge: the CA file is
+# readable and, when it can be read twice, holds a certificate and no private
+# key; the Secret's name defaults to DEFAULT_NAME and is a Kubernetes name. Run
+# only for a host that may have a private CA.
+validate_gitops_ca_inputs() {
+  local default_name="$1"
   if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
     case "$PARAM_GITOPS_CA_FILE" in
       \~/*) PARAM_GITOPS_CA_FILE="${HOME}/${PARAM_GITOPS_CA_FILE#\~/}" ;;
@@ -4664,14 +4906,14 @@ validate_gitops_forge_flags() {
     # they are read, after the apply.
     if gitops_source_is_rereadable "$PARAM_GITOPS_CA_FILE"; then
       local pem_problem
-      pem_problem="$(gitlab_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
+      pem_problem="$(gitops_ca_pem_problem "$(cat "$PARAM_GITOPS_CA_FILE")")"
       if [ -n "$pem_problem" ]; then
         print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
         [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" = "true" ] || PARAM_GITOPS_CA_FILE=""
         return 1
       fi
     fi
-    PARAM_GITOPS_CA_SECRET="${PARAM_GITOPS_CA_SECRET:-${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}}"
+    PARAM_GITOPS_CA_SECRET="${PARAM_GITOPS_CA_SECRET:-$default_name}"
   fi
   # A name from install.env or the environment is held to the rule the CRD,
   # the chart and Terraform hold it to, here, where the message names the key.
@@ -4684,6 +4926,99 @@ validate_gitops_forge_flags() {
   return 0
 }
 
+# The domains where GitHub runs its own services, which are never a GitHub
+# Enterprise Server: the github provider's ReservedDomains
+# (k8s-operator/api/v1alpha1/gitprovider.go), as the chart mirrors them.
+GITHUB_RESERVED_HOST_RE='(^|\.)(github\.com|githubusercontent\.com|githubassets\.com|githubapp\.com|github\.io|github\.dev|ghe\.com)$'
+
+# The GitHub inputs: no GitLab token, and, with --gitops-host, a GitHub
+# Enterprise Server host, its optional private CA, and an organization and a
+# repository name on it. A github.com spelling is the default host, so it
+# clears the host: that is how a recorded GitHub Enterprise Server install
+# switches back to github.com.
+validate_github_forge_flags() {
+  if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
+    print_error "--gitlab-token-file applies only with --gitops-forge=gitlab."
+    return 1
+  fi
+  case "${PARAM_GITOPS_HOST:-}" in
+    github.com|www.github.com|ssh.github.com)
+      print_info "'${PARAM_GITOPS_HOST}' is github.com, the default GitHub host: this run's GitOps forge is github.com."
+      PARAM_GITOPS_HOST=""
+      ;;
+  esac
+  local host="${PARAM_GITOPS_HOST:-}"
+  # The App was created on the GitHub host install.env records, and its KMS
+  # key holds that App's private key. On another host the minter would sign
+  # as an App the host does not know, and install.sh imports a key only into
+  # a key with no ENABLED version, so a move of host needs the new host's App
+  # and a new key.
+  if [ "${INSTALL_ENV_RECORDS_GITHUB_APP:-false}" = "true" ] && [ "${PARAM_GITOPS_RECORDED_FORGE:-github}" = "github" ]; then
+    local recorded_host="${PARAM_GITOPS_RECORDED_HOST:-}"
+    local default_ring="${DEFAULT_KMS_KEYRING:-github-token-minter-keyring}" default_key="${DEFAULT_KMS_KEY:-github-token-minter-key}"
+    # The new host's App: an App ID that --github-app-id gives and that is not
+    # the recorded one (a PEM alone, or the recorded ID given again, keeps the
+    # old App), and a KMS key other than the recorded one.
+    if [ "$host" != "$recorded_host" ] &&
+      { [ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" != "true" ] ||
+        [ "${PARAM_GITHUB_APP_ID:-}" = "${PARAM_RECORDED_GITHUB_APP_ID:-}" ] ||
+        [ "${PARAM_KMS_KEYRING:-$default_ring}/${PARAM_KMS_KEY:-$default_key}" = "${PARAM_RECORDED_KMS_KEYRING:-$default_ring}/${PARAM_RECORDED_KMS_KEY:-$default_key}" ]; }; then
+      print_error "This install's GitHub App was created on ${recorded_host:-github.com}, and an App belongs to one GitHub host. To move the install to ${host:-github.com}, give the App on that host with --github-app-id (its App ID, not the recorded one) and --github-pem-path, and a new Cloud KMS key for its private key with --kms-key (INSTALL.md, \"Switch between github.com and a GitHub Enterprise Server\")."
+      return 1
+    fi
+    # The recorded private key path is the old App's key. Imported into the
+    # new key, it would sign as the old App, so a move that gives no
+    # --github-pem-path imports nothing and records no path.
+    if [ "$host" != "$recorded_host" ] && [ "${PARAM_GITHUB_PEM_PATH_FROM_FLAG:-false}" != "true" ] &&
+      [ -n "${PARAM_GITHUB_PEM_PATH:-}" ] && [ "$PARAM_GITHUB_PEM_PATH" = "${PARAM_RECORDED_GITHUB_PEM_PATH:-}" ]; then
+      print_info "Dropping the recorded GITHUB_PEM_PATH: it is the private key of the App on ${recorded_host:-github.com}. Give the new App's key with --github-pem-path."
+      PARAM_GITHUB_PEM_PATH=""
+    fi
+  fi
+  if [ -z "$host" ]; then
+    # github.com presents a certificate that the public CAs sign, and a
+    # private CA must never vouch for it.
+    if [ -n "${PARAM_GITOPS_CA_FILE:-}" ]; then
+      print_error "--gitops-ca-file is for a GitHub Enterprise Server or a self-managed GitLab: give its hostname with --gitops-host. github.com uses the public CAs."
+      return 1
+    fi
+    if [ -n "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+      print_info "Dropping the recorded CA Secret '${PARAM_GITOPS_CA_SECRET}': this run's GitHub host is github.com, which uses the public CAs."
+      PARAM_GITOPS_CA_SECRET=""
+    fi
+    return 0
+  fi
+  if ! [[ "$host" =~ $GITLAB_HOST_RE ]] || [ "${#host}" -gt 253 ]; then
+    print_error "--gitops-host must be a bare lowercase hostname, with no scheme, path or port (got '${host}')."
+    return 1
+  fi
+  if [[ "$host" =~ $GITHUB_RESERVED_HOST_RE ]]; then
+    print_error "'${host}' is a host that GitHub operates, not a GitHub Enterprise Server. For github.com, leave --gitops-host unset."
+    return 1
+  fi
+  if [[ "$host" =~ (^|\.)gitlab\.com$ ]]; then
+    print_error "'${host}' is a GitLab host, not a GitHub Enterprise Server. For GitLab, pass --gitops-forge=gitlab."
+    return 1
+  fi
+  # The repository is named by its organization and name on the instance, as
+  # on github.com: the composition declares the forge with the organization
+  # as its namespace, and the chart holds it to GitHub's owner grammar.
+  if [ -n "${PARAM_GITOPS_ORG:-}" ] && ! [[ "$PARAM_GITOPS_ORG" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$ ]]; then
+    print_error "--gitops-org must be a GitHub organization name on ${host} (got '${PARAM_GITOPS_ORG}')."
+    return 1
+  fi
+  if [ -n "${PARAM_GITOPS_REPO:-}" ] &&
+    { ! [[ "$PARAM_GITOPS_REPO" =~ ^[A-Za-z0-9._-]+$ ]] || [ "$PARAM_GITOPS_REPO" = "." ] || [ "$PARAM_GITOPS_REPO" = ".." ]; }; then
+    print_error "--gitops-repo must be the repository's name on ${host}, with the organization in --gitops-org (got '${PARAM_GITOPS_REPO}')."
+    return 1
+  fi
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] && [ -z "${PARAM_GITOPS_ORG:-}" ]; then
+    print_error "A GitHub Enterprise Server install needs --gitops-org: the organization that owns the GitOps repository on ${host}."
+    return 1
+  fi
+  validate_gitops_ca_inputs "${DEFAULT_GITHUB_CA_SECRET:-github-forge-ca}"
+}
+
 # True when HOST is a self-managed GitLab: not empty and not gitlab.com in
 # either spelling. The one definition the interview and the validator share.
 gitlab_host_is_self_managed() {
@@ -4693,10 +5028,10 @@ gitlab_host_is_self_managed() {
   return 0
 }
 
-# Why PEM text cannot be stored as the GitLab CA, or "" when it can: it holds
+# Why PEM text cannot be stored as a forge's CA, or "" when it can: it holds
 # no certificate, or it holds a private key. A CA's private key never goes in
 # the CA Secret: anyone who can read that Secret could sign with it.
-gitlab_ca_pem_problem() {
+gitops_ca_pem_problem() {
   local pem="$1"
   if [[ "$pem" != *"-----BEGIN CERTIFICATE-----"* ]]; then
     printf '%s' "holds no PEM certificate (-----BEGIN CERTIFICATE-----); nothing was stored."
@@ -4722,6 +5057,61 @@ apply_gitlab_token_secret() {
   if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
     print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
+  fi
+}
+
+# The forge question, asked only when nothing has settled the forge: github.com,
+# a GitHub Enterprise Server (its host and an optional CA file, asked until
+# the validator accepts them), or GitLab, whose own questions follow in main.
+ask_gitops_forge() {
+  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
+    local forge_choice="1"
+    [ "$PARAM_GITOPS_FORGE" = "github" ] && [ -n "${PARAM_GITOPS_HOST:-}" ] && forge_choice="2"
+    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="3"
+    prompt_menu "Where does the GitOps repository live?" \
+      "GitHub (github.com)" \
+      "GitHub Enterprise Server (a GitHub host that you run)" \
+      "GitLab (gitlab.com or self-managed)" \
+      forge_choice
+    if [ "$forge_choice" = "3" ]; then
+      PARAM_GITOPS_FORGE="gitlab"
+    elif [ "$forge_choice" = "2" ]; then
+      PARAM_GITOPS_FORGE="github"
+      # The instance's host and its CA, asked until the validator accepts
+      # them. The CA prompt has no default, so empty stays a way to answer
+      # "a public CA signed it" on every pass.
+      while true; do
+        prompt_read "GitHub Enterprise Server hostname (for example github.example.com)" PARAM_GITOPS_HOST "${PARAM_GITOPS_HOST:-}"
+        if [ "${PARAM_GITOPS_CA_FILE_FROM_FLAG:-false}" != "true" ]; then
+          PARAM_GITOPS_CA_FILE=""
+          if [ -n "${PARAM_GITOPS_HOST:-}" ] && [ -z "${PARAM_GITOPS_CA_SECRET:-}" ]; then
+            prompt_read "PEM CA file that signed the instance's certificate (empty if a public CA signed it)" PARAM_GITOPS_CA_FILE ""
+          fi
+        fi
+        if [ -n "${PARAM_GITOPS_HOST:-}" ] && validate_gitops_forge_flags; then
+          break
+        fi
+        [ -z "${PARAM_GITOPS_HOST:-}" ] && print_error "A GitHub Enterprise Server install needs the instance's hostname."
+        has_controlling_tty || exit 1
+      done
+      # A github.com spelling clears the host: the install is then github.com.
+      if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+        print_info "Create the GitHub App on ${PARAM_GITOPS_HOST}, not on github.com: an App belongs to one GitHub host."
+      fi
+    else
+      PARAM_GITOPS_FORGE="github"
+      PARAM_GITOPS_HOST=""
+    fi
+  fi
+}
+
+# The CA file the organization check may hand to curl: --gitops-ca-file when
+# it can be read again later, and nothing for a one-shot source, which only
+# the CA Secret may read. Without a CA, the check on a host behind a private
+# CA cannot verify the host, and it warns and goes on.
+gitops_ca_file_for_check() {
+  if [ -n "${PARAM_GITOPS_CA_FILE:-}" ] && gitops_source_is_rereadable "$PARAM_GITOPS_CA_FILE"; then
+    printf '%s' "$PARAM_GITOPS_CA_FILE"
   fi
 }
 
@@ -4769,39 +5159,47 @@ gitlab_token_strip() {
   printf '%s' "$t"
 }
 
-# Creates (or replaces) the Secret the GitLab forge's caBundleRef names, from
+# Creates (or replaces) the Secret the forge's caBundleRef names (a self-managed
+# GitLab's or a GitHub Enterprise Server's), from
 # --gitops-ca-file, under the key ca.crt. A CA certificate is public, but it
-# goes in a Secret for its integrity: changing it then needs the same rights as
-# changing the token Secret beside it. Server-side apply, as for the token, so
-# no last-applied copy is kept. The file is read once, here: a process
+# goes in a Secret for its integrity: changing it then needs the rights that
+# changing a Secret needs. Server-side apply, as for the GitLab token, so no
+# last-applied copy is kept. The file is read once, here: a process
 # substitution cannot be read twice. It must hold at least one PEM certificate
 # and no private key. Without a file, an existing Secret is kept, and a missing
 # one is named, because until it exists every call to the forge fails on its
 # certificate.
-create_gitlab_ca_secret() {
+create_gitops_ca_secret() {
   local namespace="$1" context="$2"
   local name="${GITOPS_CA_SECRET:-}"
   [ -n "$name" ] || return 0
+  local label="GitLab"
+  [ "${GITOPS_FORGE:-github}" = "gitlab" ] || label="GitHub Enterprise Server"
+  # Set when this call writes the Secret, so the caller can restart what
+  # reads the CA only when it starts.
+  GITOPS_CA_SECRET_WRITTEN="false"
   local how="  kubectl create secret generic ${name} -n ${namespace} --context ${context} --from-file=ca.crt=<path-to-ca.pem> --dry-run=client -o yaml | kubectl apply --server-side -f -"
   if [ -z "${PARAM_GITOPS_CA_FILE:-}" ]; then
     if ! kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
-      print_warning "Secret '${name}' with the GitLab CA does not exist, so the agent cannot verify the GitLab host's certificate yet."
+      print_warning "Secret '${name}' with the ${label} CA does not exist, so the agent cannot verify the ${label} host's certificate yet."
       print_info "Create it; the agent picks it up with no restart:"
       print_info "$how"
+      print_github_minter_ca_restart_hint "$namespace" "$context"
     fi
     return 0
   fi
   local pem="" pem_problem=""
   IFS= read -r -d '' pem <"$PARAM_GITOPS_CA_FILE" || true
-  pem_problem="$(gitlab_ca_pem_problem "$pem")"
+  pem_problem="$(gitops_ca_pem_problem "$pem")"
   if [ -n "$pem_problem" ]; then
     # Only a one-shot source (/dev/stdin, a process substitution) reaches
     # here with bad content: a regular file was checked before the apply. The
     # apply has named the Secret already, so say how to create it and go on to
     # the health checks, as a missing token does.
     print_error "--gitops-ca-file '${PARAM_GITOPS_CA_FILE}' ${pem_problem}"
-    print_warning "The agent cannot verify the GitLab host's certificate until Secret '${name}' exists. Create it; the agent picks it up with no restart:"
+    print_warning "The agent cannot verify the ${label} host's certificate until Secret '${name}' exists. Create it; the agent picks it up with no restart:"
     print_info "$how"
+    print_github_minter_ca_restart_hint "$namespace" "$context"
     return 0
   fi
   printf '%s' "$pem" | kubectl create secret generic "$name" -n "$namespace" --context "$context" \
@@ -4810,10 +5208,37 @@ create_gitlab_ca_secret() {
       -n "$namespace" --context "$context" -f - >/dev/null 2>&1
   local rcs=("${PIPESTATUS[@]}")
   if [ "${rcs[1]}" -ne 0 ] || [ "${rcs[2]}" -ne 0 ]; then
-    print_error "Could not write the GitLab CA Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[1]}, apply ${rcs[2]})."
+    print_error "Could not write the ${label} CA Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[1]}, apply ${rcs[2]})."
     return 1
   fi
-  print_success "GitLab CA stored in Secret '${name}' (namespace ${namespace})."
+  GITOPS_CA_SECRET_WRITTEN="true"
+  print_success "${label} CA stored in Secret '${name}' (namespace ${namespace})."
+}
+
+# On a GitHub Enterprise Server, the token minter reads the CA too, but only
+# when it starts: Go loads the system roots, SSL_CERT_DIR included, once. So a
+# CA Secret created after the minter started needs a restart of the minter.
+print_github_minter_ca_restart_hint() {
+  local namespace="$1" context="$2"
+  [ "${GITOPS_FORGE:-github}" = "gitlab" ] && return 0
+  print_info "Then restart the token minter, which reads the CA when it starts:"
+  print_info "  kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${namespace} --context ${context}"
+}
+
+# Restarts the token minter after create_gitops_ca_secret wrote a GitHub
+# Enterprise Server's CA, so that the minter reads it. Nothing to do when the
+# install runs no minter. A failed restart is a warning: the CA Secret is in
+# place, and the next restart reads it.
+restart_github_minter_for_ca() {
+  local namespace="$1" context="$2"
+  [ "${GITOPS_CA_SECRET_WRITTEN:-false}" = "true" ] || return 0
+  kubectl get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" --context "$context" >/dev/null 2>&1 || return 0
+  if kubectl rollout restart deployment/"$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+    print_info "Restarted the token minter so that it reads the CA."
+  else
+    print_warning "Could not restart the token minter, which reads the CA when it starts. Restart it:"
+    print_info "  kubectl rollout restart deployment/${GITHUB_MINTER_DEPLOYMENT} -n ${namespace} --context ${context}"
+  fi
 }
 
 # Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
@@ -5257,6 +5682,11 @@ run_menu_system() {
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
+  local openai_compatible_api_base="${OPENAI_COMPATIBLE_API_BASE:-}"
+  local openai_compatible_target_port="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
+  local openai_compatible_egress_cidrs="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+  local openai_compatible_ca_secret_name="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+  local openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
   local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   local google_chat_home_channel="${GOOGLE_CHAT_HOME_CHANNEL:-}"
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
@@ -5307,7 +5737,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -5315,7 +5745,7 @@ run_menu_system() {
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
-      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
+      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI / OpenAI-compatible)" \
       "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
@@ -5348,8 +5778,13 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
-            prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-              google_chat_home_channel "$google_chat_home_channel"
+            if [ "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" = "next" ]; then
+              prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            else
+              prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            fi
             ;;
           2) slack_enabled="true" ;;
           3) google_chat_enabled="false"; slack_enabled="false" ;;
@@ -5362,6 +5797,7 @@ run_menu_system() {
           "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
+          "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
           m_opt
         case "$m_opt" in
           1)
@@ -5391,12 +5827,21 @@ run_menu_system() {
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
             ;;
+          5)
+            # A model pinned for another provider is not this server's, so the
+            # prompt starts empty on a switch, as main() does.
+            [ "$model_provider" = "openai_compatible" ] || model_default_name=""
+            model_provider="openai_compatible"
+            prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
+              openai_compatible_target_port openai_compatible_egress_cidrs \
+              openai_compatible_api_key openai_compatible_ca_secret_name
+            ;;
         esac
         ;;
       4)
         local p_opt=""
         prompt_menu "Select GCP IAM Permission Set:" \
-          "read-only — auditing and observability, no GCP write capability (Default)" \
+          "read-only — auditing and observability: read roles, no write to infrastructure (Default)" \
           "custom — exactly the roles you list, no built-in bundle" \
           p_opt
         case "$p_opt" in
@@ -5438,11 +5883,19 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+        # The check main() makes at step 7, before anything is saved; back to
+        # the menu on failure.
+        validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
+          "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || continue
+        # The chat screen's home channel, which the home-channel warning below
+        # reads; save_env_var exports it again when it writes install.env.
+        export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
         # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
         # from install.env, and if Slack moves to the A2A gateway under next,
         # the settings it cannot use are refused (and again after the
         # generator, for a bot token it recovers from the live Secret).
         refuse_next_slack_gateway_settings_from_env || return 1
+        warn_next_home_channel_unset_from_env
         # Kept until the check after the generator has passed, so that a
         # refusal there puts install.env back as it was.
         # The copy holds install.env's credentials, so it is 0600 under a
@@ -5481,6 +5934,13 @@ run_menu_system() {
         save_secret_env_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_env_var OPENAI_API_KEY "$openai_api_key"
         save_secret_env_var ANTHROPIC_API_KEY "$anthropic_api_key"
+        if [ "$model_provider" = "openai_compatible" ]; then
+          save_env_var OPENAI_COMPATIBLE_API_BASE "$openai_compatible_api_base"
+          save_env_var OPENAI_COMPATIBLE_TARGET_PORT "$openai_compatible_target_port"
+          save_env_var OPENAI_COMPATIBLE_EGRESS_CIDRS "$openai_compatible_egress_cidrs"
+          save_env_var OPENAI_COMPATIBLE_CA_SECRET_NAME "$openai_compatible_ca_secret_name"
+          save_secret_env_var OPENAI_COMPATIBLE_API_KEY "$openai_compatible_api_key"
+        fi
         save_env_var ALLOWED_USERS "$allowed_users"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
@@ -5653,6 +6113,7 @@ main() {
       exit 1
     fi
     run_menu_system
+    print_next_home_channel_unset_summary
     exit 0
   fi
 
@@ -6137,15 +6598,17 @@ main() {
       slack_allowed_hint=""
     done
     while :; do
-      prompt_read "Slack Home Channel ID (optional, a channel ID such as C0123456789)" \
+      prompt_read "Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)" \
         slack_home_channel "$slack_home_channel"
       bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
-      { [ -n "$bad" ] && $can_ask; } || break
-      print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
-      # Not the re-ask's default: the value is optional, and prompt_read
-      # turns an empty answer into the default, so a bad one could never be
-      # cleared.
-      slack_home_channel=""
+      if [ -n "$bad" ] && $can_ask; then
+        print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+        # Not the re-ask's default: prompt_read turns an empty answer into
+        # the default, so a bad one could never be cleared.
+        slack_home_channel=""
+        continue
+      fi
+      _confirm_no_home_channel SLACK_HOME_CHANNEL "$slack_home_channel" "$can_ask" && break
     done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"
@@ -6174,8 +6637,34 @@ main() {
     fi
     chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
-    prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-      google_chat_home_channel "$google_chat_home_channel"
+    if [ "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" != "next" ]; then
+      prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      return 0
+    fi
+    local can_ask=true
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      _confirm_no_home_channel GOOGLE_CHAT_HOME_CHANNEL "$google_chat_home_channel" "$can_ask" && break
+    done
+  }
+
+  # Under next the A2A gateway posts alerts and reports only to a home
+  # channel (#3320). An empty answer is allowed, after a warning and a yes:
+  # true to keep the answer, false to ask again. $1 the key, $2 the answer,
+  # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
+  # the warning before the apply and the closing summary say it then.
+  _confirm_no_home_channel() {
+    local home="${2//[[:space:]]/}" keep=""
+    [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
+    print_warning "$(next_home_channel_unset_message "$1")"
+    prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
+    case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
+    return 1
   }
 
   # Both chat platforms are opt-in and default off, so this is the common
@@ -6270,13 +6759,14 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, or openai."
+    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, or openai_compatible."
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
   if [ -z "$model_default_name" ]; then
     model_default_name="$(default_model_for_provider "$model_provider")"
   fi
+  model_default_name="$(openai_compatible_model_for_run "$model_provider" "$model_default_name" "$PARAM_MODEL_DEFAULT_NAME_PASSED" "${MODEL_PROVIDER:-}")"
   local model_max_tokens="${PARAM_MODEL_MAX_TOKENS:-${MODEL_MAX_TOKENS:-}}"
   validate_model_max_tokens || exit 1
   local redaction_ip_action="${PARAM_LITELLM_REDACTION_IP_ACTION:-$DEFAULT_LITELLM_REDACTION_IP_ACTION}"
@@ -6333,6 +6823,11 @@ main() {
   local gemini_api_key="${detected_gemini_key:-}"
   local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
   local anthropic_api_key="${PARAM_ANTHROPIC_API_KEY:-}"
+  local openai_compatible_api_base="${PARAM_OPENAI_COMPATIBLE_API_BASE:-}"
+  local openai_compatible_target_port="${PARAM_OPENAI_COMPATIBLE_TARGET_PORT:-}"
+  local openai_compatible_egress_cidrs="${PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
+  local openai_compatible_ca_secret_name="${PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
+  local openai_compatible_api_key="${PARAM_OPENAI_COMPATIBLE_API_KEY:-}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
@@ -6344,12 +6839,14 @@ main() {
       vertex_ai) model_choice="2" ;;
       openai) model_choice="3" ;;
       anthropic) model_choice="4" ;;
+      openai_compatible) model_choice="5" ;;
     esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
       "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
+      "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
       model_choice
 
     # A model the install already pins survives a re-run that leaves the
@@ -6396,6 +6893,13 @@ main() {
         fi
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
         ;;
+      5)
+        model_provider="openai_compatible"
+        [ "$model_provider_was" = "openai_compatible" ] || model_default_name=""
+        prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
+          openai_compatible_target_port openai_compatible_egress_cidrs \
+          openai_compatible_api_key openai_compatible_ca_secret_name
+        ;;
     esac
   fi
 
@@ -6430,6 +6934,13 @@ main() {
     anthropic)
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
+    openai_compatible)
+      # Loud, unlike the missing keys above: a keyless install still deploys,
+      # and this one cannot render.
+      validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
+        "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || exit 1
+      print_info "Serving ${model_default_name} from ${openai_compatible_api_base} through the gateway."
+      ;;
   esac
 
   # 8. GitOps Infrastructure Repository Connection
@@ -6460,21 +6971,7 @@ main() {
 
   # The forge comes first: a GitLab repository has no GitHub organization, App
   # or token minter, so the GitHub interview below does not apply to it.
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "${PARAM_GITOPS_FORGE_GIVEN:-false}" != "true" ]; then
-    local forge_choice="1"
-    [ "$PARAM_GITOPS_FORGE" = "gitlab" ] && forge_choice="2"
-    prompt_menu "Where does the GitOps repository live?" \
-      "GitHub" \
-      "GitLab (gitlab.com or self-managed)" \
-      forge_choice
-    if [ "$forge_choice" = "2" ]; then
-      PARAM_GITOPS_FORGE="gitlab"
-    else
-      PARAM_GITOPS_FORGE="github"
-      PARAM_GITOPS_HOST=""
-    fi
-  fi
-
+  ask_gitops_forge
   if [ "$PARAM_GITOPS_FORGE" = "gitlab" ]; then
     # No GitHub org and no minter: write_tfvars_from_state renders neither for
     # GitLab, and the CR names the forge and its token Secret instead.
@@ -6536,7 +7033,11 @@ main() {
       # organization, never their login — suggesting a username would guarantee
       # the failure below.
       local detected_gh_org=""
-      detected_gh_org=$(gh api user/orgs -q '.[0].login' 2>/dev/null || echo "")
+      if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+        detected_gh_org=$(gh api --hostname "$PARAM_GITOPS_HOST" user/orgs -q '.[0].login' 2>/dev/null || echo "")
+      else
+        detected_gh_org=$(gh api user/orgs -q '.[0].login' 2>/dev/null || echo "")
+      fi
       print_info "The GitOps repo must belong to a GitHub organization; a personal account cannot"
       print_info "mint tokens. A free organization is enough."
       # Every default below is the loaded value first, the project default or
@@ -6552,11 +7053,11 @@ main() {
         if [ -z "$github_org" ]; then
           org_problem="A GitHub organization is required to connect a GitOps repo."
         elif ! is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
-          case "$(github_account_type "$github_org")" in
+          case "$(github_account_type "$github_org" "${PARAM_GITOPS_HOST:-}" "$(gitops_ca_file_for_check)")" in
             organization) ;;
             user) org_problem="'${github_org}' is a personal GitHub account, not an organization. The token minter cannot mint tokens for it." ;;
-            missing) org_problem="'${github_org}' does not exist on GitHub. Check the spelling." ;;
-            *) print_warning "Could not reach GitHub to verify '${github_org}'; continuing." ;;
+            missing) org_problem="'${github_org}' does not exist on ${PARAM_GITOPS_HOST:-GitHub}. Check the spelling." ;;
+            *) print_warning "Could not reach ${PARAM_GITOPS_HOST:-GitHub} to verify '${github_org}'; continuing." ;;
           esac
         fi
         [ -z "$org_problem" ] && break
@@ -6638,7 +7139,7 @@ main() {
       if [ -n "$github_org" ] || [ -n "$github_app_id" ]; then
         print_info "GitOps interview skipped; keeping the GitOps configuration this install already records."
       else
-        print_info "GitOps repository connection skipped. Scheduled fleet audits still run and report to chat, but write no ledger issue or pull request without one."
+        print_info "GitOps repository connection skipped. Scheduled fleet audits still run, keep their reports on the agent's volume and post to chat when something changed, but write no ledger issue or pull request without one."
       fi
     fi
   else
@@ -6742,7 +7243,9 @@ main() {
     # These are GCP IAM role bundles for the agent's GSA, nothing else. Kubernetes
     # RBAC stays read-only in every set, and the GitOps pull-request path works in
     # every set, so neither belongs in these labels. read-only leads because it is
-    # the documented default and the only set that enforces no cloud-plane writes.
+    # the documented default and the only set that keeps writes to infrastructure
+    # out at IAM; what its roles carry beyond reads (the Trace role's console
+    # permissions) is on the canonical page, not restated in the label.
     # See docs/site/src/content/docs/reference/security-and-iam.md.
     # The "(Default)" tag follows the option enter keeps — the seeded one on a
     # re-run — for the reason the gVisor prompt below gives: a static tag on
@@ -6755,7 +7258,7 @@ main() {
       perm_tag_custom=" (Default)"
     fi
     prompt_menu "Select Platform Agent GCP IAM Permission Set:" \
-      "read-only — auditing and observability, no GCP write capability${perm_tag_ro}" \
+      "read-only — auditing and observability: read roles, no write to infrastructure${perm_tag_ro}" \
       "custom — exactly the roles you list, no built-in bundle${perm_tag_custom}" \
       perm_choice
 
@@ -7014,6 +7517,11 @@ main() {
   export GEMINI_API_KEY="$gemini_api_key"
   export OPENAI_API_KEY="$openai_api_key"
   export ANTHROPIC_API_KEY="$anthropic_api_key"
+  export OPENAI_COMPATIBLE_API_BASE="$openai_compatible_api_base"
+  export OPENAI_COMPATIBLE_TARGET_PORT="$openai_compatible_target_port"
+  export OPENAI_COMPATIBLE_EGRESS_CIDRS="$openai_compatible_egress_cidrs"
+  export OPENAI_COMPATIBLE_CA_SECRET_NAME="$openai_compatible_ca_secret_name"
+  export OPENAI_COMPATIBLE_API_KEY="$openai_compatible_api_key"
   export ALLOWED_USERS="$allowed_users"
   export CHAT_TOPIC_NAME="$chat_topic_name"
   export CHAT_SUB_NAME="$chat_sub_name"
@@ -7125,6 +7633,9 @@ main() {
     print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
     exit 1
   fi
+  # A chat backend the gateway holds with no home channel (#3320): a
+  # warning, never a refusal, repeated at the end of the run.
+  warn_next_home_channel_unset_from_env flags
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a
@@ -7244,6 +7755,8 @@ main() {
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
+  elif [ "$model_provider" = "openai_compatible" ]; then
+    echo -e "  • ${C_CYAN}OpenAI-compatible Server:${C_RESET} ${openai_compatible_api_base}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
@@ -7258,7 +7771,11 @@ main() {
   if [ "${PARAM_GITOPS_FORGE:-github}" = "gitlab" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} $(GITOPS_HOST="$PARAM_GITOPS_HOST" GITOPS_REPO="$github_repo" gitlab_repo_url) (GitLab; token in Secret ${PARAM_GITLAB_TOKEN_SECRET})"
   elif [ -n "$github_org" ] && [ -n "$github_repo" ]; then
-    echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
+    if [ -n "${PARAM_GITOPS_HOST:-}" ]; then
+      echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://${PARAM_GITOPS_HOST}/${github_org}/${github_repo} (GitHub Enterprise Server${PARAM_GITOPS_CA_SECRET:+; CA in Secret ${PARAM_GITOPS_CA_SECRET}})"
+    else
+      echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
+    fi
   fi
   echo -e "${C_CYAN}${C_BOLD}"
   draw_separator
@@ -7349,6 +7866,7 @@ main() {
     fi
     print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
     write_json_report "DRY_RUN_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -7394,6 +7912,7 @@ main() {
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
+        print_next_home_channel_unset_summary flags
         exit 0
         ;;
     esac
@@ -7401,7 +7920,7 @@ main() {
 
   if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
     print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
-    check_github_org_is_organization "${GITOPS_ORG:-}"
+    check_github_org_is_organization "${GITOPS_ORG:-}" "${GITOPS_HOST:-}" "$(gitops_ca_file_for_check)"
     # Past every gate that can stop this route: a chat flag or --mode whose
     # key the install.env lacks is recorded for the handoff, and so are the
     # GitHub GitOps keys, which the handoff's lifecycle.sh apply renders.
@@ -7409,6 +7928,7 @@ main() {
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -7420,7 +7940,7 @@ main() {
   # already settled it interactively; this catches an install.env edited by hand
   # and the non-interactive flag path. Warns-only when GitHub is unreachable;
   # SKIP_GITHUB_ORG_CHECK=true bypasses it.
-  check_github_org_is_organization "${GITOPS_ORG:-}"
+  check_github_org_is_organization "${GITOPS_ORG:-}" "${GITOPS_HOST:-}" "$(gitops_ca_file_for_check)"
   # A declared Shared VPC host or Metrics Scope is resolved in the plan, which
   # reads APIs the apply below is what enables; on a first install they
   # have to be on before the plan, or it is refused with the API disabled.
@@ -7527,8 +8047,13 @@ main() {
   if [ "${GITOPS_FORGE:-github}" = "gitlab" ]; then
     # The CA first: an empty token source stops the run here, and the CA
     # Secret must exist by then.
-    create_gitlab_ca_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+  elif [ -n "${GITOPS_HOST:-}" ]; then
+    # A GitHub Enterprise Server: the CA before the minter restart, which is
+    # how the minter reads it. The broker reads it on each call.
+    create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
+    restart_github_minter_for_ca "$namespace" "$expected_ctx"
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
@@ -7607,7 +8132,15 @@ main() {
   fi
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
+    # The install.env this run read, which need not be the checkout's, and
+    # what the run applied, which an interview answer install.env does not
+    # record makes differ from the file.
+    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$platform_agent_mode" \
+      SLACK_STEPS_SLACK_ENABLED="$slack_enabled" \
+      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}" \
+      SLACK_STEPS_HOME_CHANNEL="$slack_home_channel" \
+      bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
   fi
   # Repeated here, where the two printers above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().
@@ -7615,6 +8148,7 @@ main() {
     echo ""
     _prompt_no_chat_enabled
   fi
+  print_next_home_channel_unset_summary flags
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then
