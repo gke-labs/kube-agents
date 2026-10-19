@@ -1117,6 +1117,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/cron-reports", {"job_id": "j", "report": "r"}),
         ("POST", "/v1/findings", {"findings": []}),
         ("GET", "/v1/findings/ranked", None),
+        ("GET", "/v1/board", None),
         ("GET", "/v1/findings", None),
         ("POST", "/v1/findings/f-1/surfaced", {}),
         ("GET", "/v1/findings/additions", None),
@@ -5731,6 +5732,51 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def test_board_reads_the_board_the_findings_and_the_audit(self):
+        import sqlite3
+
+        self._create_kanban_schema()
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, created_at, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("t-1", "Diagnose the crashloop", "platform", "running", 1792155000, 1792155000),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                ("t-1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/4", "number": 4, "title": "Fix"}), 1792155000),
+            )
+        audit = {"name": "n", "findings": 0, "critical": 0, "issue_url": "", "issue": 0, "finished_at": "2026-10-16T10:24:00+00:00"}
+        with patch.object(session_kv_server.board_snapshot, "default_audit", lambda: audit), patch.object(
+            session_kv_server.board_snapshot, "PROFILES_DIR", self.root / "profiles"
+        ):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual([c["title"] for c in body["running"]], ["Diagnose the crashloop"])
+        self.assertEqual([p["number"] for p in body["prs"]], [4])
+        self.assertEqual(body["audit"], audit)
+        self.assertIn("clusters", body)
+
+    def test_board_an_unreadable_source_is_a_503(self):
+        with patch.object(
+            session_kv_server.board_snapshot, "snapshot", side_effect=session_kv_server.board_snapshot.BoardError("gone")
+        ):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 503, resp.text)
+
+    def test_board_a_malformed_source_row_is_a_503_not_a_500(self):
+        with patch.object(session_kv_server.board_snapshot, "snapshot", side_effect=ValueError("rubric is not JSON")):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 503, resp.text)
+
+    def test_board_with_no_kanban_board_yet_is_empty(self):
+        with patch.object(session_kv_server.board_snapshot, "default_audit", lambda: None), patch.object(
+            session_kv_server.board_snapshot, "PROFILES_DIR", self.root / "profiles"
+        ):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual((resp.json()["running"], resp.json()["prs"]), ([], []))
 
     def _create_kanban_schema(self):
         import sqlite3

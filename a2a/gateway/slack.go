@@ -150,6 +150,7 @@ type slackAPI interface {
 	RemoveReaction(name string, item slack.ItemRef) error
 	GetUserInfo(user string, options ...slack.GetUserInfoOption) (*slack.User, error)
 	SetAssistantThreadsSuggestedPrompts(params slack.AssistantThreadsSetSuggestedPromptsParameters) error
+	PublishView(userID string, view slack.HomeTabViewRequest, hash string) (*slack.ViewResponse, error)
 }
 
 // SlackAdapter is the first real mapped-identity backend. Transport is
@@ -232,6 +233,12 @@ type SlackAdapter struct {
 	// ux is the click and question state (slack_interactive.go), made on
 	// first use.
 	ux *slackUX
+
+	// workspaceURL is the bot's workspace as auth.test names it
+	// ("https://acme.slack.com/"), the root of a message's permalink; home is
+	// the Home tab's state (slack_home.go).
+	workspaceURL string
+	home         slackHome
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -672,8 +679,11 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}
-			case *slackevents.AssistantThreadStartedEvent, *slackevents.AppHomeOpenedEvent:
+			case *slackevents.AssistantThreadStartedEvent:
 				s.suggestPrompts(inner)
+			case *slackevents.AppHomeOpenedEvent:
+				s.suggestPrompts(inner)
+				s.homeOpened(inner)
 			}
 		}
 	}()
@@ -1218,6 +1228,7 @@ func (s *SlackAdapter) setMark(key string, isSession, force bool, until time.Tim
 func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	s.botUserID = auth.UserID
 	s.teamID = auth.TeamID
+	s.workspaceURL = auth.URL
 	s.log.Info("slack connected", "user", auth.User, "botUserID", auth.UserID, "team", auth.TeamID)
 	if auth.TeamID == "" {
 		// foreignSender fails closed without it, so a message that names any

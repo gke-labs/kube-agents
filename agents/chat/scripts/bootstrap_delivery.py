@@ -46,7 +46,10 @@ report twice; see ``_posted_as_blocks``.
 Every delivery closes with a short note on the first-run audits, read off the ``oobe`` stage's
 marker by ``_audits_note``: the report's scan leaves the workload checks to those audits (except
 on an install whose kept marker records an older stage's no-repository skip, where the scan ran
-them), and a short report would otherwise read as a healthy fleet. The text path appends it to the report; the
+them), and a short report would otherwise read as a healthy fleet. An audit the stage started or
+adopted whose summary failed to deliver, as every one that finished before anyone opened the chat
+does for want of a home channel, is named (``_undelivered_audits``). The text path appends it to
+the report; the
 card paths print it on their own, since the card leaves closing lines out.
 
 Just before the claim, the run registers the sweep's findings in the
@@ -80,6 +83,7 @@ never delivered from here.
 import contextlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -213,6 +217,24 @@ AUDITS_NONE_RAN_NOTE = (
 AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
+# Every audit the chain started has completed its run, so "have started" would be stale.
+AUDITS_FINISHED_NOTE = (
+    "Workload checks (probes, requests and limits, autoscaling, NetworkPolicy, pod security) come "
+    "from the first-run audits, which have run: {audits}."
+)
+# Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
+# that ends before anyone opens the chat always meets, and the scheduler does not post it again
+# (_undelivered_audits).
+AUDITS_UNDELIVERED_NOTE = (
+    "These finished, but their summaries were not posted to the chat: {audits}. "
+    "Ask me for any of these reports."
+)
+
+# The scheduler's record of where a run's final message went (Hermes cron/executions.db).
+DELIVERY_OUTCOME_COLUMN = "delivery_outcome"
+DELIVERY_FAILED = "failed"
+# A run that posted nothing on purpose: the scheduler's suppressed outcomes, or none recorded.
+SILENT_OUTCOMES = ("suppressed", "suppressed_acked", None)
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -633,13 +655,105 @@ def _audits_note(data_dir: Path, no_coverage: bool) -> str:
     gave_up = _list(state.get(oobe.STATE_GAVE_UP))
     not_run = [f"`{a}` ({held[a]})" for a in oobe.FIRST_RUN_AUDITS if a in held]
     not_run += [f"`{a}` ({AUDITS_GAVE_UP_REASON})" for a in oobe.FIRST_RUN_AUDITS if a in gave_up]
+    runs = _completed_runs(data_dir, fired)
+    marks = state.get(oobe.STATE_MARKS) if isinstance(state.get(oobe.STATE_MARKS), dict) else {}
+    # A mark that is not a number reads as no mark: this runs after the claim, and a raise here
+    # would lose the report.
+    since = {a: m if isinstance(m, (int, float)) else 0 for a, m in marks.items()}
+    # Judged by when the run ended: a scheduled run already going when the stage marked the audit
+    # is the stage's answer, though it was claimed before the mark.
+    finished = [
+        a for a in fired if any((ended or claimed) >= since.get(a, 0) for claimed, ended, _ in runs.get(a, ()))
+    ]
     if not state.get(oobe.STATE_DONE):
         note = AUDITS_RUNNING_NOTE
+    elif fired and finished == fired:
+        note = AUDITS_FINISHED_NOTE.format(audits=", ".join(f"`{a}`" for a in fired))
     elif fired:
         note = AUDITS_RAN_NOTE.format(audits=", ".join(f"`{a}`" for a in fired))
     else:
         note = AUDITS_NONE_RAN_NOTE
-    return f"{note} {AUDITS_NOT_RUN_NOTE.format(audits=', '.join(not_run))}" if not_run else note
+    if not_run:
+        note = f"{note} {AUDITS_NOT_RUN_NOTE.format(audits=', '.join(not_run))}"
+    undelivered = _undelivered_audits(finished, runs)
+    return f"{note} {AUDITS_UNDELIVERED_NOTE.format(audits=', '.join(undelivered))}" if undelivered else note
+
+
+def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[float, float | None, str | None]]]:
+    """``job -> [(claimed_at, finished_at, delivery_outcome), ...]`` for the completed runs of ``jobs``, oldest first.
+
+    Empty when the Platform Agent's cron store cannot be read: the note then says what it said
+    before, rather than holding the report back, and the stage log says why (Hermes drops this
+    run's stderr when it exits 0).
+    """
+    ledger = data_dir / oobe.PROFILES_DIR / oobe.PLATFORM_PROFILE / oobe.CRON_DIR / oobe.EXECUTIONS_DB
+    if not jobs:
+        return {}
+    if not ledger.is_file():
+        _stage_note(data_dir, f"no {ledger}, so the audits note names no unposted summary")
+        return {}
+    placeholders = ",".join("?" * len(jobs))
+    try:
+        conn = sqlite3.connect(
+            f"file:{ledger}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS
+        )
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+            if DELIVERY_OUTCOME_COLUMN not in columns:
+                _stage_note(
+                    data_dir,
+                    f"{ledger} has no {DELIVERY_OUTCOME_COLUMN} column, so the audits note names no unposted summary",
+                )
+            outcome = DELIVERY_OUTCOME_COLUMN if DELIVERY_OUTCOME_COLUMN in columns else "NULL"
+            finished = oobe.FINISHED_AT_COLUMN if oobe.FINISHED_AT_COLUMN in columns else "NULL"
+            rows = conn.execute(
+                f"SELECT job_id, claimed_at, {finished}, {outcome} FROM executions "
+                f"WHERE job_id IN ({placeholders}) AND status = ? ORDER BY claimed_at",
+                (*jobs, oobe.COMPLETED_STATUS),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        _stage_note(data_dir, f"cannot read {ledger}, so the audits note names no unposted summary: {e}")
+        return {}
+    runs: dict[str, list[tuple[float, float | None, str | None]]] = {}
+    for job_id, claimed, finished_at, delivery in rows:
+        try:
+            claimed_at = datetime.fromisoformat(claimed).timestamp()
+        except (TypeError, ValueError):
+            continue
+        try:
+            ended = datetime.fromisoformat(finished_at).timestamp()
+        except (TypeError, ValueError):
+            ended = None
+        runs.setdefault(job_id, []).append((claimed_at, ended, delivery))
+    return runs
+
+
+def _undelivered_audits(audits: list[str], runs: dict[str, list[tuple[float, float | None, str | None]]]) -> list[str]:
+    """The audits whose latest run that tried to post its summary failed.
+
+    A run that ends before anyone has opened the chat finds no home channel, the relay refuses
+    it, and nothing posts it later; this delivery is the first message that user reads. Any other
+    failed delivery is listed too, since its summary is just as missing. A later run that posted
+    nothing on purpose (a silent run: suppressed, or no outcome recorded) does not stand in for
+    the lost one.
+    """
+    out = []
+    for audit in audits:
+        tried = [run for run in runs.get(audit, ()) if run[2] not in SILENT_OUTCOMES]
+        if tried and tried[-1][2] == DELIVERY_FAILED:
+            out.append(f"`{audit}`")
+    return out
+
+
+def _stage_note(data_dir: Path, message: str) -> None:
+    """One line in the oobe stage log, which an operator reads; best effort."""
+    try:
+        with oobe._open_stage_log(data_dir) as log:
+            log.write(f"bootstrap_delivery: {message}\n")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: {message} (and the stage log could not be written: {e})\n")
 
 
 def _list(value) -> list:
