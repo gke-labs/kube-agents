@@ -142,6 +142,10 @@ type Config struct {
 	// calls no server it did not ask for. The daemon sets DefaultRouteURL.
 	RouteURL string
 	RouteKey string
+	// CardStopTimeout bounds a card stop's request to session-kv
+	// (cardstop.go); zero is DefaultCardStopTimeout. The wait for the
+	// session's turn before it is bounded apart (cardStopTurnWait).
+	CardStopTimeout time.Duration
 	// APIConnectRetry is how long a refused connection to the API server is
 	// retried before the task ends hermes-api-unreachable; zero is
 	// DefaultAPIConnectRetry.
@@ -236,6 +240,9 @@ func (c *Config) defaults() {
 	}
 	if c.APIURL == "" {
 		c.APIURL = DefaultAPIURL
+	}
+	if c.CardStopTimeout <= 0 {
+		c.CardStopTimeout = DefaultCardStopTimeout
 	}
 	if c.APIConnectRetry <= 0 {
 		c.APIConnectRetry = DefaultAPIConnectRetry
@@ -413,8 +420,9 @@ type Bridge struct {
 	// it while a cancel lands, without a bus that misbehaves on cue.
 	publishTurn func(ctx context.Context, run *taskRun, artifactID, text string) error
 	// resultPublish publishes a task's result artifact, publishResult by
-	// default; a field so a test can fail it. chat, when set, is the
-	// kube-agents.chat/v1 DataPart the last chunk carries (chat.go).
+	// default; a field so a test can fail it. chat, when set, is the data
+	// part the last chunk carries: the kube-agents.chat/v1 DataPart (chat.go)
+	// for a turn, or the cardStop result part (cardstop.go) for a control.
 	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
 
 	// apiClient is the API executor's HTTP client (api.go).
@@ -574,7 +582,11 @@ func (b *Bridge) Run(ctx context.Context) error {
 			"listen", b.activityLn.Addr().String(), "hook", DefaultActivityListen)
 	}
 	<-ctx.Done()
+	// Under b.mu: accept starts a card-stop goroutine (b.wg.Add) only after
+	// reading closing under the same lock, so none is added once Wait can run.
+	b.mu.Lock()
 	b.closing.Store(true)
+	b.mu.Unlock()
 	sub.Stop()
 	// The queue is never closed: Stop does not join an in-flight handler
 	// callback, and a handler mid-accept sending into a closed channel would
@@ -673,7 +685,8 @@ func (b *Bridge) handleMessage(ctx context.Context, env *lib.Envelope) {
 }
 
 // accept is the dispatcher half: register in-flight, publish submitted,
-// queue for a worker. KV before submitted, deliberately - a crash between
+// queue for a worker, or, for a card-stop control, start its own goroutine
+// (runCardStop). KV before submitted, deliberately - a crash between
 // the two leaves a key the sweep deletes harmlessly, where the opposite
 // order leaves a task the sweep cannot see.
 func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
@@ -682,7 +695,10 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 		b.cfg.Logger.Error("rejecting malformed submission", "task", env.TaskID, "err", err)
 		return
 	}
-	run := &taskRun{origin: env, exec: x}
+	// A card-stop control (cardstop.go) answers no follow-up: its turns are
+	// closed from the start, so one is refused task-ending.
+	control := cardStopRequested(env.Payload)
+	run := &taskRun{origin: env, exec: x, turnsClosed: control}
 	if err := b.markInFlight(ctx, env.TaskID); err != nil {
 		b.cfg.Logger.Error("in-flight registry write failed; dropping submission",
 			"task", env.TaskID, "err", err)
@@ -699,6 +715,27 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 	b.mu.Unlock()
 
 	b.cfg.Logger.Info("task accepted", "task", env.TaskID, "correlation", env.CorrelationID, "from", env.From.Session)
+	if control {
+		// A card stop runs no turn, so it takes no worker slot: one behind
+		// Concurrency long turns would wait out the very work it stops.
+		// The Add and the closing check share b.mu with Run's closing store,
+		// so an Add either precedes Run's wg.Wait or does not happen. Once
+		// closing is set, shutdownTasks may already have read the table, so
+		// the control is ended here. A control accepted before it is in the
+		// table for shutdownTasks, and its goroutine sees ctx end.
+		b.mu.Lock()
+		closing := b.closing.Load()
+		if !closing {
+			b.wg.Add(1)
+		}
+		b.mu.Unlock()
+		if closing {
+			b.finalize(run, lib.StateFailed, shutdownReason, nil)
+			return
+		}
+		go b.runCardStop(ctx, run)
+		return
+	}
 	select {
 	case b.queue <- run:
 	default:
@@ -1614,7 +1651,14 @@ func (b *Bridge) lookupTask(ctx context.Context, taskID string, maxAttempts int,
 // that fails to publish ends the task failed, because the result was the
 // only copy of the deliverable; finalizeCopy is the exception.
 func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultOutput *string) {
-	b.finalizeResult(run, state, msg, resultOutput, false)
+	b.finalizeResult(run, state, msg, resultOutput, nil, false)
+}
+
+// finalizeData is finalize for a result whose data part the caller made (a
+// card stop's): data rides the last chunk beside the text, in place of the
+// chat message finalize folds from the text.
+func (b *Bridge) finalizeData(run *taskRun, state lib.TaskState, msg string, resultOutput string, data []byte) {
+	b.finalizeResult(run, state, msg, &resultOutput, data, false)
 }
 
 // finalizeCopy is finalize for a result that is a copy of an answer already
@@ -1622,10 +1666,10 @@ func (b *Bridge) finalize(run *taskRun, state lib.TaskState, msg string, resultO
 // fails is logged and leaves state and msg as the cause set them, so a
 // cancel still ends canceled (payload spec assertion 13).
 func (b *Bridge) finalizeCopy(run *taskRun, state lib.TaskState, msg string, resultCopy string) {
-	b.finalizeResult(run, state, msg, &resultCopy, true)
+	b.finalizeResult(run, state, msg, &resultCopy, nil, true)
 }
 
-func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, copyOnly bool) {
+func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, data []byte, copyOnly bool) {
 	// noticeMu first and for the whole of it: no steer notice can be in
 	// flight past this, and a second finalizer waits here, then leaves on
 	// stateDone, as it always waited on mu.
@@ -1654,8 +1698,9 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	if resultOutput != nil {
 		// The answer folded for a chat renderer, on a completed task only:
 		// any other state's result is a copy beside the terminal's reason.
-		var chat []byte
-		if state == lib.StateCompleted {
+		// A caller's own data part (finalizeData) takes its place.
+		chat := data
+		if chat == nil && state == lib.StateCompleted {
 			if part, ok := resultChatPart(*resultOutput); ok {
 				chat = part.Data
 			}

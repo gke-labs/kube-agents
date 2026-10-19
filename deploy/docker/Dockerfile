@@ -462,6 +462,22 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
 
+# Cron: a run directory per agent run (gke-labs/kube-agents#2989). A job with
+# no workdir (all of ours) started its terminal in the sandbox's unwritable
+# login home, so a run that needed scratch made its own on the shared volume,
+# the profile home among it, where it stayed and became a later run's input. The patch
+# records <hermes home>/cron/runs/<job>_<execution> as the run's tool-layer cwd;
+# the session cwd, and so context-file loading, is unchanged, and script jobs
+# keep their cwd. kanban_workspace_gc.py prunes old run directories.
+COPY deploy/docker/patches/apply_cron_run_workdir.py \
+     deploy/docker/patches/verify_cron_run_workdir.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-run-workdir/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.py /opt/hermes && \
+    grep -q "kube-agents patch: cron run workdir" /opt/hermes/cron/scheduler.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/verify_cron_run_workdir.py /opt/hermes && \
+    rm -rf /tmp/cron-run-workdir
+
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
 # Must run after cron_tirith_scan: anchors into tools/approval.py at the point
 # introduced by apply_cron_tirith_scan.py.
