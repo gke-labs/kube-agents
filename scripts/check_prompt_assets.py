@@ -272,9 +272,26 @@ CRON_DELIVER_DEFAULT = "local"
 CRON_DELIVER_EXACT_CASE = frozenset({"local", "origin"})
 
 
+# The same file kinds, spelled absolutely under the platform profile home. A
+# cron run starts in a directory of its own (cron/runs/), so a prompt names
+# its SOP and collector this way; the reference is kept whole and resolved
+# against the platform profile (_cron_ref_resolves).
+CRON_PROMPT_ABS_PATH = re.compile(
+    "(" + re.escape(PLATFORM_PROFILE_HOME) + r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:md|json|py|sh))"
+    r"(?=[.,;:!?)\]]*(?:\Z|[\s'\"`]))"
+)
+
+
 def cron_prompt_refs(prompt: str) -> set[str]:
-    """Every repository-relative asset path a cron prompt names."""
-    return set(CRON_PROMPT_PATH.findall(prompt))
+    """Every asset path a cron prompt names: profile-relative, or absolute under the platform home."""
+    return set(CRON_PROMPT_PATH.findall(prompt)) | set(CRON_PROMPT_ABS_PATH.findall(prompt))
+
+
+def _cron_ref_resolves(ref: str, roster: Path) -> bool:
+    """A profile-relative ref against the roster's profile; an absolute one against the platform's."""
+    if ref.startswith(PLATFORM_PROFILE_HOME):
+        return _resolves_in_home(ref[len(PLATFORM_PROFILE_HOME):], REPO / PLATFORM_HOME_ANCHOR)
+    return _resolves_in_home(ref, roster)
 
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 FRONTMATTER_NAME = re.compile(r"^name:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
@@ -804,7 +821,7 @@ def check_cron_assets() -> list[Finding]:
                 # against the whole of agents/<profile>/ instead was how this rule
                 # came to accept `docs/glossary.md` from the platform roster --
                 # the one class the message it prints claims to be about.
-                if _resolves_in_home(ref, path):
+                if _cron_ref_resolves(ref, path):
                     continue
                 findings.append(
                     Finding(

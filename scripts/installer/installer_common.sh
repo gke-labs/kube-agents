@@ -210,6 +210,9 @@ readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/
 # The Slack app setup page's allowlist section, which says how to find a
 # member ID; refuse_next_slack_gateway_settings points at it.
 readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+# The same page's home channel section, which next_home_channel_unset_remedy
+# points at.
+readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#home-channel"
 # A Slack home channel the A2A gateway arms its notify route on: a public
 # (C...) or private (G...) channel id, the prefix letter then two or more of
 # A-Z0-9. This mirrors the gateway's slackIsHomeChannelID and
@@ -1135,6 +1138,89 @@ refuse_next_slack_gateway_settings_from_env() {
   refuse_next_slack_gateway_settings "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
+}
+
+# Under spec.mode next the A2A gateway, not the agent, makes the agent's
+# proactive posts (alerts, drift reports, scheduled reports), and it arms them
+# only on a home channel. A reply in a conversation still arrives without one,
+# so an install with none looks healthy while every unprompted post is dropped
+# (#3320). The front doors warn rather than refuse: some installs want chat
+# with no posts, and a CI install never posts. The operator reports the same
+# state as the HomeChannelUnset condition.
+#
+# The install.env key of the home channel the gateway's chat backend lacks,
+# or nothing: $1 the mode the apply renders, $2 SLACK_ENABLED, $3
+# GOOGLE_CHAT_ENABLED, $4 SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL.
+# The backend follows the operator: Chat holds the gateway when enabled, and
+# Slack only when Chat is not (slack_moves_to_a2a_gateway).
+next_home_channel_unset_key() {
+  local home
+  [ "${1:-}" = "next" ] || return 0
+  if is_truthy "${3:-}"; then
+    home="${5:-}"
+    home="${home//[[:space:]]/}"
+    [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
+    return 0
+  fi
+  if is_truthy "${2:-}"; then
+    home="${4:-}"
+    home="${home//[[:space:]]/}"
+    [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
+  fi
+  return 0
+}
+
+# The warning for that key ($1), one line.
+next_home_channel_unset_message() {
+  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so it will drop every one of them; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+}
+
+# What to set for that key ($1); $2 is "flags" when install.sh's flags can
+# set it too.
+next_home_channel_unset_remedy() {
+  local via="install.env"
+  case "${1:-}" in
+    SLACK_HOME_CHANNEL)
+      [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel"
+      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
+      ;;
+    GOOGLE_CHAT_HOME_CHANNEL)
+      [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
+      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space."
+      ;;
+  esac
+}
+
+# Set by warn_next_home_channel_unset so the front door's closing summary can
+# say it again where the reader of a non-interactive run's log will see it.
+NEXT_HOME_CHANNEL_UNSET_KEY=""
+
+# Warns when the apply leaves the gateway's chat backend without a home
+# channel, and records the key for the closing summary. Takes
+# next_home_channel_unset_key's five arguments, then "flags" as $6. Never
+# refuses.
+warn_next_home_channel_unset() {
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
+  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
+  print_warning "$(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
+  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${6:-}")"
+  return 0
+}
+
+# warn_next_home_channel_unset on the exported keys; $1 is its $6.
+warn_next_home_channel_unset_from_env() {
+  warn_next_home_channel_unset "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
+    "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
+}
+
+# The closing summary's block, when warn_next_home_channel_unset found the
+# key empty: printed last, so a non-interactive log ends on it. $1 "flags".
+print_next_home_channel_unset_summary() {
+  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
+  echo ""
+  print_warning "No home channel: proactive posts are dropped. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
+  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
 }
 
 # Said when a read the notice needs failed, so the run does not go on as if

@@ -53,6 +53,20 @@ type fakeSlackAPI struct {
 	userInfoCalls int
 	// prompts records setSuggestedPrompts calls.
 	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+	// views records views.publish calls by member.
+	views []publishedView
+}
+
+type publishedView struct {
+	member string
+	view   slack.HomeTabViewRequest
+}
+
+func (f *fakeSlackAPI) PublishView(member string, view slack.HomeTabViewRequest, _ string) (*slack.ViewResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.views = append(f.views, publishedView{member, view})
+	return &slack.ViewResponse{}, nil
 }
 
 func (f *fakeSlackAPI) AddReaction(name string, item slack.ItemRef) error {
