@@ -1178,3 +1178,8 @@
 # the preflight's stop. Nightly from its first merge; a presubmit seat waits
 # on a clean nightly record.
 ./tasks/cluster-setting-request-proposes-pr/task.yaml
+
+# A fleet search's per-cluster cards complete on the clusters that don't have
+# the workload, rather than waiting for it (#2978). Worker-scope checks, so it
+# grades on the api lanes; fixture no-pdb-workload on seeded-a.
+./tasks/fanout-absent-cluster-cards-complete/task.yaml
