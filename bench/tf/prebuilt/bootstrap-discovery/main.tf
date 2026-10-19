@@ -278,7 +278,7 @@ resource "null_resource" "sweep" {
       state="$(agent_py "${local.scan_job}" <<'PY' || true
       import json, os, sys
       home = "${local.home}"
-      if os.path.exists(home + "/.user_aligned") or os.path.exists(home + "/.user_aligned_conversation"):
+      if os.path.exists(home + "/.user_aligned") or os.path.exists(home + "/.user_aligned_conversation") or os.path.exists(home + "/onboarding_conversation.json"):
           print("aligned")
       elif os.path.exists(home + "/.bootstrap_completed"):
           print("completed")

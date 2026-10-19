@@ -401,7 +401,7 @@ resource "null_resource" "ranking" {
       jobs = {j.get("id"): j for j in load_jobs()}
       if os.path.exists("${local.state_file}"):
           print("armed")
-      elif os.path.exists(home + "/.user_aligned") or os.path.exists(home + "/.user_aligned_conversation"):
+      elif os.path.exists(home + "/.user_aligned") or os.path.exists(home + "/.user_aligned_conversation") or os.path.exists(home + "/onboarding_conversation.json"):
           print("aligned")
       elif os.path.exists("${local.greeted}"):
           print("greeted")

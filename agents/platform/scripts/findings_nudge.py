@@ -100,6 +100,12 @@ RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Filed and not yet delivered means a first report is on its way.
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 DELIVERED_MARKER = ".bootstrap_completed"
+# Under spec.mode next a claim on the conversation path is one attempt and can
+# be released; the report is out only once this outcome marker exists
+# (bootstrap_delivery.py, CONVERSATION_FILE, CONVERSATION_ALIGNED_MARKER and
+# CONVERSATION_DONE_FILE).
+CONVERSATION_MARKERS = ("onboarding_conversation.json", ".user_aligned_conversation")
+CONVERSATION_DONE_MARKER = ".bootstrap_conversation_done"
 # The line of the filed marker holding when it was filed, in Unix seconds.
 # The marker's mtime stands in when the line is missing or unreadable.
 FILED_AT_PREFIX = "filed_at="
@@ -162,6 +168,8 @@ def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
     has neither marker and is not held.
     """
     filed, delivered = gateway_home / SCAN_FILED_MARKER, gateway_home / DELIVERED_MARKER
+    if any((gateway_home / name).exists() for name in CONVERSATION_MARKERS):
+        delivered = gateway_home / CONVERSATION_DONE_MARKER
     if not filed.exists() or delivered.exists():
         return False, ""
     found = _filed_at(filed)

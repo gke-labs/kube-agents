@@ -522,6 +522,13 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertIn("larger than", self._attempts()["last_reason"])
 
+    def test_the_size_limit_counts_undecodable_bytes_as_posted(self):
+        # Each invalid byte decodes to a three-byte U+FFFD on the way to argv.
+        (self.d / INVENTORY).write_bytes(b"\xff" * (bootstrap_delivery.CONVERSATION_REPORT_MAX_BYTES // 2))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bootstrap_delivery.main(self.d), 1)
+        self.assertFalse((self.d / COMPLETED).exists())
+
     def test_the_gateway_answers_delivery_reads_are_the_gateway_s(self):
         # The gateway and the agent ship in different images, so these texts cannot change.
         source = (Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "notify.go").read_text(encoding="utf-8")

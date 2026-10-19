@@ -799,6 +799,35 @@ class ConversationPrimingTest(unittest.TestCase):
         self.assertIsNone(self._bridge_call())
         self._assert_unprimed()
 
+    def test_a_later_turn_in_the_conversation_primes_once_the_route_is_there(self):
+        # The first message found no route (the bridge's write or this read failed); the
+        # conversation keeps its session, so the next message is not a first turn.
+        self.assertIsNone(self._bridge_call(session_id="a2a-ctx-late"))
+        self._route("a2a-ctx-late", {**SLACK_ROUTE, "conversation": "slack:C0HOME/2.2", "context_id": "ctx-late"})
+        self.assertIsNotNone(self._bridge_call(session_id="a2a-ctx-late", is_first_turn=False))
+        record = json.loads((self.data_dir / plugin.CONVERSATION_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record["conversation"], "slack:C0HOME/2.2")
+        # Once greeted, no later turn primes again.
+        self.assertIsNone(self._bridge_call(is_first_turn=False))
+        self.trigger_job.assert_called_once()
+
+    def test_a_later_turn_on_a_chat_platform_is_still_ignored(self):
+        self.assertIsNone(self._call(is_first_turn=False))
+        self.assertFalse((self.data_dir / ".user_aligned").exists())
+
+    def test_a_failed_marker_touch_leaves_no_binding_behind(self):
+        real_touch = Path.touch
+
+        def touch(path, *args, **kwargs):
+            if path.name == plugin.CONVERSATION_ALIGNED_MARKER:
+                raise OSError("disk full")
+            return real_touch(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "touch", touch):
+            self.assertIsNone(self._bridge_call())
+        self.assertFalse((self.data_dir / plugin.CONVERSATION_FILE).exists())
+        self.assertFalse((self.data_dir / plugin.PRIMING_MARKER).exists())
+
     def test_a_live_priming_holds_off_a_second_first_turn(self):
         (self.data_dir / plugin.PRIMING_MARKER).touch()
         self.assertIsNone(self._bridge_call())

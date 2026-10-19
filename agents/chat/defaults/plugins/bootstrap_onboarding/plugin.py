@@ -476,6 +476,11 @@ def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, s
             (data_dir / CONVERSATION_ALIGNED_MARKER).touch(exist_ok=True)
         except Exception as e:
             logger.warning("Could not touch %s: %s", CONVERSATION_ALIGNED_MARKER, e)
+            # Delivery reads the file alone as a binding; leave none behind.
+            try:
+                (data_dir / CONVERSATION_FILE).unlink(missing_ok=True)
+            except OSError as e2:
+                logger.warning("Could not remove %s: %s", CONVERSATION_FILE, e2)
             return None
         if trigger_job is not None:
             try:
@@ -546,7 +551,11 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         if eval_request is not None:
             return _greeting(data_dir, *eval_request)
 
-    if not kwargs.get("is_first_turn", False):
+    # A bridged conversation keeps one session, so if its route could not be
+    # read (or the bridge could not record it) on the first message, a later
+    # message is the only retry: an API-server turn is checked on every turn
+    # until onboarding has greeted.
+    if not kwargs.get("is_first_turn", False) and platform_name != API_SERVER_PLATFORM:
         return None
 
     # Request/response and local surfaces have no durable adapter destination.

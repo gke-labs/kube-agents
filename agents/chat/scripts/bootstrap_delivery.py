@@ -1122,7 +1122,9 @@ def main(data_dir: Path | None = None) -> int:
             f"bootstrap_delivery: INVENTORY.md is larger than {REPORT_MAX_BYTES} bytes; not delivering it\n"
         )
         return 1
-    if conversation is not None and len(raw) > CONVERSATION_REPORT_MAX_BYTES:
+    content = raw.decode("utf-8", errors="replace")
+    # Measured as posted: each undecodable byte becomes a three-byte U+FFFD.
+    if conversation is not None and len(content.encode("utf-8")) > CONVERSATION_REPORT_MAX_BYTES:
         _record_attempt(
             data_dir,
             f"INVENTORY.md is larger than {CONVERSATION_REPORT_MAX_BYTES} bytes, more than one post into the "
@@ -1130,7 +1132,6 @@ def main(data_dir: Path | None = None) -> int:
             counted=False,
         )
         return 1
-    content = raw.decode("utf-8", errors="replace")
 
     # Before the claim, which ends the nudge's hold, so the rows exist when
     # the marks below are sent.

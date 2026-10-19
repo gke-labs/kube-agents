@@ -969,8 +969,9 @@ of the dismissal. That finding is not marked, spends no slot and is never pendin
 
 Three things keep the hourly run from adding noise. It prints nothing on a run with nothing to say,
 which is most of them. It adds nothing until the first inventory report's delivery is claimed
-(onboarding's `.bootstrap_scan_filed` present and `.bootstrap_completed` absent), so that report
-stays the first thing the user hears; an install that never ran onboarding is not held. The hold
+(onboarding's `.bootstrap_scan_filed` present and `.bootstrap_completed` absent; under
+`spec.mode: next`, when the report goes to a recorded conversation, `.bootstrap_conversation_done`
+absent, since a claim there can be released), so that report stays the first thing the user hears; an install that never ran onboarding is not held. The hold
 ends 24 hours (`FIRST_REPORT_HOLD_HOURS`) after the sweep was filed, by the marker's `filed_at` line
 or, failing that, its mtime: a report still undelivered by then means onboarding stalled, and
 holding on would add nothing ever again. Each run that is held, or would be but for that limit, says
