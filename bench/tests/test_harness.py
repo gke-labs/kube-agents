@@ -2632,22 +2632,34 @@ def test_a_status_turn_429_clears_to_the_delegated_answer(
     assert result.output.endswith(_RCA_RESULT)
 
 
-def test_a_delegated_worker_429_log_is_infrastructure_not_an_answer(
+def test_a_delegated_worker_status_turn_reported_blocked_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """When a worker transcript logs a 429 quota exhaustion, mark the rep as infrastructure."""
+    """When a status turn reports a card blocked with rate limit, it is classified as infra even if final exec fails."""
     stub_agent.turns = [
         _create_turn(),
-        _show_turn("done", body="I am blocked on quota.", result="I am blocked on quota."),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": _TASK_ID},
+                {
+                    "task": {"id": _TASK_ID, "status": "blocked"},
+                    "runs": [
+                        {
+                            "summary": (
+                                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                                'HTTP 429 ... "TPM quota exhausted"'
+                            )
+                        }
+                    ],
+                },
+                "call_show",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
     ]
 
     def _shell(script: str, timeout: float) -> str:
-        if "/opt/data/kanban/logs/" in script:
-            return (
-                f"{harness._LOG_PRESENT} 1729000000 100\n"
-                "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
-                'HTTP 429 ... "TPM quota exhausted"\n'
-            )
         return ""
 
     monkeypatch.setattr(harness, "_agent_shell", _shell)
@@ -2730,6 +2742,75 @@ def test_mark_result_infra_failure_prepends_errors_and_clears_final_message() ->
     ]
     assert "final_message" not in res.metadata
     assert res.metadata["infra_failure"] == "rate limit reached"
+
+
+def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = "task-1"
+    fallback = {t: ["provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"]}
+
+    # Branch 1: final read succeeds but card was unblocked (status is running)
+    def _shell_running(script: str, timeout: float) -> str:
+        payload = {"statuses": {t: "running"}, "summaries": {}, "errors": {}}
+        return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_running)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert msgs == fallback[t]
+
+    # Branch 2: final read succeeds, card is still blocked but has empty summaries and errors
+    def _shell_empty_failures(script: str, timeout: float) -> str:
+        payload = {"statuses": {t: "blocked"}, "summaries": {}, "errors": {}}
+        return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_empty_failures)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert msgs == fallback[t]
+
+    # Branch 3: final read succeeds and has summaries/errors, does not use fallback
+    def _shell_with_summary(script: str, timeout: float) -> str:
+        payload = {"statuses": {t: "blocked"}, "summaries": {t: "new summary"}, "errors": {}}
+        return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_with_summary)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert msgs == ["new summary"]
+
+
+def test_gitops_fix_cycle_skipped_on_infra_failure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a run is marked as infrastructure failure, gitops.await_fix_cycle is not called."""
+    called: list[bool] = []
+    import kube_agents_bench.gitops as gitops
+
+    monkeypatch.setattr(gitops, "await_fix_cycle", lambda *args, **kwargs: called.append(True))
+
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed"),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                        'HTTP 429 ... "TPM quota exhausted"'
+                    )
+                },
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+    result = KubeAgentsHarness().run("Investigate incident.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert not called
 
 
 def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
@@ -3967,18 +4048,24 @@ def test_a_card_wake_answer_turn_with_worker_rate_limit_preserves_wake_reply(
     base_shell = _replay_shell(scripts)
 
     def shell(script: str, timeout: float) -> str:
-        if "stat -c" in script and _TASK_ID in script:
-            return (
-                f"{harness._LOG_PRESENT} 2026-01-01 100\n"
-                "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 quota exhausted\n"
-            )
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {
+                    _TASK_ID: (
+                        "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 quota exhausted"
+                    )
+                },
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
         return base_shell(script, timeout)
 
     monkeypatch.setattr(harness, "_agent_shell", shell)
     stub_agent.turns = [
         _turn(_text(_FINAL_TEXT)),
         _create_turn(),
-        _show_turn("done"),
+        _show_turn("failed"),
     ]
 
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)

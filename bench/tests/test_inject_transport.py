@@ -2695,6 +2695,36 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     assert "rate_limit" in result.errors[0]
 
 
+def test_a_blocked_card_with_rate_limit_summary_on_inject_fallback_when_final_exec_fails(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the final kubectl exec fails on inject lane, it falls back to read_summaries."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+    )
+    real = local_shell(tmp_path, monkeypatch)
+
+    def flaky(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            return ""  # final exec fails
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", flaky)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+
+
 def test_a_cleared_rate_limit_rerun_on_inject_remains_graded(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

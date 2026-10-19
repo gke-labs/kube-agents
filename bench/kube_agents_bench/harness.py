@@ -1897,6 +1897,9 @@ class KubeAgentsHarness(AgentHarness):
                 # transport, so this is the run class, not an answer.
                 return _infra_failure(str(exc))
 
+        if result.metadata.get("infra_failure"):
+            return result
+
         # GitOps cases (GITOPS_RUN_BRANCH set): the agent's answer is a pull
         # request, and the cluster the verifiers grade only changes once that
         # PR has merged and Argo has synced it. Hold the run open for that, or
@@ -2766,7 +2769,12 @@ class KubeAgentsHarness(AgentHarness):
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
         settled_statuses = {t: _status(t) for t in awaited}
-        board_messages = self._final_board_failures(awaited, settled_statuses)
+        read_summaries = {
+            t: [str(read.cards[t]["summary"])]
+            for t in awaited
+            if settled_statuses[t] in _FAILURE_STATUSES and read.cards.get(t, {}).get("summary")
+        }
+        board_messages = self._final_board_failures(awaited, settled_statuses, read_summaries)
         self._settle(
             result,
             observed,
@@ -2849,8 +2857,9 @@ class KubeAgentsHarness(AgentHarness):
         # The status turns' trajectories, which carry the settled cards'
         # results. Kept beside the graded trajectory rather than in it.
         observed: list[dict[str, Any]] = list(result.trajectory)
+        poll_failure_messages: dict[str, list[str]] = {}
         if not outstanding:
-            board_messages = self._final_board_failures(awaited, statuses)
+            board_messages = self._final_board_failures(awaited, statuses, poll_failure_messages)
             self._settle(
                 result,
                 observed,
@@ -2872,7 +2881,6 @@ class KubeAgentsHarness(AgentHarness):
         # card: a board reading never retires a card from ``outstanding``,
         # because only a status turn can carry the card's result back.
         latest: dict[str, str] = dict(statuses)
-        poll_failure_messages: dict[str, list[str]] = {}
         while outstanding:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2998,8 +3006,41 @@ class KubeAgentsHarness(AgentHarness):
             # poll, so the cumulative view would let an agent that has stopped
             # reading the board pass as one still answering, and would mark
             # every turn after the first terminal card as settled.
-            fresh_reported = reported_statuses(new_calls(status_turn, seen_calls))
+            turn_new_calls = new_calls(status_turn, seen_calls)
+            fresh_reported = reported_statuses(turn_new_calls)
             latest.update(fresh_reported)
+            for t, s in fresh_reported.items():
+                if s in _FAILURE_STATUSES and t not in poll_failure_messages:
+                    cstate = board.read_board_state(_agent_shell, [t], _EXEC_TIMEOUT)
+                    if cstate is not None:
+                        _, csummaries, cerrors = cstate
+                        msgs: list[str] = []
+                        if t in csummaries:
+                            msgs.append(csummaries[t])
+                        if t in cerrors:
+                            msgs.append(cerrors[t])
+                        if msgs:
+                            poll_failure_messages[t] = msgs
+                    if t not in poll_failure_messages:
+                        for entry in turn_new_calls:
+                            res = entry.get("result")
+                            if isinstance(res, str):
+                                try:
+                                    payload = json.loads(res)
+                                except Exception:
+                                    continue
+                            elif isinstance(res, dict):
+                                payload = res
+                            else:
+                                continue
+                            shown = payload.get("task")
+                            if isinstance(shown, dict) and str(shown.get("id")) == t:
+                                runs = payload.get("runs")
+                                for r in runs if isinstance(runs, list) else []:
+                                    if isinstance(r, dict):
+                                        summ = r.get("summary")
+                                        if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
+                                            poll_failure_messages.setdefault(t, []).append(summ)
             _fold_status_turn(
                 result,
                 status_turn,
@@ -3110,18 +3151,7 @@ class KubeAgentsHarness(AgentHarness):
 
         infra_reason: str | None = None
         infra_detail: str = ""
-        for tid, wlog in (logs or {}).items():
-            if wlog and wlog.body:
-                for line in wlog.body.splitlines():
-                    reason = _extract_infra_failure_reason(line)
-                    if reason:
-                        infra_reason = reason
-                        infra_detail = f"worker transcript for {tid} logged {reason}"
-                        break
-                if infra_reason:
-                    break
-
-        if not infra_reason and board_messages:
+        if board_messages:
             for text in board_messages:
                 reason = _extract_infra_failure_reason(text)
                 if reason:
