@@ -2667,7 +2667,7 @@ def test_a_delegated_worker_rate_limit_on_board_is_infrastructure(
     """When a card on the kanban board reports rate_limit failure, mark the rep as infrastructure."""
     stub_agent.turns = [
         _create_turn(),
-        _show_turn("done", body="Worker failed.", result="Worker failed."),
+        _show_turn("failed", body="Worker failed.", result="Worker failed."),
     ]
 
     def _shell(script: str, timeout: float) -> str:
@@ -2712,6 +2712,73 @@ def test_an_agent_output_reporting_429_remains_graded(
 
     assert not result.has_errors()
     assert result.output.endswith(answer)
+
+
+def test_mark_result_infra_failure_prepends_errors_and_clears_final_message() -> None:
+    res = AgentResult(
+        output="answer text",
+        trajectory=[{"name": "step"}],
+        errors=["pre-existing error"],
+        metadata={"final_message": "answer text", "key": "value"},
+    )
+    harness._mark_result_infra_failure(res, "rate limit reached")
+    assert res.output == ""
+    assert res.trajectory == []
+    assert res.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: rate limit reached",
+        "pre-existing error",
+    ]
+    assert "final_message" not in res.metadata
+    assert res.metadata["infra_failure"] == "rate limit reached"
+
+
+def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a worker hit rate limit in an earlier poll but the re-run finishes done, it remains graded."""
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("done", body="All pods recovered.", result="All pods recovered."),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "done"},
+                "summaries": {_TASK_ID: "All pods recovered."},
+                "errors": {},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert result.output.endswith("All pods recovered.")
+
+
+def test_settle_on_answer_turn_records_worker_failure_without_infra_marker() -> None:
+    res = AgentResult(
+        output="graded answer",
+        trajectory=[],
+        errors=[],
+        metadata={"final_message": "graded answer"},
+    )
+    harness.KubeAgentsHarness._settle(
+        res,
+        [],
+        ["t_1"],
+        board_messages=["provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"],
+        opening_turn=False,
+    )
+    assert res.output == "graded answer"
+    assert res.metadata.get("final_message") == "graded answer"
+    assert len(res.errors) == 1
+    assert harness.INFRA_FAILURE_MARKER not in res.errors[0]
+    assert "delegated worker failed (rate_limit)" in res.errors[0]
 
 
 def test_a_status_turn_502_recovers_through_a_fresh_tunnel(

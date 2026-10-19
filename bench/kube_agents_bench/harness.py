@@ -635,18 +635,20 @@ _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({
 _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 _INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
+_FAILURE_STATUSES = frozenset({"blocked", "triage", "failed"})
 _RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
 _FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
 
 
 def _extract_infra_failure_reason(text: str | None) -> str | None:
-    """Extract an infrastructure failure reason (rate_limit, billing) if present in text."""
+    """Extract an infrastructure failure reason if text opens with the hermes failure prefix."""
     if not text:
         return None
-    match = _FAILURE_REASON_PATTERN.search(text)
-    if match and match.group(1) in _INFRA_FAILURE_REASONS:
-        return match.group(1)
-    if _RATE_LIMIT_REASON_PREFIX in text:
+    text = text.strip()
+    if text.startswith(_RATE_LIMIT_REASON_PREFIX):
+        match = _FAILURE_REASON_PATTERN.search(text)
+        if match and match.group(1) in _INFRA_FAILURE_REASONS:
+            return match.group(1)
         return "rate_limit"
     return None
 
@@ -655,7 +657,8 @@ def _mark_result_infra_failure(result: AgentResult, detail: str) -> None:
     """Convert an AgentResult in-place into an infrastructure failure."""
     result.output = ""
     del result.trajectory[:]
-    result.errors = [f"{INFRA_FAILURE_MARKER}: {detail}"]
+    result.errors = [f"{INFRA_FAILURE_MARKER}: {detail}", *result.errors]
+    result.metadata.pop("final_message", None)
     result.metadata["infra_failure"] = detail
 
 # The session lookup only refines accounting, so it never inherits the agent's
@@ -2724,9 +2727,9 @@ class KubeAgentsHarness(AgentHarness):
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
         board_messages = [
-            str(c.get("summary") or "") for c in read.cards.values() if c.get("summary")
-        ] + [
-            str(c.get("result") or "") for c in read.cards.values() if c.get("result")
+            str(c.get("summary") or "")
+            for c in read.cards.values()
+            if c.get("status") in _FAILURE_STATUSES and c.get("summary")
         ]
         self._settle(
             result,
@@ -2734,6 +2737,7 @@ class KubeAgentsHarness(AgentHarness):
             awaited,
             stalled=outstanding if timed_out else [],
             board_messages=board_messages,
+            opening_turn=True,
         )
         if not shown and len(result.trajectory) > before:
             withheld = result.trajectory[before:]
@@ -2810,7 +2814,25 @@ class KubeAgentsHarness(AgentHarness):
         # results. Kept beside the graded trajectory rather than in it.
         observed: list[dict[str, Any]] = list(result.trajectory)
         if not outstanding:
-            self._settle(result, observed, awaited)
+            failure_cards = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
+            board_messages: list[str] = []
+            if failure_cards:
+                final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
+                if final_bstate is not None:
+                    bstatuses, bsummaries, berrors = final_bstate
+                    for t in failure_cards:
+                        if bstatuses.get(t) in _FAILURE_STATUSES:
+                            if t in bsummaries:
+                                board_messages.append(bsummaries[t])
+                            if t in berrors:
+                                board_messages.append(berrors[t])
+            self._settle(
+                result,
+                observed,
+                awaited,
+                board_messages=board_messages,
+                opening_turn=opening_turn,
+            )
             return ""
 
         deadline = time.monotonic() + delegation_timeout
@@ -2819,7 +2841,6 @@ class KubeAgentsHarness(AgentHarness):
         transport_failures = 0
         had_answered_failure = False
         timed_out = True
-        board_messages: list[str] = []
         # The freshest status seen for each card, from whichever source read
         # it last -- the board or a status turn -- for the deadline report.
         # ``statuses`` stays the agent's own readings, which are what settle a
@@ -2855,8 +2876,6 @@ class KubeAgentsHarness(AgentHarness):
             bstate = board.read_board_state(_agent_shell, outstanding, _EXEC_TIMEOUT)
             if bstate is not None:
                 on_board, bsummaries, berrors = bstate
-                board_messages.extend(bsummaries.values())
-                board_messages.extend(berrors.values())
                 latest.update(on_board)
                 if all(t in on_board for t in outstanding) and not any(
                     on_board[t] in _TERMINAL_STATUSES for t in outstanding
@@ -2982,6 +3001,18 @@ class KubeAgentsHarness(AgentHarness):
         # the run stopped.
         if outstanding and timed_out:
             _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
+        failure_cards = [t for t in awaited if latest.get(t) in _FAILURE_STATUSES]
+        board_messages: list[str] = []
+        if failure_cards:
+            final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
+            if final_bstate is not None:
+                bstatuses, bsummaries, berrors = final_bstate
+                for t in failure_cards:
+                    if bstatuses.get(t) in _FAILURE_STATUSES:
+                        if t in bsummaries:
+                            board_messages.append(bsummaries[t])
+                        if t in berrors:
+                            board_messages.append(berrors[t])
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.
@@ -2991,6 +3022,7 @@ class KubeAgentsHarness(AgentHarness):
             awaited,
             stalled=outstanding if timed_out else [],
             board_messages=board_messages,
+            opening_turn=opening_turn,
         )
         return session_id
 
@@ -3002,6 +3034,7 @@ class KubeAgentsHarness(AgentHarness):
         *,
         stalled: Sequence[str] = (),
         board_messages: Sequence[str] = (),
+        opening_turn: bool = True,
     ) -> None:
         """Collect everything the delegated cards produced, then clear them out.
 
@@ -3055,10 +3088,13 @@ class KubeAgentsHarness(AgentHarness):
         infra_detail: str = ""
         for tid, wlog in (logs or {}).items():
             if wlog and wlog.body:
-                reason = _extract_infra_failure_reason(wlog.body)
-                if reason:
-                    infra_reason = reason
-                    infra_detail = f"worker transcript for {tid} logged {reason}"
+                for line in wlog.body.splitlines():
+                    reason = _extract_infra_failure_reason(line)
+                    if reason:
+                        infra_reason = reason
+                        infra_detail = f"worker transcript for {tid} logged {reason}"
+                        break
+                if infra_reason:
                     break
 
         if not infra_reason and board_messages:
@@ -3072,10 +3108,15 @@ class KubeAgentsHarness(AgentHarness):
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
         if infra_reason:
-            _mark_result_infra_failure(
-                result,
-                f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
-            )
+            if opening_turn:
+                _mark_result_infra_failure(
+                    result,
+                    f"delegated worker hit infrastructure failure ({infra_reason}): {infra_detail}",
+                )
+            else:
+                result.errors.append(
+                    f"delegated worker failed ({infra_reason}): {infra_detail}"
+                )
 
     @staticmethod
     def _capped(task_ids: list[str], result: AgentResult | None) -> list[str]:
