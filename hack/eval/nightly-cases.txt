@@ -15,8 +15,9 @@
 # ci-kube-agents-eval-nightly with EVAL_NIGHTLY_PART=main, and
 # ci-kube-agents-eval-nightly-writers with EVAL_NIGHTLY_PART=writers, the
 # cases that request a pull request, on a second project (the variable's
-# comment in the script says why). The budget below prices the whole matrix
-# on one job, as it ran before that split.
+# comment in the script says why). EVAL_NIGHTLY_PART=main-a and main-b halve
+# the main part again, for two jobs on two projects (#3384). The budget below
+# prices the whole matrix on one job, as it ran before that split.
 #
 # WHO APPROVES. The normal approvers (root OWNERS). Only the presubmit files
 # beside this one carry the eval-crew rule (#1546, decided 2026-09-15).
@@ -1190,7 +1191,25 @@
 # grades on the api lanes; fixture no-pdb-workload on seeded-a.
 ./tasks/fanout-absent-cluster-cards-complete/task.yaml
 
+# The front door's reply to a blocked card declares the one next step on a
+# last line of its own, `[next: <label>]`, which Slack draws as a button
+# (agents/chat/SOUL.md §2, step 5). deployer: noop; the blocked card is
+# planted per run (bench/kube_agents_bench/card_wake.py), so one front-door
+# turn and no worker: filing or unblocking a card fails its catastrophic fence.
+./tasks/chat-failure-reply-declares-next-step/task.yaml
+
+# A card's answer with one obvious next step declares it on a last line of
+# its own, `[next: <label>]`, which Slack draws as a button (the report-format
+# stanza in deploy/docker/patches/kanban_report_format.py). Read-only against
+# the crashloop-workload fixture; one card, nothing changed.
+./tasks/chat-answer-declares-next-step/task.yaml
+
+# Mock 03's shape: an answer whose offer is about a workload the user did
+# not ask about declares no next step (the report-format stanza). Read-only
+# against the no-pdb-workload and crashloop-workload fixtures; one card.
+./tasks/chat-answer-tangent-offer-declares-no-step/task.yaml
+
 # #3371: a zonal seeded cluster asked about by its region must be found, not
 # declared absent. deployer: noop, read-only, one fixture role; three units at
-# the 200s default, main nightly part.
+# the 200s default, main nightly part (its half goes by name, #3432).
 ./tasks/fleet-zonal-cluster-named-by-region/task.yaml
