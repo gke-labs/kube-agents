@@ -969,7 +969,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		cardStop := g.cardStopWanted(rec, msg)
 		switch {
 		case cardStop && rec.CardStop != nil:
+			// The control in flight is the stop on the bus: the inject
+			// door's cancel reports it, rather than a cancel never sent.
 			markCardStopAgain(rec, authority)
+			g.observeCancelPublished(rec.Key, rec.CardStop.TaskID)
 			g.post(rec.Key, cardStopAlreadyNotice)
 		case active != nil && cardStop:
 			g.stopCards(ctx, rec, authority, backend, false)

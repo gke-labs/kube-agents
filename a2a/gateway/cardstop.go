@@ -68,6 +68,16 @@ const (
 	// a newer turn running: the follow-up would stop that turn's cards too,
 	// which nobody asked for, so it is not sent.
 	cardStopSkippedNotice = "⚠️ cards filed since the last stop weren't stopped, because a newer question is running; say stop again to stop them"
+	// cardStopOffNotice is the same skip when the card stop was turned off
+	// while the control ran (a restart with A2A_CARD_STOP off).
+	cardStopOffNotice = "⚠️ cards filed since the last stop weren't stopped, because stopping cards from chat has been turned off"
+	// cardStopMovedNotice is the same skip when the conversation moved to a
+	// session worker while the control ran, where stop doesn't reach cards.
+	cardStopMovedNotice = "⚠️ cards filed since the last stop weren't stopped, because this conversation now goes to a session worker"
+	// cardStopNoCardNotice is a stop's answer when it found no open card
+	// but a newer question is running, which "nothing is running" would
+	// deny (cardStopReply).
+	cardStopNoCardNotice = "🤷 no card was open in this conversation"
 	// cardStopDoorNotice is the A2A door's stand-in for the placeholder
 	// (cardStopPlaceholderOn).
 	cardStopDoorNotice = "🛑 sent a stop to this conversation's cards; this door doesn't report how it went"
@@ -319,7 +329,7 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 		}
 		if ok {
 			outcome, stopped = cardStopOutcomeAnswered, len(result.Stopped)
-			answer = cardStopReply(result)
+			answer = cardStopReply(result, rec.ActiveTask != nil && !rec.ActiveTask.Detached)
 			// A follow-up that found nothing more says nothing: the first
 			// control already answered the stop.
 			post = !run.Quiet || cardStopNews(result)
@@ -354,13 +364,25 @@ func (g *Gateway) endCardStop(ctx context.Context, rec *SessionRecord) {
 
 // followUpCardStop runs the one follow-up a stop asked for while a control
 // was in flight. That stop already cancelled whatever turn it found, so there
-// is nothing to cancel here. A turn that is running now started after it,
-// and a control would wait for it and archive its cards too, which nobody
-// asked for, so then the follow-up is not sent and the room is told.
+// is nothing to cancel here. It is not sent, and the room is told why, when
+// the card stop has been turned off since (a restart with A2A_CARD_STOP
+// off), when the conversation has moved off the route a control is answered
+// on (/session, or a delegate's re-home), or when a turn is running: that
+// turn started after the stop, and a control would wait for it and archive
+// its cards too, which nobody asked for.
 func (g *Gateway) followUpCardStop(ctx context.Context, rec *SessionRecord, authority Authority) {
-	if active := rec.ActiveTask; (active != nil && !active.Detached) || !g.cfg.CardStop || !g.cardStopRoute(rec) {
-		g.log.Info("card stop follow-up not sent", "conversation", rec.Key, "newerTurn", active != nil)
-		g.post(rec.Key, cardStopSkippedNotice)
+	var why, notice string
+	switch active := rec.ActiveTask; {
+	case !g.cfg.CardStop:
+		why, notice = "card stop off", cardStopOffNotice
+	case !g.cardStopRoute(rec):
+		why, notice = "route moved", cardStopMovedNotice
+	case active != nil && !active.Detached:
+		why, notice = "newer turn", cardStopSkippedNotice
+	}
+	if notice != "" {
+		g.log.Info("card stop follow-up not sent", "conversation", rec.Key, "why", why)
+		g.post(rec.Key, notice)
 		return
 	}
 	g.stopCards(ctx, rec, authority, "", true)
@@ -488,8 +510,9 @@ func (g *Gateway) abandonCardStop(ctx context.Context, rec *SessionRecord, autho
 // gateway's. It names at most cardStopNamed titles per list, each cleaned of
 // anything that could ping or lay out (cardStopTitle), and says plainly what
 // the stop could not promise. A stop that found nothing open says nothing is
-// running, which is now true: the executor looked.
-func cardStopReply(r *lib.CardStopResult) string {
+// running, which is now true: the executor looked. It looked at cards only,
+// so with a newer turn running (turnRunning) it says no card was open.
+func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	var clauses []string
 	if n := r.Unresolved; n > 0 && len(r.Stopped) > 0 {
 		clauses = append(clauses, fmt.Sprintf("a worker may still start for %d of them, claimed just before the stop", n))
@@ -525,6 +548,8 @@ func cardStopReply(r *lib.CardStopResult) string {
 		head = "🛑 stopped " + count + ": " + cardTitles(r.Stopped, r.ListsCut)
 	case r.Failed > 0 || r.Pending > 0 || r.Deadline || r.Truncated || r.Unresolved > 0:
 		head = "⚠️ no card was stopped"
+	case turnRunning:
+		head = cardStopNoCardNotice
 	default:
 		head = nothingRunningNotice
 	}
@@ -559,9 +584,11 @@ func cardTitles(cards []lib.CardStopCard, cut bool) string {
 // full-width ＠, so no bare @here, @channel or @everyone pings. Markdown
 // that could make a masked link or bleed formatting into the rest of the
 // reply is neutralised the same way: [ and ] become ( and ), a backtick an
-// apostrophe, ~ a hyphen, and * and _ a space, so [x](https://…) is no link
-// and an unclosed ` or * opens nothing. It is at most cardStopTitleRunes
-// runes, a cut one ending in "…".
+// apostrophe, ~ a hyphen, | a broken bar, and * and _ a space, so
+// [x](https://…) is no link and an unclosed ` or * opens nothing. Every .
+// becomes the one-dot leader ․ and every : the look-alike ꞉, so a bare URL or
+// domain (https://evil.example, evil.example) reads the same but no surface
+// links it. It is at most cardStopTitleRunes runes, a cut one ending in "…".
 func cardStopTitle(s string) string {
 	var b strings.Builder
 	space := false
@@ -584,6 +611,12 @@ func cardStopTitle(s string) string {
 			r = '\''
 		case r == '~':
 			r = '-'
+		case r == '|':
+			r = '¦'
+		case r == '.':
+			r = '․'
+		case r == ':':
+			r = '꞉'
 		case r == '*' || r == '_':
 			space = b.Len() > 0
 			continue

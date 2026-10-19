@@ -170,23 +170,29 @@ by construction. Three interceptors run on each turn, ahead of the routing above
     "cancel already sent".
 
   One control at a time. A `stop` while one runs gets "🛑 already stopping this
-  conversation's cards…", or "cancel sent" when it cancelled a turn, and marks the control:
+  conversation's cards — the answer comes when the executor confirms", or "cancel sent" when it cancelled a turn, and marks the control:
   that stop's turn, or one started since the control went out, may have filed cards the
   control has already passed by. When the marked control ends, however it ends, one
   follow-up control goes out. It posts no placeholder and says nothing unless it stopped a
   card or could not finish. One mark is held however many stops arrive. If a question asked
   after the stop is running by then, the follow-up would wait for it and archive its cards
   too, so it is not sent, and the room gets "⚠️ cards filed since the last stop weren't
-  stopped, because a newer question is running; say stop again to stop them". The control
+  stopped, because a newer question is running; say stop again to stop them". It is not sent
+  either when the card stop was turned off meanwhile (a restart with `A2A_CARD_STOP` off:
+  "… because stopping cards from chat has been turned off") or the conversation moved to a
+  session worker (`/session`, or a `delegate` re-home: "… because this conversation now goes
+  to a session worker"). The control
   posts "🛑 stopping this conversation's cards…" and
   edits it into the answer: "🛑 stopped N cards: <title>, …" naming at most five, then
   "and K more", and clauses for what the stop could not promise (cards already finished,
   ones that could not be stopped, ones still being stopped, a worker that may still start,
   more cards than one stop takes, a stop that ran out of time). Titles are model text, so
   each is cut to one line of at most 80 runes, with angle brackets and `@` replaced by
-  look-alikes so a title can't mention anyone, and `[`, `]`, backticks, `~`, `*` and `_`
-  neutralised so it can't make a link or bleed formatting. A stop that found nothing open answers "🤷
-  nothing is running", which is then true. A control that is rejected (an older bridge
+  look-alikes so a title can't mention anyone, `[`, `]`, backticks, `~`, `|`, `*` and `_`
+  neutralised so it can't make a masked link or bleed formatting, and every `.` and `:`
+  replaced by look-alikes (`․`, `꞉`) so a bare URL or domain is not linked either. A stop that
+  found nothing open answers "🤷 nothing is running", which is then true, or "🤷 no card was
+  open in this conversation" when a question asked after the stop is already running. A control that is rejected (an older bridge
   answers `no-text-parts`), fails, is canceled, completes with no `cardStop` part, or has
   no terminal inside `A2A_CARD_STOP_TIMEOUT` (75s, above the bridge's worst case of about
   60s) gets "⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working", never a success. On an armed install the card notice ("stopping a card

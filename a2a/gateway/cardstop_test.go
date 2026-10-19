@@ -62,8 +62,15 @@ func messagesOn(t *testing.T, r *rig, addressee string) int {
 // text part and, unless res is nil, the cardStop result part; then the state.
 func answerControl(t *testing.T, r *rig, control *lib.Envelope, res *lib.CardStopResult) {
 	t.Helper()
+	answerControlOn(t, r.execFor(t, control, "platform"), res)
+}
+
+// answerControlOn is answerControl for any rig: it completes the control's
+// execution with a result artifact carrying res, or no cardStop part when
+// res is nil.
+func answerControlOn(t *testing.T, exec *lib.TaskExecution, res *lib.CardStopResult) {
+	t.Helper()
 	ctx := context.Background()
-	exec := r.execFor(t, control, "platform")
 	parts := []lib.Part{{Kind: "text", Text: "stopped some cards"}}
 	if res != nil {
 		part, err := lib.CardStopPart(lib.CardStop{CardStopResult: res})
@@ -437,7 +444,7 @@ func TestCardStopReplyWording(t *testing.T) {
 			"🛑 stopped at least 6 cards: a, b, c, d, e and at least 1 more"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := cardStopReply(&tc.r); got != tc.want {
+			if got := cardStopReply(&tc.r, false); got != tc.want {
 				t.Fatalf("reply\n got %q\nwant %q", got, tc.want)
 			}
 		})
@@ -455,16 +462,22 @@ func TestCardStopTitleIsSanitized(t *testing.T) {
 		"line one\nline two\r\n<#C123|general>",
 		"zero​width‮bidi",
 		"see [x](https://evil.example)",
+		"check https://evil.example/x and evil.example",
+		"||spoiler|| text",
 		"run `rm -rf` *now* _please_ ~~gone~~",
 		"unclosed ` and *",
 	} {
 		got := cardStopTitle(in)
-		if strings.ContainsAny(got, "<>@\n\r​‮[]`*_~") {
+		if strings.ContainsAny(got, "<>@\n\r​‮[]`*_~|.:") {
 			t.Errorf("cardStopTitle(%q) = %q keeps markup or a line break", in, got)
 		}
 	}
-	if got := cardStopTitle("see [x](https://evil.example)"); got != "see (x)(https://evil.example)" {
+	if got := cardStopTitle("see [x](https://evil.example)"); got != "see (x)(https꞉//evil․example)" {
 		t.Errorf("a masked link became %q", got)
+	}
+	// A bare URL or domain: chat surfaces link those on their own.
+	if got := cardStopTitle("check https://evil.example/x"); got != "check https꞉//evil․example/x" {
+		t.Errorf("a bare URL became %q", got)
 	}
 	if got := cardStopTitle("run `ls` *now* node_pools"); got != "run 'ls' now node pools" {
 		t.Errorf("markup became %q", got)
@@ -483,7 +496,7 @@ func TestCardStopTitleIsSanitized(t *testing.T) {
 		t.Errorf("a long title is %d runes (%q), want %d ending in …", n, long, cardStopTitleRunes)
 	}
 	// Through the reply, end to end.
-	reply := cardStopReply(&lib.CardStopResult{Stopped: []lib.CardStopCard{{ID: "t", Title: "ok <!here>\n@channel"}}})
+	reply := cardStopReply(&lib.CardStopResult{Stopped: []lib.CardStopCard{{ID: "t", Title: "ok <!here>\n@channel"}}}, false)
 	if strings.ContainsAny(reply, "<>@\n") {
 		t.Errorf("reply %q carries a title's markup", reply)
 	}
@@ -612,10 +625,51 @@ func TestCardStopFollowUpSkippedForANewerTurn(t *testing.T) {
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "an-ask", Text: "now check prod"}
 	awaitSubmission(t, r, "platform", 2)
 	answerControl(t, r, first, &lib.CardStopResult{})
+	// The control found no card, but a question is running: not "nothing
+	// is running".
+	waitFor(t, "the first answer", shown(r, cardStopNoCardNotice))
+	if shown(r, nothingRunningNotice)() {
+		t.Fatalf("posted %q above a running question", nothingRunningNotice)
+	}
 	waitFor(t, "the skipped line", shown(r, cardStopSkippedNotice))
 	time.Sleep(300 * time.Millisecond)
 	if n := messagesOn(t, r, "platform"); n != 3 {
 		t.Fatalf("%d messages on platform, want 3: a follow-up went out behind a newer turn", n)
+	}
+}
+
+// A marked control that ends after the conversation moved to a session
+// worker sends no follow-up, and says that, not that a question is running.
+func TestCardStopFollowUpSkippedWhenTheRouteMoved(t *testing.T) {
+	r, _ := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.CardStop = true })
+	conv := "discord:g1/thread-cardstop-again-moved"
+	ranATurn(t, r, conv)
+	sayStop(r, conv, "am-stop-1")
+	first := awaitSubmission(t, r, "platform", 1)
+	sayStop(r, conv, "am-stop-2")
+	waitForRecord(t, r, conv, "the mark", func(rec *SessionRecord) bool { return rec.CardStop != nil && rec.CardStop.Again != nil })
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "am-session", Text: "/session"}
+	waitForRecord(t, r, conv, "the session route", func(rec *SessionRecord) bool { return rec.SessionRouted })
+	answerControl(t, r, first, &lib.CardStopResult{})
+	waitFor(t, "the moved line", shown(r, cardStopMovedNotice))
+	if shown(r, cardStopSkippedNotice)() {
+		t.Fatalf("blamed a newer question with none running: %q", r.adapter.postTexts())
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := messagesOn(t, r, "platform"); n != 2 {
+		t.Fatalf("%d messages on platform, want 2: a follow-up went out off the route", n)
+	}
+}
+
+// A mark that outlived a restart with the card stop turned off sends no
+// follow-up, and says the stop was turned off.
+func TestCardStopFollowUpSkippedWhenTheStopIsOff(t *testing.T) {
+	r := startRigWith(t, func(c *Config) { c.CardStop = false })
+	rec := &SessionRecord{Key: "discord:g1/thread-cardstop-again-off", Addressee: "platform", ContextID: "ctx-off"}
+	r.g.followUpCardStop(context.Background(), rec, Authority{})
+	waitFor(t, "the off line", shown(r, cardStopOffNotice))
+	if shown(r, cardStopSkippedNotice)() || rec.CardStop != nil {
+		t.Fatalf("posts %q, control %+v: want the off line and no control", r.adapter.postTexts(), rec.CardStop)
 	}
 }
 
@@ -775,30 +829,19 @@ func TestCardStopInjectCancelReportsTheStop(t *testing.T) {
 		}
 		return false
 	})
-	answerControl2(t, r.execFor(t, control, "platform"), &lib.CardStopResult{Stopped: []lib.CardStopCard{{ID: "t_1", Title: "pods"}}})
+	// A second cancel while the control is in flight reaches the mark, and
+	// still reports the stop as on the bus, not as a cancel never sent.
+	again := r.cancel(t, reply.Conversation, injectTestAuthor)
+	if !again.CancelPublished || again.Refusal != "" || strings.Contains(again.Note, "still doing") {
+		t.Fatalf("second cancel reply %+v, want the stop in flight reported as published", again)
+	}
+	answerControlOn(t, r.execFor(t, control, "platform"), &lib.CardStopResult{Stopped: []lib.CardStopCard{{ID: "t_1", Title: "pods"}}})
 	// The transcript reads placeholder, then the answer as its edit.
 	waitFor(t, "the answer in the transcript", func() bool {
 		entries, _, _ := r.adapter.snapshot(reply.Conversation, 0, "")
 		return slices.Contains(entryTexts(entries, InjectEntryPost), cardStopPlaceholder) &&
 			slices.Contains(entryTexts(entries, InjectEntryEdit), "🛑 stopped 1 card: pods")
 	})
-}
-
-// answerControl2 is answerControl for a rig other than the chat rig.
-func answerControl2(t *testing.T, exec *lib.TaskExecution, res *lib.CardStopResult) {
-	t.Helper()
-	ctx := context.Background()
-	part, err := lib.CardStopPart(lib.CardStop{CardStopResult: res})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "result", Name: lib.ArtifactResult,
-		Parts: []lib.Part{{Kind: "text", Text: "stopped"}, part}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
-		t.Fatal(err)
-	}
 }
 
 // gke-labs#3263 review L3: on the A2A door a `stop` that names no task sends

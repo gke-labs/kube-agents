@@ -410,7 +410,7 @@ type Config struct {
 	// executor stopped (cardstop.go). Off, a stop cancels the active task
 	// only and says a card keeps working, as before. A rollout switch: the
 	// control needs a hermes-bridge and an agent image that answer it, and an
-	// older bridge rejects it, which reads as the old reply.
+	// older bridge rejects it, which answers cardStopUnconfirmedNotice.
 	CardStop bool
 
 	// CardStopTimeout bounds the wait for a card-stop control's terminal
