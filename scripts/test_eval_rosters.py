@@ -179,6 +179,7 @@ ADDED_AFTER_THE_MOVE = [
     "scale-request-proposes-pr",  # the mirrored gke-* skills' pull request path, #2937
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
+    "gitops-drift-backlog-digest",  # late drift records digested, not carded, #3387
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
     "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
     "upgrades-readiness-zonal-control-plane",  # catalogue entry 11 through the readiness report's per-entry rules

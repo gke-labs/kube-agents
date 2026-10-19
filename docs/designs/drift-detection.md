@@ -127,6 +127,12 @@ flowchart TB
 
 > **Legend:** teal (thick border) = the only new pieces drift adds, a source and its adapter. Everything else already ships today.
 
+One exception to "one inject, one session": a record that reached the detector late (it queued while
+no detector was pulling, or waited over 30 minutes) is backlog. It goes to `POST /v1/drift-backlog`
+with no session, and the daemon posts one digest per burst instead of a card each. An install's own
+Helm apply runs under the installer's account and arrives as exactly such a burst. The detector's
+README, "The backlog", has the rule and its cost.
+
 ## Choosing CUJs: the test
 
 Take _"detect an admin patched a LoadBalancer to a public IP and auto-revert it."_ **Not enough:** ArgoCD self-heal reverts it, Gatekeeper/Kyverno _block it at admission_, and it's a crisp rule with an obvious fix (zero judgment); auto-reverting also fights our PR-behind-approval posture.

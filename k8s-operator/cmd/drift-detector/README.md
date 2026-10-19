@@ -51,7 +51,8 @@ chat line names no severity — but billed to a daily ceiling
 of its own rather than to the event watcher's, because one `kubectl apply` over a directory is one
 human action and several audit entries: sharing the bucket let routine use of this signal cap-drop
 the watcher's for the rest of the day. The two ceilings therefore add up, which is the cost of the
-split; what it does not fix is the fan-out itself, since the detector coalesces nothing. A record
+split; what it does not fix is the fan-out itself, since the detector coalesces nothing live. Records
+that arrive late are the exception: they are digested instead ([The backlog](#the-backlog)). A record
 the ceiling refuses is lost rather than deferred: the daemon answers
 `suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
 ledger row the daemon writes is the only place that change survives. `GET /v1/alert-quota` is where
@@ -659,6 +660,31 @@ answer cannot change under a running process, and a refusal rather than a fall b
 because an operator who set `--daemon-url` asked for escalation and the two modes are
 indistinguishable in every later line. The error names dropping the flag as the way to get the
 degraded mode deliberately.
+
+## The backlog
+
+A record that reached the detector late is backlog. The subscriber marks it (`subscriber.backlog`)
+when its message's `publishTime` is earlier than this process's first successful pull, or when it
+waited in the subscription longer than `backlogMaxWait` (30 minutes). The first rule catches
+everything that queued while no detector was pulling: an install, an uninstall, a pod roll. The
+second catches a process that started and then could not pull.
+
+Against a daemon whose `/healthz` lists the `drift-backlog` feature, a backlog record skips the
+live-object join and is posted to `POST /v1/drift-backlog` with no session. The daemon records it,
+spends no alert quota, starts no triage turn, and posts one digest per burst that counts the records
+by principal. The `DRIFT` line carries `backlog=true` and the publish time, and the shutdown tally
+counts `skipped_backlog=` (join) and `backlog=` (inject). Against an older daemon, the startup line
+says so and every record is sent as a card, as before.
+
+An install's own Helm apply is the burst this exists for. It runs under the installer's account,
+so the classifier sees a person, and before this route each object it wrote became a triage card
+and spent the day's drift budget.
+
+The cost: after every detector restart, records published before the new process's first pull are
+backlog. That includes records nacked at shutdown and changes made within the sink's export lag
+before the restart. They are recorded and named in the digest under their principal, but they get
+no triage card of their own. A Helm upgrade the old detector is still running for is not covered:
+its writes reach a running process and are triaged as live changes.
 
 ## Three things to know before changing it
 

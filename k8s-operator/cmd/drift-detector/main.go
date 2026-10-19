@@ -536,6 +536,7 @@ func realMain(argv []string) error {
 
 	injectHandler := newDriftInjectHandler(inject)
 	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected)
+	join.skipBacklog = injectHandler.backlogRoute
 
 	// Said at startup, because the difference between the two modes is invisible
 	// in every later line: a run with the inject off emits exactly the DRIFT
@@ -546,6 +547,13 @@ func realMain(argv []string) error {
 		log.Printf("%s: no --daemon-url; %s injects are disabled and drift will be logged only, not escalated to anyone", commandName, injectKindDrift)
 	} else {
 		log.Printf("%s: %s injects enabled, posting to %s (owner=%q, token from $%s)", commandName, injectKindDrift, f.daemonURL, f.owner, f.tokenEnv)
+		// Said either way, because the two modes differ only for records that
+		// arrive late, and an install that has just come up is all late records.
+		if injectHandler.backlogRoute {
+			log.Printf("%s: backlog records (published before this process's first pull, or waiting over %s) go to %s for one digest, not a card each", commandName, backlogMaxWait, driftBacklogPath)
+		} else {
+			log.Printf("%s: the daemon does not advertise %q; backlog records will be injected as a card each, as live ones are", commandName, featureDriftBacklog)
+		}
 	}
 
 	// Say which mode the join is in at startup rather than leaving it to be

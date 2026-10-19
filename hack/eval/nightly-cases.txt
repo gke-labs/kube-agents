@@ -1055,6 +1055,14 @@
 # cases, so a busy board pushes this case's card wait toward its 1800s
 # ceiling. The dated paragraph above carries the budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
+# gitops-drift-backlog-digest (#3387): records that queue while the drift
+# detector is not pulling are digested, not triaged one card each. The
+# fixture stops the detector process, publishes, and kills it, so the
+# relaunched process marks them; a live record after that still gets its card.
+# Graded on the fixture's read of the ledger and the board. Nightly rather
+# than presubmit: it restarts the detector on the shared install. Priced at
+# the drift band (900s) until the nightly record measures it.
+./tasks/gitops-drift-backlog-digest/task.yaml
 
 # Asked for options to choose from, the card pauses on the question:
 # kanban_block(kind="needs_input") with a reason ending on two to five

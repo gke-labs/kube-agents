@@ -115,6 +115,14 @@ What the drift branch does differently:
   `Warning` label reaches no reader: it is the `severity` column of the ledger row and a field of
   the suppressed response, and the chat line names no severity at all.
 - **Its `suppressed` is terminal,** for the reason the bullet above gives.
+- **Late records skip it.** A record the detector marks as backlog (it queued while no detector was
+  pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
+  route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
+  starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
+  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). The
+  post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
+  route as `features: ["drift-backlog"]` on `/healthz`; the detector's README has the rule that
+  marks a record late and what it costs.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of
   the fields describing it are chosen by that person: `fieldManager` is a free query parameter and
   `callerSuppliedUserAgent` is whatever the client declared. Both are rendered inside a block the
@@ -379,7 +387,9 @@ CREATE TABLE intercepted_events(
   notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back; 1 when posted to chat; 2 when dispatched on a headless install with no chat platform enabled
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
-  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform
+  principal   TEXT NOT NULL DEFAULT ''     -- written on drift backlog rows only, for the digest's count
 );
 ```
 

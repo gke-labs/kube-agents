@@ -94,6 +94,11 @@ const (
 	// as such from that line alone, or every unreachable DRIFT line in a run
 	// reads as a card that was sent.
 	injectHeldOutOfScopeMarker = "inject=held_out_of_scope"
+
+	// backlogMarker is appended to the DRIFT line of a backlog record, for the
+	// same reason as injectHeldOutOfScopeMarker: the line an operator greps
+	// for has to say that this record is not getting a card of its own.
+	backlogMarker = "backlog=true"
 )
 
 // joinOutcome says what happened when the detector tried to enrich a record
@@ -145,6 +150,14 @@ const (
 	// joinFailed is any other lookup error: RBAC, a network fault, a timeout,
 	// an API group the cluster does not serve.
 	joinFailed joinOutcome = "failed"
+
+	// joinSkippedBacklog is a backlog record (AuditRecord.Backlog) the join
+	// did not look up, because it goes to the daemon's digest rather than to
+	// a triage card and nothing reads its ownership. Skipped so a large
+	// backlog does not spend the batch's join budget on lookups and leave its
+	// tail to fail open. Only when the daemon takes the digest route: against
+	// one that does not, the record is injected as a card and keeps its join.
+	joinSkippedBacklog joinOutcome = "skipped_backlog"
 )
 
 // joinCounts tallies outcomes for the shutdown report, so a run that enriched
@@ -162,14 +175,17 @@ type joinCounts struct {
 	// held every unreachable record and one that forwarded them all print the
 	// same Unreachable.
 	OutOfScope int
+
+	// SkippedBacklog is records not looked up because they are backlog.
+	SkippedBacklog int
 }
 
 // String renders the tally for the shutdown line, always printing every
 // outcome. A zero that is absent reads as a category that did not apply; a zero
 // that is printed reads as one that did not happen, and those differ.
 func (c joinCounts) String() string {
-	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d",
-		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed)
+	return fmt.Sprintf("enriched=%d no_object=%d gone=%d unreachable=%d out_of_scope=%d failed=%d skipped_backlog=%d",
+		c.Enriched, c.NoObject, c.Gone, c.Unreachable, c.OutOfScope, c.Failed, c.SkippedBacklog)
 }
 
 // DriftEvent is an audit record plus what the live object says about it. It is
@@ -375,6 +391,11 @@ type joiner struct {
 	// counted under unreachableOverflowLabel.
 	unreachable map[string]int
 	held        map[string]int
+
+	// skipBacklog turns on joinSkippedBacklog. Set by realMain when the daemon
+	// advertises the digest route, because that is when a backlog record is
+	// not going to a card.
+	skipBacklog bool
 }
 
 // newJoiner builds the handler. An empty or nil cluster set is legal and
@@ -444,6 +465,8 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 		}
 	case joinFailed:
 		j.counts.Failed++
+	case joinSkippedBacklog:
+		j.counts.SkippedBacklog++
 	}
 
 	j.next(ctx, event)
@@ -559,6 +582,13 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 	getter, ok := j.clusters[identity]
 	if !ok || !identity.complete() {
 		event.Outcome = joinUnreachable
+		return event
+	}
+
+	// After the routing check, so a backlog record from a cluster this process
+	// cannot read is still unreachable, and still held when it is out of scope.
+	if j.skipBacklog && record.Backlog {
+		event.Outcome = joinSkippedBacklog
 		return event
 	}
 
@@ -808,6 +838,9 @@ func logDriftEvent(_ context.Context, event DriftEvent) {
 	// which is the fact an operator reading only DRIFT lines needs.
 	if event.OutOfScope {
 		line += " " + injectHeldOutOfScopeMarker
+	}
+	if record.Backlog {
+		line += fmt.Sprintf(" %s publish_time=%s", backlogMarker, record.PublishTime.Format(time.RFC3339))
 	}
 
 	log.Print(line)

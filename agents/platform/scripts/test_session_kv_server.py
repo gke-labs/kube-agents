@@ -1108,6 +1108,9 @@ class TestSessionKvServerAuth(unittest.TestCase):
     PROTECTED_ROUTES = (
         ("POST", "/sessions", None),
         ("POST", "/sessions/sess-1/inject", {"message": "{}"}),
+        # A kind the route refuses after the key check, so the authorised half
+        # of the test writes no backlog row and starts no digest worker.
+        ("POST", "/v1/drift-backlog", {"kind": "not-drift"}),
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
@@ -6263,6 +6266,255 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
                     "/custom/home/kanban.db",
                 )
 
+
+
+class TestDriftBacklog(unittest.TestCase):
+    """`POST /v1/drift-backlog` and the digest that follows it."""
+
+    PAYLOAD = dict(TestDriftInject.DRIFT_PAYLOAD, backlog=True, publish_time="2026-09-20T11:04:09Z")
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        self.arm_patch = patch.object(session_kv_server, "_arm_drift_backlog_digest")
+        self.armed = self.arm_patch.start()
+        self.addCleanup(self.arm_patch.stop)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+                conn.execute("DELETE FROM drift_backlog_lease")
+                conn.execute("DELETE FROM intercepted_events WHERE backlog != 0")
+
+    def tearDown(self):
+        import sqlite3
+
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        # Pending rows left behind would start a real worker the next time a
+        # test reloads the module, which arms the digest at import.
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM intercepted_events WHERE backlog != 0")
+                conn.execute("DELETE FROM drift_backlog_lease")
+
+    def _post(self, **overrides):
+        return self.client.post("/v1/drift-backlog", json=dict(self.PAYLOAD, **overrides))
+
+    def _rows(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute("SELECT * FROM intercepted_events WHERE backlog != 0 ORDER BY id")]
+
+    def test_healthz_advertises_the_backlog_route(self):
+        body = self.client.get("/healthz").json()
+        self.assertIn(session_kv_server.DRIFT_BACKLOG_FEATURE, body["features"])
+
+    def test_a_backlog_record_is_recorded_with_no_session_quota_or_turn(self):
+        with patch.object(session_kv_server, "trigger_agent_troubleshooter") as trigger:
+            response = self._post()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "backlog"})
+        trigger.assert_not_called()
+        self.armed.assert_called_once()
+        [row] = self._rows()
+        self.assertEqual(row["backlog"], session_kv_server.DRIFT_BACKLOG_PENDING)
+        self.assertEqual(row["notified"], 0)
+        self.assertEqual(row["session_id"], "")
+        self.assertEqual(row["reason"], session_kv_server.DRIFT_LEDGER_REASON)
+        self.assertEqual(row["principal"], "alice@example.com")
+        self.assertEqual(row["object_uid"], "1a2b3c4d5e")
+        self.assertEqual((row["namespace"], row["object_kind"], row["workload"]), ("prod", "deployments", "checkout"))
+        drift = self.client.get("/v1/alert-quota").json()["severities"][session_kv_server.DRIFT_QUOTA_KEY]
+        self.assertEqual((drift["sent"], drift["suppressed"]), (0, 0))
+
+    def test_the_same_insert_id_is_recorded_once(self):
+        self._post()
+        self._post()
+        self.assertEqual(len(self._rows()), 1)
+
+    def test_a_record_with_no_insert_id_is_still_recorded(self):
+        self._post(insert_id="")
+        self._post(insert_id="")
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_a_record_that_is_not_drift_is_refused(self):
+        self.assertEqual(self._post(kind="k8s-event").status_code, 400)
+        self.assertEqual(self._rows(), [])
+
+    def test_the_feed_reports_a_backlog_row_as_backlog(self):
+        self._post()
+        events = self.client.get("/v1/intercepted-events").json()["events"]
+        mine = [e for e in events if e["name"] == "checkout" and e["status"] == session_kv_server.FEED_STATUS_BACKLOG]
+        self.assertEqual(len(mine), 1)
+
+    def test_the_wait_ends_at_the_quiet_period_or_the_max_wait(self):
+        wait = session_kv_server._drift_backlog_wait_seconds
+        quiet = session_kv_server.DRIFT_BACKLOG_QUIET_SECONDS
+        max_wait = session_kv_server.DRIFT_BACKLOG_MAX_WAIT_SECONDS
+        self.assertAlmostEqual(wait(10, 10, 0), quiet - 10)
+        self.assertEqual(wait(quiet + 1, quiet + 1, 0), 0)
+        # A steady trickle never goes quiet; the max wait still ends it.
+        self.assertEqual(wait(max_wait, 1, 0), 0)
+        # A failed post pushes the wait back.
+        self.assertEqual(wait(max_wait, quiet, 120), 120)
+
+    def _chat(self, platforms=("slack",), disabled=False):
+        enabled = patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms))
+        off = patch.object(session_kv_server, "_chat_platforms_disabled", return_value=disabled)
+        enabled.start()
+        off.start()
+        self.addCleanup(enabled.stop)
+        self.addCleanup(off.stop)
+
+    def test_one_digest_names_the_count_and_the_principals(self):
+        self._chat()
+        for i in range(7):
+            self._post(insert_id=f"id-{i}", principal="installer@example.com")
+        self._post(insert_id="id-x", principal="ada@example.com")
+        with patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        run.assert_called_once()
+        message = run.call_args.args[0][-1]
+        self.assertIn("8 changes", message)
+        self.assertIn("installer@example.com (7), ada@example.com (1)", message)
+        self.assertIn("and 3 more", message)
+        self.assertIsNotNone(run.call_args.kwargs["timeout"])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+
+    def test_a_headless_install_marks_the_rows_and_posts_nothing(self):
+        self._chat(platforms=(session_kv_server.DEFAULT_CHAT_PLATFORM,), disabled=True)
+        self._post()
+        with patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        run.assert_not_called()
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_HEADLESS])
+
+    def test_a_failed_post_leaves_the_rows_pending_and_releases_the_lease(self):
+        import sqlite3
+
+        self._chat()
+        self._post()
+        failure = subprocess_error(1)
+        with patch.object(session_kv_server.subprocess, "run", side_effect=failure):
+            self.assertFalse(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
+        with sqlite3.connect(temp_db_path) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM drift_backlog_lease").fetchone()[0], 0)
+
+    def test_a_failed_platform_falls_through_to_the_next(self):
+        self._chat(platforms=("google_chat", "slack"))
+        self._post()
+        with patch.object(session_kv_server.subprocess, "run", side_effect=[subprocess_error(1), None]) as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+
+    def test_an_unknown_outcome_or_a_timeout_counts_as_sent(self):
+        import subprocess as sp
+
+        for side_effect in (subprocess_error(chat_notify.NOTIFY_OUTCOME_UNKNOWN), sp.TimeoutExpired(["a2a"], 1)):
+            self._chat()
+            self._post(insert_id=f"id-{type(side_effect).__name__}-{getattr(side_effect, 'returncode', 0)}")
+            with patch.object(session_kv_server.subprocess, "run", side_effect=side_effect) as run:
+                self.assertTrue(session_kv_server._post_drift_backlog_digest())
+            run.assert_called_once()
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+
+    def test_a_live_lease_held_by_another_worker_posts_nothing(self):
+        import sqlite3
+
+        self._chat()
+        self._post()
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO drift_backlog_lease (name, holder, expires_at) VALUES (?, 'other', ?)",
+                    (session_kv_server.DRIFT_BACKLOG_LEASE_NAME, time.time() + 600),
+                )
+        with patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertFalse(session_kv_server._post_drift_backlog_digest())
+        run.assert_not_called()
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
+        with sqlite3.connect(temp_db_path) as conn:
+            self.assertEqual(conn.execute("SELECT holder FROM drift_backlog_lease").fetchone()[0], "other")
+
+    def test_an_expired_lease_is_taken_over(self):
+        import sqlite3
+
+        self._chat()
+        self._post()
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO drift_backlog_lease (name, holder, expires_at) VALUES (?, 'crashed', ?)",
+                    (session_kv_server.DRIFT_BACKLOG_LEASE_NAME, time.time() - 1),
+                )
+        with patch.object(session_kv_server.subprocess, "run"):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+
+    def test_a_row_that_arrives_during_the_send_waits_for_the_next_digest(self):
+        self._chat()
+        self._post(insert_id="first")
+
+        def arrive(*_args, **_kwargs):
+            self._post(insert_id="during")
+
+        with patch.object(session_kv_server.subprocess, "run", side_effect=arrive):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        by_id = {r["object_uid"]: r["backlog"] for r in self._rows()}
+        self.assertEqual(by_id, {"first": session_kv_server.DRIFT_BACKLOG_DIGESTED, "during": session_kv_server.DRIFT_BACKLOG_PENDING})
+
+    def test_the_worker_posts_once_the_burst_is_quiet_and_then_stops(self):
+        self.arm_patch.stop()
+        started = []
+        real_thread = session_kv_server.threading.Thread
+
+        def record(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            started.append(thread)
+            return thread
+
+        self._chat(platforms=(session_kv_server.DEFAULT_CHAT_PLATFORM,), disabled=True)
+        deadline = time.monotonic() + 5
+        with patch.object(session_kv_server, "DRIFT_BACKLOG_QUIET_SECONDS", 0), patch.object(
+            session_kv_server.threading, "Thread", side_effect=record
+        ):
+            self._post()
+            while time.monotonic() < deadline:
+                with session_kv_server._drift_backlog_lock:
+                    if session_kv_server._drift_backlog_thread is None:
+                        break
+                time.sleep(0.01)
+        self.assertEqual(len(started), 1, "the first backlog row did not start one worker")
+        self.assertIsNone(session_kv_server._drift_backlog_thread, "the worker did not stop after the digest")
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_HEADLESS])
+
+    def test_the_end_of_day_report_does_not_count_a_backlog_row(self):
+        import eod_report_generator
+
+        self.assertEqual(eod_report_generator.DRIFT_LEDGER_REASON, session_kv_server.DRIFT_LEDGER_REASON)
+
+    def test_cleanup_says_when_it_removes_an_undigested_row(self):
+        import sqlite3
+
+        self._post()
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("UPDATE intercepted_events SET created_at = datetime('now', '-30 days') WHERE backlog != 0")
+            with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+                session_kv_server.cleanup_old_records(conn)
+        self.assertTrue(any("never digested" in line for line in logs.output))
+
+
+def subprocess_error(returncode):
+    import subprocess as sp
+
+    return sp.CalledProcessError(returncode, ["send"], output="", stderr="no")
 
 
 if __name__ == "__main__":
