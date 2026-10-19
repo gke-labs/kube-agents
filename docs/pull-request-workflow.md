@@ -821,3 +821,5 @@ gh pr view <number> --repo gke-labs/kube-agents \
   --jq '{draft: .isDraft, mergeable, decision: .reviewDecision,
          requested: [.reviewRequests[].login]}'
 ```
+
+<!-- merge-queue dry run (#1363): T1, a docs-only change. -->
