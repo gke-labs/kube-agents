@@ -760,6 +760,13 @@ DRIFT_BACKLOG_LEASE_NAME = "digest"
 DRIFT_BACKLOG_MAX_PRINCIPALS = 8
 DRIFT_BACKLOG_MAX_OBJECTS = 5
 DRIFT_BACKLOG_EMOJI = "🗂️"
+# How many times the digest tries to mark its rows after a post, and the pause
+# between tries. The mark is idempotent, and a mark that never lands after a
+# delivered post would let the lease lapse under pending rows and post the same
+# digest again.
+DRIFT_BACKLOG_FINISH_ATTEMPTS = 3
+DRIFT_BACKLOG_FINISH_RETRY_SECONDS = 1.0
+SECONDS_PER_DAY = 86400.0
 # The max wait as the digest words it. The detector owns the number
 # (`backlogMaxWait` in subscriber.go); this text has to change with it.
 DRIFT_BACKLOG_MAX_WAIT_TEXT = "30 minutes"
@@ -4230,8 +4237,8 @@ def _drift_backlog_pending_ages() -> Optional[tuple[float, float]]:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
         row = conn.execute(
             "SELECT COUNT(*), "
-            "(julianday('now') - julianday(MIN(created_at))) * 86400.0, "
-            "(julianday('now') - julianday(MAX(created_at))) * 86400.0 "
+            f"(julianday('now') - julianday(MIN(created_at))) * {SECONDS_PER_DAY}, "
+            f"(julianday('now') - julianday(MAX(created_at))) * {SECONDS_PER_DAY} "
             f"FROM intercepted_events WHERE backlog = {DRIFT_BACKLOG_PENDING}"
         ).fetchone()
     if not row or not row[0]:
@@ -4311,8 +4318,8 @@ def _finish_drift_backlog(holder: str, max_id: Optional[int], outcome: Optional[
         with conn:
             if outcome is not None and max_id is not None:
                 conn.execute(
-                    "UPDATE intercepted_events SET backlog = ? WHERE backlog = ? AND id <= ?",
-                    (outcome, DRIFT_BACKLOG_PENDING, max_id),
+                    f"UPDATE intercepted_events SET backlog = ? WHERE backlog = {DRIFT_BACKLOG_PENDING} AND id <= ?",
+                    (outcome, max_id),
                 )
             conn.execute(
                 "DELETE FROM drift_backlog_lease WHERE name = ? AND holder = ?", (DRIFT_BACKLOG_LEASE_NAME, holder)
@@ -4379,6 +4386,25 @@ def _send_drift_backlog_digest(platform: str, message: str) -> bool:
     return False
 
 
+# A mark that did not land after a delivered post: (holder, max_id, outcome).
+# Only the worker thread reads or writes it. The next digest attempt finishes
+# this one first, so the rows it covers are never claimed and posted again.
+_drift_backlog_unfinished: Optional[tuple[str, int, int]] = None
+
+
+def _finish_drift_backlog_with_retries(holder: str, max_id: Optional[int], outcome: Optional[int]) -> bool:
+    """_finish_drift_backlog, tried DRIFT_BACKLOG_FINISH_ATTEMPTS times. True when it landed."""
+    for attempt in range(DRIFT_BACKLOG_FINISH_ATTEMPTS):
+        if attempt:
+            time.sleep(DRIFT_BACKLOG_FINISH_RETRY_SECONDS)
+        try:
+            _finish_drift_backlog(holder, max_id, outcome)
+            return True
+        except sqlite3.Error as exc:
+            logger.error(f"Drift backlog digest could not mark its rows or release its lease (try {attempt + 1}): {exc}")
+    return False
+
+
 def _post_drift_backlog_digest() -> bool:
     """Claim the pending rows, post one digest for them, and mark them.
 
@@ -4386,6 +4412,12 @@ def _post_drift_backlog_digest() -> bool:
     worker waits DRIFT_BACKLOG_RETRY_SECONDS. A headless install marks the rows
     with no post, as the alert path does for its own rows.
     """
+    global _drift_backlog_unfinished
+    if _drift_backlog_unfinished is not None:
+        if not _finish_drift_backlog_with_retries(*_drift_backlog_unfinished):
+            return False
+        _drift_backlog_unfinished = None
+        return True
     platforms = enabled_chat_platforms()
     headless = platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled()
     lease_seconds = DRIFT_BACKLOG_LEASE_MARGIN_SECONDS + sum(_drift_backlog_send_timeout(p) for p in platforms)
@@ -4419,10 +4451,8 @@ def _post_drift_backlog_digest() -> bool:
         )
         return False
     finally:
-        try:
-            _finish_drift_backlog(holder, max_id, outcome)
-        except sqlite3.Error as exc:
-            logger.error(f"Drift backlog digest could not mark its rows or release its lease: {exc}")
+        if not _finish_drift_backlog_with_retries(holder, max_id, outcome) and outcome is not None and max_id is not None:
+            _drift_backlog_unfinished = (holder, max_id, outcome)
 
 
 def _arm_drift_backlog_digest_if_pending() -> None:

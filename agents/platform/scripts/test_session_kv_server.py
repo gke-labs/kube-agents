@@ -6494,10 +6494,51 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertIsNone(session_kv_server._drift_backlog_thread, "the worker did not stop after the digest")
         self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_HEADLESS])
 
-    def test_the_end_of_day_report_does_not_count_a_backlog_row(self):
+    def test_a_backlog_row_carries_the_reason_the_end_of_day_report_excludes(self):
         import eod_report_generator
 
-        self.assertEqual(eod_report_generator.DRIFT_LEDGER_REASON, session_kv_server.DRIFT_LEDGER_REASON)
+        self._post()
+        [row] = self._rows()
+        self.assertEqual(row["reason"], eod_report_generator.DRIFT_LEDGER_REASON)
+
+    def test_a_mark_that_fails_once_is_retried_and_the_digest_is_posted_once(self):
+        self._chat()
+        self._post()
+        real_finish = session_kv_server._finish_drift_backlog
+        calls = []
+
+        def flaky(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise session_kv_server.sqlite3.OperationalError("database is locked")
+            return real_finish(*args)
+
+        with patch.object(session_kv_server, "_finish_drift_backlog", side_effect=flaky), patch.object(
+            session_kv_server, "DRIFT_BACKLOG_FINISH_RETRY_SECONDS", 0
+        ), patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        run.assert_called_once()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+
+    def test_a_mark_that_never_lands_after_a_post_is_finished_before_the_next_claim(self):
+        self._chat()
+        self._post()
+        self.addCleanup(setattr, session_kv_server, "_drift_backlog_unfinished", None)
+        locked = session_kv_server.sqlite3.OperationalError("database is locked")
+        with patch.object(session_kv_server, "_finish_drift_backlog", side_effect=locked), patch.object(
+            session_kv_server, "DRIFT_BACKLOG_FINISH_RETRY_SECONDS", 0
+        ), patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        run.assert_called_once()
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
+
+        # The database is back. The next attempt marks the posted rows and posts nothing.
+        with patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        run.assert_not_called()
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+        self.assertIsNone(session_kv_server._drift_backlog_unfinished)
 
     def test_cleanup_says_when_it_removes_an_undigested_row(self):
         import sqlite3

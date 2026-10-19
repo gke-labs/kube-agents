@@ -946,7 +946,7 @@ func payloadForEvent(event DriftEvent) DriftInjectPayload {
 		ReconciledBy: event.ReconciledBy,
 	}
 
-	if record.Backlog {
+	if event.Digest {
 		payload.Backlog = true
 		payload.PublishTime = formatAuditTimestamp(record.PublishTime)
 	}

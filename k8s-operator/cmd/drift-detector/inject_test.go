@@ -66,6 +66,7 @@ type fakeDaemon struct {
 	// 200; backlogPayloads holds what arrived there.
 	backlogStatus   int
 	backlogPayloads []DriftInjectPayload
+	backlogAttempts int
 }
 
 // newFakeDaemon starts a server and returns it with its base URL.
@@ -99,6 +100,7 @@ func newFakeDaemon(t *testing.T) (*fakeDaemon, string) {
 		}
 
 		if r.URL.Path == driftBacklogPath {
+			d.backlogAttempts++
 			if d.backlogStatus != 0 && d.backlogStatus != http.StatusOK {
 				w.WriteHeader(d.backlogStatus)
 				_, _ = w.Write([]byte("the daemon said no"))
@@ -1209,6 +1211,11 @@ func TestInjectSendsABacklogRecordAsACardWhenTheDaemonHasNoDigestRoute(t *testin
 	if c := handler.Counts(); c.Injected != 1 || c.Backlog != 0 {
 		t.Errorf("Counts() = %+v, want injected=1 backlog=0", c)
 	}
+	daemon.mu.Lock()
+	defer daemon.mu.Unlock()
+	if len(daemon.payloads) != 1 || daemon.payloads[0].Backlog || daemon.payloads[0].PublishTime != "" {
+		t.Errorf("a carded backlog record's payload says backlog: %+v", daemon.payloads)
+	}
 }
 
 // A live record still gets its card from a handler that has the digest route.
@@ -1266,6 +1273,12 @@ func TestInjectCountsAFailedBacklogPost(t *testing.T) {
 
 	if c := handler.Counts(); c.Failed != 1 || c.Backlog != 0 {
 		t.Errorf("Counts() = %+v, want failed=1 backlog=0", c)
+	}
+	daemon.mu.Lock()
+	attempts := daemon.backlogAttempts
+	daemon.mu.Unlock()
+	if attempts != injectRetries+1 {
+		t.Errorf("backlog post attempts = %d, want %d -- a server error is retried once", attempts, injectRetries+1)
 	}
 	if out := logs.String(); !strings.Contains(out, "BACKLOG POST FAILED for insert_id=insert-1") {
 		t.Errorf("the failure was not logged with its insert_id:\n%s", out)
