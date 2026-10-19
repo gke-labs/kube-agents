@@ -381,8 +381,8 @@ def domain_points(cases: dict[str, dict]) -> list[dict]:
     night with the range of their means (``low``, ``high``, ``cases``).
     A night mixes keys only if its cases do; the page marks the key
     changes, it does not pool across them here because a domain's cases
-    share one nightly job and therefore one key (a night split across two
-    jobs pools both, and lists both keys under ``keys`` if they differ)."""
+    share one nightly job and therefore one key (a night split across jobs
+    pools them, and lists every key under ``keys`` if they differ)."""
     by_night: dict[str, dict] = {}
     for doc in cases.values():
         for point in doc["points"]:

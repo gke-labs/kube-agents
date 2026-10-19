@@ -154,6 +154,8 @@ DOMAIN_UNKNOWN = "unknown"
 # The digest line's glyph and the separator the other digest lines use.
 DIGEST_GLYPH = "🌙"
 SEP = " · "
+# How the digest words a part's wall clock when its run recorded none.
+UNKNOWN_CLOCK = "an unknown wall clock"
 # How many newly failing cases the digest names before counting the rest.
 DIGEST_NAMED_CASES = 3
 # The per-rep timing the collector records from `rep N timing:` (SCHEMA.md:
@@ -380,15 +382,16 @@ def night_date(run: dict) -> datetime.date | None:
 
 def filed_nights(runs: list[dict]) -> list[tuple[dict[str, dict], list[dict]]]:
     """``runs`` (nightly, oldest first) as nights, oldest first, each
-    ``({part: run}, every run filed under the night)``. A main build joins
-    the oldest night of its date (``night_date``) that has no main part yet;
-    failing that, it opens a night of its own, so one job alone is one
-    build per night as before and a same-day re-run of the main job is a
-    night of its own. A build of any other part (writers, main-b) joins,
-    among the nights of its date that have no such part yet, the one whose
-    first part started closest to it (the newer on a tie), so a main re-run
-    started late the evening before does not take the cron night's other
-    parts; a re-run of that part joins one only if ``replaces`` says it
+    ``({part: run}, every run filed under the night)``. Main builds are
+    filed first, each a night of its own dated by ``night_date``, so one
+    job alone is one build per night as before and a same-day re-run of
+    the main job is a night of its own. A build of any other part (writers,
+    main-b) then joins, among the nights of its date that have no such part
+    yet, the one whose first part started closest to it (the newer on a
+    tie), so a main re-run started late the evening before does not take
+    the cron night's other parts, even one that started a moment before
+    the cron main build; a re-run of that part joins one only if
+    ``replaces`` says it
     beats the date's build of that part already filed. Failing that, it
     takes that part of the date's newest night when ``replaces``
     says so: the newest build of a part stands for the night unless it
@@ -397,10 +400,12 @@ def filed_nights(runs: list[dict]) -> list[tuple[dict[str, dict], list[dict]]]:
     night stays filed under it, so a reader keyed by build still finds it
     there. A run with no start time stands alone. A night left without a
     part beside a main re-run borrows one for its report only
-    (``lent_parts``); it is filed here once."""
+    (``lent_parts``); it is filed here once. The nights keep the order of
+    their first run in ``runs``."""
     nights: list[tuple[dict[str, dict], list[dict]]] = []
     by_date: dict[datetime.date, list[tuple[dict[str, dict], list[dict]]]] = {}
-    for run in runs:
+    order = {id(run): index for index, run in enumerate(runs)}
+    for run in sorted(runs, key=lambda r: night_part(r) != PART_MAIN):
         part, day = night_part(run), night_date(run)
         dated = by_date.get(day, []) if day else []
         open_nights = [n for n in dated if part not in n[0]]
@@ -416,7 +421,7 @@ def filed_nights(runs: list[dict]) -> list[tuple[dict[str, dict], list[dict]]]:
             started = parse_iso(run.get("started"))
             filed = min(reversed(open_nights), key=lambda n: abs(parse_iso(night_parts(n[0])[0].get("started")) - started))
         else:
-            filed = open_nights[0] if open_nights else None
+            filed = None
         if filed is None and part != PART_MAIN and dated:
             filed = dated[-1]
             if not replaces(run, filed[0][part]):
@@ -429,6 +434,7 @@ def filed_nights(runs: list[dict]) -> list[tuple[dict[str, dict], list[dict]]]:
                 by_date.setdefault(day, []).append(filed)
         filed[0][part] = run
         filed[1].append(run)
+    nights.sort(key=lambda n: min(order[id(run)] for run in n[1]))
     return nights
 
 
@@ -819,16 +825,23 @@ def name_cases(names: list[str]) -> str:
     return f"{', '.join(names[:DIGEST_NAMED_CASES])} and {len(names) - DIGEST_NAMED_CASES} more"
 
 
+def cut_notes(night: dict, parts: tuple[str, ...] = PARTS) -> list[str]:
+    """The note "<part> truncated after <its wall clock>" for each of the
+    night's ``parts`` that was cut short."""
+    notes = []
+    for part in night.get("parts") or []:
+        if part.get("truncated") and part.get("part") in parts:
+            took = duration_text(part["duration_s"]) if part.get("duration_s") is not None else UNKNOWN_CLOCK
+            notes.append(f"{PART_WORDS.get(part.get('part'), part.get('part'))} truncated after {took}")
+    return notes
+
+
 def part_notes(night: dict, cut: bool = True) -> list[str]:
     """What the digest says about a split night's parts: each part cut
     short (when ``cut``) with its own wall clock, each part missing, each
     part still running. Nothing for a night of one part that expects no
     other."""
-    notes = []
-    for part in (night.get("parts") or []) if cut else []:
-        if part.get("truncated"):
-            took = duration_text(part["duration_s"]) if part.get("duration_s") is not None else "an unknown wall clock"
-            notes.append(f"{PART_WORDS.get(part.get('part'), part.get('part'))} truncated after {took}")
+    notes = cut_notes(night) if cut else []
     notes += [f"{PART_WORDS.get(p, p)} missing" for p in night.get("missing_parts") or []]
     notes += [f"{PART_WORDS.get(p, p)} still running" for p in night.get("running_parts") or []]
     return notes
@@ -890,10 +903,7 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
             took = duration_text(main["duration_s"]) if main.get("duration_s") is not None else "unknown wall clock"
         head = f"truncated after {took}"
         if any(p.get("part") == PART_MAIN_B for p in on_record):
-            head = SEP.join(
-                f"{PART_WORDS[p['part']]} truncated after {duration_text(p['duration_s']) if p.get('duration_s') is not None else 'an unknown wall clock'}"
-                for p in on_record if p.get("part") in MAIN_PARTS and p.get("truncated")
-            )
+            head = SEP.join(cut_notes(night, MAIN_PARTS))
         notes = "".join(f"{SEP}{note}" for note in part_notes(night, cut=False))
         return f"{DIGEST_GLYPH} Nightly: {head}{SEP}{recorded}{notes}{SEP}the night's numbers are not comparable"
     parts = [f"{counts['recorded']} cases", f"{counts['passed']} passed all reps", f"{counts['partial']} partial", f"{counts['failed']} failed"]

@@ -117,10 +117,8 @@ const PAGE = {
   nightStateWords: { pass: "passed all reps", partial: "failed some reps", fail: "failed all reps", infra: "quota / infra, not graded" },
   nightsListed: 14,
   // A night split across jobs names its parts as the digest does
-  // (nightly.py's PART_WORDS), and is cut short by either main half
-  // (nightly.py's MAIN_PARTS).
+  // (nightly.py's PART_WORDS).
   nightPartWords: { main: "main part", "main-b": "main-b part", writers: "writers part" },
-  nightMainParts: ["main", "main-b"],
   // The chat-turn target the opening turn's p95 is shown beside, as advice
   // only (nightly.py's TURN1_P95_TARGET_S).
   turn1P95TargetS: 10,
@@ -1606,14 +1604,14 @@ function partNotes(night, cut = true) {
 // the other parts' cases on record: no verdict on what is newly failing,
 // as the digest gives none (nightly.py's digest_line).
 const nightLacksMain = (night) => nightParts(night).length > 0 && !nightParts(night).some((p) => p.part === "main");
-// A truncated night was cut short by its main or main-b part when it has
-// one: the first such part cut short gives the wall clock, not the longest
-// part (nightly.py's digest_line).
+// A truncated night was cut short by its main part when it has one: that
+// part's wall clock, not the longest part's (nightly.py's digest_line).
 const nightCutSeconds = (night) => {
-  const cut = nightParts(night).find((p) => PAGE.nightMainParts.includes(p.part) && p.truncated) || nightParts(night).find((p) => p.part === "main");
-  return cut ? cut.duration_s : night.duration_s;
+  const main = nightParts(night).find((p) => p.part === "main");
+  return main ? main.duration_s : night.duration_s;
 };
-// A night with a main-b part names each part cut short, as the digest does.
+// A night with a main-b part names each part cut short with its own wall
+// clock, as the digest does, rather than one wall clock for the night.
 const nightHasMainB = (night) => nightParts(night).some((p) => p.part === "main-b");
 const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
 // The night's headline state, worst first: cut short, failed cases, partial
@@ -1775,7 +1773,7 @@ function nightlyHtml(link) {
   const notes = partNotes(night, !night.truncated || nightHasMainB(night));
   const notesText = notes.length ? `${esc(notes.join(" · "))}. ` : "";
   let ledeHow;
-  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
+  if (night.truncated) ledeHow = `<b>The night was cut short:</b> ${notesText}Prow ended the job${nightHasMainB(night) ? "" : ` after ${esc(nightCutSeconds(night) != null ? minutesText(nightCutSeconds(night) * 1000) : "unknown wall clock")}`} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
   else if (!night.complete && notes.length) ledeHow = `<b>Incomplete:</b> ${notesText}${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects are recorded.`;
   else if (!night.complete) ledeHow = `<b>Incomplete:</b> the job concluded after ${esc(took)} but recorded ${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects.`;
   else ledeHow = `The job ran to the end in ${esc(took)}: ${c.recorded} cases recorded${c.expected ? ` of ${c.expected} expected` : ""}.`;

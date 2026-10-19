@@ -793,6 +793,26 @@ class ThreePartNightTest(unittest.TestCase):
         self.assertEqual([[p["part"] for p in n["parts"]] for n in nights], [["main", "main-b", "writers"], ["main"]])
         self.assertEqual((nights[0]["build"], nights[0]["started"]), (NIGHT_2, "2026-09-07T23:59:59+00:00"))
 
+    def test_a_part_that_starts_before_the_cron_main_build_joins_the_cron_night(self):
+        """A main re-run at 23:50 UTC is dated to the next night by the
+        grace. A main-b or writers build that starts a moment before the
+        cron main build still joins the cron night, not the re-run's, and
+        the re-run only borrows it."""
+        data = three_part_nights()
+        rerun = "3000000000000000009"
+        data["runs"].append(night(rerun, "2026-09-07T23:50:00+00:00", "2026-09-08T06:30:00+00:00",
+                                  [task(name, "pass", "pass", "pass") for name in ("case-a", "case-b", "case-c")], result="SUCCESS"))
+        run_of(data, MAIN_B_2)["started"] = "2026-09-07T23:59:58+00:00"
+        run_of(data, WRITERS_2)["started"] = "2026-09-07T23:59:59+00:00"
+        run_of(data, NIGHT_2)["started"] = "2026-09-08T00:00:01+00:00"
+        builds = nightly.night_builds(data)
+        self.assertEqual((builds[MAIN_B_2], builds[WRITERS_2]), (NIGHT_2, NIGHT_2))
+        cron, early = nightly.night_reports(data)[:2]
+        self.assertEqual([(p["part"], p["build"], p["from_night"]) for p in cron["parts"]],
+                         [("main", NIGHT_2, None), ("main-b", MAIN_B_2, None), ("writers", WRITERS_2, None)])
+        self.assertEqual([(p["part"], p["from_night"]) for p in early["parts"]], [("main", None), ("main-b", NIGHT_2), ("writers", NIGHT_2)])
+        self.assertEqual(early["build"], rerun, "the nights keep the order their first build started in")
+
     def test_a_missing_main_b_part_is_named_once_main_b_parts_appear(self):
         data = three_part_nights()
         data["runs"].append(night("3000000000000000003", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00",
@@ -1179,7 +1199,7 @@ class ThreePartNightPageTest(unittest.TestCase):
         app = dom_text(out / "nightly.html")
         self.assertIn(f"<code>{JOB}</code> and <code>{MAIN_B_JOB}</code> and <code>{WRITERS_JOB}</code>", app)
         self.assertIn(f'<a href="{MAIN_B_URL}">main-b part</a>', app)
-        self.assertIn("<b>The night was cut short:</b> main-b part cut short after 2h 30m. Prow ended the job after 2h 30m with 6 of 7 cases recorded", app)
+        self.assertIn("<b>The night was cut short:</b> main-b part cut short after 2h 30m. Prow ended the job with 6 of 7 cases recorded", app)
         self.assertIn("<h1>Last night's run</h1>", dom_text(out / "nightly.html", fragment=f"#build={MAIN_B_2}"))
 
 if __name__ == "__main__":

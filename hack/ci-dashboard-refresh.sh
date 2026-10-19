@@ -54,8 +54,8 @@
 #                              the EVAL_DASHBOARD_FROM_DIR path, which is
 #                              offline by definition.
 #   EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX  the same for the nightly's writers
-#                              periodic, the second job of a night split
-#                              across two (default below: the writers job's;
+#                              periodic, a job of a night split across
+#                              jobs (default below: the writers job's;
 #                              until it has run there the prefix holds no
 #                              objects, which collect.py notes and carries
 #                              on). Its runs count as the writers part only

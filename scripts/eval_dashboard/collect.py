@@ -105,7 +105,7 @@ Sources:
   --nightly-job  the job name recorded on nightly runs (`runs[].job`);
               defaults to the prefix's last path segment.
   --nightly-writers-prefix  the same, for the nightly's writers periodic
-              (a night split across two jobs; nightly.py joins the two
+              (a night split across jobs; nightly.py joins the
               builds into one night). Given without a value it is
               DEFAULT_NIGHTLY_WRITERS_PREFIX; omitted, no writers scan. It
               is read the three ways above against a watermark of its own,
@@ -226,7 +226,7 @@ SCHEMA_VERSION = 1
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
 NIGHTLY_LOGS_ROOT = "gs://kube-agents-evals-nightly-logs/logs"
 DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
-# The nightly's second periodic when a night is split across two pool
+# The nightly's writers periodic when a night is split across pool
 # projects (#2467): the cases that request a pull request, on a project of
 # their own, logging to the same bucket. Its runs are tier `nightly` too,
 # told apart by their job (nightly.py, NIGHTLY_WRITERS_JOB), and it keeps a
@@ -2495,8 +2495,8 @@ def main(argv: list[str] | None = None) -> int:
         const=DEFAULT_NIGHTLY_WRITERS_PREFIX,
         default=None,
         metavar="GS_PREFIX",
-        help="also collect the nightly's writers periodic (the second job of a"
-        " night split across two) from this Prow log prefix. Given without a"
+        help="also collect the nightly's writers periodic (a job of a night"
+        " split across jobs) from this Prow log prefix. Given without a"
         f" value: {DEFAULT_NIGHTLY_WRITERS_PREFIX}. Omitted: no writers scan."
         " Its runs are tier=nightly with the prefix's last segment as job, on"
         " a watermark of their own",
