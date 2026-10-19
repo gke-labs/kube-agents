@@ -2916,7 +2916,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
   --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
-# State-class topics (provisioned registry): upgrade-readiness, blueprint, probe.
+# State-class topics (provisioned registry): upgrade-readiness, topology-skew, blueprint, probe.
 #
 # The probe subject is the one here with NO writer, deliberately, and it is the
 # single exception to the rule that a topic's subject list and its writer's
@@ -2932,7 +2932,7 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
 # hold" is the assumption the web user already broke once. A writerless
 # subject makes the failure mode land nowhere.
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
-  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
+  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
 

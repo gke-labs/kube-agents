@@ -1,5 +1,5 @@
 {
-  "version": "b51c89426fc12c1f",
+  "version": "6846c9d4e45421be",
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
@@ -8,6 +8,7 @@
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.INFO",
@@ -52,6 +53,7 @@
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.STREAM.INFO.TOPICS-STATE",

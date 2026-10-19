@@ -328,9 +328,9 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"TASKS", "a2a.tasks.>", "--max-age=72h", "21474836480",
 		// DIRECTORY: last-value, 1GiB
 		"DIRECTORY", "a2a.agents.>", "--max-msgs-per-subject=1",
-		// TOPICS-STATE: 8-deep, no age, the two state topics
+		// TOPICS-STATE: 8-deep, no age, the state topics
 		"TOPICS-STATE", "--max-msgs-per-subject=8",
-		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.shared.blueprint",
+		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint",
 		// TOPICS-JOURNAL: 30d, 5GiB, the journal topic
 		"TOPICS-JOURNAL", "--max-age=720h", "5368709120", "a2a.topics.shared.annotations",
 		// max_bytes discipline
@@ -4451,6 +4451,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	want := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
@@ -4675,6 +4676,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.tasks.session-abc123.t1.events",
 		"a2a.tasks.session-abc123.t1.in",
 		"a2a.tasks."+a2aBridgeAddressee+".t1.in",
@@ -4736,6 +4738,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 
 	wantPublish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}

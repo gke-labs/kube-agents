@@ -543,6 +543,7 @@ func provisionIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentit
 		// is a provisioner that can destroy the audit substrate.
 		publish: []string{
 			"a2a.topics.agent.platform.upgrade-readiness",
+			"a2a.topics.agent.platform.topology-skew",
 			"a2a.topics.shared.blueprint",
 			"a2a.topics.shared.annotations",
 			"$JS.API.INFO",
@@ -709,6 +710,7 @@ const a2aVerifierUser = "verifier"
 func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 	publish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
@@ -727,7 +729,7 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 		account:        a2aAccountApp,
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(ns, agentServiceAccountName(agent)),
-		comment: "the platform agent container. Reads the whole blackboard and writes three\n" +
+		comment: "the platform agent container. Reads the whole blackboard and writes four\n" +
 			"topics on it. Beyond that, exactly two things: STREAM.INFO and DIRECT.GET on\n" +
 			"the two TOPICS streams, which carry the blackboard and nothing else, and its\n" +
 			"own reply inbox. No task plane either way, and no JetStream consumer verb\n" +
@@ -890,6 +892,7 @@ func seedIdentity() a2aIdentity {
 	// TestSeedHoldsNoWholesaleJetStreamAPI pins the rendered result.
 	publish := []string{
 		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.agent.platform.topology-skew",
 		"a2a.topics.shared.blueprint",
 		"a2a.topics.shared.annotations",
 	}
