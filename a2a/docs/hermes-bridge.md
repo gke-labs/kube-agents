@@ -574,6 +574,71 @@ failures name themselves in the status message:
 | `hermes-api-oversize`    | a 2xx body over the 8 MiB read cap (`apiResponseCap` in `api.go`); refused rather than truncated, with the limit named            | persona            |
 | `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice                                                 | graded (unlisted)  |
 | `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise                                                  | graded (unlisted)  |
+| `card-stop-unavailable`  | a card-stop control got no usable answer from session-kv ("Stopping a conversation's cards" below)                                | not an eval task   |
+| `card-stop-unsupported`  | a card-stop control reached the `cli` executor, which has no conversation session                                                 | not an eval task   |
+
+## Stopping a conversation's cards
+
+`stop` in a chat conversation cancels the front door's turn, and by then that turn has usually
+answered. What still runs is the kanban cards it filed, which the gateway can neither see nor
+reach (#3263). So the gateway can send the bridge a control task: a new submission whose
+message is one data part, `{"cardStop":{"v":1}}`, and no text (`lib.CardStopPart`,
+`lib.CardStopRequested`). The gateway is the only publisher on `a2a.tasks.*.*.in`, and it builds
+its other payloads from text alone, so no one can type a control. The same part on a follow-up
+is not a control: it has no text, so it is refused `no-text`.
+
+The bridge runs a control on a goroutine of its own, not on a worker, so it never waits behind
+long turns. It is still a task: the capability check, then `submitted`, `working` and one
+terminal. No Hermes turn runs. Instead the bridge:
+
+1. publishes `working`, then waits up to 20 s for the conversation's session turn
+   (`apiSessionID` of the `contextId`, so `a2a-<contextId>` or the hashed `a2a-h-…`). That is
+   the one exception to the rule that an `api` task waiting for its session stays `submitted`:
+   the stop has started, and the person who typed it sees it acknowledged while the turn they
+   stopped winds down. The wait lets the bridge's own request for the turn the gateway just
+   cancelled end first, and holds off the next bridge turn in the session while the cards are
+   archived. It does not prove the Hermes run behind that request has stopped: the session turn
+   is released when the bridge's request ends, and whether Hermes abandons the run then is not
+   guaranteed. A card such a run files a little later is caught by session-kv's re-scan only if
+   it lands within that window; one filed after the call has answered is not. Only bridge turns: a
+   wake turn Hermes starts on its own does not take the bridge's turn. Another conversation's
+   stop doesn't wait. The wait is not first come, first served: a message sent right after
+   `stop` can take the session first, and a turn that keeps it past 20 s ends the control
+   `card-stop-unavailable`.
+2. sends `POST /v1/sessions/{id}/cards/stop` to session-kv, on the same `BRIDGE_ROUTE_URL` and
+   `SESSION_KV_API_KEY` bearer as the route PUT, with `{"context_id", "conversation"}`. The
+   conversation is the gateway's key from `authority.audience.conversation` on a Google Chat or
+   Slack conversation, and `""` otherwise. session-kv archives the cards in the agent container
+   (`agents/platform/scripts/session_kv_server.py`), because only there can Hermes kill a card's
+   worker; this sidecar shares the hostname but not the pid namespace.
+3. ends the task `completed`. The `result` artifact holds a short text and the cardStop result
+   part:
+   `{"cardStop":{"v":1,"stopped":[{"id","title","priorStatus"}],"settled":[{"id","title"}],"failed":N,"pending":N,"unresolved":N,"truncated":bool,"deadline":bool,"listsCut":bool}}`.
+   The text counts what session-kv answered, and says plainly what the stop could not promise:
+   `unresolved` cards were stopped just after a worker was claimed for them, so a worker may
+   still start; `pending` archives were still running when session-kv ran out of time;
+   `failed` cards could not be archived; `truncated` means the conversation had more open
+   cards than one stop takes. Each list is cut at 200 cards, which sets `listsCut` (the cards
+   themselves are as the counts say), and each title at 200 runes, its "…" included. If the bus
+   refuses the result with the part, it goes out as the text alone, so the gateway must expect
+   a completed control with no cardStop part.
+
+The time budget, from the control's submission to its terminal, is about 60 s at worst: the
+capability check's 5 s, the 20 s turn wait, and the POST, bounded by
+`BRIDGE_CARD_STOP_TIMEOUT_SECONDS` (default 35). session-kv answers inside its own worst case,
+`CARD_STOP_WORST_CASE_S` (24 s), and the gateway waits 75 s for the control. Raise them
+together.
+
+A stop that gets no usable answer ends `failed` with `reason: card-stop-unavailable - <detail>`.
+That covers no `BRIDGE_ROUTE_URL` or key, a session turn that did not end inside the wait, a
+non-200 answer, a timeout, an answer over 1 MiB and an unreadable one. The `cli` executor runs no
+conversation session and ends a control `card-stop-unsupported`. A cancel that reaches a control
+still at its capability check ends it `canceled-before-start`. One during the turn wait or the
+POST ends it `canceled-by-request`. After the POST went out that ends only the bridge's wait:
+session-kv's route is a synchronous handler and carries on, so the cards may be archived
+all the same. A follow-up to a control is refused `task-ending`. A bridge older than the
+control rejects it `no-text-parts`. The gateway reads each of these as "the cards could not be
+stopped".
 
 ## Sizing against the eval harness
 
