@@ -59,8 +59,9 @@
 # WHERE A NEW CASE GOES. In the sorted section at the foot of this file, at
 # its place in case-id order, with its reason as the `#` lines directly above
 # its entry. scripts/test_eval_rosters.py holds that section sorted and every
-# entry in it to a reason. The entries above that section are frozen in the
-# order they landed.
+# entry in it to a reason. A line that comes back from the presubmit (a
+# demotion, a withdrawn seat) goes there too. The entries above that section
+# are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:

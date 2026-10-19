@@ -227,8 +227,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--summary", action="store_true",
                         help="print each roster's case count and the matrix sizes")
-    parser.add_argument("--repetitions", type=int, default=3,
-                        help="repetitions a unit count assumes (EVAL_REPETITIONS, default 3)")
+    def positive(value: str) -> int:
+        if not value.isdigit() or int(value) < 1:
+            raise argparse.ArgumentTypeError(f"must be a positive integer, got {value!r}")
+        return int(value)
+
+    parser.add_argument("--repetitions", type=positive, default=3,
+                        help="repetitions a unit count assumes (EVAL_REPETITIONS, default 3). The matrix "
+                             "is the default lane's whole nightly, before inject-lane exclusions or "
+                             "EVAL_NIGHTLY_PART")
     args = parser.parse_args(argv)
     if not args.summary:
         parser.print_help()

@@ -2559,7 +2559,7 @@ fi
 # The matrix's size, computed (#3495). The roster files don't carry totals any
 # more, so this line is where a run's count is read; for the files themselves,
 # `python3 scripts/eval_rosters.py --summary`.
-echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(( ${#TASKS[@]} * EVAL_REPETITIONS )) unit(s)"
+echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(( ${#TASKS[@]} * 10#${EVAL_REPETITIONS} )) unit(s)"
 
 # How far a judged mean may fall below main's before rung 6 fires. 0.5 is
 # arithmetic on the measured spread, not a preference: three repetitions of one
@@ -2638,9 +2638,9 @@ esac
 # eval-crew alias (#1546).
 #
 # Demoting a flaky case is a same-day edit: delete its name from that file
-# and its line from presubmit-cases.txt, add the line to nightly-cases.txt
-# with the issue that names its re-admission condition as the # line above
-# it, and cite what the record says about it.
+# and its line from presubmit-cases.txt, add the line to nightly-cases.txt's
+# sorted section (#3495) with the issue that names its re-admission
+# condition as the # line above it, and cite what the record says about it.
 #
 # A name that is not a presubmit case stops the job here: a misspelled entry
 # would otherwise arm nothing and look like a working roster, and a nightly
@@ -2830,8 +2830,9 @@ unit_cost_hint() {
     # then waits out the human record's card, then an agent turn that is a
     # board read. Priced at the band rather than at the 566-677s its
     # dev-install repetitions measured, because those met a quiet board and the
-    # nightly's is shared. hack/eval/nightly-cases.txt's 2026-10-13 paragraph
-    # carries the measurements and the budget arithmetic.
+    # nightly's is shared. The 2026-10-13 paragraph of
+    # hack/eval/nightly-budget-history.txt carries the measurements and the
+    # budget arithmetic.
     gitops-drift-noise-filtered-triage) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the

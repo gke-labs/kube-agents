@@ -526,9 +526,9 @@ nightlies run, not what can red a pull request.
 
 If an admitted case reds a pull request its diff cannot explain on a graded failure,
 demote it: delete its line from `hack/eval/blocking-roster.txt` and from
-`hack/eval/presubmit-cases.txt`, add it to `hack/eval/nightly-cases.txt` with the issue as
-the `#` line above it, and reference that issue. A held-out seat has no roster name: it is
-withdrawn by moving its line back to `hack/eval/nightly-cases.txt` and deleting its
+`hack/eval/presubmit-cases.txt`, add it to the sorted section of `hack/eval/nightly-cases.txt`
+with the issue as the `#` line above it, and reference that issue. A held-out seat has no
+roster name: it is withdrawn by moving its line back to that section and deleting its
 `HELD_OUT_IN_PRESUBMIT` entry. Demotion is a same-day edit to those
 files — the files, not the Prow config, are deliberately the fast lever. It is the lever for rung-4 reds ONLY: a rung-1–3 red (a mutation, an
 erroring verifier, an empty record on a task that provisions nothing — a record whose

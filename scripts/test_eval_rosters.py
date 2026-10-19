@@ -22,7 +22,10 @@ less the cases promoted out of it since, plus the seven, less any held-out
 seat. A later roster change
 edits the expected sets here in the same pull request; that is the point of
 pinning them, since the files are what the eval-crew rule in hack/OWNERS
-guards.
+guards. Since #3495 that pin covers the nightly file's frozen part only: a
+case registered since, or a line that comes back to the nightly (a demotion,
+a withdrawn seat), goes in its sorted section, which NightlySortedSectionTest
+holds by its properties, so a case pull request edits no list here.
 
 scripts/test_ci_eval_nightly.py runs the real shell over the real files and
 asserts it builds the arrays this module reads.
@@ -265,17 +268,25 @@ HELD_OUT_IN_PRESUBMIT = [
 # case": the line leaves blocking-roster.txt and presubmit-cases.txt and lands
 # in the nightly file with its issue above it, as (case, the nightly line it
 # follows). Restoring a case deletes its entry here.
+# The second element is the frozen-part line the demoted case follows, or None
+# when its line went in the nightly file's sorted section (#3495), which is
+# where a demotion lands from now on.
 DEMOTED_AFTER_THE_SPLIT = [
     ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
     ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
+# The presubmit file's cases when the nightly file was frozen (#3495), so the
+# held-out-seat history check knows which seats predate the sorted section.
+FROZEN_AT_3495 = frozenset(PRESUBMIT_AT_SPLIT) | {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
 
 
 def with_insertions(base, insertions):
     """``base`` with each (case, follows) pair inserted after its predecessor."""
     out = list(base)
     for case, follows in insertions:
+        if follows is None:  # its line is in the nightly file's sorted section
+            continue
         out.insert(out.index(follows) + 1, case)
     return out
 
@@ -339,6 +350,8 @@ class NightlySortedSectionTest(unittest.TestCase):
         self.frozen, self.sorted_section, self.tail = eval_rosters.split_nightly(self.text)
 
     def test_the_section_is_in_case_id_order(self):
+        # Python's order, the same as `LC_ALL=C sort`; a UTF-8 locale's sort
+        # ignores the hyphens and can disagree.
         self.assertEqual(self.sorted_section, sorted(self.sorted_section))
 
     def test_no_case_is_listed_twice(self):
@@ -346,15 +359,24 @@ class NightlySortedSectionTest(unittest.TestCase):
         self.assertEqual(len(everything), len(set(everything)))
 
     def test_every_case_in_the_section_has_its_reason_above_it(self):
+        # The marker's own stanza is nobody's reason: drop it before parsing, so
+        # an entry placed directly under it without a blank line has none.
+        lines = self.tail.splitlines()
+        i = 1
+        while i < len(lines) and lines[i].startswith("#"):
+            i += 1
         # The parser keys a reason by its entry, here a ./tasks/<id>/task.yaml path.
         reasons = {
             eval_rosters.CASE_ENTRY_RE.match(entry).group(1): reason
-            for entry, reason in eval_rosters.parse_lane_exclusions(self.tail).items()
+            for entry, reason in eval_rosters.parse_lane_exclusions("\n".join(lines[i:])).items()
             if eval_rosters.CASE_ENTRY_RE.match(entry)
         }
         for case in self.sorted_section:
             with self.subTest(case=case):
-                self.assertTrue(reasons.get(case), "a # line directly above the entry says why it's here")
+                self.assertTrue(
+                    reasons.get(case),
+                    "each case in the sorted section needs its own # lines directly above its entry; "
+                    "a reason shared with the entry above it doesn't count")
 
     def test_the_marker_must_appear_exactly_once(self):
         entry = "./tasks/a-case/task.yaml\n"
@@ -395,12 +417,14 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertIn(case, eval_rosters.presubmit_cases())
                 self.assertNotIn(case, eval_rosters.blocking_roster())
                 self.assertNotIn(case, eval_rosters.nightly_cases())
-                self.assertIn(
-                    case,
+                pinned_nightly = (
                     NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
-                    + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE,
-                    "a held-out seat's nightly line is what moved",
+                    + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
                 )
+                if case in pinned_nightly or case in FROZEN_AT_3495:
+                    self.assertIn(case, pinned_nightly, "a held-out seat's nightly line is what moved")
+                # A case registered after the freeze came from the sorted
+                # section, which pins no history; its seat cites its record.
         for case in HELD_OUT_TO_NIGHTLY:
             if case in seated:
                 continue
@@ -418,7 +442,8 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         # The frozen part only: the sorted section below the marker is held by
         # NightlySortedSectionTest (#3495).
-        frozen, _, _ = eval_rosters.split_nightly(eval_rosters.NIGHTLY_CASES_FILE.read_text(encoding="utf-8"))
+        frozen, sorted_section, _ = eval_rosters.split_nightly(
+            eval_rosters.NIGHTLY_CASES_FILE.read_text(encoding="utf-8"))
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
         seated = {case for case, _ in HELD_OUT_IN_PRESUBMIT}
         expected = [
@@ -426,17 +451,17 @@ class SplitLostNothingTest(unittest.TestCase):
             for c in NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
             if c not in promoted
         ]
-        self.assertEqual(
-            frozen,
-            with_insertions(
-                [
-                    c
-                    for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                    if c not in seated and c not in PARKED_AFTER_THE_MOVE
-                ],
-                DEMOTED_AFTER_THE_SPLIT,
-            ),
+        pinned = with_insertions(
+            [
+                c
+                for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+                if c not in seated and c not in PARKED_AFTER_THE_MOVE
+            ],
+            DEMOTED_AFTER_THE_SPLIT,
         )
+        # A pinned case whose line came back to the sorted section (a withdrawn
+        # seat, a demotion) is held there instead.
+        self.assertEqual(frozen, [c for c in pinned if c not in sorted_section])
 
     def test_a_demoted_case_is_in_the_nightly_only(self):
         for case in DEMOTED:
