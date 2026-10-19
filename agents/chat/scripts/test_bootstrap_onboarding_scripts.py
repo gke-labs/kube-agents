@@ -382,22 +382,138 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertTrue((self.d / INVENTORY).exists())
 
-    def test_a_post_that_failed_in_the_chat_keeps_the_claim(self):
-        # The gateway may have reached Slack before it failed: releasing could post the report twice.
-        self._answer(1, json.dumps({"error": "post failed: channel_not_found"}) + "\n")
-        with mock.patch.object(bootstrap_delivery, "_mark_shown") as mark_shown:
+    def test_a_text_post_that_failed_is_retried(self):
+        # The text path accepts a possible second copy over a lost report.
+        for stdout, stderr in ((json.dumps({"error": "post failed: ratelimited"}) + "\n", ""),
+                               ("", "a2a: notify: flush: nats: connection closed"),
+                               ("", "a2a: notify: nats: authorization violation")):
+            with self.subTest(stderr=stderr or stdout):
+                (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+                self._answer(1, stdout, stderr)
+                with mock.patch.object(bootstrap_delivery, "_mark_shown") as mark_shown:
+                    self._run()
+                mark_shown.assert_not_called()
+                self.assertFalse((self.d / COMPLETED).exists())
+                self.assertTrue((self.d / INVENTORY).exists())
+                self.assertFalse((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
+                self.assertEqual(self._attempts()["attempts"], 1)
+
+    def test_a_text_post_that_may_have_landed_keeps_the_claim(self):
+        for answer in (subprocess.TimeoutExpired(["a2a"], 105), chat_notify.NOTIFY_OUTCOME_UNKNOWN, 2):
+            with self.subTest(answer=answer):
+                (self.d / COMPLETED).unlink(missing_ok=True)
+                if (self.d / DELIVERED).exists():
+                    (self.d / DELIVERED).replace(self.d / INVENTORY)
+                self._answer(answer, "", "no answer")
+                self._run()
+                self.assertTrue((self.d / COMPLETED).exists())
+                self.assertFalse((self.d / INVENTORY).exists())
+                self.assertEqual(self._attempts()["attempts"], 0)
+                self.assertIn("may have landed", self._attempts()["last_reason"])
+                self.assertEqual(
+                    (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+                    bootstrap_delivery.MAYBE_POSTED,
+                )
+
+    def _card(self):
+        import inventory_presenter
+
+        card = ({"schema": "kube-agents.chat/v1", "headline": "2 findings"}, "2 findings")
+        return mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
+            mock.patch.object(inventory_presenter, "chat", return_value=card)
+
+    def test_a_card_that_may_have_landed_is_sent_again_with_its_key(self):
+        flag, chat = self._card()
+        with flag, chat:
+            for answer in (chat_notify.NOTIFY_OUTCOME_UNKNOWN, subprocess.TimeoutExpired(["a2a"], 105),
+                           1):
+                with self.subTest(answer=answer):
+                    self.calls.clear()
+                    (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+                    self._answer(answer, "", "no answer")
+                    self._run()
+                    self.assertFalse((self.d / COMPLETED).exists())
+                    self.assertTrue((self.d / INVENTORY).exists())
+                    self.assertEqual(self._attempts()["attempts"], 1)
+            # The next attempt carries the same key, so a card that landed is edited.
+            record = self._attempts()
+            record["last_at"] -= bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[0] + 1
+            (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+            self.calls.clear()
             self._run()
-        mark_shown.assert_not_called()
+        report = self.calls[0]
+        self.assertEqual(report[report.index("--update") + 1], bootstrap_delivery.CONVERSATION_REPORT_UPDATE)
+        self.assertTrue((self.d / COMPLETED).exists())
+
+    def test_an_edit_that_failed_counts_as_posted(self):
+        # The gateway holds the key, so the card from an earlier attempt is in the chat.
+        flag, chat = self._card()
+        self._answer(1, json.dumps({"error": "edit failed: message_not_found"}) + "\n")
+        with flag, chat:
+            self._run()
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertFalse((self.d / INVENTORY).exists())
-        self.assertEqual(self._attempts()["attempts"], 0)
-        self.assertIn("post failed", self._attempts()["last_reason"])
+        self.assertEqual(
+            (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+            bootstrap_delivery.POSTED,
+        )
 
-    def test_no_answer_in_time_keeps_the_claim(self):
-        self._answer(subprocess.TimeoutExpired(["a2a"], 105))
+    def test_a_posted_report_records_its_outcome(self):
         self._run()
+        self.assertEqual(
+            (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).read_text(encoding="utf-8").strip(),
+            bootstrap_delivery.POSTED,
+        )
+
+    def _claim(self, age):
+        (self.d / COMPLETED).touch()
+        then = time.time() - age
+        os.utime(self.d / COMPLETED, (then, then))
+
+    def test_a_claim_with_no_outcome_is_released_once_stale(self):
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS - 30)
+        self._run()
+        self.assertTrue((self.d / COMPLETED).exists(), "a run may still be posting")
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS + 1)
+        with mock.patch.object(bootstrap_delivery, "_retire_jobs") as retire:
+            self._run()
+        retire.assert_not_called()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 1)
+        self.assertEqual(self.calls, [])
+
+    def test_a_claim_with_an_outcome_retires_on_schedule(self):
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).write_text("posted\n", encoding="utf-8")
+        self._claim(bootstrap_delivery.RETIRE_AFTER_SECONDS + 1)
+        with mock.patch.object(bootstrap_delivery, "_retire_jobs") as retire:
+            self._run()
+        retire.assert_called_once()
         self.assertTrue((self.d / COMPLETED).exists())
-        self.assertIn("may have landed", self._attempts()["last_reason"])
+
+    def test_oobe_waits_for_the_outcome_before_it_retires(self):
+        oobe.write_state(self.d, {oobe.STATE_DONE: True})
+        self._claim(bootstrap_delivery.RETIRE_AFTER_SECONDS + 1)
+        self.assertFalse(oobe.finished(self.d, time.time()))
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).write_text("posted\n", encoding="utf-8")
+        self.assertTrue(oobe.finished(self.d, time.time()))
+
+    def test_retirement_outlasts_the_report_and_the_note(self):
+        self.assertGreater(bootstrap_delivery.RETIRE_AFTER_SECONDS, 2 * bootstrap_delivery.CONVERSATION_POST_MAX_SECONDS)
+        self.assertGreater(bootstrap_delivery.STALE_CLAIM_SECONDS, bootstrap_delivery.CONVERSATION_POST_MAX_SECONDS)
+
+    def test_the_last_failed_attempt_is_logged_for_an_operator(self):
+        record = {"attempts": bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1, "last_reason": "refused", "last_at": 0}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._answer(1, REFUSED)
+        self._run()
+        log = (self.d / oobe.STAGE_LOG).read_text(encoding="utf-8")
+        self.assertIn(f"not posted after {bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS} attempts", log)
+
+    def test_the_gateway_answers_delivery_reads_are_the_gateway_s(self):
+        # The gateway and the agent ship in different images, so these texts cannot change.
+        source = (Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "notify.go").read_text(encoding="utf-8")
+        self.assertIn(f'"{bootstrap_delivery.NOTIFY_EDIT_FAILED_PREFIX} "', source)
+        self.assertIn(f'"{"post failed:"} "', source)
 
     def test_an_absent_route_is_retried_then_released(self):
         delays = bootstrap_delivery.time.sleep
@@ -408,29 +524,6 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertEqual([c.args[0] for c in delays.call_args_list], list(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS))
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertEqual(self._attempts()["attempts"], 1)
-
-    def test_a_bus_refusal_before_the_gateway_posted_nothing(self):
-        self._answer(1, "", "a2a: notify: the bus refused it, so nothing was posted: permissions violation")
-        self._run()
-        self.assertFalse((self.d / COMPLETED).exists())
-        self.assertTrue((self.d / INVENTORY).exists())
-        self.assertEqual(self._attempts()["attempts"], 1)
-        self.assertIn("bus refused", self._attempts()["last_reason"])
-
-    def test_a_failure_without_a_gateway_answer_keeps_the_claim(self):
-        # A connection dropped after the publish: the gateway may have posted it.
-        for returncode, stderr in ((1, "a2a: notify: flush: nats: connection closed"),
-                                   (chat_notify.NOTIFY_OUTCOME_UNKNOWN, "a2a: notify: no answer from the gateway")):
-            with self.subTest(returncode=returncode):
-                (self.d / COMPLETED).unlink(missing_ok=True)
-                (self.d / DELIVERED).replace(self.d / INVENTORY) if (self.d / DELIVERED).exists() else None
-                self.calls.clear()
-                self._answer(returncode, "", stderr)
-                self._run()
-                self.assertEqual(len(self.calls), 1)
-                self.assertTrue((self.d / COMPLETED).exists())
-                self.assertEqual(self._attempts()["attempts"], 0)
-                self.assertIn("may have landed", self._attempts()["last_reason"])
 
     def test_findings_are_marked_shown_only_after_the_post(self):
         order = []

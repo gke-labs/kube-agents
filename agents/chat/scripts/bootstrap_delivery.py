@@ -102,6 +102,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import bootstrap_handoff  # beside this script in the pod
+import chat_notify  # beside this script in the pod
 import oobe  # beside this script in the pod
 import sandbox_exec
 
@@ -167,13 +168,23 @@ SANDBOX_HOME = "/opt/data"
 REPORT_MAX_BYTES = 256 * 1024
 SANDBOX_TIMEOUT_SECONDS = 30
 
+# The longest one conversation post can run (_notify_conversation): every try of
+# `a2a notify` to its kill bound, and the waits between tries.
+CONVERSATION_POST_MAX_SECONDS = (
+    (len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1) * chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS
+    + sum(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS)
+)
+CLAIM_MARGIN_SECONDS = 60
 # How old ``.bootstrap_completed`` must be before a run removes the jobs. A
 # younger marker may belong to a racing run that is still delivering (see the
 # claim in the module docstring), and removing the delivery job under it would discard its
-# report. Far above that run's post-claim work: one read and two archives over
-# ssh, each bounded by SANDBOX_TIMEOUT_SECONDS, marks that stop at the first
-# MARK_TIMEOUT_SECONDS timeout, and a stdout write.
-RETIRE_AFTER_SECONDS = 300
+# report. Above that run's post-claim work: on the origin path one read and two
+# archives over ssh, marks that stop at the first MARK_TIMEOUT_SECONDS timeout,
+# and a stdout write; on the conversation path the report's post and the note's.
+RETIRE_AFTER_SECONDS = 2 * CONVERSATION_POST_MAX_SECONDS + CLAIM_MARGIN_SECONDS
+# A conversation-path claim this old with no outcome recorded belongs to a run
+# that never finished its post (a pod restart between the claim and the answer).
+STALE_CLAIM_SECONDS = CONVERSATION_POST_MAX_SECONDS + CLAIM_MARGIN_SECONDS
 
 # By absolute path, so no PATH entry picks the binary. A function defined under
 # this name in a ~/.bashrc the model wrote, which older sandbox images allow,
@@ -250,20 +261,26 @@ ATTEMPTS_AT = "last_at"
 # a session record it could not read in time.
 CONVERSATION_RETRY_WAITS_SECONDS = (5 * 60, 30 * 60, 2 * 60 * 60, 6 * 60 * 60)
 CONVERSATION_MAX_ATTEMPTS = len(CONVERSATION_RETRY_WAITS_SECONDS) + 1
-# The card's update key, so a post retried after one that may have landed edits it rather than
-# adding one. Text goes without a key: the gateway cuts a keyed text post to one message.
+# The card's update key. Every card attempt sends it, so an attempt after one
+# that landed edits that card rather than adding one, and the card path retries
+# whatever did not answer as posted. Text goes without a key, because the
+# gateway cuts a keyed text post to one message, so the text path retries only
+# what most likely posted nothing.
 CONVERSATION_REPORT_UPDATE = "onboarding-report"
-# How the gateway answers a post that failed after reaching the chat (a2a/gateway/notify.go); its
-# other answers with no message id are refusals, which posted nothing.
-NOTIFY_POST_FAILED_PREFIX = "post failed:"
-# The words `a2a notify` uses for a bus refusal before the gateway saw the request
-# (a2a/cmd/a2a/notify.go). Any other failure without a gateway answer, a dropped connection after
-# the publish say, may have posted, so it keeps the claim.
-NOTIFY_NOTHING_SENT_PHRASES = ("so nothing was posted", "so nothing was sent")
-# A conversation post's outcome.
+# The gateway's answer when it could not edit the keyed card it holds
+# (a2a/gateway/notify.go): the card is in the chat, so the report is out. The
+# gateway and agent images roll apart, so this text is pinned by a test.
+NOTIFY_EDIT_FAILED_PREFIX = "edit failed:"
+# Written right after the report's post answers, with the outcome: the
+# conversation path's "delivered", which the stale-claim rule and retirement wait on.
+CONVERSATION_DONE_FILE = ".bootstrap_conversation_done"
+# A conversation post's outcome: posted; posted nothing as far as can be told
+# (exit 1, a route absent through the retries, a CLI that could not start); or
+# may have posted (exit 3, a killed CLI, any other exit).
 POSTED = "posted"
 NOT_POSTED = "not posted"
 MAYBE_POSTED = "maybe posted"
+NOTIFY_EXIT_FAILED = 1
 
 # The delivery job's ``origin`` and the keys the plugin writes into it.
 ORIGIN_KEY = "origin"
@@ -324,6 +341,8 @@ def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
     if not counted and record.get(ATTEMPTS_REASON) == reason:
         return  # the same block as the last tick's: no write each minute
     record.update({ATTEMPTS_COUNT: count, ATTEMPTS_REASON: reason, ATTEMPTS_AT: time.time()})
+    if counted and count >= CONVERSATION_MAX_ATTEMPTS:
+        _log_to_stage(data_dir, f"the report was not posted after {count} attempts and now waits: {reason}")
     target = data_dir / CONVERSATION_ATTEMPTS_FILE
     tmp = target.with_name(target.name + ".tmp")
     try:
@@ -331,6 +350,53 @@ def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
         tmp.replace(target)
     except OSError as e:
         sys.stderr.write(f"bootstrap_delivery: could not record the attempt: {e}\n")
+
+
+def _log_to_stage(data_dir: Path, message: str) -> None:
+    """Append ``message`` to oobe's stage log, which an operator reads; stderr from an exit-0 run is dropped."""
+    path = data_dir / oobe.STAGE_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now(timezone.utc).strftime(RUN_FORMAT)} bootstrap_delivery: {message}\n")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not write {path}: {e}\n")
+
+
+def _outcome_recorded(data_dir: Path) -> bool:
+    return (data_dir / CONVERSATION_DONE_FILE).exists()
+
+
+def delivery_settled(data_dir: Path) -> bool:
+    """Whether a taken claim may retire the jobs: always on the origin path, and
+    on the conversation path only once the report's post recorded an outcome."""
+    return _bound_conversation(data_dir) is None or _outcome_recorded(data_dir)
+
+
+def _release_claim(data_dir: Path) -> None:
+    try:
+        (data_dir / ".bootstrap_completed").unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not release the claim: {e}\n")
+
+
+def _release_stale_claim(data_dir: Path, claimed_at: float) -> None:
+    """Release a conversation-path claim whose run never recorded an outcome.
+
+    Only past ``STALE_CLAIM_SECONDS``, so a run still posting keeps it. It
+    counts as an attempt unless one was already recorded after the claim.
+    """
+    if time.time() - claimed_at < STALE_CLAIM_SECONDS:
+        return
+    try:
+        last = float(_read_attempts(data_dir).get(ATTEMPTS_AT))
+    except (TypeError, ValueError):
+        last = 0.0
+    if last <= claimed_at:
+        _record_attempt(data_dir, "a run claimed the report and recorded no outcome; trying again", counted=True)
+    _release_claim(data_dir)
 
 
 def _conversation_ready(data_dir: Path, conversation: dict) -> bool:
@@ -341,8 +407,6 @@ def _conversation_ready(data_dir: Path, conversation: dict) -> bool:
     claims nothing. Past ``CONVERSATION_MAX_ATTEMPTS`` posts that posted
     nothing, and inside the wait after each, it is False too.
     """
-    import chat_notify  # beside this script in the pod
-
     platform = conversation["platform"]
     if not all(conversation.values()):
         reason = f"{CONVERSATION_FILE} is missing or incomplete; the report waits"
@@ -895,14 +959,10 @@ def _gateway_error(stdout: str) -> str:
 def _notify_conversation(conversation: dict, text: str, chat: dict | None = None, update: str = "") -> tuple[str, str]:
     """Post ``text`` (or ``chat``, with ``text`` its fallback) into the conversation.
 
-    Returns ``POSTED``, ``NOT_POSTED`` (``a2a notify`` could not start, a gateway
-    refusal, a bus refusal before the gateway saw it, or a route that was not
-    there through the retries) or
-    ``MAYBE_POSTED`` (anything that may have reached the chat), and a reason
-    for the last two.
+    Returns ``POSTED`` (or the gateway's ``edit failed:``, whose card is in the
+    chat), ``NOT_POSTED`` or ``MAYBE_POSTED`` (see their constants), and a
+    reason for the last two.
     """
-    import chat_notify  # beside this script in the pod
-
     path = ""
     try:
         if chat is not None:
@@ -937,21 +997,22 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
             with contextlib.suppress(OSError):
                 os.unlink(path)
     error = _gateway_error(res.stdout)
-    stderr = (res.stderr or "").strip()
-    if not chat_notify.outcome_unknown(res.returncode) and (
-        (error and not error.startswith(NOTIFY_POST_FAILED_PREFIX))
-        or (not error and any(phrase in stderr for phrase in NOTIFY_NOTHING_SENT_PHRASES))
-    ):
-        return NOT_POSTED, f"a2a notify posted nothing: {error or stderr}"
-    return MAYBE_POSTED, f"a2a notify exited {res.returncode}; the post may have landed: {error or stderr}"
+    detail = error or (res.stderr or "").strip()
+    if error.startswith(NOTIFY_EDIT_FAILED_PREFIX):
+        return POSTED, ""
+    if res.returncode == NOTIFY_EXIT_FAILED:
+        return NOT_POSTED, f"a2a notify failed: {detail}"
+    return MAYBE_POSTED, f"a2a notify exited {res.returncode}; the post may have landed: {detail}"
 
 
-def _post_to_conversation(conversation: dict, content: str, note: str) -> tuple[str, str]:
+def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note: str) -> tuple[str, str]:
     """Post the report and the audits note: the card then the note, or one text message.
 
     The card goes only when ``KAGE_SLACK_UX`` is on, the conversation is Slack's
-    and the report parses. A note that fails after the card posted is logged:
-    the report is out.
+    and the report parses. On the card path anything short of posted is
+    returned as ``NOT_POSTED``, since the next attempt's key edits a card that
+    landed. The outcome is recorded before the note goes, and a note that
+    fails is logged: the report is out.
     """
     platform = conversation["platform"]
     card = None
@@ -965,34 +1026,41 @@ def _post_to_conversation(conversation: dict, content: str, note: str) -> tuple[
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
     if card is None:
-        return _notify_conversation(conversation, _with_note(_presented(content, platform), note))
+        outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, platform), note))
+        if outcome != NOT_POSTED:
+            _record_outcome(data_dir, outcome)
+        return outcome, reason
     chat, text = card
     outcome, reason = _notify_conversation(conversation, text, chat, CONVERSATION_REPORT_UPDATE)
-    if outcome == POSTED:
-        note_outcome, note_reason = _notify_conversation(conversation, note)
-        if note_outcome != POSTED:
-            sys.stderr.write(f"bootstrap_delivery: the report posted but its audits note did not: {note_reason}\n")
+    if outcome != POSTED:
+        return NOT_POSTED, reason
+    _record_outcome(data_dir, outcome)
+    note_outcome, note_reason = _notify_conversation(conversation, note)
+    if note_outcome != POSTED:
+        _log_to_stage(data_dir, f"the report posted but its audits note did not: {note_reason}")
     return outcome, reason
+
+
+def _record_outcome(data_dir: Path, outcome: str) -> None:
+    try:
+        (data_dir / CONVERSATION_DONE_FILE).write_text(outcome + "\n", encoding="utf-8")
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the outcome: {e}\n")
 
 
 def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dict, content: str,
                              no_ranking: bool | None, suppressed: set[str]) -> None:
-    """After the claim: post into the conversation, and release the claim only if nothing posted.
+    """After the claim: post into the conversation, and release the claim unless the report is out.
 
-    The findings are marked shown only once the report is out, so a released
+    The findings are marked shown only once the report posted, so a released
     claim leaves none counted against the day's limit.
     """
-    import chat_notify  # beside this script in the pod
-
     note = _audits_note(data_dir, no_ranking is True, home=bool(chat_notify.routed_platform()))
-    outcome, reason = _post_to_conversation(conversation, content, note)
+    outcome, reason = _post_to_conversation(data_dir, conversation, content, note)
     if outcome == NOT_POSTED:
         # Recorded first, so the released claim is retried only after the wait.
         _record_attempt(data_dir, reason, counted=True)
-        try:
-            (data_dir / ".bootstrap_completed").unlink()
-        except OSError as e:
-            sys.stderr.write(f"bootstrap_delivery: could not release the claim: {e}\n")
+        _release_claim(data_dir)
         return
     shown = False
     if outcome == POSTED:
@@ -1008,7 +1076,9 @@ def main(data_dir: Path | None = None) -> int:
 
     completed = _completed_at(data_dir)
     if completed is not None:
-        if time.time() - completed >= RETIRE_AFTER_SECONDS:
+        if not delivery_settled(data_dir):
+            _release_stale_claim(data_dir, completed)
+        elif time.time() - completed >= RETIRE_AFTER_SECONDS:
             _retire_jobs()
         return 0
 

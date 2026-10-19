@@ -142,10 +142,12 @@ PRIMING_STALE_SECONDS = 120
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 SCAN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 CONVERSATION_JOB_ID = "oobe"
-# Delivery's count of posts to the bound conversation that posted nothing
-# (bootstrap_delivery.py, CONVERSATION_ATTEMPTS_FILE). A new binding starts it
-# again, so a re-run after a capped one is not refused on the old count.
+# Delivery's record for the bound conversation: its count of attempts that did
+# not post, and the outcome of the post that did (bootstrap_delivery.py,
+# CONVERSATION_ATTEMPTS_FILE and CONVERSATION_DONE_FILE). A new binding starts
+# both again, so a re-run is judged on its own attempts.
 CONVERSATION_ATTEMPTS_FILE = ".bootstrap_conversation_attempts.json"
+CONVERSATION_DONE_FILE = ".bootstrap_conversation_done"
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
@@ -460,6 +462,7 @@ def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, s
             return None
         try:
             (data_dir / CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+            (data_dir / CONVERSATION_DONE_FILE).unlink(missing_ok=True)
             _write_conversation(data_dir, route)
         except Exception as e:
             logger.warning("Could not record the onboarding conversation: %s", e)
