@@ -9980,6 +9980,47 @@ class TestPromotion(BaseTestCase):
         self.assertEqual(plan.withheld, [])
         self.assertEqual(plan.below_floor, ["min"])
 
+    def test_the_install_switch_turns_the_sweep_off_but_not_a_request(self):
+        """`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` is the inject lane's install: the
+        sweep opens nothing, a `/remediate` still opens what it names, and the
+        ledger says which switch is off and what still works (#3439)."""
+        findings = [
+            manifest_finding("crit", "a.yaml", severity="critical"),
+            manifest_finding("maj", "b.yaml", severity="major"),
+        ]
+        plan = audit_report.promotion_candidates(findings, {}, auto_promote=False, vouched={"crit", "maj"})
+        self.assertEqual(plan.promote, [])
+        self.assertEqual((plan.withheld, plan.below_floor), ([], []))
+        asked = audit_report.promotion_candidates(findings, {}, ["maj"], auto_promote=False, vouched={"crit", "maj"})
+        self.assertEqual(asked.promote, ["maj"])
+        body = render_body(make_doc(findings=findings), generated_at=NOW, sweep_off=True)
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
+        self.assertIn("/remediate <finding-id>", body)
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+
+    def test_the_switch_reads_the_root_owned_file_before_the_variable(self):
+        """A session can export the variable in one word; the sandbox entrypoint's
+        file is root-owned, so it is read first and the variable only without it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "audit-auto-promote")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", path):
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "false"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled())
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "FALSE"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled())
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "0"}):
+                    self.assertTrue(audit_report.auto_promotion_enabled(), "only the word false turns it off")
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(audit_report.AUTO_PROMOTE_ENV, None)
+                    self.assertTrue(audit_report.auto_promotion_enabled())
+                pathlib.Path(path).write_text("false\n")
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled(), "the file wins over the variable")
+                pathlib.Path(path).write_text("true\n")
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "false"}):
+                    self.assertTrue(audit_report.auto_promotion_enabled(), "the file wins over the variable")
+
     def test_the_floor_is_major(self):
         self.assertEqual(audit_report.AUTO_PROMOTION_FLOOR, "major")
 

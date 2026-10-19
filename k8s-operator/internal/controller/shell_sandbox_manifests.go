@@ -111,6 +111,13 @@ const (
 	// Read by agents/platform/scripts/fleet_scope_args.py; always set, so that a
 	// value a plugin or an operator env override supplied is never the only one.
 	envScopeDeclared = "KUBEAGENTS_SCOPE_DECLARED"
+	// The fleet audits' automatic remediation sweep, off when the value is
+	// "false": audit_report.py's finish then opens no pull request nobody asked
+	// for (an explicit /remediate still does). An operator sets it in
+	// spec.deployment.env; it is forwarded here because finish runs in this
+	// pod, not the agent's, and deploy/sandbox/entrypoint.sh writes it to a
+	// root-owned file the script reads before the session's variable (#3439).
+	envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -533,6 +540,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	}
 
 	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
+	if agent.Spec.Deployment != nil {
+		for _, v := range agent.Spec.Deployment.Env {
+			if v.Name == envAuditAutoPromote {
+				env = append(env, *v.DeepCopy())
+				break
+			}
+		}
+	}
 
 	containers := buildShellSandboxContainers(agent, env)
 	volumes := buildShellSandboxVolumes(agent, authorizedKeysSecret)

@@ -1578,6 +1578,27 @@ UNVOUCHED_PROMOTION_FLOOR = "critical"
 # the bottom of a ComputeClass (`ccc-no-ondemand-floor`). A new check is held
 # to `critical` until someone argues it onto this list.
 MAJOR_SWEEP_CHECKS = frozenset({"no-pdb", "unbound-sa-automount", "ccc-no-ondemand-floor"})
+# The install's switch for the automatic sweep. "false" turns it off: `finish`
+# opens no pull request nobody asked for, and the ledger says so; an explicit
+# `/remediate` still opens what it names. The operator sets it in
+# spec.deployment.env and forwards it to the shell sandbox, whose entrypoint
+# writes it to the root-owned file first (a session can unset or override the
+# variable in one word, and the file is what an operator's choice rests on).
+# Unset, or anything but "false", is the sweep as it always ran. The eval's
+# inject lane turns it off (hack/ci-deploy.sh, #3439): its write safeguard
+# charges any pull request in a repetition's window to the case in flight.
+AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+AUTO_PROMOTE_FILE = "/run/kube-agents-sandbox/audit-auto-promote"
+AUTO_PROMOTE_OFF = "false"
+
+
+def auto_promotion_enabled() -> bool:
+    """Whether this install runs the automatic sweep: the root-owned file first, then the variable."""
+    try:
+        value = Path(AUTO_PROMOTE_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        value = os.environ.get(AUTO_PROMOTE_ENV, "")
+    return value.strip().lower() != AUTO_PROMOTE_OFF
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
@@ -10353,8 +10374,13 @@ def _render_withheld(
     noun: str = DEFAULT_PROPOSAL_NOUN,
     below_floor: list[str] | None = None,
     triage_reasons: dict[str, str] | None = None,
+    sweep_off: bool = False,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
+
+    `sweep_off` is the install's switch (`auto_promotion_enabled`): the sweep
+    ran over nothing, so the four blocks below are empty, and the section says
+    why instead, with the command that still works.
 
     A filter that silently drops work reads as "nothing more to do". Naming
     what it dropped, with the command to ask for one, is what keeps it honest.
@@ -10376,6 +10402,15 @@ def _render_withheld(
     unbacked = list(uncorroborated or [])
     triaged = list(needs_triage or [])
     floor = list(below_floor or [])
+    if sweep_off:
+        return [
+            "",
+            "## Awaiting `/remediate`",
+            "",
+            f"The automatic remediation sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), "
+            f"so no {noun} was opened without a request. A manifest fix above is opened by "
+            "`/remediate <finding-id>` as on any other install.",
+        ]
     if not withheld and not unbacked and not triaged and not floor:
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
@@ -10677,6 +10712,7 @@ def render_issue_body(
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
     unlinked_paths: set[str] | frozenset[str] = frozenset(),
+    sweep_off: bool = False,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
@@ -10731,6 +10767,7 @@ def render_issue_body(
         noun=noun,
         below_floor=list(below_floor or []),
         triage_reasons=triage_reasons,
+        sweep_off=sweep_off,
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -15843,9 +15880,11 @@ def _handle_finish_dry_run(
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
     triage_reasons = triage_markers(findings, manifest)
+    sweep_on = auto_promotion_enabled()
     plan = promotion_candidates(
         findings,
         {},
+        auto_promote=sweep_on,
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
@@ -15902,6 +15941,7 @@ def _handle_finish_dry_run(
         needs_triage=plan.needs_triage,
         below_floor=plan.below_floor,
         triage_reasons=triage_reasons,
+        sweep_off=not sweep_on,
         held=preview_held,
         held_preview=True,
         states=states,
@@ -17758,11 +17798,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         noun=noun,
     )
     triage_reasons = triage_markers(findings, manifest)
+    sweep_on = auto_promotion_enabled()
+    if not sweep_on:
+        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep is off; only `/remediate` requests open a {noun}.")
     plan = promotion_candidates(
         findings,
         pr_by_finding,
         requests.targets,
         requested_at=requests.requested_at,
+        auto_promote=sweep_on,
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
@@ -17825,6 +17869,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         needs_triage=plan.needs_triage,
         below_floor=plan.below_floor,
         triage_reasons=triage_reasons,
+        sweep_off=not sweep_on,
         held=carried,
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
@@ -17995,6 +18040,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 needs_triage=plan.needs_triage,
                 below_floor=plan.below_floor,
                 triage_reasons=triage_reasons,
+                sweep_off=not sweep_on,
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
