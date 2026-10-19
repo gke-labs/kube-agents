@@ -120,15 +120,15 @@ class TestEffectiveOwnerOfCase(unittest.TestCase):
     def test_the_scan_agrees_with_yaml_on_every_real_case(self):
         # The validator reads task.yaml as YAML; the filer's helper line-scans
         # it. A spelling only one of them understands would route reds to the
-        # domain owner while the lint shows the case owner.
-        domains = case_owner.load_domain_owners()
+        # domain owner while the lint shows the case owner. Field by field, not
+        # through effective_owner: on a case whose owner is also its domain's
+        # owner, a misread owner falls back to the same login and hides.
         for task in sorted((case_owner.REPO_ROOT / case_owner.TASKS_PATH).glob("*/" + case_owner.TASK_FILENAME)):
-            spec = yaml.safe_load(task.read_text())
+            text = task.read_text()
+            spec = yaml.safe_load(text)
             with self.subTest(case=task.parent.name):
-                self.assertEqual(
-                    case_owner.effective_owner_of_case(task.parent.name),
-                    case_owner.effective_owner(spec.get("owner"), spec.get("domain"), domain_owners=domains),
-                )
+                self.assertEqual(case_owner._task_field(text, "owner"), spec.get("owner"))
+                self.assertEqual(case_owner._task_field(text, "domain"), spec.get("domain"))
 
     def test_every_real_case_resolves_to_someone(self):
         for task in sorted((case_owner.REPO_ROOT / case_owner.TASKS_PATH).glob("*/" + case_owner.TASK_FILENAME)):
