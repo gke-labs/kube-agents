@@ -8445,7 +8445,7 @@ def test_worker_commands_required_run_names_what_did_not_run():
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
 
 
-def test_worker_commands_required_run_succeeded_reports_trajectory_command_count():
+def test_worker_commands_required_run_succeeded_card_log_trajectory_discrepancy_is_error():
     from kube_agents_bench.verifiers import WorkerRun
 
     run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
@@ -8455,15 +8455,36 @@ def test_worker_commands_required_run_succeeded_reports_trajectory_command_count
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "kubectl get nodes"}, "result": "node-1", "status": "completed", "at": 2.0},
     ]
     # Card log has 1 command carrying the collector, while trajectory has 2 completed non-matching calls.
-    # Evaluated across trajectory calls (2), not card log rows (1).
+    # The two sources disagree: card log shows it ran, but trajectory lacks the call, so success
+    # cannot be verified -> capture discrepancy (status="error").
     transcript.set(
         "ok",
         traj,
         worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
     )
     res = v.verify(5.0)
+    assert res.status == "error"
+    assert "the worker card log shows fleet_upgrade_report.py --readiness ran, but the worker trajectory did not capture the call" in res.reason
+
+
+def test_worker_commands_required_run_succeeded_missing_from_both_is_fail():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo other"}, "result": "other", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "kubectl get nodes"}, "result": "node-1", "status": "completed", "at": 2.0},
+    ]
+    # Neither card log nor trajectory carries the collector. Conclusive fail.
+    transcript.set(
+        "ok",
+        traj,
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+    )
+    res = v.verify(5.0)
     assert res.status == "fail"
-    assert "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
+    assert "no worker command ran fleet_upgrade_report.py --readiness across 1 command(s)" in res.reason
 
 
 def test_worker_commands_required_run_succeeded_flag():

@@ -1856,6 +1856,12 @@ _NO_WORKER_TERMINAL_CALLS_REASON = (
     "subject (a worker whose tagged calls are all MCP or board calls, with an empty card log, "
     "grades as zero commands)"
 )
+_NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON = (
+    "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
+    "card was delegated, the worker-trajectory capture did not run, or the pod withheld a call's "
+    "arguments, so required run(s) requiring success could not be verified (a worker whose tagged "
+    "calls are all MCP or board calls, with an empty card log, grades as zero commands)"
+)
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
     "cannot say what came after the refusal"
@@ -2299,7 +2305,7 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
 
 
 def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
-    """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
+    """``(card, at, command, result, succeeded)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
     recorded): the worker the call belongs to. The workers' entries reach
@@ -2483,8 +2489,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     graded on its calls: a filed card's log shows no program text); only
     delegated workers' logs or calls are read, never the router's, and a
     worker-filed card is read only as far as the trajectory capture reached
-    it (``worker_capture_gaps`` makes a clean read an error only under
-    ``after_result_pattern``); and a
+    it (``worker_capture_gaps`` makes a clean read an error under
+    ``after_result_pattern`` or when an uncredited ``succeeded: true`` run cannot be verified); and a
     command the shell resolved through an alias appears as typed; and a
     pattern reads the characters on the line, so a word the command splits
     with an empty quote or a backslash inside it (``compute''Metadata``) is
@@ -2635,16 +2641,16 @@ class WorkerCommandsVerifier(BaseVerifier):
                     sources = f" ({len(logged_commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
             typed = logged_commands + children
             windowed = typed
-            traj_calls = _worker_terminal_calls(snap.trajectory) if snap.trajectory else []
+            traj_calls = calls
             if has_succeeded_runs and not traj_calls:
                 tagged = any(isinstance(e, dict) and e.get("agent") and e.get("name") not in _CODE_TOOLS for e in (snap.trajectory or ()))
                 dropped = any(isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS for e in (snap.trajectory or ()))
-                if not tagged or dropped or snap.worker_commands is None or snap.worker_commands:
+                if not tagged or dropped or snap.worker_commands:
                     return VerificationResult(
                         success=False,
                         status="error",
                         elapsed_time=time.monotonic() - start,
-                        reason=_NO_WORKER_TERMINAL_CALLS_REASON,
+                        reason=_NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON,
                     )
         else:
             calls = _worker_terminal_calls(snap.trajectory)
@@ -2710,9 +2716,15 @@ class WorkerCommandsVerifier(BaseVerifier):
         typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
 
         traj_eligible = [(cmd, succ) for _, _, cmd, _, succ in traj_calls if self._without_exempt_text(cmd) == cmd]
+        traj_argv_entries = [
+            (argv, call_succeeded)
+            for cmd_text, call_succeeded in traj_eligible
+            for argv in _shell_argvs(cmd_text)
+        ]
 
         unrun_missing: list[WorkerRun] = []
         unrun_failed: list[WorkerRun] = []
+        traj_missing: list[WorkerRun] = []
         for run in self.required_runs:
             if not run.succeeded:
                 if not any(_argv_runs(argv, run) for argv in argvs):
@@ -2722,18 +2734,19 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # A required run with succeeded: true and no trajectory to read is not credited.
                 matched_any = False
                 succeeded = False
-                for cmd_text, call_succeeded in traj_eligible:
-                    for argv in _shell_argvs(cmd_text):
-                        if _argv_runs(argv, run):
-                            matched_any = True
-                            if call_succeeded:
-                                succeeded = True
-                                break
-                    if succeeded:
-                        break
+                for argv, call_succeeded in traj_argv_entries:
+                    if _argv_runs(argv, run):
+                        matched_any = True
+                        if call_succeeded:
+                            succeeded = True
+                            break
                 if not succeeded:
                     if matched_any:
                         unrun_failed.append(run)
+                    elif self.after_result_pattern is None and any(_argv_runs(argv, run) for argv in argvs):
+                        # The card log carries the command, but the trajectory capture missed it.
+                        # Discrepancy between capture sources: cannot verify exit code.
+                        traj_missing.append(run)
                     else:
                         unrun_missing.append(run)
 
@@ -2743,15 +2756,13 @@ class WorkerCommandsVerifier(BaseVerifier):
         # patterns or missing required items inconclusive; on the standard path,
         # card-log misses are conclusive (fail), credited runs pass, and capture
         # gaps make only an uncredited succeeded: true run inconclusive (error).
-        uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed] if run.succeeded]
+        uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *traj_missing] if run.succeeded]
         if self.after_result_pattern is not None:
-            card_log_miss = False
             partial = bool(snap.worker_capture_gaps)
         else:
-            card_log_miss = bool(missing or any(not run.succeeded for run in unrun_missing))
-            partial = bool(snap.worker_capture_gaps) and bool(uncredited_succeeded) and not card_log_miss
+            partial = bool(snap.worker_capture_gaps) and bool(uncredited_succeeded)
 
-        if hits or ran or card_log_miss or ((missing or unrun_missing or unrun_failed) and not partial):
+        if hits or ran or ((missing or unrun_missing or unrun_failed) and not partial):
             parts = []
             if missing:
                 parts.append(
@@ -2760,7 +2771,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 )
             if unrun_missing:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
-                if all(run.succeeded for run in unrun_missing):
+                if all(run.succeeded for run in unrun_missing) and self.after_result_pattern is not None:
                     count = len(traj_eligible)
                     parts.append(f"no worker command ran {named} across {count} command(s)")
                 else:
@@ -2804,6 +2815,17 @@ class WorkerCommandsVerifier(BaseVerifier):
                 status="error",
                 elapsed_time=time.monotonic() - start,
                 reason=reason,
+            )
+        if traj_missing:
+            named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"the worker card log shows {named} ran, but the worker trajectory did not "
+                    f"capture the call, so success could not be verified"
+                ),
             )
         return VerificationResult(
             success=True,
