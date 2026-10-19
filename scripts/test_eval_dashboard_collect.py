@@ -1342,9 +1342,28 @@ class TestNightlySource(_MergeBase):
             gsutil=gsutil,
         )
         self.assertIn(f"names job {collect.DEFAULT_NIGHTLY_WRITERS_JOB}, not ci-kube-agents-eval-nightly-main-b; the report files its runs as the writers part", stderr)
-        self.assertIn("both name job", stderr)
+        self.assertIn("as --nightly-writers-prefix does; listing it once", stderr)
         calls = log.read_text().splitlines()
         self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}", f"ls {FAKE_WRITERS_PREFIX}"])
+
+    def test_a_part_flag_naming_the_main_job_is_listed_once_and_keeps_the_main_watermark(self):
+        """The main job's prefix under a part flag is listed once, and the
+        main job's runs still set its watermark: the scan resumes above the
+        main build on record rather than re-reading every main build."""
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_956_TRUNCATED)
+        for flag in ("nightly_writers_prefix", "nightly_main_b_prefix"):
+            with self.subTest(flag=flag):
+                log.unlink(missing_ok=True)
+                prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+                prior_data["runs"] = [{"build_id": BUILD_956_TRUNCATED, "tier": "nightly", "job": FAKE_NIGHTLY_JOB, "pr": None, "tasks": []}]
+                prior = self.tmp / "prior-main-collision.json"
+                prior.write_text(json.dumps(prior_data))
+                _, stderr = self.quiet_collect(merge_with=str(prior), nightly_prefix=FAKE_NIGHTLY_PREFIX, gsutil=gsutil, **{flag: FAKE_NIGHTLY_PREFIX})
+                self.assertIn("as --nightly-prefix does; listing it once", stderr)
+                self.assertIn(f"nightly scan resumed above build {BUILD_956_TRUNCATED}", stderr)
+                calls = log.read_text().splitlines()
+                self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}"])
 
     def test_the_main_b_job_resumes_above_its_own_watermark(self):
         """main-a and main-b start together and either may finish first: a

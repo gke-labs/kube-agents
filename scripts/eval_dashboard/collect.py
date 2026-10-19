@@ -2117,22 +2117,25 @@ def collect(
         ("--nightly-main-b-prefix", nightly_main_b_prefix, main_b_job, DEFAULT_NIGHTLY_MAIN_B_JOB),
     ):
         if job != expected:
-            # nightly.py tells the part by this job name alone (PART_JOBS).
-            part = {DEFAULT_NIGHTLY_WRITERS_JOB: "writers", DEFAULT_NIGHTLY_MAIN_B_JOB: "main-b"}.get(job, "main")
+            # nightly.py tells the part by this job name alone.
+            part = nightly.night_part({"job": job})
             print(
                 f"warning: {flag} {prefix} names job {job}, not {expected};"
                 f" the report files its runs as the {part} part",
                 file=sys.stderr,
             )
-    # Both flags naming one job would list it twice above one watermark:
-    # list it once, under --nightly-writers-prefix.
-    if nightly_writers_prefix and nightly_main_b_prefix and writers_job == main_b_job:
-        print(
-            f"warning: --nightly-writers-prefix and --nightly-main-b-prefix both name job {writers_job};"
-            " listing it once",
-            file=sys.stderr,
-        )
-        nightly_main_b_prefix = None
+    # A part flag naming a job an earlier flag already lists (the main
+    # job, or the writers job under --nightly-main-b-prefix) would list it
+    # twice and take that job's runs out of its own watermark: list each
+    # job once, under the first flag that names it, and drop the later one.
+    main_job = (nightly_job or _periodic_job(nightly_prefix)) if nightly_prefix else None
+    if nightly_writers_prefix and writers_job == main_job:
+        print(f"warning: --nightly-writers-prefix names job {writers_job}, as --nightly-prefix does; listing it once", file=sys.stderr)
+        nightly_writers_prefix, writers_job = None, DEFAULT_NIGHTLY_WRITERS_JOB
+    if nightly_main_b_prefix and main_b_job in (main_job, writers_job if nightly_writers_prefix else None):
+        other = "--nightly-prefix" if main_b_job == main_job else "--nightly-writers-prefix"
+        print(f"warning: --nightly-main-b-prefix names job {main_b_job}, as {other} does; listing it once", file=sys.stderr)
+        nightly_main_b_prefix, main_b_job = None, DEFAULT_NIGHTLY_MAIN_B_JOB
     after_build = None
     nightly_after = None
     writers_after = None
