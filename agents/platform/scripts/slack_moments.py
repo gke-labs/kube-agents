@@ -17,8 +17,10 @@ Pure functions only, like ``slack_presenter``, whose layout this reuses.
 * A question the work is waiting on (:func:`needs_you`): the worker's question
   in bold (plain, when bold would cost it a ``*`` or a ``__name__``), the rest
   of its reason below it (of a first line too long for the headline, its first
-  sentence is the headline and the rest opens the detail, so nothing shows
-  twice), a choice button for each option
+  sentence is the headline, cut at a word with an ellipsis when a question is
+  too long as well, and the rest opens the detail; a headline's links open it
+  too, alone, so nothing shows twice and no url is lost), a choice button for
+  each option
   the reason ends with, and a "waiting on you" line. A click is the clicker's
   answer in the thread (``gateway/slack_ux_clicks.py``), the same path as
   typing it. The options are buttons only when there are two to five, each
@@ -260,6 +262,9 @@ OPTIONS_MIN = 2
 OPTIONS_MAX = _presenter.BUTTONS_PER_ROW
 #: The reason below the question, clipped; ``kanban_block`` puts no bound on it.
 DETAIL_MAX = 2000
+#: Where a question's first sentence too long for the headline may be cut at a word
+#: (:func:`_word_cut`).
+WORD_GAP = re.compile(r"\s+")
 #: Bold in a context line: ``**text**`` between word boundaries with no ``*`` inside,
 #: which mrkdwn would read as a marker. ``__x__`` stays text, so a ``__init__.py`` in a
 #: path or url keeps its characters.
@@ -592,39 +597,80 @@ def _question(reason: str, buttons: bool) -> tuple[str, list[str], list[str]]:
     if not usable:
         start, options = len(lines), []
     head, overflow = _headline_cut(lines[0].strip())
-    # Linked options likewise stay in the detail: their buttons show only the label.
+    # Linked options stay in the detail: their buttons show only the label.
     end = len(lines) if any(_presenter.MD_LINK.search(line) for line in lines[start:]) else start
-    # A headline with a link keeps its whole line below it: the headline shows only the
-    # label, the line below the url. So does one :func:`_headline_cut` could not cut.
-    if overflow is None or _presenter.MD_LINK.search(head):
-        return head, [*before, *lines[:end]], options
     return head, [*before, *([overflow] if overflow else []), *lines[1:end]], options
 
 
-def _headline_cut(line: str) -> tuple[str, str | None]:
+def _headline_cut(line: str) -> tuple[str, str]:
     """``(headline, overflow)`` for a question's first line, so no word of it shows twice.
 
-    A line that fits the headline, measured as shown, is the headline, with no
-    overflow. A longer one gives its first sentence, cut at a clause when that is
-    too long as well (``slack_presenter.split_lead``), and the rest of the line
-    as the overflow, which opens the detail. A sentence with no clause to cut at
-    is clipped at a word, and the overflow resumes after the ellipsis; one whose
-    markup a clip could split is left whole, its overflow None, and the whole
-    line stays below the clipped headline.
+    A line that fits the headline, measured as shown, is the headline; otherwise
+    its first sentence is, when that fits, and the rest of the line is the
+    overflow, which opens the detail. A first sentence too long as well is cut:
+    a statement at a clause, as an answer's is (``slack_presenter.clause_cut``),
+    and a question, or a statement with no clause to cut at, at the last word
+    that fits, outside a code span, a link and a bold or italic run, the headline
+    ending in an ellipsis the overflow resumes after, so a cut question never
+    reads as a statement. A sentence with no such word is cut as plain text. The
+    headline shows a link's label only, so each link in it also opens the
+    overflow, alone, to keep its url.
     """
-    if len(_headline_text(line)) <= _presenter.HEADLINE_MAX:
-        return line, ""
-    sentence, body = _presenter.split_lead(line)
-    overflow = "\n".join(body)
-    if sentence and len(_headline_text(sentence)) <= _presenter.HEADLINE_MAX:
-        return sentence, overflow
-    if sentence and _headline_text(sentence) == sentence:
-        title = _presenter._clip(sentence, _presenter.HEADLINE_MAX)
-        shown = title[: -len(_presenter.ELLIPSIS)]
-        if sentence.startswith(shown):
-            resumed = _presenter.ELLIPSIS + sentence[len(shown) :].lstrip()
-            return title, " ".join(part for part in (resumed, overflow) if part)
-    return line, None
+    sentence, after = line, ""
+    if len(_headline_text(line)) > _presenter.HEADLINE_MAX:
+        lead, body = _presenter.split_lead(line, cut=False)
+        if lead:
+            sentence, after = lead, "\n".join(body)
+    cut: tuple[str, str] | None = sentence, ""
+    if len(_headline_text(sentence)) > _presenter.HEADLINE_MAX:
+        cut = None if _headline_text(sentence).endswith(QUESTION_END) else _presenter.clause_cut(sentence)
+        cut = cut or _word_cut(sentence) or _plain_cut(_headline_text(sentence))
+    head, rest = cut
+    shown = [link.group(0) for link in _presenter.MD_LINK.finditer(sentence) if link.group(0) not in rest]
+    return head, " ".join(part for part in (" ".join(shown), rest, after) if part)
+
+
+def _word_cut(sentence: str) -> tuple[str, str] | None:
+    """``(headline, rest)``: ``sentence`` cut at the last space that leaves a headline of at
+    most ``HEADLINE_MAX`` characters once shown with its ellipsis, outside a code span and a
+    link, with no bold or italic run left open; each half carries the ellipsis. A sentence
+    bold from end to end is cut inside the bold, each half staying bold, as
+    ``slack_presenter.clause_cut`` cuts one. None when no space qualifies."""
+    for marker in _presenter.BOLD_MARKERS:
+        inner = sentence[len(marker) : -len(marker)]
+        if len(sentence) > 2 * len(marker) and sentence.startswith(marker) and sentence.endswith(marker) \
+                and marker not in inner:
+            cut = _word_cut(inner)
+            return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
+    held, spans = _presenter._hold_code(sentence)
+    links = [link.span() for link in _presenter.MD_LINK.finditer(held)]
+    found = None
+    for space in WORD_GAP.finditer(held):
+        head = held[: space.start()]
+        if any(start < space.start() < end for start, end in links):
+            continue
+        if any(head.count(marker) % 2 for marker in _presenter.BOLD_MARKERS):
+            continue
+        # A lone italic marker this head opens and does not close, as clause_cut counts them.
+        if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
+               for marker, (opener, _closer) in _presenter.ITALIC_EDGES.items()):
+            continue
+        if len(_headline_text(_presenter._restore_code(head, spans))) + len(_presenter.ELLIPSIS) > _presenter.HEADLINE_MAX:
+            break
+        found = space
+    if found is None or not held[: found.start()].strip():
+        return None
+    head, rest = (_presenter._restore_code(part, spans) for part in (held[: found.start()], held[found.end() :]))
+    return head + _presenter.ELLIPSIS, _presenter.ELLIPSIS + rest
+
+
+def _plain_cut(text: str) -> tuple[str, str]:
+    """``(headline, rest)``: plain ``text`` clipped to the headline, the rest resuming after the ellipsis."""
+    title = _presenter._clip(text, _presenter.HEADLINE_MAX)
+    if title == text:
+        return title, ""
+    shown = title[: -len(_presenter.ELLIPSIS)]
+    return title, _presenter.ELLIPSIS + text[len(shown) :].lstrip()
 
 
 def _detail(lines: Sequence[str]) -> str:

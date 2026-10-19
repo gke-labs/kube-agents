@@ -572,18 +572,40 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_buttons(blocks), [])
         self.assertIn(long, _contexts(blocks)[0])
 
-    def test_a_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+    def test_a_headline_with_a_link_keeps_the_link_alone_on_the_line_below(self):
         url = "https://example.com/" + "a" * 150
         blocks, _ = m.needs_you(f"Check the [runbook]({url}) first. Which?\n- seeded-a\n- seeded-b")
         self.assertIn("Check the runbook first. Which?", blocks[0]["text"]["text"])
-        self.assertEqual(_contexts(blocks)[0], f"Check the <{url}|runbook> first. Which?")
+        self.assertEqual(_contexts(blocks)[0], f"<{url}|runbook>")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["seeded-a", "seeded-b"])
 
-    def test_a_short_headline_with_a_link_keeps_the_url_on_the_line_below(self):
+    def test_a_short_headline_with_a_link_keeps_the_link_alone_on_the_line_below(self):
         url = "https://github.com/acme/x/pull/412"
         blocks, _ = m.needs_you(f"Should I merge [PR #412]({url})?\n- Yes\n- No")
-        self.assertEqual(_contexts(blocks)[0], f"Should I merge <{url}|PR #412>?")
+        self.assertEqual(_contexts(blocks)[0], f"<{url}|PR #412>")
         self.assertEqual([b["value"] for b in _buttons(blocks)], ["Yes", "No"])
+
+    def test_a_long_question_with_a_link_shows_its_words_once(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = (
+            f"Should I merge [PR #412]({url}), which raises the memory limit of checkout-gateway in "
+            "seeded-reliability to 512Mi, or close it and open one that rolls back the image instead?"
+        )
+        blocks, _ = m.needs_you(question)
+        headline, detail = blocks[0]["text"]["text"].strip("*"), _contexts(blocks)[0]
+        self.assertTrue(headline.endswith(p.ELLIPSIS), headline)
+        self.assertTrue(detail.startswith(f"<{url}|PR #412> {p.ELLIPSIS}"), detail)
+        self.assertNotIn(headline.removesuffix(p.ELLIPSIS), detail)
+
+    def test_a_long_question_with_a_code_span_is_cut_outside_it_and_shown_once(self):
+        question = (
+            "Should I scale `checkout-gateway` in `seeded-reliability` down to zero replicas while I read the "
+            "OOMKill events and the `resources.limits.memory` set on each of its containers?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertTrue(head.endswith(p.ELLIPSIS) and rest[0].startswith(p.ELLIPSIS), (head, rest))
+        self.assertEqual(head.count("`") % 2, 0)
+        self.assertEqual(head.removesuffix(p.ELLIPSIS) + " " + rest[0].removeprefix(p.ELLIPSIS), question)
 
     def test_a_short_headline_without_a_link_is_not_repeated_below(self):
         blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
@@ -597,12 +619,22 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(_contexts(blocks), [rest, m.WAITING])
         self.assertEqual(text.count(question), 1)
 
-    def test_a_long_first_sentence_is_cut_at_a_clause_and_the_rest_opens_the_detail(self):
-        head = "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision"
-        tail = "or leave it running while the on-call engineer reads the crash loop's logs and the recent change history?"
-        blocks, _ = m.needs_you(f"{head}, {tail}")
+    def test_a_long_question_is_cut_at_a_word_and_never_ends_in_a_stop(self):
+        question = (
+            "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision, "
+            "or leave it running while the on-call engineer reads the crash loop's logs and the recent change history?"
+        )
+        blocks, _ = m.needs_you(question)
+        headline, detail = blocks[0]["text"]["text"].strip("*"), _contexts(blocks)[0]
+        self.assertTrue(headline.endswith(p.ELLIPSIS) and detail.startswith(p.ELLIPSIS), (headline, detail))
+        self.assertEqual(headline[: -len(p.ELLIPSIS)] + " " + detail[len(p.ELLIPSIS) :], question)
+
+    def test_a_long_statement_is_cut_at_a_clause_and_the_rest_opens_the_detail(self):
+        head = "I found two deployments named checkout-gateway on seeded-a, one in seeded-reliability and one in seeded-debug"
+        tail = "and both restart every few minutes after an OOMKill."
+        blocks, _ = m.needs_you(f"{head}, {tail} Which one did you mean?")
         self.assertEqual(blocks[0]["text"]["text"], f"*{head}.*")
-        self.assertEqual(_contexts(blocks)[0], tail[:1].upper() + tail[1:])
+        self.assertEqual(_contexts(blocks)[0], f"{tail[:1].upper() + tail[1:]} Which one did you mean?")
 
     def test_a_long_first_line_with_no_place_to_cut_resumes_below_the_clipped_headline(self):
         first = "why " * 60
@@ -612,10 +644,11 @@ class NeedsYouTest(unittest.TestCase):
         self.assertTrue(headline.endswith(p.ELLIPSIS) and detail.startswith(p.ELLIPSIS))
         self.assertEqual(headline[: -len(p.ELLIPSIS)] + " " + detail[len(p.ELLIPSIS) :], first.strip())
 
-    def test_a_long_first_line_whose_markup_a_clip_could_split_stays_whole_below(self):
+    def test_a_long_first_line_of_bold_runs_is_cut_between_them_and_shown_once(self):
         first = "**why** " * 40
-        blocks, _ = m.needs_you(first)
-        self.assertEqual(_contexts(blocks)[0].count("why"), first.count("why"))
+        head, rest, _ = m._question(first, True)
+        self.assertEqual(head.count("**") % 2, 0)
+        self.assertEqual(head.count("why") + rest[0].count("why"), first.count("why"))
 
     def test_detail_is_clipped(self):
         blocks, _ = m.needs_you("Question\n" + "y" * (m.DETAIL_MAX * 2))
