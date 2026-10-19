@@ -214,7 +214,9 @@ jobs:
     # gateway rollout agree, then the same pair from the candidate checkout to
     # bring the environment back to the candidate. After the matrix, so what
     # the matrix graded is the fresh install and not an install that has been
-    # moved twice.
+    # moved twice. That install is step 2's, so the leg rolls a
+    # `spec.mode: next` install back to the previous GA: the path a new
+    # install on the next default takes when its owner rolls back.
     #
     # `continue-on-error` for the reason step 3's optional suites carry it: a
     # leg with no green run behind it cannot gate. Step 4 does not depend on

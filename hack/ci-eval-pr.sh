@@ -97,7 +97,7 @@ readonly EVAL_NOT_RUN_STATUS="failed"
 # recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
 # step after the fan-out); the dashboard publisher's gate, which mirrors
 # the recorder's; and the rollback round trip after the suite verdict
-# (run_rollback_roundtrip, below). A flagged run passes neither the recorder
+# (run_rollback_roundtrip, below; skipped on a release-candidate run). A flagged run passes neither the recorder
 # nor the publisher: the next lane's periodic on
 # main runs under it with no PULL_NUMBER, the shape both otherwise write
 # from, and a next-mode sample in today's window would be indistinguishable
@@ -114,7 +114,8 @@ readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 
 # The rollback round trip under EVAL_MODE_NEXT=1 (run_rollback_roundtrip, after
-# the suite verdict is computed): hack/rollback-roundtrip.sh flips the install
+# the suite verdict is computed; a release-candidate run skips it, and the
+# function says why): hack/rollback-roundtrip.sh flips the install
 # next -> today -> next and checks the JetStream PVC and the bus creds Secret
 # come through it (cutover condition 6, #2461). Reported beside the verdict,
 # never in it: its own log section and artifacts, no case, no effect on the

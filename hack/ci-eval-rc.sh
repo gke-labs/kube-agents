@@ -106,7 +106,12 @@ set -euo pipefail
 # fan-out is the same work this lane does: three runs that reached a verdict on
 # 2026-09-24 spent 83, 110 and 143 minutes in it. Add the ~20 minutes of lease,
 # build and deploy this lane pays before grading starts and the poller keeps
-# real headroom under 330 even on the slow end. What that does not cover is a
+# real headroom under 330 even on the slow end. Under EVAL_MODE_NEXT=1 the
+# deploy also runs ci-deploy.sh's step 6b, the flip to next and its gates,
+# which the next-mode presubmit pays in front of the same matrix; its waits
+# are bounded there (MODE_NEXT_*_TIMEOUT), and ci-eval-pr.sh skips the
+# report-only rollback round trip on this lane so nothing runs after the
+# verdict. What that does not cover is a
 # run whose cases stall rather than run: #1840's delegation block costs 45
 # minutes per repetition, and enough of those exceed any budget. That failure
 # is unsettled, so it withdraws the nomination and the next night asks again.
