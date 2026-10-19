@@ -16,6 +16,10 @@
 # dev install, main's answer named "the
 # cluster-bnaylor-kagents-dev-ka-today-2-northamerica-northeast1 agent", the
 # unsuffixed form. The report is lowercased and `_`-stripped before matching.
+# Known edges, accepted for a nightly case on the seeded pool: a cluster whose
+# own name starts with `cluster-` and has four more segments would false-fail,
+# and a truncated id with fewer segments than four would slip through. The
+# pool's clusters are named neither way.
 # The required phrase
 # is that the answer does describe the cluster agents, so a reply that drops
 # them entirely does not pass by saying nothing.
