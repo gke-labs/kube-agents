@@ -518,7 +518,7 @@ collector, and for the same reason the operator treats what it reads as untruste
 pod shares its network namespace across the agent container, the sidecar and any container
 `spec.deployment.sidecars` adds, and the watcher's port is free whenever its process is down, so
 a body on any of the ports can come from something other than the listeners. Folding each line as
-it is read keeps the operator's memory per poll at one line, under its 128Mi limit whatever the
+it is read keeps the operator's memory per poll at one line, under its memory limit whatever the
 fleet's exposition grows to, and the per-poll ceiling bounds what one body can do to a total; neither makes the body more trusted. What is left is stated
 rather than hidden: a workload in the pod can refuse the operator a count, can raise one by at
 most `usageDeltaCeiling` per poll for as long as it holds the port, and can never set one. The

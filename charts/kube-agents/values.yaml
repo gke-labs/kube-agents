@@ -193,13 +193,23 @@ operator:
     # not also create the CR (platformAgent.enabled=false), and after the first
     # install once the operator is serving.
     failurePolicy: Ignore
+  # Memory here is the manager's cache, and the cache holds one entry per
+  # object in the cluster, not per install: every informer it starts is
+  # cluster-wide. Measured on a 3-node install (761 cached objects over twelve
+  # kinds) the store is 3.7 MiB of live heap and the process 33 MiB of RSS;
+  # the kinds that stay cached — ConfigMaps, ServiceAccounts, ClusterRoles,
+  # RoleBindings — grow with the cluster's namespaces rather than its
+  # workloads, so the limit is sized for roughly an order of magnitude more of
+  # them. Pods, the one kind that grows with workloads, are read live and not
+  # cached. Raise both on a cluster with very many namespaces; the operator is
+  # one pod per install. Kept in step with k8s-operator/config/manager.
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 512Mi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 128Mi
 
 telemetry:
   # Where OpenTelemetry signals go. One setting, three consumers: the PlatformAgent CR,

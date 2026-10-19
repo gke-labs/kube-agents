@@ -137,13 +137,24 @@ spec:
               port: 8081
             initialDelaySeconds: 5
             periodSeconds: 10
+          # Memory here is the manager's cache, and the cache holds one entry
+          # per object in the CLUSTER, not per install: every informer it
+          # starts is cluster-wide. Measured on a 3-node install (761 cached
+          # objects over twelve kinds) the store is 3.7 MiB of live heap and
+          # the process 33 MiB of RSS; the kinds that remain cached --
+          # ConfigMaps, ServiceAccounts, ClusterRoles, RoleBindings -- grow
+          # with the cluster's namespaces rather than its workloads, so the
+          # limit is sized for roughly an order of magnitude more of them.
+          # Pods, the one kind that grows with workloads, are read live
+          # (podReader) and not cached at all (#3493). Keep in step with
+          # charts/kube-agents/values.yaml's operator.resources.
           resources:
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 512Mi
             requests:
               cpu: 10m
-              memory: 64Mi
+              memory: 128Mi
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
               name: cert
