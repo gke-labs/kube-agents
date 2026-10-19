@@ -1,3 +1,4 @@
+# merge-queue dry run (#1363): T4 changes a workflow file.
 name: Actionlint
 
 on:
