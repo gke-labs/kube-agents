@@ -128,11 +128,13 @@ type SessionRecord struct {
 	// serializes nothing, steers nothing, is no status ask's subject, and
 	// never counts as a task the conversation ran.
 	CardStop *CardStopRun `json:"cardStop,omitempty"`
-	// LastCardStopTaskID is the last control that ended, kept so a late event
-	// for it is dropped even when its task index outlived the route's
-	// retirement (a failed DropTask): read as an ordinary task, its terminal
-	// would post the executor's raw text.
-	LastCardStopTaskID string `json:"lastCardStopTaskId,omitempty"`
+	// RetiredCardStops are the last controls that ended, newest last, at most
+	// cardStopRetiredKept, kept so a late event for one is dropped even when
+	// its task index outlived the route's retirement (a failed DropTask):
+	// read as an ordinary task, its terminal would post the executor's raw
+	// text. More than one, because a follow-up ends seconds after the control
+	// it follows.
+	RetiredCardStops []string `json:"retiredCardStops,omitempty"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,

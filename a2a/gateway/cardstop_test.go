@@ -415,6 +415,13 @@ func TestCardStopReplyWording(t *testing.T) {
 		}
 		return out
 	}
+	many := func(prefix string, n int) []lib.CardStopCard {
+		out := make([]lib.CardStopCard, n)
+		for i := range out {
+			out[i] = lib.CardStopCard{ID: fmt.Sprintf("t_%s%d", prefix, i), Title: fmt.Sprintf("%s%d", prefix, i)}
+		}
+		return out
+	}
 	for _, tc := range []struct {
 		name string
 		r    lib.CardStopResult
@@ -440,8 +447,11 @@ func TestCardStopReplyWording(t *testing.T) {
 			"🛑 stopped 1 card: a; the stop ran out of time before it finished, so some may still be open"},
 		{"truncated", lib.CardStopResult{Stopped: cards("a"), Truncated: true},
 			"🛑 stopped 1 card: a; this conversation had more cards than one stop takes, so some may still be open"},
-		{"lists cut", lib.CardStopResult{Stopped: cards("a", "b", "c", "d", "e", "f"), ListsCut: true},
-			"🛑 stopped at least 6 cards: a, b, c, d, e and at least 1 more"},
+		// ListsCut is one flag; only the list at the cap is hedged.
+		{"stopped list cut", lib.CardStopResult{Stopped: many("s", lib.CardStopListMax), Settled: cards("x", "y"), ListsCut: true},
+			"🛑 stopped at least 200 cards: s0, s1, s2, s3, s4 and at least 195 more; already finished: x, y"},
+		{"settled list cut", lib.CardStopResult{Stopped: cards("a", "b", "c"), Settled: many("d", lib.CardStopListMax), ListsCut: true},
+			"🛑 stopped 3 cards: a, b, c; already finished: d0, d1, d2, d3, d4 and at least 195 more"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := cardStopReply(&tc.r, false); got != tc.want {
@@ -817,7 +827,7 @@ func TestCardStopLateEventAfterAFailedIndexDropIsDropped(t *testing.T) {
 	control := awaitSubmission(t, r, "platform", 1)
 	answerControl(t, r, control, &lib.CardStopResult{})
 	waitForRecord(t, r, conv, "the control ended", func(rec *SessionRecord) bool {
-		return rec.CardStop == nil && rec.LastCardStopTaskID == control.TaskID
+		return rec.CardStop == nil && slices.Contains(rec.RetiredCardStops, control.TaskID)
 	})
 	// The index survives, as a failed DropTask leaves it.
 	if err := r.g.reg.IndexTask(context.Background(), control.TaskID, conv); err != nil {
@@ -828,6 +838,33 @@ func TestCardStopLateEventAfterAFailedIndexDropIsDropped(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if n := len(r.adapter.postTexts()) + len(r.adapter.editTexts()); n != shownBefore || shownContaining(r, "raw bridge text") {
 		t.Fatalf("a late control event rendered: %q", r.adapter.postTexts())
+	}
+}
+
+// The same late event, for a control a follow-up has since followed and
+// ended: one remembered id would name the follow-up, not the control.
+func TestCardStopLateEventAfterAFollowUpIsDropped(t *testing.T) {
+	r := cardStopRig(t, 0)
+	conv := "discord:g1/thread-cardstop-late-fu"
+	ranATurn(t, r, conv)
+	sayStop(r, conv, "lf-stop-1")
+	control := awaitSubmission(t, r, "platform", 1)
+	sayStop(r, conv, "lf-stop-2")
+	waitForRecord(t, r, conv, "the mark", func(rec *SessionRecord) bool { return rec.CardStop != nil && rec.CardStop.Again != nil })
+	answerControl(t, r, control, &lib.CardStopResult{})
+	followUp := awaitSubmission(t, r, "platform", 2)
+	answerControl(t, r, followUp, &lib.CardStopResult{})
+	waitForRecord(t, r, conv, "both ended", func(rec *SessionRecord) bool {
+		return rec.CardStop == nil && slices.Contains(rec.RetiredCardStops, followUp.TaskID)
+	})
+	if err := r.g.reg.IndexTask(context.Background(), control.TaskID, conv); err != nil {
+		t.Fatal(err)
+	}
+	shownBefore := len(r.adapter.postTexts()) + len(r.adapter.editTexts())
+	publishFinal(t, r, control, "platform", lib.StateFailed, "raw bridge text")
+	time.Sleep(500 * time.Millisecond)
+	if n := len(r.adapter.postTexts()) + len(r.adapter.editTexts()); n != shownBefore || shownContaining(r, "raw bridge text") {
+		t.Fatalf("a late event for the first control rendered: %q", r.adapter.postTexts())
 	}
 }
 
@@ -873,6 +910,55 @@ func TestCardStopInjectCancelReportsTheStop(t *testing.T) {
 		return slices.Contains(entryTexts(entries, InjectEntryPost), cardStopPlaceholder) &&
 			slices.Contains(entryTexts(entries, InjectEntryEdit), "🛑 stopped 1 card: pods")
 	})
+}
+
+// A follow-up runs from the relay, inside no turn, so it must not move the
+// inject door's cancel count: a program's cancel waiting on the conversation
+// would read the follow-up as its own cancel on the bus.
+func TestCardStopFollowUpTellsNoDoorACancelWent(t *testing.T) {
+	r := startInjectRigWith(t, func(c *Config) { c.CardStop = true })
+	reply := r.inject(t, "case-cardstop-fu", injectTestAuthor, "check the pods")
+	origin := r.awaitTask(t, "platform")
+	completeTask(t, r.execFor(t, origin, "platform"), "checking")
+	r.waitForTerminal(t, reply.Conversation, reply.TaskID)
+	record := func() *SessionRecord {
+		rec, err := r.g.reg.Get(context.Background(), reply.Conversation)
+		if err != nil {
+			return nil
+		}
+		return rec
+	}
+	waitFor(t, "the conversation released", func() bool { rec := record(); return rec != nil && rec.ActiveTask == nil })
+	r.cancel(t, reply.Conversation, injectTestAuthor)
+	r.cancel(t, reply.Conversation, injectTestAuthor)
+	var first *lib.Envelope
+	waitFor(t, "the marked control", func() bool {
+		rec := record()
+		if rec == nil || rec.CardStop == nil || rec.CardStop.Again == nil {
+			return false
+		}
+		for _, e := range inSubjectEnvelopes(t, r.url, "platform") {
+			if e.TaskID == rec.CardStop.TaskID {
+				first = e
+				return true
+			}
+		}
+		return false
+	})
+	cancels := func() int {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		return r.adapter.conversationLocked(reply.Conversation).cancelsPublished
+	}
+	before := cancels()
+	answerControlOn(t, r.execFor(t, first, "platform"), &lib.CardStopResult{})
+	waitFor(t, "the follow-up in flight", func() bool {
+		rec := record()
+		return rec != nil && rec.CardStop != nil && rec.CardStop.TaskID != first.TaskID
+	})
+	if got := cancels(); got != before {
+		t.Fatalf("the follow-up moved the door's cancel count from %d to %d", before, got)
+	}
 }
 
 // gke-labs#3263 review L3: on the A2A door a `stop` that names no task sends

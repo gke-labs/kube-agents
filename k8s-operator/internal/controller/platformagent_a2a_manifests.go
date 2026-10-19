@@ -397,9 +397,9 @@ const (
 	// install: the control it sends needs a hermes-bridge sidecar and an
 	// agent image that answer it, and the operator cannot tell which images
 	// an install runs. An older bridge rejects the control and the gateway
-	// falls back to the old reply, so an early flip is wrong words rather
-	// than broken; the default stays off until the images that answer it
-	// ship together. a2aCardStopTimeoutEnvVar is the gateway's wait for the
+	// answers that it couldn't confirm the cards stopped, so an early flip
+	// is a hedged reply rather than broken; the default stays off until the
+	// images that answer it ship together. a2aCardStopTimeoutEnvVar is the gateway's wait for the
 	// control, rendered at the gateway's default (a2aCardStopTimeout).
 	a2aCardStopEnvVar        = "A2A_CARD_STOP"
 	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"

@@ -197,7 +197,8 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   answers `no-text-parts`), fails, is canceled, completes with no `cardStop` part, or has
   no terminal inside `A2A_CARD_STOP_TIMEOUT` (75s, above the bridge's worst case of about
   60s) gets "⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working", never a success. On an armed install the card notice ("stopping a card
-  from chat isn't supported yet") is not used. Past the timeout the gateway also cancels the
+  from chat isn't supported yet") is used only where no control is sent: a conversation whose
+  tasks go to a session worker (the session route, or after `delegate`). Past the timeout the gateway also cancels the
   control. Each control's end is one log line, `card stop ended`, with the terminal's
   `state`, its `reason` token and an `outcome`: `answered`, `no-result` (completed with no
   part), `not-stopped` (rejected, failed or canceled; `rejected` with `no-text-parts` is a

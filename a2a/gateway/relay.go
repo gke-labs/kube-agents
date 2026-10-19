@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -262,7 +263,7 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 		g.applyCardStopEvent(ctx, rec, rs, item)
 		return
 	}
-	if rec.LastCardStopTaskID != "" && rec.LastCardStopTaskID == env.TaskID {
+	if slices.Contains(rec.RetiredCardStops, env.TaskID) {
 		g.retireTaskRoute(ctx, env.TaskID)
 		return
 	}

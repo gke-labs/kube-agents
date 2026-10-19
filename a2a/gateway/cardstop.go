@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -89,6 +90,11 @@ const (
 	cardStopNamed      = 5
 	cardStopTitleRunes = 80
 )
+
+// cardStopRetiredKept is how many ended controls a record remembers
+// (SessionRecord.RetiredCardStops): a control and the follow-ups a repeated
+// stop chains behind it, with room to spare.
+const cardStopRetiredKept = 4
 
 // The outcomes the "card stop ended" log line names, one per way a control
 // ends. INSTALL.md's troubleshooting quotes them.
@@ -248,7 +254,13 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 		g.answerCardStop(rec.Key, statusMsgID, cardStopUnconfirmedNotice)
 		return
 	}
-	g.observeCancelPublished(rec.Key, taskID)
+	// Only a stop's own turn tells a door its cancel went out. A quiet
+	// follow-up runs from the relay or the timer, inside no turn, and a
+	// door's cancel waiting on this conversation must not read it as its
+	// own.
+	if !quiet {
+		g.observeCancelPublished(rec.Key, taskID)
+	}
 	g.armCardStopTimer(rec.Key, taskID, authority)
 }
 
@@ -353,12 +365,15 @@ func cardStopNews(r *lib.CardStopResult) bool {
 }
 
 // endCardStop clears rec's control, whatever ended it: its timer, its route
-// (a late event finds no route, and LastCardStopTaskID catches one whose
+// (a late event finds no route, and RetiredCardStops catches one whose
 // index outlived the drop), and then the follow-up a later stop asked for.
 func (g *Gateway) endCardStop(ctx context.Context, rec *SessionRecord) {
 	run := rec.CardStop
 	rec.CardStop = nil
-	rec.LastCardStopTaskID = run.TaskID
+	rec.RetiredCardStops = append(rec.RetiredCardStops, run.TaskID)
+	if n := len(rec.RetiredCardStops); n > cardStopRetiredKept {
+		rec.RetiredCardStops = slices.Clone(rec.RetiredCardStops[n-cardStopRetiredKept:])
+	}
 	g.stopCardStopTimer(run.TaskID)
 	g.retireTaskRoute(ctx, run.TaskID)
 	if run.Again != nil {
@@ -538,18 +553,22 @@ func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	if r.Truncated {
 		clauses = append(clauses, "this conversation had more cards than one stop takes, so some may still be open")
 	}
+	// ListsCut is one flag for both lists; the one that was cut is the one
+	// at the executor's cap (lib.CardStopListMax).
+	stoppedCut := r.ListsCut && len(r.Stopped) >= lib.CardStopListMax
+	settledCut := r.ListsCut && len(r.Settled) >= lib.CardStopListMax
 	if len(r.Settled) > 0 {
-		clauses = append(clauses, "already finished: "+cardTitles(r.Settled, r.ListsCut))
+		clauses = append(clauses, "already finished: "+cardTitles(r.Settled, settledCut))
 	}
 
 	var head string
 	switch {
 	case len(r.Stopped) > 0:
 		count := cardCount(len(r.Stopped))
-		if r.ListsCut {
+		if stoppedCut {
 			count = "at least " + count
 		}
-		head = "🛑 stopped " + count + ": " + cardTitles(r.Stopped, r.ListsCut)
+		head = "🛑 stopped " + count + ": " + cardTitles(r.Stopped, stoppedCut)
 	case r.Failed > 0 || r.Pending > 0 || r.Deadline || r.Truncated || r.Unresolved > 0:
 		head = "⚠️ no card was stopped"
 	case turnRunning:
