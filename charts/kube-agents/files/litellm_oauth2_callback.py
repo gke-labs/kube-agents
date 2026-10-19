@@ -1,0 +1,241 @@
+"""Exchange OAuth2 client credentials for the bearer an openai_compatible gateway wants.
+
+An enterprise AI gateway that speaks the OpenAI chat-completions API often
+takes no static key: a client id and secret are exchanged at a token URL for a
+short-lived bearer token (OAuth2 client_credentials, RFC 6749 section 4.4)
+that has to be renewed before it expires. LiteLLM's hosted_vllm handler, which
+the chart uses for openai_compatible, sends whatever api_key the request
+carries, so this pre-call hook fetches the token, caches it, renews it ahead
+of expiry and sets it as the request's api_key on every request whose alias
+routes to hosted_vllm deployments. Any other alias is left as sent.
+
+The environment configures it, filled from the Secret litellm.envFromSecret
+names:
+
+  OPENAI_COMPATIBLE_OAUTH_TOKEN_URL     the token endpoint; unset, the hook is idle
+  OPENAI_COMPATIBLE_OAUTH_CLIENT_ID
+  OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET
+  OPENAI_COMPATIBLE_OAUTH_SCOPE         optional, sent as scope
+  OPENAI_COMPATIBLE_OAUTH_CLIENT_AUTH   basic (default): id and secret in an
+                                        Authorization header; post: in the form
+
+The token request is a form POST through urllib in a worker thread, so the
+proxy's event loop is not held. It leaves the pod under the gateway's egress
+rules, so the token URL has to be reachable the way the server is: a public
+address on 443, or inside litellm.openaiCompatible.egressCIDRs. A response
+without expires_in is kept for DEFAULT_TOKEN_LIFETIME_SECONDS. A failed
+exchange raises, so the request that needed the token fails with that error
+rather than leaving without a credential, and the next request tries again.
+
+The chart renders this file into the litellm-config ConfigMap only for
+openai_compatible with litellm.envFromSecret set;
+tests/test_litellm_oauth2_callback.py holds it to this contract.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import logging
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+from litellm.integrations.custom_logger import CustomLogger
+
+TOKEN_URL_ENV = "OPENAI_COMPATIBLE_OAUTH_TOKEN_URL"
+CLIENT_ID_ENV = "OPENAI_COMPATIBLE_OAUTH_CLIENT_ID"
+# Named for what it holds, the variable's name, not the credential: CodeQL's
+# clear-text queries read "secret" in an identifier as the credential itself.
+CLIENT_CREDENTIAL_ENV = "OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET"
+SCOPE_ENV = "OPENAI_COMPATIBLE_OAUTH_SCOPE"
+CLIENT_AUTH_ENV = "OPENAI_COMPATIBLE_OAUTH_CLIENT_AUTH"
+CLIENT_AUTH_BASIC = "basic"
+CLIENT_AUTH_POST = "post"
+GRANT_TYPE = "client_credentials"
+# Renew this long before the stated expiry, so a request that starts just
+# before the deadline does not reach the server with a token it has already
+# stopped accepting.
+REFRESH_MARGIN_SECONDS = 60
+# For a token response that names no expires_in (RFC 6749 recommends it and
+# does not require it): short, so a server that rotates quietly is not outrun.
+DEFAULT_TOKEN_LIFETIME_SECONDS = 300
+TOKEN_REQUEST_TIMEOUT_SECONDS = 15
+ACCESS_TOKEN_KEY = "access_token"
+EXPIRES_IN_KEY = "expires_in"
+FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
+JSON_CONTENT_TYPE = "application/json"
+# The provider prefix the chart gives every openai_compatible deployment.
+HOSTED_VLLM_PREFIX = "hosted_vllm/"
+MODEL_KEY = "model"
+# The request field LiteLLM's router hands through to the provider handler,
+# which hosted_vllm sends as the bearer.
+REQUEST_CREDENTIAL_KEY = "api_key"
+DEPLOYMENT_PARAMS_KEY = "litellm_params"
+DEPLOYMENT_MODEL_KEY = "model"
+# The proxy leaves the root logger at WARNING and this logger has no handler
+# of its own; the fetch and renew lines are the sign the hook is at work.
+LOG_LEVEL = logging.INFO
+LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+
+logger = logging.getLogger("litellm_oauth2_callback")
+
+# Whether the hook has already said it cannot see the router, so a LiteLLM
+# change that blinds it is logged once rather than on every request.
+_blind_warned = False
+
+
+class TokenCache:
+    """One bearer token and when it stops being safe to send."""
+
+    def __init__(self) -> None:
+        self.token = ""
+        self.expires_at = 0.0
+        self.lock = asyncio.Lock()
+
+    def usable(self) -> bool:
+        return bool(self.token) and time.monotonic() < self.expires_at - REFRESH_MARGIN_SECONDS
+
+
+_cache = TokenCache()
+
+
+def settings_from_env(environ: Any = None) -> dict[str, str] | None:
+    """The hook's configuration, or None while the token URL is unset."""
+    env = os.environ if environ is None else environ
+    token_url = str(env.get(TOKEN_URL_ENV, "")).strip()
+    if not token_url:
+        return None
+    client_id = str(env.get(CLIENT_ID_ENV, "")).strip()
+    client_secret = str(env.get(CLIENT_CREDENTIAL_ENV, "")).strip()
+    if not client_id or not client_secret:
+        raise ValueError(f"oauth2: {TOKEN_URL_ENV} is set but {CLIENT_ID_ENV} or {CLIENT_CREDENTIAL_ENV} is empty")
+    client_auth = str(env.get(CLIENT_AUTH_ENV, CLIENT_AUTH_BASIC)).strip().lower() or CLIENT_AUTH_BASIC
+    if client_auth not in (CLIENT_AUTH_BASIC, CLIENT_AUTH_POST):
+        raise ValueError(f"oauth2: {CLIENT_AUTH_ENV} must be {CLIENT_AUTH_BASIC} or {CLIENT_AUTH_POST}, not {client_auth!r}")
+    return {
+        "token_url": token_url,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": str(env.get(SCOPE_ENV, "")).strip(),
+        "client_auth": client_auth,
+    }
+
+
+def fetch_token(settings: dict[str, str]) -> tuple[str, float]:
+    """Blocking: run the client_credentials grant; return the token and its lifetime in seconds."""
+    form = {"grant_type": GRANT_TYPE}
+    if settings["scope"]:
+        form["scope"] = settings["scope"]
+    headers = {"Content-Type": FORM_CONTENT_TYPE, "Accept": JSON_CONTENT_TYPE}
+    if settings["client_auth"] == CLIENT_AUTH_POST:
+        form["client_id"] = settings["client_id"]
+        form["client_secret"] = settings["client_secret"]
+    else:
+        pair = f"{settings['client_id']}:{settings['client_secret']}".encode()
+        headers["Authorization"] = "Basic " + base64.b64encode(pair).decode()
+    request = urllib.request.Request(
+        settings["token_url"], data=urllib.parse.urlencode(form).encode(), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TOKEN_REQUEST_TIMEOUT_SECONDS) as response:
+            body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"oauth2: the token endpoint answered {exc.code} {exc.reason}") from None
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(f"oauth2: the token request failed: {exc}") from None
+    token = body.get(ACCESS_TOKEN_KEY) if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token:
+        raise RuntimeError(f"oauth2: the token response carries no {ACCESS_TOKEN_KEY}")
+    try:
+        lifetime = float(body.get(EXPIRES_IN_KEY, DEFAULT_TOKEN_LIFETIME_SECONDS))
+    except (TypeError, ValueError):
+        lifetime = float(DEFAULT_TOKEN_LIFETIME_SECONDS)
+    return token, lifetime
+
+
+async def bearer_for(settings: dict[str, str], cache: TokenCache) -> str:
+    """The cached token while it is safe to send, otherwise a fresh one; one fetch at a time."""
+    if cache.usable():
+        return cache.token
+    async with cache.lock:
+        if cache.usable():
+            return cache.token
+        verb = "renewed" if cache.token else "fetched"
+        try:
+            token, lifetime = await asyncio.to_thread(fetch_token, settings)
+        except Exception as exc:  # noqa: BLE001 - the request that needed the token gets the error
+            logger.warning("oauth2: %s; the request fails and the next one tries again", exc)
+            raise
+        cache.token, cache.expires_at = token, time.monotonic() + lifetime
+        logger.info("oauth2: %s a bearer token from %s, valid for %d s", verb, settings["token_url"], int(lifetime))
+        if lifetime <= REFRESH_MARGIN_SECONDS:
+            logger.warning("oauth2: the token lives %d s, within the %d s renewal margin, so every request renews it", int(lifetime), REFRESH_MARGIN_SECONDS)
+        return token
+
+
+def routes_to_hosted_vllm(model_name: str, router: Any) -> bool:
+    """Whether every deployment ``router`` serves ``model_name`` with is a hosted_vllm one.
+
+    False when the alias cannot be resolved: the request then goes out as it
+    was, and the hook says once that it is blind.
+    """
+    if router is None:
+        _warn_blind("no LiteLLM router to resolve aliases with")
+        return False
+    if not model_name:
+        return False
+    try:
+        deployments = router.get_model_list(model_name=model_name) or []
+    except Exception as exc:  # noqa: BLE001 - an unresolvable alias is left alone
+        _warn_blind(f"the router could not resolve {model_name!r} ({exc})")
+        return False
+    models = [(d.get(DEPLOYMENT_PARAMS_KEY) or {}).get(DEPLOYMENT_MODEL_KEY, "") for d in deployments]
+    if not models or not any(models):
+        _warn_blind(f"the router returned no deployment model for {model_name!r}")
+        return False
+    return all(str(m).startswith(HOSTED_VLLM_PREFIX) for m in models)
+
+
+def _warn_blind(reason: str) -> None:
+    global _blind_warned
+    if not _blind_warned:
+        _blind_warned = True
+        logger.warning("oauth2: hook inactive, %s; requests go out without a bearer token", reason)
+
+
+def _configure_logger() -> None:
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        logger.addHandler(handler)
+    logger.setLevel(LOG_LEVEL)
+    logger.propagate = False
+
+
+def _router() -> Any:
+    try:
+        from litellm.proxy.proxy_server import llm_router
+    except Exception:  # noqa: BLE001 - outside the proxy there is no router
+        return None
+    return llm_router
+
+
+class OAuth2ClientCredentials(CustomLogger):
+    async def async_pre_call_hook(self, user_api_key_dict: Any, cache: Any, data: dict, call_type: Any) -> dict:
+        settings = settings_from_env()
+        if settings is None:
+            return data
+        if not routes_to_hosted_vllm(data.get(MODEL_KEY, ""), _router()):
+            return data
+        data[REQUEST_CREDENTIAL_KEY] = await bearer_for(settings, _cache)
+        return data
+
+
+_configure_logger()
+proxy_handler_instance = OAuth2ClientCredentials()

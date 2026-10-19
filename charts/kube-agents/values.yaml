@@ -241,14 +241,31 @@ litellm:
   # the otel callback's DNS failure aborts every LLM request. Enable it once
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
-  # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai, openai_compatible. The provider's API
-  # key must exist in the credentials Secret — except vertex_ai, which
-  # authenticates with Workload Identity instead, and openai_compatible, whose
-  # key (OPENAI_COMPATIBLE_API_KEY) is optional; see openaiCompatible below.
+  # model-default routes to <modelProvider>/<modelDefaultName>. Providers with
+  # a default model: gemini, anthropic, openai, vertex_ai, sap (SAP AI Core).
+  # The provider's API key must exist in the credentials Secret — except
+  # vertex_ai, which authenticates with Workload Identity instead;
+  # openai_compatible, whose key (OPENAI_COMPATIBLE_API_KEY) is optional (see
+  # openaiCompatible below); and sap, whose credentials arrive through
+  # envFromSecret. Any other LiteLLM provider slug (azure, bedrock, ...) is
+  # accepted when modelDefaultName names the model; its credentials arrive
+  # through envFromSecret too.
   modelProvider: gemini
+  # A Secret in the release namespace mounted whole into the gateway container
+  # as environment variables (envFrom, optional: a missing Secret does not stop
+  # the pod). Create it yourself; the chart only names it. It carries whatever
+  # the LiteLLM provider reads from the environment: AICORE_SERVICE_KEY and
+  # AICORE_RESOURCE_GROUP for sap, AZURE_API_KEY and AZURE_API_BASE for azure,
+  # and for openai_compatible the OAuth2 client-credentials trio
+  # OPENAI_COMPATIBLE_OAUTH_TOKEN_URL / _CLIENT_ID / _CLIENT_SECRET, which turns
+  # on the gateway's token-exchange hook. A key the chart also sets from the
+  # credentials Secret (GEMINI_API_KEY, HOSTED_VLLM_API_KEY, ...) wins over the
+  # same name here. envFrom does not roll the pods on a Secret change:
+  # `kubectl rollout restart deployment/litellm` after rotating it.
+  envFromSecret: ""
   # Empty selects the per-provider default (mirrors common.sh).
-  # A Claude model (anthropic, or vertex_ai with a claude-* name) gets
+  # A Claude model (anthropic, vertex_ai with a claude-* name, or sap with an
+  # anthropic--* name) gets
   # additional_drop_params: temperature, top_p and top_k under every alias,
   # because Claude Opus 5 refuses them and a caller may send them anyway.
   # Chart-only; the kustomize dev base carries no such key.

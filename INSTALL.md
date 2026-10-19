@@ -302,7 +302,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai` or `openai_compatible`),
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`, `sap`, or
+   another LiteLLM provider slug),
    where the model credential comes from, and, if the operator wants GitOps pull requests, the
    forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
@@ -335,7 +336,11 @@ An agent given that prompt, or reading this file on its own, follows these steps
    (`--openai-compatible-api-base`), and either the server pod's port for an in-cluster Service
    (`--openai-compatible-target-port`) or the CIDRs of a private address
    (`--openai-compatible-egress-cidrs`), and add those flags to the dry run; its key is optional and
-   goes in `OPENAI_COMPATIBLE_API_KEY`. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#openai-compatible-endpoints-self-hosted-or-private)
+   goes in `OPENAI_COMPATIBLE_API_KEY`. `sap` (SAP AI Core) and any other LiteLLM provider slug take
+   their credentials from a Secret the operator creates in the agent's namespace and names with
+   `--litellm-env-secret` (the SAP service key under `AICORE_SERVICE_KEY`; a slug outside the menu
+   also needs `--model-default-name`); the same flag carries an `openai_compatible` gateway's OAuth2
+   client credentials. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#openai-compatible-endpoints-self-hosted-or-private)
    has every setting. For a GitOps repository on
    GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
    [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
@@ -1477,6 +1482,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
   ```
+
   - The Slack lines (`dropping message from unverified sender`, `slack: ignoring a message from another workspace's member`, `chat backend stopped; restarting it, the console stays up`, and the empty-allowlist warning) and their fixes are in [Slack app setup → Verify](https://gke-labs.github.io/kube-agents/install/slack-app/#verify). A sender the allowlist refuses was sent the `⛔ I can't verify who you are …` notice once, unless all they did was reply under one of the bot's own posts without a mention, which logs only `dropping unaddressed message from unverified sender` at info level; on Google Chat, add their email to `ALLOWED_USERS` in `install.env` and run `./upgrade.sh`.
   - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map-next-optional)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
   - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).

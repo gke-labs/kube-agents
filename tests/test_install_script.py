@@ -1386,6 +1386,15 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             proc.stdout,
         )
 
+    def test_parse_args_litellm_env_secret_flag(self):
+        cmd = (
+            "parse_args --model-provider=sap --litellm-env-secret=sap-aicore; "
+            'echo "P=$PARAM_MODEL_PROVIDER S=$PARAM_LITELLM_ENV_SECRET_NAME"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("P=sap S=sap-aicore", proc.stdout)
+
     def test_validate_openai_compatible_inputs_refuses_what_the_chart_or_operator_would(self):
         # The chart cannot render without these, and the operator drops the
         # whole egress rule over one bad CIDR, so the installer stops before
@@ -6525,8 +6534,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         end = text.index("\n        ;;\n", start)
         names = ("allowed_users anthropic_api_key chat_sub_name chat_topic_name cluster_name custom_roles "
                  "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
-                 "google_chat_home_channel image_tag kms_key kms_keyring model_default_name model_provider "
-                 "openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
+                 "google_chat_home_channel image_tag kms_key kms_keyring litellm_env_secret_name model_default_name "
+                 "model_provider openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
                  "openai_compatible_egress_cidrs openai_compatible_target_port permission_set project_id region "
                  "repo_dir vertex_location vertex_project_id").split()
         stubs = (

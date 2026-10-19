@@ -95,7 +95,11 @@ in, where the operator sets it.
    model name (`--model-default-name`), the base URL with `/v1` (`--openai-compatible-api-base`),
    and the server pod's port for an in-cluster Service (`--openai-compatible-target-port`) or the
    CIDRs of a private address (`--openai-compatible-egress-cidrs`). The key
-   (`OPENAI_COMPATIBLE_API_KEY`) and a CA Secret for a private CA are optional.
+   (`OPENAI_COMPATIBLE_API_KEY`) and a CA Secret for a private CA are optional. `sap` (SAP AI
+   Core) and any other LiteLLM provider slug read their credentials from a Secret the operator
+   creates in the agent's namespace and names with `--litellm-env-secret` (never ask for the
+   service key itself); a slug outside the menu also needs `--model-default-name`. The same flag
+   names the Secret holding an `openai_compatible` gateway's OAuth2 client credentials.
 4. **How the operator reaches the agent** — a terminal when no chat flag is passed (see
    [Handing over a chat-less install](#handing-over-a-chat-less-install)), `--enable-google-chat`,
    or `--enable-slack` (tokens in `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`).

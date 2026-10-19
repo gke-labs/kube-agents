@@ -764,10 +764,15 @@ neither key), which only openai_compatible passes.
   model, not only the ones that refuse: a name test that tracked which do
   would break on each new release, and an older Claude losing a caller's
   sampling override is a quieter failure than a 400. Claude only: anthropic
-  serves nothing else, vertex_ai serves Claude under claude-* names, and a
-  Gemini or OpenAI render stays byte-identical.
+  serves nothing else, vertex_ai serves Claude under claude-* names, sap (SAP
+  AI Core) under anthropic--* names and forwards temperature and top_p into
+  its orchestration request, and a Gemini or OpenAI render stays
+  byte-identical. $claudeDrop is that set; $claude, which also gates prompt
+  caching below, leaves sap out, because the cache_control markers have not
+  been shown to pass SAP's orchestration API.
 */}}
 {{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
+{{- $claudeDrop := or $claude (and (eq .provider "sap") (hasPrefix "anthropic--" .model)) -}}
 {{- /*
   openai_compatible goes through LiteLLM's hosted_vllm handler, which speaks the
   same OpenAI chat-completions API, rather than through openai/. Read from
@@ -794,7 +799,7 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: hermes-agent
@@ -812,7 +817,7 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: {{ .model }}
@@ -830,7 +835,7 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
 litellm_settings:
