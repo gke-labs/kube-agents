@@ -85,7 +85,7 @@ ids = [a for a in sys.argv[4:] if a]
 # Seconds a read waits on a locked store before giving up. A hermes writer
 # holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
-out = {"statuses": {}, "summaries": {}, "errors": {}, "error": None}
+out = {"statuses": {}, "summaries": {}, "errors": {}, "block_kinds": {}, "error": None}
 
 
 def has_table(conn, name):
@@ -103,16 +103,41 @@ try:
     marks = ",".join("?" for _ in ids)
     cols = columns(conn, "tasks")
     has_lfe = "last_failure_error" in cols
-    query = "SELECT id, status%s FROM tasks WHERE id IN (%s)" % (", last_failure_error" if has_lfe else "", marks)
+    has_bk = "block_kind" in cols
+    query = "SELECT id, status%s%s FROM tasks WHERE id IN (%s)" % (
+        ", last_failure_error" if has_lfe else "",
+        ", block_kind" if has_bk else "",
+        marks,
+    )
     rows = conn.execute(query, ids).fetchall()
     for row in rows:
         tid, status = row[0], row[1]
         out["statuses"][str(tid)] = str(status)
-        if has_lfe and len(row) > 2 and row[2]:
-            out["errors"][str(tid)] = str(row[2])
+        idx = 2
+        if has_lfe:
+            if len(row) > idx and row[idx]:
+                out["errors"][str(tid)] = str(row[idx])
+            idx += 1
+        if has_bk:
+            if len(row) > idx and row[idx]:
+                out["block_kinds"][str(tid)] = str(row[idx])
     if has_table(conn, "task_runs"):
         run_cols = columns(conn, "task_runs")
-        if "summary" in run_cols:
+        has_sum = "summary" in run_cols
+        has_err = "error" in run_cols
+        if has_sum and has_err:
+            for tid in ids:
+                r = conn.execute(
+                    "SELECT summary, error FROM task_runs WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                if r:
+                    if r[0]:
+                        out["summaries"][str(tid)] = str(r[0])
+                    if r[1] and str(tid) not in out["errors"]:
+                        out["errors"][str(tid)] = str(r[1])
+        elif has_sum:
             for tid in ids:
                 r = conn.execute(
                     "SELECT summary FROM task_runs WHERE task_id = ? "
@@ -121,7 +146,7 @@ try:
                 ).fetchone()
                 if r and r[0]:
                     out["summaries"][str(tid)] = str(r[0])
-        if "error" in run_cols:
+        elif has_err:
             for tid in ids:
                 r = conn.execute(
                     "SELECT error FROM task_runs WHERE task_id = ? "
@@ -366,10 +391,10 @@ def command(task_ids: list[str]) -> str:
 
 def read_board_state(
     shell: Callable[[str, float], str], task_ids: list[str], timeout: float
-) -> tuple[dict[str, str], dict[str, str], dict[str, str]] | None:
-    """The board's current status, latest summary, and errors for each of ``task_ids``, or ``None``.
+) -> tuple[dict[str, str], dict[str, str], dict[str, str], dict[str, str]] | None:
+    """The board's current status, latest summary, errors, and block kinds for each of ``task_ids``, or ``None``.
 
-    Returns a tuple of ``(statuses, summaries, errors)``.
+    Returns a tuple of ``(statuses, summaries, errors, block_kinds)``.
     """
     if not task_ids:
         return None
@@ -404,7 +429,13 @@ def read_board_state(
         if isinstance(raw_errors, dict)
         else {}
     )
-    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}, summaries, errors
+    raw_block_kinds = payload.get("block_kinds")
+    block_kinds = (
+        {str(k): str(v) for k, v in raw_block_kinds.items() if k in task_ids}
+        if isinstance(raw_block_kinds, dict)
+        else {}
+    )
+    return {str(k): str(v) for k, v in statuses.items() if k in task_ids}, summaries, errors, block_kinds
 
 
 def read_statuses(

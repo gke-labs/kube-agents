@@ -399,10 +399,11 @@ def test_read_board_state_returns_summaries_and_errors(tmp_path: Path) -> None:
     reply = _run_script(tmp_path, [FRONT])
     got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
     assert got is not None
-    statuses, summaries, errors = got
+    statuses, summaries, errors, block_kinds = got
     assert statuses == {FRONT: "failed"}
     assert summaries == {FRONT: "API retries exhausted"}
     assert errors == {FRONT: "HTTP 429 TPM quota exhausted"}
+    assert block_kinds == {}
 
 
 def test_read_board_state_returns_error_from_task_runs_when_last_failure_error_is_null(tmp_path: Path) -> None:
@@ -420,10 +421,11 @@ def test_read_board_state_returns_error_from_task_runs_when_last_failure_error_i
     reply = _run_script(tmp_path, [FRONT])
     got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
     assert got is not None
-    statuses, summaries, errors = got
+    statuses, summaries, errors, block_kinds = got
     assert statuses == {FRONT: "failed"}
     assert summaries == {}
     assert errors == {FRONT: "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"}
+    assert block_kinds == {}
 
 
 def test_read_board_state_newest_run_without_error_clears_older_error(tmp_path: Path) -> None:
@@ -445,10 +447,11 @@ def test_read_board_state_newest_run_without_error_clears_older_error(tmp_path: 
     reply = _run_script(tmp_path, [FRONT])
     got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
     assert got is not None
-    statuses, summaries, errors = got
+    statuses, summaries, errors, block_kinds = got
     assert statuses == {FRONT: "failed"}
     assert summaries == {}
     assert errors == {}
+    assert block_kinds == {}
 
 
 def test_read_board_state_newest_run_without_summary_clears_older_summary(tmp_path: Path) -> None:
@@ -470,9 +473,27 @@ def test_read_board_state_newest_run_without_summary_clears_older_summary(tmp_pa
     reply = _run_script(tmp_path, [FRONT])
     got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
     assert got is not None
-    statuses, summaries, errors = got
+    statuses, summaries, errors, block_kinds = got
     assert statuses == {FRONT: "failed"}
     assert summaries == {}
+    assert block_kinds == {}
+
+
+def test_read_board_state_returns_block_kind_when_present(tmp_path: Path) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, block_kind TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, status, block_kind) VALUES (?, ?, ?)",
+            (FRONT, "blocked", "transient"),
+        )
+    reply = _run_script(tmp_path, [FRONT])
+    got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
+    assert got is not None
+    statuses, summaries, errors, block_kinds = got
+    assert statuses == {FRONT: "blocked"}
+    assert summaries == {}
+    assert errors == {}
+    assert block_kinds == {FRONT: "transient"}
 
 
 def test_read_session_cards_newest_run_without_summary_does_not_return_older_summary(
