@@ -295,6 +295,7 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertEqual(plugin.CONVERSATION_FILE, bootstrap_delivery.CONVERSATION_FILE)
         self.assertEqual(plugin.CONVERSATION_ALIGNED_MARKER, bootstrap_delivery.CONVERSATION_ALIGNED_MARKER)
         self.assertEqual(plugin.CONVERSATION_ATTEMPTS_FILE, bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE)
+        self.assertEqual(plugin.CONVERSATION_DONE_FILE, bootstrap_delivery.CONVERSATION_DONE_FILE)
 
     def test_the_report_and_its_note_post_into_the_conversation_once(self):
         self.assertEqual(self._run(), 0)
@@ -513,7 +514,28 @@ class DeliveryToConversationTest(unittest.TestCase):
         # The gateway and the agent ship in different images, so these texts cannot change.
         source = (Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "notify.go").read_text(encoding="utf-8")
         self.assertIn(f'"{bootstrap_delivery.NOTIFY_EDIT_FAILED_PREFIX} "', source)
-        self.assertIn(f'"{"post failed:"} "', source)
+
+    def test_a_stale_claim_after_a_recorded_attempt_is_not_counted_twice(self):
+        self._claim(bootstrap_delivery.STALE_CLAIM_SECONDS + 1)
+        record = {"attempts": 2, "last_reason": "refused", "last_at": time.time()}
+        (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self._run()
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(self._attempts()["attempts"], 2)
+
+    def test_the_outcome_is_recorded_before_the_note_goes(self):
+        flag, chat = self._card()
+        seen = []
+
+        def run(argv, **kwargs):
+            if "--chat-file" not in argv:
+                seen.append((self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).exists())
+            return self._fake_run(argv, **kwargs)
+
+        with flag, chat, mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bootstrap_delivery.main(self.d)
+        self.assertEqual(seen, [True])
 
     def test_an_absent_route_is_retried_then_released(self):
         delays = bootstrap_delivery.time.sleep

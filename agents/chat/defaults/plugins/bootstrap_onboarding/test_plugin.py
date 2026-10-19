@@ -841,10 +841,12 @@ class ConversationPrimingTest(unittest.TestCase):
             self.assertFalse((self.data_dir / name).exists(), name)
         self.trigger_job.assert_not_called()
 
-    def test_a_new_binding_starts_the_attempt_count_again(self):
+    def test_a_new_binding_starts_the_attempt_count_and_outcome_again(self):
         (self.data_dir / plugin.CONVERSATION_ATTEMPTS_FILE).write_text('{"attempts": 5}', encoding="utf-8")
+        (self.data_dir / plugin.CONVERSATION_DONE_FILE).write_text("posted\n", encoding="utf-8")
         self.assertIsNotNone(self._bridge_call())
         self.assertFalse((self.data_dir / plugin.CONVERSATION_ATTEMPTS_FILE).exists())
+        self.assertFalse((self.data_dir / plugin.CONVERSATION_DONE_FILE).exists())
 
     def test_a_turn_that_takes_the_priming_after_a_greeting_binds_nothing(self):
         # It passed the greeted check while another turn was priming, and takes the marker after.

@@ -47,7 +47,10 @@ That record wins over a job origin. The run then never prints the report, since 
 cannot reach a gateway conversation: it checks before the claim that this child's env carries the
 bus address, a bus identity and the gateway's platform, posts the report
 and the audits note with ``a2a notify --conversation``, marks the findings shown only once the post
-landed, and releases the claim when nothing posted, to try again after a wait, up to
+landed, and releases the claim when the attempt was not confirmed posted (on the card path anything
+short of a post, since the next attempt's update key edits a card that landed; on the text path an
+exit 1), or when a claim outlives the longest post with no outcome recorded, to try again after a
+wait, up to
 ``CONVERSATION_MAX_ATTEMPTS`` (``CONVERSATION_ATTEMPTS_FILE`` records why). So on that path a claim
 is one attempt rather than the delivery, and the marks follow the post rather than the claim.
 Then only the audits note below is printed, as a second message; any failure prints the
@@ -354,13 +357,11 @@ def _record_attempt(data_dir: Path, reason: str, counted: bool) -> None:
 
 def _log_to_stage(data_dir: Path, message: str) -> None:
     """Append ``message`` to oobe's stage log, which an operator reads; stderr from an exit-0 run is dropped."""
-    path = data_dir / oobe.STAGE_LOG
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
+        with oobe._open_stage_log(data_dir) as handle:
             handle.write(f"{datetime.now(timezone.utc).strftime(RUN_FORMAT)} bootstrap_delivery: {message}\n")
     except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not write {path}: {e}\n")
+        sys.stderr.write(f"bootstrap_delivery: could not write {oobe.STAGE_LOG}: {e}\n")
 
 
 def _outcome_recorded(data_dir: Path) -> bool:

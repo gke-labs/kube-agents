@@ -73,7 +73,8 @@ report itself and files no ranking card. The ranking worker writes `/opt/data/IN
 sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
 (`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or under `spec.mode: next`
 `.user_aligned_conversation`) and claims
-`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run five minutes later removes both jobs.
+`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run `RETIRE_AFTER_SECONDS` later (five minutes
+then, about 16 now) removes both jobs.
 
 ## 4. First-run audits
 
@@ -231,8 +232,9 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   for the stage), so a failed delivery posts only delivery's own error; an exception in either is
   caught so it neither posts nor blocks delivery. The plugin triggers only the first job it binds,
   because `trigger_job` also enables a job and the old delivery entry ships disabled.
-- **Removal.** Five minutes after the report is claimed (`.bootstrap_completed`), the delivery
-  stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
+- **Removal.** `RETIRE_AFTER_SECONDS` (about 16 minutes) after the report is claimed
+  (`.bootstrap_completed`), and under `spec.mode: next` only once its post recorded an outcome
+  (`.bootstrap_conversation_done`), the delivery stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
   audits stage is also done, `oobe` removes itself.
   On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
 - **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
