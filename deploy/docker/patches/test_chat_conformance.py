@@ -20,6 +20,7 @@ the ask kind they carry is the one ``chat_message.ask_kind`` gives.
 """
 
 import asyncio
+import html
 import itertools
 import json
 import sys
@@ -58,6 +59,8 @@ THREAD = "slack:C1/1.2"
 HEADER = "@platform "
 #: What a clipped headline ends with, ``slack_presenter.ELLIPSIS``.
 ELLIPSIS = "…"
+#: The mrkdwn marker around today's bold headline.
+BOLD = "*"
 
 
 class _ChatAdapter:
@@ -293,20 +296,27 @@ class SharedCasesTest(unittest.TestCase):
 
 
 class QuestionDrawnOnceTest(unittest.TestCase):
-    """A question case's headline is not repeated in its detail, under next or today."""
+    """A question case's headline is not repeated in its detail, under next or today.
+
+    The headline is plain text, so the detail is read as plain too: a code span's
+    backticks, a link's url and paired markup do not hide a repeat."""
 
     def test_every_question_case(self):
         cases = [c for c in chat_cases.load() if "reason" in c["input"]]
         self.assertGreater(len(cases), 0)
+        moments = chat_message._moments
         for case in cases:
             reason = case["input"]["reason"]
             with self.subTest(case=case["name"]):
                 chat = chat_message.needs_you_message(reason)
+                detail = [moments._headline_text(line) for line in chat.get("detail", "").splitlines()]
                 shown = chat["headline"].removesuffix(ELLIPSIS)
-                self.assertNotIn(shown, chat.get("detail", ""))
-                blocks, _text = chat_message._moments.needs_you(reason)
-                below = [b["elements"][0]["text"] for b in blocks if b["type"] == "context"]
-                self.assertFalse(any(shown in line for line in below), below)
+                self.assertFalse(any(shown in line for line in detail), detail)
+                blocks, _text = moments.needs_you(reason)
+                title = html.unescape(blocks[0]["text"]["text"]).strip(BOLD).removesuffix(ELLIPSIS)
+                _head, rest, _options = moments._question(reason, True)
+                below = [moments._headline_text(line) for line in "\n".join(rest).splitlines()]
+                self.assertFalse(any(title in line for line in below), below)
 
 
 class PlanDrawnAlikeTest(unittest.TestCase):

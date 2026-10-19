@@ -594,8 +594,59 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you(question)
         headline, detail = blocks[0]["text"]["text"].strip("*"), _contexts(blocks)[0]
         self.assertTrue(headline.endswith(p.ELLIPSIS), headline)
-        self.assertTrue(detail.startswith(f"<{url}|PR #412> {p.ELLIPSIS}"), detail)
+        self.assertTrue(detail.startswith(f"<{url}|PR #412>\n{p.ELLIPSIS}"), detail)
         self.assertNotIn(headline.removesuffix(p.ELLIPSIS), detail)
+
+    def test_a_headline_link_is_on_its_own_line_above_the_next_sentence(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        after = (
+            "The pipeline has been red since the image bump and the on-call engineer asked for a decision "
+            "before the end of the current shift."
+        )
+        head, rest, _ = m._question(f"Should I merge [PR #412]({url})? {after}", True)
+        self.assertEqual(head, f"Should I merge [PR #412]({url})?")
+        self.assertEqual(rest, [f"[PR #412]({url})\n{after}"])
+
+    def test_a_headline_link_the_rest_of_the_line_repeats_is_not_added_again(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        after = (
+            f"The pipeline on [PR #412]({url}) has been red since the image bump and the on-call engineer "
+            "asked for a decision before the end of the shift."
+        )
+        _head, rest, _ = m._question(f"Should I merge [PR #412]({url})? {after}", True)
+        self.assertEqual(rest, [after])
+
+    def test_a_long_question_is_never_cut_inside_an_italic_run(self):
+        question = (
+            "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision "
+            "_while the on-call engineer reads the crash loop logs and the recent change history_ or wait?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertEqual(head.count("_") % 2, 0, head)
+        self.assertTrue(rest[0].startswith(p.ELLIPSIS), rest)
+
+    def test_the_continuation_comes_before_a_fenced_block_above_the_question(self):
+        question = (
+            "Should I roll back the payments-api deployment in the prod-east cluster to its previous revision, "
+            "or leave it running while the on-call engineer reads the crash loop's logs and the recent change history?"
+        )
+        head, rest, _ = m._question(f"```\nlog line\n```\n{question}", True)
+        self.assertTrue(head.endswith(p.ELLIPSIS))
+        self.assertTrue(rest[0].startswith(p.ELLIPSIS), rest)
+        self.assertEqual(rest[1:], ["```", "log line", "```"])
+
+    def test_a_cut_across_a_code_span_closes_it_and_keeps_later_markup(self):
+        question = (
+            f"Should I scale `{'x' * 150}` with its sidecar, or set `resources.limits.memory` and roll "
+            "[it](https://example.com/back) back?"
+        )
+        head, rest, _ = m._question(question, True)
+        self.assertGreaterEqual(len(head), m.WORD_CUT_MIN)
+        self.assertEqual(head.count("`"), 2, head)
+        self.assertTrue(rest[0].startswith(f"{p.ELLIPSIS}`"), rest)
+        self.assertIn("`resources.limits.memory`", rest[0])
+        self.assertIn("roll [it](https://example.com/back) back?", rest[0])
+        self.assertIn(" with its sidecar", rest[0])
 
     def test_a_long_question_with_a_code_span_is_cut_outside_it_and_shown_once(self):
         question = (
@@ -620,13 +671,13 @@ class NeedsYouTest(unittest.TestCase):
         blocks, _ = m.needs_you(f"Should I merge [PR #412]({url}) or [PR #412]({url})?")
         self.assertEqual(_contexts(blocks)[0], f"<{url}|PR #412>")
 
-    def test_a_link_the_plain_cut_left_whole_in_the_rest_is_linked_there(self):
+    def test_a_link_after_a_character_cut_stays_where_it_was_written(self):
         url = "https://github.com/acme/gitops/pull/412"
-        question = f"Should I scale {'x' * 150} now, or merge [PR #412]({url}) first?"
+        question = f"Should I scale {'x' * 150} now that PR #412 is green, or merge [PR #412]({url}) first?"
         head, rest, _ = m._question(question, True)
         self.assertNotIn("PR #412", head)
-        self.assertEqual(rest[0].count("PR #412"), 1)
-        self.assertIn(f"[PR #412]({url})", rest[0])
+        self.assertTrue(rest[0].endswith(f"x now that PR #412 is green, or merge [PR #412]({url}) first?"), rest)
+        self.assertEqual(head.count("x") + rest[0].count("x"), 150)
 
     def test_a_short_headline_without_a_link_is_not_repeated_below(self):
         blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")

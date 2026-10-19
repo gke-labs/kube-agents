@@ -34,7 +34,11 @@
                     "url": "https://github.com/acme/gitops/pull/412"
                   },
                   {
-                    "text": " …the image instead?",
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "…the image instead?",
                     "type": "text"
                   }
                 ],
