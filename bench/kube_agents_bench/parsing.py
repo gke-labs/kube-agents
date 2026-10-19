@@ -245,11 +245,13 @@ def _json_object(raw: Any) -> dict[str, Any]:
     A failed hermes tool answers with a differently-shaped payload, so every
     read of a result is defensive.
     """
+    if isinstance(raw, dict):
+        return raw
     if not isinstance(raw, str):
         return {}
     try:
         data = json.loads(raw)
-    except ValueError:
+    except (ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
 
