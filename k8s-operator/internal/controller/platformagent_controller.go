@@ -4473,6 +4473,23 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 	return true
 }
 
+// podReader returns the reader every Pod read goes through, and it is the live
+// API server for the same reason a2aReader is. No Owns() or Watches() names
+// Pods, so a cached Pod read is what starts their informer — and it starts a
+// cluster-wide one: client.InNamespace on a cached List filters the store after
+// the fact, it does not scope the watch. This operator reads a handful of its
+// own pods per agent, a few times an hour, and the cached client would hold
+// every Pod in the cluster to serve that (#3493). Pods are the largest kind in
+// most clusters, so this one reader is the difference between a cache that
+// scales with the install and one that scales with the cluster it runs on.
+// Nil falls back to the cached client, which is what tests supply.
+func (r *PlatformAgentReconciler) podReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 // capBucketProvisioned is "this install has provisioned the bus at least
 // once", which is this operator's only cheap proxy for "the capability bucket
 // exists". It qualifies exactly one container's crash loop; see the verifier
@@ -4549,7 +4566,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	pods := make([]corev1.Pod, 0)
 	for _, selector := range selectors {
 		podList := &corev1.PodList{}
-		if err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+		if err := r.podReader().List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
 			continue
 		}
 		pods = append(pods, podList.Items...)
@@ -5436,7 +5453,7 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 	}
 
 	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(agent.Namespace),
+	if err := r.podReader().List(ctx, podList, client.InNamespace(agent.Namespace),
 		client.MatchingLabels{"app": agent.Name + "-gateway"}); err != nil {
 		return failures
 	}

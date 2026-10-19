@@ -644,7 +644,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 	var targets []usageTarget
 	for _, group := range groups {
 		var pods corev1.PodList
-		if err := p.r.List(ctx, &pods, client.InNamespace(agent.Namespace), client.MatchingLabels(group.selector)); err != nil {
+		if err := p.r.podReader().List(ctx, &pods, client.InNamespace(agent.Namespace), client.MatchingLabels(group.selector)); err != nil {
 			return nil, nil, fmt.Errorf("listing pods: %w", err)
 		}
 		for i := range pods.Items {
