@@ -29,6 +29,7 @@ To install with the `next` path, pass `--mode=next` to the installer (`./install
      name: kube-agents
    features:
      app_home:
+       home_tab_enabled: true
        messages_tab_enabled: true
        messages_tab_read_only_enabled: false
      bot_user:
@@ -54,6 +55,7 @@ To install with the `next` path, pass `--mode=next` to the installer (`./install
    settings:
      event_subscriptions:
        bot_events:
+         - app_home_opened
          - assistant_thread_started
          - message.channels
          - message.groups
@@ -71,17 +73,19 @@ What the manifest covers, so you can check an existing app instead:
 
 - **Events.** The gateway reads messages only: `message.im` for DMs, and `message.channels`, `message.groups` and `message.mpim` for public, private and group channels. Each event needs its history scope (`im:history`, `channels:history`, `groups:history`, `mpim:history`); without it the app connects normally and is never sent the message. In a channel the gateway answers only a message that mentions the app, or a reply in a thread it is already answering; it finds mentions in the message text, so `app_mention` is not needed.
 - **Scopes.** `chat:write` covers every post and edit the gateway makes. `channels:read`, `groups:read`, `im:read` and `mpim:read` read who is in a conversation. A reply goes into the conversation or thread the message came from, so no other scope is needed for it, in a DM either. `reactions:write` puts the reactions on your message, `users:read` names who answered a question, and `assistant:write` shows Working… on a thread, titles it and sets the suggested prompts; without them the answers still arrive and only those go missing ([ChatOps](/kube-agents/concepts/chatops/#slack)).
-- **Interactivity, the assistant view and `assistant_thread_started`.** The gateway answers a click on a question's buttons, so interactivity is on, and it offers suggested prompts when a member opens a new assistant thread. An app using agent view subscribes `app_home_opened` instead, which the gateway answers on the Messages tab.
+- **Interactivity, the assistant view and `assistant_thread_started`.** The gateway answers a click on a question's buttons, so interactivity is on, and it offers suggested prompts when a member opens a new assistant thread. On an app using agent view the gateway also answers `app_home_opened` on the Messages tab with the prompts.
 - **Messages tab.** Without it, members cannot DM the app.
+- **Home tab and `app_home_opened`.** The gateway draws the fleet dashboard ([the Slack Home tab](/kube-agents/concepts/chatops/#the-slack-home-tab)) when a member opens the tab. Without either, the tab is absent or blank and nothing else changes; neither needs a scope. With `allowedUsers` left empty, the gateway checks each member's workspace with `users.info`, so the tab also needs `users:read`; without it the tab stays blank.
 - **No slash commands.** The gateway does not acknowledge them, so a member who used one would see Slack's timeout error.
 
 ### Moving an existing app to `next`
 
-An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs, unless it was generated with `--no-assistant`, so it keeps its tokens and needs no new install. A `--no-assistant` app lacks `assistant:write`, the assistant view and `assistant_thread_started`: add them as in the manifest above and reinstall, or Working…, the thread titles and the suggested prompts do not appear. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
+An app made for `today` from the `hermes slack manifest` output already has every scope and event the gateway needs to answer messages (the Home tab needs the two settings in step 3), unless it was generated with `--no-assistant`, so it keeps its tokens and needs no new install. A `--no-assistant` app lacks `assistant:write`, the assistant view and `assistant_thread_started`: add them as in the manifest above and reinstall, or Working…, the thread titles and the suggested prompts do not appear. Edit it rather than pasting the manifest above, which would rename the app and drop the scopes `today` needs if you switch back:
 
 1. After the switch, open the app's **App Manifest** page.
 2. Delete the `features.slash_commands` block. Leave interactivity on: the gateway answers button clicks.
-3. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
+3. For the [Home tab](/kube-agents/concepts/chatops/#the-slack-home-tab), set `features.app_home.home_tab_enabled` to `true` and add `app_home_opened` to `settings.event_subscriptions.bot_events`.
+4. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
 
 Do it after the switch rather than before, because the `today` listener answers slash commands until then. Until you do, a slash command under `next` shows the member Slack's timeout error. Switching back to `today` means putting the block back, which the full manifest from `hermes slack manifest` does.
 
