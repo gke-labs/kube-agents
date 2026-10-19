@@ -2136,6 +2136,12 @@ def collect(
         other = "--nightly-prefix" if main_b_job == main_job else "--nightly-writers-prefix"
         print(f"warning: --nightly-main-b-prefix names job {main_b_job}, as {other} does; listing it once", file=sys.stderr)
         nightly_main_b_prefix, main_b_job = None, DEFAULT_NIGHTLY_MAIN_B_JOB
+    # The mirror case: --nightly-prefix itself naming a part's job. Its runs
+    # are the main source here, so only the part jobs it does not name are
+    # kept out of the main watermark; otherwise every run it lists would be.
+    part_jobs = {j for j in (writers_job, main_b_job) if j != main_job}
+    if main_job is not None and main_job in (DEFAULT_NIGHTLY_WRITERS_JOB, DEFAULT_NIGHTLY_MAIN_B_JOB):
+        print(f"warning: --nightly-prefix names job {main_job}, a part's job; the report files its runs as the {nightly.night_part({'job': main_job})} part", file=sys.stderr)
     after_build = None
     nightly_after = None
     writers_after = None
@@ -2147,7 +2153,7 @@ def collect(
         if prior_data is not None:
             prior = prior_data["runs"]
             after_build = newest_build_id(tiers.presubmit_runs(prior))
-            nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") not in (writers_job, main_b_job)])
+            nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") not in part_jobs])
             writers_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_job])
             main_b_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == main_b_job])
             # The lane's pull-request builds and its nights are two sources

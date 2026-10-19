@@ -1365,6 +1365,21 @@ class TestNightlySource(_MergeBase):
                 calls = log.read_text().splitlines()
                 self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}"])
 
+    def test_the_main_flag_naming_the_main_b_job_keeps_its_own_watermark(self):
+        """--nightly-prefix pointed at the main-b periodic: its runs are the
+        main source of this scan, so they set the main watermark rather than
+        being excluded from it as another flag's part."""
+        gsutil, log = self.fake_gsutil([])
+        main_b_prefix = f"{FAKE_BUCKET}logs/{collect.DEFAULT_NIGHTLY_MAIN_B_JOB}/"
+        self.place_nightly_build(BUILD_956_TRUNCATED, periodic=main_b_prefix)
+        prior_data = json.loads(pathlib.Path(self.prior_with([])).read_text())
+        prior_data["runs"] = [{"build_id": BUILD_956_TRUNCATED, "tier": "nightly", "job": collect.DEFAULT_NIGHTLY_MAIN_B_JOB, "pr": None, "tasks": []}]
+        prior = self.tmp / "prior-main-is-main-b.json"
+        prior.write_text(json.dumps(prior_data))
+        _, stderr = self.quiet_collect(merge_with=str(prior), nightly_prefix=main_b_prefix, gsutil=gsutil)
+        self.assertIn(f"--nightly-prefix names job {collect.DEFAULT_NIGHTLY_MAIN_B_JOB}, a part's job", stderr)
+        self.assertIn(f"nightly scan resumed above build {BUILD_956_TRUNCATED}", stderr)
+
     def test_the_main_b_job_resumes_above_its_own_watermark(self):
         """main-a and main-b start together and either may finish first: a
         main-b id on record must not lift the main job's watermark, nor the
