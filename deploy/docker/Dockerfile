@@ -823,11 +823,12 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # edit_message; the steer and auth failure replies are replaced where they
 # are built, so no exception text reaches Slack). See
 # deploy/docker/patches/slack_boilerplate.py.
-# Slack, flag or not: a message_changed with no `edited` object is dropped
-# instead of being read as a new message. Slack sends one for a thread's parent
-# whenever a reply in the thread changes, and after a restart empties the
+# Slack, flag or not: a message_changed that is not an edit (no `edited`, or
+# the same `edited` as previous_message, since Slack keeps it once set) is
+# dropped instead of being read as a new message. Slack sends one for a thread's
+# parent whenever a reply in the thread changes, and after a restart empties the
 # adapter's processed-ts map that change re-ran the thread's opening @mention.
-# A real edit carries `edited`, so an @mention edited in still gets its turn.
+# A real edit carries a new `edited`, so an @mention edited in still gets its turn.
 # Applied first, against upstream's text. See the module docstring in
 # deploy/docker/patches/apply_slack_unedited_change.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \

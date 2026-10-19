@@ -8,7 +8,10 @@ the real ``adapter.py`` text against a stand-in adapter whose processed-ts map
 is empty, as it is after a restart:
 
 - a thread parent's change with reply metadata and no ``edited`` returns None;
-- a user's edit (``edited`` present) still returns the normalized message;
+- so does one for a parent edited earlier, whose ``edited`` is unchanged from
+  ``previous_message``'s;
+- a user's edit, a second edit, and an edit with no ``previous_message`` still
+  return the normalized message;
 - a change to a message already routed to the agent still returns None.
 
 The method is located with ``ast``, so an upstream move is reported, never a
@@ -33,9 +36,12 @@ RELATIVE = "plugins/platforms/slack/adapter.py"
 METHOD = "_normalize_changed_message"
 MARKER = "kube-agents patch: slack_unedited_change"
 FAILURES: list[str] = []
+#: What run() returns when the method raised; the failure is already recorded.
+RAISED = object()
 
 ROOT_TS = "1792165462.838609"
 EDIT_TS = "1792180249.000100"
+EARLIER_EDIT = {"user": "U1", "ts": "1792165470.000001"}
 
 #: Slack's change to a thread parent when a reply in the thread is updated.
 PARENT_METADATA_CHANGE = {
@@ -52,6 +58,13 @@ PARENT_METADATA_CHANGE = {
     },
 }
 
+#: The same change for a parent the user edited once, long before: both sides keep that `edited`.
+EDITED_PARENT_METADATA_CHANGE = {
+    **PARENT_METADATA_CHANGE,
+    "message": {**PARENT_METADATA_CHANGE["message"], "edited": EARLIER_EDIT},
+    "previous_message": {**PARENT_METADATA_CHANGE["message"], "reply_count": 3, "edited": EARLIER_EDIT},
+}
+
 #: A user editing an @mention into their message.
 USER_EDIT = {
     "subtype": "message_changed",
@@ -63,7 +76,14 @@ USER_EDIT = {
         "ts": ROOT_TS,
         "edited": {"user": "U1", "ts": EDIT_TS},
     },
+    "previous_message": {"text": "is checkout-gateway healthy in seeded-z?", "user": "U1", "ts": ROOT_TS},
 }
+
+#: A second edit of a message edited before: `edited` moves on.
+SECOND_EDIT = {**USER_EDIT, "previous_message": {**USER_EDIT["previous_message"], "edited": EARLIER_EDIT}}
+
+#: A user's edit delivered without previous_message: `edited` alone decides.
+BARE_EDIT = {k: v for k, v in USER_EDIT.items() if k != "previous_message"}
 
 
 def fail(msg: str) -> None:
@@ -101,21 +121,26 @@ def run(text: str, event: dict, processed=()):
         return ns[METHOD](_Adapter(processed), event)
     except Exception as exc:  # noqa: BLE001 -- any failure is the build's to see
         fail(f"{METHOD}() raised when run: {exc!r}")
-        return "raised"
+        return RAISED
 
 
 def main() -> int:
     text = method_source((HERMES / RELATIVE).read_text())
     if text:
-        got = run(text, PARENT_METADATA_CHANGE)
-        if got is not None and got != "raised":
-            fail("a thread parent's metadata change with no `edited` is routed as a message")
-        got = run(text, USER_EDIT)
-        if not isinstance(got, dict) or got.get("ts") != ROOT_TS:
-            fail(f"a user's edit is not routed as the edited message: {got!r}")
-        got = run(text, USER_EDIT, processed=(ROOT_TS,))
-        if got is not None and got != "raised":
-            fail("an edit to a message already routed to the agent is routed again")
+        dropped = [
+            (PARENT_METADATA_CHANGE, (), "a thread parent's metadata change with no `edited` is routed as a message"),
+            (EDITED_PARENT_METADATA_CHANGE, (), "a metadata change on a parent edited earlier is routed as a message"),
+            (USER_EDIT, (ROOT_TS,), "an edit to a message already routed to the agent is routed again"),
+        ]
+        for event, processed, why in dropped:
+            got = run(text, event, processed)
+            if got is not None and got is not RAISED:
+                fail(why)
+        for event, what in ((USER_EDIT, "a user's edit"), (SECOND_EDIT, "a second edit"),
+                            (BARE_EDIT, "an edit with no previous_message")):
+            got = run(text, event)
+            if got is not RAISED and (not isinstance(got, dict) or got.get("ts") != ROOT_TS):
+                fail(f"{what} is not routed as the edited message: {got!r}")
     if FAILURES:
         for f in FAILURES:
             print(f"verify_slack_unedited_change: {f}", file=sys.stderr)

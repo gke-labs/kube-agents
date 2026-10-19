@@ -69,7 +69,7 @@ class ApplierTest(unittest.TestCase):
         apply(root)
         patched = (root / RELATIVE).read_text()
         self.assertIn(GUARD_ANCHOR + "        # " + MARKER, patched)
-        self.assertIn('if not isinstance(updated_message.get("edited"), dict):', patched)
+        self.assertIn('_kage_edited == (event.get("previous_message") or {}).get("edited")', patched)
 
     def test_a_second_apply_is_refused(self):
         root = stage()
@@ -94,6 +94,17 @@ class VerifierTest(unittest.TestCase):
         rc, failures = run_verifier(stage())
         self.assertEqual(rc, 1)
         self.assertTrue(any("metadata change" in f for f in failures), failures)
+
+    def test_a_presence_only_guard_is_refused_for_an_earlier_edit(self):
+        # Slack keeps `edited` once set, so presence alone lets a once-edited parent replay.
+        root = stage()
+        apply(root)
+        path = root / RELATIVE
+        path.write_text(path.read_text().replace(
+            ' or _kage_edited == (event.get("previous_message") or {}).get("edited")', ""))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("parent edited earlier" in f for f in failures), failures)
 
     def test_a_moved_method_is_reported_not_raised(self):
         root = stage(ADAPTER_STUB.replace("def _normalize_changed_message", "def _normalize_change"))

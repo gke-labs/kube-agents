@@ -16,13 +16,23 @@ its report. After a restart the parent, which @-mentions the bot, is no longer
 in the map, so the change is processed as that mention again and the thread's
 opening ask runs a second time.
 
-Slack marks a real edit with an ``edited`` object on the changed message; a
-metadata change, a link unfurl and a bot-side rewrite of another message carry
-none. The insertion returns None for a change without one, after upstream's
-processed-ts check, so the edit-to-mention case keeps its single turn and
-everything upstream already dropped stays dropped. A link unfurl was already
-dropped by the processed-ts guard for any message the agent saw; this drops it
-for one it did not see either, which was never a user's turn.
+Slack marks an edited message with an ``edited`` object, and keeps it: a
+message edited once carries the same ``edited`` on every later change, and the
+envelope's ``previous_message`` carries it too. So a change is an edit only
+when the message's ``edited`` differs from ``previous_message``'s; with no
+``previous_message`` to compare, when it has one at all. A metadata change, a
+link unfurl and a bot-side rewrite of another message are not edits. The
+insertion returns None for a change that is not, after upstream's processed-ts
+check, so the edit-to-mention case keeps its single turn and everything
+upstream already dropped stays dropped. A link unfurl was already dropped by
+the processed-ts guard for any message the agent saw; this drops it for one it
+did not see either, which was never a user's turn.
+
+One behaviour goes with it: under ``allow_bots`` ``mentions`` or ``all``, a
+peer bot that edits our mention into its own message with ``chat.update`` no
+longer wakes the agent if Slack sends that change without a new ``edited``.
+Nothing in this repository sets ``allow_bots``, and its default drops bot posts
+anyway.
 
 The Go gateway (next mode) admits no ``message_changed`` at all
 (``slackTurnSubtypes`` in ``a2a/gateway/slack.go``), so this is today mode's half.
@@ -52,9 +62,10 @@ GUARD_ANCHOR = (
     "            return None\n"
 )
 GUARD_PATCHED = GUARD_ANCHOR + (
-    f"        # {MARKER}: no `edited` means nobody edited it (reply metadata, an\n"
-    "        # unfurl, a bot rewrite); after a restart it would replay a thread's opening ask.\n"
-    '        if not isinstance(updated_message.get("edited"), dict):\n'
+    f"        # {MARKER}: not an edit unless `edited` is new (Slack keeps it once set);\n"
+    "        # reply metadata, an unfurl or a bot rewrite would replay a thread's opening ask after a restart.\n"
+    '        _kage_edited = updated_message.get("edited")\n'
+    '        if not isinstance(_kage_edited, dict) or _kage_edited == (event.get("previous_message") or {}).get("edited"):\n'
     "            return None\n"
 )
 
