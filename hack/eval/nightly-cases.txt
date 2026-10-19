@@ -404,6 +404,12 @@
 # lists on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine cases
 # (237 units) here, of a ninety-three-case, 279-unit matrix, the paragraphs
 # above included.
+#
+# 2026-10-14 adds provisioning-cluster-request-never-creates and
+# provisioning-kcc-cluster-without-crds-stops (#2937): read-only cases with no
+# stack and no fixture, so neither joins the infra-lock chain. They are
+# card-wait cases that end in a stop; on a dev install a repetition took 3 to
+# 11 minutes, inside the 1800s ceiling. Six units in all.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -481,7 +487,9 @@
 #      pull_request_opened, #1780, nothing until #2263, then 90 %) and the
 #      miss shape the seat counts as the case's own; this file never lists a
 #      presubmit case twice. pdb-remediation-pr took the remediation roster
-#      line on 2026-10-14 (#2016 step 4); rca-remediation-pr below stays nightly.
+#      line on 2026-10-14 (#2016 step 4) and was demoted back to this file on
+#      2026-10-17 (#3120, its line with the demotions below);
+#      rca-remediation-pr below stays nightly.
 ./tasks/chat-routing-board-read/task.yaml
 
 # #1023's incident-triage probe, incident-triage-oom-event-probe, was listed
@@ -667,6 +675,25 @@
 # INSTANTANEOUS question, so the cost domain is covered meanwhile. Audit
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
+
+# #3269: upgrades-lagging-master-probe demoted 2026-10-16. The fixture is
+# healthy (seeded-b one minor behind REGULAR's defaultVersion on every pool),
+# but the agent compares seeded-b against the channel's upgradeTargetVersion,
+# the newest patch of its own minor, and reports no lag, so it fails 0/3 on
+# unrelated pull requests. Back on the roster once an agent-side fix has the
+# comparison use the channel default and the case shows greens (#3269).
+./tasks/upgrades-lagging-master-probe/task.yaml
+
+# #3120: pdb-remediation-pr demoted 2026-10-17. It collapsed 0/3 on unrelated
+# pull requests after its roster line of 2026-10-14 (#2971, #3017, #3329):
+# mostly, the worker finds checkout-gateway with no PodDisruptionBudget, then
+# declines to open a pull request because the pool's *-infra GitOps
+# repository holds no manifest for it (on #3017 it named an older pull
+# request it had not opened), so the report names no pull request it opened. Back on the roster once #3145 (seeds checkout-gateway's
+# manifest into every pool's -infra repository) merges and the case's
+# record holds (#3120). Still on the GitLab lane (gitlab-cases.txt), now
+# held out there.
+./tasks/pdb-remediation-pr/task.yaml
 
 # Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
 # Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
@@ -1055,3 +1082,66 @@
 # safe-to-evict pod-template annotation that rolls the fleet when removed.
 # deployer: noop, transcript-only.
 ./tasks/compute-class-canary-active-migration-pdb-probe/task.yaml
+
+# kube-agents-observability skill's trace latency helper, run to completion
+# through the credential broker's relay and graded on the report's breakdown
+# shape and on the worker's route (no token fetched or pasted). Reads the
+# install's own traces; parked in FIXTURE_NOT_READY from its merge until the
+# pool host clusters exported traces (scope set 2026-10-02, held by the
+# provisioning script and the verifier since). Nightly from the merge
+# that un-parked it.
+# deployer: noop, read-only, no fixture: three units at the 200s default,
+# ~10 serial minutes, off the infra lock, main nightly part.
+./tasks/observability-trace-latency-brokered/task.yaml
+
+# A plain chat request for a cost analysis runs the waste audit's collector
+# (#2386): the Platform Agent routes a domain request to its stream's
+# collector even when the request names no SOP, and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's idle-nodepool role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/cost-chat-request-runs-collector/task.yaml
+
+# A plain chat request about workload reliability across the fleet runs the
+# reliability audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's no-pdb-workload role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/reliability-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the fleet's stockout and capacity risks runs the
+# stockout-prevention audit's collector (#2386), and answers in chat without
+# publishing. deployer: noop; reads the seeded fleet's hpa-saturated role.
+# Nightly rather than presubmit for the collector's full sweep.
+./tasks/stockout-chat-request-runs-collector/task.yaml
+
+# A plain chat request about upgrade and patch readiness runs the patch
+# audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads seeded-a's shipped no-notifications posture (no
+# fixtures role). Nightly rather than presubmit for the collector's full sweep.
+./tasks/upgrade-chat-request-runs-collector/task.yaml
+
+# A plain chat request for the clusters that differ from their peers runs the
+# drift audit's collector (#2386), and answers in chat without publishing.
+# deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
+# Nightly rather than presubmit: consistency-authorized-networks-probe holds
+# the domain's presubmit seat. Red on main: no SOUL.md row routes the question
+# to fleet_drift.py. Marked expected_fail: true, so the nightly records it as
+# EXPECTED_FAIL and also records whether the outlier and facet reply checks
+# pass on seeded-c. The follow-up that adds the drift row removes the marker.
+./tasks/drift-chat-request-runs-collector/task.yaml
+
+# A plain chat request about the security of the fleet's AI and
+# model-serving workloads runs the AI security audit's collector (#2386), and
+# answers in chat without publishing. The chat form of
+# ai-security-planted-model-audit above: a tofu stack
+# (prebuilt/ai-model-defects) that plants its own workload in a namespace of
+# its own on the host cluster, so it too serializes on the infra lock. Priced
+# at that case's 1450s hint until it has a record.
+./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# A cluster request with nothing to write to ends in a stated stop, never a
+# direct create (#2937). On the pool it grades the stop: the pool repositories hold no
+# provisioning/ path. Read-only; requests no pull request.
+./tasks/provisioning-cluster-request-never-creates/task.yaml
+# gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
+# created another way (#2937). The pool's clusters carry no Config Connector.
+./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml

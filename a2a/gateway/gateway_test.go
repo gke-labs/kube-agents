@@ -3465,3 +3465,35 @@ func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
 		})
 	}
 }
+
+// TestStopAfterTheTurnEndedSaysACardKeepsWorking pins gke-labs#3263's reply.
+// The front door's turn ends seconds after it files a kanban card, so by the
+// time a user says "stop" the conversation holds no active task while the
+// card is still working and will post here. The gateway cannot see or cancel
+// the card, and its reply must say so rather than a bare "nothing is running".
+// The rig models the turn, not the card: what the gateway keys on is that the
+// conversation ran a task and holds none now. A conversation that never ran
+// one gets the plain reply (TestStopWithNothingToStopStartsNoTask).
+func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-card-stop"
+	ctx := context.Background()
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-1", Text: "check the pods on x"}
+	origin := r.awaitTask(t, "platform")
+	completeTask(t, r.execFor(t, origin, "platform"), "checking the pods on x")
+	waitFor(t, "the turn's terminal to release the conversation", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-2", Text: "stop"}
+	waitFor(t, "the stop to be answered with the card notice", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if p == nothingRunningCardNotice {
+				return true
+			}
+		}
+		return false
+	})
+}

@@ -59,6 +59,7 @@ TRUSTED_DIR = "/opt/vcs/libexec/platform"
 # crons, which never run in the sandbox.
 INSTRUCTION_GLOBS = (
     "agents/platform/skills/*/SKILL.md",
+    "agents/platform/skills/*/references/*.md",
     "agents/platform/SOUL.md",
     "agents/platform/AGENTS.md",
     "agents/platform/governance/*.md",

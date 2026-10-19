@@ -43,7 +43,8 @@ their own copies:
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
 | `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
-| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
+| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`  |
+| `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                  |
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
@@ -373,8 +374,13 @@ github.com, it refuses both.
 - A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`, and a recorded
   GitHub Enterprise Server host and CA Secret. A switch back to GitHub drops the GitLab keys.
 - A run on GitHub that changes the GitHub host or the CA Secret rewrites `GITOPS_ORG`,
-  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys, and drops
-  `GITHUB_PEM_PATH`.
+  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys. It keeps
+  `GITHUB_PEM_PATH` (the path, never the key): the path this run uses (from `--github-pem-path` or
+  the PEM prompt), or else the recorded one. A move to another GitHub host does not keep the
+  recorded path, because it is the old App's key: give the new App's key with
+  `--github-pem-path`, or export `GITHUB_PEM_PATH` for the run when `install.env` records no
+  path (a recorded line wins over the shell). A run that does not need the file (the KMS key already has an `ENABLED`
+  version and the file is gone) records no path.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
 

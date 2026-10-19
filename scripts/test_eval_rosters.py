@@ -13,7 +13,8 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013; #2016's seat took its roster line 2026-10-14) -- and the nightly file holds the
+the documented exception: #2013; #2016's seat took its roster line 2026-10-14) and the
+cases demoted since (DEMOTED_AFTER_THE_SPLIT) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
 whatever landed there since (ADDED_AFTER_THE_SPLIT, ADDED_AFTER_THE_MOVED_BLOCK),
@@ -86,7 +87,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016)
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120)
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here had no
@@ -185,6 +186,15 @@ ADDED_AFTER_THE_MOVE = [
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
+    "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
+    "cost-chat-request-runs-collector",  # a plain cost request runs the waste collector, #2386
+    "reliability-chat-request-runs-collector",  # a plain workload-reliability request runs the obtainability collector, #2386
+    "stockout-chat-request-runs-collector",  # a plain stockout-risk request runs the stockout collector, #2386
+    "upgrade-chat-request-runs-collector",  # a plain upgrade-readiness request runs the patch collector, #2386
+    "drift-chat-request-runs-collector",  # a plain peer-consistency request runs the drift collector, #2386
+    "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
+    "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
+    "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -240,6 +250,17 @@ HELD_OUT_TO_NIGHTLY = [
 HELD_OUT_IN_PRESUBMIT = [
     ("compliance-rbac-overgrant", "agent-kanban-smoke"),  # #2013 step 2, seated 2026-09-29; the roster line is step 4
 ]
+
+
+# Demoted after the split under docs/eval-gate-roster.md "Demoting a flaky
+# case": the line leaves blocking-roster.txt and presubmit-cases.txt and lands
+# in the nightly file with its issue above it, as (case, the nightly line it
+# follows). Restoring a case deletes its entry here.
+DEMOTED_AFTER_THE_SPLIT = [
+    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
+    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+]
+DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 
 
 def with_insertions(base, insertions):
@@ -298,7 +319,10 @@ class ParserTest(unittest.TestCase):
 
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
-        expected = [c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT) if c not in HELD_OUT_TO_NIGHTLY]
+        expected = [
+            c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
+            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+        ]
         self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
 
     def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
@@ -329,7 +353,10 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertIn(case, eval_rosters.nightly_cases())
 
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
-        self.assertEqual(eval_rosters.blocking_roster(), with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT))
+        self.assertEqual(
+            eval_rosters.blocking_roster(),
+            [c for c in with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT) if c not in DEMOTED],
+        )
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
@@ -341,15 +368,27 @@ class SplitLostNothingTest(unittest.TestCase):
         ]
         self.assertEqual(
             eval_rosters.nightly_cases(),
-            [
-                c
-                for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                if c not in seated and c not in PARKED_AFTER_THE_MOVE
-            ],
+            with_insertions(
+                [
+                    c
+                    for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+                    if c not in seated and c not in PARKED_AFTER_THE_MOVE
+                ],
+                DEMOTED_AFTER_THE_SPLIT,
+            ),
         )
+
+    def test_a_demoted_case_is_in_the_nightly_only(self):
+        for case in DEMOTED:
+            with self.subTest(case=case):
+                self.assertIn(case, eval_rosters.nightly_cases())
+                self.assertNotIn(case, eval_rosters.presubmit_cases())
+                self.assertNotIn(case, eval_rosters.blocking_roster())
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:
+            if case in DEMOTED:
+                continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
                 self.assertIn(case, eval_rosters.presubmit_cases())
                 self.assertIn(case, eval_rosters.blocking_roster())

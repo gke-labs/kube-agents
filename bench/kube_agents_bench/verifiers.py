@@ -59,6 +59,7 @@ import json
 import os
 import re
 import shlex
+import ssl
 import subprocess
 import textwrap
 import time
@@ -1335,7 +1336,9 @@ class ToolCalledVerifier(BaseVerifier):
     worker call's result is clipped in the pod, so the pattern must match near
     the start of it. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
-    check ``status="error"``, since a pattern over it would read as no match.
+    check ``status="error"``, since a pattern over it would read as no match --
+    but only when its arguments are withheld too or still match ``arguments``;
+    an unread call whose readable arguments rule it out is left out instead.
     """
 
     type: Literal["tool_called"]
@@ -1706,6 +1709,19 @@ _NO_PR_URL_REASON = (
     "reply must carry the pull request URL in full"
 )
 
+
+def _no_pr_url_reason(host: str) -> str:
+    """``_NO_PR_URL_REASON`` for the GitHub host the reply must name."""
+    if host == forges.GITHUB_DEFAULT_HOST:
+        return _NO_PR_URL_REASON
+    return (
+        f"the run's report names no {host} pull request URL, so no fix was "
+        "proposed (or the agent did not report the PR it opened); a remediation "
+        "reply must carry the pull request URL in full. A github.com URL does not "
+        f"count: this run's GitHub forge is the GitHub Enterprise Server at {host} "
+        f"({forges.GITHUB_HOST_ENV_VAR})"
+    )
+
 _NO_TOKEN_REASON = (
     "no GitHub read credential in the environment: set one of "
     f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
@@ -1818,7 +1834,7 @@ def _gitlab_path_key(value: str) -> str:
 def _issue_api_url(forge: str, repo: str, number: int) -> str:
     if forge == forges.FORGE_GITLAB:
         return f"{forges.gitlab_api_root()}{forges.gitlab_project_path(repo)}/issues/{number}"
-    return f"{forges.GITHUB_API_ROOT}/repos/{repo}/issues/{number}"
+    return f"{forges.github_api_root()}/repos/{repo}/issues/{number}"
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -2369,23 +2385,35 @@ class WorkerCommandsVerifier(BaseVerifier):
     Sees the ROUTE a worker took rather than the answer it gave, through the
     terminal commands it typed; ``tool_called`` under ``scope: workers`` is
     the companion for the MCP tool calls it made (see its docstring).
-    Without ``after_result_pattern`` the harness reads each delegated card's
-    worker log before purging it and stashes every ``💻 $`` line as a command
-    (``transcript.worker_commands``); this verifier matches Python regular
-    expressions against those strings, ``re.search`` on each command verbatim.
-    That line is hermes's one-line rendering of the command
-    (``summarize_shell_command`` in its ``agent/display.py``), not the text as
-    typed: a newline becomes a space, a chain joined by ``;``, ``&&`` or ``||``
-    arrives as its first command (a leading ``cd``, ``export``, ``set``,
-    ``source``, ``true`` or ``false`` skipped) plus `` + N command(s)``, a
-    redirection is dropped, and a pipe, a substitution and a backtick stay. A
-    pattern reads the rendering, so a command chained behind another is not on
-    any line it sees. The command as typed is on the trajectory already, tagged
-    with the worker's profile (:mod:`kube_agents_bench.worker_trajectory` reads
-    each worker session's tool calls after the log scrape; ``tool_called``
-    grades them); ``after_result_pattern`` (below) reads the ``terminal`` calls
-    from there instead of the card log, and without it this verifier still
-    reads the rendering.
+    Without ``after_result_pattern`` the harness reads the worker log of each
+    card the front agent filed before purging it and stashes every ``💻 $``
+    line as a command (``transcript.worker_commands``); the cards those
+    workers filed in turn (a Cluster Agent's card under the platform
+    worker's, and its own children) have no log read, so their commands come
+    from their tagged ``terminal`` and ``execute_code`` calls in the
+    trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
+    a log line is graded on its log lines, whether or not its calls reached
+    the trajectory, and any other card on its calls. This verifier matches
+    Python regular expressions against the union, ``re.search`` on each
+    command verbatim, and an exemption reads a tagged call as it reads a log
+    line. The two halves are not spelled alike. A log line is hermes's
+    one-line rendering of the command (``summarize_shell_command`` in its
+    ``agent/display.py``), not the text as typed: a newline becomes a space, a
+    chain joined by ``;``, ``&&`` or ``||`` arrives as its first command (a
+    leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
+    skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe, a
+    substitution and a backtick stay. A pattern reads the rendering there, so a
+    command chained behind another on a log line is not on any line it sees. A
+    tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
+    reads each worker session's tool calls after the log scrape; ``tool_called``
+    grades them), so a pattern, forbidden or exempt, reads a worker-filed
+    card's call as one string with its newlines and operators intact and a
+    front-filed card's as rendered: a ``^``-anchored pattern written against
+    the rendering can miss a worker-filed card's command behind a ``cd ... &&``
+    or on a second line, and a capture gap on such a card does not change the
+    result (#3406).
+    ``after_result_pattern`` (below) reads the tagged calls alone, as typed,
+    for every card.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -2436,50 +2464,55 @@ class WorkerCommandsVerifier(BaseVerifier):
     JSON-escaped, so a pattern spanning a line break writes ``(?:\\n|\\\\n)``.
 
     Limits, stated so a case is not written against them: only terminal
-    commands and ``execute_code`` text are visible, not MCP tool calls; only
-    delegated workers' logs or calls are read, never the router's; a command
-    the shell resolved through an alias appears as typed; and a pattern reads
-    the characters on the line, so a word the command splits with an empty
-    quote or a backslash inside it (``compute''Metadata``) is one word to the
-    shell and none to the pattern -- the call text as typed under
-    ``after_result_pattern`` closes the chain gap, and the split stays.
-    ``required_runs`` reads each flag as the exact word, so a script a case
-    names this way is built with ``allow_abbrev=False`` (argparse's default
-    lets ``--readi`` run ``--readiness``), as ``fleet_upgrade_report.py`` is;
-    and a line bash refuses (an unclosed quote) yields no words, so no run is
-    credited from it (``forbidden_patterns`` read the text and still match it);
-    and no shell expansion is resolved, so a run spelled through a variable
-    that holds the whole path (``python3 "$SCRIPT" ...``) is not read as one --
-    the dictated command spells the path in full; a ``$(...)``, ``<(...)``,
-    ``>(...)`` or backtick span is kept inside its word, as the shell keeps it,
-    and the commands inside it are read as commands of their own, as the shell
-    runs them, quoted or not (``$((...))`` runs none); a bare operator is one
-    outside quotes only, so a quoted ``">"`` or ``';'`` is text; and a reserved
-    word (``if``, ``do``, ``!``) stands ahead of the command word; so may an
-    exec wrapper (``timeout``, ``sudo``, ``env``, ``xargs``, ``flock``) with its
-    own words -- a flag, the word after a flag, a count, an unresolved
-    expansion, ``--``, the one positional ``flock`` and ``chroot`` take, and a
-    redirect with its target -- and a program behind one that is not the
-    script, a shell or an interpreter (``sudo ls``, ``nohup echo``) is a command
-    of its own, not a run; which flags take a value is not tabled, so the word
-    after a bare flag is read as its value (``sudo -n ls <script> --readiness``
-    is still credited); and a run made through a script file or a shell's
-    standard input (``bash run.sh``, ``nohup bash /tmp/run.sh &``,
-    ``echo "<command>" | bash``, ``bash -s < run.sh``) is not read as one, since
-    the argv names the file or the shell and not what was written to it, which
-    no reading of the argv recovers -- a case names a run this way where the
-    persona dictates one typed command, and a worker that runs it through a
-    file is not credited. Under ``after_result_pattern``: a refused command
-    whose output the call discarded prints nothing into its result; a result is
-    clipped in the pod at ``worker_trajectory.MAX_RESULT_CHARS``; a read whose
-    output quotes the refusal text opens the window; the command patterns read
-    a call's text as typed, so a route behind a shell variable or an alias is
-    not read; no tagged worker call at all, or no readable one (every code-tool
-    call's argument withheld), is ``status="error"``, a withheld argument beside
-    a readable call is skipped, a worker whose tagged calls are all MCP calls
-    grades as zero commands, and a capture with gaps that found no forbidden
-    command is ``status="error"``. Fails closed like its siblings -- a run with
-    no captured worker commands is ``status="error"``, not a pass.
+    commands and ``execute_code`` text are visible, not MCP tool calls (and,
+    without ``after_result_pattern``, ``execute_code`` text only for a card
+    graded on its calls: a filed card's log shows no program text); only
+    delegated workers' logs or calls are read, never the router's, and a
+    worker-filed card is read only as far as the trajectory capture reached
+    it (``worker_capture_gaps`` makes a clean read an error only under
+    ``after_result_pattern``); and a
+    command the shell resolved through an alias appears as typed; and a
+    pattern reads the characters on the line, so a word the command splits
+    with an empty quote or a backslash inside it (``compute''Metadata``) is
+    one word to the shell and none to the pattern -- the call text as typed
+    closes the chain gap, and the split stays. ``required_runs``
+    reads each flag as the exact word, so a script a case names this way is
+    built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
+    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a line bash refuses
+    (an unclosed quote) yields no words, so no run is credited from it
+    (``forbidden_patterns`` read the text and still match it); and no shell
+    expansion is resolved, so a run spelled through a variable that holds the
+    whole path (``python3 "$SCRIPT" ...``) is not read as one -- the dictated
+    command spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or
+    backtick span is kept inside its word, as the shell keeps it, and the
+    commands inside it are read as commands of their own, as the shell runs
+    them, quoted or not (``$((...))`` runs none); a bare operator is one outside
+    quotes only, so a quoted ``">"`` or ``';'`` is text; and a reserved word
+    (``if``, ``do``, ``!``) stands ahead of the command word; so may an exec
+    wrapper (``timeout``, ``sudo``, ``env``, ``xargs``, ``flock``) with its own
+    words -- a flag, the word after a flag, a count, an unresolved expansion,
+    ``--``, the one positional ``flock`` and ``chroot`` take, and a redirect with
+    its target -- and a program behind one that is not the script, a shell or an
+    interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a run;
+    which flags take a value is not tabled, so the word after a bare flag is
+    read as its value (``sudo -n ls <script> --readiness`` is still credited);
+    and a run made through a script file or a shell's standard input
+    (``bash run.sh``, ``nohup bash /tmp/run.sh &``, ``echo "<command>" | bash``,
+    ``bash -s < run.sh``) is not read as one, since the argv names the file or
+    the shell and not what was written to it, which no reading of the argv
+    recovers -- a case names a run this way where the persona dictates one typed
+    command, and a worker that runs it through a file is not credited. Under
+    ``after_result_pattern``: a refused command whose output the call discarded
+    prints nothing into its result; a result is clipped in the pod at
+    ``worker_trajectory.MAX_RESULT_CHARS``; a read whose output quotes the
+    refusal text opens the window; the command patterns read a call's text as
+    typed, so a route behind a shell variable or an alias is not read; no tagged
+    worker call at all, or no readable one (every code-tool call's argument
+    withheld), is ``status="error"``, a withheld argument beside a readable call
+    is skipped, a worker whose tagged calls are all MCP calls grades as zero
+    commands, and a capture with gaps that found no forbidden command is
+    ``status="error"``. Fails closed like its siblings -- a run with no captured
+    worker commands is ``status="error"``, not a pass.
     """
 
     type: Literal["worker_commands"]
@@ -2527,8 +2560,13 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         window = ""
+        sources = ""
         result_hits: list[tuple[str, str]] = []
         if self.after_result_pattern is None:
+            # ``None`` stays an error even when the trajectory carries tagged calls: it
+            # means a filed card's log could not be read (or nothing was filed), and
+            # grading only the cards whose calls did arrive would pass a forbidden
+            # check on the unread card's commands -- the no-capture case is unchanged.
             if snap.worker_commands is None:
                 return VerificationResult(
                     success=False,
@@ -2536,7 +2574,39 @@ class WorkerCommandsVerifier(BaseVerifier):
                     elapsed_time=time.monotonic() - start,
                     reason=_NO_WORKER_COMMANDS_REASON,
                 )
-            typed = [row.get("command", "") for row in snap.worker_commands]
+            logged_commands = [row.get("command", "") for row in snap.worker_commands]
+            # The logs are read for the cards the front agent filed only; a card a worker
+            # filed (a Cluster Agent's card under the platform worker's) reaches the run
+            # through its tagged calls in the trajectory alone. Neither source is complete:
+            # the trajectory can be the narrower one too (two #2959 runs had a ``helm list``
+            # in the log and no tagged terminal call), so every log line is kept whatever
+            # the trajectory holds, and the trajectory's calls join the
+            # graded set by card, not by string: a card with a log line contributes its
+            # log lines and none of its calls, so a command a filed card typed is counted
+            # once (its log line and its call need not be spelled alike) and a command
+            # typed twice is counted twice. A card with no log line -- a worker filed it,
+            # or its log showed no shell command -- contributes its tagged calls, which
+            # for a filed card can only add ``execute_code`` text the log never shows (a
+            # behaviour change for a filed card that ran only code: its program text is
+            # now graded, where it used to read as zero commands). A row with no card
+            # (a record stashed before rows carried one) cannot be joined, so such a
+            # capture grades the plain union, every tagged call beside every log line:
+            # each check here is an existence check, so a command counted twice can only
+            # inflate the count, while dropping the calls could hide a filed card's write.
+            logged = {str(row.get("task") or "") for row in snap.worker_commands}
+            calls = _worker_terminal_calls(snap.trajectory)
+            if "" in logged:
+                children = [command for _, _, command, _, _ in calls]
+                if children:
+                    sources = (
+                        f" ({len(logged_commands)} from the filed cards' logs and {len(children)} tagged calls,"
+                        " unjoined because a log row names no card, so a command may be counted twice)"
+                    )
+            else:
+                children = [command for card, _, command, _, _ in calls if card not in logged]
+                if children:
+                    sources = f" ({len(logged_commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
+            typed = logged_commands + children
             windowed = typed
         else:
             calls = _worker_terminal_calls(snap.trajectory)
@@ -2610,11 +2680,11 @@ class WorkerCommandsVerifier(BaseVerifier):
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
-                    f"across {len(commands)} command(s){exempted}"
+                    f"across {len(commands)} command(s){exempted}{sources}"
                 )
             if unrun:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
+                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -2647,7 +2717,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason=(
-                f"{len(commands)} worker command(s){exempted}: all {len(self.required_patterns)} "
+                f"{len(commands)} worker command(s){exempted}{sources}: all {len(self.required_patterns)} "
                 f"required pattern(s) matched, all {len(self.required_runs)} required run(s) made, "
                 f"none of {len(self.forbidden_patterns) + len(self.forbidden_result_patterns)} forbidden pattern(s) matched, "
                 f"none of {len(self.forbidden_runs)} forbidden run(s) made"
@@ -3023,7 +3093,16 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
         },
         method="GET",
     )
-    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        context = forges.forge_ssl_context()
+    except forges.UnknownForge as exc:
+        raise OSError(str(exc)) from exc
+    handlers: list[Any] = [_NoRedirect]
+    if context is not None:
+        # BENCH_FORGE_CA_FILE: the system CAs plus a private one, for a
+        # self-managed GitLab or the GHES proxy.
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    opener = urllib.request.build_opener(*handlers)
     for attempt in range(1, _FORGE_READ_ATTEMPTS + 1):
         try:
             with opener.open(request, timeout=timeout) as response:
@@ -3044,6 +3123,16 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
             if attempt == _FORGE_READ_ATTEMPTS:
                 if isinstance(exc, http.client.HTTPException):
                     raise OSError(f"{type(exc).__name__}: {exc}") from exc
+                reason = getattr(exc, "reason", exc)
+                if context is not None and isinstance(reason, ssl.SSLCertVerificationError):
+                    # With BENCH_FORGE_CA_FILE set, a certificate failure is
+                    # most likely that file (an old or another CA); name it,
+                    # or the error reads as if no CA file was set at all.
+                    raise OSError(
+                        f"{forges.FORGE_CA_FILE_ENV_VAR}="
+                        f"{os.environ.get(forges.FORGE_CA_FILE_ENV_VAR, '')!r} does not verify "
+                        f"{urllib.parse.urlsplit(url).netloc}: {reason}"
+                    ) from exc
                 raise
             time.sleep(_FORGE_READ_RETRY_PAUSE_SEC)
     raise AssertionError("unreachable")
@@ -4060,7 +4149,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         pull request.
         """
         globs = [g for check in self.content for g in check.paths]
-        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         texts: dict[str, str] = {}
         unread: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
@@ -4106,7 +4195,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         A rename counts under both names: moving the declaration away is as
         much a change to it as rewriting it.
         """
-        base = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
         paths: list[str] = []
         for page in range(1, _PR_FILES_MAX_PAGES + 1):
             status, files = _http_get_json(
@@ -4152,7 +4241,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         if not ref:
             return None, f"GitHub returned no head ref for {slug}; this check could not be evaluated"
         status_code, listed = _http_get_json(
-            f"https://api.github.com/repos/{owner}/{repo}/pulls"
+            f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls"
             f"?state=closed&head={owner}:{urllib.parse.quote(ref, safe='')}&per_page={_GITHUB_PAGE_SIZE}",
             token,
             budget,
@@ -4210,7 +4299,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     status_code = 200
                 else:
                     status_code, commits = _http_get_json(
-                        f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/commits"
+                        f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/commits"
                         f"?per_page={_PR_COMMITS_PAGE_SIZE}&page={page}",
                         token,
                         budget,
@@ -4271,7 +4360,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         same for every repetition, and no grade drawn from it would mean
         anything. Everything else the agent chose, so it is graded.
         """
-        base = f"https://api.github.com/repos/{owner}/{repo}"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         first, payload = _http_get_json(f"{base}/issues/{number}", token, budget)
         status_code = first
         if first in (401, 403, 404):
@@ -4339,7 +4428,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         as on ``/pulls/{n}``; folding it into ``None`` would pass a leftover
         the run only wrote to.
         """
-        base = f"https://api.github.com/repos/{owner}/{repo}"
+        base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         payload = resolved
         if "changed_files" not in payload:
             status, payload = _http_get_json(f"{base}/pulls/{number}", token, budget)
@@ -4717,7 +4806,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "so no fix was proposed (or the agent did not report the merge request "
                     "it opened); a remediation reply must carry its URL in full",
                 )
-            return done(False, _NO_PR_URL_REASON)
+            return done(False, _no_pr_url_reason(forges.web_host(forge)))
         if len(seen) > _MAX_PR_CANDIDATES:
             return done(
                 False,
