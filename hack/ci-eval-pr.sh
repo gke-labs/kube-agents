@@ -39,6 +39,14 @@ readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
+# The stack-bearing cases of the nightly's main part that run in main-b, when
+# EVAL_NIGHTLY_PART splits that part in two (#3384).
+readonly EVAL_NIGHTLY_MAIN_B_FILE="eval/nightly-main-b.txt"
+# Which bit of a name's cksum places a case without a stack in main-a or
+# main-b: any bit is a coin toss per name, and bit 2 splits the matrix of
+# 2026-10-19 near evenly where bit 0 did not. scripts/test_ci_eval_nightly.py
+# holds the split within a fifth; if the matrix drifts past that, change it.
+readonly NIGHTLY_HALF_CKSUM_BIT=2
 # A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
@@ -2263,15 +2271,18 @@ unit_task_path() { # <task-path> <task-name>
 # The "Nightly part:" line is the record of which part a night ran, and
 # names the cases the part left out.
 #
-# main-a and main-b halve the stack-bearing units, the ones that take
-# lock-infra, since their one-at-a-time chain is what sets the main part's
-# length; the cases without a stack are halved too. The onboarding cases
-# (unit_state_lock) all go to main-a: they rewrite one install's onboarding
-# state, and only a run on one install keeps them apart. Each remaining case
-# goes, in matrix order, to the half with fewer of its kind so far, main-a on
-# a tie, so a case's half depends only on the matrix. The three helpers it
-# reads are defined here, ahead of the fan-out further down that also uses
-# them, because the split runs first.
+# main-a and main-b halve the main part. A stack-bearing case (task_stack,
+# off infra_lock_exempt) runs in main-b when NIGHTLY_MAIN_B_FILE lists it and
+# in main-a otherwise: their one-at-a-time chain under lock-infra is what sets
+# the part's length, and that file is chosen to balance it. A case without a
+# stack goes by one bit of its name's cksum (NIGHTLY_HALF_CKSUM_BIT). The
+# onboarding cases (unit_state_lock) all go to main-a: they rewrite one
+# install's onboarding state, and only a run on one install keeps them apart.
+# Every rule reads the case's name and nothing else, so the two halves, which
+# are two periodics that each check out main for themselves, agree on the
+# split even when a merge lands between their checkouts. The three helpers it reads are defined
+# here, ahead of the fan-out further down that also uses them, because the
+# split runs first.
 
 # Reads infrastructure.stack out of a task file. The nightly part split uses
 # it to tell a stack-bearing case, and the fan-out's loop to decide whether
@@ -2313,59 +2324,32 @@ unit_state_lock() { # <task-name>
   esac
 }
 
-# Each case's kind for the halves: filled in by the first loop below, read
-# by the second.
-NIGHTLY_HALF_KIND=()
+NIGHTLY_MAIN_B_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_MAIN_B_FILE}"
 NIGHTLY_PART_DROPPED=""
 if [ "${EVAL_TIER}" = "nightly" ]; then
   NIGHTLY_MATRIX_SIZE="${#TASKS[@]}"
   if [ "${EVAL_NIGHTLY_PART}" != "all" ]; then
-    # First pass: each case's kind -- writers, onboarding, stack or plain --
-    # and the onboarding cases' share of main-a, so the second pass balances
-    # the rest around them.
-    HALF_A_STACK=0 HALF_B_STACK=0 HALF_A_PLAIN=0 HALF_B_PLAIN=0
-    for ENTRY in "${TASKS[@]}"; do
-      NAME="$(basename "$(dirname "${ENTRY}")")"
-      KIND="plain"
-      # An inject-lane copy is an absolute path (lane_task_entry, above).
-      case "${ENTRY}" in
-        /*) ENTRY_FILE="${ENTRY}" ;;
-        *) ENTRY_FILE="${BENCH_DIR}/${ENTRY}" ;;
-      esac
-      if [ -n "$(task_stack "${ENTRY_FILE}")" ] && ! infra_lock_exempt "${NAME}"; then KIND="stack"; fi
-      case ",${INJECT_LANE_REQUESTING}," in
-        *",${NAME},"*) KIND="writers" ;;
-        *)
-          if [ "$(unit_state_lock "${NAME}")" = "onboarding" ]; then
-            if [ "${KIND}" = "stack" ]; then HALF_A_STACK=$((HALF_A_STACK + 1)); else HALF_A_PLAIN=$((HALF_A_PLAIN + 1)); fi
-            KIND="onboarding"
-          fi
-          ;;
-      esac
-      NIGHTLY_HALF_KIND+=("${KIND}")
-    done
+    NIGHTLY_MAIN_B=""
+    case "${EVAL_NIGHTLY_PART}" in
+      main-a | main-b) NIGHTLY_MAIN_B="$(roster_entries "${NIGHTLY_MAIN_B_FILE}")" ;;
+    esac
     NIGHTLY_PART_KEPT=()
-    INDEX=0
     for ENTRY in "${TASKS[@]}"; do
       NAME="$(basename "$(dirname "${ENTRY}")")"
-      KIND="${NIGHTLY_HALF_KIND[${INDEX}]}"
-      INDEX=$((INDEX + 1))
-      case "${EVAL_NIGHTLY_PART}:${KIND}" in
-        *:writers) ENTRY_PART="writers" ;;
-        main:*) ENTRY_PART="main" ;;
-        *:onboarding) ENTRY_PART="main-a" ;;
-        *:stack)
-          if [ "${HALF_B_STACK}" -lt "${HALF_A_STACK}" ]; then
-            ENTRY_PART="main-b"; HALF_B_STACK=$((HALF_B_STACK + 1))
+      case ",${INJECT_LANE_REQUESTING}," in
+        *",${NAME},"*) ENTRY_PART="writers" ;;
+        *) ENTRY_PART="main" ;;
+      esac
+      case "${EVAL_NIGHTLY_PART}:${ENTRY_PART}" in
+        main-a:main | main-b:main)
+          if [ "$(unit_state_lock "${NAME}")" = "onboarding" ]; then
+            ENTRY_PART="main-a"
+          elif [ -n "$(task_stack "${BENCH_DIR}/${ENTRY}")" ] && ! infra_lock_exempt "${NAME}"; then
+            if grep -qxF -- "${NAME}" <<< "${NIGHTLY_MAIN_B}"; then ENTRY_PART="main-b"; else ENTRY_PART="main-a"; fi
+          elif [ $(( ($(printf '%s' "${NAME}" | cksum | cut -d' ' -f1) >> NIGHTLY_HALF_CKSUM_BIT) & 1 )) -eq 1 ]; then
+            ENTRY_PART="main-b"
           else
-            ENTRY_PART="main-a"; HALF_A_STACK=$((HALF_A_STACK + 1))
-          fi
-          ;;
-        *)
-          if [ "${HALF_B_PLAIN}" -lt "${HALF_A_PLAIN}" ]; then
-            ENTRY_PART="main-b"; HALF_B_PLAIN=$((HALF_B_PLAIN + 1))
-          else
-            ENTRY_PART="main-a"; HALF_A_PLAIN=$((HALF_A_PLAIN + 1))
+            ENTRY_PART="main-a"
           fi
           ;;
       esac
