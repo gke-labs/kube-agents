@@ -833,6 +833,17 @@ class NightlyPartTest(unittest.TestCase):
             max(cost.values()),
             f"main-a's stack chain is {chain_a}s and main-b's {chain_b}s; list a stack case in, or out of, hack/eval/nightly-main-b.txt",
         )
+        # The onboarding cases all run in main-a, one at a time under their
+        # own state lock, some of them off lock-infra; that chain must not
+        # outgrow the longer stack chain, or main-a is the long half whatever
+        # the list says.
+        onboarding = [n for n, a in self.script_answers(self.names(a), "unit_state_lock {name}").items() if a == "onboarding"]
+        chain_onboarding = sum(int(c) for c in self.script_answers(onboarding, "unit_cost_hint {name}").values())
+        self.assertLessEqual(
+            chain_onboarding,
+            max(chain_a, chain_b),
+            f"main-a's onboarding chain is {chain_onboarding}s, longer than either stack chain ({chain_a}s, {chain_b}s)",
+        )
 
     def test_the_cases_without_a_stack_split_roughly_evenly(self):
         a, b = self.halves()

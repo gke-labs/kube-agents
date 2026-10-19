@@ -11,14 +11,18 @@
 # script's comment says how), so it needs no line here.
 #
 # The choice is by name, not computed from the matrix, so the two jobs agree
-# on it even when a merge lands between their checkouts.
+# on it when a merge that adds or drops other cases lands between their
+# checkouts. A merge between them that edits this file can run a moved case
+# in both halves, or in neither, for that one night.
 #
 # scripts/test_ci_eval_nightly.py holds the two halves' stack time
 # (unit_cost_hint in the script, summed per half) to within one case's worth
 # of each other, and fails on a line here that names no stack-bearing main
 # case. Adding a stack case to the nightly can therefore fail that test:
 # list the case here, or move one, until the halves balance again. The
-# onboarding cases (bootstrap-*) stay in main-a whatever this file says.
+# onboarding cases (unit_state_lock in the script) stay in main-a whatever
+# this file says; they run one at a time under a lock of their own, and the
+# same test holds that chain to no longer than the longer stack chain.
 ai-security-planted-model-audit
 fleet-audit-clean-close-reads-clean
 gpu-stress-test-diagnosis

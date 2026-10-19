@@ -2278,11 +2278,14 @@ unit_task_path() { # <task-path> <task-name>
 # stack goes by one bit of its name's cksum (NIGHTLY_HALF_CKSUM_BIT). The
 # onboarding cases (unit_state_lock) all go to main-a: they rewrite one
 # install's onboarding state, and only a run on one install keeps them apart.
-# Every rule reads the case's name and nothing else, so the two halves, which
-# are two periodics that each check out main for themselves, agree on the
-# split even when a merge lands between their checkouts. The three helpers it reads are defined
-# here, ahead of the fan-out further down that also uses them, because the
-# split runs first.
+# No rule reads the matrix's order or size: a case's half follows from its
+# name, its task file's stack line, NIGHTLY_MAIN_B_FILE and the helpers below.
+# So the two halves, two periodics that each check out main for themselves,
+# agree on the split when a merge that adds or drops other cases lands between
+# their checkouts. A merge between them that edits one of those inputs for a
+# case can run that case in both halves, or in neither, for one night. The
+# three helpers are defined here, ahead of the fan-out further down that also
+# uses them, because the split runs first.
 
 # Reads infrastructure.stack out of a task file. The nightly part split uses
 # it to tell a stack-bearing case, and the fan-out's loop to decide whether
@@ -2806,7 +2809,9 @@ fi
 (cd "${BENCH_DIR}" && uv run python -c '' >/dev/null 2>&1) || true
 
 # Launch-order hints, longest first, from measured runs (2026-08-27/28).
-# A wrong hint costs packing efficiency, never correctness.
+# A wrong hint costs packing efficiency, never correctness. The hints also
+# price the main-a/main-b split, so scripts/test_ci_eval_nightly.py can fail
+# on a hint edit that leaves the two halves unbalanced.
 unit_cost_hint() {
   case "$1" in
     # The two tofu incumbents, nightly-only since #1218: ~20 and ~15 min a
@@ -3010,7 +3015,6 @@ unit_delegation_timeout() {
 # of every task's `audit_streams:`; a file that will not read stops the run,
 # since a unit that held none of its declared locks would run beside the
 # audit cases they keep out.
-#
 TASK_NAMES=()
 TASK_REUSE=()
 TASK_HAS_STACK=()
