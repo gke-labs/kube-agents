@@ -11,7 +11,8 @@ specific area; a path under none is unowned, and any `OWNERS` approver answers f
 request on a change that reshapes the area. **Backup** covers when the primary is out; an empty
 backup means there is none, and the fallback is again any `OWNERS` approver. Names are GitHub logins without the `@`, as
 `owner:` in a bench case writes them. `unowned` is an honest entry: the row has no owner yet, and
-anyone picking up work there may claim it.
+anyone picking up work there may claim it. An eval domain's owner, who answers for its bench cases
+as a set, is the `owner:` on its row in `docs/designs/domains.yaml`.
 
 To change a row, open a pull request; the primary of the row you are changing reviews it, or any
 `OWNERS` approver if the row is `unowned`. `scripts/test_ownership.py` checks that every path

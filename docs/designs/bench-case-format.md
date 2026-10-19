@@ -402,12 +402,10 @@ while the coverage report shows the domain it actually exercises as a gap, and n
 finds out until someone writes a second case for a domain that already had one. So a case
 declares a domain.
 
-The exception is a case that genuinely covers no row in `domains.yaml` — the way
-`gpu-stress-test-diagnosis` is a chat-prompted post-incident RCA and not the event-fired
-autoops triage `incident-triage` names. That is a real answer, and the answer is recorded
-as a reviewed entry in the validator's `KNOWN_NO_DOMAIN` map with its reason, not as an
-absent field. The distinction the map owns is the one between "covers nothing, and we
-checked" and "nobody remembered".
+There is no exemption. A case no row describes gets a new row in `domains.yaml`, with
+the `owner:` who answers for the domain's cases as a set, a different `backup:`, and a
+one-sentence `meaning:` a reader outside the code understands; `scripts/test_domain_coverage.py`
+fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist.
 
 ## Every case declares a verification spec
 
@@ -459,8 +457,7 @@ may first seat its candidate in the presubmit file without a roster line, to ear
 presubmit volume; it cannot red a pull request on quality there, only on rungs 1–3) and cites that record — never the pull request that makes it pass. Cases that stay in the nightly for good are
 the ones kept out of the presubmit for cost, because a cheaper probe holds their presubmit
 seat, or because what they grade is not one of the core journeys the presubmit gate is
-for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`, and a case
-that claims no domain there is outside them by construction. A case the agent cannot pass
+for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A case the agent cannot pass
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
@@ -529,7 +526,7 @@ is a populated list, and the empty string is in every text there has ever been, 
 check reads as an assertion and can only pass; the validator treats a blank phrase as no
 phrase.
 
-The three allowlists (`KNOWN_UNREGISTERED`, `KNOWN_NO_DOMAIN`, `KNOWN_JUDGE_ONLY`) all
+The two allowlists (`KNOWN_UNREGISTERED`, `KNOWN_JUDGE_ONLY`) both
 work the same way: an entry names a case and carries the reason, and an entry whose case
 no longer exists fails the lint.
 

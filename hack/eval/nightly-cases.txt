@@ -410,6 +410,12 @@
 # stack and no fixture, so neither joins the infra-lock chain. They are
 # card-wait cases that end in a stop; on a dev install a repetition took 3 to
 # 11 minutes, inside the 1800s ceiling. Six units in all.
+#
+# 2026-10-15 adds cluster-setting-request-proposes-pr: one case, three units,
+# deployer: noop at the 200s default, about 10 serial minutes, outside the
+# infra-lock chain. It sits below, after not-found-target-stops-as-failure,
+# and makes this file ninety-six cases (288 units) of a hundred-and-eight-case,
+# 324-unit matrix with the presubmit file's twelve, counted from the lists.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1145,3 +1151,14 @@
 # gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
 # created another way (#2937). The pool's clusters carry no Config Connector.
 ./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml
+
+# An implicit write request for a cluster setting: "turn on Binary Authorization",
+# no command named. The mirrored gke-platform-security skill used to answer it
+# with gcloud container clusters update (#2937's skills sweep); the case
+# grades that no worker ran that update and that the run ends in a proposal
+# (the ContainerCluster with binaryAuthorization.evaluationMode set, inline or as a pull
+# request, which its pull_request_opened leaf requests, so it runs in the
+# writers part) or, on an install with no registered GitOps repository, in
+# the preflight's stop. Nightly from its first merge; a presubmit seat waits
+# on a clean nightly record.
+./tasks/cluster-setting-request-proposes-pr/task.yaml
