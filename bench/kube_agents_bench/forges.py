@@ -78,8 +78,10 @@ __all__ = [
     "is_gitlab_token_bot",
     "issue_refs",
     "proposal_refs",
+    "missing_token_hint",
     "read_token",
     "token_env_vars",
+    "token_source",
     "web_host",
 ]
 
@@ -199,15 +201,50 @@ def read_token(forge: str, environ: Mapping[str, str] | None = None) -> str | No
     token, and an embedded newline or a non-Latin-1 character would otherwise
     raise out of the HTTP request's header instead of grading."""
     env = _env(environ)
+    token = _file_token(forge, env)
+    if token:
+        return token
+    return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
+
+
+def _file_token(forge: str, env: Mapping[str, str]) -> str | None:
+    """GITHUB_TOKEN_FILE_ENV_VAR's token when it names a file holding one."""
+    token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
+    if forge == FORGE_GITLAB or not token_file:
+        return None
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
+        return None
+    if token and token.isascii() and token.isprintable() and not any(c.isspace() for c in token):
+        return token
+    return None
+
+
+def token_source(forge: str, environ: Mapping[str, str] | None = None) -> str:
+    """Names the credential :func:`read_token` returns, for a diagnostic:
+    the file when it supplied the token, else the first variable that is set
+    (the forge's first variable when none is)."""
+    env = _env(environ)
+    if _file_token(forge, env):
+        return f"the token in the file {GITHUB_TOKEN_FILE_ENV_VAR} names ({env[GITHUB_TOKEN_FILE_ENV_VAR]})"
+    names = token_env_vars(forge)
+    name = next((n for n in names if env.get(n)), names[0])
+    return f"the token in {name}"
+
+
+def missing_token_hint(forge: str, environ: Mapping[str, str] | None = None) -> str:
+    """What to set when :func:`read_token` found nothing, saying so when
+    GITHUB_TOKEN_FILE_ENV_VAR is set but its file holds no usable token."""
+    env = _env(environ)
+    hint = f"set one of {', '.join(token_env_vars(forge))}"
     token_file = env.get(GITHUB_TOKEN_FILE_ENV_VAR)
     if forge != FORGE_GITLAB and token_file:
-        try:
-            token = Path(token_file).read_text(encoding="utf-8").strip()
-        except (OSError, ValueError):  # UnicodeDecodeError is a ValueError
-            token = ""
-        if token and token.isascii() and token.isprintable() and not any(c.isspace() for c in token):
-            return token
-    return next((v for v in (env.get(n) for n in token_env_vars(forge)) if v), None)
+        hint += (
+            f" ({GITHUB_TOKEN_FILE_ENV_VAR} names {token_file}, which was refused: "
+            "unreadable, empty, or not one line of printable ASCII)"
+        )
+    return hint
 
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*\Z")

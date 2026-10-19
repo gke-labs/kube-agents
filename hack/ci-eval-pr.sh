@@ -1034,7 +1034,12 @@ mint_ledger_token() { # <label>
 # (bench/kube_agents_bench/forges.py, GITHUB_TOKEN_FILE_ENV_VAR), and a
 # background loop re-mints into it every LEDGER_TOKEN_RENEW_SECONDS. A failed
 # renewal leaves the previous token in place and is tried again after
-# LEDGER_TOKEN_RENEW_RETRY_SECONDS. Nothing to renew under gitlab or on the
+# LEDGER_TOKEN_RENEW_RETRY_SECONDS. A renewal's mint runs with its stderr
+# discarded: mint_ledger_token's ERROR block says grading cannot proceed, which
+# is not yet true while the file holds a live token, and a retry every
+# LEDGER_TOKEN_RENEW_RETRY_SECONDS would repeat it for the rest of the unit. The
+# loop prints one WARNING per failure streak instead, carrying the mint's last
+# diagnostic, and a line when renewal recovers. Nothing to renew under gitlab or on the
 # mounted PAT, as in mint_ledger_token. stop_ledger_token_renewal ends it, and
 # the loop ends itself once the unit that started it is gone, so a unit killed
 # before its stop leaves no renewer holding the job's output open.
@@ -1050,16 +1055,28 @@ start_ledger_token_renewal() { # <label> <file>
   export BENCH_GITHUB_TOKEN_FILE="${file}"
   (
     waited=0
+    failures=0
     while :; do
       sleep "${LEDGER_TOKEN_RENEW_TICK_SECONDS}"
       kill -0 "${owner}" 2>/dev/null || exit 0
       waited=$((waited + LEDGER_TOKEN_RENEW_TICK_SECONDS))
       [ "${waited}" -ge "${LEDGER_TOKEN_RENEW_SECONDS}" ] || continue
-      if mint_ledger_token "${label} renewal" \
+      if mint_ledger_token "${label} renewal" 2>/dev/null \
         && (umask 077 && printf '%s\n' "${BENCH_GITHUB_TOKEN}" > "${file}.next") \
         && mv -f "${file}.next" "${file}"; then
+        if [ "${failures}" -gt 0 ]; then
+          echo "Ledger token (${label} renewal): renewed after ${failures} failed attempt(s)" >&2
+        fi
+        failures=0
         waited=0
       else
+        failures=$((failures + 1))
+        if [ "${failures}" -eq 1 ]; then
+          echo "WARNING: ${label}: could not renew the ledger read token" \
+               "(${LEDGER_MINT_LAST_FAILURE:-could not write ${file}}); the previous token" \
+               "stays in ${file} until it expires, and renewal is retried every" \
+               "${LEDGER_TOKEN_RENEW_RETRY_SECONDS}s without repeating this warning." >&2
+        fi
         waited=$((LEDGER_TOKEN_RENEW_SECONDS - LEDGER_TOKEN_RENEW_RETRY_SECONDS))
       fi
     done

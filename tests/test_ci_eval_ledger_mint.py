@@ -349,7 +349,35 @@ class LedgerTokenRenewalTest(unittest.TestCase):
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertIn("RENEWED=tok-renewed", proc.stdout)
-        self.assertIn("stub refusal 2", proc.stderr)
+        self.assertIn("renewed after 2 failed attempt(s)", proc.stderr)
+
+    def test_a_failure_streak_warns_once_without_the_mints_error_block(self):
+        # The mint's ERROR block says grading cannot proceed, which is false
+        # while the file still holds a live token; repeated on every retry it
+        # filled the job log for the rest of the unit.
+        proc = self._run(
+            textwrap.dedent(
+                """\
+                start_ledger_token_renewal "case rep 1" "${TOKEN_FILE}"
+                for _ in $(seq 1 16); do
+                  grep -q tok-renewed "${TOKEN_FILE}" && break
+                  command sleep 0.5
+                done
+                echo "RENEWED=$(cat "${TOKEN_FILE}")"
+                stop_ledger_token_renewal "${TOKEN_FILE}"
+                echo "MINTS=$(cat "${COUNT_FILE}")"
+                """
+            ),
+            MINT_FAILURES="3",
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("RENEWED=tok-renewed", proc.stdout)
+        self.assertIn("MINTS=4", proc.stdout)
+        self.assertEqual(1, proc.stderr.count("WARNING: case rep 1: could not renew"), proc.stderr)
+        self.assertIn("(stub refusal 1); the previous token stays in", proc.stderr)
+        self.assertNotIn("Grading a ledger issue needs it", proc.stderr)
+        self.assertNotIn("ERROR:", proc.stderr)
+        self.assertIn("renewed after 3 failed attempt(s)", proc.stderr)
 
     def test_the_renewer_ends_when_its_unit_is_gone(self):
         # A unit killed before it reaches stop_ledger_token_renewal must not

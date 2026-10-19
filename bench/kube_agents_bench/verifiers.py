@@ -1724,20 +1724,17 @@ def _no_pr_url_reason(host: str) -> str:
         f"({forges.GITHUB_HOST_ENV_VAR})"
     )
 
-_NO_TOKEN_REASON = (
-    "no GitHub read credential in the environment: set one of "
-    f"{', '.join(LEDGER_TOKEN_ENV_VARS)} to a token that can read issues on "
-    "the eval GitOps repository, or this check cannot be evaluated"
-)
-
-
 def _no_token_reason(forge: str) -> str:
-    """The reason for an absent grading credential, naming the forge's variables."""
+    """The reason for an absent grading credential, naming what was read."""
     if forge == forges.FORGE_GITHUB:
-        return _NO_TOKEN_REASON
+        return (
+            "no GitHub read credential in the environment: "
+            f"{forges.missing_token_hint(forge)} to a token that can read issues on "
+            "the eval GitOps repository, or this check cannot be evaluated"
+        )
     return (
-        f"no {forge} read credential in the environment: set one of "
-        f"{', '.join(forges.token_env_vars(forge))} to a token that can read the eval "
+        f"no {forge} read credential in the environment: "
+        f"{forges.missing_token_hint(forge)} to a token that can read the eval "
         "GitOps repository, or this check cannot be evaluated"
     )
 
@@ -4319,8 +4316,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             # token lasts an hour, and telling the reader to widen a permission
             # sends them to the App's settings for a fault that is in the mint.
             return None, (
-                f"GitHub answered 401 for {owner}/{repo}#{number}: the token in "
-                f"{LEDGER_TOKEN_ENV_VARS[0]} is not valid — an installation token "
+                f"GitHub answered 401 for {owner}/{repo}#{number}: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} is not valid — an installation token "
                 "expires an hour after it is minted — so this check could not be "
                 "evaluated"
             )
@@ -4328,8 +4325,8 @@ class PullRequestOpenedVerifier(BaseVerifier):
             return payload, None
         if first == 403 and status_code == 403:
             return None, (
-                f"GitHub denied {owner}/{repo}#{number} on both endpoints: the token "
-                f"behind {LEDGER_TOKEN_ENV_VARS[0]} can reach that repository but "
+                f"GitHub denied {owner}/{repo}#{number} on both endpoints: "
+                f"{forges.token_source(forges.FORGE_GITHUB)} can reach that repository but "
                 "read neither its issues nor its pull requests — add "
                 "`pull_requests: read` to the installation — so this check could "
                 "not be evaluated"
@@ -4390,7 +4387,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub answered 401 for {owner}/{repo}#{number} on the pulls "
-                    f"endpoint: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                    f"endpoint: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                     "an installation token expires an hour after it is minted — so "
                     "this check could not be evaluated",
                 )
@@ -4401,7 +4398,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     {},
                     None,
                     f"GitHub denied {owner}/{repo}#{number} on the pulls endpoint; "
-                    f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                    f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                     "`pull_requests: read` to grade what a run pushed, so this "
                     "check could not be evaluated",
                 )
@@ -4437,7 +4434,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub answered 401 for {owner}/{repo}#{number} on the commits "
-                f"page: the token in {LEDGER_TOKEN_ENV_VARS[0]} is not valid — "
+                f"page: {forges.token_source(forges.FORGE_GITHUB)} is not valid — "
                 "an installation token expires an hour after it is minted — so "
                 "this check could not be evaluated",
             )
@@ -4448,7 +4445,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 {},
                 None,
                 f"GitHub denied {owner}/{repo}#{number} on the commits page; "
-                f"the token behind {LEDGER_TOKEN_ENV_VARS[0]} needs "
+                f"{forges.token_source(forges.FORGE_GITHUB)} needs "
                 "`pull_requests: read` to grade what a run pushed, so this "
                 "check could not be evaluated",
             )
@@ -5167,13 +5164,12 @@ class GitHubWritesVerifier(BaseVerifier):
             forge = github_writes.forge_name()
         except github_writes.UnknownForge as exc:
             return done(False, str(exc), status="error")
-        token_vars = github_writes.token_env_vars(forge)
         token = forges.read_token(forge)
         if not token:
             return done(
                 False,
-                f"no {forge} read credential in the environment: set one of "
-                f"{', '.join(token_vars)} to a token that can read the GitOps repository, "
+                f"no {forge} read credential in the environment: "
+                f"{forges.missing_token_hint(forge)} to a token that can read the GitOps repository, "
                 "or this check cannot be evaluated",
                 status="error",
             )
