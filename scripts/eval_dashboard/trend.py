@@ -36,8 +36,8 @@ WHAT "SCORE" MEANS is written once, in ``docs/designs/eval-scorer.md``
 LATENCY IS ADVISORY, AND NOT FROM THE STORE. The store's records carry no
 timing, so the latency row under each card reads ``data.json``'s nightly
 runs, each night filed as ``nightly.filed_nights`` files it, with its own
-parts only (a main re-run night does not borrow its date's writers part,
-so writers reps count once): per night and scope (a case, a domain's cases,
+parts only (a main re-run night does not borrow its date's other parts,
+so their reps count once): per night and scope (a case, a domain's cases,
 every case), the p50 and the slow percentile (``LATENCY_SLOW_PCT``: the
 opening chat turn's p95, ``nightly.TURN1_TARGET_PCT``, which its target is
 defined on; the agent run's ``nightly.SLOW_PCT``) over the scope's reps

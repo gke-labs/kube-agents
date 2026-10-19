@@ -194,6 +194,9 @@ env:
   # and until a writers build is on record any other listing failure but a
   # hang is a note too: it has a watermark of its own.
   NIGHTLY_WRITERS_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/
+  # The periodic that runs the nightly main part's second half (main-b) when
+  # that part runs as two jobs, in the same bucket; read the same way.
+  NIGHTLY_MAIN_B_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/
   # The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
   # tier gitlab with no pull request, listed under the Brief's GitLab section.
   GITLAB_NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/
@@ -333,6 +336,7 @@ jobs:
             --gitlab-pr-glob "$GITLAB_PR_GLOB" \
             --nightly-prefix "$NIGHTLY_PREFIX" \
             --nightly-writers-prefix "$NIGHTLY_WRITERS_PREFIX" \
+            --nightly-main-b-prefix "$NIGHTLY_MAIN_B_PREFIX" \
             --gitlab-nightly-prefix "$GITLAB_NIGHTLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
