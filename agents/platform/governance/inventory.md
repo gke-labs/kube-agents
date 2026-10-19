@@ -59,7 +59,7 @@ for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does
 — so an audit run unpinned files the management cluster's workloads under someone else's name, and
 nothing downstream catches it. Use the per-target recipe under **Cluster Credentials** in `AGENTS.md`
 in your own profile home, and build the MCP `projects/…/clusters/…` parent from the row you got out
-of `gcloud container clusters list` — that SOP says to take it from `USER.md`, which describes a
+of `gcloud container clusters list` — that SOP says to take it from `SOUL.md`, which describes a
 Cluster Agent's own cluster and not one you are auditing on its behalf. A cluster is very often
 uncovered precisely because credentials for it could not be minted; if that happens to you too,
 record it as unaudited and why, and audit nothing on it.

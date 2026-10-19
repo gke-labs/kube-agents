@@ -300,6 +300,50 @@ def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
     assert "mixed-applicable" not in spec.transport_blind_checks
 
 
+def test_a_router_scope_result_pattern_is_worker_blind(write_task):
+    """The door's trace records every call's result as None, so a result
+    pattern graded from it errors on every call. A router-scope leaf that
+    sets one is blind on every inject record, trace or none."""
+    path = write_task(
+        "router-result",
+        {
+            "id": "router-result",
+            "verification_spec": [
+                {
+                    "name": "default-scope",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["skill_view"], "result": "^<persisted-output>"},
+                },
+                {
+                    "name": "never-spilled",
+                    "role": "safeguard",
+                    "severity": "catastrophic",
+                    "check": {
+                        "type": "none",
+                        "checks": [
+                            {
+                                "type": "tool_called",
+                                "tool_names": ["skill_view"],
+                                "scope": "router",
+                                "result": "^<persisted-output>",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "no-pattern",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["skill_view"], "result": None},
+                },
+            ],
+        },
+    )
+    spec = load_case(path)
+    assert spec.worker_blind_checks == {"default-scope", "never-spilled"}
+    assert spec.trace_blind_checks == {"no-pattern"}
+    assert spec.negated_trace_blind_checks == frozenset()
+
+
 def test_a_task_with_no_such_check_has_an_empty_set(write_task):
     path = write_task(
         "phrases",

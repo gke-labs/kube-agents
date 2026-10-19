@@ -415,12 +415,13 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
+values (`"chat"` alone for a fleet-audit job, see below), with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
 scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
-on the same leg.
+on the same leg, and the relay posts that line as written for a fleet-audit job
+too.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
@@ -455,18 +456,26 @@ child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
 `deliver: "chat"` hands the run's report to the relay instead, which posts it as
-written (on Slack, a fleet-audit report is replaced by a headline linking its
-ledger issue) and stores the full report against its thread, so the user's reply there reaches the
-Chat Agent with the report attached. It is a delivery mode, not a
+written and stores the full report against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. A fleet-audit job the image ships is the
+exception: its scheduled delivery posts the report the run's `finish` rendered,
+not the final message,
+which holds whatever else the model wrote in its last turn. A run over several
+repositories posts each finished repository's report, then a line naming any it
+did not finish. A failed run posts the scheduler's failure line, which says why,
+and a run that finished no repository without failing posts a one-line notice
+that it did not finish. On Slack the report is then replaced by a headline linking its
+ledger issue when the run covered one repository; a message with that line, or
+with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
 dual-platform install whose cron child can address both, a job left on `"all"`
-is heard twice on _each_ of them rather than twice in one place. Two entries here name `"all"`
-(`gcp-networking-fabric-audit` and `gce-compute-fleet-audit`) and accept that;
-the rest name `"chat"`.
+is heard twice on _each_ of them rather than twice in one place. Under `"all"`
+the scheduler also posts the final message itself, past the relay's choice of
+report, so every entry here names `"chat"`.
 
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
@@ -481,7 +490,7 @@ instruction, and what the plugin route costs — is
 
 ## Moving the roster onto `"chat"` needed no migration
 
-Every report-producing job here names `"chat"` or `"all"`, and getting there was an edit to this file alone
+Every report-producing job here names `"chat"`, and getting there was an edit to this file alone
 — no script, no one-off Job, nothing run against a live volume. `deliver` is an
 image-owned key on this profile: `merge_cron_store` gives the image every key it
 ships and leaves the volume only the keys it does not, so the next pod start
@@ -596,7 +605,7 @@ rule outlives the memory of why:
   Platform Agent marks the job due for the next tick instead of running the SOP
   itself. The one run that does happen in a session (#1876, #1887): a card that
   delegates exactly one stream per its SOP is run by that worker through
-  `audit_report.py start … finish` (`skills/fleet-audit/SKILL.md`, "Running a
+  `audit_report.py start … finish` (`skills/fleet-audit/references/on-demand.md`, "Running a
   stream on demand"); several streams still queue.
   Such a run holds no per-job lock, so `start` keeps its own guard: an
   in-flight note per stream on the sandbox pod's own volume, at

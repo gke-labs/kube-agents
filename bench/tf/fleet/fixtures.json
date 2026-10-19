@@ -174,7 +174,7 @@
           "path": "currentMasterVersion",
           "op": "minor_behind_channel_default",
           "value": 1,
-          "why": "the defect itself. GKE upgrading the master -- reconciles lapsing past the exclusion window, or the held minor reaching end of life -- heals it, and upgrades-lagging-master-probe going red on every pull request is otherwise the first anyone hears of it"
+          "why": "the defect itself. GKE upgrading the master -- reconciles lapsing past the exclusion window, or the held minor reaching end of life -- heals it, and upgrades-lagging-master-probe going red (in the nightly since 2026-10-16, #3269) is otherwise the first anyone hears of it"
         },
         {
           "subject": "cluster",

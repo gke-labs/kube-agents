@@ -201,12 +201,16 @@ class InjectLaneTest(unittest.TestCase):
         # them and the log says so. obtainability-remediation-proposal left
         # the list when the persona's rule put its manifest in the reply
         # (#2037), so it is graded at zero writes with the rest of the first
-        # phase; pdb-remediation-pr asks for its pull request by its own check.
+        # phase. pdb-remediation-pr, which asks for its pull request by its
+        # own check, was the presubmit's one requesting case until its
+        # demotion to the nightly (2026-10-17, #3120), so today the list is
+        # empty and the log says "none";
+        # test_the_requesting_cases_are_named_for_the_second_phase below
+        # covers a matrix that holds them.
         requesting = requesting_among(presubmit_tasks())
         self.assertNotIn("obtainability-remediation-proposal", requesting.split(","))
-        self.assertIn("pdb-remediation-pr", requesting.split(","))
         self.assertEqual(value(result, "REQUESTING"), requesting)
-        self.assertIn(f"run after every other unit: {requesting}\n", result.stdout)
+        self.assertIn(f"run after every other unit: {requesting or 'none'}\n", result.stdout)
 
     def test_the_requesting_cases_are_named_for_the_second_phase(self):
         # Every pinned requesting case the presubmit matrix does not seat,
