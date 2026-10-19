@@ -1013,14 +1013,17 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
     return MAYBE_POSTED, f"a2a notify exited {res.returncode}; the post may have landed: {detail}"
 
 
-def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note: str) -> tuple[str, str]:
+def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note: str,
+                          mark_shown) -> tuple[str, str, bool]:
     """Post the report and the audits note: the card then the note, or one text message.
 
     The card goes only when ``KAGE_SLACK_UX`` is on, the conversation is Slack's
     and the report parses. On the card path anything short of posted is
     returned as ``NOT_POSTED``, since the next attempt's key edits a card that
-    landed. The outcome is recorded before the note goes, and a note that
-    fails is logged: the report is out.
+    landed. Once the claim is kept, the outcome is recorded, then the
+    findings are marked shown (``mark_shown``, whose result is returned), both
+    before the card path's note goes, since the outcome ends the findings
+    nudge's hold. A note that fails is logged: the report is out.
     """
     platform = conversation["platform"]
     card = None
@@ -1035,18 +1038,20 @@ def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note
         sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
     if card is None:
         outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, platform), note))
-        if outcome != NOT_POSTED:
-            _record_outcome(data_dir, outcome)
-        return outcome, reason
+        if outcome == NOT_POSTED:
+            return outcome, reason, False
+        _record_outcome(data_dir, outcome)
+        return outcome, reason, mark_shown()
     chat, text = card
     outcome, reason = _notify_conversation(conversation, text, chat, CONVERSATION_REPORT_UPDATE)
     if outcome != POSTED:
-        return NOT_POSTED, reason
+        return NOT_POSTED, reason, False
     _record_outcome(data_dir, outcome)
+    shown = mark_shown()
     note_outcome, note_reason = _notify_conversation(conversation, note)
     if note_outcome != POSTED:
         _log_to_stage(data_dir, f"the report posted but its audits note did not: {note_reason}")
-    return outcome, reason
+    return outcome, reason, shown
 
 
 def _record_outcome(data_dir: Path, outcome: str) -> None:
@@ -1065,16 +1070,17 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
     against the day's limit.
     """
     note = _audits_note(data_dir, no_ranking is True, home=bool(chat_notify.routed_platform()))
-    outcome, reason = _post_to_conversation(data_dir, conversation, content, note)
+    outcome, reason, shown = _post_to_conversation(
+        data_dir, conversation, content, note, lambda: _mark_shown(data_dir, in_sandbox, suppressed)
+    )
     if outcome == NOT_POSTED:
         # Recorded first, so the released claim is retried only after the wait.
         _record_attempt(data_dir, reason, counted=True)
         _release_claim(data_dir)
         return
-    # A kept claim is final for this report, whether it posted or most likely did.
     if outcome != POSTED:
         _record_attempt(data_dir, reason, counted=False)
-    _cleanup(data_dir, in_sandbox, _mark_shown(data_dir, in_sandbox, suppressed))
+    _cleanup(data_dir, in_sandbox, shown)
 
 
 def main(data_dir: Path | None = None) -> int:

@@ -347,6 +347,19 @@ def _load_image_module(path: Path, name: str) -> ModuleType:
     return module
 
 
+# Loaded once: until onboarding greets, every API-server turn reads the route.
+_chat_notify: Optional[ModuleType] = None
+# Platforms already warned about as unserved, so a mismatch logs once.
+_unserved_warned: set = set()
+
+
+def _load_chat_notify() -> ModuleType:
+    global _chat_notify
+    if _chat_notify is None:
+        _chat_notify = _load_image_module(CHAT_NOTIFY_PATH, CHAT_NOTIFY_MODULE)
+    return _chat_notify
+
+
 def _load_sandbox_exec() -> ModuleType:
     return _load_image_module(SANDBOX_EXEC_PATH, SANDBOX_EXEC_MODULE)
 
@@ -436,7 +449,7 @@ def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, s
     serve its platform's conversations.
     """
     try:
-        chat_notify = _load_image_module(CHAT_NOTIFY_PATH, CHAT_NOTIFY_MODULE)
+        chat_notify = _load_chat_notify()
         route = chat_notify.conversation_route(session_id)
         served = chat_notify.gateway_platform()
     except Exception as e:
@@ -445,6 +458,9 @@ def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, s
     if not route or route["platform"] not in DURABLE_CHAT_PLATFORMS:
         return None
     if served != route["platform"]:
+        if route["platform"] in _unserved_warned:
+            return None
+        _unserved_warned.add(route["platform"])
         logger.warning(
             "The gateway does not serve %s conversations here (%s=%r); leaving onboarding unprimed.",
             route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV, served,

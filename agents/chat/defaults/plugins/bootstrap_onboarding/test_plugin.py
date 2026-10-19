@@ -717,9 +717,13 @@ class ConversationPrimingTest(unittest.TestCase):
         )
         env.start()
         self.addCleanup(env.stop)
-        patcher = mock.patch.object(plugin, "CHAT_NOTIFY_PATH", REPO_CHAT_NOTIFY)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (
+            mock.patch.object(plugin, "CHAT_NOTIFY_PATH", REPO_CHAT_NOTIFY),
+            mock.patch.object(plugin, "_chat_notify", None),
+            mock.patch.object(plugin, "_unserved_warned", set()),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def _route(self, session_id, route):
         with sqlite3.connect(self.db) as conn:
@@ -793,6 +797,19 @@ class ConversationPrimingTest(unittest.TestCase):
             with self.subTest(served=served), mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": served}):
                 self.assertIsNone(self._bridge_call())
                 self._assert_unprimed()
+
+    def test_chat_notify_is_loaded_once(self):
+        with mock.patch.object(plugin, "_load_image_module", wraps=plugin._load_image_module) as load:
+            self._bridge_call(session_id="a2a-ctx-none-1")
+            self._bridge_call(session_id="a2a-ctx-none-2", is_first_turn=False)
+        self.assertEqual([c.args[0] for c in load.call_args_list].count(REPO_CHAT_NOTIFY), 1)
+
+    def test_an_unserved_platform_is_warned_about_once(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "google_chat"}), \
+                self.assertLogs(plugin.logger, level="WARNING") as logs:
+            self._bridge_call()
+            self._bridge_call(is_first_turn=False)
+        self.assertEqual(sum("does not serve" in line for line in logs.output), 1)
 
     def test_an_unreadable_session_store_leaves_onboarding_unprimed(self):
         self.db.write_text("not a database", encoding="utf-8")

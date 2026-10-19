@@ -566,6 +566,21 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertFalse((self.d / COMPLETED).exists())
         self.assertEqual(self._attempts()["attempts"], 1)
 
+    def test_the_card_marks_findings_before_the_note_goes(self):
+        flag, chat = self._card()
+        order = []
+        real = self._fake_run
+
+        def run(argv, **kwargs):
+            order.append("card" if "--chat-file" in argv else "note")
+            return real(argv, **kwargs)
+
+        with flag, chat, mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run), \
+                mock.patch.object(bootstrap_delivery, "_mark_shown", side_effect=lambda *a: order.append("mark") or True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            bootstrap_delivery.main(self.d)
+        self.assertEqual(order, ["card", "mark", "note"])
+
     def test_findings_are_marked_shown_only_after_the_post(self):
         order = []
         self.answers = []

@@ -32,8 +32,9 @@ formatting and bookkeeping. Each run:
    records it against the day. An announced item counts against the day from
    the state file alone while its marks have not landed.
 
-Nothing is added before the first inventory report's delivery is claimed, so
-that report is the first thing onboarding says about the fleet. The hold ends
+Nothing is added before the first inventory report is out (its delivery
+claimed, or under ``spec.mode: next`` its post's outcome recorded), so that
+report is the first thing onboarding says about the fleet. The hold ends
 ``FIRST_REPORT_HOLD_HOURS`` (24) after onboarding filed its sweep, delivered or
 not: an undelivered report by then means onboarding stalled, and holding on
 would keep the queue silent for good. Each run that is held, or would be but
@@ -184,7 +185,8 @@ def first_report_hold(gateway_home: Path, now: datetime) -> tuple[bool, str]:
             f"held for it ({markers})"
         )
     return True, (
-        f"{LOG_PREFIX}: adding nothing until the first inventory report's delivery is claimed, or until "
+        f"{LOG_PREFIX}: adding nothing until the first inventory report is out (its delivery claimed, or "
+        f"its conversation post's outcome recorded), or until "
         f"{(filed_at + FIRST_REPORT_HOLD).strftime(TIME_FORMAT)} ({markers})"
     )
 

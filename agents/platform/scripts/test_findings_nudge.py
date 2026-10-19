@@ -406,7 +406,7 @@ class FirstReportTests(NudgeHarness):
         self.assertEqual(self.marks, [])
         # A held run says so, so a stuck onboarding is not a silent one.
         err = self.err.getvalue()
-        self.assertIn("adding nothing until the first inventory report's delivery is claimed", err)
+        self.assertIn("adding nothing until the first inventory report is out (its delivery claimed", err)
         self.assertIn("or until 2026-10-07 09:00 UTC", err)
         self.assertIn(nudge.DELIVERED_MARKER, err)
         self.assertEqual(err.count(nudge.LOG_PREFIX), 1)
