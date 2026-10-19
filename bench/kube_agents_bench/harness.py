@@ -2577,12 +2577,16 @@ class KubeAgentsHarness(AgentHarness):
     def _extract_trajectory_failure_summaries(
         trajectory: Iterable[dict[str, Any]],
         task_ids: Iterable[str],
+        store: dict[str, list[str]] | None = None,
     ) -> dict[str, list[str]]:
-        """Scan tool calls in a trajectory for rate-limit summaries of failure cards."""
+        """Scan tool calls in a trajectory for rate-limit summaries of failure cards.
+
+        When store is provided, updates or evicts matching task entries in-place.
+        """
         wanted = set(str(t) for t in task_ids)
         if not wanted:
-            return {}
-        found: dict[str, list[str]] = {}
+            return store if store is not None else {}
+        found: dict[str, list[str]] = store if store is not None else {}
         for entry in trajectory:
             payload = _json_object(entry.get("result"))
             if not payload:
@@ -2591,12 +2595,16 @@ class KubeAgentsHarness(AgentHarness):
             if isinstance(shown, dict):
                 tid = str(shown.get("id"))
                 if tid in wanted:
-                    if shown.get("status") in ("blocked", "triage") and shown.get("block_kind") != "transient":
+                    if (
+                        shown.get("status") in ("blocked", "triage")
+                        and shown.get("block_kind")
+                        and shown.get("block_kind") != "transient"
+                    ):
                         found.pop(tid, None)
                         continue
                     runs = payload.get("runs")
-                    if isinstance(runs, list):
-                        if runs and isinstance(runs[-1], dict):
+                    if isinstance(runs, list) and runs:
+                        if isinstance(runs[-1], dict):
                             summ = runs[-1].get("summary")
                             if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
                                 found[tid] = [summ]
@@ -2610,12 +2618,16 @@ class KubeAgentsHarness(AgentHarness):
                     if isinstance(item, dict):
                         tid = str(item.get("id"))
                         if tid in wanted:
-                            if item.get("status") in ("blocked", "triage") and item.get("block_kind") != "transient":
+                            if (
+                                item.get("status") in ("blocked", "triage")
+                                and item.get("block_kind")
+                                and item.get("block_kind") != "transient"
+                            ):
                                 found.pop(tid, None)
                                 continue
                             runs = item.get("runs")
-                            if isinstance(runs, list):
-                                if runs and isinstance(runs[-1], dict):
+                            if isinstance(runs, list) and runs:
+                                if isinstance(runs[-1], dict):
                                     summ = runs[-1].get("summary")
                                     if isinstance(summ, str) and summ.strip().startswith(_RATE_LIMIT_REASON_PREFIX):
                                         found[tid] = [summ]
@@ -3122,36 +3134,11 @@ class KubeAgentsHarness(AgentHarness):
                         else:
                             poll_failure_messages.pop(t, None)
                 else:
-                    # If board read exec failed, check if the status turn explicitly
-                    # reported a non-transient block kind, evicting any stale prefix.
-                    for entry in turn_new_calls:
-                        payload = _json_object(entry.get("result"))
-                        if not payload:
-                            continue
-                        tasks_to_check = []
-                        if isinstance(payload.get("task"), dict):
-                            tasks_to_check.append(payload["task"])
-                        if isinstance(payload.get("tasks"), list):
-                            tasks_to_check.extend(
-                                it for it in payload["tasks"] if isinstance(it, dict)
-                            )
-                        for it in tasks_to_check:
-                            tid = str(it.get("id"))
-                            if (
-                                tid in needed_read
-                                and it.get("status") in ("blocked", "triage")
-                                and it.get("block_kind")
-                                and it.get("block_kind") != "transient"
-                            ):
-                                poll_failure_messages.pop(tid, None)
-                still_needed = [t for t in needed_read if t not in poll_failure_messages]
-                if still_needed:
-                    traj_summaries = self._extract_trajectory_failure_summaries(
-                        turn_new_calls, still_needed
+                    # If board read exec failed, evaluate trajectory failure summaries
+                    # across all needed cards, allowing newer runs to both set and evict.
+                    self._extract_trajectory_failure_summaries(
+                        turn_new_calls, needed_read, store=poll_failure_messages
                     )
-                    for t in still_needed:
-                        if t in traj_summaries:
-                            poll_failure_messages[t] = traj_summaries[t]
             _fold_status_turn(
                 result,
                 status_turn,
