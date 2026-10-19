@@ -96,6 +96,14 @@ in `tf/modules/` and reference it with `source = "../../modules/<module-name>"` 
 paths resolve whether the stack is applied in place (the default) or from the per-run copy of the
 whole `tf/` tree that `--parallel` makes.
 
+What several stacks share is often a shell or python helper rather than Terraform, because the work
+happens inside one `local-exec`. A module directory may hold those instead, run from the same
+relative path: `tf/modules/drift-inject/` is a bash library the three `gitops-drift-*` stacks
+`source` and two python files they execute. Prefer that to inlining the text with `file()`, which
+costs `shellcheck -x` its ability to follow the call and puts the whole helper into every rendered
+plan — and whose interpolation, placed at a smaller indent than the heredoc body, silently sets the
+`<<-` dedent to zero and leaves every embedded heredoc terminator indented.
+
 The deployer only reads `*.tf` and `*.tf.json` in the stack directory itself and never descends into
 modules, so re-declare every variable you want to reach a module in the stack's own `variables.tf`
 and pass it through.

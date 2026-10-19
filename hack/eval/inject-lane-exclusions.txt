@@ -131,3 +131,14 @@ chat-fanout-fleet-restarts-rows
 # ids, so the worker checks fail closed. Returns to the lane with
 # agent-kanban-smoke.
 chat-question-asked-to-choose-pauses
+# #2039: grades the chat front door's reply to the wake a blocked card sends
+# it, as chat-voice-failure-leads-with-fact does: a card-wake replay needs
+# AGENT_TRANSPORT=api and errors on this lane. Returns to the lane with it.
+chat-failure-reply-declares-next-step
+# #2039: grades the worker's answer under the one card the chat front door
+# files, as chat-question-asked-to-choose-pauses does: the lane's delegation
+# wait reads no card ids. Returns to the lane with agent-kanban-smoke.
+chat-answer-declares-next-step
+# #2039: grades the worker's answer under the door's one card, as
+# chat-answer-declares-next-step does. Returns to the lane with agent-kanban-smoke.
+chat-answer-tangent-offer-declares-no-step

@@ -1,0 +1,101 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. Mock 03, the negative of chat-answer-declares-next-step:
+# the user asks whether checkout-gateway is restarting because someone in
+# #oncall said it was crashlooping. It is healthy, and the crashlooping
+# workload is payments-api, which the user did not ask about. The mock ends
+# that answer on a plain offer ("Want me to look?") with no button (Jayanti's
+# decision: the mocks stand as they are). So the worker does not declare a
+# next step about the other workload: the report-format stanza
+# (deploy/docker/patches/kanban_report_format.py) keeps an offer about
+# something the user did not ask about a question, with no `[next: ...]` line.
+#
+# What is graded is the delivered answer (report_contains, final): no
+# declared step is about a workload the case knows the user did not ask about
+# (payments-api, inventory-api or seeded-debug, named in the step).
+# A step about checkout-gateway itself (a PodDisruptionBudget, say) is
+# allowed. The limit: a run in which the worker never meets the other
+# workload passes vacuously. Requiring it to name payments-api or
+# seeded-debug failed about half of the clean runs, because the worker often
+# does not look there, so the case grades the step and not the discovery.
+# The safeguards keep the run read-only.
+#
+# The prompt names no cluster: fixtures.json is the only thing allowed to
+# address a seeded cluster (cluster-agent-crashloop-debug's header). It names
+# the seeded-debug namespace so the worker reliably meets payments-api, as
+# mock 03's answer does ("#oncall may mean payments-api in seeded-debug");
+# without it, a run that never looks there passes the negative vacuously.
+#
+# Planted defects required: no-pdb-workload (checkout-gateway, healthy, slot a)
+# and crashloop-workload (payments-api, OOMKilled, slot a). Isolation class:
+# read-only.
+id: chat-answer-tangent-offer-declares-no-step
+name: An answer's offer about a workload the user did not ask about declares no step
+prompt: >-
+  is checkout-gateway restarting? someone in #oncall said it's crashlooping,
+  though they may have been looking at seeded-debug
+expected_output: >-
+  The front door files one card and acks it. The worker finds checkout-gateway
+  healthy and not restarting, may say the workload that is crashlooping is
+  payments-api in seeded-debug, and if so offers to look at it as a question in the
+  answer. It declares no next step about payments-api, seeded-debug or any
+  other workload; a step about checkout-gateway itself would be allowed.
+  Nothing is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the conversation around a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: jayantid
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - no-pdb-workload
+  - crashloop-workload
+
+verification_spec:
+  # No declared step is about a workload the user did not ask about. The
+  # report is normalized first (lowercased; `*`, `_` and backticks dropped).
+  - name: no-step-about-the-unasked-workload
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\[next:[^\]\n]*\b(?:payments-api|inventory-api|seeded-debug)\b'
+  # The answer is about what was asked: checkout-gateway.
+  - name: the-answer-names-checkout-gateway
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["checkout-gateway"]
+  # Offered, not taken: the crashloop fixture's limit is unchanged.
+  - name: the-crashloop-was-not-fixed
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: crashloop-workload
+      kind: deployment
+      resource_name: payments-api
+      namespace: seeded-debug
+      path: spec.template.spec.containers[?(@.name=='api')].resources.limits.memory
+      op: eq
+      value: 64Mi
+  # The front door files the card and never works it.
+  - name: front-door-stays-out-of-the-worker-verbs
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]
