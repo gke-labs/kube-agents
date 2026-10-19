@@ -924,8 +924,8 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     # owner in docs/designs/domains.yaml when it is absent (scripts/case_owner.py).
     # Offline: whether GitHub accepts the login as an assignee is checked when
     # a bug is filed, not here. devops-bench discards the key, so like `domain`
-    # it is enforced here or nowhere. A blank `owner:` (YAML null) counts as
-    # absent, as it does for `domain` and in case_owner.
+    # it is enforced here or nowhere. A bare `owner:` counts as absent.
+    owner_problems = len(problems)
     owner = spec.get("owner")
     if owner is not None:
         if not isinstance(owner, str) or not owner:
@@ -948,6 +948,25 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 f"owner {owner!r} is not a GitHub login (letters, digits and "
                 "single hyphens, at most 39 characters)"
             )
+
+    # The filer routes a red with case_owner's line scan, not this YAML read.
+    # Where the two read `owner:` or `domain:` differently (`owner: null`, a
+    # block scalar, an anchor, a quoted key), the lint would show one person
+    # and the bug would go to another, so the case is rejected here.
+    if len(problems) == owner_problems:
+        text = path.read_text(encoding="utf-8")
+        for key in ("owner", "domain"):
+            parsed = spec.get(key)
+            if parsed is not None and not isinstance(parsed, str):
+                continue  # already reported above as not a string
+            scanned = case_owner.task_field(text, key)
+            if scanned != parsed:
+                problems.append(
+                    f"'{key}:' reads as {parsed!r} to YAML but as {scanned!r} to "
+                    "scripts/case_owner.py, which routes the case's bugs. Write "
+                    f"it as a plain '{key}: value' on one line, or delete an "
+                    "empty 'owner:' line"
+                )
 
     # The audit streams a case drives without grading their ledger. The runner
     # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an

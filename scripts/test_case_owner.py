@@ -127,8 +127,8 @@ class TestEffectiveOwnerOfCase(unittest.TestCase):
             text = task.read_text()
             spec = yaml.safe_load(text)
             with self.subTest(case=task.parent.name):
-                self.assertEqual(case_owner._task_field(text, "owner"), spec.get("owner"))
-                self.assertEqual(case_owner._task_field(text, "domain"), spec.get("domain"))
+                self.assertEqual(case_owner.task_field(text, "owner"), spec.get("owner"))
+                self.assertEqual(case_owner.task_field(text, "domain"), spec.get("domain"))
 
     def test_every_real_case_resolves_to_someone(self):
         for task in sorted((case_owner.REPO_ROOT / case_owner.TASKS_PATH).glob("*/" + case_owner.TASK_FILENAME)):

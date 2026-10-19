@@ -622,9 +622,24 @@ class TestTheRulesReject(unittest.TestCase):
         # Optional: the case's bugs go to its domain's owner.
         self.assertEqual(self._validate(owner=DELETE), [])
 
-    def test_a_blank_owner_passes_like_a_missing_one(self):
-        # `owner:` with no value is YAML null; case_owner reads it as absent too.
-        self.assertEqual(self._validate(owner=None), [])
+    def _text_with(self, line):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        return yaml.safe_dump(spec) + line
+
+    def test_a_bare_owner_line_passes_like_a_missing_one(self):
+        # Both readers see a bare `owner:` as absent.
+        self.assertEqual(self._validate(text=self._text_with("owner:\n")), [])
+
+    def test_an_owner_the_filer_would_read_differently_is_rejected(self):
+        # YAML reads these as absent or as bob; case_owner's scan does not.
+        for line in ("owner: null\n", "owner: Null\n", "owner: >-\n  bob\n", "owner: &a bob\n", '"owner": bob\n'):
+            with self.subTest(line=line):
+                self._only("to scripts/case_owner.py", text=self._text_with(line))
+
+    def test_a_domain_the_filer_would_read_differently_is_rejected(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "domain"}
+        text = yaml.safe_dump(spec) + "domain: >-\n  " + self.VALID["domain"] + "\n"
+        self._only("'domain:' reads as", text=text)
 
     def test_an_empty_string_owner_is_rejected(self):
         self._only("is not a GitHub login string", owner="")

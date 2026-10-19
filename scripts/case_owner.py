@@ -99,7 +99,12 @@ def effective_owner(case_owner: object, domain: object, *, domain_owners: dict[s
     return domain_owner(domain, domain_owners)
 
 
-def _task_field(text: str, key: str) -> str | None:
+def task_field(text: str, key: str) -> str | None:
+    """The plain `key: value` at the top of task.yaml text, as the filer reads it.
+
+    The validator rejects a case where this disagrees with its YAML read, so
+    on a linted case the two are the same.
+    """
     found = re.search(_TASK_FIELD.format(key=re.escape(key)), text, re.MULTILINE)
     return found.group(1).strip(_QUOTES) if found else None
 
@@ -118,7 +123,7 @@ def effective_owner_of_case(name: str, repo_root: pathlib.Path = REPO_ROOT) -> s
     except OSError:
         return None
     return effective_owner(
-        _task_field(text, "owner"),
-        _task_field(text, "domain"),
+        task_field(text, "owner"),
+        task_field(text, "domain"),
         domain_owners=load_domain_owners(repo_root / DOMAINS_PATH),
     )
