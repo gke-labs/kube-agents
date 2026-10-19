@@ -2563,7 +2563,8 @@ class KubeAgentsHarness(AgentHarness):
         if status in _FAILURE_STATUSES:
             # A card a block landed in ``blocked`` (or, on the loop breaker's second
             # block, ``triage``) must carry block_kind == "transient" to be recognized
-            # as infra, so a worker-authored kanban_block cannot spoof the infra prefix.
+            # as infra; stops non-transient blocks (e.g. needs_input) from admitting
+            # summaries as infra failure reasons.
             if status in ("blocked", "triage") and bblock_kinds.get(task_id) != "transient":
                 return []
             if task_id in bsummaries:
@@ -3106,7 +3107,7 @@ class KubeAgentsHarness(AgentHarness):
                     poll_failure_messages.pop(t, None)
             needed_read = [
                 t for t, s in fresh_reported.items()
-                if t in outstanding and s in _FAILURE_STATUSES and t not in poll_failure_messages
+                if t in outstanding and s in _FAILURE_STATUSES
             ]
             if needed_read:
                 remaining_turn = max(0.0, deadline - time.monotonic())
@@ -3118,6 +3119,31 @@ class KubeAgentsHarness(AgentHarness):
                         msgs = self._extract_board_card_messages(cstate, t)
                         if msgs:
                             poll_failure_messages[t] = msgs
+                        else:
+                            poll_failure_messages.pop(t, None)
+                else:
+                    # If board read exec failed, check if the status turn explicitly
+                    # reported a non-transient block kind, evicting any stale prefix.
+                    for entry in turn_new_calls:
+                        payload = _json_object(entry.get("result"))
+                        if not payload:
+                            continue
+                        tasks_to_check = []
+                        if isinstance(payload.get("task"), dict):
+                            tasks_to_check.append(payload["task"])
+                        if isinstance(payload.get("tasks"), list):
+                            tasks_to_check.extend(
+                                it for it in payload["tasks"] if isinstance(it, dict)
+                            )
+                        for it in tasks_to_check:
+                            tid = str(it.get("id"))
+                            if (
+                                tid in needed_read
+                                and it.get("status") in ("blocked", "triage")
+                                and it.get("block_kind")
+                                and it.get("block_kind") != "transient"
+                            ):
+                                poll_failure_messages.pop(tid, None)
                 still_needed = [t for t in needed_read if t not in poll_failure_messages]
                 if still_needed:
                     traj_summaries = self._extract_trajectory_failure_summaries(

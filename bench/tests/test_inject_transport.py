@@ -2720,6 +2720,58 @@ def test_worker_authored_kanban_block_with_infra_prefix_on_inject_remains_graded
     assert "TPM quota exhausted" in result.metadata["final_message"]
 
 
+def test_a_triage_card_with_transient_rate_limit_summary_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card in triage at the ceiling with a transient rate limit summary marks rep as infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "triage",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+
+
+def test_a_triage_card_with_non_transient_block_kind_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card in triage at the ceiling with non-transient block_kind remains graded on inject lane."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "triage",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="needs_input",
+    )
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "1")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.1")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert result.metadata["final_message"] == ACK
+    assert any(harness.DELEGATION_CEILING_MARKER in err for err in result.errors)
+
+
 def test_a_blocked_card_with_rate_limit_summary_on_inject_fallback_when_final_exec_fails(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
