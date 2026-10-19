@@ -607,6 +607,27 @@ class NeedsYouTest(unittest.TestCase):
         self.assertEqual(head.count("`") % 2, 0)
         self.assertEqual(head.removesuffix(p.ELLIPSIS) + " " + rest[0].removeprefix(p.ELLIPSIS), question)
 
+    def test_a_run_across_the_limit_leaves_a_full_headline_not_a_stub(self):
+        for run in (f"`{'x' * 150}`", f"**{'bold ' * 30}**", f"[{'label ' * 25}](https://example.com/a)"):
+            question = f"Should I scale {run} now or wait until the on-call engineer has read the logs?"
+            with self.subTest(run=run[:8]):
+                head, rest, _ = m._question(question, True)
+                self.assertGreaterEqual(len(head), m.WORD_CUT_MIN, head)
+                self.assertTrue(head.endswith(p.ELLIPSIS) and rest[0].lstrip("[").find(p.ELLIPSIS) >= 0, (head, rest))
+
+    def test_a_headline_link_opens_the_detail_once(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        blocks, _ = m.needs_you(f"Should I merge [PR #412]({url}) or [PR #412]({url})?")
+        self.assertEqual(_contexts(blocks)[0], f"<{url}|PR #412>")
+
+    def test_a_link_the_plain_cut_left_whole_in_the_rest_is_linked_there(self):
+        url = "https://github.com/acme/gitops/pull/412"
+        question = f"Should I scale {'x' * 150} now, or merge [PR #412]({url}) first?"
+        head, rest, _ = m._question(question, True)
+        self.assertNotIn("PR #412", head)
+        self.assertEqual(rest[0].count("PR #412"), 1)
+        self.assertIn(f"[PR #412]({url})", rest[0])
+
     def test_a_short_headline_without_a_link_is_not_repeated_below(self):
         blocks, _ = m.needs_you("Which cluster?\n- seeded-a\n- seeded-b")
         self.assertEqual([b for b in blocks if b["type"] == "context" and b.get("block_id") != p.WAITING_BLOCK_ID], [])

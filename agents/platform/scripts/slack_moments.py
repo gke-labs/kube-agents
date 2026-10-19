@@ -263,8 +263,11 @@ OPTIONS_MAX = _presenter.BUTTONS_PER_ROW
 #: The reason below the question, clipped; ``kanban_block`` puts no bound on it.
 DETAIL_MAX = 2000
 #: Where a question's first sentence too long for the headline may be cut at a word
-#: (:func:`_word_cut`).
+#: (:func:`_word_cut`), and the shortest headline that cut may leave: a code span, link or
+#: bold run across the limit would otherwise leave "Should I scale…", and the plain cut
+#: shows a full headline instead.
 WORD_GAP = re.compile(r"\s+")
+WORD_CUT_MIN = _presenter.HEADLINE_MAX // 2
 #: Bold in a context line: ``**text**`` between word boundaries with no ``*`` inside,
 #: which mrkdwn would read as a marker. ``__x__`` stays text, so a ``__init__.py`` in a
 #: path or url keeps its characters.
@@ -612,9 +615,11 @@ def _headline_cut(line: str) -> tuple[str, str]:
     and a question, or a statement with no clause to cut at, at the last word
     that fits, outside a code span, a link and a bold or italic run, the headline
     ending in an ellipsis the overflow resumes after, so a cut question never
-    reads as a statement. A sentence with no such word is cut as plain text. The
-    headline shows a link's label only, so each link in it also opens the
-    overflow, alone, to keep its url.
+    reads as a statement. A sentence with no such word, or only one that would
+    leave a stub of a headline, is cut as plain text. The headline shows a link's
+    label only, so each link in it also opens the overflow, alone and once, to
+    keep its url; one whose whole label the plain cut left in the overflow is
+    linked there instead.
     """
     sentence, after = line, ""
     if len(_headline_text(line)) > _presenter.HEADLINE_MAX:
@@ -626,7 +631,16 @@ def _headline_cut(line: str) -> tuple[str, str]:
         cut = None if _headline_text(sentence).endswith(QUESTION_END) else _presenter.clause_cut(sentence)
         cut = cut or _word_cut(sentence) or _plain_cut(_headline_text(sentence))
     head, rest = cut
-    shown = [link.group(0) for link in _presenter.MD_LINK.finditer(sentence) if link.group(0) not in rest]
+    shown: list[str] = []
+    for link in _presenter.MD_LINK.finditer(sentence):
+        markdown, label = link.group(0), link.group(1)
+        if markdown in rest or markdown in after or markdown in shown:
+            continue
+        if _presenter.MD_LINK.search(head) is None and label in rest:
+            # The plain cut left the whole label in the rest: link it there, rather than show it twice.
+            rest = rest.replace(label, markdown, 1)
+            continue
+        shown.append(markdown)
     return head, " ".join(part for part in (" ".join(shown), rest, after) if part)
 
 
@@ -635,7 +649,8 @@ def _word_cut(sentence: str) -> tuple[str, str] | None:
     most ``HEADLINE_MAX`` characters once shown with its ellipsis, outside a code span and a
     link, with no bold or italic run left open; each half carries the ellipsis. A sentence
     bold from end to end is cut inside the bold, each half staying bold, as
-    ``slack_presenter.clause_cut`` cuts one. None when no space qualifies."""
+    ``slack_presenter.clause_cut`` cuts one. None when no space qualifies, or the one that
+    does leaves a headline shorter than :data:`WORD_CUT_MIN`."""
     for marker in _presenter.BOLD_MARKERS:
         inner = sentence[len(marker) : -len(marker)]
         if len(sentence) > 2 * len(marker) and sentence.startswith(marker) and sentence.endswith(marker) \
@@ -647,6 +662,9 @@ def _word_cut(sentence: str) -> tuple[str, str] | None:
     found = None
     for space in WORD_GAP.finditer(held):
         head = held[: space.start()]
+        # Every later space leaves a longer headline, so a run left open past the limit ends the scan.
+        if len(_headline_text(_presenter._restore_code(head, spans))) + len(_presenter.ELLIPSIS) > _presenter.HEADLINE_MAX:
+            break
         if any(start < space.start() < end for start, end in links):
             continue
         if any(head.count(marker) % 2 for marker in _presenter.BOLD_MARKERS):
@@ -655,10 +673,8 @@ def _word_cut(sentence: str) -> tuple[str, str] | None:
         if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
                for marker, (opener, _closer) in _presenter.ITALIC_EDGES.items()):
             continue
-        if len(_headline_text(_presenter._restore_code(head, spans))) + len(_presenter.ELLIPSIS) > _presenter.HEADLINE_MAX:
-            break
         found = space
-    if found is None or not held[: found.start()].strip():
+    if found is None or len(_headline_text(_presenter._restore_code(held[: found.start()], spans))) < WORD_CUT_MIN:
         return None
     head, rest = (_presenter._restore_code(part, spans) for part in (held[: found.start()], held[found.end() :]))
     return head + _presenter.ELLIPSIS, _presenter.ELLIPSIS + rest
