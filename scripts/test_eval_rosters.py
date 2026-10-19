@@ -193,6 +193,8 @@ ADDED_AFTER_THE_MOVE = [
     "upgrade-chat-request-runs-collector",  # a plain upgrade-readiness request runs the patch collector, #2386
     "drift-chat-request-runs-collector",  # a plain peer-consistency request runs the drift collector, #2386
     "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
+    "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
+    "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.

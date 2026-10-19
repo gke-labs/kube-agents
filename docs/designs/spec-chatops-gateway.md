@@ -493,7 +493,7 @@ link in the mint's own write, the refusal in its own - so neither path runs a re
 child's result is already posted, so it tells the session to reply with what it means rather than
 repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
 answer. Either way it says to state plainly when the child failed or reports more work still
-running. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
+running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
 `A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn has the tool turned
 off by its adapter for each task whose authority block carries `via`, which only a wake's does
 and only the gateway can publish. A wake that could delegate read an interim answer such as "still
@@ -1612,9 +1612,11 @@ thread is the session in a DM as in a channel. So `stop`, a status question and
 the top of the DM is a conversation with nothing running in it, so it starts no task
 and its reply says to send it in the question's thread instead; the adapter marks such
 a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
-gateway keys the reply on that mark, not on the conversation's task history, so a
-`stop` in a thread with nothing running (a question refused at the session cap, say)
-gets the plain "nothing is running". A top-level status question matches the exact
+gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
+nothing running gets "nothing is running": the plain reply when the conversation has
+never run a task (a question refused at the session cap, say), and otherwise one that
+adds that if the agent filed a card, that card keeps working until it finishes, since
+`stop` cannot reach a card (gke-labs#3263). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
 A bare `/session` asks for the next message in its thread.
 

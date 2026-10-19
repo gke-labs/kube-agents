@@ -198,6 +198,12 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
+# The A2A gateway Deployment that holds Slack under spec.mode next, and its
+# container.
+# shellcheck disable=SC2034  # read by print_instructions_slack.sh
+readonly PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT="platform-agent-a2a-gateway"
+# shellcheck disable=SC2034  # read by print_instructions_slack.sh
+readonly PLATFORM_AGENT_A2A_GATEWAY_CONTAINER="gateway"
 # The operator's page for a spec.mode switch, which links the design document
 # (docs/designs/spec-mode-switch.md) for what the switch changes inside.
 readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode"

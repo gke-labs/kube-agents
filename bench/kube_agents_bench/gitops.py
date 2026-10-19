@@ -21,7 +21,7 @@ passes, and Argo CD in the task cluster syncs the merge. The verifiers grade
 the cluster, so the harness has to hold the run open until that sync has
 happened, or until it is clear it never will.
 
-Three phases, each bounded:
+Three phases, each bounded, and an optional fourth:
 
 1. **PR**: a pull request whose base is the run branch, created after this run
    started, appears. None within ``GITOPS_PR_TIMEOUT`` seconds is the
@@ -39,7 +39,14 @@ Three phases, each bounded:
    current head and ``Healthy``. The head is re-read each poll because it can
    move after the merge (Argo tracks the branch, not the merge commit);
    ``head_moved_after_merge`` records when it did. Then the verifiers run
-   against the recovered cluster: ``merged``.
+   against the recovered cluster: ``merged`` (or phase 4 runs first when
+   ``GITOPS_SOAK_SECONDS`` is above zero).
+4. **Soak** (only when ``GITOPS_SOAK_SECONDS`` is above zero): the Application
+   is polled for that long and must stay ``Synced`` at the revision that
+   settled in phase 3 and ``Healthy`` throughout (an ``Unknown`` sync or health
+   status or malformed status object is counted in ``poll_errors`` and retried).
+   A successful read that is not is ``soak_regressed``, so a fix that comes up
+   and then falls over is not recorded as ``merged``.
 
 The outcome and its evidence land in ``result.metadata["gitops"]`` and, because
 devops-bench persists ``trajectory`` but not ``metadata``, in one harness-authored
@@ -63,6 +70,8 @@ Env:
   GITOPS_ARGO_NAMESPACE  Application namespace (default ``argocd``)
   GITOPS_ARGO_CONTEXT    kube context of the task cluster (default: current)
   GITOPS_PR_TIMEOUT / GITOPS_MERGE_TIMEOUT / GITOPS_SYNC_TIMEOUT   seconds
+  GITOPS_SOAK_SECONDS    seconds the Application must stay Synced and Healthy after
+                         phase 3 (default 0: no soak)
   GITOPS_POLL_INTERVAL   seconds between polls (default 15)
   GITOPS_MERGE_CHECK     comma-separated check-run names whose failure means the
                          repository rejected the PR (default ``check``, the job the
@@ -98,6 +107,18 @@ DEFAULT_POLL_INTERVAL_S = 15.0
 DEFAULT_PR_TIMEOUT_S = 900.0
 DEFAULT_MERGE_TIMEOUT_S = 600.0
 DEFAULT_SYNC_TIMEOUT_S = 300.0
+# No soak unless GITOPS_SOAK_SECONDS asks for one: the wait ends at the first
+# Synced+Healthy reading, as it always has.
+DEFAULT_SOAK_S = 0.0
+MAX_SOAK_S = 86400.0
+# The Argo Application readings phases 3 and 4 wait for, the poll label their
+# reads are counted under, and how much of a SHA the soak's log lines and
+# reason quote.
+ARGO_SYNCED = "Synced"
+ARGO_HEALTHY = "Healthy"
+ARGO_UNKNOWN = "Unknown"
+SHORT_SHA_LEN = 8
+READ_APPLICATION = "reading the Argo Application"
 HTTP_TIMEOUT_S = 30
 KUBECTL_TIMEOUT_S = 60
 
@@ -119,6 +140,7 @@ OUTCOME_PR_REJECTED = "pr_rejected"
 OUTCOME_MERGED = "merged"
 OUTCOME_MERGE_TIMEOUT = "merge_timeout"
 OUTCOME_SYNC_TIMEOUT = "sync_timeout"
+OUTCOME_SOAK_REGRESSED = "soak_regressed"
 
 FetchJson = Callable[[str, Mapping[str, str]], Any]
 RunKubectl = Callable[[list[str]], str]
@@ -166,9 +188,14 @@ def _seconds(env: Mapping[str, str], name: str, default: float) -> float:
     if raw is None or raw == "":
         return default
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be a number of seconds, got {raw!r}") from exc
+    if not (0.0 <= value <= MAX_SOAK_S):
+        # Negative values would skip a phase or soak, and nan/inf/huge floats
+        # would build a deadline that never expires.
+        raise ValueError(f"{name} must be between 0 and {MAX_SOAK_S:g} seconds, got {value!r}")
+    return value
 
 
 def _parse_github_time(value: str) -> float:
@@ -215,6 +242,7 @@ def await_fix_cycle(
     pr_timeout = _seconds(env, "GITOPS_PR_TIMEOUT", DEFAULT_PR_TIMEOUT_S)
     merge_timeout = _seconds(env, "GITOPS_MERGE_TIMEOUT", DEFAULT_MERGE_TIMEOUT_S)
     sync_timeout = _seconds(env, "GITOPS_SYNC_TIMEOUT", DEFAULT_SYNC_TIMEOUT_S)
+    soak = _seconds(env, "GITOPS_SOAK_SECONDS", DEFAULT_SOAK_S)
     merge_checks = {n.strip() for n in (env.get("GITOPS_MERGE_CHECK") or DEFAULT_MERGE_CHECK).split(",") if n.strip()}
 
     headers = dict(GITHUB_HEADERS)
@@ -373,7 +401,7 @@ def await_fix_cycle(
             record["branch_head"] = head
             if head != merge_sha:
                 record["head_moved_after_merge"] = True
-        raw = attempt("reading the Argo Application", lambda: run_kubectl(args))
+        raw = attempt(READ_APPLICATION, lambda: run_kubectl(args))
         status = json.loads(raw).get("status", {}) if raw else {}
         sync = status.get("sync", {})
         health = status.get("health", {})
@@ -385,12 +413,81 @@ def await_fix_cycle(
         # the head: Argo Synced there is the fix landing, not a stale answer.
         expected = head or merge_sha
         at_head = bool(expected) and sync.get("revision") == expected
-        if sync.get("status") == "Synced" and at_head and health.get("status") == "Healthy":
+        if sync.get("status") == ARGO_SYNCED and at_head and health.get("status") == ARGO_HEALTHY:
             _log.info("gitops: application %s Synced at branch head %s and Healthy", app, expected[:8])
-            return finish(OUTCOME_MERGED)
+            break
         if not wait(deadline):
             _log.warning(
                 "gitops: application %s not Synced+Healthy at head %s (merge %s) within %.0fs",
                 app, head[:8], merge_sha[:8], sync_timeout,
             )
             return finish(OUTCOME_SYNC_TIMEOUT)
+    if soak <= 0:
+        return finish(OUTCOME_MERGED)
+
+    # -- 4. optional soak: still Synced at that revision, and Healthy ---
+    # Healthy is a point-in-time reading: a Deployment whose new pods pass
+    # readiness once and then crash reports Healthy at the sync and
+    # Progressing a minute later. The soak polls through GITOPS_SOAK_SECONDS
+    # and ends the wait at the first successful read that is no longer Synced
+    # at the revision that settled, or no longer Healthy. The branch head is
+    # not re-read: a head that moves during the soak shows up as Argo leaving
+    # that revision. A failed read is counted and retried like any other; the
+    # soak passes only on a successful read at or after its end, and when the
+    # reads keep failing past the end that read is retried for up to
+    # GITOPS_SYNC_TIMEOUT more seconds before the wait gives up as
+    # ``sync_timeout``.
+    settled = expected
+    record.update(soak_s=soak, soak_revision=settled)
+    soak_started = clock()
+    soak_end = soak_started + soak
+    give_up = soak_end + sync_timeout
+    while True:
+        now = clock()
+        if now >= give_up:
+            _log.warning("gitops: no Argo read of %s at the end of the %.0fs soak", app, soak)
+            return finish(OUTCOME_SYNC_TIMEOUT, reason="no Argo read at the end of the soak")
+        sleep(min(poll, soak_end - now) if now < soak_end else poll)
+        # ``or {}``: an Application with no status is a reading that is not
+        # Synced, not a failed read; None is reserved for the failure. A reading
+        # whose sync.status or health.status is Unknown is Argo reporting that
+        # its own comparison or health check failed (repo fetch or manifest
+        # error), not a cluster state change, so _read_soak_status raises
+        # ValueError for attempt() to count and retry.
+        def _read_soak_status() -> dict[str, Any]:
+            doc = json.loads(run_kubectl(args))
+            if not isinstance(doc, dict):
+                raise ValueError("Argo Application response is not a JSON object")
+            raw_st = doc.get("status")
+            if raw_st is not None and not isinstance(raw_st, dict):
+                raise ValueError("Argo Application status is not a JSON object")
+            st: dict[str, Any] = raw_st or {}
+            sync_part = st.get("sync") if isinstance(st.get("sync"), dict) else {}
+            health_part = st.get("health") if isinstance(st.get("health"), dict) else {}
+            if sync_part.get("status") == ARGO_UNKNOWN:
+                raise ValueError("Argo Application sync.status is Unknown")
+            if health_part.get("status") == ARGO_UNKNOWN:
+                raise ValueError("Argo Application health.status is Unknown")
+            return st
+
+        status = attempt(READ_APPLICATION, _read_soak_status)
+        if status is None:
+            continue
+        sync = status.get("sync") if isinstance(status.get("sync"), dict) else {}
+        health = status.get("health") if isinstance(status.get("health"), dict) else {}
+        record.update(
+            sync_status=str(sync.get("status") or ""),
+            synced_revision=str(sync.get("revision") or ""),
+            health=str(health.get("status") or ""),
+        )
+        if not (sync.get("status") == ARGO_SYNCED and sync.get("revision") == settled and health.get("status") == ARGO_HEALTHY):
+            after = round(clock() - soak_started, 1)
+            reason = (
+                f"{after:g}s into the {soak:g}s soak: sync {record['sync_status'] or 'unknown'} at "
+                f"{record['synced_revision'][:SHORT_SHA_LEN] or 'no revision'}, health {record['health'] or 'unknown'}"
+            )
+            _log.warning("gitops: application %s regressed during the soak: %s", app, reason)
+            return finish(OUTCOME_SOAK_REGRESSED, reason=reason)
+        if clock() >= soak_end:
+            _log.info("gitops: application %s still Synced at %s and Healthy after a %.0fs soak", app, settled[:SHORT_SHA_LEN], soak)
+            return finish(OUTCOME_MERGED)

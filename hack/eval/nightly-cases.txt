@@ -404,6 +404,12 @@
 # lists on 2026-10-15, after the rebase onto `02f251ff`: seventy-nine cases
 # (237 units) here, of a ninety-three-case, 279-unit matrix, the paragraphs
 # above included.
+#
+# 2026-10-14 adds provisioning-cluster-request-never-creates and
+# provisioning-kcc-cluster-without-crds-stops (#2937): read-only cases with no
+# stack and no fixture, so neither joins the infra-lock chain. They are
+# card-wait cases that end in a stop; on a dev install a repetition took 3 to
+# 11 minutes, inside the 1800s ceiling. Six units in all.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1131,3 +1137,11 @@
 # its own on the host cluster, so it too serializes on the infra lock. Priced
 # at that case's 1450s hint until it has a record.
 ./tasks/ai-security-chat-request-runs-collector/task.yaml
+
+# A cluster request with nothing to write to ends in a stated stop, never a
+# direct create (#2937). On the pool it grades the stop: the pool repositories hold no
+# provisioning/ path. Read-only; requests no pull request.
+./tasks/provisioning-cluster-request-never-creates/task.yaml
+# gcp-config-connector's no-CRDs stop holds for a new cluster, and nothing is
+# created another way (#2937). The pool's clusters carry no Config Connector.
+./tasks/provisioning-kcc-cluster-without-crds-stops/task.yaml

@@ -34,7 +34,7 @@ The `PlatformAgent` CR reconciles into a Deployment running the [Hermes runtime]
 The Platform Agent talks to an LLM through a **Completions API** proxy so provider choice is a config toggle:
 
 - **[LiteLLM](https://litellm.ai)** for hosted models — Gemini (default), Vertex AI / Model Garden, Anthropic, OpenAI, or a personal ChatGPT subscription — or for an OpenAI-compatible server you run ([`openai_compatible`](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private)). Example manifests: [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini), [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription).
-- **[vLLM](https://vllm.ai)** for local, open models on GPU node pools — [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) serves Gemma via GKE's official inference tutorial.
+- **[vLLM](https://vllm.ai)** for local, open models on GPU node pools — [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) serves Gemma 4 26B-A4B through vLLM's OpenAI-compatible server on two L4 GPUs, with a 128k-token context.
 - An optional **inference-replay proxy** in front of either can cache responses from a `PersistentVolumeClaim` so demos and tests replay deterministically — [`examples/inference-replay/`](https://github.com/gke-labs/kube-agents/tree/main/examples/inference-replay).
 
 ### 4. GitHub Token Minter (Minty)

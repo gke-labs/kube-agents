@@ -5,9 +5,10 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 ## Prerequisites
 
 - Kubernetes 1.29+ (GKE Autopilot or Standard) — the credential proxy is a native sidecar, and `SidecarContainers` is beta and on by default from 1.29 (alpha and off in 1.28, GA in 1.33)
-- A Google Service Account (GSA) with a Workload Identity binding to the agent's
-  Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
-  namespace by default (`platformAgent.security.serviceAccountName`):
+- A Google Service Account (GSA) with a Workload Identity binding to the credential
+  broker's Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
+  namespace by default (`platformAgent.security.serviceAccountName`). The agent
+  gateway runs as its own `<name>-gateway-agent`, which holds no cloud identity:
 
   ```bash
   gcloud iam service-accounts add-iam-policy-binding <GSA>@<PROJECT>.iam.gserviceaccount.com \
@@ -831,7 +832,7 @@ granted by hand.
 
 ### ServiceAccount ownership
 
-Exactly one owner creates the agent's KSA, depending on
+Exactly one owner creates the broker's KSA, depending on
 `platformAgent.security.serviceAccountAnnotations`:
 
 - **Annotations set** (the Workload Identity case): the **operator** creates
