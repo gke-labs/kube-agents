@@ -371,6 +371,15 @@ func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	}
 }
 
+// SetHome hands the Home tab's admission rule and board reader to the
+// primary, the half with a home view; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	if sink, ok := s.primary.(HomeSink); ok {
+		sink.SetHome(admits, board)
+	}
+}
+
 // SetSessionLookup hands the gateway's session lookup, and the idle TTL it
 // is bounded by, to the primary, which is the half that wants them (the
 // Slack adapter's session-thread rule; the door keys every conversation

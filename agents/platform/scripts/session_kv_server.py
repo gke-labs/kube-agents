@@ -27,6 +27,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import board_snapshot
 import chat_notify
 import findings_queue
 import gitops_workspace
@@ -4847,6 +4848,24 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     fleet that got healthier.
     """
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
+
+
+@app.get("/v1/board", dependencies=[Depends(verify_api_key)])
+def get_board() -> Dict[str, Any]:
+    """The Slack Home tab's snapshot (`board_snapshot.py`), relayed by the Hermes bridge.
+
+    A source that cannot be read is a 503, never an empty board: the gateway
+    then says it could not read the board rather than drawing a clean fleet.
+    """
+    board = _kanban_db_path()
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as session_db:
+            if not os.path.isfile(board):
+                return board_snapshot.snapshot(session_db, None, datetime.now(timezone.utc))
+            with closing(_read_only(board)) as kanban:
+                return board_snapshot.snapshot(session_db, kanban, datetime.now(timezone.utc))
+    except Exception as exc:  # noqa: BLE001 — a source that cannot be read is a 503, whatever raised
+        raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
 
 
 @app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])

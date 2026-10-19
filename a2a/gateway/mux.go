@@ -284,6 +284,14 @@ func (m *MultiAdapter) CancelPublished(conversation, taskID string) {
 	}
 }
 
+func (m *MultiAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(HomeSink); ok {
+			sink.SetHome(admits, board)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {

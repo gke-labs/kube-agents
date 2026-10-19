@@ -176,6 +176,7 @@ ADDED_AFTER_THE_MOVE = [
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
+    "scale-request-proposes-pr",  # the mirrored gke-* skills' pull request path, #2937
     "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
     "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
     "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
@@ -195,7 +196,9 @@ ADDED_AFTER_THE_MOVE = [
     "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
     "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
     "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
+    "cluster-agent-security-audit-script",  # a Cluster Agent runs its audit script from the path its skill names, #3402
     "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
+    "fanout-absent-cluster-cards-complete",  # a fleet search's per-cluster cards complete, #2978
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -654,6 +657,10 @@ INJECT_LANE_REQUESTING = [
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
     "rca-remediation-pr",
+    # scale-request-proposes-pr: asked to scale a Deployment, it may propose
+    # the change as a pull request; its objective's pull_request_opened leaf
+    # allows one.
+    "scale-request-proposes-pr",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
     # beside the one its check grades.
