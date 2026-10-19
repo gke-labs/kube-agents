@@ -2672,6 +2672,29 @@ def test_a_running_card_at_the_ceiling_delivers_nothing_from_an_earlier_run(
     assert "RESOURCE_EXHAUSTED" not in result.output
 
 
+def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card on the board blocked with a rate limit summary marks the repetition as infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+
+
 def test_a_board_that_stops_answering_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
