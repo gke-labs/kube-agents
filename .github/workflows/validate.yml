@@ -61,7 +61,9 @@ jobs:
 
       # Mirrored gke-* skills (docs/designs/upstream-skill-overlays.md): every
       # generated skill must equal its upstream copy plus overlay, and every copy
-      # the sha256 in its lock. Offline, so nothing here can fail on GitHub.
+      # the sha256 in its lock. Offline, so nothing here can fail on GitHub. The
+      # same target holds every shipped skill document under the size skill_view
+      # returns whole (scripts/check_skill_size.py).
       - name: Mirrored skills match their upstream copy and overlay
         run: make skills-check
 

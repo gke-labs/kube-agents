@@ -1526,6 +1526,16 @@ class FleetScopeToolTest(unittest.TestCase):
         self.assertEqual(out["collector_args"], "--scope-projects ops-mgmt,payments-prod --scope-unread payments-staging=denied")
         self.assertEqual(out["resolved_at"], "2026-10-09T12:00:00Z")
 
+    def test_excluded_clusters_are_reported_and_ride_in_the_collector_arguments(self):
+        # #3081: the scope is otherwise per project, so the agent and the
+        # collectors both need the clusters the operator left out.
+        declared = dict(self.SNAPSHOT["declared"], exclude={"projects": [], "clusters": [
+            {"projectId": "payments-prod", "location": "us-central1", "clusterName": "lane-b"}]})
+        out = self._call(dict(self.SNAPSHOT, declared=declared))
+        self.assertEqual(out["excluded_clusters"], [{"project": "payments-prod", "location": "us-central1", "cluster": "lane-b"}])
+        self.assertTrue(out["collector_args"].endswith(" --scope-exclude-clusters payments-prod/us-central1/lane-b"), out["collector_args"])
+        self.assertEqual(self._call(self.SNAPSHOT)["excluded_clusters"], [])
+
     def test_no_declared_scope_and_no_snapshot_both_report_undeclared(self):
         undeclared = dict(self.SNAPSHOT, declared={k: [] for k in ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes")})
         self.assertFalse(self._call(undeclared)["declared"])

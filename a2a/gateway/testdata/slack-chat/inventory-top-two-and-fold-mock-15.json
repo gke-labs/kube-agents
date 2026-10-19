@@ -94,12 +94,65 @@
       {
         "child_blocks": [
           {
-            "text": {
-              "text": "No PDB on payments-api\nA node drain takes every replica down at once.\n`minor` Default namespace holds workloads\nMove them into a namespace of their own.\nWorkload Identity is off on one node pool\nPods there use the node's service account.",
-              "type": "mrkdwn",
-              "verbatim": true
-            },
-            "type": "section"
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "No PDB on payments-api",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "A node drain takes every replica down at once.",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "code": true
+                    },
+                    "text": "minor",
+                    "type": "text"
+                  },
+                  {
+                    "text": " Default namespace holds workloads",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Move them into a namespace of their own.",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Workload Identity is off on one node pool",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Pods there use the node's service account.",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
           }
         ],
         "default_collapsed": true,

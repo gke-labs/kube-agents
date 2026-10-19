@@ -1,0 +1,74 @@
+# The GHES proxy. It forwards to github.com, so it needs egress to TCP 443 on
+# the internet, and it holds no credential of its own: each client sends its
+# own Authorization header.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ghes-proxy
+  namespace: ${NAMESPACE}
+  labels:
+    app.kubernetes.io/name: ghes-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ghes-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ghes-proxy
+    spec:
+      automountServiceAccountToken: false
+      # Longer than the proxy's 25-second drain of the requests in flight.
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ghes-proxy
+          image: ${GHES_PROXY_IMAGE}
+          args:
+            - -public-host=${GHES_PUBLIC_HOST}
+          env:
+            - name: GHES_PROXY_LISTEN
+              value: ":8443"
+            - name: GHES_PROXY_ENTERPRISE_VERSION
+              value: "3.17.0"
+          ports:
+            - name: https
+              containerPort: 8443
+          # A TCP probe: the proxy answers 404 to every path it does not
+          # forward, health paths included. The server's handshake-EOF line
+          # for each probe is dropped from the log (main.go,
+          # probeNoiseFilter).
+          readinessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: https
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/ghes-proxy/tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: ghes-proxy-tls

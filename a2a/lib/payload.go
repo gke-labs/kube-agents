@@ -63,7 +63,21 @@ const (
 	// with a chat message. Each one posts once and is never edited
 	// (spec-a2a-payloads.md, "Reserved artifact names").
 	ArtifactNotice = "notice"
+	// ArtifactHandoff says a completed task handed work to kanban cards,
+	// which report into the task's conversation themselves: one text part,
+	// HandoffCards. The hermes-bridge's API executor publishes it ahead of the
+	// terminal of such a task whenever the conversation route was recorded
+	// (Slack or Google Chat); the gateway never
+	// renders it and reads it as a delegated child's cards-pending signal
+	// beside the terminal's chat mark, which the bridge sets only on Slack
+	// with KAGE_SLACK_UX on (#3258; spec-a2a-payloads.md, "Reserved artifact
+	// names").
+	ArtifactHandoff = "handoff"
 )
+
+// HandoffCards is the ArtifactHandoff text part: the work went to kanban
+// cards.
+const HandoffCards = "cards"
 
 // DelegateRequest is the ArtifactDelegate data part's shape: one child task
 // to mint, addressee and the task text. It is also the wire shape the
@@ -143,6 +157,131 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 		return n, true
 	}
 	return SteerNotice{}, false
+}
+
+// CardStop is the cardStop data part: the gateway's request that the
+// executor stop the kanban cards a conversation's turns filed (#3263), and
+// the executor's answer. It rides a task of its own, so the request is
+// answered on the same stream as any task: the terminal, and the result
+// artifact before it.
+//
+// The request is a submission whose message carries this part and nothing
+// else, no text (CardStopRequested):
+//
+//	{"cardStop":{"v":1}}
+//
+// The result is the same key on the completed task's result artifact,
+// beside a text part that says the same for a reader that does not know it:
+//
+//	{"cardStop":{"v":1,"stopped":[{"id":"t_1","title":"…","priorStatus":"running"}],
+//	  "settled":[{"id":"t_2","title":"…"}],"failed":0,"pending":0,"unresolved":0,
+//	  "truncated":false,"deadline":false,"listsCut":false}}
+//
+// stopped is the cards the stop archived, with the status each had;
+// settled the conversation's cards that had already finished. The counts
+// own up to what it could not promise: failed, cards it could not archive;
+// pending, archives still running when it ran out of time, so those cards
+// may or may not end; unresolved, stopped cards that were claimed just
+// before the stop with no worker seen yet, so a worker may still start for
+// them (the executor's log names each card). truncated says the
+// conversation had more open cards than one stop takes, so some may still
+// be open; deadline that the stop ran out of time. listsCut says only that
+// the executor cut stopped or settled to fit the part: the cards themselves
+// are as the counts say. A stop that found nothing open answers empty lists.
+// A stop that failed answers no part: its terminal is failed, and the
+// reason says why.
+type CardStop struct {
+	V int `json:"v"`
+	// The result's fields; nil on a request. Embedded so the wire form is
+	// one flat object either way, and a request carries none of them.
+	*CardStopResult
+}
+
+// CardStopResult is the result form's fields (CardStop).
+type CardStopResult struct {
+	Stopped    []CardStopCard `json:"stopped"`
+	Settled    []CardStopCard `json:"settled"`
+	Failed     int            `json:"failed"`
+	Pending    int            `json:"pending"`
+	Unresolved int            `json:"unresolved"`
+	Truncated  bool           `json:"truncated"`
+	Deadline   bool           `json:"deadline"`
+	ListsCut   bool           `json:"listsCut"`
+}
+
+// CardStopCard is one card a result names. PriorStatus is set on a stopped
+// card only: the status it had before the stop archived it.
+type CardStopCard struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	PriorStatus string `json:"priorStatus,omitempty"`
+}
+
+// CardStopVersion is the cardStop part's version, the only one there is. A
+// part of any other version is not read as one.
+const CardStopVersion = 1
+
+const cardStopKey = "cardStop"
+
+// CardStopPart is c as a data part, at CardStopVersion: the request when
+// c.CardStopResult is nil, the result otherwise. A result's nil lists go
+// out empty, so a result never reads as a request.
+func CardStopPart(c CardStop) (Part, error) {
+	c.V = CardStopVersion
+	if r := c.CardStopResult; r != nil {
+		norm := *r
+		if norm.Stopped == nil {
+			norm.Stopped = []CardStopCard{}
+		}
+		if norm.Settled == nil {
+			norm.Settled = []CardStopCard{}
+		}
+		c.CardStopResult = &norm
+	}
+	data, err := json.Marshal(map[string]CardStop{cardStopKey: c})
+	if err != nil {
+		return Part{}, err
+	}
+	return Part{Kind: "data", Data: data}, nil
+}
+
+// CardStopOf finds the cardStop part among parts, request or result,
+// whatever else they hold. A data part that is not one, or one of another
+// version, is skipped.
+func CardStopOf(parts []Part) (CardStop, bool) {
+	for _, p := range parts {
+		if p.Kind != "data" || len(p.Data) == 0 {
+			continue
+		}
+		var wrap map[string]json.RawMessage
+		if json.Unmarshal(p.Data, &wrap) != nil {
+			continue
+		}
+		raw, ok := wrap[cardStopKey]
+		if !ok {
+			continue
+		}
+		var c CardStop
+		if json.Unmarshal(raw, &c) != nil || c.V != CardStopVersion {
+			continue
+		}
+		return c, true
+	}
+	return CardStop{}, false
+}
+
+// CardStopRequested reports whether parts are a card-stop request: data
+// parts only, one of them a cardStop part in its request form. A message
+// with a text or file part is a question, whatever data rides beside it, so
+// a message that asks something is never taken for the control.
+func CardStopRequested(parts []Part) bool {
+	for _, p := range parts {
+		if p.Kind != "data" {
+			return false
+		}
+	}
+	c, ok := CardStopOf(parts)
+	return ok && c.CardStopResult == nil
 }
 
 // The A2A object shapes below carry only the fields the library consults.

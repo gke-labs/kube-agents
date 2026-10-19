@@ -1098,6 +1098,16 @@ class FailedLineTest(unittest.TestCase):
         report = "## What's wrong\nThe audit could not run\nbecause no repository is registered. It will retry.\n"
         self.assertEqual(sar.failed_line(report), "The audit could not run because no repository is registered.")
 
+    def test_a_sentence_past_the_headline_cap_keeps_its_clause(self):
+        sentence = (
+            "The audit ran and identified 2 critical firewall issues across 14 projects in the production folder "
+            "but could not publish its findings because no GitOps repository is registered in the ConfigMap."
+        )
+        # The presenter's headline cut shortens this sentence; the failed line is the whole of it.
+        self.assertGreater(len(sentence), sar.HEADLINE_MAX)
+        self.assertNotEqual(sar.split_lead(sentence)[0], sentence)
+        self.assertEqual(sar.failed_line(f"## What's wrong\n{sentence}\n\n## Why\n- none\n"), sentence)
+
     def test_a_report_with_its_ledger_link_is_not_failed(self):
         self.assertIsNone(sar.failed_line(WALL_HEADING + f"\nSecurity audit: 2 new — {LEDGER}"))
         self.assertIsNone(sar.failed_line(REPORT))

@@ -34,9 +34,26 @@ const sessionKindDM = "dm"
 // in a message the adapter marked TopLevel: one that roots a conversation of
 // its own (a top-level Slack DM), so nothing is running in it and the task
 // the user means is in another thread. The notice says where to send it. A
-// thread with nothing running, a question refused at the session cap among
-// them, gets the plain reply: the user is already in the right place.
+// thread with nothing running gets one of the in-thread replies below
+// (nothingRunningNotice or nothingRunningCardNotice): the user is already in
+// the right place.
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
+
+// nothingRunningNotice answers a "stop" in a conversation with no active
+// task. nothingRunningCardNotice is the same answer for a conversation that
+// has run a task before: its turn may have filed a kanban card (the gateway
+// cannot tell whether it did, so the reply says "if"; nor where the card's
+// answer lands, which a console conversation never receives), which ends the
+// turn within seconds but is not a task the gateway holds or can cancel. The
+// card keeps working, so the reply must not read as "nothing is happening"
+// (gke-labs#3263); stopping the card is the follow-up there. A
+// conversation that never ran a task (a first message, or one refused at the
+// session cap) has no card of its own to mention. Both start with the same
+// text, so readers matching "nothing is running" still do.
+const (
+	nothingRunningNotice     = "🤷 nothing is running"
+	nothingRunningCardNotice = "🤷 nothing is running in this conversation. If the agent filed a card for it, that card keeps working until it finishes; stopping a card from chat isn't supported yet."
+)
 
 // What retireIncarnation posts when the previous task cannot be closed on
 // the bus, by what the caller was about to do: three callers start a task,
@@ -45,6 +62,10 @@ const (
 	retireRefusalNotStarted = "⚠️ not started: could not close the previous task on the bus; try again in a moment"
 	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
+
+// noticeBusUnreachable says a task's publish failed: on its rolling line, or
+// posted when the backend keeps none (StatusShower).
+const noticeBusUnreachable = "❌ could not reach the bus; try again"
 
 // turnTimeout bounds one handler turn — an inbound message or a relay
 // batch — so a stuck bus or backend call frees the conversation's queue
@@ -471,6 +492,13 @@ func New(o Options) (*Gateway, error) {
 	if sink, ok := o.Adapter.(SessionLookupSink); ok {
 		sink.SetSessionLookup(g.hasSession, o.Config.IdleTTL)
 	}
+	// The Home tab: the allowlist an inbound message is admitted by, and the
+	// agent pod's board read over the bus (slack_home.go, board.go).
+	if sink, ok := o.Adapter.(HomeSink); ok {
+		sink.SetHome(func(member string) (bool, bool) {
+			return g.slackRosterPrincipal(member) != "", g.slackAllowAll && !g.slackAllowed[member]
+		}, busBoardReader(o.Client))
+	}
 	g.events = newKeyedQueue(g.relayBatch)
 	if o.Spawner != nil {
 		g.spawner = o.Spawner
@@ -573,12 +601,29 @@ func (h *sessionLockHandle) Lock() {
 	h.entry.mu.Lock()
 }
 
+// TryLock takes the lock only if it is free. On false the handle is spent:
+// its reference is released and a later Unlock is a no-op, so a caller can
+// defer Unlock either way.
+func (h *sessionLockHandle) TryLock() bool {
+	if h.entry.mu.TryLock() {
+		return true
+	}
+	h.unlocked = true
+	h.release()
+	return false
+}
+
 func (h *sessionLockHandle) Unlock() {
 	if h.unlocked {
 		return
 	}
 	h.unlocked = true
 	h.entry.mu.Unlock()
+	h.release()
+}
+
+// release drops the handle's reference, pruning the entry with the last one.
+func (h *sessionLockHandle) release() {
 	h.g.mu.Lock()
 	h.entry.refcount--
 	if h.entry.refcount <= 0 {
@@ -612,6 +657,14 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// a program say "the gateway answered without starting a task" as a fact
 	// rather than as a guess about timing.
 	defer g.observeTurnFinished(msg.Conversation)
+
+	// Counted before the sender is verified, as the chat_metrics plugin
+	// counts the Hermes-side ingress before its allowlist, so the two halves
+	// of chatMessagesInboundTotal mean the same thing: a message a person
+	// sent, whether or not the gateway went on to answer it.
+	if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+		g.metrics.messageInbound(platform)
+	}
 
 	backend, principal, ok := g.verifySender(msg)
 	g.observeInboundVerified(msg, ok)
@@ -695,22 +748,39 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 	backend = g.backendFor(msg)
 	principal = g.resolvePrincipal(backend, msg.AuthorID)
 	if principal == "" {
-		g.log.Warn("dropping message from unverified sender",
-			"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		if msg.Unaddressed {
+			// Someone off the list talking under one of the bot's posts, to a
+			// colleague as often as not: routine, so Info rather than a Warn per
+			// message. Not Debug: the gateway's handler drops Debug, and this
+			// line is the only trace the drop leaves.
+			g.log.Info("dropping unaddressed message from unverified sender",
+				"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation, "unaddressed", true)
+		} else {
+			g.log.Warn("dropping message from unverified sender",
+				"backend", backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		}
 		// Keyed by backend and case-folded author: one gateway has several
 		// ingresses, and the same id on two of them is not the same sender,
 		// so a notice on one must not silence the other. Case-folded because
 		// an asserted address that varies in case is one person. Bounded the
 		// way the adapters bound their own maps: wholesale eviction at the
 		// cap, which at worst repeats a notice.
-		key := droppedNoticeKey(backend, msg.AuthorID)
-		g.mu.Lock()
-		if len(g.droppedNotices) >= droppedNoticesCap {
-			g.droppedNotices = map[string]bool{}
+		//
+		// Not for a message that addressed nobody (Unaddressed): a member off
+		// the list talking to a colleague under an alert would otherwise get
+		// a public refusal in a thread the channel is reading. Nor is it
+		// counted as notified, so their first real ask still gets the notice.
+		notified := msg.Unaddressed
+		if !notified {
+			key := droppedNoticeKey(backend, msg.AuthorID)
+			g.mu.Lock()
+			if len(g.droppedNotices) >= droppedNoticesCap {
+				g.droppedNotices = map[string]bool{}
+			}
+			notified = g.droppedNotices[key]
+			g.droppedNotices[key] = true
+			g.mu.Unlock()
 		}
-		notified := g.droppedNotices[key]
-		g.droppedNotices[key] = true
-		g.mu.Unlock()
 		if !notified {
 			g.post(msg.Conversation, "⛔ I can't verify who you are on "+backend+
 				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
@@ -750,6 +820,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	}
 	rec.LastActivity = time.Now().UTC()
+	rec.LastUserMessage = rec.LastActivity
 
 	rosterIDs, rosterComplete, err := g.adapter.Roster(msg.Conversation)
 	if err != nil {
@@ -779,6 +850,8 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 	// card rather than clearing silently — the same deterministic template
 	// the status ask uses. In the relay-lag case this duplicates the
 	// rolling-line edit that follows; redundant beats swallowed.
+	// MarkTerminalObserved on the record dedupes the relay's observeTaskTerminal
+	// call so metrics are not double-counted.
 	//
 	// The other stale shape has no terminal to find: a task with NO events
 	// at all (TasksGet answers TaskNotFound) because its executor never
@@ -878,8 +951,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			g.post(rec.Key, "🛑 cancel already sent — the task ends when the executor confirms")
 		case msg.TopLevel:
 			g.post(rec.Key, topLevelNothingRunningNotice)
+		case len(rec.Tasks) > 0:
+			g.post(rec.Key, nothingRunningCardNotice)
 		default:
-			g.post(rec.Key, "🤷 nothing is running")
+			g.post(rec.Key, nothingRunningNotice)
 		}
 	case active != nil && !active.Detached:
 		// The one routing decision with no other log line: a new task logs
@@ -910,9 +985,10 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			// A lingering previous incarnation is not this task's executor,
 			// and its task is already closed (healed or detached). Delete
 			// the pod rather than just untrack it: once PodName clears,
-			// reap can never find it again, and sweep only sees terminal
-			// phases - a wedged Running pod would hold its bus credential
-			// forever. If the task is detached, the gateway is its
+			// reap can never find it again, and the sweep takes a live pod
+			// only when it is a reused one its record no longer names
+			// (sweepUntracked) - a wedged Running one-task pod would hold
+			// its bus credential until its deadline. If the task is detached, the gateway is its
 			// supervisor and owes its terminal `canceled` BEFORE the delete
 			// (the one deletion rule in Session lifecycle); a refusal here
 			// precedes every route mutation, so the record is untouched.
@@ -926,9 +1002,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			rec.Addressee = rec.BusSession
 			msg.Text = rest
 		} else if rec.SessionRouted {
-			// Every new task on the session route gets a fresh incarnation;
-			// freshIncarnation says why and holds the cap.
-			if !g.freshIncarnation(ctx, rec) {
+			// A new task on the session route goes to the conversation's
+			// live pod when it can take it, and to a fresh incarnation
+			// otherwise; nextIncarnation says when, and the fresh path
+			// holds the cap.
+			if !g.nextIncarnation(ctx, rec) {
 				return
 			}
 		} else {
@@ -1036,6 +1114,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 	healed := false
 	var healedSource TerminalSource
 	var healedTask *lib.Task // the terminal the heal found, shape (a) only
+	var healedTerminal chatmsg.Reading
 	switch {
 	case err == nil && task.Final && task.Artifact(lib.ArtifactDelegate) != nil && !rec.delegationHandled(active.TaskID):
 		// A turn that asked to delegate, whose request the relay has not
@@ -1111,13 +1190,14 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// root's end comes from the wake below or, with no wake, from
 		// observeChildEnd.
 		g.observeEnded(rec, active.TaskID, task.State, source, finalMessageText(task))
+		rec.MarkTerminalObserved(active.TaskID)
 		// The terminal's mark, or the default, as relayTerminal draws it.
 		var terminal chatmsg.Reading
 		if task.FinalMessage != nil {
 			terminal = g.readChat(rec.Key, active.TaskID, chatmsg.Terminal, task.FinalMessage.Parts)
 		}
 		g.terminalMark(rec, active.TaskID, task.State, terminal)
-		healed, healedSource, healedTask = true, source, task
+		healed, healedSource, healedTask, healedTerminal = true, source, task, terminal
 	case noFirstEventPastGrace(active, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing an active task with no first event inside the grace",
 			"conversation", rec.Key, "taskId", active.TaskID, "addressee", addressee,
@@ -1134,6 +1214,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.applyTerminalMark(rec, active.TaskID, lib.StateFailed)
 		healed, healedSource = true, TerminalNeverStarted
+		// A pod that never started this task is not handed the next one:
+		// it may yet run the abandoned task first, after the person has
+		// moved on, or never run anything. Unmarked, the next turn retires
+		// it and spawns fresh, as before reuse (reuseLivePod).
+		if addressee == rec.BusSession && rec.PodName == rec.BusSession {
+			rec.PodReuse = false
+		}
 	}
 	if healed {
 		// Notices held for the task's terminal (a delegation refusal)
@@ -1153,16 +1240,19 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// terminal the heal found finds no route and is dropped, so it
 		// neither posts nor wakes. A never-started child's late events are
 		// dropped the same way. A human turn keeps its index, so its late
-		// result still posts.
+		// result still posts; MarkTerminalObserved on the record prevents
+		// double-counting in metrics when the relay arrives.
 		ref, known := rec.TaskRefFor(active.TaskID)
 		child := known && ref.Role == taskRoleChild
 		if child {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
+		unmarkOnSupervisorTerminal(rec, active.TaskID, healedSource)
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is
-		// activity, and the idle window opens at the answer. Without this a
+		// activity, and the session-thread window opens at the answer (the
+		// reap's opens at the last user message). Without this a
 		// healed thread went quiet the moment its lost answer was posted.
 		if healedSource == TerminalFromExecutor {
 			now := time.Now().UTC()
@@ -1179,7 +1269,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
 			// false: the heal's status card above carries no result text.
-			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false); !woken {
+			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
 			}
 		case child:
@@ -1522,9 +1612,10 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 
 // retireIncarnation deletes the record's lingering session pod before a
 // successor is minted or the route is left. Delete rather than just untrack:
-// once PodName clears, reap can never find the pod again, and sweep only
-// sees terminal phases - a wedged Running pod would hold its bus credential
-// forever. A detached task's supervisor terminal is owed BEFORE the delete
+// once PodName clears, reap can never find the pod again, and the sweep takes
+// a live pod only when it is a reused one its record no longer names
+// (sweepUntracked) - a wedged Running one-task pod would hold its bus
+// credential until its deadline. A detached task's supervisor terminal is owed BEFORE the delete
 // (the one deletion rule in Session lifecycle); false means that terminal
 // could not be published, a post has said so, and nothing was touched.
 // Spawner-nil is the W4-rollback shape: the record names a pod nothing can
@@ -1547,13 +1638,14 @@ func (g *Gateway) retireIncarnation(ctx context.Context, rec *SessionRecord, why
 }
 
 // freshIncarnation retires the previous session pod, if any, and mints the
-// next incarnation's name as the record's addressee. The worker adapter is
-// one task per process, so a lingering PodName names an executor that can
-// never serve the next task; publishing toward it wedges the conversation
-// (S9 review finding). Retire it the way Delegate does: supervisor terminal
-// for a detached task first, then the delete, then the successor. The cap
-// holds here too, or Delegate refusals just push the flood one affordance
-// over.
+// next incarnation's name as the record's addressee. It is the path for a
+// conversation whose pod cannot take the next task (reuseLivePod): none is
+// live, it was spawned to serve one task only, or a stopped task is still
+// finishing on it. Publishing toward such a pod wedges the conversation (S9
+// review finding), so it is retired the way Delegate does: supervisor
+// terminal for a detached task first, then the delete, then the successor.
+// The cap holds here too, or Delegate refusals just push the flood one
+// affordance over.
 //
 // False means the turn was refused - at the cap, or because the previous
 // task could not be closed on the bus - and a post has already said so.
@@ -1671,7 +1763,7 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		return true
 	}
 	msg.Text = rest
-	if !g.freshIncarnation(ctx, rec) {
+	if !g.nextIncarnation(ctx, rec) {
 		return false
 	}
 	g.startTask(ctx, rec, msg, backend, principal, authority)
@@ -1781,6 +1873,13 @@ func artifactParts(task *lib.Task, name string) []lib.Part {
 	return parts
 }
 
+// showsTaskStatus reports whether the backend that owns conversation shows
+// a task's status itself (StatusShower), and so wants no rolling line.
+func (g *Gateway) showsTaskStatus(conversation string) bool {
+	shower, ok := g.adapter.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
 // TaskObserver about a task's two ends. Both are no-ops for an adapter that
 // does not implement the interface -- Discord and gchat, for which a human
@@ -1797,9 +1896,13 @@ func (g *Gateway) observeTaskStarted(conversation, taskID string) {
 // observeTaskTerminal is also where the task-terminal counter counts
 // (metrics.go), whatever the adapter: it is the funnel every terminal path
 // ends in, once per path -- relayTerminal, the heal (stale terminal or never
-// started) and the publish that never reached the bus -- so the failures the
-// gateway itself declares are counted beside the executor's, and a terminal
-// is counted as often as an adapter is told of it.
+// started), observeChildEnd, and the publish that never reached the bus -- so
+// the failures the gateway itself declares are counted beside the executor's,
+// and a terminal is counted as often as an adapter is told of it.
+// A delegation chain is counted once under its root: observedAs keeps both
+// the turn that delegated and its child from reaching observeTaskTerminal
+// separately, and a session turn that asked to delegate but started no child
+// is counted as failed (handOffEnd) even when the executor reported completed.
 func (g *Gateway) observeTaskTerminal(conversation, taskID string, state lib.TaskState, source TerminalSource, reason string) {
 	g.metrics.taskTerminal(state, source)
 	if observer, ok := g.adapter.(TaskObserver); ok {
@@ -2155,9 +2258,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 
 	// Placeholder first, so the rolling line exists before the first event
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
-	statusMsgID, err := g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
-	if err != nil {
-		g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+	// None on a backend that shows the task's status itself (StatusShower).
+	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
+	if !lineless {
+		var err error
+		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
+		if err != nil {
+			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
+		}
 	}
 
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
@@ -2231,7 +2339,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
-			_ = g.adapter.Edit(rec.Key, statusMsgID, "❌ could not reach the bus; try again")
+			_ = g.adapter.Edit(rec.Key, statusMsgID, noticeBusUnreachable)
+		} else if lineless {
+			// No line to put it on, and nothing else would say the ask
+			// went nowhere.
+			g.post(rec.Key, noticeBusUnreachable)
 		}
 		rec.ActiveTask = nil
 		g.mu.Lock()

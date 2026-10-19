@@ -7,19 +7,26 @@ command whose program is a shell variable (`$G add`) and the refusal is final.
 The image build's deploy/docker/check_skill_commands.py runs the fenced shell
 blocks through that scanner but not inline code, most of which is JSON, report
 templates or fragments the scanner cannot rate. This reads the inline code of
-the same three skill trees for the variable forms the skills used to teach: a
+every shipped skill document, as deploy/docker/skill_documents.py defines it,
+for the variable forms the skills used to teach: a
 variable as the program, a script run by a path that starts with one, or the
 path of git or `submit_suggestion.py` put in a variable.
 """
 
 import re
+import sys
 import unittest
 from pathlib import Path
 
 from markdown_it import MarkdownIt
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
+sys.path.insert(0, str(REPO_ROOT / "deploy" / "docker"))
+
+from skill_documents import SKILL_ROOT_GLOBS, shipped_skill_documents, shipped_trees, skill_dirs  # noqa: E402
+
+# The trees the agent image ships, which deploy/docker/Dockerfile copies.
+IMAGE_SKILL_TREES = ("agents/platform/skills", "agents/cluster/skills", "a2a/persona/platform/skills")
 
 # A variable run as the program at the start of a span, after a shell join or
 # inside `$(`, and after a shell keyword or a wrapper that runs the next word
@@ -68,6 +75,18 @@ def inline_code(text):
                     yield token.map[0] + 1 + token.content.count("\n", 0, start), child.content
 
 
+def refused_spans(repo):
+    """``(document, line, span)`` for each refused inline span in the shipped skills at ``repo``."""
+    return [
+        (document, line, span)
+        for document in shipped_skill_documents(repo)
+        for line, span in inline_code(
+            REFUSED_EXAMPLE_RE.sub("", document.read_text(encoding="utf-8"))
+        )
+        if refused(span)
+    ]
+
+
 def refused(span):
     return any(
         pattern.search(span)
@@ -77,22 +96,23 @@ def refused(span):
 
 class SkillInlineCommandsTest(unittest.TestCase):
     def test_each_tree_holds_a_skill(self):
-        for tree in SKILL_TREES:
+        for tree in IMAGE_SKILL_TREES:
+            with self.subTest(tree):
+                self.assertIn(REPO_ROOT / tree, shipped_trees(REPO_ROOT))
+        for pattern in SKILL_ROOT_GLOBS:
+            with self.subTest(pattern):
+                self.assertTrue(any(REPO_ROOT.glob(pattern)), f"{pattern} matches no skill tree")
+        for tree in shipped_trees(REPO_ROOT):
             with self.subTest(tree):
                 self.assertTrue(
-                    any((REPO_ROOT / tree).rglob("SKILL.md")),
-                    f"{tree} holds no SKILL.md, so its inline code would pass unread",
+                    skill_dirs(tree),
+                    f"{tree} holds no skill, so its inline code would pass unread",
                 )
 
     def test_no_inline_command_runs_a_variable_as_its_program(self):
         found = [
-            f"{skill.relative_to(REPO_ROOT)}:{line}: {span}"
-            for tree in SKILL_TREES
-            for skill in sorted((REPO_ROOT / tree).rglob("SKILL.md"))
-            for line, span in inline_code(
-                REFUSED_EXAMPLE_RE.sub("", skill.read_text(encoding="utf-8"))
-            )
-            if refused(span)
+            f"{document.relative_to(REPO_ROOT)}:{line}: {span}"
+            for document, line, span in refused_spans(REPO_ROOT)
         ]
         self.assertEqual([], found)
 

@@ -92,7 +92,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 
-# The scope this collector was handed, set by main from the two flags.
+# The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
 
 # A run narrowed on purpose -- `--project-id` or `MONITORED_PROJECT_IDS` --
@@ -2141,7 +2141,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--check", choices=CHECK_CHOICES, default=CHECK_ALL,
                         help=f"run the subnet sweep, the project-level checks ({PROJECT_CHECKS_CHOICE}), or both")
     args = parser.parse_args(argv)
-    declared_scope.set(args.scope_projects, args.scope_unread)
+    declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
     # A run killed before it writes must not leave the last run's manifest to
     # be read as this one's.
     if args.output:

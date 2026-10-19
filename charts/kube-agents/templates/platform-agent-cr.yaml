@@ -12,10 +12,11 @@ metadata:
   {{- $annotations = deepCopy . }}
   {{- end }}
   {{- /*
-    Two keys the operator reads are also derived from chart values, and the value
+    Three keys the operator reads are also derived from chart values, and the value
     wins because it drives the rest of the release too: litellm.networkPolicy is
     the static render gate, telemetry.collectorNamespace the static policy's
-    egress namespace. A platformAgent.annotations entry that disagrees with the
+    egress namespace, and litellm.openaiCompatible the static policy's rule to
+    the model server. A platformAgent.annotations entry that disagrees with the
     value it duplicates fails the render rather than being overwritten in silence.
   */}}
   {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
@@ -36,6 +37,23 @@ metadata:
   {{- end }}
   {{- end }}
   {{- $_ := set $annotations $collectorNamespaceKey . }}
+  {{- end }}
+  {{- /*
+    Empty, and so not stamped, for any other provider and for a public port-443
+    endpoint, which the operator's 443 rule already reaches.
+  */}}
+  {{- $upstreamEgressKey := "kubeagents.x-k8s.io/litellm-upstream-egress" }}
+  {{- if and .Values.litellm .Values.litellm.enabled (eq .Values.litellm.modelProvider "openai_compatible") }}
+  {{- with include "kube-agents.openaiCompatibleEgress" $ }}
+  {{- $upstreamEgress := . }}
+  {{- with get $annotations $upstreamEgressKey }}
+  {{- /* The operator reads this value trimmed; agree with it. */}}
+  {{- if ne (toString . | trim) $upstreamEgress }}
+  {{- fail (printf "platformAgent.annotations[%q]=%q contradicts litellm.openaiCompatible, from which the chart derives %q. Drop the annotation; the chart stamps it from litellm.openaiCompatible." $upstreamEgressKey (toString .) $upstreamEgress) }}
+  {{- end }}
+  {{- end }}
+  {{- $_ := set $annotations $upstreamEgressKey $upstreamEgress }}
+  {{- end }}
   {{- end }}
   {{- with $annotations }}
   annotations:
@@ -169,8 +187,40 @@ spec:
       cluster has no collector, so this is for the cases it will not decide:
       discovery switched off, a pinned endpoint, or a collector you would rather
       this agent did not export to.
+
+      The daily alert ceilings in deployment.alertDailyLimits come first in the
+      list, as ALERT_DAILY_LIMIT_<KEY>. A key that is not set adds no entry, so
+      a default render has no env. A name that deployment.env also lists is
+      skipped, so the explicit entry wins. The CRD keys env on name, and the
+      API server refuses a duplicate name. A valueFrom entry for a name whose
+      key is set fails the render. The operator forwards only literal values
+      and drops that entry, so the agent would ignore both the entry and the
+      key. The value goes through int64 because Helm reads a number from a
+      values file as float64, and toString writes a large float64 in exponent
+      form, which the daemon cannot read.
     */}}
-    {{- with .Values.platformAgent.deployment.env }}
+    {{- $userEnv := .Values.platformAgent.deployment.env | default list }}
+    {{- $userEnvNames := dict }}
+    {{- $userValueFromNames := dict }}
+    {{- range $userEnv }}
+    {{- $_ := set $userEnvNames (toString .name) true }}
+    {{- if .valueFrom }}
+    {{- $_ := set $userValueFromNames (toString .name) true }}
+    {{- end }}
+    {{- end }}
+    {{- $alertDailyLimits := .Values.platformAgent.deployment.alertDailyLimits | default dict }}
+    {{- $env := list }}
+    {{- range $bucket := list "critical" "warning" "info" "drift" }}
+    {{- $name := printf "ALERT_DAILY_LIMIT_%s" (upper $bucket) }}
+    {{- $limit := index $alertDailyLimits $bucket }}
+    {{- if and (not (kindIs "invalid" $limit)) (hasKey $userValueFromNames $name) }}
+    {{- fail (printf "platformAgent.deployment.alertDailyLimits.%s is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the agent keeps its default. Remove the valueFrom entry or the key." $bucket $name) }}
+    {{- end }}
+    {{- if and (not (kindIs "invalid" $limit)) (not (hasKey $userEnvNames $name)) }}
+    {{- $env = append $env (dict "name" $name "value" ($limit | int64 | toString)) }}
+    {{- end }}
+    {{- end }}
+    {{- with concat $env $userEnv }}
     env:
       {{- /*
         `value` is quoted rather than passed through toYaml because the CRD types

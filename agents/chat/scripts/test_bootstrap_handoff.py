@@ -28,6 +28,7 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[2] / "platform" / "scrip
 import bootstrap_handoff as h
 import inventory_findings
 
+
 FIXTURE = Path(__file__).parent / "testdata" / "bootstrap_handoff" / "cluster_metadata.json"
 SWEEP = "t_sweep"
 SWEEP_CREATED = 1000
@@ -159,6 +160,17 @@ class FindingLinesTest(unittest.TestCase):
         self.assertTrue(managed["kube-system"])
         self.assertFalse(managed["buildkit"])
 
+    def test_a_dash_placeholder_names_no_object(self):
+        # A Cluster Agent wrote "workload": "-" on a namespace finding, and the ranking stage
+        # refused the line whose object was "-".
+        meta = {"project": "p", "cluster": "c", "findings": [
+            {"check": "no-resourcequota", "namespace": "default", "workload": "-", "issue": "no ResourceQuota"},
+            {"check": "no-resourcequota", "namespace": "—", "workload": "-", "issue": "no ResourceQuota"}]}
+        first, second = h.finding_lines(meta)
+        self.assertEqual((first["namespace"], first["object"]), ("default", "default"))
+        self.assertEqual(second["object"], "c")
+        self.assertNotIn("namespace", second)
+
     def test_a_check_the_agent_named_is_kept(self):
         meta = {"project": "p", "cluster": "c", "findings": [
             {"check": "probes-readiness", "namespace": "ns", "workload": "api", "issue": "no readinessProbe"}]}
@@ -183,6 +195,16 @@ class ComposeTest(unittest.TestCase):
         text = h.compose(self._state(_all_done()), timed_out=False, now=NOW)
         self.assertIn("| seeded-b |", text)
         self.assertNotIn('"cluster": "seeded-b"', text)
+
+    def test_the_workload_table_carries_only_the_scans_own_checks(self):
+        workload = {"namespace": "ns", "name": "api", "kind": "Deployment", "replicas": "2/2",
+                    "probes": {"startup": False}, "telemetry": "otlp", "security_context": {"read_only_root_fs": True}}
+        meta = {"project": "p", "cluster": "c", "workloads": [workload], "findings": []}
+        text = h.compose(self._state([("t_w", "done", meta, "")]), timed_out=False, now=NOW)
+        self.assertIn("| Replicas | Startup Probe | Telemetry | ReadOnlyFS |", text)
+        self.assertIn("| c | ns | api | Deployment | 2/2 | no | otlp | yes |", text)
+        self.assertNotIn("Requests/Limits", text)
+        self.assertIn("are not checked by this scan: the first-run audits own them", text)
 
     def test_a_blocked_card_is_a_named_gap(self):
         clusters = _all_done()[:1] + [("t_blocked", "blocked", None, "Cluster preflight check failed with exit code 255.")]

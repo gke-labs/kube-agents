@@ -17,7 +17,14 @@ from admin_console.agent_runtime import (
     AgentRuntimeProvider,
     KubeCommandResult,
 )
+from admin_console.kanban_view import display_status
 from admin_console.project_config import DeploymentTarget
+
+# A result that cites a status page and a log path. It does not link a PR.
+CITED_RESULT = (
+    "Checked https://status.cloud.google.com — all green.\n"
+    "Rotated logs under /mnt/pull/2024-10-01."
+)
 
 
 class AgentRuntimeRunner:
@@ -655,6 +662,281 @@ class EmbeddedReadScriptTest(unittest.TestCase):
         self.assertTrue(payload["runs_truncated"])
         self.assertEqual(payload["runs"][0]["id"], 6)
         self.assertEqual(payload["runs"][-1]["id"], 105)
+
+    def _create_card_state_board(self, path: Path) -> None:
+        with closing(sqlite3.connect(path)) as connection, connection:
+            connection.executescript(
+                """
+                CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, title TEXT, assignee TEXT, status TEXT,
+                    priority INTEGER, session_id TEXT, created_at REAL,
+                    started_at REAL, completed_at REAL, last_heartbeat_at REAL,
+                    last_failure_error TEXT, block_kind TEXT, result TEXT
+                );
+                CREATE TABLE task_runs (
+                    id INTEGER PRIMARY KEY, task_id TEXT, profile TEXT,
+                    step_key TEXT, status TEXT, started_at REAL, ended_at REAL,
+                    outcome TEXT, summary TEXT, metadata TEXT, error TEXT
+                );
+                CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY, task_id TEXT, run_id INTEGER,
+                    kind TEXT, payload TEXT, created_at REAL
+                );
+                CREATE TABLE task_comments (
+                    id INTEGER, task_id TEXT, author TEXT, body TEXT,
+                    created_at REAL
+                );
+                CREATE TABLE task_attachments (
+                    id INTEGER, task_id TEXT, filename TEXT, content_type TEXT,
+                    size INTEGER, uploaded_by TEXT, created_at REAL
+                );
+                CREATE TABLE kanban_notify_subs (
+                    task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT,
+                    user_id TEXT, notifier_profile TEXT, created_at REAL,
+                    last_event_id INTEGER
+                );
+                """
+            )
+            cards = [
+                ("t_done_pr", "done", None, None),
+                ("t_done", "done", None, "No change was needed."),
+                ("t_done_bad", "done", None, None),
+                (
+                    "t_result_pr",
+                    "done",
+                    None,
+                    "Opened https://github.com/acme/infra/pull/12 for review.",
+                ),
+                (
+                    "t_result_mr",
+                    "done",
+                    None,
+                    "Opened https://gitlab.example/acme/infra/-/merge_requests/4.",
+                ),
+                (
+                    "t_result_issue",
+                    "done",
+                    None,
+                    "Filed https://github.com/acme/infra/issues/9.",
+                ),
+                # Two URL-like parts with white space between them are not
+                # one PR URL.
+                (
+                    "t_result_cited",
+                    "done",
+                    None,
+                    CITED_RESULT,
+                ),
+                (
+                    "t_result_spaced",
+                    "done",
+                    None,
+                    "See https://status.cloud.google.com and /mnt/pull/2024-10-01.",
+                ),
+                # A link that only offers to open a PR has no PR number.
+                (
+                    "t_result_new_pr",
+                    "done",
+                    None,
+                    "Open https://github.com/acme/infra/pull/new/fix-dns to file it.",
+                ),
+                # The console shows a PR only for a done card.
+                (
+                    "t_running_pr",
+                    "running",
+                    None,
+                    "Opened https://github.com/acme/infra/pull/13 for review.",
+                ),
+                ("t_pr_false", "done", None, None),
+                ("t_pr_zero", "done", None, None),
+                ("t_input", "blocked", "needs_input", None),
+                ("t_access", "blocked", "capability", None),
+                ("t_gave_up", "blocked", "needs_input", None),
+                ("t_unblocked", "blocked", "needs_input", None),
+                ("t_triage", "triage", None, None),
+            ]
+            connection.executemany(
+                "INSERT INTO tasks VALUES (?, 'Card', 'platform', ?, 0, "
+                "'portal_session', ?, NULL, NULL, NULL, '', ?, ?)",
+                [
+                    (task_id, status, index, kind, result)
+                    for index, (task_id, status, kind, result) in enumerate(
+                        cards, 1
+                    )
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO task_runs (task_id, status, metadata) VALUES (?, 'done', ?)",
+                [
+                    # A later review run does not hide the URL of an older run.
+                    ("t_done_pr", '{"pr_url": "https://example.invalid/pull/7"}'),
+                    ("t_done_pr", '{"decision": "approve"}'),
+                    ("t_done_pr", None),
+                    ("t_done", '{"pr_url": ""}'),
+                    ("t_done", '{"decision": "no change"}'),
+                    ("t_done_bad", "not json"),
+                    # Only a text value is a URL.
+                    ("t_pr_false", '{"pr_url": false}'),
+                    ("t_pr_zero", '{"pr_url": 0}'),
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, ?, '{}', 0)",
+                [
+                    ("t_input", "blocked"),
+                    ("t_access", "blocked"),
+                    # A block, an unblock, then the breaker. The breaker keeps
+                    # the old kind, and a later comment is the newest event.
+                    ("t_gave_up", "blocked"),
+                    ("t_gave_up", "unblocked"),
+                    ("t_gave_up", "gave_up"),
+                    ("t_gave_up", "commented"),
+                    # A person unblocked the card after the breaker. A later
+                    # status move without a new 'blocked' event is not a give up.
+                    ("t_unblocked", "gave_up"),
+                    ("t_unblocked", "unblocked"),
+                    ("t_unblocked", "status"),
+                    ("t_triage", "blocked"),
+                    ("t_triage", "blocked"),
+                ],
+            )
+
+    def test_reads_select_block_kind_gave_up_and_pr(self):
+        expected = {
+            "t_done_pr": (None, 0, 1),
+            "t_done": (None, 0, 0),
+            "t_done_bad": (None, 0, 0),
+            "t_result_pr": (None, 0, 1),
+            "t_result_mr": (None, 0, 1),
+            "t_result_issue": (None, 0, 0),
+            "t_result_cited": (None, 0, 0),
+            "t_result_spaced": (None, 0, 0),
+            "t_result_new_pr": (None, 0, 0),
+            "t_running_pr": (None, 0, 0),
+            "t_pr_false": (None, 0, 0),
+            "t_pr_zero": (None, 0, 0),
+            "t_input": ("needs_input", 0, 0),
+            "t_access": ("capability", 0, 0),
+            "t_gave_up": ("needs_input", 1, 0),
+            "t_unblocked": ("needs_input", 0, 0),
+            "t_triage": (None, 0, 0),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._create_card_state_board(root / "kanban.db")
+            with closing(sqlite3.connect(root / "kanban.db")) as connection, connection:
+                connection.executemany(
+                    "INSERT INTO task_links VALUES (?, ?)",
+                    [
+                        ("t_result_pr", "t_gave_up"),
+                        ("t_gave_up", "t_result_mr"),
+                        ("t_gave_up", "t_result_cited"),
+                    ],
+                )
+            board = self._run_script(root, "board", "100")
+            tasks = self._run_script(root, "tasks", "portal_session", "100")
+            detail = self._run_script(root, "task", "t_gave_up")
+
+        for read, payload in (("board", board), ("tasks", tasks)):
+            with self.subTest(read=read):
+                self.assertEqual(
+                    {
+                        row["id"]: (row["block_kind"], row["gave_up"], row["has_pr"])
+                        for row in payload["tasks"]
+                    },
+                    expected,
+                )
+        self.assertEqual(
+            (
+                detail["task"]["block_kind"],
+                detail["task"]["gave_up"],
+                detail["task"]["has_pr"],
+            ),
+            ("needs_input", 1, 0),
+        )
+        self.assertEqual(
+            [(row["id"], row["has_pr"]) for row in detail["parents"]],
+            [("t_result_pr", True)],
+        )
+        self.assertEqual(
+            [(row["id"], row["has_pr"]) for row in detail["children"]],
+            [("t_result_mr", True), ("t_result_cited", False)],
+        )
+        # The read scans the result but does not send it.
+        for payload in (
+            board["tasks"],
+            tasks["tasks"],
+            detail["parents"],
+            detail["children"],
+        ):
+            text = json.dumps(payload)
+            self.assertNotIn("status.cloud.google.com", text)
+            self.assertNotIn("github.com/acme/infra/pull", text)
+            self.assertNotIn("merge_requests", text)
+            self.assertNotIn("pr_scan_result", text)
+
+    def test_reads_tolerate_a_board_without_card_state_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._create_board_db(root / "kanban.db", [("t_00000001", "Task", "s")])
+            board = self._run_script(root, "board", "10")
+
+        row = board["tasks"][0]
+        self.assertEqual(
+            (row["block_kind"], row["gave_up"], row["has_pr"]), (None, 0, 0)
+        )
+        self.assertNotIn("pr_scan_result", row)
+
+    def test_provider_parses_card_state_from_the_real_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._create_card_state_board(root / "kanban.db")
+            with closing(sqlite3.connect(root / "kanban.db")) as connection, connection:
+                connection.execute(
+                    "INSERT INTO task_links VALUES ('t_done_pr', 't_gave_up')"
+                )
+
+            def provider_for(*arguments: str) -> AgentRuntimeProvider:
+                completed = subprocess.run(
+                    [sys.executable, "-c", self._script_for(root), *arguments],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return AgentRuntimeProvider(
+                    DeploymentTarget("test-project-01", "test-cluster-01", "us-east4"),
+                    runner=FramedReadRunner(completed.stdout),
+                )
+
+            board = provider_for("board", "100").list_kanban_tasks("platform-agent")
+            updates = provider_for("tasks", "portal_session", "100").get_task_updates(
+                "platform-agent", session_id="portal_session"
+            )
+            detail = provider_for("task", "t_done_pr").get_kanban_task(
+                "platform-agent", "t_done_pr"
+            )
+
+        for result in (board, updates):
+            cards = {task.task_id: task for task in result.tasks}
+            self.assertEqual(
+                (cards["t_gave_up"].block_kind, cards["t_gave_up"].gave_up),
+                ("needs_input", True),
+            )
+            self.assertEqual(
+                (cards["t_input"].block_kind, cards["t_input"].gave_up),
+                ("needs_input", False),
+            )
+            self.assertTrue(cards["t_done_pr"].has_pr)
+            self.assertFalse(cards["t_done"].has_pr)
+            self.assertEqual(cards["t_done"].block_kind, "")
+        self.assertTrue(detail.task.has_pr)
+        self.assertFalse(detail.task.gave_up)
+        self.assertEqual(
+            [(child.task_id, display_status(child)) for child in detail.children],
+            [("t_gave_up", "failed after all attempts")],
+        )
 
 
 class AgentRuntimeProviderTest(unittest.TestCase):

@@ -1057,6 +1057,33 @@ class OpenCardsQueryTest(unittest.TestCase):
             ],
         )
 
+    def test_a_hard_wall_block_is_parked_and_a_question_is_not(self):
+        # j stopped on a hard wall (a target that does not exist); k asks the user something;
+        # l hit a hard wall, was unblocked, and blocked again on a question.
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT);"
+            "CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT);"
+            "CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);"
+            "INSERT INTO task_events VALUES (1,'j','blocked','{\"kind\": \"capability\"}'),"
+            " (2,'k','blocked','{\"kind\": \"needs_input\"}'),(3,'l','blocked','{\"kind\": \"capability\"}'),"
+            " (4,'l','unblocked','{}'),(5,'l','blocked','{\"kind\": \"needs_input\"}');"
+            "INSERT INTO tasks VALUES ('j','blocked'),('k','blocked'),('l','blocked');"
+            "INSERT INTO kanban_notify_subs VALUES"
+            " ('j','slack','C1','111.000'),('k','slack','C1','111.000'),('l','slack','C1','111.000');"
+        )
+        rows = conn.execute(runtime.OPEN_CARDS_SQL, ("slack", "C1", "111.000")).fetchall()
+        self.assertEqual(
+            sorted(rows), [("j", "blocked", None, 1), ("k", "blocked", None, 0), ("l", "blocked", None, 0)],
+        )
+
+    def test_the_parked_kinds_match_the_notifiers(self):
+        # The notifier settles a hard-wall block as a give-up; this read must park the same two.
+        import kanban_progress_lines
+
+        self.assertEqual(runtime.HARD_WALL_BLOCK_KIND, kanban_progress_lines.HARD_WALL_BLOCK_KIND)
+        self.assertEqual(runtime.GAVE_UP_KIND, kanban_progress_lines.GAVE_UP_KIND)
+
     def _fake_hermes(self, paths, rows, reads, broken=()):
         """``hermes_cli`` modules listing ``paths`` as boards, each database returning ``rows``."""
 

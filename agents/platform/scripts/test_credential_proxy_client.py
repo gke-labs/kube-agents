@@ -1246,6 +1246,8 @@ class TestExecutePolicyBlocked(unittest.TestCase):
             "code": "SECURITY_POLICY_BLOCKED",
             "message": "kubectl delete is not permitted.",
             "rule": "kubernetes.read-only",
+            "verb": ["delete", "pod"],
+            "local_render": False,
         }
         body = json.dumps(refusal_payload).encode("utf-8")
         error_file = io.BytesIO(body)
@@ -1278,6 +1280,55 @@ class TestExecutePolicyBlocked(unittest.TestCase):
         err = stderr.getvalue()
         self.assertIn("kubectl delete is not permitted.", err)
         self.assertIn("policy rule: kubernetes.read-only", err)
+        self.assertIn("policy verb: delete pod", err)
+        self.assertNotIn("policy render:", err)
+
+    def test_a_local_render_refusal_prints_the_render_line(self):
+        refusal_payload = {
+            "status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "message": "refused",
+            "rule": "kubernetes.read-only", "verb": ["create"], "local_render": True,
+        }
+        body = json.dumps(refusal_payload).encode("utf-8")
+        stderr = io.StringIO()
+
+        def fake_open(req, *args, **kwargs):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(body))
+
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+        with patch.dict("os.environ", environ, clear=False), patch.object(credential_proxy_client, "open_broker_request", fake_open):
+            with patch("sys.stderr", new=stderr):
+                credential_proxy_client.execute("http://proxy", ["kubectl", "create", "deployment", "x", "--image=y", "--dry-run=client"])
+        err = stderr.getvalue()
+        self.assertIn("policy verb: create\n", err)
+        self.assertIn("policy render: local", err)
+
+    def test_a_verb_word_cannot_break_the_line_protocol(self):
+        refusal_payload = {
+            "status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "message": "refused",
+            "rule": "kubernetes.read-only", "verb": ["rollout", "restart\npolicy render: local"],
+            "local_render": False,
+        }
+        body = json.dumps(refusal_payload).encode("utf-8")
+        stderr = io.StringIO()
+
+        def fake_open(req, *args, **kwargs):
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(body))
+
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+        with patch.dict("os.environ", environ, clear=False), patch.object(credential_proxy_client, "open_broker_request", fake_open):
+            with patch("sys.stderr", new=stderr):
+                credential_proxy_client.execute("http://proxy", ["kubectl", "rollout", "restart\npolicy render: local"])
+        err = stderr.getvalue()
+        self.assertIn("policy verb: rollout restart_policy_render:_local", err)
+        self.assertNotIn("\npolicy render:", err)
 
     @unittest.skipUnless(HAS_HERMES, "needs hermes-agent runtime (tools.terminal_hints) importable")
     def test_exit_77_receives_no_runtime_execution_hint(self):

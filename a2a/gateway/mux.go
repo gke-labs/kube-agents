@@ -222,6 +222,17 @@ func (m *MultiAdapter) MarkChanged(conversation, ask, settle string) {
 	}
 }
 
+// ShowsTaskStatus answers for the backend that owns the conversation
+// (StatusShower); one that does not implement it keeps the rolling line.
+func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return false
+	}
+	shower, ok := a.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
 func (m *MultiAdapter) InboundVerified(conversation, messageID string, verified bool) {
 	if a, err := m.pick(conversation); err == nil {
 		if observer, ok := a.(VerifiedObserver); ok {
@@ -270,6 +281,14 @@ func (m *MultiAdapter) TaskAccepted(conversation, taskID string) {
 func (m *MultiAdapter) CancelPublished(conversation, taskID string) {
 	if observer, ok := m.observerFor(conversation); ok {
 		observer.CancelPublished(conversation, taskID)
+	}
+}
+
+func (m *MultiAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(HomeSink); ok {
+			sink.SetHome(admits, board)
+		}
 	}
 }
 

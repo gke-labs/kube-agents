@@ -239,7 +239,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		"defaultAddressee", cfg.DefaultAddressee,
 		"spawnSessions", cfg.SpawnSessions,
 		"idleTTL", cfg.IdleTTL.String())
-	return serve(ctx, cfg, metrics, log, gw.Run)
+	return serve(ctx, cfg, gw.Metrics(), log, gw.Run)
 }
 
 // chatNotifier builds the chat.notify route for the backend adapter, or nil
@@ -254,7 +254,7 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 	log *slog.Logger) *gateway.Notifier {
 	if slack, ok := backend.(*gateway.SlackAdapter); ok {
 		if cfg.SlackHomeChannel == "" {
-			log.Info("chat.notify home posts not armed: no Slack home channel configured; conversation posts are")
+			log.Warn("chat.notify home posts not armed: no Slack home channel configured; conversation posts are")
 		}
 		n, err := gateway.NewSlackNotifier(slack, cfg.SlackHomeChannel, log)
 		if err != nil {
@@ -269,7 +269,7 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 		return nil
 	}
 	if cfg.GchatHomeChannel == "" {
-		log.Info("chat.notify home posts not armed: no home channel configured; conversation posts are")
+		log.Warn("chat.notify home posts not armed: no home channel configured; conversation posts are")
 	}
 	n, err := gateway.NewGchatNotifier(gchat, cfg.GchatHomeChannel, log)
 	if err != nil {

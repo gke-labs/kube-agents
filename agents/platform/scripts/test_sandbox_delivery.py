@@ -59,6 +59,7 @@ TRUSTED_DIR = "/opt/vcs/libexec/platform"
 # crons, which never run in the sandbox.
 INSTRUCTION_GLOBS = (
     "agents/platform/skills/*/SKILL.md",
+    "agents/platform/skills/*/references/*.md",
     "agents/platform/SOUL.md",
     "agents/platform/AGENTS.md",
     "agents/platform/governance/*.md",
@@ -329,7 +330,7 @@ class SandboxDelivery(unittest.TestCase):
         for pattern in INSTRUCTION_GLOBS:
             for doc in REPO.glob(pattern):
                 for name in CALL.findall(doc.read_text()):
-                    if name in self.shared:
+                    if staged_source(name) is not None:
                         wanted.setdefault(name, []).append(
                             str(doc.relative_to(REPO))
                         )

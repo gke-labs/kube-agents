@@ -80,11 +80,16 @@ const (
 // replaces had it too, over a far wider grant set. Read the list below as what
 // a session may ASK FOR, which is what it governs, rather than as reach.
 //
-// The task id is not part of the claim, so the events grant is per incarnation
-// (`<pod>.*.events`) rather than per task id. The gateway spawns one
-// incarnation per task, which makes those the same thing today; the gateway
-// pins that when it routes a session (gateway.go, the SessionRouted branch,
-// which retires the previous incarnation and re-mints rec.BusSession).
+// The task id is not part of the claim, so the grants are per incarnation
+// (`<pod>.*.events`, and consumer filters on `<pod>.*.in` and
+// `<pod>.*.events`) rather than per task id. That is what lets one pod serve
+// every turn of its conversation (the gateway's reuseLivePod, the adapter's
+// runSessionLoop): each turn is another task id under the same pod, and the
+// adapter learns it through the origin consumer filtered `<pod>.*.in`, granted
+// below, so a later turn asks for nothing the first did not. An incarnation
+// ends when the gateway retires its pod and mints a new rec.BusSession
+// (freshIncarnation), and these grants, derived from the pod name, end with
+// it.
 func sessionGrants(pod string) (Grants, error) {
 	g := executorGrants(pod, pod)
 	inbox := "_INBOX." + pod + ".>"

@@ -159,7 +159,7 @@ type ScopeSpec struct {
 	Exclude *ScopeExcludeSpec `json:"exclude,omitempty"`
 }
 
-// ScopeExcludeSpec names what the scope must never manage.
+// ScopeExcludeSpec names what the scope must never manage or read.
 type ScopeExcludeSpec struct {
 	// Projects are project IDs or shell-style globs (`*-sandbox`) matched against
 	// each resolved project ID. A match on the management project is ignored and
@@ -174,6 +174,11 @@ type ScopeExcludeSpec struct {
 	// are unique only within a project and location. This replaces the
 	// RECONCILE_EXCLUDE environment variable, which matched bare names across
 	// every project.
+	// An excluded cluster gets no Cluster Agent, and fleet answers, the
+	// onboarding sweep and the fleet-audit collectors that list clusters leave
+	// it out. Still covering it: the daily upgrade-readiness watch, the
+	// networking audit's subnet usage, the GCE audit's instance listing, and
+	// the third-party gke MCP server's list_clusters.
 	// +kubebuilder:validation:MaxItems=100
 	// +listType=map
 	// +listMapKey=projectId

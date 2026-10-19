@@ -63,8 +63,12 @@ jobs:
   semgrep-scan:
     name: SAST Scan (semgrep)
     runs-on: ubuntu-latest
+    # Pulled through mirror.gcr.io rather than from Docker Hub: the runner's daemon
+    # pulls a job container anonymously, and Docker Hub's per-IP anonymous limit
+    # failed this job 25 times on 2026-10-09 (#2870; docker-build.yml has the
+    # account). The digest pins the same bytes on either host.
     container:
-      image: semgrep/semgrep:1.155.0@sha256:cc869c685dcc0fe497c86258da9f205397d8108e56d21a86082ea4886e52784d
+      image: mirror.gcr.io/semgrep/semgrep:1.155.0@sha256:cc869c685dcc0fe497c86258da9f205397d8108e56d21a86082ea4886e52784d
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

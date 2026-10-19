@@ -91,10 +91,17 @@ jobs:
     concurrency:
       group: ${{ inputs.github_environment }}-environment
       cancel-in-progress: false
-    # `next` adds the mode switch's wait to the install's: the agent rolls
-    # again, and Ready waits on the bus, the callout and the provisioning Job.
-    # `today` keeps the 60 it always had.
-    timeout-minutes: ${{ inputs.mode == 'next' && 90 || 60 }}
+    # Sized to provision_environment.sh's stockout retry, not to one install.
+    # The long case is a stockout on the first two attempts and a success on
+    # the third: about five minutes of setup, a teardown of whatever last
+    # night left (ten), two failed creates that each take about ten minutes
+    # to be refused, two ten-minute waits, two teardowns of the half-built
+    # environment (ten each), and one full install (forty) -- about 115
+    # minutes, so 150 with margin. `next` adds the mode switch's wait on
+    # top: the agent rolls again, and Ready waits on the bus, the callout and
+    # the provisioning Job. A job stopped here reports `cancelled`, not
+    # `failure`, which the promotion pipeline's teardown condition names.
+    timeout-minutes: ${{ inputs.mode == 'next' && 180 || 150 }}
     permissions:
       contents: read
       id-token: write

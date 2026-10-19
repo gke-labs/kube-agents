@@ -9,7 +9,9 @@ This test is what makes the rule a build failure:
 * a domain that IS covered must not stay on the allowlist -- otherwise the
   list stops being the progress metric it exists to be;
 * a task claiming an unknown domain is a typo that would otherwise count as
-  coverage of nothing.
+  coverage of nothing;
+* a domain with no ``owner:``, ``backup:`` (a second login) or ``meaning:``
+  has nobody answering for it or no sentence saying what it checks.
 
 Delete allowlist entries as Phase 2 ACTIVATES scenarios. The shrinking
 allowlist is the tier-2 progress metric of the testing implementation plan.
@@ -122,6 +124,28 @@ class TestDomainCoverage(unittest.TestCase):
             [],
             "\n\nThese tasks claim a domain docs/designs/domains.yaml does not "
             "define:\n  " + "\n  ".join(unknown),
+        )
+
+    def test_every_domain_has_an_owner_a_backup_and_a_meaning(self):
+        domains, _ = load_domains()
+        missing = sorted(
+            f"{d.get('slug')}: {key}"
+            for d in domains
+            for key in ("owner", "backup", "meaning")
+            if not isinstance(d.get(key), str) or not d[key].strip()
+        ) + sorted(
+            f"{d.get('slug')}: backup is the owner"
+            for d in domains
+            if isinstance(d.get("owner"), str)
+            and isinstance(d.get("backup"), str)
+            and d["owner"].strip().lower() == d["backup"].strip().lower()
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "\n\nEvery domain in docs/designs/domains.yaml needs a non-empty "
+            "`owner:` and `backup:` (two different GitHub logins) and a "
+            "`meaning:` (one plain sentence):\n  " + "\n  ".join(missing),
         )
 
     def test_every_allowlist_entry_names_a_real_domain(self):

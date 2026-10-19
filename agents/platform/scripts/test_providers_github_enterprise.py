@@ -52,9 +52,22 @@ OPENSSL = shutil.which("openssl")
 HOST = "ghe.mock.test"
 OTHER_HOST = "elsewhere.mock.test"
 REPO_URL = f"https://{HOST}/acme/infra"
-TOKEN = "ghs_mockinstallationtoken0001"
+TOKEN = "mock-installation-token-0001"
 FIXTURES = Path(__file__).resolve().parent / "testdata" / "providers" / "github"
 DIFF = "diff --git a/x b/x\n"
+
+
+def setUpModule():
+    # gitops_workspace ignores GITOPS_STATE_PATH where the operator's
+    # /etc/gitops mount exists (in_operator_pod), and this module isolates its
+    # tests with that variable. Point the mount check away from any real one.
+    global _NO_MOUNT
+    _NO_MOUNT = mock.patch.object(gitops_workspace, "GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
+    _NO_MOUNT.start()
+
+
+def tearDownModule():
+    _NO_MOUNT.stop()
 
 
 def _openssl(*args: str, cwd: Path) -> None:
@@ -725,8 +738,8 @@ class ContentWorkspaceTest(unittest.TestCase):
             self.assertEqual("github.com", credential_proxy._workspace_github_host())
 
 
-WRITE_TOKEN = "ghs_mockwritetoken0002"
-READ_TOKEN = "ghs_mockreadtoken0003"
+WRITE_TOKEN = "mock-write-token-0002"
+READ_TOKEN = "mock-read-token-0003"
 EXTRAHEADER = f"http.https://{HOST}/.extraheader"
 
 

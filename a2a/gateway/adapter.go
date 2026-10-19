@@ -77,6 +77,13 @@ type InboundMessage struct {
 	// settles on the answer, and the ask keeps ⏸️. False on every backend
 	// but Slack.
 	Answer bool
+	// Unaddressed marks a message the sender did not address to the bot,
+	// delivered only because of where it was typed: today an unmentioned
+	// Slack reply under one of the bot's own posts (an alert, or another
+	// post it roots in the home channel), which is often people talking to each other. An unverified
+	// sender's such message is dropped without the public refusal notice,
+	// since they asked the bot nothing. False on every other path.
+	Unaddressed bool
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
@@ -176,6 +183,20 @@ type MarkObserver interface {
 // is taken: record and return.
 type VerifiedObserver interface {
 	InboundVerified(conversation, messageID string, verified bool)
+}
+
+// StatusShower is the optional extension an Adapter implements when its
+// backend shows a task's status itself, so the relay's rolling line ("⏳
+// submitted…" edited on to "✅ completed") would only repeat it. The Slack
+// adapter does, with Agent Sessions' Working… status, the ask's reaction and
+// the plan rows, as the today path shows no receipt either. With it true the
+// gateway posts no placeholder for a task, so the relay has no line to edit
+// and every line edit is skipped; the notices that stand on their own (the
+// queue notice, a publish failure, a failed or canceled task) still post.
+// Asked per conversation, so a wrapper (the mux, the side door) answers for
+// the backend that owns it.
+type StatusShower interface {
+	ShowsTaskStatus(conversation string) bool
 }
 
 // OutMessage is one post or edit as a value: the text, and the chat message

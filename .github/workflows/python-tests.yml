@@ -98,6 +98,17 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
+          cache: "pip"
+          # Keyed on both files the install step below reads: the test list
+          # and the console file it pulls in with -r. The install itself is
+          # the same command either way; a hit spares the wheel downloads,
+          # about a minute per job at the runner's egress. The key changes
+          # only when one of those files does, and the action saves nothing
+          # on a hit, so a release of one of the unpinned packages is fetched
+          # on every run until the next edit to either file refreshes the set.
+          cache-dependency-path: |
+            requirements-test.txt
+            admin_console/requirements.txt
 
       # Not for a Go suite -- k8s-operator-test.yml owns those. This job's
       # sweep includes tests/integration, and its injector seam
@@ -252,6 +263,17 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".agent-python-version"
+          cache: "pip"
+          # Keyed on both files the install step below reads: the test list
+          # and the console file it pulls in with -r. The install itself is
+          # the same command either way; a hit spares the wheel downloads,
+          # about a minute per job at the runner's egress. The key changes
+          # only when one of those files does, and the action saves nothing
+          # on a hit, so a release of one of the unpinned packages is fetched
+          # on every run until the next edit to either file refreshes the set.
+          cache-dependency-path: |
+            requirements-test.txt
+            admin_console/requirements.txt
 
       # Go and Helm for the same reason the coverage job installs them: the
       # injector seam and the chart-rendering suites skip silently without them.
