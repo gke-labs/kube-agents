@@ -2424,10 +2424,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # and the 16.4min fixed term extrapolate honestly, which is what the four
 # estimates before them did not.
 #
-# Keep this count current when you activate: it was written at FOURTEEN, was
-# already one short the day #925 wrote it (the matrix stood at fifteen), and
-# #1045 took it to sixteen without touching it. Recount the entries in
-# hack/eval/presubmit-cases.txt rather than incrementing what is here.
+# The counts above are as of the day each paragraph was written, and they
+# drifted (one was written at FOURTEEN when the matrix stood at fifteen).
+# Don't hand-maintain one here: each run logs its matrix as "Eval matrix: ..."
+# and `python3 scripts/eval_rosters.py --summary` counts the files (#3495).
 #
 # The budget has been raised three times to get here, all merged: oss-test-infra
 # #2667 took it 85m -> 150m off an estimate, #2669 took it 150m -> 240m off a
@@ -2556,6 +2556,10 @@ if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "Zero repetitions would run nothing and report green -- refusing." >&2
   exit 1
 fi
+# The matrix's size, computed (#3495). The roster files don't carry totals any
+# more, so this line is where a run's count is read; for the files themselves,
+# `python3 scripts/eval_rosters.py --summary`.
+echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(( ${#TASKS[@]} * EVAL_REPETITIONS )) unit(s)"
 
 # How far a judged mean may fall below main's before rung 6 fires. 0.5 is
 # arithmetic on the measured spread, not a preference: three repetitions of one

@@ -143,7 +143,9 @@ ADDED_AFTER_THE_MOVED_BLOCK = [
     "vcs-forge-cli-request-uses-the-verbs",
 ]
 # Registered after the moved block, in file order, by the pull request that
-# authored each case.
+# authored each case. Frozen with the nightly file's frozen part (#3495): a
+# case registered since goes in that file's sorted section, which
+# NightlySortedSectionTest holds by its properties, so nothing is appended here.
 ADDED_AFTER_THE_MOVE = [
     "obtainability-design-quota-vs-capacity",  # the two obtainability-journey probes, PR #1841
     "obtainability-window-planning-probe",
@@ -324,6 +326,54 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(eval_rosters.blocking_roster())
 
 
+class NightlySortedSectionTest(unittest.TestCase):
+    """The nightly file's last section, where new cases go (#3495).
+
+    Properties instead of a pinned list: a case pull request adds one line at
+    its place in case-id order, with its reason above it, and edits nothing a
+    second such pull request edits.
+    """
+
+    def setUp(self):
+        self.text = eval_rosters.NIGHTLY_CASES_FILE.read_text(encoding="utf-8")
+        self.frozen, self.sorted_section, self.tail = eval_rosters.split_nightly(self.text)
+
+    def test_the_section_is_in_case_id_order(self):
+        self.assertEqual(self.sorted_section, sorted(self.sorted_section))
+
+    def test_no_case_is_listed_twice(self):
+        everything = self.frozen + self.sorted_section
+        self.assertEqual(len(everything), len(set(everything)))
+
+    def test_every_case_in_the_section_has_its_reason_above_it(self):
+        # The parser keys a reason by its entry, here a ./tasks/<id>/task.yaml path.
+        reasons = {
+            eval_rosters.CASE_ENTRY_RE.match(entry).group(1): reason
+            for entry, reason in eval_rosters.parse_lane_exclusions(self.tail).items()
+            if eval_rosters.CASE_ENTRY_RE.match(entry)
+        }
+        for case in self.sorted_section:
+            with self.subTest(case=case):
+                self.assertTrue(reasons.get(case), "a # line directly above the entry says why it's here")
+
+    def test_the_marker_must_appear_exactly_once(self):
+        entry = "./tasks/a-case/task.yaml\n"
+        marker = eval_rosters.NIGHTLY_SORTED_SECTION_MARKER + " ──\n"
+        with self.assertRaises(ValueError):
+            eval_rosters.split_nightly(entry)
+        with self.assertRaises(ValueError):
+            eval_rosters.split_nightly(marker + entry + marker)
+        self.assertEqual(eval_rosters.split_nightly(entry + marker + "# why\n" + entry)[:2],
+                         (["a-case"], ["a-case"]))
+
+    def test_the_summary_counts_the_files(self):
+        got = eval_rosters.summary(repetitions=3)
+        matrix = len(eval_rosters.presubmit_cases()) + len(eval_rosters.nightly_cases())
+        self.assertEqual(got["nightly matrix cases"], matrix)
+        self.assertEqual(got["nightly matrix units"], matrix * 3)
+        self.assertEqual(got["nightly-only cases"], len(self.frozen) + len(self.sorted_section))
+
+
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [
@@ -366,6 +416,9 @@ class SplitLostNothingTest(unittest.TestCase):
         )
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
+        # The frozen part only: the sorted section below the marker is held by
+        # NightlySortedSectionTest (#3495).
+        frozen, _, _ = eval_rosters.split_nightly(eval_rosters.NIGHTLY_CASES_FILE.read_text(encoding="utf-8"))
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
         seated = {case for case, _ in HELD_OUT_IN_PRESUBMIT}
         expected = [
@@ -374,7 +427,7 @@ class SplitLostNothingTest(unittest.TestCase):
             if c not in promoted
         ]
         self.assertEqual(
-            eval_rosters.nightly_cases(),
+            frozen,
             with_insertions(
                 [
                     c
