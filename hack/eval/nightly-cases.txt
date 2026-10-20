@@ -1044,14 +1044,22 @@
 # merge.
 ./tasks/upgrades-fleet-readiness-retired-registry-image/task.yaml
 
-# Upgrade-failure catalogue entry 8 (a default changes in the new minor): the
-# seeded-defaults namespace on seeded-a, whose Pod Security Admission version
-# follows the running minor, read from the namespace labels or through the
-# readiness report's changed-defaults rule, graded on a declared line per such
-# namespace. deployer: noop; reads the moving-admission-default role, mutates
-# nothing. Nightly from its first merge; a presubmit seat is a later pull
-# request that cites its record.
-./tasks/upgrades-pod-security-latest-pinned-named/task.yaml
+# Upgrade-failure catalogue entry 8 through the readiness report's
+# changed-defaults rule: the seeded-defaults namespace on slot a (role
+# moving-admission-default) enforces baseline at enforce-version latest, so
+# its rule set follows the running minor; the report counts it in a note on
+# the fleet as it stands and names it as a risk when a crossed minor tightens
+# baseline, never as a blocker. Read-only chat prompt graded on declared lines
+# per seeded cluster (the three slot roles beside the planted one tell a
+# missed cluster from an absent one). Nightly from its first merge.
+./tasks/upgrades-readiness-changed-defaults/task.yaml
+
+# Catalogue entry 10 through the readiness report's client-addon-skew rule:
+# stale-kubectl-client on slot a (role stale-client-skew) runs kubectl v1.29.0
+# against a control plane several minors ahead, so the report names it as a
+# risk, never a blocker. Read-only chat prompt graded on the planted object's
+# declared line: its verdict and the rule's cell. Nightly from its first merge.
+./tasks/upgrades-readiness-client-addon-skew/task.yaml
 
 # Catalogue entry 13 through the readiness report's container-runtime rule:
 # node-runtime-probe on slot a mounts the containerd socket (role
@@ -1096,15 +1104,6 @@
 # first merge; a presubmit seat is a later pull request that cites its
 # record.
 ./tasks/upgrades-retired-registry-image-named/task.yaml
-
-# Upgrade-failure catalogue entry 10 (add-on and client skew): seeded-a's
-# stale-kubectl-client CronJob, a kubectl several minors outside the skew
-# window, read from the workload's image or through the readiness report's
-# client-addon-skew rule, graded on a declared line per such workload.
-# deployer: noop; reads the stale-client-skew role, mutates nothing. Nightly
-# from its first merge; a presubmit seat is a later pull request that cites
-# its record.
-./tasks/upgrades-stale-client-skew-named/task.yaml
 
 # Catalogue entry 3 (every replica in one zone or on one node), in the shape
 # the seeded fleet plants it: zone-pinned-api in seeded-topology on

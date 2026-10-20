@@ -9736,6 +9736,7 @@ _SURGE_CASE = "upgrades-readiness-surge-capacity"
 _DATAPLANE_CASE = "upgrades-readiness-legacy-dataplane"
 _CONTAINERD_CASE = "upgrades-readiness-containerd-socket"
 _INTREE_CASE = "upgrades-readiness-intree-volume"
+_DEFAULTS_CASE = "upgrades-readiness-changed-defaults"
 _SLOT_NAMES = dict(zip(_SLOT_LETTERS, _SLOTS))
 _SURGE_CELL = (
     "surge-capacity: pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node(s), not autoscaled) removes a node before its replacement exists; "
@@ -9760,6 +9761,17 @@ _CONTAINERD_RISK_CELL = (
 _INTREE_CELL = (
     "in-tree-volumes: PersistentVolume intree-pd (in-tree gcePersistentDisk seeded-a-intree-pd, claim seeded-shapes/intree-pd, Bound) "
     "attaches through CSI migration for Deployment seeded-shapes/intree-pd-reader; move it to pd.csi.storage.gke.io"
+)
+# The changed-defaults rule's three forms for the planted namespace: the note on the fleet as it
+# stands (no crossed minor changes a baseline check), the note for a crossed minor that only
+# widens the allowlist, and the risk for one that tightens it. The counts and minors are the
+# fleet's; the case's pattern stops before them.
+_DEFAULTS_NOTE_CELL = "changed-defaults: 1 namespace follows latest with no enforced check changing between 1.35 and 1.36 per the table"
+_DEFAULTS_LOOSENS_CELL = "changed-defaults: seeded-defaults follows latest; 1.37 only widens the baseline allowlist, which rejects nothing new"
+_DEFAULTS_RISK_CELL = (
+    "changed-defaults: namespace seeded-defaults: pod-security.kubernetes.io/enforce=baseline, pod-security.kubernetes.io/enforce-version=latest: "
+    "follows the running minor, so the enforced baseline rule set changes at 1.34; 1.34: the host field of probes and lifecycle hooks must be unset "
+    "(https://kubernetes.io/docs/concepts/security/pod-security-standards/)"
 )
 _CELL_WRAPS = ("{cell}", '"{cell}"', "'{cell}'", "\u201c{cell}\u201d", "<{cell}>", "`{cell}`")
 
@@ -9803,6 +9815,16 @@ def _containerd_report(cell: str = _CONTAINERD_NOTE_LINE, blocks: str = "no") ->
     return "\n".join(lines)
 
 
+def _defaults_report(cell: str = _DEFAULTS_NOTE_CELL, grade: str = "note", count: str = "1", rule: str = "changed-defaults") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "a":
+            lines.append(f"{cluster}: kind Cluster; namespaces whose pod security version follows the running minor: {count}; readiness rule: {rule}; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: kind Cluster; namespaces whose pod security version follows the running minor: 0; readiness rule: none; graded as: none; cell: none")
+    return "\n".join(lines)
+
+
 def _intree_report(cell: str = _INTREE_CELL, addon: str = "on", blocks: str = "no") -> str:
     lines = [f"{_SLOT_NAMES['a']}/intree-pd: kind PersistentVolume; pd csi driver add-on: {addon}; blocks the upgrade: {blocks}; cell: {cell}"]
     lines += [f"{cluster}: no in-tree volumes" for letter, cluster in _SLOT_NAMES.items() if letter != "a"]
@@ -9833,6 +9855,16 @@ _GROUP_CASE_REPORTS = {
         ("the-planted-volume-is-named-with-the-addon-on-and-does-not-block", "the-planted-volumes-line-quotes-the-reports-cell"),
         lambda wrap: _intree_report(wrap.format(cell=_INTREE_CELL)),
     ),
+    _DEFAULTS_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-planted-clusters-line-counts-the-namespace",
+            "the-planted-clusters-line-names-the-reports-rule",
+            "the-planted-clusters-line-does-not-block",
+            "the-planted-clusters-line-quotes-the-reports-cell",
+        ),
+        lambda wrap: _defaults_report(wrap.format(cell=_DEFAULTS_NOTE_CELL)),
+    ),
 }
 
 
@@ -9845,6 +9877,14 @@ def test_rule_cases_accept_the_cell_however_the_agent_wrapped_it(case, objective
 @pytest.mark.parametrize("wrap", _CELL_WRAPS)
 def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_changes_major(wrap):
     assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=_CONTAINERD_RISK_CELL)))
+
+
+@pytest.mark.parametrize("cell,grade", [(_DEFAULTS_LOOSENS_CELL, "note"), (_DEFAULTS_RISK_CELL, "risk")])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_defaults_case_accepts_the_rules_other_forms_on_a_fleet_that_crosses_a_baseline_change(cell, grade, wrap):
+    report = _defaults_report(wrap.format(cell=cell), grade=grade)
+    assert _case_grades(_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", report)
+    assert _case_grades(_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", report)
 
 
 @pytest.mark.parametrize(
@@ -9875,6 +9915,18 @@ def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_chang
         (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _without_cell_slot(_dataplane_report())),
         (_CONTAINERD_CASE, "the-planted-agent-is-named-and-does-not-block", _without_cell_slot(_containerd_report())),
         (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _without_cell_slot(_intree_report())),
+        # The changed-defaults case: a missing or foreign cell, a blocker or `none` grade, a rule the
+        # report did not name, a count that denies the namespace, and the frame without the cell slot.
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report("none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report('"changed-defaults: something else"')),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_DATAPLANE_NOTE_LINE)),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _defaults_report(grade="blocker")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _defaults_report(grade="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-names-the-reports-rule", _defaults_report(rule="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-counts-the-namespace", _defaults_report(count="0")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-counts-the-namespace", _defaults_report(count="none")),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _without_cell_slot(_defaults_report())),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _without_cell_slot(_defaults_report())),
     ],
 )
 def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
@@ -9883,7 +9935,7 @@ def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
 
 
 
-# The workload-rule cases for catalogue entries 4, 12, 14, 15, 17, 18 and 20
+# The workload-rule cases for catalogue entries 4, 10, 12, 14, 15, 17, 18 and 20
 # grade the planted object's declared line on two slots: its verdict and the
 # cell the report printed for it, wording only the rule produces. The cell
 # carries a `;`, so a wrap the agent kept around it survives `_VALUE_WRAP`, and
@@ -9942,6 +9994,15 @@ _WORKLOAD_RULE_CASES = {
         "retired-registry: Deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s.gcr.io/pause:3.9 from k8s.gcr.io "
         "(frozen 2023-04-03, a redirect to registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host that stopped publishing; "
         "pool(s) default-pool are below the target and are rebuilt in this upgrade",
+    ),
+    # Entry 10 through the same frame (scripts/test_audit_rules.py asserts the cell); the gap and
+    # the target are the fleet's, so the case's pattern stops after the image.
+    "upgrades-readiness-client-addon-skew": (
+        "stale-kubectl-client",
+        "cronjob",
+        "client-addon-skew",
+        "client-addon-skew: kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0): "
+        "7 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver (https://kubernetes.io/releases/version-skew-policy/#kubectl)",
     ),
 }
 # The other grades the same rules print for the same objects on another fleet
