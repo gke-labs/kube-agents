@@ -370,6 +370,17 @@ The token, and the paths of the token file and the CA file, are never recorded.
 the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag. With
 github.com, it refuses both.
 
+`GITLAB_READ_TOKEN_FILE`, in `install.env` or the environment, is the optional path to a file that
+holds a read-only GitLab token. The broker presents this token only to clone private context
+repositories, never on a write. `install.sh` writes it into the `GITLAB_TOKEN_SECRET` Secret under
+the key `read-token`, beside `token`, and does not record the path. Set it only for the run that
+stores or replaces the read token, then remove it: a run with it set applies the file again, over a
+token rotated since, and stops when the file is gone. A later run without the key keeps the stored
+read token: the installer writes each key with its own server-side-apply field
+manager, so the write-token apply never removes `read-token`. Use a GitLab project or group access
+token with the Reporter role and only the `read_repository` scope, on the GitOps forge's host
+(gitlab.com or self-managed). On GitHub, `install.sh` refuses the key.
+
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
 - A run that you decline, or that ends with `--generate-only`, does not change them in an existing

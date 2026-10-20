@@ -335,6 +335,7 @@ fixtures:
     slot: a
     available_from_day: 0
     objects:
+      - namespace/seeded-defaults
       - deployment/baseline-edge-worker
     namespace: seeded-defaults
     defect: >-

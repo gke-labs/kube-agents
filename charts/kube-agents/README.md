@@ -923,7 +923,8 @@ the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, 
 have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
 `platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
-pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
+pod is multiplied by `platformAgent.deployment.availability.replicas` (an over-count above one,
+since the operator runs the gateway as a single replica whatever the value); the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
@@ -974,8 +975,9 @@ sizes for is the largest one in the release that a rollout actually creates: rol
 per-workload, so room for one at a time is enough. The shell sandbox's StatefulSet and the
 pre-delete cleanup Job never surge, and neither does the agent pod at the default
 `platformAgent.deployment.availability.replicas` of one, where the operator rolls the
-gateway Deployment with `strategy: Recreate` — it counts only from two replicas up, where
-the strategy becomes `RollingUpdate`.
+gateway Deployment with `strategy: Recreate`. The check counts an agent-pod surge from two
+replicas up, which the operator no longer renders: it runs the gateway as a single replica
+under `Recreate` at any value, so that surge is an over-count.
 
 **Where it is silent, and where it is not.** The check needs a cluster to query, so it
 does nothing under `helm template` and nothing in a namespace with no ResourceQuota — a

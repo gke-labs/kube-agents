@@ -786,6 +786,25 @@ class TasksBudgetSizingTest(unittest.TestCase):
         default = int(consts["EVAL_TASK_PARALLELISM_DEFAULT"])
         self.assertLessEqual(expected[default] * per_session + fixed + per_worker * default, floor)
 
+    def test_the_next_lane_turns_the_audits_automatic_sweep_off_at_install(self) -> None:
+        """#3439: the lane's write safeguard charges any pull request in a repetition's
+        window to the case in flight, and the fleet audits' sweep opens one on every
+        fresh install once the pool repositories declare checkout-gateway. The switch
+        rides the install's own helm args, gated on EVAL_MODE_NEXT=1, so the today
+        lane's release is unchanged; the operator forwards the name to the shell
+        sandbox and audit_report.py reads it (pinned across the three files)."""
+        script = _CI_DEPLOY.read_text()
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.S)
+        self.assertIsNotNone(block, "MODE_NEXT_ENV_ARGS is not filled under EVAL_MODE_NEXT=1")
+        assert block is not None
+        self.assertIn('--set-string "platformAgent.deployment.env[2].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[2].value=false"', block.group(1))
+        self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
+        root = _CI_DEPLOY.parent.parent
+        self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
+        self.assertIn("KUBEAGENTS_AUDIT_AUTO_PROMOTE", (root / "deploy/sandbox/entrypoint.sh").read_text())
+        self.assertIn('AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "agents/platform/skills/fleet-audit/scripts/audit_report.py").read_text())
+
     def test_the_first_change_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
         consts = constants()
         values = json.loads(consts["MODE_NEXT_HELM_VALUES_FORMAT"] % 6)
