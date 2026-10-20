@@ -24,6 +24,7 @@ from readiness_rules import (
     CONTEXT_AT,
     CONTEXT_CLUSTER_NAME,
     CONTEXT_LOCATION,
+    HOLDS_BOTH,
     OPERATION_NAME_KEY,
     OPERATION_START_KEY,
     OPERATION_STATUS_KEY,
@@ -42,6 +43,7 @@ from readiness_rules import (
 RULE_ID = "cluster-status-age"
 ENTRY = 5
 CAN_BLOCK = True
+HOLDS = HOLDS_BOTH  # a held cluster takes no change: neither move goes through
 
 STATUS_RUNNING = "RUNNING"
 STATUS_KEY = "status"

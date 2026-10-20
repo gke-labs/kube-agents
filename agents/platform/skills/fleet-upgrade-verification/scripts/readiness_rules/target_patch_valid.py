@@ -26,6 +26,7 @@ import re
 from readiness_rules import (
     CONTEXT_LOCATION,
     CONTEXT_TARGET_TEXT,
+    HOLDS_BOTH,
     LOCATION_READ_SERVER_CONFIG,
     new_result,
     project_read,
@@ -34,6 +35,7 @@ from readiness_rules import (
 RULE_ID = "target-patch-valid"
 ENTRY = 10
 CAN_BLOCK = True
+HOLDS = HOLDS_BOTH  # a withdrawn patch is no target for the control plane or a pool
 
 # The server config's fields and the cluster record's channel.
 CHANNELS_KEY = "channels"

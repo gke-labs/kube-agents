@@ -411,11 +411,14 @@ EXTRA_RULES = [
 RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
 # What the fold stamps on a finding: the rule's id and entry on every one, the rule's own
 # rendering (`text`) on a blocker or risk and on an `unknown` entry (the note line), the
-# `reason` an `unknown` entry carries, and whether the rule could have blocked, which is
-# what decides whether its `unknown` moves the verdict.
+# `reason` an `unknown` entry carries, whether the rule could have blocked, which is
+# what decides whether its `unknown` moves the verdict, and on a blocker the moves the
+# rule's mechanism holds (`holds`, from the module's `HOLDS`; absent when the module
+# declares none, which the Monday audit's join reads as both).
 RULE_KEY = "rule"
 ENTRY_KEY = "entry"
 TEXT_KEY = "text"
+HOLDS_KEY = "holds"
 REASON_KEY = "reason"
 DETAIL_KEY = "detail"
 CAN_BLOCK_KEY = "can_block"
@@ -427,6 +430,7 @@ TIER_KEY = "tier"
 RULE_ID_ATTRIBUTE = "RULE_ID"
 ENTRY_ATTRIBUTE = "ENTRY"
 CAN_BLOCK_ATTRIBUTE = "CAN_BLOCK"
+HOLDS_ATTRIBUTE = "HOLDS"
 # What names a rule that has no RULE_ID (it is keyed and evaluated under this name) or one
 # whose attributes fail the check below (its unknown entry carries this name).
 MODULE_NAME_ATTRIBUTE = "__name__"
@@ -446,6 +450,7 @@ RULE_ATTRIBUTES_RAISED_REASON = "reading the module's attributes raised {error};
 EXPECTED_STRING = "a string"
 EXPECTED_BOOL = "a bool"
 EXPECTED_JSON = "a JSON value"
+EXPECTED_HOLDS = "a non-empty tuple of " + " or ".join(readiness_rules.HOLDS_VALUES)
 # A rule that declares it cannot block and files a blocker anyway: the finding is kept as
 # a risk, and the note says so, so the invariant holds and the defect is visible.
 DEMOTED_BLOCKER_NOTE = "filed a blocker but declares CAN_BLOCK False; reported as a risk"
@@ -1402,11 +1407,12 @@ def _unknown_entry(item, rule_id: str, entry, can_block: bool) -> dict:
     return out
 
 
-def _rule_result(rule, rule_id: str, entry, can_block: bool, cluster: dict, member: dict, read, target, context: dict) -> dict:
+def _rule_result(rule, rule_id: str, entry, can_block: bool, holds, cluster: dict, member: dict, read, target, context: dict) -> dict:
     """One rule's result checked against the contract and in the form the fold emits: every
     key a list, every blocker and risk a dict copied before it is stamped (so a rule's own
     objects are never changed or re-attributed) carrying a one-line string `text` (the
-    rule's `describe`, unless the rule set it), its `rule` and `entry`, every note a string
+    rule's `describe`, unless the rule set it), its `rule` and `entry` (and, on a blocker,
+    `holds` when the module declares `HOLDS`), every note a string
     prefixed with the rule's id, a blocker from a rule that cannot block kept as a risk with
     a note, every `unknown` entry in the dict form `_unknown_entry` gives, and the whole, as
     it will be written, a JSON value; and the audit-log cache, the one thing the report reads
@@ -1453,6 +1459,8 @@ def _rule_result(rule, rule_id: str, entry, can_block: bool, cluster: dict, memb
             finding[TEXT_KEY] = readiness_rules.one_line(finding[TEXT_KEY])
             finding[RULE_KEY] = rule_id
             finding[ENTRY_KEY] = entry
+            if kind == "blocking" and holds is not None:
+                finding[HOLDS_KEY] = list(holds)
             stamped.append(finding)
         out[kind] = stamped
     for note in out["notes"]:
@@ -1504,31 +1512,39 @@ def _failed_result(reason: str, rule_id: str, entry, can_block: bool) -> dict:
     return result
 
 
-def _rule_attributes(rule) -> tuple[str, object, bool, str | None]:
-    """The module's `RULE_ID`, `ENTRY` and `CAN_BLOCK`, read and checked before anything is
-    derived from them: the id a string (returned as a plain `str`), the entry a JSON value,
-    `CAN_BLOCK` a bool. The fourth value is None, or the reason the module is not evaluated;
-    then the id is the module's name, the entry None and `can_block` True, the conservative
+def _holds_declared(holds) -> bool:
+    """Whether a module's `HOLDS` is a non-empty tuple or list of the moves the contract names."""
+    return isinstance(holds, (tuple, list)) and bool(holds) and all(isinstance(move, str) and move in readiness_rules.HOLDS_VALUES for move in holds)
+
+
+def _rule_attributes(rule) -> tuple[str, object, bool, tuple | None, str | None]:
+    """The module's `RULE_ID`, `ENTRY`, `CAN_BLOCK` and `HOLDS`, read and checked before anything
+    is derived from them: the id a string (returned as a plain `str`), the entry a JSON value,
+    `CAN_BLOCK` a bool, `HOLDS` absent (None) or a non-empty tuple of the moves the contract
+    names. The fifth value is None, or the reason the module is not evaluated; then the id is
+    the module's name, the entry None, `can_block` True and `holds` None, the conservative
     reading."""
     name = str(getattr(rule, MODULE_NAME_ATTRIBUTE, rule))
     rule_id = getattr(rule, RULE_ID_ATTRIBUTE, name)
     entry = getattr(rule, ENTRY_ATTRIBUTE, None)
     can_block = getattr(rule, CAN_BLOCK_ATTRIBUTE, True)
+    holds = getattr(rule, HOLDS_ATTRIBUTE, None)
     checks = (
         (RULE_ID_ATTRIBUTE, rule_id, EXPECTED_STRING, isinstance(rule_id, str)),
         (CAN_BLOCK_ATTRIBUTE, can_block, EXPECTED_BOOL, isinstance(can_block, bool)),
         (ENTRY_ATTRIBUTE, entry, EXPECTED_JSON, _is_json(entry)),
+        (HOLDS_ATTRIBUTE, holds, EXPECTED_HOLDS, holds is None or _holds_declared(holds)),
     )
-    for attribute, value, expected, holds in checks:
-        if not holds:
-            return name, None, True, RULE_ATTRIBUTE_REASON.format(attribute=attribute, type=type(value).__name__, expected=expected)
+    for attribute, value, expected, passes in checks:
+        if not passes:
+            return name, None, True, None, RULE_ATTRIBUTE_REASON.format(attribute=attribute, type=type(value).__name__, expected=expected)
     if not rule_id.strip():  # a blank id would key `rules` and print as nothing in every cell and note
-        return name, None, True, RULE_ID_BLANK_REASON
+        return name, None, True, None, RULE_ID_BLANK_REASON
     # A plain `str`, whatever subclass the module declared: the id keys `rules` and formats the
     # notes after the fold's guard closes, so a subclass whose `__hash__` raises would leave
     # the fold there. `str()` runs the subclass's `__str__`, inside the guard; one that raises
     # is the module's defect like any other attribute read.
-    return str(rule_id), entry, can_block, None
+    return str(rule_id), entry, can_block, None if holds is None else tuple(holds), None
 
 
 def _is_json(value) -> bool:
@@ -1590,9 +1606,9 @@ def evaluate_extra_rules(cluster: dict, member: dict, read, target, context: dic
         # attribute reads have not returned.
         rule_id = None
         try:
-            rule_id, entry, can_block, defect = _rule_attributes(rule)
+            rule_id, entry, can_block, holds, defect = _rule_attributes(rule)
             if defect is None and rule_id not in folded["rules"]:
-                result = _rule_result(rule, rule_id, entry, can_block, cluster, member, read, target, context)
+                result = _rule_result(rule, rule_id, entry, can_block, holds, cluster, member, read, target, context)
         except readiness_rules.NOT_A_RULE_DEFECT:
             raise
         except RuleDefect as e:  # the fold's own probe refused the result, or the cache the rule left: named as that defect, the rule having returned

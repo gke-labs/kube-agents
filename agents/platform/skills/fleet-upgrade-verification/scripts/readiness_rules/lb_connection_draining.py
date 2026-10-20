@@ -26,6 +26,7 @@ pods on any pool.
 import json
 
 from readiness_rules import (
+    HOLDS_NODE_POOL,
     PATH_SEPARATOR,
     PROJECT_READ_BACKEND_SERVICES,
     new_result,
@@ -35,6 +36,7 @@ from readiness_rules import (
 RULE_ID = "lb-connection-draining"
 ENTRY = 21
 CAN_BLOCK = True
+HOLDS = (HOLDS_NODE_POOL,)  # the drain holds a node's removal; a control-plane move removes none
 
 # GKE's per-node deregistration wait during a pool upgrade: the longest it waits for a backend
 # service's connection draining before it deletes the node.

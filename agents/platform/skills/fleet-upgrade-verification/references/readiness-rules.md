@@ -19,6 +19,13 @@ project-level inventory.
 | `lb-connection-draining`        | Entry 21: a backend service whose connection drain outlasts the node's deregistration wait | blocker | `gcloud compute backend-services list` once per project: each backend on the member's `nodePools[].instanceGroupUrls` or on a NEG its Services annotate, with `connectionDraining.drainingTimeoutSec` above 600                                                                                                                                                                  | `gcloud compute backend-services update <name> --global\|--region <region> --connection-draining-timeout=600`.                                                                                 |
 | `orphan-node-objects`           | Entry 22: a Node object that outlives its virtual machine                                  | blocker | `gcloud compute instances list` once per project against the member's Nodes (`spec.providerID`'s zone and instance name); a `Ready`, uncordoned Node the list predates is a note naming the list's read time, not a blocker; the note counts nodes against instances on every member                                                                                             | `kubectl delete node <name>`.                                                                                                                                                                  |
 
+A blocking rule declares what its mechanism holds (`HOLDS`): a control-plane move, a node-pool
+move, or both. The fold stamps it on each `rule_blocking` row as `holds`, and the Monday audit's
+`upgrade-blocked` check counts the block for the move the cluster's lag makes due:
+`lb-connection-draining` and `orphan-node-objects` hold a node's removal and do not count where
+the control plane alone is due, as a budget does not; `cluster-status-age` and
+`target-patch-valid` hold both moves.
+
 A failed project or location read is an error row under the table (exit 1), and the rules that
 need it say `unknown`; a rule that can block then leaves the member `unknown`, one that cannot
 is reported in the note. The three list reads are projected to the fields the rules use, so a

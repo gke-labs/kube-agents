@@ -1150,3 +1150,5 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
 class RegistryOrderTest(unittest.TestCase):
     def test_the_incident_rules_are_registered_by_entry(self):
         self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix", "zonal-control-plane", "lb-connection-draining", "orphan-node-objects"])
+        # Every blocking rule says what its mechanism holds; the node-removal rules hold the pool move alone.
+        self.assertEqual({m.RULE_ID: m.HOLDS for m in r.EXTRA_RULES if m.CAN_BLOCK}, {"cluster-status-age": shared.HOLDS_BOTH, "target-patch-valid": shared.HOLDS_BOTH, "lb-connection-draining": (shared.HOLDS_NODE_POOL,), "orphan-node-objects": (shared.HOLDS_NODE_POOL,)})

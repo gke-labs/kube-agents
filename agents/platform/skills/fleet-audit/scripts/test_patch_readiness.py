@@ -1732,14 +1732,23 @@ class UpgradeBlockedTest(unittest.TestCase):
     DRAIN_RULE = {
         "rule": "lb-connection-draining",
         "entry": 21,
+        "holds": ["node-pool"],
         "backend_service": "drain-timeout-seeded-b",
         "text": "BackendService drain-timeout-seeded-b drains for 3600 s on pool default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out; set the timeout at or under the wait: `gcloud compute backend-services update drain-timeout-seeded-b --global --connection-draining-timeout=600`",
     }
     ORPHAN_RULE = {
         "rule": "orphan-node-objects",
         "entry": 22,
+        "holds": ["node-pool"],
         "node": "gke-lag-default-pool-aaaa-ghost",
         "text": "Node gke-lag-default-pool-aaaa-ghost names no instance in the project (providerID gce://acme/us-central1-a/gke-lag-default-pool-aaaa-ghost; Ready=Unknown; unschedulable=true): a pool upgrade waits on it; delete the Node object: `kubectl delete node gke-lag-default-pool-aaaa-ghost`",
+    }
+
+    STATUS_RULE = {
+        "rule": "cluster-status-age",
+        "entry": 5,
+        "holds": ["cluster", "node-pool"],
+        "text": "lag has been RECONCILING for 6d 3h on operation-1 (UPDATE_CLUSTER, RUNNING since 2026-10-14T00:00:00Z), past the 4h threshold; freeze changes",
     }
 
     def member_with_rules(self, name, rules, **kwargs):
@@ -1811,6 +1820,32 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertLessEqual(len(hit["impact"]), pr.IMPACT_MAX_CHARS)
         self.assertIn("1 readiness rule block(s), listed in the readiness report at", hit["excerpt"])
         self.assertIn("1 readiness rule block(s), listed in the readiness report at", hit["impact"])
+
+    def test_a_rules_block_counts_only_for_the_move_its_mechanism_holds(self):
+        """A pool ahead of its control plane: the control plane's move is due,
+        which removes no node, so a rule that holds node removal cannot hold
+        it, as a budget cannot; the check ran clean. A rule that holds both
+        moves counts, as does a row from a reporter too old to say."""
+        ahead = cluster(name="ahead", master=self.CURRENT, node_pools=[pool("default-pool", "1.31.0-gke.1")])
+        entry = self.collect([ahead], [self.member_with_rules("ahead", [self.DRAIN_RULE, self.ORPHAN_RULE])])["ahead"]
+        self.assertIn("pool-skew", {c["check"] for c in entry["candidates"]})
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+        entry = self.collect([ahead], [self.member_with_rules("ahead", [self.DRAIN_RULE, self.STATUS_RULE])])["ahead"]
+        hit = next(c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertIn("readiness rule cluster-status-age blocks it", hit["excerpt"])
+        self.assertNotIn("lb-connection-draining", hit["excerpt"])
+        legacy = {k: v for k, v in self.DRAIN_RULE.items() if k != "holds"}
+        entry = self.collect([ahead], [self.member_with_rules("ahead", [legacy])])["ahead"]
+        self.assertTrue(any(c["check"] == pr.UPGRADE_BLOCKED_CHECK for c in entry["candidates"]))
+        # A behind control plane makes both moves due: the node-pool rule counts there.
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_rules("lag", [self.DRAIN_RULE])])["lag"]
+        self.assertTrue(any(c["check"] == pr.UPGRADE_BLOCKED_CHECK for c in entry["candidates"]))
+        self.assertEqual((pr._due_moves(pr.LAG_POOL_AHEAD), pr._due_moves(pr.LAG_POOL_ONLY), pr._due_moves(pr.LAG_POOL_MAJOR), pr._due_moves(pr.LAG_BEHIND), pr._due_moves(pr.LAG_PATCH)), ((pr.HOLDS_CLUSTER,), (pr.HOLDS_NODE_POOL,), (pr.HOLDS_NODE_POOL,), pr.HOLDS_BOTH, pr.HOLDS_BOTH))
+        readiness = {"status": "blocked", "pdbs": {"blocking": []}, "skew": {"blocking": []}, "rule_blocking": [self.DRAIN_RULE]}
+        self.assertIsNone(pr._readiness_cause(readiness, budget_applies=False, moves=(pr.HOLDS_CLUSTER,)))
+        self.assertEqual(pr._readiness_cause(readiness, moves=(pr.HOLDS_NODE_POOL,)).rules, [("lb-connection-draining", self.DRAIN_RULE["text"])])
 
     def test_rule_rows_without_a_rule_id_are_not_a_cause(self):
         readiness = {"status": "blocked", "pdbs": {"blocking": []}, "skew": {"blocking": []}, "rule_blocking": ["junk", {"text": "no id"}, {"rule": "", "text": "blank"}]}

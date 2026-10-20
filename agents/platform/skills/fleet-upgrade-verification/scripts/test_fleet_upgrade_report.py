@@ -2423,7 +2423,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("| p1 | seeded-b | us-central1-a | none |", text)
         # The ghost node, read through the jsonpath template with its providerID, blocks the member.
         self.assertEqual(a["status"], "blocked")
-        self.assertEqual([(f["rule"], f["node"], f["ready"], f["unschedulable"]) for f in a["rule_blocking"]], [("orphan-node-objects", "gke-seeded-a-default-pool-aaaa-ghost", "Unknown", True)])
+        self.assertEqual([(f["rule"], f["node"], f["ready"], f["unschedulable"], f["holds"]) for f in a["rule_blocking"]], [("orphan-node-objects", "gke-seeded-a-default-pool-aaaa-ghost", "Unknown", True, ["node-pool"])])
         self.assertIn("| orphan-node-objects: Node gke-seeded-a-default-pool-aaaa-ghost names no instance in the project (providerID gce://p1/us-central1-a/gke-seeded-a-default-pool-aaaa-ghost; Ready=Unknown; unschedulable=true)", text)
         self.assertIn("orphan-node-objects: 1 orphan Node(s) (2 nodes, 1 instances in the project)", a["note"])
 

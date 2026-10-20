@@ -349,6 +349,15 @@ UPGRADE_BLOCKED_RULE_CAUSE_FORMAT = "readiness rule {rule} blocks it: {text}"
 READINESS_RULE_BLOCKING_KEY = "rule_blocking"
 RULE_ROW_RULE_KEY = "rule"
 RULE_ROW_TEXT_KEY = "text"
+# What the rule's mechanism holds, as the fold stamps it on the row (`holds`, a list of the
+# reporter's readiness_rules.HOLDS_VALUES): the control-plane move, the node-pool move, or
+# both. A block counts for a lag only when it holds a move that lag makes due, as a budget
+# counts only where a node is drained; a row with no `holds` (a reporter older than the
+# stamp) counts on every lag.
+RULE_ROW_HOLDS_KEY = "holds"
+HOLDS_CLUSTER = "cluster"
+HOLDS_NODE_POOL = "node-pool"
+HOLDS_BOTH = (HOLDS_CLUSTER, HOLDS_NODE_POOL)
 # Joins the clauses of one cause: every blocking budget, with the skew clause
 # before them when both block.
 CAUSE_SEPARATOR = "; "
@@ -1367,15 +1376,23 @@ class Cause(NamedTuple):
     rules: list[tuple[str, str]]
 
 
-def _rule_blocks(readiness: dict) -> list[tuple[str, str]]:
-    """`(rule id, text)` for each of the reporter's `rule_blocking` rows, in
-    the registry's order; a row that is not a dict or carries no rule id is
-    not one of them."""
+def _holds_a_move(row: dict, moves) -> bool:
+    """Whether the row's rule holds one of `moves`; a row that declares no `holds` holds both."""
+    holds = row.get(RULE_ROW_HOLDS_KEY)
+    if not isinstance(holds, list) or not holds:
+        return True
+    return any(move in holds for move in moves)
+
+
+def _rule_blocks(readiness: dict, moves=HOLDS_BOTH) -> list[tuple[str, str]]:
+    """`(rule id, text)` for each of the reporter's `rule_blocking` rows whose
+    rule holds one of `moves`, in the registry's order; a row that is not a
+    dict or carries no rule id is not one of them."""
     rows = readiness.get(READINESS_RULE_BLOCKING_KEY) or []
-    return [(str(row[RULE_ROW_RULE_KEY]), str(row.get(RULE_ROW_TEXT_KEY) or "")) for row in rows if isinstance(row, dict) and row.get(RULE_ROW_RULE_KEY)]
+    return [(str(row[RULE_ROW_RULE_KEY]), str(row.get(RULE_ROW_TEXT_KEY) or "")) for row in rows if isinstance(row, dict) and row.get(RULE_ROW_RULE_KEY) and _holds_a_move(row, moves)]
 
 
-def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True) -> Cause | None:
+def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_applies: bool = True, moves=HOLDS_BOTH) -> Cause | None:
     """Why the reporter graded a member blocked, in the forms 3.11 flags; None
     for a block that rests on a maintenance exclusion alone, which is 3.8's
     subject and neither a held drain nor a refused move, and None when nothing
@@ -1386,13 +1403,15 @@ def _readiness_cause(readiness: dict, *, budget_applies: bool = True, skew_appli
     causes can block the upgrade that is due: a control-plane move drains no
     node, so a budget cannot hold it (`budget_applies=False`); a pool moving
     toward its control plane is what closes a skew, so the ceiling does not
-    refuse it (`skew_applies=False`). A readiness rule's block applies on
-    every lag: the rule graded the upgrade the reporter was asked about, and
-    its text says what stops it, so the row's `rule_blocking` entries are a
-    cause whatever the lag, named after the ceiling and before the budgets."""
+    refuse it (`skew_applies=False`); a readiness rule's block counts when
+    its mechanism holds one of `moves`, the moves the lag makes due (a rule
+    that holds a node's removal, like a budget, cannot hold a control-plane
+    move), and its text says what stops it, so the row's `rule_blocking`
+    entries that hold are a cause, named after the ceiling and before the
+    budgets."""
     pdbs = [p for p in (readiness.get("pdbs") or {}).get("blocking") or [] if isinstance(p, dict)] if budget_applies else []
     pools = [str(p) for p in ((readiness.get("skew") or {}).get("blocking") or [])] if skew_applies else []
-    rules = _rule_blocks(readiness)
+    rules = _rule_blocks(readiness, moves)
     if not pdbs and not pools and not rules:
         return None
     # Every blocking budget, in name order: the reporter lists them in the
@@ -1499,6 +1518,17 @@ def _applicable_causes(lag: str) -> tuple[bool, bool]:
     return lag != LAG_POOL_AHEAD, lag not in (LAG_POOL_ONLY, LAG_POOL_MAJOR)
 
 
+def _due_moves(lag: str) -> tuple[str, ...]:
+    """The moves the lag makes due, which a readiness rule's block has to hold to
+    count: the control plane's alone when a pool is ahead of it, the pool's alone
+    when a pool is behind a current control plane, both otherwise."""
+    if lag == LAG_POOL_AHEAD:
+        return (HOLDS_CLUSTER,)
+    if lag in (LAG_POOL_ONLY, LAG_POOL_MAJOR):
+        return (HOLDS_NODE_POOL,)
+    return HOLDS_BOTH
+
+
 class Due(NamedTuple):
     """What 3.11 knows about a cluster before the reporter runs, computed once
     per entry by `_due` and read by every arm that disposes of the check: the
@@ -1510,6 +1540,7 @@ class Due(NamedTuple):
     lag: str
     budget_applies: bool
     skew_applies: bool
+    moves: tuple
 
 
 def _due(entry: dict) -> Due:
@@ -1523,7 +1554,7 @@ def _due(entry: dict) -> Due:
     behind = judged and _is_behind(entry)
     lag = _lag_phrase(entry) if behind else LAG_BEHIND
     budget_applies, skew_applies = _applicable_causes(lag)
-    return Due(judged, behind, lag, budget_applies, skew_applies)
+    return Due(judged, behind, lag, budget_applies, skew_applies, _due_moves(lag))
 
 
 def _lag_phrase(entry: dict) -> str:
@@ -1555,7 +1586,7 @@ def _upgrade_blocked_hit(entry: dict, member: dict, report_path: str, due: Due) 
     readiness = member.get("readiness") or {}
     if readiness.get("status") != READINESS_BLOCKED:
         return None
-    cause = _readiness_cause(readiness, budget_applies=due.budget_applies, skew_applies=due.skew_applies)
+    cause = _readiness_cause(readiness, budget_applies=due.budget_applies, skew_applies=due.skew_applies, moves=due.moves)
     if cause is None:
         return None
     return {
@@ -1907,9 +1938,10 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         # A readiness rule's block (`rule_blocking`: a load balancer draining
         # longer than GKE waits per node, a Node whose instance is gone, a
         # cluster held by an operation, a withdrawn target patch) is as
-        # definite as a budget's or the ceiling's, on every lag: blocked beats
-        # unknown here too, so a failed budget read beside it is no gap.
-        rule_blocked = readiness.get("status") == READINESS_BLOCKED and bool(_rule_blocks(readiness))
+        # definite as a budget's or the ceiling's on the lag whose move it
+        # holds (`holds`): blocked beats unknown here too, so a failed budget
+        # read beside it is no gap.
+        rule_blocked = readiness.get("status") == READINESS_BLOCKED and bool(_rule_blocks(readiness, due.moves))
         # `blocked` for something that is neither a budget, skew, a readiness
         # rule's block, nor an exclusion: a cause the reporter learned after
         # this join was written. Recording it as run-and-clean would publish an

@@ -20,6 +20,7 @@ clean cluster reads as graded rather than silent.
 
 from readiness_rules import (
     CONDITION_TRUE,
+    HOLDS_NODE_POOL,
     KIND_NODE,
     LIST_SEPARATOR,
     NODE_READ_KIND,
@@ -39,6 +40,7 @@ from readiness_rules import (
 RULE_ID = "orphan-node-objects"
 ENTRY = 22
 CAN_BLOCK = True
+HOLDS = (HOLDS_NODE_POOL,)  # the pool upgrade waits on the Node; a control-plane move does not
 
 # The instance record's fields, as `gcloud compute instances list --format=json(name,zone,status)` returns them.
 INSTANCE_NAME_KEY = "name"

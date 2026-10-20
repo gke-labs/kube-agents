@@ -10,7 +10,11 @@ the version side and the add-on matrix). Each module exposes:
   block the upgrade. A rule with `CAN_BLOCK = False` files risks and notes; an `unknown` it
   files is reported in the note and never moves the member's verdict, since the finding it
   could not make would not have blocked either, and a blocker it files is demoted to a risk
-  with a note saying so.
+  with a note saying so. `HOLDS` (optional), the moves a blocking finding of the rule stops:
+  `HOLDS_CLUSTER` (a control-plane move), `HOLDS_NODE_POOL` (a node-pool move), or both,
+  which a module that declares none holds; the fold stamps it on each blocking finding as
+  `holds`, and the Monday audit's `upgrade-blocked` join counts the block for the move the
+  cluster's lag makes due.
 - `evaluate(cluster, member, read, target, context) -> dict`, a pure function over what the
   report has already read, returning `blocking`, `risks`, `unknown` and `notes`, each a list
   (`new_result()` is the empty one; a key left out is an empty list, a key outside the four
@@ -86,6 +90,12 @@ from datetime import datetime, timedelta, timezone
 import upgrade_shape_tables as tables
 
 RESULT_KEYS = ("blocking", "risks", "unknown", "notes")
+# What a blocking rule's mechanism stops, declared per module as `HOLDS` and stamped on each
+# blocking finding as `holds`: a control-plane move, a node-pool move, or both (the default).
+HOLDS_CLUSTER = "cluster"
+HOLDS_NODE_POOL = "node-pool"
+HOLDS_VALUES = (HOLDS_CLUSTER, HOLDS_NODE_POOL)
+HOLDS_BOTH = HOLDS_VALUES
 # A table cell is one line. Text that reaches a cell (a finding's `text`, an unknown's
 # reason, a note, a read's error) is collapsed to one line here, and a reason or an error is
 # cut to this many characters; the JSON keeps the whole text.
