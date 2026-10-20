@@ -458,6 +458,12 @@ resource "kubernetes_pod_disruption_budget_v1" "drain_blocked" {
 # backend's `group` takes; `instance_group_urls` is the manager's. The
 # readiness rule matches either by zone and name.
 #
+# The reconciler creates and deletes these two kinds with
+# roles/compute.loadBalancerAdmin (the grant loop in
+# scripts/provision_ci_pool_project.sh, FLEET_RECONCILER_ROLES, the repair block
+# in docs/ci-pool-projects.md section 3), granted on every registered project
+# before this merges; the role landed with the fixture.
+#
 # Addressed by the readiness-lb-drain-timeout role.
 resource "google_compute_health_check" "drain_timeout" {
   name = "drain-timeout-${var.cluster_prefix}-b"
