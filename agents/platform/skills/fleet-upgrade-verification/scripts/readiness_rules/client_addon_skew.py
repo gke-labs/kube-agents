@@ -88,7 +88,7 @@ NOTE_ADDON_NO_TABLE = "{addon} {version} at {where}: version not graded (no supp
 NOTE_ADDON_RELEASE_NOT_LISTED = "{addon} {version} at {where}: version not graded (release not in the table read on {read_on}, {source}; check it against {target})"
 NOTE_ADDON_NO_TARGET = "{addon} {version} at {where}: version not graded (no target)"
 NOTE_GKE_ADDONS = "GKE add-ons on: {addons} (GKE-managed; the cluster record carries no version, so not graded)"
-NOTE_CLIENT_GO = "{count} client-go caller{plural} whose user agent carries the binary's version, not the library's; not graded"
+NOTE_CLIENT_GO = "{count} client-go caller{plural} among the deprecated-API writers the audit read returns, whose user agent carries the binary's version, not the library's; not graded"
 NOTE_ADDON_OK = "{addon} {version} supports the target {target} ({source})"
 NOTE_CLIENTS_OK = "{count} kubectl client{plural} within one minor of the target"
 LIST_SEPARATOR = ", "
@@ -205,13 +205,14 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     result = finding.empty_result()
     target_minor = (target[0], target[1]) if target else None
     clients: list[tuple[tuple, str]] = []
-    client_go = 0
+    client_go: set[tuple[str, str]] = set()
 
     log = audit_log.read_deprecated(context)
     if log["error"]:
         result[finding.RESULT_UNKNOWN].append(finding.unknown(RULE_ID, AUDIT_READ_FAILED.format(reason=log["error"])))
     # The read's records are per (principal, user agent, API); one binary is one client, so the
-    # records of a principal and user agent fold into one, its writes summed and its APIs listed.
+    # records of a principal and user agent fold into one, its writes summed and its APIs listed,
+    # and a client-go binary is counted once however many APIs it wrote.
     kubectl_callers: dict[tuple[str, str], dict] = {}
     for caller in log["callers"]:
         if caller["caller_class"] == audit_log.CLASS_PROVIDER:
@@ -222,7 +223,7 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
             folded["count"] += caller["count"]
             folded["apis"].add(str(caller["api"]))
         elif CLIENT_GO_USER_AGENT_MARKER in str(caller["user_agent"]):
-            client_go += 1
+            client_go.add((str(caller["principal"]), str(caller["user_agent"])))
     for (principal, user_agent), folded in kubectl_callers.items():
         where = CLIENT_FROM_AUDIT.format(principal=principal, user_agent=user_agent, count=folded["count"], plural="" if folded["count"] == 1 else CALL_PLURAL, apis=LIST_SEPARATOR.join(sorted(folded["apis"])), days=log["window_days"])
         clients.append((folded["version"], where))
@@ -259,7 +260,7 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
             finding.add_note(result, NOTE_CLIENTS_OK.format(count=within, plural="" if within == 1 else MINOR_PLURAL))
 
     if client_go:
-        finding.add_note(result, NOTE_CLIENT_GO.format(count=client_go, plural="" if client_go == 1 else MINOR_PLURAL))
+        finding.add_note(result, NOTE_CLIENT_GO.format(count=len(client_go), plural="" if len(client_go) == 1 else MINOR_PLURAL))
     addons = enabled_gke_addons(cluster)
     if addons:
         finding.add_note(result, NOTE_GKE_ADDONS.format(addons=LIST_SEPARATOR.join(addons)))

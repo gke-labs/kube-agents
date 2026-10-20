@@ -293,7 +293,7 @@ class ClientAddonSkewTest(unittest.TestCase):
         self.assertEqual(from_image["where"], "CronJob seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0)")
         self.assertIn("kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client", client_addon_skew.describe(from_image))
         self.assertIn("1 kubectl client within one minor of the target", result["notes"])
-        self.assertIn("1 client-go caller whose user agent carries the binary's version, not the library's; not graded", result["notes"])
+        self.assertIn("1 client-go caller among the deprecated-API writers the audit read returns, whose user agent carries the binary's version, not the library's; not graded", result["notes"])
 
     def test_one_kubectl_principal_writing_two_apis_is_one_client_naming_both(self):
         # The audit read's records are per API: the stale kubectl's ConfigMap writes plus a Secret
@@ -310,6 +310,18 @@ class ClientAddonSkewTest(unittest.TestCase):
         self.assertEqual(len(from_log), 1)
         self.assertIn("2 writes to core/v1 configmaps, core/v1 secrets in ", from_log[0]["where"])
         self.assertIn("1 kubectl client within one minor of the target", result["notes"])
+
+    def test_one_client_go_binary_writing_two_apis_is_one_caller(self):
+        # The records are per API: the gateway operator's Endpoints writes plus an EndpointSlice
+        # write from the same principal and user agent are one client-go caller, not two.
+        removed, deprecated = split_sample()
+        operator = next(e for e in deprecated if GATEWAY_OPERATOR in json.dumps(e))
+        slices = json.loads(json.dumps(operator))
+        slices["insertId"] = operator["insertId"] + "-slices"
+        slices["protoPayload"]["resourceName"] = "discovery.k8s.io/v1beta1/namespaces/mesh/endpointslices/legacy-gateway"
+        slices["protoPayload"]["methodName"] = "io.k8s.discovery.v1beta1.endpointslices.update"
+        result = client_addon_skew.evaluate(self.CLUSTER, member(), read(self.ITEMS), TARGET_1_35, context_with(FakeRunner(removed, deprecated + [slices])))
+        self.assertEqual([n for n in result["notes"] if "client-go" in n], ["1 client-go caller among the deprecated-API writers the audit read returns, whose user agent carries the binary's version, not the library's; not graded"])
 
     def test_an_addon_without_a_table_is_a_note_and_the_verdict_stays(self):
         result = client_addon_skew.evaluate(self.CLUSTER, member(), read(self.ITEMS), TARGET_1_35, context_with())
