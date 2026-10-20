@@ -568,7 +568,7 @@ def test_capture_yields_canonical_entries_with_secrets_scrubbed(data_root: Path)
     names = [e["name"] for e in captured.entries]
     assert names == ["terminal", "kanban_create", "kubectl_get"]
     first, failed, cluster = captured.entries
-    assert set(first) == {"name", "args", "result", "status", "agent", "task", "session", "at"}
+    assert set(first) == {"name", "args", "result", "status", "exit_code", "agent", "task", "session", "at"}
     assert first["args"] == {"command": "kubectl get pods"}
     assert first["status"] == "completed"
     assert TOKEN not in first["result"]

@@ -1858,10 +1858,9 @@ _NO_WORKER_TERMINAL_CALLS_REASON = (
 )
 _NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON = (
     "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
-    "card was delegated, the worker-trajectory capture did not run, the card log shows commands "
-    "the trajectory did not carry, or the pod withheld a call's arguments, so required run(s) "
-    "requiring success could not be verified (a worker whose tagged calls are all MCP or board calls, "
-    "with an empty card log, grades as zero commands)"
+    "card was delegated, the worker-trajectory capture did not run, or the pod withheld a "
+    "call's arguments, so required run(s) requiring success could not be verified (a worker whose "
+    "tagged calls are all MCP or board calls, with an empty card log, grades as zero commands)"
 )
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
@@ -2305,6 +2304,20 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
     return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
+def _extract_exit_code(result: Any) -> int | None:
+    if isinstance(result, str):
+        try:
+            result = json.loads(result.strip())
+        except ValueError:
+            return None
+    if not isinstance(result, dict):
+        return None
+    code = result.get("exit_code", result.get("returncode"))
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
 def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
     """``(card, at, command, result, succeeded)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
@@ -2320,9 +2333,9 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     ``tool_called`` reads its arguments, and one clipped inside the command
     itself keeps the head that survived, which carries the verb. A result
     that is not text reads as empty; ``succeeded`` is whether the pod recorded
-    a completed result (``status == "completed"``); a call with ``status == "error"``,
-    ``status == "called"`` (a call with no recorded result) or absent status is
-    ``False``, so it survives the clip.
+    a completed result with an exit code of 0 (``status == "completed"`` and an
+    integer exit code of 0, from ``exit_code`` or parsed from JSON ``result``;
+    a non-zero or unrecorded exit is ``False``).
     """
     calls: list[tuple[str, float | None, str, str, bool]] = []
     for entry in trajectory:
@@ -2351,13 +2364,17 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
             continue
         at = entry.get("at")
         result = entry.get("result")
+        call_exit = entry.get("exit_code")
+        if call_exit is None and isinstance(result, str):
+            call_exit = _extract_exit_code(result)
+        call_succeeded = entry.get("status") == "completed" and call_exit == 0
         calls.append(
             (
                 str(entry.get("task") or entry.get("session") or ""),
                 float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
                 command,
                 result if isinstance(result, str) else "",
-                entry.get("status") == "completed",
+                call_succeeded,
             )
         )
     calls.sort(key=lambda call: float("-inf") if call[1] is None else call[1])
@@ -2647,7 +2664,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             if has_succeeded_runs and not traj_calls:
                 tagged = any(isinstance(e, dict) and e.get("agent") and e.get("name") not in _CODE_TOOLS for e in (snap.trajectory or ()))
                 dropped = any(isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS for e in (snap.trajectory or ()))
-                if not tagged or dropped or snap.worker_commands:
+                if not tagged or dropped:
                     no_traj_for_succeeded = True
         else:
             no_traj_for_succeeded = False

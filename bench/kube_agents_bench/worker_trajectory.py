@@ -359,6 +359,20 @@ def failed(result):
     )
 
 
+def exit_code(result):
+    if isinstance(result, str):
+        try:
+            result = json.loads(result.strip())
+        except ValueError:
+            return None
+    if not isinstance(result, dict):
+        return None
+    code = result.get("exit_code", result.get("returncode"))
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
 def clip(text, limit):
     if text is None:
         return None
@@ -478,6 +492,7 @@ def read_session(conn, card, profile, sid):
                     "args": clip(scrub(arguments), MAX_ARGS) if arguments is not None else None,
                     "result": None,
                     "failed": None,
+                    "exit_code": None,
                     "agent": profile,
                     "task": card,
                     "session": sid,
@@ -507,6 +522,7 @@ def read_session(conn, card, profile, sid):
             pending.remove(target)
             result = decode(row["content"])
             target["failed"] = failed(result)
+            target["exit_code"] = exit_code(result)
             target["result"] = clip(scrub(result), MAX_RESULT)
     if orphans:
         out["errors"].append(
@@ -729,6 +745,20 @@ def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
 
 
 
+def extract_exit_code(result: Any) -> int | None:
+    if isinstance(result, str):
+        try:
+            result = json.loads(result.strip())
+        except ValueError:
+            return None
+    if not isinstance(result, dict):
+        return None
+    code = result.get("exit_code", result.get("returncode"))
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    return None
+
+
 def _entry(call: dict[str, Any]) -> dict[str, Any]:
     """One trajectory entry in ``parsing.parse_response``'s shape, plus the tags.
 
@@ -744,11 +774,15 @@ def _entry(call: dict[str, Any]) -> dict[str, Any]:
         status = "error"
     else:
         status = "completed"
+    code = call.get("exit_code")
+    if code is None and isinstance(result, str):
+        code = extract_exit_code(result)
     return {
         "name": str(call.get("name") or ""),
         "args": _call_args(call.get("args")),
         "result": result,
         "status": status,
+        "exit_code": code,
         "agent": str(call.get("agent") or ""),
         "task": str(call.get("task") or ""),
         "session": str(call.get("session") or ""),

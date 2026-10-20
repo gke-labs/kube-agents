@@ -8519,12 +8519,28 @@ def test_worker_commands_required_run_succeeded_flag():
     run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
     v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
 
-    # Trajectory entry with status="completed" passes.
+    # Trajectory entry with status="completed" and exit_code 0 passes.
     traj_ok = [
-        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "done", "status": "completed", "at": 1.0}
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 0, "output": "done"}', "exit_code": 0, "status": "completed", "at": 1.0}
     ]
     transcript.set("ok", traj_ok, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
     assert v.verify(5.0).status == "pass"
+
+    # Trajectory entry with status="completed" but unrecorded exit (plain text or non-zero) fails.
+    traj_unrecorded = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "started in background", "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_unrecorded, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_unrecorded = v.verify(5.0)
+    assert res_unrecorded.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_unrecorded.reason
+
+    # Trajectory entry with status="completed" and non-zero exit code fails.
+    traj_nonzero = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_nonzero, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_nonzero = v.verify(5.0)
+    assert res_nonzero.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_nonzero.reason
 
     # Trajectory entry with status="error" fails.
     traj_err = [
@@ -8653,7 +8669,7 @@ def test_worker_commands_succeeded_worker_typed_nothing_grades_as_zero_commands(
     assert "no worker command ran fleet_upgrade_report.py --readiness across 0 command(s)" in res.reason
 
 
-def test_worker_commands_succeeded_tagged_mcp_beside_card_log_is_error():
+def test_worker_commands_succeeded_tagged_mcp_beside_card_log_missing_from_both_is_fail():
     from kube_agents_bench.verifiers import WorkerRun
 
     run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
@@ -8668,15 +8684,41 @@ def test_worker_commands_succeeded_tagged_mcp_beside_card_log_is_error():
         "at": 10.0,
     }
     # Tagged MCP calls beside non-empty card log with 0 terminal calls in trajectory:
-    # yields status="error" naming that the card log shows commands the trajectory did not carry.
+    # command is absent from both sources, so it fails conclusively.
     transcript.set(
         "ok",
         [mcp],
         worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
     )
     res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command ran fleet_upgrade_report.py --readiness across 1 command(s)" in res.reason
+
+
+def test_worker_commands_succeeded_tagged_mcp_beside_card_log_with_command_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    mcp = {
+        "agent": "worker",
+        "name": "mcp__gke__get_k8s_resource",
+        "task": "t_1",
+        "args": {"name": "test"},
+        "result": "{}",
+        "status": "completed",
+        "at": 10.0,
+    }
+    # Tagged MCP calls beside card log carrying the required run:
+    # discrepancy between capture sources yields status="error".
+    transcript.set(
+        "ok",
+        [mcp],
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+    )
+    res = v.verify(5.0)
     assert res.status == "error"
-    assert "the card log shows commands the trajectory did not carry" in res.reason
+    assert "the worker card log shows fleet_upgrade_report.py --readiness ran, but the worker trajectory did not capture the call" in res.reason
 
 
 def test_worker_commands_succeeded_no_trajectory_with_conclusive_card_log_failure_fails():
@@ -8734,7 +8776,7 @@ def test_worker_commands_required_run_succeeded_with_after_result_pattern():
     # Trajectory entry with status="completed" passes.
     traj_completed = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
-        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "done", "status": "completed", "at": 2.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
     ]
     transcript.set("ok", traj_completed)
     assert v.verify(5.0).status == "pass"
@@ -8750,7 +8792,7 @@ def test_worker_commands_required_run_succeeded_with_after_result_pattern():
 
     # Required run completes before the opener pattern matches (runs read every command).
     traj_before_opener = [
-        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "done", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 1.0},
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 2.0},
     ]
     transcript.set("ok", traj_before_opener)
