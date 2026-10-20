@@ -5465,6 +5465,36 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
 
 
+class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
+    """The Google Chat checklist names a GOOGLE_CHAT_HOME_CHANNEL the A2A
+    gateway would not arm its notify route on. The installer's check copies
+    the gateway's gchatIsSpaceName and the operator's a2aGchatHomeSpace; this
+    keeps the copy from drifting (docs/README.md lists the rule's three
+    homes)."""
+
+    def test_the_rule_is_the_gateways_and_the_operators(self):
+        gateway = (_REPO_ROOT / "a2a/gateway/gchat.go").read_text()
+        self.assertRegex(gateway, r'\n\tgchatSpacesToken\s*=\s*"spaces/"\n')
+        self.assertIn("func gchatIsSpaceName(s string) bool {\n"
+                      "\tid, found := strings.CutPrefix(s, gchatSpacesToken)\n"
+                      "\treturn found && id != \"\" && !strings.Contains(id, \"/\")\n}\n", gateway)
+        operator = (_REPO_ROOT / "k8s-operator/internal/controller/platformagent_a2a_manifests.go").read_text()
+        self.assertRegex(operator, r'\n\ta2aGchatSpacePrefix\s*=\s*"spaces/"\n')
+        self.assertIn("\thome := strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel)\n"
+                      "\tid, ok := strings.CutPrefix(home, a2aGchatSpacePrefix)\n"
+                      "\tif !ok || id == \"\" || strings.Contains(id, \"/\") {\n", operator)
+        shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
+        self.assertRegex(shell, r'(?m)^readonly GCHAT_SPACE_PREFIX="spaces/"$')
+        cases = {"spaces/AAA": "", "  spaces/AAA ": "", "": "", "AAA": "AAA", "spaces/": "spaces/",
+                 "spaces/AAA/threads/B": "spaces/AAA/threads/B", " Spaces/AAA": "Spaces/AAA"}
+        script = "".join(f'printf "[%s]\\n" "$(gchat_home_channel_not_a_space_name {shlex.quote(v)})"\n'
+                         for v in cases)
+        proc = subprocess.run(["bash", "-c", f'source "{_INSTALLER_COMMON}"\n{script}'],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), [f"[{v}]" for v in cases.values()])
+
+
 class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
     gateway makes the proactive posts and arms them only on a home channel,

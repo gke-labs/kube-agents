@@ -76,7 +76,7 @@ print_a2a_gateway_steps() {
     echo -e "       Set ${C_WHITE}GOOGLE_CHAT_HOME_CHANNEL${C_RESET} in install.env to ${C_WHITE}spaces/<id>${C_RESET} and re-run the installer."
     echo -e "       The id is the part after ${C_WHITE}/room/${C_RESET} or ${C_WHITE}/space/${C_RESET} in the space's URL."
   else
-    echo -e "[ ] ${step}. GOOGLE_CHAT_HOME_CHANNEL in install.env is ${C_WHITE}${home}${C_RESET}: add the app to that space (@mention the app there),"
+    echo -e "[ ] ${step}. GOOGLE_CHAT_HOME_CHANNEL is ${C_WHITE}${home}${C_RESET}: add the app to that space (@mention the app there),"
     echo -e "       or the agent's alerts and scheduled reports do not reach it."
   fi
   echo -e ""

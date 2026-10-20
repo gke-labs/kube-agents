@@ -633,7 +633,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve google_chat <PAIRING_CODE>
      ```
    - The A2A gateway under `spec.mode: next` has no pairing: it answers the addresses in `ALLOWED_USERS`, or everyone the app is visible to when that is empty.
-   - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist instead:
+   - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist instead. The checklist `install.sh` prints at the end of a run follows the mode the PlatformAgent is left on, which a `spec.mode` set by hand can keep from the key; this script reads `install.env` alone:
      ```bash
      ./scripts/installer/print_instructions_gchat.sh
      ```

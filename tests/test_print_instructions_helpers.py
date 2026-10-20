@@ -179,9 +179,9 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         file_says_no_slack = self._env(mode="next").replace("SLACK_ENABLED=true", "SLACK_ENABLED=false")
         self._assert_next(self._run(file_says_no_slack, applied_slack_only))
 
-    def test_a_standalone_run_ignores_what_the_shell_exports(self):
+    def test_a_standalone_run_ignores_an_exported_mode(self):
         # install.sh's bootstrap drops an inherited PLATFORM_AGENT_MODE too.
-        exported = {"PLATFORM_AGENT_MODE": "next", "GOOGLE_CHAT_ENABLED": "false"}
+        exported = {"PLATFORM_AGENT_MODE": "next"}
         self._assert_today(self._run(self._env(mode=None), exported))
         self._assert_today(self._run(self._env(mode="next", gchat=True), exported))
 
@@ -280,10 +280,10 @@ class GchatStepsFollowTheModeTest(unittest.TestCase):
             self.assertIn("Set GOOGLE_CHAT_HOME_CHANNEL in install.env to a space name (spaces/<id>)", out)
             self.assertNotIn("--google-chat-home-channel", out)
 
-    def test_next_with_a_space_names_it_and_its_source(self):
+    def test_next_with_a_space_names_it(self):
         for out in self._both(self._env(mode="next", home=f'"  {self._SPACE} "')):
             self._assert_next(out)
-            self.assertIn(f"GOOGLE_CHAT_HOME_CHANNEL in install.env is {self._SPACE}: add the app to that space", out)
+            self.assertIn(f"GOOGLE_CHAT_HOME_CHANNEL is {self._SPACE}: add the app to that space", out)
             self.assertNotIn("No home channel is configured", out)
 
     def test_next_with_a_value_that_is_not_a_space_says_how_to_fix_it(self):
