@@ -280,6 +280,13 @@ DEMOTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
+# The demotions recorded before the freeze (#3495), whose lines sit in the
+# frozen part after a named predecessor. Written out and not to grow: every
+# later demotion goes in the sorted section, recorded with None.
+DEMOTED_INTO_THE_FROZEN_PART = frozenset({
+    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),
+    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),
+})
 # Held-out seats withdrawn since #3495: a withdrawal moves the line to the
 # nightly file's sorted section and records the case here, in the same edit
 # that deletes its HELD_OUT_IN_PRESUBMIT entry.
@@ -510,6 +517,13 @@ class SplitLostNothingTest(unittest.TestCase):
             "a new case goes in the sorted section at the foot of the file; a demotion is recorded "
             "in DEMOTED_AFTER_THE_SPLIT with None and a withdrawn seat in WITHDRAWN_TO_SORTED",
         )
+
+    def test_a_demotion_since_the_freeze_goes_in_the_sorted_section(self):
+        named = {(case, follows) for case, follows in DEMOTED_AFTER_THE_SPLIT if follows is not None}
+        self.assertLessEqual(
+            named, DEMOTED_INTO_THE_FROZEN_PART,
+            "a demotion since #3495 puts its line in the nightly file's sorted section and is "
+            "recorded in DEMOTED_AFTER_THE_SPLIT with None, not after a frozen-part predecessor")
 
     def test_a_demoted_case_is_in_the_nightly_only(self):
         for case in DEMOTED:
