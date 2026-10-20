@@ -312,7 +312,10 @@ Note that the summary line the harness prints accounts for 203 of the 206: a
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
 not run in CI — it edits tracked files in place — so it is a thing to run
-when adding a test, which step 4 below says to do.
+when adding a test, which step 4 below says to do. Its STALE check needs no
+edit, so that part does run on every pull request:
+`test_every_mutation_still_finds_the_text_it_edits` fails when a refactor
+moves the text a mutation edits, naming the mutation to rewrite.
 
 **The coverage of that set is checked by the suite, because it rotted once.**
 The first version of this file claimed every test had been mutation-verified

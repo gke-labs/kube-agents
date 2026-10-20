@@ -352,20 +352,27 @@ func (s *SlackAdapter) interactive(raw json.RawMessage) (InboundMessage, bool) {
 	if p.User.ID == "" || p.Channel.ID == "" || p.Message.TS == "" || p.ActionTS == "" {
 		return InboundMessage{}, false
 	}
-	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {
-		s.log.Info("slack: ignoring a click from another workspace's member",
-			"userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
-		return InboundMessage{}, false
-	}
-	if s.alreadySeen("click:" + p.Channel.ID + "/" + p.ActionTS) {
-		return InboundMessage{}, false
-	}
 	thread := p.Message.ThreadTS
 	if thread == "" {
 		thread = p.Container.ThreadTS
 	}
 	if thread == "" {
 		thread = p.Message.TS
+	}
+	if s.otherWorkspace(p.User.TeamID) || s.otherWorkspace(p.Team.ID) {
+		s.log.Info("slack: ignoring a click from another workspace's member",
+			"user", p.User.ID, "userTeam", p.User.TeamID, "team", s.teamID, "channel", p.Channel.ID)
+		// The same once-per-sender notice a refused message gets, in the
+		// question's thread: a button that does nothing looks broken.
+		team := p.User.TeamID
+		if team == "" {
+			team = p.Team.ID
+		}
+		s.noticeForeignSender(p.Channel.ID, thread, team, p.User.ID)
+		return InboundMessage{}, false
+	}
+	if s.alreadySeen("click:" + p.Channel.ID + "/" + p.ActionTS) {
+		return InboundMessage{}, false
 	}
 	kind, channelType := "group", "channel"
 	if strings.HasPrefix(p.Channel.ID, slackDMChannelPrefix) {

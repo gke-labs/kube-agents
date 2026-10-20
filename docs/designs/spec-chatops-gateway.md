@@ -1742,8 +1742,11 @@ Because an unmapped sender's member id is enough to be admitted, admission must 
 past the install's own workspace. Slack names the sender's workspace as `user_team` on a
 message in a channel shared between workspaces, and a message's own `team` field names the
 workspace it was posted from. The gateway refuses a message that names a workspace other
-than the bot's own (from `auth.test`) in either: it is not a turn, silent to the sender,
-and logged when it addressed the bot. Without a team id from `auth.test` it refuses any
+than the bot's own (from `auth.test`) in either: it is not a turn. When it addressed the
+bot (a DM or a mention), the refusal is logged with the sender's member id, and the sender
+gets one reply in that message's thread, once per workspace and member, saying the bot
+answers only its own workspace. A click on one of the bot's buttons by such a member is
+refused the same way, and shares that once-per-sender notice, in the question's thread. Without a team id from `auth.test` it refuses any
 message that names a workspace, and warns once at start. A message that names no workspace
 in either field is taken as our own member's, which rests on Slack setting them on a
 shared channel's messages; no captured Slack Connect payload has confirmed it yet. Under allow-all this is the only boundary on
