@@ -327,6 +327,19 @@ locals {
   )
 }
 
+# A warning rather than a precondition: setting image_registry without
+# third_party_image_registry is a valid configuration if the operator only
+# intends to mirror first-party images. But third-party images (cert-manager,
+# LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+# will remain on upstream public registries. On restricted or air-gapped clusters,
+# operators must be informed so deployments do not fail on ImagePullBackOff.
+check "unmirrored_third_party_images" {
+  assert {
+    condition     = var.image_registry == "" || var.third_party_image_registry != ""
+    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
+  }
+}
+
 # A warning rather than a precondition: an install that enables Slack before
 # the Slack app exists is a legitimate order of operations, and the empty keys
 # above keep the pod running until the tokens land. What is not legitimate is

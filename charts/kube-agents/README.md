@@ -176,12 +176,12 @@ separate repository — which is why it has to be named.
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
 `make mirror-images` writes. Setting `litellm.image.repository` while
-`global.imageRegistry` is set therefore changes only the name the prefix is
+`global.thirdPartyImageRegistry` is set therefore changes only the name the prefix is
 joined to, not where the image is pulled from. To place images individually —
-most on the mirror, one somewhere else — leave `global.imageRegistry` empty and
-give each `*.image.repository` its full mirrored path instead; the operator's
-`PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and `FLUENT_BIT_IMAGE` are
-rendered from those values either way.
+most on the mirror, one somewhere else — leave `global.imageRegistry` and
+`global.thirdPartyImageRegistry` empty and give each `*.image.repository` its full
+mirrored path instead; the operator's `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
+and `FLUENT_BIT_IMAGE` are rendered from those values either way.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
@@ -191,11 +191,10 @@ credentials cannot read — Harbor or Artifactory with token auth, rather than a
 in-project Artifact Registry. An entry is either a bare Secret **name**, so a
 single one is reachable with `--set global.imagePullSecrets[0]=regcred`, or the
 `{name: <secret>}` map a `PodSpec` takes; any other shape fails the render. It
-reaches the same two populations `global.imageRegistry` does: every pod the chart renders
-(operator, LiteLLM, the pre-delete cleanup Job) and the agent pods the operator
-renders, via `IMAGE_PULL_SECRETS` on the manager and `spec.deployment.imagePullSecrets`
-on the `PlatformAgent`. A hand-written `PlatformAgent` that sets that field
-replaces the operator's default rather than adding to it.
+reaches every pod the chart renders (operator, LiteLLM, the pre-delete cleanup Job)
+and the agent pods the operator renders, via `IMAGE_PULL_SECRETS` on the manager and
+`spec.deployment.imagePullSecrets` on the `PlatformAgent`. A hand-written `PlatformAgent`
+that sets that field replaces the operator's default rather than adding to it.
 
 The Secrets are referenced, never created: keeping registry credentials out of
 Helm release data is the point, and the chart has no way to write one that would

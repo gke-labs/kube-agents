@@ -3,7 +3,7 @@ remain on upstream registries when thirdPartyImageRegistry is unset/empty, even
 when imageRegistry is set (#3503).
 
 A custom first-party imageRegistry must not rewrite third-party images (LiteLLM,
-fluent-bit, cleanup hook, GitHub token minter, cert-manager) onto the first-party
+fluent-bit, cleanup hook, GitHub token minter, Hindsight) onto the first-party
 prefix, where an operator who only mirrored kube-agents images never mirrored them.
 
 When global.imageRegistry is set without global.thirdPartyImageRegistry, the chart's
@@ -137,6 +137,7 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
         self.assertIn("WARNING: global.imageRegistry is set", notes)
         self.assertIn("global.thirdPartyImageRegistry is empty", notes)
         self.assertIn("will still be pulled from their upstream public registries", notes)
+        self.assertIn("cert-manager is not rendered by this chart", notes)
 
     def test_notes_silent_when_both_registries_set(self):
         mirror = "us-east4-docker.pkg.dev/my-proj/kube-agents"
@@ -180,3 +181,10 @@ class CompositionWiringTest(unittest.TestCase):
         self.assertNotIn("var.third_party_image_registry != \"\" ? var.third_party_image_registry : var.image_registry", main_tf)
         match = re.search(r'third_party_registry\s*=\s*trimsuffix\(\s*var\.third_party_image_registry,\s*"/"\s*\)', main_tf)
         self.assertIsNotNone(match, "third_party_registry should trim var.third_party_image_registry without falling back to var.image_registry")
+
+    def test_composition_warns_when_image_registry_set_and_third_party_empty(self):
+        main_tf = _MAIN_TF.read_text()
+        self.assertIn('check "unmirrored_third_party_images"', main_tf)
+        self.assertIn('var.image_registry == "" || var.third_party_image_registry != ""', main_tf)
+        self.assertIn('var.image_registry is set', main_tf)
+        self.assertIn('var.third_party_image_registry is empty', main_tf)
