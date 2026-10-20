@@ -867,6 +867,51 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn("omitted", text)
         self.assertLessEqual(len(text), 580)
 
+    def test_last_item_large_group_promoted_when_fits_in_omission_reserve_with_no_dropped_ids(self):
+        # A single card fits in available_for_items. A 4-card large group's head exceeds
+        # the remaining available_for_items (triggering continue at L582-583), leaving it
+        # as the single untaken item. In last-item promotion, the large group fits in the
+        # omission reserve (budget_for_body - current_chars) without dropping any IDs (L602-606).
+        # Header (113) + Footer (281) = 394. max_chars=634 -> budget_for_body=240, available_for_items=120.
+        # S card (~42 chars) leaves 78 in available_for_items.
+        # Group head (~86 chars) > 78 so skipped in taking loop.
+        # Promotion budget = 240 - 42 = 198 chars. All 4 IDs fit in group_ids_budget.
+        cards = [
+            ("t_new", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 1}},
+             {"task_id": "t_new", "status": "blocked", "title": "Fresh"}),
+        ] + [
+            (f"t_g_{i}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 2 + i}},
+             {"task_id": f"t_g_{i}", "status": "blocked", "title": "Repeated title"})
+            for i in range(4)
+        ]
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=634)
+        text = "\n".join(lines)
+        self.assertIn("ids: t_g_0, t_g_1, t_g_2, t_g_3", text)
+        self.assertIn("Fresh", text)
+        self.assertNotIn("omitted", text)
+        self.assertLessEqual(len(text), 634)
+
+    def test_last_item_large_group_declined_when_ids_exceed_omission_reserve(self):
+        # Sibling fixture: same single card + 20-card group.
+        # The 20-card group cannot fit all IDs in the promotion budget without dropping IDs.
+        # Because promo_item has dropped_ids, L604 declines promotion and preserves room
+        # for the omission summary line.
+        cards = [
+            ("t_new", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 1}},
+             {"task_id": "t_new", "status": "blocked", "title": "Fresh"}),
+        ] + [
+            (f"t_g_{i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 2 + i}},
+             {"task_id": f"t_g_{i:02d}", "status": "blocked", "title": "Repeated title"})
+            for i in range(20)
+        ]
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=634)
+        text = "\n".join(lines)
+        self.assertIn("Fresh", text)
+        self.assertIn("omitted", text)
+        self.assertNotIn("Repeated title", text)
+        self.assertNotIn("    ids:", text)
+        self.assertLessEqual(len(text), 634)
+
     def test_last_item_not_promoted_when_earlier_group_has_dropped_ids(self):
         # When an earlier group folded IDs (has dropped_ids), the last item must NOT be promoted
         # even if it fits in budget_for_body, ensuring the omission reserve is preserved.
