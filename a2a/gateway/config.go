@@ -107,6 +107,17 @@ const defaultSessionTTL = 7 * 24 * time.Hour
 // field's comment carries the sizing rationale.
 const defaultFirstEventGrace = 10 * time.Minute
 
+// defaultCardStopTimeout is what CardStopTimeout means when unset: above the
+// bridge's worst case for a card-stop control, about 60 s (its capability
+// check's 5 s, its 20 s wait for the session's turn and its 35 s POST to
+// session-kv; a2a/hermes-bridge/cardstop.go), with room for the bus.
+const defaultCardStopTimeout = 75 * time.Second
+
+// cardStopTimeoutFloor is the least A2A_CARD_STOP_TIMEOUT FromEnv takes: a
+// wait shorter than the bridge's own turn wait gives up on every stop that
+// has to wait for the turn it just cancelled.
+const cardStopTimeoutFloor = 30 * time.Second
+
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
 // else has playground defaults.
@@ -391,6 +402,27 @@ type Config struct {
 	// raising it is how long a user waits before the conversation answers
 	// again. Values under 1m are refused at boot.
 	FirstEventGrace time.Duration
+
+	// CardStop arms the card stop (A2A_CARD_STOP, off unless "true";
+	// gke-labs#3263): a `stop` in a conversation on the default addressee
+	// also sends that addressee a card-stop control, a task whose message is
+	// the cardStop data part alone, and the reply names the kanban cards the
+	// executor stopped (cardstop.go). Off, a stop cancels the active task
+	// only and says a card keeps working, as before. A rollout switch: the
+	// control needs a hermes-bridge and an agent image that answer it, and an
+	// older bridge rejects it, which answers cardStopUnconfirmedNotice.
+	CardStop bool
+
+	// CardStopTimeout bounds the wait for a card-stop control's terminal
+	// (A2A_CARD_STOP_TIMEOUT, a Go duration, 75s by default and at least
+	// 30s). Past it the gateway cancels the control and answers that it
+	// could not confirm the stop: the cards may have stopped, and the
+	// executor's answer is what was lost. The operator renders it at the
+	// 75s default and offers no override, as the bridge's own bound
+	// (BRIDGE_CARD_STOP_TIMEOUT_SECONDS, 35s by default) has none; the env
+	// is read so a hand-built Deployment can set it. A change to either
+	// bound is a code change made to both together.
+	CardStopTimeout time.Duration
 
 	// OwnerDeployment names the gateway's own Deployment
 	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
@@ -796,6 +828,17 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q is under the 1m floor; it would release a task still cold-starting", grace)
 	}
 	cfg.FirstEventGrace = fg
+
+	cfg.CardStop = os.Getenv("A2A_CARD_STOP") == "true"
+	cardStopTimeout := envOr("A2A_CARD_STOP_TIMEOUT", defaultCardStopTimeout.String())
+	cst, err := time.ParseDuration(cardStopTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_CARD_STOP_TIMEOUT %q: %w", cardStopTimeout, err)
+	}
+	if cst < cardStopTimeoutFloor {
+		return nil, fmt.Errorf("A2A_CARD_STOP_TIMEOUT %q is under the %v floor; the bridge alone may wait 20s for the turn the stop cancelled", cardStopTimeout, cardStopTimeoutFloor)
+	}
+	cfg.CardStopTimeout = cst
 
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 

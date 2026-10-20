@@ -550,8 +550,8 @@ de-admission window, with nobody in the loop.)
 A demoted case keeps running and reporting in the nightly; give it a hold-out entry above
 with the issue that names its re-admission condition, and date it as `demoted YYYY-MM-DD` inside its
 `- **case-name** —` bullet, the shape the entries above use — the dashboard's Cases page
-reads that phrase from those bullets for the case's "demoted" pill. That issue goes to the case's `owner:` in its
-`task.yaml` — a GitHub login, or `maintainers` for the approvers in the root `OWNERS` file —
+reads that phrase from those bullets for the case's "demoted" pill. That issue goes to the case's effective owner — its `owner:`, or
+its domain's owner ([`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md#ownership)) —
 who investigates and either fixes the case or proposes retiring it. A case whose owner does
 not answer stays demoted. The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
