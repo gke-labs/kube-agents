@@ -274,10 +274,8 @@ list, add the entry to that list, because Helm replaces a list as a whole. See
 
 ## Switching `spec.mode`
 
-A first install runs `next`; `today` is the previous stack, kept as a rollback. An `install.env`
-that sets no `PLATFORM_AGENT_MODE` resolves to `today` in `upgrade.sh`, so upgrading an install made
-before `next` became the default leaves it on `today`, and `install.sh` keeps the mode the cluster
-runs and records it there. To move a running install between `today` and `next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
+`next` is an unsupported development stack. To move a running install between `today` and
+`next`, set `PLATFORM_AGENT_MODE` in `install.env` and run a full upgrade (the default mode) or
 `install.sh`. The operator and harness modes re-apply the values the release recorded, so they do
 not switch. Preview a full upgrade with `upgrade.sh --plan` first; a run that switches says so
 before it applies.
@@ -534,7 +532,7 @@ change of the new release.
 
 ## What stops during an upgrade
 
-This section describes `spec.mode: today`, which an install made before `next` became the first-install default keeps.
+This section describes `spec.mode: today`, the default.
 
 At the default of one replica, the agent gateway and the credential broker each run one pod with
 the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so chat stops
