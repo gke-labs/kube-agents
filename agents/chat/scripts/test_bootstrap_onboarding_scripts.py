@@ -2329,6 +2329,33 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertNotIn("`compliance-audit`", unposted)
         self.assertIn("`stockout-prevention`", unposted)
 
+    def test_every_hermes_outcome_is_classified(self):
+        self.assertEqual(
+            set(bootstrap_delivery.DELIVERY_OUTCOME_CLASS),
+            {"failed", "suppressed", "suppressed_acked", None, "delivered", "queued", "not_configured"},
+        )
+
+    def test_each_outcome_lists_the_audit_as_it_did_before_the_classes(self):
+        # (listed when it is the only run, listed when it follows a refused run)
+        expected = {
+            "failed": (True, True),
+            "suppressed": (False, True),
+            "suppressed_acked": (False, True),
+            None: (False, True),
+            "delivered": (False, False),
+            "queued": (False, False),
+            "not_configured": (False, False),
+            "a-value-hermes-added-later": (False, False),
+        }
+        for outcome, (alone, after_failed) in expected.items():
+            with self.subTest(outcome=outcome):
+                for runs, listed in (
+                    ([(1.0, 2.0, outcome)], alone),
+                    ([(1.0, 2.0, "failed"), (3.0, 4.0, outcome)], after_failed),
+                ):
+                    got = bootstrap_delivery._undelivered_audits(["compliance-audit"], {"compliance-audit": runs})
+                    self.assertEqual(got, ["`compliance-audit`"] if listed else [])
+
     def test_a_run_from_before_the_mark_is_not_the_first_run(self):
         now = time.time()
         self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)

@@ -260,9 +260,24 @@ AUDITS_UNDELIVERED_NOTE = (
 
 # The scheduler's record of where a run's final message went (Hermes cron/executions.db).
 DELIVERY_OUTCOME_COLUMN = "delivery_outcome"
+OUTCOME_LOST = "lost"
+OUTCOME_SILENT = "silent"
+OUTCOME_TRIED = "tried"
 DELIVERY_FAILED = "failed"
-# A run that posted nothing on purpose: the scheduler's suppressed outcomes, or none recorded.
-SILENT_OUTCOMES = ("suppressed", "suppressed_acked", None)
+# Every value Hermes records there, and None for a run with none recorded.
+# deploy/docker/plugins/verify_chat_relay.py keeps a copy and fails the image build when Hermes' known
+# outcomes, or the values its scheduler writes, are not all in it.
+DELIVERY_OUTCOME_CLASS: dict[str | None, str] = {
+    DELIVERY_FAILED: OUTCOME_LOST,
+    # Posted nothing on purpose.
+    "suppressed": OUTCOME_SILENT,
+    "suppressed_acked": OUTCOME_SILENT,
+    None: OUTCOME_SILENT,
+    "delivered": OUTCOME_TRIED,
+    "queued": OUTCOME_TRIED,
+    # Hermes records it only for `deliver: origin` with no origin to resolve; the audits use `deliver: chat`.
+    "not_configured": OUTCOME_TRIED,
+}
 
 # The sentence of the two notes above that names the home channel, and what replaces it where the
 # gateway has none to post to (no A2A_NOTIFY_PLATFORM on the conversation path).
@@ -956,8 +971,9 @@ def _undelivered_audits(audits: list[str], runs: dict[str, list[tuple[float, flo
     """
     out = []
     for audit in audits:
-        tried = [run for run in runs.get(audit, ()) if run[2] not in SILENT_OUTCOMES]
-        if tried and tried[-1][2] == DELIVERY_FAILED:
+        classes = [DELIVERY_OUTCOME_CLASS.get(run[2], OUTCOME_TRIED) for run in runs.get(audit, ())]
+        tried = [c for c in classes if c != OUTCOME_SILENT]
+        if tried and tried[-1] == OUTCOME_LOST:
             out.append(f"`{audit}`")
     return out
 
