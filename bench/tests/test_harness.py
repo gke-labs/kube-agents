@@ -3444,7 +3444,7 @@ def test_a_cleared_rate_limit_card_evicted_from_poll_fallback_remains_graded(
     stub_agent.turns = [
         _create_turn(),
         _turn(_text("still looking")),
-        _show_turn("failed", body=worker_failure, result=worker_failure, call_id="call_show_2"),
+        _show_turn("blocked", block_kind="transient", body=worker_failure, result=worker_failure, call_id="call_show_2"),
     ]
     reads = []
 
@@ -3494,7 +3494,7 @@ def test_a_cleared_rate_limit_card_evicted_by_status_turn_running_remains_graded
     stub_agent.turns = [
         _create_turn(),
         _show_turn("running", call_id="call_show_1"),
-        _show_turn("failed", body=worker_failure, result=worker_failure, call_id="call_show_2"),
+        _show_turn("blocked", block_kind="transient", body=worker_failure, result=worker_failure, call_id="call_show_2"),
     ]
     reads = []
 
@@ -4187,7 +4187,7 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
                 {"task_id": t2},
                 {
                     "task": {"id": t2, "status": "blocked", "block_kind": "needs_input"},
-                    "runs": [{"summary": "worker failed"}],
+                    "runs": [{"error": "worker failed"}],
                 },
                 "s2",
             ),
@@ -4239,6 +4239,96 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_c
                     "summaries": {t2: "worker failed"},
                     "errors": {},
                     "block_kinds": {t1: "transient", t2: "needs_input"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+    ]
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome == "infra"
+
+
+def test_a_429_blocked_card_unblocked_and_done_without_delivered_result_records_ceiling(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any
+) -> None:
+    """When a sibling card is reported done but delivered no result, an unblocked card records ceiling infra."""
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done but with null result and no run summary -> t2 retires
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": None}, "runs": []},
+                "s2",
+            ),
+            _text("t2 done."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                return ""
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                # Settle read: failure_cards is [t1].
+                # Board shows t1 was unblocked to running.
+                payload = {
+                    "statuses": {t1: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
                     "error": None,
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"

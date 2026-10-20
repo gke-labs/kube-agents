@@ -2811,6 +2811,29 @@ def test_a_failed_card_with_worker_429_error_on_inject_remains_graded(
     assert not infra(result)
 
 
+def test_worker_authored_kanban_block_with_transient_kind_and_infra_prefix_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker-authored kanban_block with transient kind and hermes rate limit prefix is infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert not result.output
+
+
 def test_worker_authored_kanban_block_with_non_transient_kind_on_inject_remains_graded(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
