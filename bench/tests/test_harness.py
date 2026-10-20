@@ -3883,10 +3883,10 @@ def test_extract_infra_failure_reason_classifier() -> None:
     )
 
 
-def test_poll_loop_refreshes_retired_card_poll_failure_messages_remains_graded(
+def test_a_429_blocked_card_unblocked_and_running_at_settle_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """A retired card in poll_failure_messages is refreshed/evicted on subsequent polls and remains graded."""
+    """A card 429-blocked and retired, then unblocked and still running at settle, falls back to infra."""
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -3943,18 +3943,26 @@ def test_poll_loop_refreshes_retired_card_poll_failure_messages_remains_graded(
                 # keeps t1 in poll_failure_messages as it retires.
                 return ""
             elif idx == 2:
-                # Poll 1: polled_ids = outstanding [t2] + stored [t1]. t1 has
-                # re-run and failed for its own fault with no text, so this
-                # poll is the only reader that can evict its stored prefix.
+                # Poll 1: poll reads outstanding [t2] only; t1 is retired so poll
+                # mirror stays off it, preserving latest[t1]=blocked and stored prefix.
                 payload = {
-                    "statuses": {t1: "failed", t2: "running"},
+                    "statuses": {t2: "running"},
                     "summaries": {},
                     "errors": {},
                     "block_kinds": {},
                     "error": None,
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
-            # Final settle read fails
+            elif idx == 3:
+                # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is running.
+                payload = {
+                    "statuses": {t1: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             return ""
         return ""
 
@@ -3962,7 +3970,9 @@ def test_poll_loop_refreshes_retired_card_poll_failure_messages_remains_graded(
 
     result = KubeAgentsHarness().run("Check cards.")
 
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
 
 
 def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
