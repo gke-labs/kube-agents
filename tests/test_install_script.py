@@ -6777,7 +6777,8 @@ class PlatformAgentModeTest(unittest.TestCase):
         start = text.index('        local menu_mode_to_save=""\n', arm)
         end = text.index("        fi\n", start) + len("        fi\n")
         block = text[start:end]
-        self.assertIn('mirrored_first_install_mode "${THIRD_PARTY_REGISTRY_PREFIX%/}"', block)
+        self.assertIn('local menu_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"', block)
+        self.assertIn('mirrored_first_install_mode "${menu_third_party_prefix%/}"', block)
         body = (
             f"gcloud() {{ echo '{_GCLOUD_CLUSTER_NOT_FOUND}' >&2; return 1; }}\n"
             "PLATFORM_AGENT_MODE_SETTLED=true\n"

@@ -6192,7 +6192,8 @@ run_menu_system() {
           PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
             adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || return 1
           # The menu has no flag, so the recorded prefix is the mirror.
-          mirrored_first_install_mode "${THIRD_PARTY_REGISTRY_PREFIX%/}"
+          local menu_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+          mirrored_first_install_mode "${menu_third_party_prefix%/}"
           export PLATFORM_AGENT_MODE="$PLATFORM_AGENT_MODE_FALLBACK"
           [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] || menu_mode_to_save="$PLATFORM_AGENT_MODE_FALLBACK"
         fi
