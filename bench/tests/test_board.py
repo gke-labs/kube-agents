@@ -537,3 +537,32 @@ def test_read_session_cards_newest_run_without_summary_does_not_return_older_sum
     assert read is not None
     assert read.cards[FRONT]["summary"] is None
 
+
+def test_read_session_cards_returns_error_from_last_failure_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'failed', last_failure_error = ? WHERE id = ?",
+            ("provider rate limit: API retries exhausted (failure_reason=rate_limit): 429", FRONT),
+        )
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT])
+    assert read is not None
+    assert read.cards[FRONT]["error"] == "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+
+
+def test_read_session_cards_returns_error_from_task_runs_when_last_failure_error_is_null(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, error) VALUES (?, 'platform', 'failed', ?)",
+            (FRONT, "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"),
+        )
+    read = board.read_session_cards(local_shell(tmp_path, monkeypatch), SESSION, 5, want=[FRONT])
+    assert read is not None
+    assert read.cards[FRONT]["error"] == "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+
+

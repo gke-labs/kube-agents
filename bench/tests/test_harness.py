@@ -3301,7 +3301,7 @@ def test_a_delegated_worker_cleared_rate_limit_rerun_remains_graded(
 def test_a_cleared_rate_limit_card_evicted_from_poll_fallback_remains_graded(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """When a poll-captured rate-limit card is later reported running, it is evicted from poll_failure_messages.
+    """When a poll-captured rate-limit card is later reported running by a poll, it is evicted from poll_failure_messages.
 
     If the subsequent re-run fails for its own fault with no summary/error and final board read fails,
     the stale rate-limit message is not handed to _settle and the run remains graded.
@@ -3309,7 +3309,7 @@ def test_a_cleared_rate_limit_card_evicted_from_poll_fallback_remains_graded(
     worker_failure = "Worker failed: syntax error in script."
     stub_agent.turns = [
         _create_turn(),
-        _show_turn("running", call_id="call_show_1"),
+        _turn(_text("still looking")),
         _show_turn("blocked", body=worker_failure, result=worker_failure, call_id="call_show_2"),
     ]
     reads = []
@@ -3350,6 +3350,126 @@ def test_a_cleared_rate_limit_card_evicted_from_poll_fallback_remains_graded(
 
     assert not result.has_errors()
     assert worker_failure in result.output
+
+
+def test_a_cleared_rate_limit_card_evicted_by_status_turn_running_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports a card running, it is evicted from poll_failure_messages even if poll exec fails."""
+    worker_failure = "Worker failed: syntax error in script."
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("running", call_id="call_show_1"),
+        _show_turn("blocked", body=worker_failure, result=worker_failure, call_id="call_show_2"),
+    ]
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Intermediate poll, status turn clamped read, and final read fail
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert worker_failure in result.output
+
+
+def test_status_turn_re_read_retired_card_refreshes_or_evicts_poll_fallback_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn re-reads a card already retired from outstanding, it refreshes or evicts the stored prefix."""
+    prefix = (
+        "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+        'HTTP 429 ... "TPM quota exhausted"'
+    )
+    task_1 = "task-t1"
+    task_2 = "task-t2"
+    stub_agent.turns = [
+        _turn(
+            *_call("kanban_create", {"title": "alpha"}, {"task_id": task_1}, "call_create_1"),
+            *_call("kanban_create", {"title": "beta"}, {"task_id": task_2}, "call_create_2"),
+            _text("Created two tasks."),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": task_1},
+                {
+                    "task": {"id": task_1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": prefix}],
+                },
+                "call_show_1",
+            ),
+            _text(f"Task {task_1} is blocked."),
+        ),
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": task_1},
+                {
+                    "task": {"id": task_1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [
+                        {"summary": prefix},
+                        {"summary": None},
+                    ],
+                },
+                "call_show_2a",
+            ),
+            *_call(
+                "kanban_show",
+                {"task_id": task_2},
+                {
+                    "task": {"id": task_2, "status": "done"},
+                    "runs": [],
+                },
+                "call_show_2b",
+            ),
+            _text("Task 1 failed worker re-run, Task 2 is done."),
+        ),
+    ]
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {task_1: "blocked", task_2: "running"},
+                    "summaries": {task_1: prefix},
+                    "errors": {},
+                    "block_kinds": {task_1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
 
 
 def test_a_failure_status_card_with_empty_messages_evicted_from_poll_fallback_remains_graded(

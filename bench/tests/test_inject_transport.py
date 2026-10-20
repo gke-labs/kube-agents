@@ -2696,6 +2696,29 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     assert "rate_limit" in result.errors[0]
 
 
+def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card on the board failed with a rate limit error marks the repetition as infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "failed",
+        error=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+
+
 def test_worker_authored_kanban_block_with_infra_prefix_on_inject_remains_graded(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2772,10 +2795,10 @@ def test_a_triage_card_with_non_transient_block_kind_on_inject_remains_graded(
     assert any(harness.DELEGATION_CEILING_MARKER in err for err in result.errors)
 
 
-def test_a_blocked_card_with_rate_limit_summary_on_inject_fallback_when_final_exec_fails(
+def test_a_blocked_card_with_rate_limit_summary_on_inject_does_not_issue_board_present_exec(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When the final kubectl exec fails on inject lane, it falls back to read_summaries."""
+    """Inject lane resolves failure summaries directly from read_session_cards without issuing BOARD_PRESENT exec."""
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2788,19 +2811,20 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_fallback_when_final_ex
         block_kind="transient",
     )
     real = local_shell(tmp_path, monkeypatch)
+    scripts: list[str] = []
 
-    def flaky(script: str, timeout: float) -> str:
-        if board.BOARD_PRESENT in script:
-            return ""  # final exec fails
+    def recording_shell(script: str, timeout: float) -> str:
+        scripts.append(script)
         return real(script, timeout)
 
-    monkeypatch.setattr(harness, "_agent_shell", flaky)
+    monkeypatch.setattr(harness, "_agent_shell", recording_shell)
 
     result = KubeAgentsHarness().run("check the fleet")
 
     assert infra(result)
     assert result.output == ""
     assert "rate_limit" in result.errors[0]
+    assert not any(board.BOARD_PRESENT in s for s in scripts)
 
 
 def test_a_cleared_rate_limit_rerun_on_inject_remains_graded(

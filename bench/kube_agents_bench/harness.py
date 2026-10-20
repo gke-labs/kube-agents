@@ -3119,7 +3119,7 @@ class KubeAgentsHarness(AgentHarness):
                     poll_failure_messages.pop(t, None)
             needed_read = [
                 t for t, s in fresh_reported.items()
-                if t in outstanding and s in _FAILURE_STATUSES
+                if t in awaited and s in _FAILURE_STATUSES
             ]
             if needed_read:
                 remaining_turn = max(0.0, deadline - time.monotonic())
