@@ -64,7 +64,9 @@ runs no command of its own except through `context["run_cmd"]`.
 
 This file holds what the modules share: the result shape, the read kinds and context keys,
 the quantity parser, a pod's owner and requests, node helpers, pod templates with their
-selectors and node-pool pins, image tags, the cgroup transition, and `shell_forks(script)`,
+selectors and node-pool pins, image tags, the cgroup transition, `shell_scripts(command)`,
+the scripts a container's command hands a shell through `-c`, `shell_words(script)`, the
+programs such a script names, and `shell_forks(script)`,
 whether a `sh -c` script puts a command in the background (True or False; None when the
 script cannot be read: an unterminated quote, heredoc or expansion, which a rule reports as
 unknown).
@@ -286,6 +288,12 @@ SHELL_FORK_MARK = " & "
 # a crafted container command from costing the report more than a bounded walk.
 SHELL_NESTING_CAP = 64
 PATH_SEPARATOR = "/"
+# A shell `-c` (or `-ec`, `-lc`: any short flag group carrying `c`, SHELL_COMMAND_FLAG_RE)
+# takes its script as the next word; `["sh", "-c", "a && b"]` is the script at offset 2 from
+# the shell. A script's words, for a rule that asks which programs it runs, are what is left
+# between whitespace and the operator characters, each word's last path component.
+SHELL_SCRIPT_OFFSET = 2
+SHELL_WORD_SPLIT_RE = re.compile("[" + re.escape(SHELL_OPERATOR_CHARS) + r"\s]+")
 
 
 # -------------------------------------------------------------------- results and reads
@@ -683,6 +691,29 @@ def image_repository_and_tag(image: str) -> tuple[str, str]:
 
 
 # ------------------------------------------------------------------------ shell scripts
+
+
+def shell_scripts(command: list) -> list[str]:
+    """The scripts a command list hands a shell: for every shell program in it (SHELL_PROGRAMS,
+    by last path component) followed by a flag group carrying `c`, the word after the flag.
+    `["tini", "--", "bash", "-c", "nginx & php-fpm"]` -> `["nginx & php-fpm"]`."""
+    words = [str(w) for w in command or []]
+    scripts = []
+    for index, word in enumerate(words):
+        script_index = index + SHELL_SCRIPT_OFFSET
+        if word.rsplit(PATH_SEPARATOR, 1)[-1] in tables.SHELL_PROGRAMS and script_index < len(words) and tables.SHELL_COMMAND_FLAG_RE.match(words[index + 1]):
+            scripts.append(words[script_index])
+    return scripts
+
+
+def shell_words(script) -> list[str]:
+    """The programs and arguments a `-c` script names, by last path component: the words between
+    whitespace and the shell's operator characters. `"/sbin/modprobe br_netfilter && exec /agent"`
+    -> `["modprobe", "br_netfilter", "exec", "agent"]`. Quoting is not read: a program named
+    inside a quoted string counts as named."""
+    if not isinstance(script, str):
+        return []
+    return [word.rsplit(PATH_SEPARATOR, 1)[-1] for word in SHELL_WORD_SPLIT_RE.split(script) if word]
 
 
 def shell_forks(script) -> bool | None:

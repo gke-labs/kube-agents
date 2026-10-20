@@ -437,9 +437,26 @@ class NodeImageCoupledAgentTest(unittest.TestCase):
             "containers": [{"name": "a", "image": "x", "command": ["/bin/sh", "-c", "modprobe ip_vs && exec agent"]}],
             "volumes": [{"name": "mods", "hostPath": {"path": "/lib/modules"}}, {"name": "bins", "hostPath": {"path": "/home/kubernetes/bin"}}],
         }
-        self.assertEqual(node_image_coupled_agent.couplings(spec), ["selects on node-image label cloud.google.com/gke-os-distribution", "mounts /lib/modules from the node", "mounts /home/kubernetes/bin from the node"])
+        self.assertEqual(node_image_coupled_agent.couplings(spec), ["selects on node-image label cloud.google.com/gke-os-distribution", "mounts /lib/modules from the node", "mounts /home/kubernetes/bin from the node", "runs modprobe"])
         spec["containers"][0]["command"] = ["modprobe", "ip_vs"]
         self.assertIn("runs modprobe", node_image_coupled_agent.couplings(spec))
+
+    def test_a_module_load_inside_a_shell_script_is_a_risk(self):
+        # The program is a word of the `-c` script, not of argv: the shared script walk finds it
+        # under a path, after `&&`, and inside args as well as command; a program the script only
+        # names in passing (a file called modprobe.conf) is not a load.
+        agent = template("DaemonSet", "module-loader", {"hostNetwork": True, "containers": [{"name": "agent", "image": "x", "command": ["/bin/sh", "-c", "modprobe br_netfilter && exec /agent"]}]})
+        out = run(node_image_coupled_agent, [agent])
+        self.assertEqual((out["blocking"], out["unknown"]), ([], []))
+        self.assertEqual((out["risks"][0]["object"], out["risks"][0]["couplings"]), ("seeded-shapes/module-loader", ["runs modprobe"]))
+        self.assertIn("coupled to the node image: runs modprobe; pool(s) default-pool are below the target", out["risks"][0]["detail"])
+        for command in (["bash", "-ec", "/sbin/insmod /lib/modules/x.ko; /agent"], ["tini", "--", "sh", "-lc", "exec modprobe -a ip_vs ip_vs_rr"]):
+            spec = {"hostNetwork": True, "containers": [{"name": "a", "image": "x", "args": command}]}
+            self.assertEqual(node_image_coupled_agent.couplings(spec), ["runs " + ("insmod" if "insmod" in command[-1] else "modprobe")], command)
+        spec = {"hostNetwork": True, "containers": [{"name": "a", "image": "x", "command": ["/bin/sh", "-c", "cat /etc/modprobe.conf && exec /agent"]}]}
+        self.assertEqual(node_image_coupled_agent.couplings(spec), [])
+        self.assertEqual(rules.shell_scripts(["sh", "-c"]), [])
+        self.assertEqual(rules.shell_words(None), [])
 
     def test_clean_without_host_network_without_coupling_or_in_managed_namespaces(self):
         items = [

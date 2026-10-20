@@ -46,8 +46,6 @@ NOTE_SINGLE_PROCESS = "{kind} {object} container {container} {shape} on pool {po
 NOTE_STAYS = "{kind} {object} container {container} {shape} on pool {pool}; {reason}; not a risk at this target"
 NOTE_BELOW_KUBELET = "{kind} {object} container {container} {shape} on pool {pool}; the target {target} is below 1.{minor}, where the kubelet starts the group kill; not a risk at this target"
 WORKLOADS_UNREAD_DETAIL = "DaemonSets and CronJobs not read ({reason}); Deployments and StatefulSets graded"
-# A shell `-c` (or `-ec`, `-lc`) takes its script as the next word.
-SHELL_SCRIPT_OFFSET = 2
 
 
 def _program(word: str) -> str:
@@ -71,13 +69,11 @@ def multi_process_shape(container: dict) -> str | None:
         if program in tables.SUPERVISOR_PROGRAMS:
             return SUPERVISOR_SHAPE.format(program=program)
     unreadable = False
-    for index, program in enumerate(programs):
-        script_index = index + SHELL_SCRIPT_OFFSET
-        if program in tables.SHELL_PROGRAMS and script_index < len(command) and tables.SHELL_COMMAND_FLAG_RE.match(command[index + 1]):
-            forks = rules.shell_forks(command[script_index])
-            if forks:
-                return SHELL_FORK_SHAPE
-            unreadable = unreadable or forks is None
+    for script in rules.shell_scripts(command):
+        forks = rules.shell_forks(script)
+        if forks:
+            return SHELL_FORK_SHAPE
+        unreadable = unreadable or forks is None
     repository = _repository(container.get("image") or "")
     for repo in tables.MULTI_PROCESS_IMAGE_REPOS:
         if repository == repo or repository.endswith(rules.PATH_SEPARATOR + repo):

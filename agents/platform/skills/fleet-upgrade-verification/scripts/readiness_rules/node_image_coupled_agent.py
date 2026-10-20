@@ -3,7 +3,9 @@ Entry 17 of docs/designs/upgrade-failure-catalogue.md, a node networking agent f
 new image: a per-node agent on the node's own network that depends on the node image, through
 a selector on a node-image label (`NODE_IMAGE_LABELS`), a mount of the kernel's module tree or
 the network plugin's directories (`KERNEL_MODULE_HOST_PATHS`, `CNI_HOST_PATHS`), or a command
-that loads a kernel module, breaks when a node upgrade changes the image under it.
+that loads a kernel module (`KERNEL_MODULE_COMMANDS`, as a word of the container's command or
+args or of a script they hand a shell through `-c`, read with the package's
+`shell_scripts` and `shell_words`), breaks when a node upgrade changes the image under it.
 
 Every such DaemonSet with `hostNetwork: true` outside the system namespaces is a `risk`, named
 with its couplings; the detail names the pools below the target, whose image this upgrade
@@ -47,7 +49,10 @@ def couplings(spec: dict) -> list[str]:
         if path.startswith(tables.KERNEL_MODULE_HOST_PATHS + tables.CNI_HOST_PATHS):
             out.append(MOUNT_COUPLING.format(path=path))
     for container in rules.containers(spec):
-        words = [str(w).rsplit(rules.PATH_SEPARATOR, 1)[-1] for w in (container.get("command") or []) + (container.get("args") or [])]
+        command = (container.get("command") or []) + (container.get("args") or [])
+        words = [str(w).rsplit(rules.PATH_SEPARATOR, 1)[-1] for w in command]
+        for script in rules.shell_scripts(command):
+            words.extend(rules.shell_words(script))
         for program in tables.KERNEL_MODULE_COMMANDS:
             if program in words:
                 out.append(COMMAND_COUPLING.format(program=program))
