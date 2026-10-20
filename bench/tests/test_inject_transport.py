@@ -2714,8 +2714,10 @@ def test_a_card_unblocked_between_poll_and_final_read_on_inject_is_infrastructur
 
     def _on_read(n: int) -> None:
         if n == 2:
-            # On the deliverable read (want_cards), card has unblocked and is running
-            set_card(tmp_path, CARD_A, "running", block_kind="transient")
+            # On the deliverable read (want_cards) the card has been unblocked
+            # (``unblock_task`` -> ready) and not yet claimed, so the blocked
+            # run's row is still the newest ``task_runs`` row.
+            set_card(tmp_path, CARD_A, "ready", block_kind="transient")
 
     monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
 
@@ -2724,6 +2726,42 @@ def test_a_card_unblocked_between_poll_and_final_read_on_inject_is_infrastructur
     assert infra(result)
     assert result.output == ""
     assert "rate_limit" in result.errors[0]
+
+
+def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card unblocked and re-claimed running on the deliverable read has a fresh run row and remains graded."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            # On deliverable read (want_cards), card was unblocked and re-claimed running with fresh run row
+            set_card(tmp_path, CARD_A, "running", block_kind="transient")
+            conn = sqlite3.connect(tmp_path / "sessions" / "test-session" / "board.db")
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status) VALUES (?, 'platform', 'running')",
+                (CARD_A,),
+            )
+            conn.commit()
+            conn.close()
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
 
 
 def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
