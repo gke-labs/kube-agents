@@ -376,16 +376,13 @@ class NightlySortedSectionTest(unittest.TestCase):
         self.assertEqual(len(everything), len(set(everything)))
 
     def test_every_case_in_the_section_has_its_reason_above_it(self):
-        # The marker's own stanza is nobody's reason: drop it before parsing, so
-        # an entry placed directly under it without a blank line has none.
-        lines = self.tail.splitlines()
-        i = 1
-        while i < len(lines) and lines[i].lstrip().startswith("#"):
-            i += 1
-        # The parser keys a reason by its entry, here a ./tasks/<id>/task.yaml path.
+        # The parser's own boundary rule keeps the marker's stanza from being
+        # anyone's reason: a comment separated from the next entry by a blank
+        # line isn't a reason (test_a_blank_line_follows_the_marker_stanza).
+        # It keys a reason by its entry, here a ./tasks/<id>/task.yaml path.
         reasons = {
             eval_rosters.CASE_ENTRY_RE.match(entry).group(1): reason
-            for entry, reason in eval_rosters.parse_lane_exclusions("\n".join(lines[i:])).items()
+            for entry, reason in eval_rosters.parse_lane_exclusions(self.tail).items()
             if eval_rosters.CASE_ENTRY_RE.match(entry)
         }
         for case in self.sorted_section:
@@ -394,6 +391,17 @@ class NightlySortedSectionTest(unittest.TestCase):
                     reasons.get(case),
                     "each case in the sorted section needs its own # lines directly above its entry; "
                     "a reason shared with the entry above it doesn't count")
+
+    def test_a_blank_line_follows_the_marker_stanza(self):
+        lines = self.tail.splitlines()
+        i = 0
+        while i < len(lines) and lines[i].lstrip().startswith("#"):
+            i += 1
+        if i < len(lines):  # an empty section ends at the stanza
+            self.assertEqual(
+                lines[i].strip(), "",
+                "leave a blank line between the sorted-section marker's comment block and the first "
+                "case's reason, so the marker's text isn't read as that case's reason")
 
     def test_the_marker_must_appear_exactly_once(self):
         entry = "./tasks/a-case/task.yaml\n"
@@ -495,7 +503,13 @@ class SplitLostNothingTest(unittest.TestCase):
         )
         # A demotion recorded with None, or a withdrawn seat, is held in the
         # sorted section instead; nothing else may leave the frozen part.
-        self.assertEqual(frozen, [c for c in pinned if c not in ALLOWED_IN_THE_SORTED_SECTION])
+        self.assertEqual(
+            frozen,
+            [c for c in pinned if c not in ALLOWED_IN_THE_SORTED_SECTION],
+            "the nightly file's frozen part (every entry above the sorted-section marker) changed: "
+            "a new case goes in the sorted section at the foot of the file; a demotion is recorded "
+            "in DEMOTED_AFTER_THE_SPLIT with None and a withdrawn seat in WITHDRAWN_TO_SORTED",
+        )
 
     def test_a_demoted_case_is_in_the_nightly_only(self):
         for case in DEMOTED:

@@ -58,7 +58,7 @@
 #
 # WHERE A NEW CASE GOES. In the sorted section at the foot of this file, at
 # its place in case-id order, with its reason as the `#` lines directly above
-# its entry. scripts/test_eval_rosters.py holds that section sorted and every
+# its entry and a blank line before the reason. scripts/test_eval_rosters.py holds that section sorted and every
 # entry in it to a reason. A line that comes back from the presubmit (a
 # demotion, a withdrawn seat) goes there too. The entries above that section
 # are frozen in the order they landed.
@@ -862,6 +862,7 @@
 
 # ── New cases, sorted by case id (#3495) ─────────────────────────────────────
 # Everything below is in case-id order, and each entry has its reason as the
-# `#` lines directly above it, separated from the next case by a blank line.
+# `#` lines directly above it, with a blank line before the reason (after
+# this block too).
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
