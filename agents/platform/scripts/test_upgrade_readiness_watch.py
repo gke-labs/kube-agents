@@ -1054,6 +1054,17 @@ class Budget(Base):
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
         self.assertFalse(self.marker().exists())
 
+    def test_a_tick_whose_every_number_is_unresolved_names_six_and_counts_the_rest(self) -> None:
+        numbers = [f"12345{i}" for i in range(8)]
+        versions = envelope([member(f"c{i}", "lagging", project=f"proj-{i}") for i in range(8)])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(numbers)}):
+            sandbox = FakeSandbox(versions, aliases={n: f"proj-{i}" for i, n in enumerate(numbers)}, describe_down=set(numbers))
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("ProjectUnresolved: no project was read under a key", out)
+        self.assertEqual(out.count("the project number did not resolve"), watch.MAX_NAMES_IN_LINE)
+        self.assertIn(watch.NAMES_OVERFLOW.format(more=2), out)
+
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
@@ -1584,6 +1595,18 @@ class DeclaredScope(Base):
         self.assertIn("; p2: refused by the report script: the install's declared scope lists p2 but the install could not read it", out)
         self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, sorted([["p1", watch.REFUSAL_OUTSIDE], ["p2", watch.REFUSAL_UNREAD.format(outcome="denied")]])])
 
+    def test_an_all_refused_tick_names_six_refusals_and_counts_the_rest(self) -> None:
+        """Bounded as the partial line is: a roster of outside projects posts one line
+        of six refusals and a count, and the marker still keys on every one."""
+        self.declare_scope(["mgmt"])
+        roster = [f"p{i}" for i in range(1, 9)]
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(roster)}):
+            code, out = self.run_tick(FakeSandbox(envelope([])))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("refused by the report script"), watch.MAX_NAMES_IN_LINE)
+        self.assertIn(watch.NAMES_OVERFLOW.format(more=2), out)
+        self.assertEqual([project for project, _ in json.loads(self.marker().read_text())[1]], roster)
+
     def test_a_refused_project_is_its_own_kind_of_partial_so_a_later_outage_is_still_announced(self) -> None:
         """A roster project the declared scope does not list is refused every
         tick: the partial line names it once, with the remedy on the install,
@@ -1680,7 +1703,8 @@ class DeclaredScope(Base):
             "it lists p1; the remedy is on the install, not this job: name the project in spec.scope, "
             "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)",
         )
-        # The failed tick writes nothing of its own to the ledger but the standing-outside record, which the next tick's hold reads.
+        # The failed tick writes nothing of its own to the ledger but the standing-outside record (and any id it learned, none
+        # here), which the next tick's hold reads.
         self.assertEqual(self.ledger()["standing_outside"], {"p2": []})
         self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["table_runs"]), (None, {}, {}))
 
@@ -1716,6 +1740,34 @@ class DeclaredScope(Base):
         asked = [argv[1] for kind, argv, _ in sandbox.calls if kind == "versions"]
         self.assertEqual(sorted(asked), ["123456", "mgmt"], "legacy-proj is the number's project, run once")
         self.assertEqual(out.count("does not list legacy-proj"), 1)
+
+    def test_both_spellings_refused_on_the_tick_the_id_is_learned_are_one_refusal_so_the_next_tick_is_quiet(self) -> None:
+        """The number was stamped by an earlier tick that did not learn its id, so the id spelling,
+        never run, goes first; the number runs after it, unlearned, and its refusal teaches the id.
+        The partial line keys the project once, so the next tick, which runs it once, posts nothing."""
+        self.declare_scope(["mgmt"])
+        ledger = watch.empty_ledger()
+        ledger[watch.TABLE_RUNS_KEY] = {"123456": (NOW - timedelta(days=1)).isoformat()}
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
+        versions = envelope([member("a", "current", project="mgmt")])
+        outs = []
+        for day in range(2):
+            with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "mgmt,123456,legacy-proj"}), mock.patch.object(watch, "now_utc", return_value=NOW + timedelta(days=day)):
+                code, out = self.run_tick(FakeSandbox(versions, aliases={"123456": "legacy-proj"}))
+            self.assertEqual(code, 0)
+            outs.append(out)
+        self.assertIn("does not list legacy-proj", outs[0])
+        self.assertEqual(outs[1], "", "the same refusal, keyed once, posts nothing the next day")
+
+    def test_an_all_refused_ticks_marker_keys_a_number_by_the_id_it_learned(self) -> None:
+        """Whichever spelling runs, the key is the project's: the number, refused naming
+        legacy-proj, is keyed as legacy-proj."""
+        self.declare_scope(["mgmt"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "123456,legacy-proj"}):
+            code, out = self.run_tick(FakeSandbox(envelope([]), aliases={"123456": "legacy-proj"}))
+        self.assertEqual(code, 0)
+        self.assertIn("the tick failed", out)
+        self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["legacy-proj", watch.REFUSAL_OUTSIDE]]])
 
     def test_an_all_refused_ticks_failure_line_is_keyed_on_the_refusal_not_its_text(self) -> None:
         """The failure line names the resolved set, which moves with the scope's

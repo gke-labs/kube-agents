@@ -497,8 +497,9 @@ ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_UNGRADED_KEY = "ungraded"
 # A failed tick writes nothing to the ledger but the standing-outside record
-# (``keep_standing``); the failure it announced is kept in this file beside
-# it, so the same failure is posted once and its recovery once.
+# and the ids it learned (``keep_standing``); the failure it announced is kept
+# in this file beside it, so the same failure is posted once and its recovery
+# once.
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 RECOVERED_LINE = "{prefix} watch: the tick runs again"
 DETAIL_KEY = "detail"
@@ -908,7 +909,7 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     (``ReportRefused``), so the partial line tells it from a sandbox that
     fails. Until a reconcile tick writes a snapshot that answers (the first on
     a new install, the next on one whose snapshot predates the ``boundary``
-    key) the render answers: the management project is the one project read,
+    key and declares nothing) the render answers: the management project is the one project read,
     and every project the declaration names explicitly goes as unread, so the
     report refuses another project, with that reason, until that tick. The whole set goes because nothing
     records this argv: it is one line of the loader on the sandbox command's
@@ -1201,12 +1202,12 @@ def partial_signature(read_errors: list) -> str:
     project and the cause as well, since that is a standing, per-project
     condition only the operator clears, named nowhere but this line: a second
     refused project, or a refusal whose cause (and so remedy) changed, is a
-    new line, while the same refusal stays quiet."""
+    new line, while the same refusal stays quiet. One pair per project, as
+    the ungraded key has: both spellings of a project, run on the tick its id
+    is learned, are one refusal, as the next tick that runs it once says."""
     kinds = {error_kind(error) for error in read_errors}
-    refusals = sorted(
-        [str(error.get(MEMBER_ID_KEYS[0])), error_kind(error)]
-        for error in read_errors
-        if error_kind(error).startswith(ERROR_KIND_REFUSED_PREFIX)
+    refusals = signature_pairs(
+        {str(error.get(MEMBER_ID_KEYS[0])): error_kind(error) for error in read_errors if error_kind(error).startswith(ERROR_KIND_REFUSED_PREFIX)}
     )
     return json.dumps(sorted(kind for kind in kinds if not kind.startswith(ERROR_KIND_REFUSED_PREFIX)) + refusals)
 
@@ -1632,14 +1633,16 @@ def versions_by_project(
             chosen = next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
             if isinstance(chosen, ReportRefused):
                 # Every run was refused: the line names each refusal it is keyed on, the
-                # project before its reason when there is more than one.
+                # project before its reason when there is more than one, bounded as the
+                # partial line is; the marker keys on every refusal.
                 if len(failed) > 1:
-                    chosen = ReportRefused(REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=project, message=exc) for project, exc in failed.items()), chosen.cause)
-                chosen.signature = refused_tick_signature(failed)
+                    chosen = ReportRefused(shown_names([PARTIAL_REASON.format(project=project, message=exc) for project, exc in failed.items()], REASONS_SEPARATOR), chosen.cause)
+                # Keyed by the id learned for each spelling, so the key is the same whichever spelling ran.
+                chosen.signature = refused_tick_signature({keyed(project): exc for project, exc in failed.items()})
             raise chosen
         if unresolved:
             raise ProjectUnresolved(
-                UNRESOLVED_TICK_DETAIL.format(reasons=REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()))
+                UNRESOLVED_TICK_DETAIL.format(reasons=shown_names([PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()], REASONS_SEPARATOR))
             )
     # Both budget shapes are one kind: the announcement must not re-post when a
     # cut-short run comes and goes beside the projects never reached.
@@ -1987,7 +1990,7 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     is due, the readiness runs, the reports and the ledger's save. ``started``
     is the tick's first ``time.monotonic`` instant, which the budget counts
     from. Raises out with the ledger unsaved when a step fails; ``tick`` keeps
-    the standing-outside record then."""
+    the standing-outside record and the learned ids then."""
     now = now_utc()
     days = refresh_days()
     ledger_path = home / LEDGER_FILE_NAME
@@ -2131,7 +2134,7 @@ def announce_failure_once(detail: str, key: str | None = None) -> bool:
     the detail names can change membership without re-posting a standing
     refusal), and the next clean tick posts a recovery line. The marker lives
     beside the ledger, to which a failed tick writes nothing but the
-    standing-outside record; a marker that cannot be read or written leaves
+    standing-outside record and the learned ids; a marker that cannot be read or written leaves
     the line posted every time, since nothing can remember it."""
     try:
         marker = watch_home() / FAILURE_MARKER_FILE_NAME
