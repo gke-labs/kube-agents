@@ -120,10 +120,11 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - intree-pd-volume
+      # The `in-tree-volumes: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?in-tree-volumes: persistentvolume intree-pd \(in-tree gcepersistentdisk [a-z0-9-]+, claim seeded-shapes/intree-pd, [a-z]+\) attaches through csi migration[^\n]*$'
+        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?(?:in-tree-volumes: )?persistentvolume intree-pd \(in-tree gcepersistentdisk [a-z0-9-]+, claim seeded-shapes/intree-pd, [a-z]+\) attaches through csi migration[^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?in-tree-volumes: persistentvolume intree-pd \(in-tree gcepersistentdisk [a-z0-9-]+, claim seeded-shapes/intree-pd, [a-z]+\) attaches through csi migration)[^\n]*$'
+        - '(?m)^{cluster:a}/intree-pd: kind [^;\n]+; pd csi driver add-on: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?(?:in-tree-volumes: )?persistentvolume intree-pd \(in-tree gcepersistentdisk [a-z0-9-]+, claim seeded-shapes/intree-pd, [a-z]+\) attaches through csi migration)[^\n]*$'
 
   - name: no-invented-cves
     role: objective

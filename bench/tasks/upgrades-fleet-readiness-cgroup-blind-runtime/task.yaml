@@ -137,10 +137,11 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - cgroup-blind-runtime
+      # The `cgroup-v2-runtime: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?cgroup-v2-runtime: deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+[^\n]*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?cgroup-v2-runtime: deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+)[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])cgroup-blind-jvm(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:cgroup-v2-runtime: )?deployment seeded-shapes/cgroup-blind-jvm:? container [a-z0-9-]+ runs docker\.io/library/eclipse-temurin:8u302-b08-jre \(jdk 8u302, below 8u372\) on pool [a-z0-9-]+)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

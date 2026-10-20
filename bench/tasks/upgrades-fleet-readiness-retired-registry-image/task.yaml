@@ -135,10 +135,11 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - retired-registry-image
+      # The `retired-registry: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?retired-registry: deployment seeded-shapes/legacy-registry-pull: container [a-z0-9-]+ pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\)[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container [a-z0-9-]+ pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\)[^\n]*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?retired-registry: deployment seeded-shapes/legacy-registry-pull: container [a-z0-9-]+ pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\))[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])legacy-registry-pull(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:retired-registry: )?deployment seeded-shapes/legacy-registry-pull: container [a-z0-9-]+ pulls k8s\.gcr\.io/pause:3\.9 from k8s\.gcr\.io \(frozen 2023-04-03, a redirect to registry\.k8s\.io since 2023-03-20\))[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

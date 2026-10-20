@@ -144,10 +144,11 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - stale-client-skew
+      # The `client-addon-skew: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?client-addon-skew: kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\)[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\)[^\n]*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?client-addon-skew: kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\))[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])stale-kubectl-client(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:client-addon-skew: )?kubectl v1\.29 from cronjob seeded-shapes/stale-kubectl-client \(image registry\.k8s\.io/kubectl:\s?v1\.29\.0\))[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

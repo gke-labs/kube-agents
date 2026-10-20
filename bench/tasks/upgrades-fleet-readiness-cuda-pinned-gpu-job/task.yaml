@@ -143,10 +143,11 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - cuda-pinned-gpu-job
+      # The `gpu-driver: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?gpu-driver: cronjob seeded-shapes/cuda-pinned-trainer:? requests nvidia\.com/gpu (?:on accelerator nvidia-l4 and no pool in the cluster carries that accelerator|with image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 on )[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer:? requests nvidia\.com/gpu (?:on accelerator nvidia-l4 and no pool in the cluster carries that accelerator|with image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 on )[^\n]*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?gpu-driver: cronjob seeded-shapes/cuda-pinned-trainer:? requests nvidia\.com/gpu (?:on accelerator nvidia-l4 and no pool in the cluster carries that accelerator|with image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 on ))[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])cuda-pinned-trainer(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:gpu-driver: )?cronjob seeded-shapes/cuda-pinned-trainer:? requests nvidia\.com/gpu (?:on accelerator nvidia-l4 and no pool in the cluster carries that accelerator|with image docker\.io/nvidia/cuda:12\.2\.0-base-ubuntu22\.04 on ))[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

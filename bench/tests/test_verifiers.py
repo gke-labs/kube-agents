@@ -9787,6 +9787,11 @@ def _case_grades(case: str, objective: str, text: str) -> bool:
             return v.verify(5.0).status == "pass"
 
 
+def _bare(cell: str) -> str:
+    """The cell as `report.json` carries it: the rule's text without the `<rule>: ` prefix the table adds."""
+    return cell.split(": ", 1)[1]
+
+
 def _without_cell_slot(text: str) -> str:
     return "\n".join(line.rsplit("; cell:", 1)[0] for line in text.splitlines())
 
@@ -9877,6 +9882,24 @@ def test_rule_cases_accept_the_cell_however_the_agent_wrapped_it(case, objective
 @pytest.mark.parametrize("wrap", _CELL_WRAPS)
 def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_changes_major(wrap):
     assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=_CONTAINERD_RISK_CELL)))
+
+
+@pytest.mark.parametrize(
+    "case,objective,text",
+    [
+        # The cell as report.json carries it, with no rule prefix: the table adds the prefix when it
+        # renders, so an agent that reads the JSON copies the bare text, which the cases admit.
+        (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report(_bare(_SURGE_CELL))),
+        (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(_bare(_DATAPLANE_RISK_CELL), _bare(_DATAPLANE_NOTE_LINE))),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_NOTE_LINE))),
+        (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_RISK_CELL))),
+        (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report(_bare(_INTREE_CELL))),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_NOTE_CELL))),
+        (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_RISK_CELL), grade="risk")),
+    ],
+)
+def test_rule_cases_accept_the_bare_json_text_without_the_rule_prefix(case, objective, text):
+    assert _case_grades(case, objective, text)
 
 
 @pytest.mark.parametrize("cell,grade", [(_DEFAULTS_LOOSENS_CELL, "note"), (_DEFAULTS_RISK_CELL, "risk")])
@@ -10063,6 +10086,12 @@ def test_workload_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, 
     text = _workload_line(name, kind, wrap.format(cell=cell))
     assert _workload_case_grades(case, f"{name}-line-does-not-block", text)
     assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", text)
+
+
+@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_CASES))
+def test_workload_rule_case_accepts_the_bare_json_text_without_the_rule_prefix(case):
+    name, kind, _rule, cell = _WORKLOAD_RULE_CASES[case]
+    assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", _workload_line(name, kind, _bare(cell)))
 
 
 @pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_OTHER_CELLS))

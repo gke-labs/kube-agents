@@ -215,10 +215,11 @@ verification_spec:
         - version-laggard
         - drift-outlier
         - zonal-skew-scheduling
+      # The `changed-defaults: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?changed-defaults: (?:[0-9]+ namespaces? follows? latest with no enforced check changing between|seeded-defaults follows latest;|namespace seeded-defaults: pod-security\.kubernetes\.io/enforce=baseline, pod-security\.kubernetes\.io/enforce-version=latest: follows the running minor)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:changed-defaults: )?(?:[0-9]+ namespaces? follows? latest with no enforced check changing between|seeded-defaults follows latest;|namespace seeded-defaults: pod-security\.kubernetes\.io/enforce=baseline, pod-security\.kubernetes\.io/enforce-version=latest: follows the running minor)[^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?changed-defaults: (?:[0-9]+ namespaces? follows? latest with no enforced check changing between|seeded-defaults follows latest;|namespace seeded-defaults: pod-security\.kubernetes\.io/enforce=baseline, pod-security\.kubernetes\.io/enforce-version=latest: follows the running minor))[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: kind cluster; namespaces whose pod security version follows the running minor: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:changed-defaults: )?(?:[0-9]+ namespaces? follows? latest with no enforced check changing between|seeded-defaults follows latest;|namespace seeded-defaults: pod-security\.kubernetes\.io/enforce=baseline, pod-security\.kubernetes\.io/enforce-version=latest: follows the running minor))[^\n]*$'
 
   # The prompt's "read only", grounded: the namespace's enforce-version label
   # still reads latest. The key carries dots, so it is quoted for the JSONPath

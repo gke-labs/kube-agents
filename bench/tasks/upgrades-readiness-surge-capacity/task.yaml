@@ -182,10 +182,11 @@ verification_spec:
         - readiness-surge-blocked
         - readiness-pinned-workload
         - version-laggard
+      # The `surge-capacity: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?surge-capacity: pool no-surge-pool \(maxsurge 0, maxunavailable 1; [0-9]+ node\(s\), not autoscaled\) removes a node before its replacement exists; draining its node [a-z0-9.-]+ leaves [^\n]*$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: ["''“‘<]?(?:surge-capacity: )?pool no-surge-pool \(maxsurge 0, maxunavailable 1; [0-9]+ node\(s\), not autoscaled\) removes a node before its replacement exists; draining its node [a-z0-9.-]+ leaves [^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?surge-capacity: pool no-surge-pool \(maxsurge 0, maxunavailable 1; [0-9]+ node\(s\), not autoscaled\) removes a node before its replacement exists; draining its node [a-z0-9.-]+ leaves )[^\n]*$'
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:surge-capacity: )?pool no-surge-pool \(maxsurge 0, maxunavailable 1; [0-9]+ node\(s\), not autoscaled\) removes a node before its replacement exists; draining its node [a-z0-9.-]+ leaves )[^\n]*$'
 
   # The other three slots are on GKE's default surge settings: a report that
   # names a pool there, or a rule or grade for one, has read a setting that is

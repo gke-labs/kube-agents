@@ -123,10 +123,11 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - containerd-socket-agent
+      # The `container-runtime: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?container-runtime: (?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe[^)\n]*\); no pool|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ [^\n]*mounting the runtime socket: [^\n]*daemonset seeded-shapes/node-runtime-probe)[^\n]*$'
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe[^)\n]*\); no pool|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ [^\n]*mounting the runtime socket: [^\n]*daemonset seeded-shapes/node-runtime-probe)[^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?container-runtime: (?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe[^)\n]*\); no pool|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ [^\n]*mounting the runtime socket: [^\n]*daemonset seeded-shapes/node-runtime-probe))[^\n]*$'
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe[^)\n]*\); no pool|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ [^\n]*mounting the runtime socket: [^\n]*daemonset seeded-shapes/node-runtime-probe))[^\n]*$'
 
   - name: no-invented-cves
     role: objective

@@ -133,10 +133,11 @@ verification_spec:
       fold_decoration: true
       fixture_roles:
         - deprecated-label-selector
+      # The `removed-node-label: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?removed-node-label: deployment seeded-shapes/arch-pinned-worker: selects on beta\.kubernetes\.io/arch=amd64 \(nodeselector\), deprecated since 1\.14 in favour of kubernetes\.io/arch[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:removed-node-label: )?deployment seeded-shapes/arch-pinned-worker: selects on beta\.kubernetes\.io/arch=amd64 \(nodeselector\), deprecated since 1\.14 in favour of kubernetes\.io/arch[^\n]*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?removed-node-label: deployment seeded-shapes/arch-pinned-worker: selects on beta\.kubernetes\.io/arch=amd64 \(nodeselector\), deprecated since 1\.14 in favour of kubernetes\.io/arch)[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])arch-pinned-worker(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:removed-node-label: )?deployment seeded-shapes/arch-pinned-worker: selects on beta\.kubernetes\.io/arch=amd64 \(nodeselector\), deprecated since 1\.14 in favour of kubernetes\.io/arch)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.
