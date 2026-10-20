@@ -110,8 +110,9 @@ and nothing to re-run until that run's `finish`. A `BROKER UNAVAILABLE` line, fr
 on an older build, so check the credential-proxy pod and re-run the same command once it answers.
 From `start`, nothing is in flight. From `finish`, the run is still in flight and its document is
 untouched: re-run `finish`, never `start`. Do not report that nothing reached GitHub: the ledger, a
-label or a pull request may already have landed, and the re-run picks up from them. Once the sweep
-has opened a pull request, the re-run opens no further automatic ones (`silent_floor`, above).
+label or a pull request may already have landed, and the re-run picks up from them. On a run `start`
+opened, re-run within two hours of its last step, a re-run after the sweep opened a pull request
+opens no further automatic ones (`silent_floor`, above).
 
 ### Partial coverage
 

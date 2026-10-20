@@ -3106,7 +3106,7 @@ def earlier_finish(audit_id: str, repo: str, now: datetime) -> dict | None:
 
 
 def silent_floor(earlier: dict | None) -> bool:
-    """Whether an earlier `finish` in this run reported news (see `earlier_finish`)."""
+    """Whether an earlier `finish` in this run reported news or opened a pull request."""
     return earlier is not None and earlier.get(CHAT_REPORT_SILENT_OK_KEY) is False
 
 
@@ -3119,8 +3119,8 @@ def apply_earlier_finish(payload: dict, earlier: dict | None) -> None:
         payload["silent_ok"] = False
         payload[SILENT_FLOOR_KEY] = True
         log(
-            "SILENT FLOOR: an earlier finish in this run reported news, so this one "
-            "is not silent either."
+            "SILENT FLOOR: an earlier finish in this run reported news or opened a pull "
+            "request, so this one is not silent either and its sweep opens nothing."
         )
 
 
