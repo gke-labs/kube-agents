@@ -1196,6 +1196,13 @@ export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
 make deploy-github
 ```
 
+This minter is not part of an `install.sh` install. To move this cluster to `install.sh` later,
+remove the minter first: run `make -C k8s-operator undeploy-github` with the same variables
+exported, and delete the `github-app-credentials` Secret. On a first `install.sh` run there is no
+`kube-agents` release yet, so the installer cannot tell this minter from its own: the run refuses
+while the minter runs, or, with `GITHUB_APP_ID` set, the apply fails on the minter's objects
+([When an upgrade is refused](docs/site/src/content/docs/install/upgrade.md#when-an-upgrade-is-refused)).
+
 ### Step 6: Apply Custom Resources
 
 Submit a sample `PlatformAgent` Custom Resource to activate cluster governance (run inside `k8s-operator/`).

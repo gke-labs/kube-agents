@@ -122,7 +122,7 @@ The allowlist decides who may talk to the agent. It takes **Slack member IDs**, 
 
 What a member who is not on the list sees:
 
-- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. Members of other workspaces get no reply.
+- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. A member of another workspace in a Slack Connect channel is not served, even with an empty list. The first time they mention the bot, send it a direct message, or click one of its buttons, the bot replies once, in that thread, that it answers only its own workspace, and names their member ID. The reply is a public post in the thread, so in a Slack Connect channel members of both organizations can read it.
 - **`today`:** the message is ignored, with no reply.
 
 The pairing step in `INSTALL.md` applies only if you set the Hermes Slack DM policy to `pairing` yourself. A kube-agents install configures the allowlist instead, and the A2A gateway has no pairing.
@@ -158,5 +158,5 @@ The gateway reads the map when it starts, so restart it after every change. The 
    | none at all for your message                                                                           | A missing history scope or event subscription, or the messages tab is off | Compare the app with the manifest above, then reinstall it |
    | `dropping message from unverified sender`                                                              | Your member ID is not on the allowlist                                    | Add the member ID, not an email                            |
    | `slack allowlist is empty and allow-all is off; every inbound message will be dropped at verification` | The list has only blank entries                                           | Set real member IDs, or remove the list to admit everyone  |
-   | `slack: ignoring a message from another workspace's member`                                            | The sender is in another workspace                                        | Use the workspace the app is installed in                  |
+   | `slack: ignoring a message from another workspace's member`                                            | The sender (`user`) is in another workspace (`userTeam` or `messageTeam`) | Use the workspace the app is installed in                  |
    | `chat backend stopped; restarting it, the console stays up`                                            | The tokens were refused, for example a comma-separated bot token          | Pass one `xoxb-` bot token and one `xapp-` app token       |

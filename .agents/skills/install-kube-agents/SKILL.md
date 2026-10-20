@@ -299,6 +299,13 @@ them to add `ACCEPT_NO_NETWORK_POLICY=true` to it (the installer prints the same
 next `upgrade.sh` regenerates from that file and is refused without the key. When they later
 confine the cluster, tell them to remove the key again; the installer warns while it lingers.
 
+A GitHub token minter that this install did not make (one from `make deploy-github`, by hand, or
+from another Helm release) also stops a run, with exit 1 and no `REFUSED_*` status, in two cases.
+The run names the GitOps repository with keys that do not match the `PlatformAgent` (it prints the
+lines to set), or the run deploys the chart's own minter over the other one. In the second case,
+ask the operator whether to remove the other minter or to keep it with `GITHUB_APP_ID` empty. See
+"When an upgrade is refused" in the upgrade page.
+
 ## Source verification
 
 Before provisioning, the installer requires the checkout holding the Terraform configuration and
