@@ -288,12 +288,19 @@ SHELL_FORK_MARK = " & "
 # a crafted container command from costing the report more than a bounded walk.
 SHELL_NESTING_CAP = 64
 PATH_SEPARATOR = "/"
-# A shell `-c` (or `-ec`, `-lc`: any short flag group carrying `c`, SHELL_COMMAND_FLAG_RE)
-# takes its script as the next word; `["sh", "-c", "a && b"]` is the script at offset 2 from
-# the shell. A script's words, for a rule that asks which programs it runs, are what is left
-# between whitespace and the operator characters, each word's last path component.
-SHELL_SCRIPT_OFFSET = 2
-SHELL_WORD_SPLIT_RE = re.compile("[" + re.escape(SHELL_OPERATOR_CHARS) + r"\s]+")
+# A shell reads options until its first non-option word; `-c` (or `-ec`, `-lc`: any short
+# flag group carrying `c`, SHELL_COMMAND_FLAG_RE) makes the word after the options the
+# script, so `["bash", "-o", "pipefail", "-c", "a && b"]` and `["sh", "-e", "-c", "a && b"]`
+# carry a script too. An option word starts with `-` or `+` (bash's `+O`); the ones that take
+# the next word as their argument (`-o pipefail`, `+O extglob`, `--rcfile FILE`, and a short
+# group ending in `o` or `O`, `-eo pipefail`) are stepped over with it. A script's words, for a
+# rule that asks which programs it runs, are what is left between whitespace, the operator
+# characters and the quotes, each word's last path component, so a quoted path names its
+# program too.
+SHELL_OPTION_PREFIXES = ("-", "+")
+SHELL_OPTIONS_WITH_ARGUMENT = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
+SHELL_OPTION_ARGUMENT_GROUP_RE = re.compile(r"^[-+][a-zA-Z]*[oO]$")
+SHELL_WORD_SPLIT_RE = re.compile("[" + re.escape(SHELL_OPERATOR_CHARS + SHELL_QUOTES) + r"\s]+")
 
 
 # -------------------------------------------------------------------- results and reads
@@ -694,23 +701,40 @@ def image_repository_and_tag(image: str) -> tuple[str, str]:
 
 
 def shell_scripts(command: list) -> list[str]:
-    """The scripts a command list hands a shell: for every shell program in it (SHELL_PROGRAMS,
-    by last path component) followed by a flag group carrying `c`, the word after the flag.
-    `["tini", "--", "bash", "-c", "nginx & php-fpm"]` -> `["nginx & php-fpm"]`."""
+    """The scripts a command list hands a shell: after every shell program in it (SHELL_PROGRAMS,
+    by last path component) the option words are walked (`-e`, `-o pipefail`, `--norc`, the
+    fused `-ec`), and once a flag group carrying `c` (SHELL_COMMAND_FLAG_RE) is met, the first
+    word after the options is the script. `["tini", "--", "bash", "-o", "pipefail", "-c",
+    "nginx & php-fpm"]` -> `["nginx & php-fpm"]`; a shell with no `c` flag hands back none."""
     words = [str(w) for w in command or []]
     scripts = []
     for index, word in enumerate(words):
-        script_index = index + SHELL_SCRIPT_OFFSET
-        if word.rsplit(PATH_SEPARATOR, 1)[-1] in tables.SHELL_PROGRAMS and script_index < len(words) and tables.SHELL_COMMAND_FLAG_RE.match(words[index + 1]):
-            scripts.append(words[script_index])
+        if word.rsplit(PATH_SEPARATOR, 1)[-1] not in tables.SHELL_PROGRAMS:
+            continue
+        j, carried = index + 1, False
+        while j < len(words) and words[j].startswith(SHELL_OPTION_PREFIXES) and not carried:
+            option = words[j]
+            j += 1
+            if tables.SHELL_COMMAND_FLAG_RE.match(option):
+                carried = True
+            elif option in SHELL_OPTIONS_WITH_ARGUMENT or SHELL_OPTION_ARGUMENT_GROUP_RE.match(option):
+                j += 1
+        if not carried:
+            continue
+        while j < len(words) and words[j].startswith(SHELL_OPTION_PREFIXES):
+            j += 1
+        if j < len(words):
+            scripts.append(words[j])
     return scripts
 
 
 def shell_words(script) -> list[str]:
     """The programs and arguments a `-c` script names, by last path component: the words between
-    whitespace and the shell's operator characters. `"/sbin/modprobe br_netfilter && exec /agent"`
-    -> `["modprobe", "br_netfilter", "exec", "agent"]`. Quoting is not read: a program named
-    inside a quoted string counts as named."""
+    whitespace, the shell's operator characters and its quotes, so `'/sbin/modprobe' x`,
+    `exec "$BIN/modprobe" x` and a nested `bash -c 'modprobe x'` all name `modprobe`.
+    `"/sbin/modprobe br_netfilter && exec /agent"` -> `["modprobe", "br_netfilter", "exec",
+    "agent"]`. Quoting is read no further: a program named inside a quoted string counts as
+    named."""
     if not isinstance(script, str):
         return []
     return [word.rsplit(PATH_SEPARATOR, 1)[-1] for word in SHELL_WORD_SPLIT_RE.split(script) if word]

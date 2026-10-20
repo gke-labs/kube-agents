@@ -385,6 +385,11 @@ class GroupOomKillTest(unittest.TestCase):
         self.assertEqual(shape({"command": ["tini", "--", "bash", "-c", "nginx & php-fpm & wait"]}), "runs a shell script that forks a background job")
         self.assertEqual(shape({"command": ["sh", "-ec", "nginx & php-fpm & wait"]}), "runs a shell script that forks a background job")
         self.assertEqual(shape({"command": ["bash", "-lc", "a & b & wait"]}), "runs a shell script that forks a background job")
+        # Options between the shell and `-c`: a flag with an argument, a lone flag, a long flag.
+        self.assertEqual(shape({"command": ["bash", "-o", "pipefail", "-c", "a & b & wait"]}), "runs a shell script that forks a background job")
+        self.assertEqual(shape({"command": ["sh", "-e", "-c", "a & b & wait"]}), "runs a shell script that forks a background job")
+        self.assertEqual(shape({"command": ["bash", "--norc", "-c", "a & b & wait"]}), "runs a shell script that forks a background job")
+        self.assertEqual(shape({"command": ["bash", "-eo", "pipefail", "-c", "a & b & wait"]}), "runs a shell script that forks a background job")
         self.assertEqual(shape({"image": "docker.io/phusion/baseimage:jammy-1.0.1"}), "runs phusion/baseimage, whose entrypoint is a supervisor")
         self.assertIsNone(shape({"command": ["sh", "-c", "curl -fsS 'http://svc/health?x=y&z=1'"]}))
         self.assertIsNone(shape({"command": ["sh", "-c", 'echo "Tom & Jerry"']}))
@@ -457,6 +462,18 @@ class NodeImageCoupledAgentTest(unittest.TestCase):
         self.assertEqual(node_image_coupled_agent.couplings(spec), [])
         self.assertEqual(rules.shell_scripts(["sh", "-c"]), [])
         self.assertEqual(rules.shell_words(None), [])
+        # A quoted program path, a quoted variable path and a nested shell name the program too.
+        for script in ("'/sbin/modprobe' br_netfilter", 'exec "$BIN/modprobe" x', "bash -c 'modprobe x'", "sh -c \"modprobe x\""):
+            spec = {"hostNetwork": True, "containers": [{"name": "a", "image": "x", "command": ["/bin/sh", "-c", script]}]}
+            self.assertEqual(node_image_coupled_agent.couplings(spec), ["runs modprobe"], script)
+        # The script is read behind the shell's other options, and a shell with no `c` flag hands back none.
+        self.assertEqual(rules.shell_scripts(["bash", "-o", "pipefail", "-c", "a"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["sh", "-e", "-c", "a"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["bash", "--norc", "-c", "a"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["bash", "--rcfile", "/etc/rc", "-c", "a", "arg0"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["bash", "-c", "-e", "a"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["bash", "-e", "script.sh"]), [])
+        self.assertEqual(rules.shell_scripts(["bash", "-o", "pipefail", "script.sh"]), [])
 
     def test_clean_without_host_network_without_coupling_or_in_managed_namespaces(self):
         items = [
