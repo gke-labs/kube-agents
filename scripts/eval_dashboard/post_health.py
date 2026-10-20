@@ -304,9 +304,9 @@ POOL_JOB_HISTORY_URL = (
     f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{POOL_PRESSURE_JOB}"
 )
 
-# gsutil is how the state object is read and written; publish.py uses the
+# gcloud storage is how the state object is read and written; publish.py uses the
 # same header so a reader never gets an hour-stale copy.
-GSUTIL = "gsutil"
+GSUTIL = "gcloud storage"
 GS_PREFIX = "gs://"
 CACHE_CONTROL = "Cache-Control: no-cache"
 

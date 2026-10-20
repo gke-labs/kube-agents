@@ -440,7 +440,7 @@ EVAL_FORGE_HELPER_ARGS=()
 # MAIN-BRANCH run, red or green, from the EXIT trap below. FAIL-SAFE BY
 # CONTRACT: the dashboard must never break the job it observes, so every
 # failure mode -- the sibling dashboard PRs not merged yet (no
-# scripts/eval_dashboard/), the IAM grant not applied, a gsutil error, a
+# scripts/eval_dashboard/), the IAM grant not applied, a gcloud storage error, a
 # python crash, a hung upload -- logs exactly ONE
 # "eval-dashboard publish skipped: <reason>" line and never changes the job's
 # exit code.
@@ -533,7 +533,7 @@ publish_eval_dashboard() {
   #
   # The budget must be LARGER than the 300s collect.py grants each individual
   # gsutil call, or the one hung call the collector is willing to wait out
-  # kills the whole pipeline instead -- and the sweep is 1 + 3N gsutil
+  # kills the whole pipeline instead -- and the sweep is 1 + 3N gcloud storage
   # processes over every archived build (READ_WORKERS at a time), so it
   # needs real headroom on top. 900s covers both and only ever taxes the
   # nightly's tail (the gate
@@ -569,9 +569,9 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     # keeps the page on the last read instead of blanking it.
     case "$3" in
       gs://*)
-        gsutil cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
-        gsutil cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
-        gsutil cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
+        gcloud storage cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
+        gcloud storage cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
+        gcloud storage cp "${3%/}/store.json" "$2/store.json" 2>&1 || rm -f "$2/store.json"
         ;;
       *)
         [ -f "${3%/}/health.json" ] && cp "${3%/}/health.json" "$2/health.json" || true

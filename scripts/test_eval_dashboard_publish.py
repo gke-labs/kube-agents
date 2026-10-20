@@ -400,7 +400,7 @@ class PublishHookFailSafeTest(unittest.TestCase):
             self.assertNotIn("--health-history", argv)
 
     def test_gsutil_downloads_health_and_history_for_bucket_target(self):
-        """For a gs:// target, the hook calls gsutil cp to download
+        """For a gs:// target, the hook calls gcloud storage cp to download
         health.json and health-history.jsonl and passes them to render.py."""
         collect_ok = """\
             import json, pathlib, sys

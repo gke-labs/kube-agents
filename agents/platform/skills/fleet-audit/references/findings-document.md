@@ -127,7 +127,7 @@ field, and publishes nothing:
     "2.6" and not prose). An unknown slug or a duplicate is rejected.
   - **`command`** — the literal invocation you issued on that cluster for that check, with its
     `--context`/`--project` and the namespace or resource it targeted. It must name one of
-    `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`, or the upgrade audit's readiness reporter
+    `kubectl`, `gcloud`, `gcloud storage`, `bq`, `helm`, or `curl`, or the upgrade audit's readiness reporter
     `fleet_upgrade_report.py`; `echo`, `cat`, `python3 -c`, a call back
     into `audit_report.py`, and anything under eight characters are all rejected. One command per
     entry — the one that produced the evidence, not a summary of your approach.
