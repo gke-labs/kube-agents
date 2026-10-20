@@ -9,8 +9,9 @@ serves, so any other reader of the same shapes (a review of what an upgrade did,
 fact) imports this module instead of carrying a copy. A table is appended to, never
 rewritten: a constant keeps its name and its shape once it exists. Every table names its
 source beside it; a date beside one is the day a page that moves was read. The tables
-are deliberately small: a rule whose input has no row here grades `unknown` with the reason
-rather than guessing (docs/designs/upgrade-readiness-checks.md, "What a run produces").
+are deliberately small: a rule whose input has no row here grades `unknown`, or files a note
+where the rule cannot block, with the reason rather than guessing
+(docs/designs/upgrade-readiness-checks.md, "What a run produces").
 Nothing here is computed from a cluster and nothing here runs a command.
 
 Each section names the catalogue entries it serves, as docs/designs/upgrade-failure-catalogue.md
@@ -121,7 +122,8 @@ DEPRECATED_API_SUCCESSORS_SOURCE = "https://kubernetes.io/blog/2025/03/26/kubern
 
 # Defaults that change at a minor (entry 8), keyed by the minor that changes them. A
 # minor at or below DEFAULT_CHANGES_AS_OF with no key changes nothing in this table; a
-# target above it is not covered, and the rule says `unknown`. Row fields: `setting`
+# target above it is graded on the minors the table covers, with a note that the table
+# ends there (the rule cannot block). Row fields: `setting`
 # names what changes; `detector` names the object shape the row is matched against
 # (namespace Pod Security labels, or workloads carrying a gitRepo volume); `side` says
 # which component's version the change rides on, so the rule measures the minors crossed
@@ -250,8 +252,9 @@ DEFAULT_CHANGES_BY_MINOR = {
 # container image (registry kept, tag and digest stripped) and its release read from the
 # tag. A support row maps an add-on release to the Kubernetes minors it supports,
 # inclusive, as the vendor's page listed them on the day given. An add-on detected with
-# no row here, or at a release the rows do not list, is reported `unknown` with the page
-# to read; no range is ever inferred from a neighbouring release.
+# no row here, or at a release the rows do not list, is a note naming the page to read
+# ("version not graded"; the rule cannot block); no range is ever inferred from a
+# neighbouring release.
 ADDON_IMAGES = {
     "quay.io/jetstack/cert-manager-controller": "cert-manager",
     "docker.io/istio/pilot": "istio",
