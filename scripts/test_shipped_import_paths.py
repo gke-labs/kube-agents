@@ -6,9 +6,13 @@ into ``skills_override/`` and ``scripts_override/`` in its profile home, patched
 them, and edited the copied ``audit_report.py`` to put its own scripts first on
 ``sys.path``.  Nothing the product ships reads those trees, so a copy only runs
 when the worker runs it.  The nightly ``kanban-workspace-gc`` removes them.
-This test keeps the first half true: no shipped Python file adds a path that
-names an ``_override`` tree or sits inside a profile home, and no shipped shell
-script sets one on ``PYTHONPATH``.
+This test keeps the first half true, for what it can read: no literal path
+given to a shipped import-path call (``sys.path`` insert, append, extend or
+slice assignment, ``site.addsitedir``, ``spec_from_file_location``) names an
+``_override`` tree or sits under ``/opt/data/profiles/``; no shipped shell
+script puts one on ``PYTHONPATH``; and no shipped config names an override
+tree, so none can become a skill directory.  A path built from a variable or
+the environment is not seen.
 
 Run: python3 scripts/test_shipped_import_paths.py
 """
@@ -38,17 +42,30 @@ def shipped(suffix: str) -> list[Path]:
     return files
 
 
-def _is_sys_path_mutation(node: ast.Call) -> bool:
+def _is_sys_path(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "path"
+            and isinstance(node.value, ast.Name) and node.value.id == "sys")
+
+
+# Calls that put a directory on the import path, or load a module from a file:
+# `sys.path.insert/append/extend`, `site.addsitedir`, and
+# `importlib.util.spec_from_file_location` (also by its bare name).
+def _is_import_path_call(node: ast.Call) -> bool:
     func = node.func
-    return (isinstance(func, ast.Attribute) and func.attr in ("insert", "append", "extend")
-            and isinstance(func.value, ast.Attribute) and func.value.attr == "path"
-            and isinstance(func.value.value, ast.Name) and func.value.value.id == "sys")
+    if isinstance(func, ast.Attribute):
+        if func.attr in ("insert", "append", "extend") and _is_sys_path(func.value):
+            return True
+        return func.attr in ("addsitedir", "spec_from_file_location")
+    return isinstance(func, ast.Name) and func.id in ("addsitedir", "spec_from_file_location")
 
 
 def import_path_strings(source: str) -> tuple[int, list[str]]:
-    """How many sys.path mutations *source* makes, and every string literal in their arguments.
+    """How many import-path calls and assignments *source* makes, and every string literal in them.
 
-    A file Python can't parse (a template, a fixture) counts as none.
+    Covers `_is_import_path_call` and an assignment to `sys.path` or a slice of
+    it.  Only literals count: a path held in a variable set elsewhere, or read
+    from the environment, is not seen.  A file Python can't parse (a template,
+    a fixture) counts as none.
     """
     try:
         tree = ast.parse(source)
@@ -56,11 +73,19 @@ def import_path_strings(source: str) -> tuple[int, list[str]]:
         return 0, []
     count, strings = 0, []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and _is_sys_path_mutation(node):
-            count += 1
-            for arg in node.args:
-                strings.extend(n.value for n in ast.walk(arg)
-                               if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        values: list[ast.AST] = []
+        if isinstance(node, ast.Call) and _is_import_path_call(node):
+            values = [*node.args, *(k.value for k in node.keywords)]
+        elif isinstance(node, ast.Assign) and any(
+                _is_sys_path(t) or (isinstance(t, ast.Subscript) and _is_sys_path(t.value))
+                for t in node.targets):
+            values = [node.value]
+        else:
+            continue
+        count += 1
+        for value in values:
+            strings.extend(n.value for n in ast.walk(value)
+                           if isinstance(n, ast.Constant) and isinstance(n.value, str))
     return count, strings
 
 
@@ -73,7 +98,7 @@ class ShippedImportPathsTest(unittest.TestCase):
             total += count
             offenders.extend(f"{path.relative_to(REPO)}: {s!r}" for s in strings if FORBIDDEN.search(s))
         self.assertEqual(offenders, [])
-        # Not vacuous: the shipped tree makes dozens of these calls (82 when this
+        # Not vacuous: the shipped tree makes dozens of these calls (98 when this
         # was written).  A walk that found almost none has stopped reading the tree.
         self.assertGreater(total, 40)
 
@@ -92,6 +117,28 @@ class ShippedImportPathsTest(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual([s for s in strings if FORBIDDEN.search(s)],
                          ["/opt/data/profiles/platform/scripts_override"])
+
+    def test_the_walk_catches_the_other_forms(self):
+        for source in (
+            'import sys\nsys.path[:0] = ["/opt/data/profiles/platform/scripts_override"]\n',
+            'import site\nsite.addsitedir("/opt/data/profiles/platform/scripts_override")\n',
+            'import importlib.util as u\nu.spec_from_file_location("m", "/x/skills_override/m.py")\n',
+            'from importlib.util import spec_from_file_location\nspec_from_file_location("m", f"{H}/scripts_override/m.py")\n',
+        ):
+            count, strings = import_path_strings(source)
+            self.assertEqual(count, 1, source)
+            self.assertTrue([s for s in strings if FORBIDDEN.search(s)], source)
+
+    def test_no_shipped_config_names_an_override_tree(self):
+        # Hermes finds skills under the profile's skills/ and any skills.external_dirs
+        # a config lists; no shipped config may point one at an override tree.
+        offenders = []
+        for suffix in (".yaml", ".yml", ".json"):
+            for path in shipped(suffix):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                offenders.extend(f"{path.relative_to(REPO)}: {m.group(0)}"
+                                 for m in re.finditer(r"[\w./-]*_override\b[\w./-]*", text))
+        self.assertEqual(offenders, [])
 
     def test_the_walk_catches_a_built_path(self):
         source = 'import os, sys\nsys.path.insert(0, os.path.join(os.environ["HERMES_HOME"], "scripts_override"))\n'

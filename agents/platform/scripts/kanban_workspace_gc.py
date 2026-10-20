@@ -193,7 +193,7 @@ CRON_RUN_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 # A worker's override copy of a shipped tree, at the top of a profile home
 # (#3551): `skills_override`, `scripts_override` and the like.  No product
 # writer uses the suffix there, which a test pins.
-OVERRIDE_NAME = re.compile(r"^[A-Za-z0-9.-]+_override$")
+OVERRIDE_NAME = re.compile(r"[A-Za-z0-9._-]+_override")
 
 LOGS_DIR = "logs"
 LOG_FILE_NAME = "kanban_workspace_gc.log"
@@ -687,7 +687,7 @@ def _local_overrides(home: Path) -> list[Path]:
         entries = list(home.iterdir())
     except OSError:
         return []
-    return sorted(e for e in entries if OVERRIDE_NAME.match(e.name) and (e.is_symlink() or e.is_dir()))
+    return sorted(e for e in entries if OVERRIDE_NAME.fullmatch(e.name) and (e.is_symlink() or e.is_dir()))
 
 
 def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
@@ -710,7 +710,7 @@ def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
     if result.returncode != 0:
         return []
     return sorted(name for name, _, _, kind in _parse_listing(result.stdout)
-                  if OVERRIDE_NAME.match(name) and kind in ("d", "l"))
+                  if OVERRIDE_NAME.fullmatch(name) and kind in ("d", "l"))
 
 
 def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep) -> None:
@@ -790,8 +790,10 @@ def main() -> int:
         lines.append(f"{LOG_PREFIX}: removed {len(sweep.cron_runs_removed)} cron run "
                      f"directories older than {CRON_RUNS_MAX_AGE_DAYS} days")
     if sweep.overrides_removed:
+        named = sweep.overrides_removed[:INVENTORY_LIMIT]
+        more = len(sweep.overrides_removed) - len(named)
         lines.append(f"{LOG_PREFIX}: removed {len(sweep.overrides_removed)} override "
-                     f"trees: {', '.join(sweep.overrides_removed)}")
+                     f"trees: {', '.join(named)}" + (f" and {more} more" if more else ""))
     if remote_root is not None:
         try:
             lines.extend(_format_inventory(take_inventory(agent_home() / "profiles", remote_root)))

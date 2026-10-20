@@ -2154,10 +2154,12 @@ Two shapes are removed rather than inventoried. A cron run's working directory
 (`<home>/cron/runs/<run>`) is pruned after seven days. An override tree, a top-level
 directory named `<something>_override`, is removed the first night (#3551): it is a
 worker's copy of a shipped skill or script, patched to run in place of the original
-(#3444), and no product code reads one (`scripts/test_shipped_import_paths.py` keeps
-it that way). Neither prune follows a symlink the model planted: the runs root and each directory
-above it must be real directories, a symlinked home is left alone, and a symlinked
-override entry is unlinked rather than followed.
+(#3444). No product code writes one, and `scripts/test_shipped_import_paths.py` keeps
+literal paths in shipped import-path calls, `PYTHONPATH` and configs off them. Both
+prunes cover the homes the agent pod has a profile for, so a stale sandbox home is left
+to the inventory. Neither follows a symlink the model planted: the home, `cron` and
+`cron/runs` must be real directories for the runs prune, a symlinked home is left alone
+by the override prune, and a symlinked override entry is unlinked rather than followed.
 
 #### The agent pod gives up cluster tooling entirely
 

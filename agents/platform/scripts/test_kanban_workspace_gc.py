@@ -783,18 +783,22 @@ class OverridesTest(unittest.TestCase):
     def test_override_trees_go_and_shipped_trees_stay(self):
         skills = self.make_override("skills_override")
         scripts = self.make_override("scripts_override")
+        underscored = self.make_override("fleet_audit_override")
         cluster = self.make_override("skills_override", self.profiles / "cluster-a")
         sweep = self.sweep()
         self.assertFalse(skills.exists())
         self.assertFalse(scripts.exists())
+        self.assertFalse(underscored.exists())
         self.assertFalse(cluster.exists())
         self.assertTrue((self.home / "skills" / "fleet-audit").is_dir())
         self.assertEqual(sweep.overrides_removed,
-                         ["cluster-a/skills_override", "platform/scripts_override", "platform/skills_override"])
+                         ["cluster-a/skills_override", "platform/fleet_audit_override",
+                          "platform/scripts_override", "platform/skills_override"])
         self.assertEqual(sweep.local_removed, [], "override trees are not reported as kanban workspaces")
 
     def test_only_the_suffix_at_the_top_of_a_home_counts(self):
-        keep = [self.home / "override", self.home / "skills_overrides", self.home / "scratch" / "skills_override"]
+        keep = [self.home / "override", self.home / "skills_overrides", self.home / "_override",
+                self.home / "scratch" / "skills_override"]
         for path in keep:
             path.mkdir(parents=True)
         note = self.home / "notes_override"
@@ -879,10 +883,28 @@ class OverridesTest(unittest.TestCase):
         log = (home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8")
         self.assertIn("removed 1 override trees: platform/skills_override", log)
 
+    def test_a_flood_of_overrides_is_logged_by_count_past_the_limit(self):
+        import io
+        home = self.profiles.parent
+        for i in range(gc.INVENTORY_LIMIT + 3):
+            (self.home / f"a{i:03d}_override").mkdir()
+        hermes_cli = type(sys)("hermes_cli")
+        hermes_cli.kanban_db = type("K", (), {"list_boards": staticmethod(lambda: [])})
+        with patch.dict(sys.modules, {"hermes_cli": hermes_cli}), \
+             patch.dict("os.environ", {"PLATFORM_AGENT_HOME": str(home)}), \
+             patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            gc.main()
+        log = (home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn(" and 3 more", log)
+
     def test_no_expected_home_entry_carries_the_suffix(self):
         for profile in ("platform", "cluster-a", "other"):
             for name in gc.expected_entries(profile):
-                self.assertIsNone(gc.OVERRIDE_NAME.match(name), (profile, name))
+                self.assertIsNone(gc.OVERRIDE_NAME.fullmatch(name), (profile, name))
+
+    def test_a_trailing_newline_does_not_match(self):
+        self.assertIsNone(gc.OVERRIDE_NAME.fullmatch("skills_override\n"))
 
 
 if __name__ == "__main__":

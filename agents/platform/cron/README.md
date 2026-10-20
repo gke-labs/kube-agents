@@ -298,13 +298,13 @@ pod no longer has a profile for, such as a cluster dropped from scope. That's an
 inventory only: nothing is moved or deleted, and a failure to take it is logged
 there too rather than posted.
 
-Two things in a profile home are removed, both logged by name. Cron run
+Two things in a profile home are removed, both logged by name, in every home
+the agent pod has a profile for, on the agent pod and in the sandbox. Cron run
 directories (`cron/runs/<job>_<execution>`, each cron run's working directory)
 go after seven days. Override trees go the first night: a top-level directory
 named `<something>_override`, such as a worker's patched copy of a shipped skill
-in `skills_override/` (#3444, #3551). Nothing the product ships writes or reads
-one. Both are swept on the agent pod and in the sandbox, and neither follows a
-symlink.
+in `skills_override/` (#3444, #3551). No product code writes one, and none is
+on a shipped import path or skill directory. Neither prune follows a symlink.
 
 Daily is deliberate rather than conservative. The first install to run this had
 accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
