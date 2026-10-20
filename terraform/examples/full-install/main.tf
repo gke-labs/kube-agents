@@ -863,17 +863,17 @@ resource "helm_release" "kube_agents" {
   timeout = 600
 
   values = [yamlencode({
-    # Reaches every image this release pulls, including the three the chart
-    # does not render itself — the agent Deployment, the shell sandbox
-    # StatefulSet, and the fluent-bit sidecar the operator resolves at
-    # reconcile time. See the chart README's "Installing from a mirrored
-    # registry".
+    # Reaches every image this release pulls, including the two the chart
+    # does not render itself — the agent Deployment and the shell sandbox
+    # StatefulSet the operator resolves at reconcile time (the fluent-bit
+    # sidecar follows thirdPartyImageRegistry). See the chart README's
+    # "Installing from a mirrored registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
-    # local.cert_manager_mirror_values carries the same registry to that
-    # release's image repositories, so a mirrored install pulls every image —
-    # cert-manager's included — from the mirror.
+    # When third_party_image_registry is set, local.cert_manager_mirror_values
+    # carries it to that release's image repositories, so a fully mirrored
+    # install pulls cert-manager from the mirror too.
     global = {
       imageRegistry           = var.image_registry
       thirdPartyImageRegistry = var.third_party_image_registry

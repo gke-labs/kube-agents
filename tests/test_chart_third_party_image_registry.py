@@ -6,10 +6,13 @@ A custom first-party imageRegistry must not rewrite third-party images (LiteLLM,
 fluent-bit, cleanup hook, GitHub token minter, cert-manager) onto the first-party
 prefix, where an operator who only mirrored kube-agents images never mirrored them.
 
+When global.imageRegistry is set without global.thirdPartyImageRegistry, the chart's
+NOTES.txt warns operators that third-party images will still pull from upstream public
+registries.
+
 Run: python3 -m unittest discover -s tests -p 'test_chart_third_party_image_registry.py' -v
 """
 
-import json
 import pathlib
 import re
 import shutil
@@ -20,10 +23,8 @@ import yaml
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
-_VALUES = _CHART / "values.yaml"
 _COMPOSITION = _REPO_ROOT / "terraform" / "examples" / "full-install"
 _MAIN_TF = _COMPOSITION / "main.tf"
-_VARIABLES_TF = _COMPOSITION / "variables.tf"
 _HELM = shutil.which("helm")
 
 _REQUIRED = [
@@ -37,6 +38,12 @@ def _render_chart(*args) -> list[dict]:
     cmd = [_HELM, "template", "test-release", str(_CHART), *_REQUIRED, *args]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     return [doc for doc in yaml.safe_load_all(proc.stdout) if doc is not None]
+
+
+def _render_notes(*args) -> str:
+    cmd = [_HELM, "install", "test-release", str(_CHART), "--dry-run", *_REQUIRED, *args]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return proc.stdout
 
 
 @unittest.skipIf(_HELM is None, "helm is required for chart template rendering tests")
@@ -123,6 +130,25 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
         self.assertTrue(any(img.startswith(f"{third_mirror}/litellm") for img in rendered_images))
         self.assertTrue(any(img.startswith(f"{third_mirror}/fluent-bit") for img in rendered_images))
         self.assertTrue(any(img.startswith(f"{third_mirror}/k8s") for img in rendered_images))
+
+    def test_notes_warns_when_first_party_registry_set_and_third_party_empty(self):
+        mirror = "us-east4-docker.pkg.dev/my-proj/kube-agents"
+        notes = _render_notes("--set", f"global.imageRegistry={mirror}")
+        self.assertIn("WARNING: global.imageRegistry is set", notes)
+        self.assertIn("global.thirdPartyImageRegistry is empty", notes)
+        self.assertIn("will still be pulled from their upstream public registries", notes)
+
+    def test_notes_silent_when_both_registries_set(self):
+        mirror = "us-east4-docker.pkg.dev/my-proj/kube-agents"
+        notes = _render_notes(
+            "--set", f"global.imageRegistry={mirror}",
+            "--set", f"global.thirdPartyImageRegistry={mirror}",
+        )
+        self.assertNotIn("WARNING: global.imageRegistry is set", notes)
+
+    def test_notes_silent_when_both_registries_empty(self):
+        notes = _render_notes()
+        self.assertNotIn("WARNING: global.imageRegistry is set", notes)
 
     def _extract_images(self, docs: list[dict]) -> list[str]:
         images = []

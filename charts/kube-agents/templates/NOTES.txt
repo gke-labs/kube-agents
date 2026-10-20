@@ -1,4 +1,14 @@
 {{ .Chart.Name }} {{ .Chart.Version }} (app {{ .Chart.AppVersion }}) installed in namespace {{ .Release.Namespace }}.
+{{- if and (include "kube-agents.imageRegistry" .) (not (include "kube-agents.thirdPartyImageRegistry" .)) }}
+
+WARNING: global.imageRegistry is set ({{ include "kube-agents.imageRegistry" . }}),
+but global.thirdPartyImageRegistry is empty. Third-party images (cert-manager,
+LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+will still be pulled from their upstream public registries (quay.io, ghcr.io,
+docker.io). If this cluster is restricted or air-gapped, set
+global.thirdPartyImageRegistry (commonly the same prefix) to pull third-party
+images from your mirror too — see the chart README.
+{{- end }}
 {{- if and .Values.litellm.enabled (ne .Release.Namespace "kubeagents-system") }}
 
 WARNING: this release is not in the kubeagents-system namespace, but the
