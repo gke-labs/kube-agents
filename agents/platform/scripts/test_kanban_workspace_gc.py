@@ -825,6 +825,40 @@ class OverridesTest(unittest.TestCase):
         self.assertTrue((target / "skills_override").exists())
         self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
 
+    def test_an_empty_symlinked_home_says_nothing(self):
+        # Nothing to remove behind the link, so nothing for chat either.
+        target = Path(self.tmp.name) / "elsewhere"
+        target.mkdir()
+        (self.profiles / "cluster-b").symlink_to(target)
+        sweep = self.sweep()
+        self.assertEqual(sweep.warnings, [])
+
+    def test_a_home_the_sandbox_cannot_list_is_reported(self):
+        def fake(argv, **kwargs):
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 1, "", "find: Permission denied")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertTrue(any("exited 1" in w and "Permission denied" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_a_down_sandbox_is_tried_once_across_both_sweeps(self):
+        runs = self.profiles.joinpath("platform", *gc.CRON_RUNS_PARTS)
+        runs.mkdir(parents=True)
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            raise sandbox_exec.SandboxUnavailable("no route to host")
+
+        sweep = gc.Sweep()
+        with patch.object(sandbox_exec, "run", side_effect=fake):
+            remote = gc.sweep_cron_runs(self.profiles, Path("/sandbox-root"), sweep)
+            remote = gc.sweep_overrides(self.profiles, remote, sweep)
+        self.assertIsNone(remote)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len([w for w in sweep.warnings if "did not answer" in w]), 1, sweep.warnings)
+
     def test_the_sandbox_half_removes_overrides_only_under_a_real_home(self):
         remote = Path("/sandbox-root")
         rhome = remote / "profiles" / "platform"

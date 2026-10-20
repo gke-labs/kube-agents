@@ -630,7 +630,7 @@ def _old_remote_runs(runs: Path, cutoff: float, sweep: Sweep) -> list[str]:
 
 
 def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep,
-                    now: float | None = None) -> None:
+                    now: float | None = None) -> Path | None:
     """Remove each profile's cron run directories older than the cutoff.
 
     The profile list comes from the agent pod, as the inventory's does, and
@@ -642,7 +642,7 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
                        if e.is_dir() and not e.name.startswith("."))
     except OSError as exc:
         sweep.warnings.append(f"could not read {agent_profiles}: {exc}")
-        return
+        return remote_root
     for name in names:
         runs = agent_profiles.joinpath(name, *CRON_RUNS_PARTS)
         local_ok = _real_dirs_local(_runs_components(agent_profiles / name))
@@ -680,6 +680,7 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
             removed = sweep.remote_removed[before:]
             del sweep.remote_removed[before:]
             sweep.cron_runs_removed.extend(f"sandbox {name}/{run}" for run in removed)
+    return remote_root
 
 
 def _local_overrides(home: Path) -> list[Path]:
@@ -708,23 +709,29 @@ def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
         sweep.warnings.append(f"listing {home} in the sandbox failed: {exc}")
         return []
     if result.returncode != 0:
+        # Unlike a cron runs root, the home always exists for a profile the agent
+        # pod has, so a failed listing is a problem, not "nothing there".
+        sweep.warnings.append(f"listing {home} in the sandbox exited {result.returncode}, so its override trees "
+                              f"were not checked: {(result.stderr or '').strip()[:STDERR_EXCERPT_CHARS]}")
         return []
     return sorted(name for name, _, _, kind in _parse_listing(result.stdout)
                   if OVERRIDE_NAME.fullmatch(name) and kind in ("d", "l"))
 
 
-def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep) -> None:
+def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep) -> Path | None:
     """Remove every profile home's override trees, on the agent pod and in the sandbox.
 
     A symlink is unlinked, never followed.  A home that is itself a symlink is
-    left alone and reported, as a symlinked runs root is.
+    left alone, and reported when it holds an override tree, as a symlinked
+    runs root is.  Returns *remote_root*, or None once the sandbox has not
+    answered, so the caller's next sandbox step can skip it.
     """
     try:
         names = sorted(e.name for e in agent_profiles.iterdir()
                        if e.is_dir() and not e.name.startswith("."))
     except OSError as exc:
         sweep.warnings.append(f"could not read {agent_profiles}: {exc}")
-        return
+        return remote_root
     for name in names:
         home = agent_profiles / name
         if _real_dirs_local([home]):
@@ -733,7 +740,7 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
                 _remove_local(path, sweep)
                 if len(sweep.local_removed) > before:
                     sweep.overrides_removed.append(f"{name}/{sweep.local_removed.pop()}")
-        else:
+        elif _local_overrides(home):
             sweep.warnings.append(f"{home} is reached through a symlink; its override trees were not removed")
         if remote_root is None:
             continue
@@ -752,6 +759,7 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
             removed = sweep.remote_removed[before:]
             del sweep.remote_removed[before:]
             sweep.overrides_removed.extend(f"sandbox {name}/{entry}" for entry in removed)
+    return remote_root
 
 
 def main() -> int:
@@ -779,8 +787,13 @@ def main() -> int:
             remote_root = sandbox_root()
     except Exception as exc:  # noqa: BLE001 - the sandbox halves never fail the job
         lines.append(f"{LOG_PREFIX}: inventory skipped: {exc}; sandbox cron runs not pruned either")
-    sweep_cron_runs(agent_home() / "profiles", remote_root, sweep)
-    sweep_overrides(agent_home() / "profiles", remote_root, sweep)
+    # Each sweep hands back None once the sandbox has not answered, so a night
+    # it is down costs one connect timeout and one warning, not one per step.
+    configured = remote_root
+    remote_root = sweep_cron_runs(agent_home() / "profiles", remote_root, sweep)
+    remote_root = sweep_overrides(agent_home() / "profiles", remote_root, sweep)
+    if configured is not None and remote_root is None:
+        lines.append(f"{LOG_PREFIX}: inventory skipped: the shell sandbox did not answer")
     if sweep.local_removed or sweep.remote_removed:
         lines.append(
             f"{LOG_PREFIX}: removed {len(sweep.local_removed)} on the agent "
