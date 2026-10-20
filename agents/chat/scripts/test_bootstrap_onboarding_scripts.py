@@ -357,6 +357,18 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertNotIn("--update", note)
         self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note[note.index("--") + 1])
 
+    def test_the_card_is_given_the_selection_of_the_batch_it_registered(self):
+        import inventory_presenter
+
+        (self.d / ITEMS).write_text(json.dumps(EXTRACTED), encoding="utf-8")
+        (self.d / SCORES).write_text(json.dumps(SCORED), encoding="utf-8")
+        card = ({"schema": "kube-agents.chat/v1", "headline": "done"}, "done")
+        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
+                mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}), \
+                mock.patch.object(inventory_presenter, "chat", return_value=card) as chat:
+            self._run()
+        self.assertEqual(chat.call_args.args[1:], ({"listed": 0, "held": 0, "queued": 2},))
+
     def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
         import inventory_presenter
 

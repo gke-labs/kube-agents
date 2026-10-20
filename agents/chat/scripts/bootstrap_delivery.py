@@ -36,7 +36,7 @@ cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 With the flag on, a Slack origin and the credential proxy's Slack relay in the
 environment, the report goes out as Block Kit instead (a headline with the
 total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
-buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
+buttons; for a report that lists no item, the short card ``_selection`` decides), posted here through ``slack_blocks_post`` because the scheduler's delivery
 takes text only. Under ``spec.mode: next``, on an install whose job was linked to a Slack chat before
 the switch and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
 (``_posted_through_gateway``).

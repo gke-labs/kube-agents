@@ -182,6 +182,18 @@ class QuietCardTest(unittest.TestCase):
         _, text = inventory_presenter.blocks(REPORT)
         self.assertNotIn("Also found", text)
 
+    def test_a_gap_on_the_line_after_the_counts_is_kept(self):
+        report = QUIET_REPORT.replace("workloads.\n\nSecret", "workloads.\nSecret")
+        self.assertNotEqual(report, QUIET_REPORT)
+        out = inventory_presenter.present(report, QUIET_SELECTION)
+        self.assertIn(f"{QUIET_COUNTS}\n{QUIET_GAP}\n", out)
+
+    def test_the_pace_lines_own_non_critical_does_not_veto_the_card(self):
+        for words in ("Non-critical items arrive at most 3 a day.", "Noncritical items arrive at most 3 a day."):
+            with self.subTest(words=words):
+                report = QUIET_REPORT.replace("The full inventory", f"{words}\n\nThe full inventory")
+                self.assertTrue(inventory_presenter.present(report, QUIET_SELECTION).startswith("**First look"))
+
     def test_a_report_without_the_exact_posture_line_goes_as_written(self):
         report = QUIET_REPORT.replace(inventory_presenter.SCAN_SCOPE_LINE, "The fleet looks healthy.")
         self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)

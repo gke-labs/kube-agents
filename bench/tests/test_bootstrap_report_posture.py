@@ -175,6 +175,17 @@ def test_a_verdict_after_the_posture_fails(sandbox: Path, verdict: str) -> None:
     assert "judges the fleet" in result.reason
 
 
+def test_a_verdict_in_a_heading_fails(sandbox: Path) -> None:
+    # Headings are skipped for the opening, not for the verdict scan: Google Chat posts them as written.
+    report = _report(*_objective()["posture"]).replace(
+        "# GKE Environment Scan", "# GKE Environment Scan\n\n## Fleet status: healthy"
+    )
+    (sandbox / "INVENTORY.delivered.md").write_text(report)
+    result = _verify()
+    assert result.status == "fail"
+    assert "judges the fleet" in result.reason
+
+
 def test_a_word_that_contains_a_verdict_is_not_one(sandbox: Path) -> None:
     middle = "1. **Critical: `log-shipper` is unhealthy on every node**\n   No logs ship; fix the image tag."
     (sandbox / "INVENTORY.delivered.md").write_text(_report(*_objective()["posture"], middle=middle))

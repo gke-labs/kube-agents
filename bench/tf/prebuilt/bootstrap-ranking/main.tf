@@ -284,7 +284,7 @@ resource "null_resource" "ranking" {
     inventory         = local.inventory
     disarm_b64        = base64encode(local.disarm_py)
     resolve_b64       = base64encode(local.resolve_py)
-    raw_b64           = local.raw_b64
+    planted_b64       = join(" ", local.planted_b64)
   }
 
   provisioner "local-exec" {
@@ -385,11 +385,10 @@ resource "null_resource" "ranking" {
       disarm() {
         printf '%s' '${base64encode(local.disarm_py)}' | base64 -d | agent_py
       }
+      # Every case's planted report: the next run on this stack may be the other case, so a
+      # resolve that failed here is finished by whichever case runs next. A finding already
+      # resolved stays resolved.
       resolve() {
-        printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py "${local.raw_b64}"
-      }
-      # The teardown an earlier run left may be the other case's on this stack.
-      resolve_planted() {
         printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py ${join(" ", local.planted_b64)}
       }
       # Writes base64 $1 to the sandbox path $2 aside and renames it, owned as
@@ -438,7 +437,7 @@ resource "null_resource" "ranking" {
         # `disarm` removed the state file, so the next run will not come back
         # here; the planted ids it registers again are the ones its own
         # teardown resolves.
-        if ! resolve_planted >&2; then
+        if ! resolve >&2; then
           echo "ERROR: could not finish the teardown an earlier run left on ${var.host_cluster_name}: delivery is disarmed, but its planted findings are still open on the queue. Nothing was planted; the next run's teardown resolves them." >&2
           exit 1
         fi
@@ -649,7 +648,7 @@ resource "null_resource" "ranking" {
         ${self.triggers.python} - || failed="$failed, disarm the delivery job"
       printf '%s' '${self.triggers.resolve_b64}' | base64 -d | \
         kubectl exec -i -n "$ns" "$target" -c "${self.triggers.container}" --pod-running-timeout=${self.triggers.pod_wait}s -- \
-        ${self.triggers.python} - "${self.triggers.raw_b64}" || failed="$failed, resolve the planted findings"
+        ${self.triggers.python} - ${self.triggers.planted_b64} || failed="$failed, resolve the planted findings"
       if [ -n "$failed" ]; then
         echo "Cleanup incomplete: could not$${failed#,}. The next run archives the cards, removes the files and disarms delivery, and its teardown resolves the findings." >&2
         exit 1

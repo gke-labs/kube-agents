@@ -6033,7 +6033,7 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
     order. Passes when the report's text, headings dropped and whitespace
     collapsed, starts with them, so a sentence added before or between them is
     a fail, and when none of ``forbidden_patterns`` (case-insensitive) matches
-    anywhere in it. No report, or one that cannot be read, is a fail; an
+    anywhere in the report, headings included. No report, or one that cannot be read, is a fail; an
     unreadable sandbox is ``status="error"``.
     """
 
@@ -6061,7 +6061,9 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
             return "fail", f"the report on {pod} cannot be read: {text}", raw
         body = _report_body(text)
         expected = " ".join(" ".join(paragraph.split()) for paragraph in self.posture)
-        verdicts = sorted({m.group(0) for p in self.forbidden_patterns for m in re.finditer(p, body, re.IGNORECASE)})
+        # Headings included: a verdict in a heading reaches the user as written.
+        full = " ".join(text.split())
+        verdicts = sorted({m.group(0) for p in self.forbidden_patterns for m in re.finditer(p, full, re.IGNORECASE)})
         raw.update({"opening": body[: len(expected) + 200], "verdicts": verdicts})
         if not body.startswith(expected):
             return "fail", f"the report does not open with the posture the SOP fixes; it opens: {body[: len(expected) + 80]!r}", raw

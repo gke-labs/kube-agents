@@ -145,7 +145,10 @@ QUIET_COUNTS = "{scanned} · no critical item in this scan's {checks} checks"
 #: The roll-up's own words for none critical. Any other "critical" in the report vetoes the card:
 #: the selection says nothing is critical, so a report that says otherwise goes as written.
 NONE_CRITICAL = re.compile(r"\bnone of them critical\b", re.IGNORECASE)
-CRITICAL_WORD = re.compile(r"critical", re.IGNORECASE)
+# "non-critical" and "noncritical" are the pace line's own words, not a claim that something is critical.
+CRITICAL_WORD = re.compile(r"(?<!non-)(?<!non )\bcritical\b", re.IGNORECASE)
+#: Where a sentence ends inside the counts paragraph, so a gap written on the next line is kept.
+SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 QUIET_COUNTS_JOIN = " · "
 QUIET_QUEUE = "{count} smaller {items} queued. I'll bring up to {daily} a day."
 QUIET_QUEUE_ASK = "{count} smaller {items} queued. Ask me when you want them."
@@ -914,9 +917,11 @@ def _quiet(report: str, selection: dict | None) -> _Quiet | None:
     posture, tail = paragraphs[:at], paragraphs[at + 1 :]
     if not posture:
         return None
+    first, *rest = SENTENCE_END.split(posture[0], 1)
+    first = [first]
     scanned = [
         _counted(count, nouns)
-        for count, nouns in ((_stated(CLUSTER_COUNT, posture[:1]), CLUSTERS_NOUN), (_stated(WORKLOAD_COUNT, posture[:1]), WORKLOADS_NOUN))
+        for count, nouns in ((_stated(CLUSTER_COUNT, first), CLUSTERS_NOUN), (_stated(WORKLOAD_COUNT, first), WORKLOADS_NOUN))
         if count is not None
     ]
     if not scanned:
@@ -932,7 +937,9 @@ def _quiet(report: str, selection: dict | None) -> _Quiet | None:
                  else QUIET_QUEUE_ASK.format(count=queued, items=items))
     else:
         queue = ""
-    return _Quiet(counts, [*posture[1:], *filter(None, [queue])], closing, queued)
+    # The counts are the first sentence; anything after it in that paragraph (a gap written on the
+    # next line) is kept as written.
+    return _Quiet(counts, [*rest, *posture[1:], *filter(None, [queue])], closing, queued)
 
 
 def _card(report: str, selection: dict | None = None) -> _Card | None:

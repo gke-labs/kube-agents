@@ -72,4 +72,9 @@ variable "raw_report" {
   type        = string
   description = "File name, beside main.tf, of the INVENTORY.raw.md this case plants"
   default     = "inventory-raw.txt"
+  # The teardown resolves, and the fixture test composes, only files matching this.
+  validation {
+    condition     = can(regex("^inventory-raw[^/]*\\.txt$", var.raw_report))
+    error_message = "raw_report must be an inventory-raw*.txt file beside main.tf, with a .cards.json beside it."
+  }
 }

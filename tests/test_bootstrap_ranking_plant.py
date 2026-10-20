@@ -54,6 +54,8 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _STACK = _REPO_ROOT / "bench" / "tf" / "prebuilt" / "bootstrap-ranking"
 _MODULE = _STACK / "main.tf"
 _RAW = _STACK / "inventory-raw.txt"
+# Every case's planted report on this stack, which each teardown resolves.
+_PLANTED = [base64.b64encode(raw.read_bytes()).decode() for raw in sorted(_STACK.glob("inventory-raw*.txt"))]
 _CHAT_SCRIPTS = _REPO_ROOT / "agents" / "chat" / "scripts"
 _PLATFORM_SCRIPTS = _REPO_ROOT / "agents" / "platform" / "scripts"
 _HEREDOC_RE = re.compile(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT\n", re.S)
@@ -159,7 +161,7 @@ _DESTROY_INTERPOLATIONS = {
     "self.triggers.inventory": _INTERPOLATIONS["local.inventory"],
     "self.triggers.disarm_b64": _INTERPOLATIONS["base64encode(local.disarm_py)"],
     "self.triggers.resolve_b64": _INTERPOLATIONS["base64encode(local.resolve_py)"],
-    "self.triggers.raw_b64": _INTERPOLATIONS["local.raw_b64"],
+    "self.triggers.planted_b64": _INTERPOLATIONS['join(" ", local.planted_b64)'],
 }
 
 # Records every call to $CALLS, tagging the in-pod Python by what it reads, and
@@ -478,9 +480,8 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertLess(states[1], self._indices(calls, "[plant pod/platform-agent-shell-0]")[0])
         # The leftover may be the other case's on this stack, so it resolves every planted report.
         argv = (self._state / "resolve_argv").read_text().split("\n")
-        planted = [base64.b64encode(raw.read_bytes()).decode() for raw in sorted(_STACK.glob("inventory-raw*.txt"))]
-        self.assertEqual(len(planted), 2)
-        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *planted])
+        self.assertEqual(len(_PLANTED), 2)
+        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *_PLANTED])
 
     def test_a_leftover_arm_that_will_not_tear_down_stops_the_apply(self):
         for fail in ("DISARM_FAIL", "RESOLVE_FAIL"):
@@ -593,7 +594,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertEqual(len(resolve), 1, calls)
         self.assertLess(self._indices(calls, "[disarm]")[0], resolve[0])
         argv = (self._state / "resolve_argv").read_text().split("\n")
-        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", _INTERPOLATIONS["local.raw_b64"]])
+        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *_PLANTED])
         archived = self._indices(calls, "archive t_card [archive]")
         self.assertEqual(len(archived), 1, calls)
         self.assertLess(self._indices(calls, "[create]")[0], archived[0])
@@ -710,7 +711,7 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertEqual(len(resolve), 1)
         self.assertLess(disarm[0], resolve[0])
         argv = (self._state / "resolve_argv").read_text().split("\n")
-        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", _INTERPOLATIONS["local.raw_b64"]])
+        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *_PLANTED])
 
     def test_destroy_carries_on_past_a_failed_step_and_names_it(self):
         completed, calls = self._run(
