@@ -401,7 +401,7 @@ are not added in chat, that they wait in the queue until the user asks. **Omit t
 when it prints `roll-up: none`** — printing `Also found: 0 items` is noise.
 
 **A report that lists no item is a correct report.** When `select` prints `list no item; there are
-no critical findings`, write the posture, the roll-up line, and when the rest arrives. Add no verdict
+no critical findings`, write the posture, the roll-up line, and how many arrive a day. Add no verdict
 on the fleet: no critical finding among this scan's checks says nothing about the checks the
 first-run audits run, and they post their own findings soon after. When it prints `list no item;
 the limit is 0`, the install has turned the list off: write the posture and the roll-up line only.
@@ -430,7 +430,7 @@ Write clean Markdown that reads well in a chat client. Structure:
    - the `posture:` line `select` printed, copied exactly, without the `posture:` label.
 
    Nothing else: no judgement of the fleet, such as "healthy", "clean", or "no critical
-   vulnerabilities". The scan runs the checks that line names and reports in passing only what no first-run audit checks. The first-run audits check
+   vulnerabilities". The scan runs only the checks that line counts, plus what it sees in passing that no first-run audit checks. The first-run audits check
    security and RBAC, reliability, capacity and cost minutes later and post their own findings,
    so a verdict here contradicts them.
 

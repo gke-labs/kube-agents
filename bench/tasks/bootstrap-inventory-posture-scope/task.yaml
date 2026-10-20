@@ -26,7 +26,7 @@
 # SOP, which takes a dispatcher slot for most of the stack's wait.
 ---
 id: bootstrap-inventory-posture-scope
-name: The first onboarding report says what the scan checked and judges nothing
+name: The first onboarding report says how far the scan went and judges nothing
 
 fixtures: []
 
@@ -86,3 +86,4 @@ verification_spec:
         - '\ball clear\b'
         - '\bclean bill\b'
         - '\bgood shape\b'
+        - '\bgood health\b'

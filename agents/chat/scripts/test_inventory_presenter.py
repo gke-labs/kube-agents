@@ -120,13 +120,17 @@ class QuietCardTest(unittest.TestCase):
             self.assertIn(json.dumps(line), text)
         self.assertIn("Secret inspection was skipped on platform-agent-host and seeded-d", text)
         labels = [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
-        self.assertEqual(labels, ["See all 19 findings", "What did the scan check?"])
+        self.assertEqual(labels, ["See all 19 findings"])
+        fold = next(b for b in blocks if b.get("title", {}).get("text") == "What this scan checked")
+        for _, words in inventory_presenter.SCAN_CHECKS:
+            self.assertIn(json.dumps(words), json.dumps(fold))
         self.assertNotIn("available on request", text)
         self.assertNotIn("16:00", text)
         message, _ = inventory_presenter.chat(QUIET_REPORT)
         self.assertEqual(message["headline"], "First look at your fleet: done")
         self.assertEqual(message["detail"], QUIET_COUNTS)
-        self.assertEqual([c["text"] for c in message["choices"]], ["See all 19 findings", "What did the scan check?"])
+        self.assertEqual([c["text"] for c in message["choices"]], ["See all 19 findings"])
+        self.assertIn("What this scan checked", json.dumps(message))
 
     def test_a_pace_of_zero_says_to_ask(self):
         with mock.patch.dict(os.environ, {"FINDINGS_NONCRITICAL_MAX": "0"}):
@@ -138,13 +142,26 @@ class QuietCardTest(unittest.TestCase):
         report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4], rollup)
         self.assertNotEqual(report, QUIET_REPORT)
         out = inventory_presenter.present(report)
-        self.assertTrue(out.startswith("**First look at your fleet: done**"), out)
+        self.assertTrue(out.startswith("**First look at your fleet: done**\n5 clusters · 221 workloads · 9 configuration checks\n"), out)
+        self.assertNotIn("no critical item", out)
         self.assertIn(rollup, out)
 
-    def test_nothing_queued_has_only_the_scan_button(self):
+    def test_nothing_queued_has_no_button_and_one_queued_is_singular(self):
         report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4] + "\n\n", "")
         message, _ = inventory_presenter.chat(report)
-        self.assertEqual([c["text"] for c in message["choices"]], ["What did the scan check?"])
+        self.assertEqual(message.get("choices", []), [])
+        one = QUIET_REPORT.replace("19 more items", "1 more item")
+        message, _ = inventory_presenter.chat(one)
+        self.assertEqual([c["text"] for c in message["choices"]], ["See the 1 finding"])
+
+    def test_a_critical_written_outside_the_numbered_list_goes_as_written(self):
+        # The card would say "no critical item" above it.
+        for item in ("- **Critical: quote-api is down**", "  1. **Critical: quote-api is down**",
+                     "**1. Critical: quote-api is down**", "Critical: quote-api is down."):
+            with self.subTest(item=item):
+                report = QUIET_REPORT.replace("The full inventory", f"{item}\n\nThe full inventory")
+                self.assertEqual(inventory_presenter.present(report), report)
+                self.assertIsNone(inventory_presenter.blocks(report))
 
     def test_a_report_without_the_exact_posture_line_goes_as_written(self):
         report = QUIET_REPORT.replace(inventory_presenter.SCAN_SCOPE_LINE, "The fleet looks healthy.")

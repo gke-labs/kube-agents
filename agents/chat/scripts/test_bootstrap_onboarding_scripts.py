@@ -326,7 +326,7 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
 
     def test_no_home_says_not_posted_once_when_summaries_are_listed(self):
-        ran = bootstrap_delivery.AUDITS_RAN_NOTE.format(areas="security and RBAC")
+        ran = bootstrap_delivery.AUDITS_RAN_NOTE.format(audits="The security and RBAC audit", have="has")
         undelivered = bootstrap_delivery.AUDITS_UNDELIVERED_NOTE.format(audits="`fleet-wide-cost-analysis`")
         with mock.patch.object(bootstrap_delivery, "_audits_state_note", return_value=f"{ran} {undelivered}"):
             note = bootstrap_delivery._audits_note(self.d, False, home=False)
@@ -2247,7 +2247,7 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_a_finished_chain_says_which_audits_ran(self):
         note = self._note({oobe.STATE_FIRED: list(oobe.FIRST_RUN_AUDITS), oobe.STATE_DONE: True})
-        self.assertIn("The cost, security and RBAC, reliability and capacity audits have started.", note)
+        self.assertIn("The security and RBAC, reliability, capacity and cost audits have started.", note)
         self.assertNotIn("`", note)
         self.assertIn("Each posts", note)
         self.assertNotIn("Not run", note)
@@ -2259,7 +2259,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             oobe.STATE_GAVE_UP: ["obtainability-audit"],
             oobe.STATE_DONE: True,
         })
-        self.assertIn("The cost and capacity audits have started.", note)
+        self.assertIn("The capacity and cost audits have started.", note)
         self.assertTrue(note.endswith(
             "Not run: the security and RBAC audit (disabled), "
             f"the reliability audit ({bootstrap_delivery.AUDITS_GAVE_UP_REASON})."
@@ -2301,7 +2301,7 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_audits_that_finished_before_a_home_channel_are_listed(self):
         note = self._note(self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))
-        self.assertIn("The cost, security and RBAC, reliability and capacity audits have run.", note)
+        self.assertIn("The security and RBAC, reliability, capacity and cost audits have run.", note)
         self.assertNotIn("have started", note)
         # The ran note promises no home-channel post while summaries are missing.
         self.assertNotIn("Each posts a summary to the home channel", note)
@@ -2315,7 +2315,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._run("compliance-audit", now - 960, bootstrap_delivery.DELIVERY_FAILED)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 930},
                            oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC audits have run.", note)
+        self.assertIn("The security and RBAC audit has run.", note)
         self.assertIn("were not posted to the chat: `compliance-audit`", note)
 
     def test_a_suppressed_acked_run_is_silent(self):
@@ -2333,7 +2333,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             with self.subTest(mark=mark):
                 note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": mark},
                                    oobe.STATE_DONE: True})
-                self.assertIn("The security and RBAC audits have run.", note)
+                self.assertIn("The security and RBAC audit has run.", note)
                 self.assertIn("were not posted to the chat: `compliance-audit`", note)
 
     def test_a_later_silent_run_does_not_hide_the_lost_summary(self):
@@ -2368,7 +2368,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._run("compliance-audit", now - 86400, bootstrap_delivery.DELIVERY_FAILED)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
                            oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC audits have started.", note)
+        self.assertIn("The security and RBAC audit has started.", note)
         self.assertNotIn("not posted", note)
 
     def test_a_store_without_the_outcome_column_lists_nothing(self):
@@ -2376,7 +2376,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self._run("compliance-audit", now - 600, None, columns=False)
         note = self._note({oobe.STATE_FIRED: ["compliance-audit"], oobe.STATE_MARKS: {"compliance-audit": now - 900},
                            oobe.STATE_DONE: True})
-        self.assertIn("The security and RBAC audits have run.", note)
+        self.assertIn("The security and RBAC audit has run.", note)
         self.assertNotIn("not posted", note)
         # The stage log says why no unposted summary can be named; stderr is dropped on exit 0.
         self.assertIn("no delivery_outcome column", (self.d / oobe.STAGE_LOG).read_text())

@@ -228,17 +228,18 @@ AUDITS_UNCHECKED_SCHEDULED_NOTE = (
     "No cluster was audited either, so this report covers no cluster; those audits check "
     f"{inventory_findings.AUDIT_FAMILY_WORDS} on their schedules."
 )
-# The audits by what each reports on, as the report's posture line names them; the job ids
-# stay out of the user's chat.
-AUDITS_AREAS = "The {areas} audits"
+# The audits by what each reports on, in the posture line's order. The job ids stay out of
+# these sentences; the list of unposted summaries keeps them, since a request for one names it.
+AUDITS_AREAS = "The {areas} {audits}"
+AUDITS_WORD = ("audit", "audits")
 # Also the note before the marker exists: the stage writes it on its first tick after the ranking
 # card finishes, which a user already in the chat can beat to this run.
 AUDITS_RUNNING_NOTE = (
-    f"{AUDITS_AREAS.format(areas=inventory_findings.AUDIT_FAMILY_WORDS)} run one after another once this "
+    f"{AUDITS_AREAS.format(areas=inventory_findings.AUDIT_FAMILY_WORDS, audits=AUDITS_WORD[1])} run one after another once this "
     "scan is done. Each posts a summary to the home channel when it finds something new."
 )
 AUDITS_RAN_NOTE = (
-    f"{AUDITS_AREAS} have started. Each posts a summary to the home channel when it finds something new."
+    "{audits} {have} started. Each posts a summary to the home channel when it finds something new."
 )
 AUDITS_NONE_RAN_NOTE = (
     f"None of the first-run audits ran. This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}."
@@ -248,7 +249,8 @@ AUDITS_NOT_RUN_ITEM = "the {area} audit ({reason})"
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
 # Every audit the chain started has completed its run, so "have started" would be stale.
-AUDITS_FINISHED_NOTE = f"{AUDITS_AREAS} have run."
+AUDITS_FINISHED_NOTE = "{audits} {have} run."
+AUDITS_HAVE = ("has", "have")
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
 # (_undelivered_audits).
@@ -852,9 +854,12 @@ def _area(audit: str) -> str:
 
 
 def _areas(audits: list[str]) -> str:
-    """``a, b and c`` of the audits' areas."""
-    words = [_area(a) for a in audits]
-    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+    """"The a, b and c audits", in the posture line's order of the areas."""
+    order = list(inventory_findings.AUDIT_FAMILIES)
+    ranked = sorted(audits, key=lambda a: order.index(a) if a in order else len(order))
+    words = [_area(a) for a in ranked]
+    joined = words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+    return AUDITS_AREAS.format(areas=joined, audits=AUDITS_WORD[len(words) != 1])
 
 
 def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
@@ -895,9 +900,9 @@ def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
     if not state.get(oobe.STATE_DONE):
         note = AUDITS_RUNNING_NOTE
     elif fired and finished == fired:
-        note = AUDITS_FINISHED_NOTE.format(areas=_areas(fired))
+        note = AUDITS_FINISHED_NOTE.format(audits=_areas(fired), have=AUDITS_HAVE[len(fired) != 1])
     elif fired:
-        note = AUDITS_RAN_NOTE.format(areas=_areas(fired))
+        note = AUDITS_RAN_NOTE.format(audits=_areas(fired), have=AUDITS_HAVE[len(fired) != 1])
     else:
         note = AUDITS_NONE_RAN_NOTE
     if not_run:

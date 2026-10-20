@@ -137,7 +137,9 @@ def test_a_report_that_opens_with_the_fixed_posture_passes(sandbox: Path) -> Non
 
 def test_the_posture_in_one_paragraph_or_wrapped_still_passes(sandbox: Path) -> None:
     counts, line = _objective()["posture"]
-    for posture in (f"{counts} {line}", f"{counts}\n\n{line.replace(', Dataplane V2', ',\nDataplane V2')}"):
+    wrapped = line.replace("; ", ";\n")
+    assert wrapped != line
+    for posture in (f"{counts} {line}", f"{counts}\n\n{wrapped}"):
         (sandbox / "INVENTORY.md").write_text(_report(posture))
         result = _verify()
         assert result.status == "pass", result.reason

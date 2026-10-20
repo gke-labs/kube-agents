@@ -48,8 +48,8 @@ roll-up, the total is a closing line's "all <n> findings", then the
 posture's "<n> findings" after a scan verb, then the largest of the closing
 lines' "<n> findings in total" (one may count one cluster), then any other
 "<n> findings" in the posture, then the listed items. The posture line
-``inventory_findings.py select`` printed, naming what the scan checked, is kept
-whole, first on the line under the headline. The rest of the
+``inventory_findings.py select`` printed, counting the scan's checks and naming
+the audits' areas, is kept whole, first on the line under the headline. The rest of the
 findings, the rest of the posture and any other roll-up paragraph are left out;
 every other closing line is kept as written, counts and all, since they are
 how a text reader asks for the rest. When the roll-up was the last of them,
@@ -70,9 +70,12 @@ A report that lists no item, opened with the scan counts and the posture line
 as Step 6 fixes them, gets its own card (``_quiet``): "First look at your
 fleet: done", the counts with "no critical item in this scan's 9 checks", any
 gap sentence, a queue line from the roll-up's count and the install's pace (no
-delivery hour), and the buttons "See all N findings" and "What did the scan
-check?". The text layout keeps the closing lines under it; the card leaves them
-to its buttons.
+delivery hour), the scan's checks folded under "What this scan checked", and a
+"See all N findings" button when items are queued. With criticals held back
+(the first report's limit is 0) the counts make no claim and the roll-up is
+kept as written. A list or a severity label anywhere sends the report as
+written. The text layout keeps the closing lines under it; the card leaves them
+to its button.
 
 The report is model-written to the format in
 ``agents/platform/governance/inventory_prioritize_sop.md`` (Step 6). A report
@@ -131,12 +134,18 @@ SEE_ALL = "See all {count}"
 #: its own card, since the headline above counts things to look at.
 QUIET_HEADLINE = "First look at your fleet: done"
 QUIET_COUNTS = "{scanned} · no critical item in this scan's {checks} checks"
+# Criticals held back (the first report's limit is 0): the roll-up says so, so the counts claim nothing.
+QUIET_COUNTS_HELD = "{scanned} · {checks} configuration checks"
 QUIET_COUNTS_JOIN = " · "
 QUIET_QUEUE = "{count} smaller {items} queued. I'll bring up to {daily} a day."
 QUIET_QUEUE_ASK = "{count} smaller {items} queued. Ask me when you want them."
 QUIET_ITEMS = ("item is", "items are")
-SEE_ALL_FINDINGS = "See all {count} findings"
-WHAT_CHECKED = "What did the scan check?"
+SEE_ALL_FINDINGS = ("See the {count} finding", "See all {count} findings")
+#: The scan's checks, folded under the card's lines, so the card answers what it covered.
+CHECKS_FOLD_TITLE = "What this scan checked"
+#: Any list or severity label: a critical item written outside the numbered list Step 6 asks
+#: for is not a report with no item, so it goes as written.
+NOT_QUIET = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\*\*\d+[.)])|\bcritical\s*:", re.IGNORECASE | re.MULTILINE)
 #: The card shows this many of the listed findings as rows; the rest fold under FOLD_TITLE.
 CARD_ROWS = 2
 FOLD_TITLE = "{count} more worth a look"
@@ -669,7 +678,7 @@ class _Shape:
         # Otherwise only the roll-up goes: the headline carries its count, and a
         # closing line with a count in it is still how a text reader asks.
         self.closing = [p for p in tail if p is not rollup]
-        # The posture line select prints says what the scan checked; it is kept whole, since without
+        # The posture line select prints counts the scan's checks; it is kept whole, since without
         # it the total reads as the whole fleet's: under the headline as text, under the rows on the
         # card, whose line under the headline is clipped shorter than it.
         posture = " ".join(posture.split())
@@ -877,7 +886,7 @@ def _quiet(report: str) -> _Quiet | None:
     as written, as on the card for a report with items.
     """
     lines = report.splitlines()
-    if any(ITEM_START.match(line) for line in lines):
+    if NOT_QUIET.search(report):
         return None
     paragraphs = [" ".join(p.split()) for p in _paragraphs([line for line in lines if not HEADING.match(line)])]
     paragraphs = [p for p in paragraphs if p and not _is_title(p)]
@@ -894,11 +903,14 @@ def _quiet(report: str) -> _Quiet | None:
     ]
     if not scanned:
         return None
-    counts = QUIET_COUNTS.format(scanned=QUIET_COUNTS_JOIN.join(scanned), checks=len(SCAN_CHECKS))
     rollup = next((p for p in tail if _rollup_count(p, 0) is not None), None)
+    held = rollup is not None and DEFERRED_CRITICALS.search(rollup) is not None
+    counts = (QUIET_COUNTS_HELD if held else QUIET_COUNTS).format(
+        scanned=QUIET_COUNTS_JOIN.join(scanned), checks=len(SCAN_CHECKS)
+    )
     queued = (_rollup_count(rollup, 0) or 0) if rollup is not None else 0
     closing = [p for p in tail if p is not rollup]
-    if rollup is not None and DEFERRED_CRITICALS.search(rollup):
+    if held:
         queue = rollup
     elif queued:
         daily = fq.pacing_limits(os.environ).noncritical_max
@@ -916,8 +928,9 @@ def _card(report: str) -> _Card | None:
     report = report.replace("\0", "")
     quiet = _quiet(report)
     if quiet is not None:
-        choices = ([SEE_ALL_FINDINGS.format(count=quiet.queued)] if quiet.queued else []) + [WHAT_CHECKED]
-        return _Card(QUIET_HEADLINE, "", quiet.counts, [], [], "", choices, "\n".join(quiet.after))
+        choices = [SEE_ALL_FINDINGS[quiet.queued != 1].format(count=quiet.queued)] if quiet.queued else []
+        checks = [{"text": words} for _, words in SCAN_CHECKS]
+        return _Card(QUIET_HEADLINE, "", quiet.counts, [], checks, CHECKS_FOLD_TITLE, choices, "\n".join(quiet.after))
     shape = _shape(report)
     if shape is None:
         return None

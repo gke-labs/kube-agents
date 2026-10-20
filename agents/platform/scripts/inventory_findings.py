@@ -51,10 +51,9 @@ SOURCE = "inventory"
 
 # What the onboarding scan checks: the slug table in
 # governance/cluster_inventory_audit_sop.md, in its order, with the words the
-# report uses for each. The scan also reports problems it sees in passing that
-# no first-run audit checks (a workload in CrashLoopBackOff), so the line says
-# so; the report names this list and the audits' areas rather than an exclusion
-# list it cannot keep complete.
+# report uses for each. The posture line counts them and names the audits'
+# areas rather than an exclusion list it cannot keep complete; the raw file and
+# the Slack card list them by name.
 SCAN_CHECKS = (
     ("probes-startup", "startup probes"),
     ("no-resourcequota", "ResourceQuota and LimitRange"),
@@ -567,19 +566,16 @@ def describe_selection(
         if not limits.daily_criticals:
             out.append("pace: the critical items not listed are not added in chat; the daily limit is 0")
         else:
-            start = " the day after the report arrives" if len(shown) >= limits.daily_criticals else ""
+            # No hour: the report states the pace, and a UTC time is noise to the reader.
+            start = " starting the day after the report arrives," if len(shown) >= limits.daily_criticals else ""
             out.append(
-                f"pace: the critical items not listed are added in chat from {fq.REMIND_HOUR}:00 UTC{start}, "
-                f"at most {limits.daily_criticals} a day"
+                f"pace: the critical items not listed are added in chat{start} at most {limits.daily_criticals} a day"
             )
     elif not shown and others:
         if not limits.noncritical_max:
             out.append("pace: non-critical items are not added in chat; the daily limit is 0")
         else:
-            out.append(
-                f"pace: non-critical items are added in chat from {limits.noncritical_after_hour}:00 UTC, "
-                f"at most {limits.noncritical_max} a day"
-            )
+            out.append(f"pace: non-critical items are added in chat, at most {limits.noncritical_max} a day")
     return "\n".join(out)
 
 

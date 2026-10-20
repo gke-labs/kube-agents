@@ -559,14 +559,14 @@ class SelectCommandTests(unittest.TestCase):
         self.assertIn("roll-up: 1 more item, 1 of them critical", out)
         # The two listed fill the delivery day's allowance of 2.
         self.assertIn(
-            "pace: the critical items not listed are added in chat from 12:00 UTC the day after the report "
+            "pace: the critical items not listed are added in chat starting the day after the report "
             "arrives, at most 2 a day",
             out,
         )
 
     def test_criticals_left_out_start_the_same_day_while_the_allowance_lasts(self):
         _, out, _ = self.run_select(criticals(3), {"first_report_criticals": 1, "daily_criticals": 2})
-        self.assertIn("pace: the critical items not listed are added in chat from 12:00 UTC, at most 2 a day", out)
+        self.assertIn("pace: the critical items not listed are added in chat at most 2 a day", out)
 
     def test_a_daily_limit_of_zero_gives_no_arrival_time(self):
         _, out, _ = self.run_select(criticals(3), {"daily_criticals": 0})
@@ -581,7 +581,8 @@ class SelectCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("list no item; there are no critical findings", out)
         self.assertIn("roll-up: 2 more items, none of them critical", out)
-        self.assertIn("pace: non-critical items are added in chat from 15:00 UTC, at most 4 a day", out)
+        self.assertIn("pace: non-critical items are added in chat, at most 4 a day", out)
+        self.assertNotIn("UTC", out)
         self.assertEqual(json.loads(self.shown.read_text(encoding="utf-8")), {"items": []})
 
     def test_every_branch_prints_the_posture_line(self):
