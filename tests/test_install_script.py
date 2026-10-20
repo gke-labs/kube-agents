@@ -1386,6 +1386,58 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             proc.stdout,
         )
 
+    def test_parse_args_litellm_env_secret_flag(self):
+        cmd = (
+            "parse_args --model-provider=sap --litellm-env-secret=sap-aicore; "
+            'echo "P=$PARAM_MODEL_PROVIDER S=$PARAM_LITELLM_ENV_SECRET_NAME"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("P=sap S=sap-aicore", proc.stdout)
+
+    def test_the_slug_prompt_gives_up_without_a_tty_instead_of_looping(self):
+        # Without a tty prompt_read answers with the default every time, so a
+        # prompt that waited for a valid answer would never return; the
+        # function returns 1 and leaves the caller's variables alone. Interactive,
+        # a typo is asked again (the pty case lives with the other prompt tests).
+        cmd = (
+            'source_provisioning_helpers "$PWD" >/dev/null; '
+            'PARAM_NON_INTERACTIVE="false"; has_controlling_tty() { return 1; }; '
+            'model_provider="v-llm"; model_default_name="m"; litellm_env_secret_name="s"; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC=${rc:-0} P=$model_provider M=$model_default_name S=$litellm_env_secret_name"; '
+            'model_provider="azure"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC2=${rc:-0} P2=$model_provider M2=[$model_default_name]"; '
+            'model_provider="sap"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC3=${rc:-0} P3=$model_provider M3=$model_default_name"; '
+            # A keyed table provider typed at the slug prompt belongs to its own
+            # entry: refused, variables untouched. prompt_read is stubbed to type
+            # it, since the seed for a recorded gemini is sap.
+            'typed() { case "$1" in *slug*) printf -v "$2" %s gemini;; *) printf -v "$2" %s "$3";; esac; }; '
+            'real_prompt_read=$(declare -f prompt_read); eval "${real_prompt_read/prompt_read/orig_prompt_read}"; '
+            'prompt_read() { typed "$@"; }; '
+            'model_provider="gemini"; model_default_name="m"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC4=${rc:-0} P4=$model_provider M4=$model_default_name"; '
+            'eval "${real_prompt_read}"; '
+            # A Secret name Kubernetes would refuse: refused here, variables untouched.
+            'model_provider="sap"; model_default_name="m"; litellm_env_secret_name="SAP-AICore"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC5=${rc:-0} P5=$model_provider M5=$model_default_name S5=$litellm_env_secret_name"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertIn("RC=1 P=v-llm M=m S=s", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("is not a LiteLLM provider slug", proc.stdout + proc.stderr)
+        self.assertIn("RC2=1 P2=azure M2=[]", proc.stdout)
+        self.assertIn("A model name is required", proc.stdout + proc.stderr)
+        self.assertIn("RC3=0 P3=sap M3=anthropic--claude-4.5-sonnet", proc.stdout)
+        self.assertIn("RC4=1 P4=gemini M4=m", proc.stdout)
+        self.assertIn("has its own entry in the provider menu", proc.stdout + proc.stderr)
+        self.assertIn("RC5=1 P5=sap M5=m S5=SAP-AICore", proc.stdout)
+        self.assertIn("is not a valid Kubernetes Secret name", proc.stdout + proc.stderr)
+
     def test_validate_openai_compatible_inputs_refuses_what_the_chart_or_operator_would(self):
         # The chart cannot render without these, and the operator drops the
         # whole egress rule over one bad CIDR, so the installer stops before
@@ -4551,7 +4603,8 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     invocation, so dropping it again would look like nothing in a diff.
     """
 
-    def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False):
+    def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
+             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None):
         """import_github_pem against a stub gcloud that records every call.
 
         By default the stub reports no ENABLED key version, so the import is
@@ -4583,7 +4636,40 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 if creates_fail
                 else ""
             )
-            describe_case = "  *'kms keys describe'*) exit 1 ;;\n" if describe_fails else ""
+            describe_case = ""
+            if keys_describe_fail_first > 0:
+                describe_case = (
+                    f'  *\'kms keys describe\'*)\n'
+                    f'    d_count=$(grep -c "kms keys describe" "{log}" || true)\n'
+                    f'    if [ "$d_count" -le {keys_describe_fail_first} ]; then\n'
+                    f'      echo "{fail_msg or "ERROR: (gcloud.kms) Error 403: Google Cloud KMS API has not been used in project a-project before or it is disabled."}" >&2; exit 1\n'
+                    f'    fi ;;\n'
+                )
+            elif describe_fails:
+                describe_case = "  *'kms keys describe'*) exit 1 ;;\n"
+            fail_403 = (
+                fail_msg or
+                "ERROR: (gcloud.kms) Error 403: Google Cloud KMS API "
+                "has not been used in project a-project before or it is disabled."
+            )
+            keyrings_fail_block = ""
+            if keyrings_fail_first > 0:
+                keyrings_fail_block = (
+                    f'  *\'kms keyrings create\'*)\n'
+                    f'    kr_count=$(grep -c "kms keyrings create" "{log}" || true)\n'
+                    f'    if [ "$kr_count" -le {keyrings_fail_first} ]; then\n'
+                    f'      echo "{fail_403}" >&2; exit 1\n'
+                    f'    fi ;;\n'
+                )
+            keys_fail_block = ""
+            if keys_fail_first > 0:
+                keys_fail_block = (
+                    f'  *\'kms keys create\'*)\n'
+                    f'    k_count=$(grep -c "kms keys create" "{log}" || true)\n'
+                    f'    if [ "$k_count" -le {keys_fail_first} ]; then\n'
+                    f'      echo "{fail_403}" >&2; exit 1\n'
+                    f'    fi ;;\n'
+                )
             gcloud = bin_dir / "gcloud"
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
@@ -4591,6 +4677,8 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 'case "$*" in\n'
                 "  *'kms keys versions list'*) exit 0 ;;\n"
                 f"{describe_case}"
+                f"{keyrings_fail_block}"
+                f"{keys_fail_block}"
                 f"{create_case}"
                 "esac\n"
                 "exit 0\n"
@@ -4620,12 +4708,20 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 "GITOPS_ORG=an-org GITOPS_REPO=a-repo GITHUB_APP_ID=12345 "
                 f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a\n'
             )
+            merged_env = {"KMS_API_PROPAGATION_WAIT_SECONDS": "0"}
+            if env_overrides:
+                merged_env.update(env_overrides)
             proc = subprocess.run(
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides=merged_env,
+                    absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+                ),
                 cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
@@ -4817,6 +4913,73 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         self.assertIn("tools import-pk", combined)
         self.assertNotIn("-private-key=@<path-to-pem>", combined)
 
+    def test_import_github_pem_retries_keyring_create_on_kms_propagation_403(self):
+        """A Cloud KMS 403 on the keyring create is retried across the propagation window."""
+        proc, calls = self._run(keyrings_fail_first=1)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        self.assertEqual(len(kr_creates), 2, f"expected retry on 403, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_import_github_pem_retries_key_create_on_kms_propagation_403(self):
+        """A Cloud KMS 403 on the key create is retried across the propagation window."""
+        proc, calls = self._run(keys_fail_first=1)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        k_creates = [c for c in calls if "kms keys create" in c]
+        self.assertEqual(len(k_creates), 2, f"expected retry on 403, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_import_github_pem_retries_keys_describe_on_kms_propagation_403(self):
+        """A Cloud KMS 403 on the key describe check is retried across the propagation window."""
+        proc, calls = self._run(describe_fails=False, keys_describe_fail_first=1, git_clone_fails=True)
+        # git clone fails after key describe succeeds, verifying it made it past describe check
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("PEM import failed", proc.stdout + proc.stderr)
+        d_calls = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(d_calls), 2, f"expected retry on describe 403, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_import_github_pem_does_not_retry_unrelated_api_403(self):
+        """A 403 from an unrelated API is not retried."""
+        other_403 = (
+            "Error 403: Kubernetes Engine API has not been used in "
+            "project a-project before or it is disabled."
+        )
+        proc, calls = self._run(keyrings_fail_first=1, fail_msg=other_403)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        self.assertEqual(len(kr_creates), 1, "unrelated API 403 must not be retried")
+
+    def test_import_github_pem_skips_key_create_when_keyring_create_exhausts_retries(self):
+        """When keyring create exhausts its KMS 403 retries, keys create and describe are skipped."""
+        proc, calls = self._run(
+            keyrings_fail_first=5,
+            env_overrides={"KMS_API_PROPAGATION_ATTEMPTS": "2"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        k_describes = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(kr_creates), 2, f"expected 2 attempts before exhaustion, got calls: {calls}")
+        self.assertEqual(len(k_creates), 0, "keys create must be skipped after keyring exhaustion")
+        self.assertEqual(len(k_describes), 0, "keys describe must be skipped after keyring exhaustion")
+        self.assertIn("could not be confirmed to exist", proc.stdout)
+
+    def test_import_github_pem_skips_describe_when_key_create_exhausts_retries(self):
+        """When key create exhausts its KMS 403 retries, keys describe is skipped."""
+        proc, calls = self._run(
+            keys_fail_first=5,
+            env_overrides={"KMS_API_PROPAGATION_ATTEMPTS": "2"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        k_describes = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(kr_creates), 1, f"expected 1 keyring attempt, got calls: {calls}")
+        self.assertEqual(len(k_creates), 2, f"expected 2 key attempts before exhaustion, got calls: {calls}")
+        self.assertEqual(len(k_describes), 0, "keys describe must be skipped after key exhaustion")
+        self.assertIn("could not be confirmed to exist", proc.stdout)
+
     def test_main_turns_a_failed_import_into_a_hard_exit(self):
         """The two returns above are only fatal because main() makes them so.
 
@@ -4831,6 +4994,355 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             body,
             "a failed PEM import must stop the run before terraform apply",
         )
+
+
+class RetryKmsPropagationTest(unittest.TestCase):
+    """Direct tests for retry_kms_create in scripts/installer/installer_common.sh."""
+
+    _KMS_403 = (
+        "Error: Error creating CryptoKey: googleapi: Error 403: Google Cloud KMS API "
+        "has not been used in project 123 before or it is disabled."
+    )
+    _OLDER_KMS_403 = (
+        "Error 403: Cloud Key Management Service (KMS) API has not been used in "
+        "project 123 before or it is disabled."
+    )
+
+    def _run_cmd(self, script, env_overrides=None):
+        merged = {"KMS_API_PROPAGATION_WAIT_SECONDS": "0"}
+        if env_overrides:
+            merged.update(env_overrides)
+        body = f"""
+source "{_INSTALLER_COMMON}"
+{script}
+"""
+        return subprocess.run(
+            ["bash", "-c", body],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides=merged,
+                absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+            ),
+            cwd=str(_REPO_ROOT),
+            timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+        )
+
+    def test_retry_kms_create_retries_and_succeeds(self):
+        script = f"""
+log=$(mktemp)
+stub() {{
+  echo call >> "$log"
+  count=$(wc -l < "$log")
+  if [ "$count" -le 1 ]; then
+    echo "{self._KMS_403}" >&2
+    exit 1
+  fi
+  echo "key created"
+  exit 0
+}}
+retry_kms_create stub
+rm -f "$log"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("key created", proc.stdout)
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_retry_kms_create_retries_older_api_name(self):
+        script = f"""
+log=$(mktemp)
+stub() {{
+  echo call >> "$log"
+  count=$(wc -l < "$log")
+  if [ "$count" -le 1 ]; then
+    echo "{self._OLDER_KMS_403}" >&2
+    exit 1
+  fi
+  echo "key created"
+  exit 0
+}}
+retry_kms_create stub
+rm -f "$log"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("key created", proc.stdout)
+
+    def test_retry_kms_create_does_not_retry_other_api_403(self):
+        script = """
+count=0
+stub() {
+  count=$((count + 1))
+  echo "Error 403: Container API has not been used in project 123 before or it is disabled." >&2
+  exit 1
+}
+retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("attempt 2", proc.stderr)
+
+    def test_retry_kms_create_does_not_retry_already_exists(self):
+        script = """
+count=0
+stub() {
+  count=$((count + 1))
+  echo "ALREADY_EXISTS: Resource already exists" >&2
+  exit 1
+}
+retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("ALREADY_EXISTS", proc.stdout)
+        self.assertNotIn("attempt 2", proc.stderr)
+
+    def test_retry_kms_create_gives_up_after_budget(self):
+        script = f"""
+count=0
+stub() {{
+  count=$((count + 1))
+  echo "{self._KMS_403}" >&2
+  exit 1
+}}
+KMS_API_PROPAGATION_ATTEMPTS=3 retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Cloud KMS still rejects requests 3 attempts after enabling it", proc.stderr)
+
+    def test_retry_kms_create_non_integer_attempts_falls_back_to_default(self):
+        for invalid_val in ["invalid", "99999999999999999999", "-1", "1.5"]:
+            with self.subTest(attempts=invalid_val):
+                script = f"""
+count=0
+stub() {{
+  count=$((count + 1))
+  echo "{self._KMS_403}" >&2
+  exit 1
+}}
+KMS_API_PROPAGATION_ATTEMPTS="{invalid_val}" retry_kms_create stub
+"""
+                proc = self._run_cmd(script)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("Cloud KMS still rejects requests 5 attempts after enabling it", proc.stderr)
+
+    def test_retry_kms_create_zero_attempts_runs_single_attempt_without_retry(self):
+        """KMS_API_PROPAGATION_ATTEMPTS=0 makes one attempt and stops without retry, matching lifecycle.sh."""
+        script = f"""
+count=0
+stub() {{
+  count=$((count + 1))
+  echo "stub attempt $count" >&2
+  echo "{self._KMS_403}" >&2
+  exit 1
+}}
+KMS_API_PROPAGATION_ATTEMPTS=0 retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stub attempt 1", proc.stdout)
+        self.assertNotIn("stub attempt 2", proc.stdout)
+        self.assertIn("Cloud KMS still rejects requests 1 attempts after enabling it", proc.stderr)
+        self.assertNotIn("Waiting", proc.stderr)
+
+    def test_sourcing_installer_common_then_lifecycle_does_not_fail_on_readonly_pattern(self):
+        """Sourcing installer_common.sh and then lifecycle.sh does not fail on KMS_API_PROPAGATION_PATTERN."""
+        lifecycle_sh = _REPO_ROOT / "terraform" / "examples" / "full-install" / "lifecycle.sh"
+        script = f"""
+source "{_INSTALLER_COMMON}"
+cd "{lifecycle_sh.parent}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{lifecycle_sh}"
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"]),
+            cwd=str(_REPO_ROOT),
+            timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_sanitize_kms_int_warns_on_invalid_value(self):
+        script = """
+_sanitize_kms_int "invalid" 5 0 "TEST_KMS_KNOB"
+_sanitize_kms_int "-1" 5 0 "TEST_KMS_KNOB_NEG"
+_sanitize_kms_int "0" 5 0 "TEST_KMS_KNOB_ZERO"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("TEST_KMS_KNOB='invalid' is not a whole number >= 0; using default 5", proc.stderr)
+        self.assertIn("TEST_KMS_KNOB_NEG='-1' is not a whole number >= 0; using default 5", proc.stderr)
+        self.assertNotIn("TEST_KMS_KNOB_ZERO", proc.stderr)
+
+
+class EnsureExistingClusterCmekKmsTest(unittest.TestCase):
+    """ensure_existing_cluster_cmek retries KMS creates on first-enablement 403."""
+
+    def test_cmek_creates_retry_on_kms_propagation_403(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    kr_count=$(grep -c "kms keyrings create" "{log}" || true)
+    if [ "$kr_count" -le 1 ]; then
+      echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+      exit 1
+    fi
+    exit 0 ;;
+  *'kms keys create'*)
+    k_count=$(grep -c "kms keys create" "{log}" || true)
+    if [ "$k_count" -le 1 ]; then
+      echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+      exit 1
+    fi
+    exit 0 ;;
+  *'kms keys add-iam-policy-binding'*)
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0"},
+                    absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 2, f"expected retry on keyring create, got calls: {calls}")
+        self.assertEqual(len(k_creates), 2, f"expected retry on key create, got calls: {calls}")
+        self.assertEqual(len(b_creates), 1, f"expected single call on key binding, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_cmek_skips_later_creates_when_keyring_create_exhausts_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+    exit 1 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0", "KMS_API_PROPAGATION_ATTEMPTS": "2"},
+                    absent=["KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 1)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 2)
+        self.assertEqual(len(k_creates), 0, "key create should be skipped when keyring create exhausts retry budget")
+        self.assertEqual(len(b_creates), 0, "binding should be skipped when keyring create exhausts retry budget")
+
+    def test_cmek_skips_later_creates_when_key_create_exhausts_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    exit 0 ;;
+  *'kms keys create'*)
+    echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+    exit 1 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0", "KMS_API_PROPAGATION_ATTEMPTS": "2"},
+                    absent=["KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 1)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 1, "keyring create succeeds on first attempt")
+        self.assertEqual(len(k_creates), 2, "key create retries up to budget")
+        self.assertEqual(len(b_creates), 0, "binding should be skipped when key create exhausts retry budget")
 
 
 class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
@@ -6112,6 +6624,43 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
+class NextHomeChannelUnsetWiringTest(unittest.TestCase):
+    """Where install.sh calls the #3320 home-channel warning and its closing
+    summary. The functions are tested in test_installer_common.py; these pin
+    the call sites a review found wrong: the Day-2 menu read the home channel
+    before exporting the one just typed, and two exits skipped the summary."""
+
+    def setUp(self):
+        self.text = _INSTALL_SH.read_text()
+
+    def test_the_menu_exports_its_home_channel_before_warning(self):
+        export = self.text.index('export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"')
+        warn = self.text.index("warn_next_home_channel_unset_from_env\n", export)
+        refuse = self.text.index("refuse_next_slack_gateway_settings_from_env || return 1")
+        self.assertLess(export, refuse)
+        self.assertLess(refuse, warn)
+        self.assertLess(warn - refuse, 200, "the menu's warning moved away from its Slack check")
+
+    def test_the_apply_path_warns_right_after_its_slack_check(self):
+        # The route --dry-run and a non-interactive apply take (#3320).
+        refuse = self.text.index("  elif ! refuse_next_slack_gateway_settings_from_env flags; then")
+        warn = self.text.index("  warn_next_home_channel_unset_from_env flags\n", refuse)
+        self.assertLess(warn - refuse, 600, "the apply path's warning moved away from its Slack check")
+        self.assertLess(warn, self.text.index('print_success "Terraform input saved to: $tfvars_file"', refuse))
+
+    def test_every_exit_that_warned_ends_on_the_summary(self):
+        for report in ('write_json_report "DRY_RUN_SUCCESS"', 'write_json_report "PAUSED"',
+                       'write_json_report "GENERATE_ONLY_SUCCESS"'):
+            with self.subTest(exit=report):
+                at = self.text.index(report)
+                tail = self.text[at:self.text.index("exit 0", at)]
+                self.assertIn("print_next_home_channel_unset_summary flags", tail)
+        menu = self.text.index("    run_menu_system\n")
+        self.assertIn("print_next_home_channel_unset_summary", self.text[menu:self.text.index("exit 0", menu)])
+        main_end = self.text.index('\nif [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then')
+        self.assertIn("  print_next_home_channel_unset_summary flags\n}\n", self.text[main_end - 400:main_end + 1])
+
+
 class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     """#2812 on install.sh. A run whose mode is next (--mode=next, or
     PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
@@ -6225,7 +6774,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 out = proc.stdout + proc.stderr
                 self.assertIn("went on", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
-                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("which is not a Slack channel id", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     def test_main_refuses_after_the_interview_and_again_after_recovery_before_any_write(self):
@@ -6319,7 +6868,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("USERS=[U0123ABCD] HOME=[C0123ABCD] TOKENS=", proc.stdout)
         self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)", out)
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789)", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)", out)
         self.assertNotIn("User IDs / Emails", out)
         self.assertNotIn("comma-separated for several workspaces", out)
         # Each bad answer is named and asked again, once.
@@ -6335,27 +6884,65 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # Bot token: a stray comma, then one token. Allowlist: emails, then
         # Enter, which keeps the refused list (an empty one would admit
         # everyone) under a default that shows it, then IDs. Home channel: a
-        # DM, then Enter, which clears it.
+        # DM, then Enter, which clears it, and a yes to going on without one
+        # (#3320).
         answers = ["xoxb-1-secretpart,", "xoxb-1-secretpart", "xapp-1",
                    "U0123ABCD,alice@example.com", "<enter>", "U0123ABCD",
-                   "D0123ABCD", "<enter>", "#ops"]
+                   "D0123ABCD", "<enter>", "y", "#ops"]
         proc = self._interview("--mode=next", "", answers)
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("went on ASKED=10", proc.stdout, out)
         self.assertIn("USERS=[U0123ABCD] HOME=[] TOKENS=", proc.stdout)
         self.assertIn("SLACK_BOT_TOKEN holds a comma or space.", out)
         self.assertEqual(out.count("These look like emails: alice@example.com."), 2)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails) "
                       "[default: U0123ABCD,alice@example.com]", out)
         self.assertNotIn("[default: empty list]", out.split("These look like emails", 1)[1])
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789) [default: ]", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there) [default: ]", out)
         self.assertNotIn("secretpart", out)
+
+    def test_an_empty_home_channel_under_next_is_confirmed_or_asked_again(self):
+        # #3320: under next the gateway posts alerts only to a home channel.
+        # Declining the warning asks again; accepting keeps the empty answer.
+        lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "C0123ABCD", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=7", proc.stdout, out)
+        self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("HOME=[]", proc.stdout, out)
+        # A home channel given at once is not questioned.
+        proc = self._interview("--mode=next", "", lead + ["C0123ABCD", "#ops"])
+        self.assertNotIn("Continue without a home channel", proc.stdout + proc.stderr)
+
+    def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
+        # #3320 on Chat, which holds the gateway whenever it is enabled under
+        # next. Allowlist, topic, subscription, then the home channel.
+        lead = ["", "", ""]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "spaces/AAA"], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
+        self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y"], choice="1")
+        self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
+        # Under today the prompt stays optional and nothing is confirmed.
+        proc = self._interview("", "", lead + [""], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=4", proc.stdout, out)
+        self.assertIn("Google Chat Home Channel / Space ID (optional", out)
+        self.assertNotIn("Continue without a home channel", out)
 
     def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
         answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
         for flags, choice in (("", "2"), ("--mode=next", "3")):
             with self.subTest(flags=flags, choice=choice):
-                chat = ["", "", "", ""] if choice == "3" else []
+                chat = ["", "", "", "spaces/AAA"] if choice == "3" else []
                 proc = self._interview(flags, "", chat + answers, choice=choice)
                 out = proc.stdout + proc.stderr
                 self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
@@ -6450,8 +7037,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         end = text.index("\n        ;;\n", start)
         names = ("allowed_users anthropic_api_key chat_sub_name chat_topic_name cluster_name custom_roles "
                  "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
-                 "google_chat_home_channel image_tag kms_key kms_keyring model_default_name model_provider "
-                 "openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
+                 "google_chat_home_channel image_tag kms_key kms_keyring litellm_env_secret_name model_default_name "
+                 "model_provider openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
                  "openai_compatible_egress_cidrs openai_compatible_target_port permission_set project_id region "
                  "repo_dir vertex_location vertex_project_id").split()
         stubs = (
@@ -11732,7 +12319,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
                       "the menu refusal does not name the pool flags it refuses")
         dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
         refusal = self.text.index("--menu takes no --scope-* flag")
-        run = self.text.index("    run_menu_system\n    exit 0")
+        run = self.text.index("    run_menu_system\n    print_next_home_channel_unset_summary\n    exit 0")
         self.assertLess(dispatch, refusal)
         self.assertLess(refusal, run)
 

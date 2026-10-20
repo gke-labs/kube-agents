@@ -145,6 +145,14 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # openai_compatible_ca_secret_name = ""
 # openai_compatible_api_key        = ""
 
+# A Secret you create in the agent's namespace that the gateway reads whole as
+# environment variables: the SAP AI Core service key (AICORE_SERVICE_KEY and
+# AICORE_RESOURCE_GROUP) for model_provider = "sap", another LiteLLM provider's
+# variables (then model_default_name is required), or the OAuth2 client
+# credentials of an openai_compatible gateway — see variables.tf.
+# model_provider          = "sap"
+# litellm_env_secret_name = "sap-aicore"
+
 
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).
 # enable_github_minter = true

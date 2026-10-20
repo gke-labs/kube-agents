@@ -635,6 +635,8 @@ table in markdown is text, never a table (use `fold.table`).
 | `plan`     | `title` plain, at most 256. `items`: at most 20, each with `id` (opaque, 1-64 characters, unique in the plan), `title` (plain, at most 256), `status`, `steps` (at most 6 plain lines, at most 300 each), `stepCount` (how many steps the item has had, kept or not), `note` (plain, at most 300) and `result` (plain, at most 256). `note`, `result` and `stepCount` are already folded into `title`; they ride beside it for a backend that shows them as their own fields (a task card's details and output). `status` is `pending` (queued), `in_progress`, `complete` or `error`.                                                                                                                                                                                                                                                                                                           |
 | `mark`     | Reaction state for the user message that started the work (below): `ask`, a token of 1-16 characters of `[a-z0-9-]` naming the kind of ask, and `settle`, one of `done`, `blocked` or `failed`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
+A choice may also carry `next: true`, which marks a finished answer's optional next step: a click arrives as the `choices` rule says, but nothing waits on it, so a renderer never reads a typed reply as its answer.
+
 Block order is fixed so every renderer agrees: headline and note, detail, rows, after, fold,
 then the buttons, choices before links. In `progress` the `plan` follows the headline and
 takes the place of the rows. The caps on headline, row text and row detail, button
@@ -725,7 +727,12 @@ first sentence as `headline`, cut at a clause when it runs past the headline's c
 as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
 to five listed options to take carries them as `choices`, its opening paragraph, each
 option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
-by the rule `slack_moments.answer_choices` applies under `today`),
+by the rule `slack_moments.answer_choices` applies under `today`; an answer that instead
+declares its one next step on a last line of its own, `[next: <label>]`, carries that
+step as its only choice, `next` and not `primary`, and leaves the line out of `headline`, `detail`
+and `fold`, by `slack_moments.next_step`'s rule; the line is plumbing, so the text fallback
+leaves it out too (`slack_moments.visible_text`, the bridge's `visibleText`), and a renderer
+without buttons shows the answer alone),
 the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
 `kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on and its conversation route recorded,
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the
@@ -750,12 +757,64 @@ typed answer read back onto the question it answers, which needs the backend's o
 history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
 stands), it posts each notify's text, a later `update` of the same key included.
 
+**Stopping the cards (gke-labs#3263).** A `stop` cancels the conversation's task, and by
+then that task has usually ended. The cards it filed are what still runs, and no carrier
+above reaches them. So the gateway can send the bridge a control, a task of its own whose
+`kind: message` holds one `data` part and no text:
+
+```json
+{ "cardStop": { "v": 1 } }
+```
+
+A message with a text or file part is a question whatever data rides with it, so only a
+data-only message is the control (`lib.CardStopRequested`). The gateway is the only
+publisher on `…in` and builds every other payload from text, so no one can type one. The
+same part on a follow-up is refused `no-text`. The bridge runs the control without a model
+turn: it waits for the conversation's session turn, has session-kv archive every open card
+in the conversation and the cards they spawned, and ends the task `completed`. Its `result`
+artifact holds a short text and the same key in its result form:
+
+```json
+{
+  "cardStop": {
+    "v": 1,
+    "stopped": [{ "id": "t_1", "title": "…", "priorStatus": "running" }],
+    "settled": [{ "id": "t_2", "title": "…" }],
+    "failed": 0,
+    "pending": 0,
+    "unresolved": 0,
+    "truncated": false,
+    "deadline": false,
+    "listsCut": false
+  }
+}
+```
+
+`stopped` is what the stop archived and `settled` the cards that had already finished. The
+counts are what it could not promise: `failed` cards it could not archive, `pending`
+archives still running when it ran out of time, and `unresolved` cards claimed just before
+the stop, for which a worker may still start. `truncated` says more cards were open than one
+stop takes, `deadline` that the stop ran out of time, and `listsCut` only that a list was
+cut to fit the part. A stop that failed carries no part and ends `failed` with
+`reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
+bus refuses the result with the part, the text goes alone, so a `completed` control can
+arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.
+
+The gateway reads the control as no turn. It is never the conversation's active task and
+never in its task history, so it steers nothing, serializes nothing and is no status ask's
+subject. It words the reply from the result part. Anything else (rejected, failed,
+canceled, completed with no part, or no terminal inside `A2A_CARD_STOP_TIMEOUT`) gets
+"⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working", never a success. A stop that arrives while a control runs marks it, and one quiet
+follow-up control goes out when it ends. The control goes only to the default addressee,
+and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, Stop).
+
 ### Rules
 
 - **The text fallback is the answer.** It stands alone, because a consumer that is not a
   chat renderer (another agent, the eval, an older gateway) reads only it. The chat
-  message lays out the same content and adds no fact the text lacks. A chat message with
-  no text fallback is invalid, except the terminal mark-only one above.
+  message lays out the same content and adds no fact the text lacks, except an answer's
+  next step (`next`), an optional follow-up the text's own offer, if any, already makes. A
+  chat message with no text fallback is invalid, except the terminal mark-only one above.
 - **The renderer validates, then renders or falls back.** A chat message that breaks a rule
   above (an unknown `schema`, a cap exceeded, a `tone` or `status` outside its set, an
   unsafe url, a `reply` that doesn't contain its `text`) is dropped whole and the

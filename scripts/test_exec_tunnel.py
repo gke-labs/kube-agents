@@ -256,14 +256,26 @@ class ExecTunnelTest(unittest.TestCase):
         self.assertIsNotNone(proc.poll(), "reap left the child unwaited")
 
     def test_ready_timeout_does_not_hang_on_a_listener_that_never_answers(self):
-        # A remote port nothing is bound to: the remote half raises before it
-        # writes READY, so _spawn must reject rather than block the handler.
+        # Bound but never listened on, and held open until the test ends: the
+        # kernel refuses a connect to it, and nothing else -- least of all the
+        # tunnel itself -- can be handed the port in the meantime. The remote
+        # half raises before it writes READY, so _spawn must reject rather
+        # than block the handler.
         dead = socket.socket()
+        self.addCleanup(dead.close)
         dead.bind(("127.0.0.1", 0))
         dead_port = dead.getsockname()[1]
-        dead.close()
 
         port = self._tunnel(remote_port=dead_port, ready_timeout=5.0, stderr=self._temp_sink())
+        self.assertNotEqual(port, dead_port, "tunnel listener was handed the dead port")
+        # Assert the port cannot be recycled by a server binding with SO_REUSEADDR:
+        # with `dead` held bound without SO_REUSEADDR, any subsequent bind to dead_port
+        # raises EADDRINUSE. If dead.close() is reintroduced, this fails immediately.
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            with self.assertRaises(OSError):
+                probe.bind(("127.0.0.1", dead_port))
+
         started = time.time()
         with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
             client.sendall(b"GET / HTTP/1.0\r\n\r\n")

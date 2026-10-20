@@ -725,5 +725,92 @@ class AnswerChoicesTest(unittest.TestCase):
         m.answer_choices("- x\n" * 20000 + "\nWhich one?")
 
 
+class NextStepTest(unittest.TestCase):
+    def test_the_last_line_declares_the_step(self):
+        self.assertEqual(
+            m.next_step("I couldn't find seeded-z. Check it there?\n\n[next: check seeded-a]\n"),
+            ("I couldn't find seeded-z. Check it there?", "check seeded-a"),
+        )
+
+    def test_the_word_and_the_spacing_are_forgiven(self):
+        self.assertEqual(m.next_step("Up.\n  [Next:   upgrade plan for\tseeded-c ]  "), ("Up.", "upgrade plan for seeded-c"))
+
+    def test_anything_else_declares_none_and_keeps_the_text(self):
+        for text in (
+            "Up.",
+            "Up.\n[next: check seeded-a]\nAnything else?",  # not the last line
+            "Up. [next: check seeded-a]",  # not a line of its own
+            "Up.\n[next: check seeded-b]\n[next: check seeded-a]",  # two steps
+            "Up.\n[next: ]",
+            "Up.\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 1) + "]",
+            "Up.\n[next: ask <@U1>]",
+            "Up.\n[next: open <https://x.example|x>]",
+            "Up.\n[next: **]",
+            "Up.\n[next: [x] check]",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(m.next_step(text), (text, ""))
+
+    def test_a_label_sheds_its_bold_and_backticks(self):
+        # The report format asks for ids in backticks; a button shows them as typed, so they go.
+        self.assertEqual(m.next_step("Up.\n[next: check `seeded-a`]"), ("Up.", "check seeded-a"))
+        self.assertEqual(m.next_step("Up.\n[next: **check seeded-a**]"), ("Up.", "check seeded-a"))
+        self.assertEqual(m.next_step("Up.\n[next: scale my_app]"), ("Up.", "scale my_app"))
+        # A glob's lone star is the user's words, not markup.
+        self.assertEqual(m.next_step("Up.\n[next: scale app=web-* to 3]"), ("Up.", "scale app=web-* to 3"))
+
+    def test_a_refused_step_is_still_set_aside_by_its_shape(self):
+        long = "Up.\n\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 1) + "]"
+        self.assertEqual(m.next_step(long), (long, ""))
+        self.assertEqual(m.step_line(long), ("Up.", long.split("\n")[-1]))
+        self.assertEqual(m.step_line("Up. Want me to?"), ("Up. Want me to?", ""))
+
+    def test_visible_text_takes_every_step_shaped_line_off_the_end(self):
+        too_long = "Up.\n\n[next: " + "x" * (p.BUTTON_TEXT_MAX + 5) + "]"
+        for text, want in (
+            ("Up.\n\n[next: check seeded-a]", "Up."),
+            ("Up.\n[next: a]\n[next: b]\n", "Up."),
+            (too_long, "Up."),
+            ("Up. [next: inline]", "Up. [next: inline]"),
+            ("Up.", "Up."),
+            ("[next: check]", ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(m.visible_text(text), want)
+
+    def test_any_whitespace_around_a_step_line_reads_as_none(self):
+        two = "Up.\n[next: a]\x0c\n[next: b]"
+        self.assertEqual(m.next_step(two), (two, ""), "a form feed hides no second step")
+        self.assertEqual(m.visible_text(two), "Up.")
+        self.assertEqual(m.visible_text("Up.\n\u00a0[next: b]"), "Up.", "a leading NBSP is still a step line")
+
+    def test_a_long_blank_run_in_a_broken_step_line_does_not_backtrack(self):
+        import time
+        for line in ("[next:" + " " * 5000 + "x", "[next:" + " " * 5000 + "x]."):
+            started = time.monotonic()
+            m.visible_text("Up.\n" + line)
+            m.next_step("Up.\n" + line)
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_visible_text_is_one_pass(self):
+        import time
+        many = "Up.\n" + "[next: x]\n" * 20000
+        started = time.monotonic()
+        self.assertEqual(m.visible_text(many), "Up.")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_a_crlf_answer_reads_as_an_lf_one(self):
+        self.assertEqual(m.next_step("Up.\r\n\r\n[next: check seeded-a]\r\n"), ("Up.", "check seeded-a"))
+        two = "Up.\r\n[next: check seeded-b]\r\n[next: check seeded-a]\r\n"
+        self.assertEqual(m.next_step(two), (two, ""))
+
+    def test_a_label_at_the_button_cap_is_kept(self):
+        label = "x" * p.BUTTON_TEXT_MAX
+        self.assertEqual(m.next_step(f"Up.\n[next: {label}]"), ("Up.", label))
+
+    def test_an_answer_that_is_only_the_step(self):
+        self.assertEqual(m.next_step("[next: check seeded-a]"), ("", "check seeded-a"))
+
+
 if __name__ == "__main__":
     unittest.main()

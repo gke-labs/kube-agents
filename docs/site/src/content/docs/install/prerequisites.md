@@ -247,7 +247,7 @@ Pick one at least:
 - `GEMINI_API_KEY` (recommended default; get one at [aistudio.google.com](https://aistudio.google.com)).
 - `ANTHROPIC_API_KEY`.
 - `OPENAI_API_KEY`.
-- `OPENAI_COMPATIBLE_API_KEY`, for an OpenAI-compatible server you run (`openai_compatible`), and only if that server checks a key. See [Inference gateway](/kube-agents/concepts/inference-gateway/#openai-compatible-endpoints-self-hosted-or-private).
+- `OPENAI_COMPATIBLE_API_KEY`, for an OpenAI-compatible server you run (`openai_compatible`), and only if that server checks a key. A gateway behind OAuth2 client credentials, SAP AI Core (`sap`) and any other LiteLLM provider take theirs from a Secret you create and name with `--litellm-env-secret` instead. See [Inference gateway](/kube-agents/concepts/inference-gateway/#a-credentials-secret-for-the-gateway).
 
 Or route one of these keys through a self-hosted LiteLLM gateway — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a Gemini API-key template.
 

@@ -261,7 +261,7 @@ than in the Pod's status.
 
 | Data                             | Sandbox                | Credential runtime          |
 | -------------------------------- | ---------------------- | --------------------------- |
-| `spec.deployment.env`            | No                     | Yes                         |
+| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
 | Slack tokens                     | No                     | Yes, Secret-backed env      |
 | PlatformAgent external API key   | No                     | Yes, Secret-backed env      |
 | Session KV API key and HMAC salt | Yes, Secret-backed env | Yes, API key only           |
@@ -1112,7 +1112,8 @@ needs the same treatment.
 
 CI and deployment tests should assert that:
 
-1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
+1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
+   normalised to `true` or `false`), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

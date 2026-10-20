@@ -401,7 +401,7 @@ resource "null_resource" "ranking" {
       jobs = {j.get("id"): j for j in load_jobs()}
       if os.path.exists("${local.state_file}"):
           print("armed")
-      elif os.path.exists(home + "/.user_aligned"):
+      elif os.path.exists(home + "/.user_aligned") or os.path.exists(home + "/.user_aligned_conversation") or os.path.exists(home + "/onboarding_conversation.json"):
           print("aligned")
       elif os.path.exists("${local.greeted}"):
           print("greeted")
@@ -438,7 +438,7 @@ resource "null_resource" "ranking" {
       case "$state" in
         clear) ;;
         aligned)
-          echo "ERROR: ${local.home}/.user_aligned exists on ${var.host_cluster_name}: a person has connected, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
+          echo "ERROR: ${local.home}/.user_aligned exists (or .user_aligned_conversation) on ${var.host_cluster_name}: a person has connected, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
           exit 1 ;;
         greeted)
           echo "ERROR: ${local.greeted} exists on ${var.host_cluster_name}: a person has been greeted, and the ranked report this case produces is the one onboarding delivers to their chat. Run this case on an install nobody is chatting with." >&2
