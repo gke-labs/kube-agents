@@ -46,9 +46,17 @@ NO_DESCRIPTION = "(no description provided)"
 # IDENTITY_INDENT. Quote characters a dumped scalar may be wrapped in.
 PROFILE_CONFIG = "config.yaml"
 IDENTITY_BLOCK = "cluster_identity:"
-IDENTITY_KEYS = ("cluster", "project", "location")
+IDENTITY_NAME_KEY = "cluster"
+IDENTITY_PLACE_KEYS = ("project", "location")
+IDENTITY_KEYS = (IDENTITY_NAME_KEY, *IDENTITY_PLACE_KEYS)
 IDENTITY_INDENT = "  "
 YAML_QUOTES = "'\""
+# discover() stores each identity value under this prefix plus its key, and the
+# roster line shows it with these templates (see _identity_note).
+IDENTITY_FIELD_PREFIX = "cluster_"
+IDENTITY_NOTE = " (the {cluster} cluster agent{where})"
+IDENTITY_WHERE = "; {places}"
+IDENTITY_PLACE = "{key} {value}"
 
 
 def log(msg: str) -> None:
@@ -152,7 +160,7 @@ def discover(base: Path | None = None) -> list[dict[str, str]] | None:
             if not p.is_dir() or p.name == SELF_PROFILE:
                 continue
             agent = {"name": p.name, "responsibilities": _responsibilities(p)}
-            agent.update({f"cluster_{k}": v for k, v in _cluster_identity(p).items()})
+            agent.update({IDENTITY_FIELD_PREFIX + k: v for k, v in _cluster_identity(p).items()})
             agents.append(agent)
         except OSError as e:
             log(f"skipping unreadable profile {p.name}: {e}")
@@ -217,11 +225,16 @@ def _identity_note(agent: dict[str, str]) -> str:
     Set apart from the assignee id by a space and parentheses, so the id stays
     the exact token the footer tells the caller to copy.
     """
-    cluster = agent.get("cluster_cluster", "")
+    cluster = agent.get(IDENTITY_FIELD_PREFIX + IDENTITY_NAME_KEY, "")
     if not cluster:
         return ""
-    where = ", ".join(f"{k} {agent[f'cluster_{k}']}" for k in ("project", "location") if agent.get(f"cluster_{k}"))
-    return f" (the {cluster} cluster agent" + (f"; {where}" if where else "") + ")"
+    places = ", ".join(
+        IDENTITY_PLACE.format(key=k, value=agent[IDENTITY_FIELD_PREFIX + k])
+        for k in IDENTITY_PLACE_KEYS
+        if agent.get(IDENTITY_FIELD_PREFIX + k)
+    )
+    where = IDENTITY_WHERE.format(places=places) if places else ""
+    return IDENTITY_NOTE.format(cluster=cluster, where=where)
 
 
 def render(base: Path | None = None) -> str | None:
