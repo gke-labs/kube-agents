@@ -7008,9 +7008,8 @@ class PlatformAgentModeTest(unittest.TestCase):
         block = text[summary : text.index('print_step "12.', summary)]
         self.assertIn('if [ "$platform_agent_mode" = "next" ]; then', block)
         self.assertIn("Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway", block)
-        # A Slack-only next install is told what it gives up, and how to keep it.
-        self.assertIn('if slack_moves_to_a2a_gateway "$platform_agent_mode" "$slack_enabled" "$google_chat_enabled"; then', block)
-        self.assertIn("Today's stack keeps the plan card.", block)
+        # The gateway draws the plan card under next, so no Slack caveat follows the mode line.
+        self.assertNotIn("plan card", block)
         self.assertIn("Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}", block)
 
     def test_a_mirrored_next_install_is_told_the_bus_images_are_not_mirrored(self):
