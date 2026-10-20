@@ -8,11 +8,17 @@ strand a pod and are never graded. A label (or label value) in `DROPPED_NODE_LAB
 `blocking` only when the upgrade crosses the drop for a pool the template can land on: the
 pool's current minor is below the drop and the target at or past it. A drop every such pool
 has passed already is a note: the pods either run or are already unschedulable, and neither
-is the upgrade's doing. A label no node in the template's pools carries today is a `risk`, as
-is one of the deprecated beta labels the kubelet still sets, named with its GA replacement.
-The carried question is not asked on Autopilot (GKE provisions the nodes) nor for a pool that
-is empty today and scales from zero, and it is `unknown` when the Node read failed. The rule
-can block, so `CAN_BLOCK` is True and its unknowns move the member's verdict.
+is the upgrade's doing. A label that no pool's `config.labels` defines and no node in the
+template's pools carries today is a `risk`, named as such: nothing in the cluster's
+configuration sets it, so the rebuilt nodes carry it no more. A key GKE sets from the pool's
+configuration (`GKE_NODE_LABEL_PREFIXES`: the pool, accelerator, OS and machine labels) or one
+a pool's `config.labels` defines is a pool shape, graded by the rules that read pools, and
+never this rule's risk even with no node today: a GPU selector with no GPU pool is entry 18's
+finding, not a removed label. One of the deprecated beta labels the kubelet still sets is a
+`risk` named with its GA replacement. The carried question is not asked on Autopilot (GKE
+provisions the nodes) nor for a pool that is empty today and scales from zero, and it is
+`unknown` when the Node read failed. The rule can block, so `CAN_BLOCK` is True and its
+unknowns move the member's verdict.
 
 Sources: kubernetes/kubernetes#107533 (kubeadm stops setting the master label in 1.24);
 docs.cloud.google.com/kubernetes-engine/docs/deprecations/docker-containerd (GKE 1.24 removes
@@ -33,7 +39,9 @@ ANY_VALUE_FORMAT = "{key}"
 DROPPED_DETAIL = "selects on {label} ({where}), dropped at {minor}: {source}; pool(s) {pools} cross the drop in this upgrade to {target}, and the rebuilt nodes carry it no more"
 DROPPED_NO_TARGET_DETAIL = "selects on {label} ({where}), dropped at {minor}: {source}; whether a pool crosses the drop needs a target"
 DROPPED_PASSED_NOTE = "{kind} {object} selects on {label} ({where}), dropped at {minor}, which {pools} passed already; the pods either run or are already unschedulable, and the upgrade changes neither"
-NOT_CARRIED_DETAIL = "selects on {label} ({where}) and no node in {scope} carries it today; the rebuilt nodes carry it no more"
+NOT_CARRIED_DETAIL = "selects on {label} ({where}): no pool's labels define it and no node in {scope} carries it today; the rebuilt nodes carry it no more"
+# Where a pool's configuration defines its nodes' labels (NodeConfig.labels).
+POOL_LABELS_KEY = "labels"
 DEPRECATED_DETAIL = "selects on {label} ({where}), deprecated since {since} in favour of {replacement}; the kubelet still sets it today, and a node image that stops setting it strands the pods"
 DEPRECATED_PREFIX_DETAIL = "selects on {label} ({where}), a beta-prefixed label Kubernetes has deprecated; a node image that stops setting it strands the pods"
 NODES_UNREAD_DETAIL = "selects on {label} ({where}); the Node read failed ({reason}), so whether a node carries it is unknown"
@@ -58,6 +66,18 @@ def _dropped_row(key: str, operator: str, values: list):
         if value is None or (operator == rules.OP_IN and value in values):
             return label, value, minor, source
     return None
+
+
+def _pool_defined(key: str, values: list, pools: list[dict]) -> bool:
+    """Whether the label is one GKE sets from the pool's configuration (a key under
+    GKE_NODE_LABEL_PREFIXES) or one a pool's `config.labels` defines with a selected value."""
+    if key.startswith(tables.GKE_NODE_LABEL_PREFIXES):
+        return True
+    for pool in pools:
+        labels = rules.pool_config(pool).get(POOL_LABELS_KEY)
+        if isinstance(labels, dict) and key in labels and (not values or str(labels[key]) in values):
+            return True
+    return False
 
 
 def _carried(key: str, values: list, node_list: list[dict]) -> bool:
@@ -116,7 +136,7 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
                     passed = SCOPE_POOLS.format(pools=rules.LIST_SEPARATOR.join(pool_names)) if named else POOLS_ALL
                     result["notes"].append(DROPPED_PASSED_NOTE.format(minor=minor_text, pools=passed, **{**common, "label": drop_text}))
                 continue
-            if not autopilot:
+            if not autopilot and not _pool_defined(key, values, pools):
                 if nodes_failed:
                     detail = NODES_UNREAD_DETAIL.format(label=text, where=where, reason=nodes_failed)
                     result["unknown"].append(_unknown(obj, detail, label=key))

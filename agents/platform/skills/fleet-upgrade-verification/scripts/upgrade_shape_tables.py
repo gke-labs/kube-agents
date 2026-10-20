@@ -308,6 +308,25 @@ DROPPED_NODE_LABELS = (
     ("node-role.kubernetes.io/master", None, (1, 24), "kubeadm 1.24 stops setting it (kubernetes/kubernetes#107533)"),
     ("cloud.google.com/gke-container-runtime", "docker", (1, 24), "GKE 1.24 removes Docker node images"),
 )
+# Label keys GKE and the kubelet set on every node from the pool's configuration and the
+# machine: the pool, accelerator, machine-family, OS-distribution, runtime, spot and
+# preemptible labels under cloud.google.com/, the arch, os, hostname, zone, region and
+# instance-type labels under kubernetes.io/, node.kubernetes.io/ and topology.kubernetes.io/,
+# the GKE topology and networking labels, and the deprecated beta spellings. A selector on
+# one of these names a pool shape, not a label a node image could stop setting: whether a
+# pool of that shape exists is another rule's question (entry 18 asks it for accelerators),
+# so the removed-node-label rule asks the carried question only of other keys.
+# Sources: docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pools (the labels GKE
+# sets); kubernetes.io/docs/reference/labels-annotations-taints/ (the kubelet's).
+GKE_NODE_LABEL_PREFIXES = (
+    "cloud.google.com/",
+    "kubernetes.io/",
+    "node.kubernetes.io/",
+    "topology.kubernetes.io/",
+    "topology.gke.io/",
+    "iam.gke.io/",
+    "networking.gke.io/",
+) + DEPRECATED_NODE_LABEL_PREFIXES
 
 # ------------------------------------------------------------------ entry 13: the container runtime
 

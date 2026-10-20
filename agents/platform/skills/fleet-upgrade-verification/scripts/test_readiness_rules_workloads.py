@@ -207,10 +207,10 @@ class RemovedNodeLabelTest(unittest.TestCase):
         out = run(removed_node_label, self.NODES + [pinned], target=None)
         self.assertIn("whether a pool crosses the drop needs a target", out["unknown"][0]["detail"])
         self.assertTrue(out["unknown"][0]["reason"].startswith("Deployment seeded-shapes/docker-pinned: "))
+        # The value that was not dropped, on a key GKE sets from the pool's configuration: no node of
+        # the canned list carries it, and that is a pool shape, not this rule's risk.
         containerd = template("Deployment", "containerd-pinned", {"containers": [busybox()], "nodeSelector": {"cloud.google.com/gke-container-runtime": "containerd"}})
-        out = run(removed_node_label, self.NODES + [containerd])
-        self.assertEqual(out["blocking"], [])
-        self.assertEqual(removed_node_label.describe(out["risks"][0]), "Deployment seeded-shapes/containerd-pinned: selects on cloud.google.com/gke-container-runtime=containerd (nodeSelector) and no node in the cluster carries it today; the rebuilt nodes carry it no more")
+        self.assertEqual(run(removed_node_label, self.NODES + [containerd]), rules.new_result())
 
     def test_kubeadm_master_label_on_gke_is_a_note_for_exists_and_nothing_for_does_not_exist(self):
         exists = template("Deployment", "reflector", {"containers": [busybox()], **affinity("node-role.kubernetes.io/master", "Exists")})
@@ -235,22 +235,39 @@ class RemovedNodeLabelTest(unittest.TestCase):
         pinned = template("Deployment", "pinned", {"containers": [busybox()], "nodeSelector": {tables.NODEPOOL_LABEL: "pool-b", "team/gpu": "yes"}})
         out = run(removed_node_label, nodes + [pinned], pools=[pool("pool-a"), pool("pool-b")])
         self.assertEqual([f["label"] for f in out["risks"]], ["team/gpu"])
-        self.assertIn("no node in pool(s) pool-b carries it today; the rebuilt nodes carry it no more", out["risks"][0]["detail"])
+        self.assertIn("selects on team/gpu=yes (nodeSelector): no pool's labels define it and no node in pool(s) pool-b carries it today; the rebuilt nodes carry it no more", out["risks"][0]["detail"])
         self.assertNotIn("do not schedule", out["risks"][0]["detail"])
         free = template("Deployment", "free", {"containers": [busybox()], "nodeSelector": {"team/gpu": "yes"}})
         self.assertEqual(run(removed_node_label, nodes + [free], pools=[pool("pool-a"), pool("pool-b")]), rules.new_result())
+        # A pool whose configuration defines the label provides it, with no node today or ever: not this rule's risk.
+        defined = pool("pool-b", labels={"team/gpu": "yes"})
+        self.assertEqual(run(removed_node_label, nodes + [pinned], pools=[pool("pool-a"), defined]), rules.new_result())
+        other_value = pool("pool-b", labels={"team/gpu": "no"})
+        self.assertEqual([f["label"] for f in run(removed_node_label, nodes + [pinned], pools=[pool("pool-a"), other_value])["risks"]], ["team/gpu"])
 
     def test_a_pool_at_zero_nodes_is_a_note_and_autopilot_skips_the_carried_question(self):
-        trainer = template("CronJob", "trainer", {"containers": [busybox()], "nodeSelector": {tables.NODEPOOL_LABEL: "gpu-pool", "cloud.google.com/gke-accelerator": "nvidia-l4"}})
+        # The pool and accelerator labels are GKE's, set from the pool's configuration: a pool at zero
+        # nodes files nothing for them. A custom label on the same empty pool is the note.
         gpu_pool = pool("gpu-pool", autoscaling={"enabled": True, "minNodeCount": 0, "maxNodeCount": 4})
-        out = run(removed_node_label, self.NODES + [trainer], pools=[pool(), gpu_pool])
+        trainer = template("CronJob", "trainer", {"containers": [busybox()], "nodeSelector": {tables.NODEPOOL_LABEL: "gpu-pool", "cloud.google.com/gke-accelerator": "nvidia-l4"}})
+        self.assertEqual(run(removed_node_label, self.NODES + [trainer], pools=[pool(), gpu_pool]), rules.new_result())
+        tagged = template("CronJob", "trainer", {"containers": [busybox()], "nodeSelector": {tables.NODEPOOL_LABEL: "gpu-pool", "team/gpu": "yes"}})
+        out = run(removed_node_label, self.NODES + [tagged], pools=[pool(), gpu_pool])
         self.assertEqual((out["blocking"], out["risks"], out["unknown"]), ([], [], []))
-        self.assertEqual(len(out["notes"]), 2)
-        self.assertIn("pool(s) gpu-pool has no node today (the pool scales from zero); not graded as stranded", out["notes"][0])
+        self.assertEqual(len(out["notes"]), 1)
+        self.assertIn("selects on team/gpu=yes (nodeSelector) and pool(s) gpu-pool has no node today (the pool scales from zero); not graded as stranded", out["notes"][0])
         arch = template("Deployment", "arch-pinned-worker", {"containers": [busybox()], "nodeSelector": {"beta.kubernetes.io/arch": "amd64", "team/gpu": "yes"}})
         out = run(removed_node_label, [arch], pools=[], autopilot=True)
         self.assertEqual([f["label"] for f in out["risks"]], ["beta.kubernetes.io/arch"])
         self.assertEqual(out["notes"], [])
+
+    def test_the_seeded_gpu_selector_with_no_gpu_pool_is_not_this_rules_risk(self):
+        # The seeded cuda-pinned-trainer: a selector on cloud.google.com/gke-accelerator=nvidia-l4 on a
+        # cluster with no accelerator pool and no node carrying the label. The missing pool is the
+        # gpu-driver rule's finding (entry 18); this rule files nothing, so the object has one cell.
+        trainer = template("CronJob", "cuda-pinned-trainer", {"containers": [busybox()], "nodeSelector": {"cloud.google.com/gke-accelerator": "nvidia-l4"}})
+        self.assertEqual(run(removed_node_label, self.NODES + [trainer], pools=[pool()]), rules.new_result())
+        self.assertEqual(run(removed_node_label, self.NODES + [trainer], pools=[pool()], read_errors={"node": "nodes is forbidden"}), rules.new_result())
 
     def test_read_failures_are_unknown_for_what_they_hide(self):
         pinned = template("Deployment", "pinned", {"containers": [busybox()], "nodeSelector": {"team/gpu": "yes"}})
