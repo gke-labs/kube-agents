@@ -50,7 +50,7 @@ FINDING_TEXT = (
     "and start to apply the moment enforcement turns on, at the node rebuild that follows enabling the network policy add-on "
     "or on a Dataplane V2 cluster{peers}; test what they deny before either"
 )
-PEERS_TEXT = " ({peers} already enforce them)"
+PEERS_TEXT = " (in the listing: {peers}, each enforcing its own policies)"
 NOTE_ENFORCED = "legacy dataplane; NetworkPolicies in {namespaces} are enforced by the network policy add-on"
 NOTE_NO_POLICIES = "legacy dataplane, policy enforcement {enforcement}; network policies: none, nothing to enforce"
 ENFORCEMENT_ON = "on (network policy add-on)"

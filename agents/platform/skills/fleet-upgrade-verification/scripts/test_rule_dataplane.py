@@ -35,14 +35,15 @@ class DataplaneRuleTest(unittest.TestCase):
         self.assertEqual((finding["policies"], finding["enforced"], finding["peers_on_v2"], finding["datapath"]), (3, False, ["platform-agent-host"], "LEGACY_DATAPATH"))
         text = dataplane.describe(finding)
         self.assertIn("policy enforcement off and NetworkPolicies in seeded-debug (1), seeded-upgrade (2)", text)
-        self.assertIn("(platform-agent-host already enforce them)", text)
+        # The peers are named as where enforcement is on, not as enforcing this member's policies, which nothing reads.
+        self.assertIn("or on a Dataplane V2 cluster (in the listing: platform-agent-host, each enforcing its own policies); test what they deny before either", text)
         self.assertIn("start to apply the moment enforcement turns on", text)
 
     def test_without_a_v2_peer_the_shape_is_still_a_risk(self):
         record = cluster(name="seeded-b")
         out = dataplane.evaluate(record, {}, read(items=policies()), TARGET, context_for(record))
         self.assertEqual(out["risks"][0]["peers_on_v2"], [])
-        self.assertNotIn("already enforce", dataplane.describe(out["risks"][0]))
+        self.assertNotIn("in the listing:", dataplane.describe(out["risks"][0]))
 
     def test_a_v2_twin_named_like_the_member_is_a_peer_and_the_member_never_is(self):
         # The fold hands the rule copies, so a peer is never told from the member by identity:

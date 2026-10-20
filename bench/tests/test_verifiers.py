@@ -9746,7 +9746,7 @@ _SURGE_CELL = (
 _DATAPLANE_RISK_CELL = (
     "network-dataplane: legacy dataplane with policy enforcement off and NetworkPolicies in seeded-debug (1), seeded-upgrade (2): "
     "the policies apply nowhere today and start to apply the moment enforcement turns on, at the node rebuild that follows enabling "
-    "the network policy add-on or on a Dataplane V2 cluster (platform-agent-host already enforce them); test what they deny before either"
+    "the network policy add-on or on a Dataplane V2 cluster (in the listing: platform-agent-host, each enforcing its own policies); test what they deny before either"
 )
 _DATAPLANE_NOTE_LINE = "network-dataplane: legacy dataplane, policy enforcement off; network policies: none, nothing to enforce"
 _CONTAINERD_NOTE_LINE = (
