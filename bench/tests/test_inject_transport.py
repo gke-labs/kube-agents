@@ -2725,7 +2725,10 @@ def test_a_card_unblocked_between_poll_and_final_read_on_inject_remains_graded(
 
     assert not infra(result)
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert any(CARD_A in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {CARD_A} was reported blocked during wait but ready at settle; nothing delivered"
+    ]
 
 
 def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
@@ -2762,7 +2765,10 @@ def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
 
     assert not infra(result)
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert any(CARD_A in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    assert result.errors == [
+        f"delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
+    ]
     assert result.metadata.get("final_message") == ACK
 
 
@@ -2854,7 +2860,11 @@ def test_a_triage_card_with_transient_rate_limit_summary_on_inject_is_infrastruc
 
     assert infra(result)
     assert result.output == ""
-    assert "rate_limit" in result.errors[0]
+    assert result.errors == [
+        f"{harness.INFRA_FAILURE_MARKER}: delegated worker hit infrastructure failure (rate_limit): "
+        'card on board recorded rate_limit: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429 ... "TPM quota exhausted"',
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: {CARD_A} (triage)",
+    ]
 
 
 def test_a_triage_card_with_non_transient_block_kind_on_inject_remains_graded(
@@ -2880,7 +2890,9 @@ def test_a_triage_card_with_non_transient_block_kind_on_inject_remains_graded(
 
     assert not infra(result)
     assert result.metadata["final_message"] == ACK
-    assert any(harness.DELEGATION_CEILING_MARKER in err for err in result.errors)
+    assert result.errors == [
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 1s: {CARD_A} (triage)"
+    ]
 
 
 def test_a_blocked_card_with_rate_limit_summary_on_inject_does_not_issue_board_present_exec(
