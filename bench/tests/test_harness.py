@@ -2892,7 +2892,7 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
     t = "task-1"
     fallback = {t: ["provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"]}
 
-    # Branch 1: final read fails after retries, falls back to fallback store
+    # Branch 1: final read fails, falls back immediately to fallback store
     read_attempts: list[str] = []
 
     def _shell_failed(script: str, timeout: float) -> str:
@@ -2900,8 +2900,8 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
         return ""
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_failed)
-    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
-    assert len(read_attempts) == harness._MAX_TRANSPORT_FAILURES
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    assert len(read_attempts) == 1
     assert msgs == fallback[t]
 
     # Branch 2: final read succeeds but card was unblocked (status is running) -> cleared, empty msgs
@@ -2910,7 +2910,7 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
         return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_running)
-    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
     assert msgs == []
 
     # Branch 3: final read succeeds, card is still blocked but has empty summaries and errors
@@ -2919,7 +2919,7 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
         return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_empty_failures)
-    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
     assert msgs == []
 
     # Branch 4: final read succeeds and has summaries/errors, does not use fallback
@@ -2933,7 +2933,7 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
         return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_with_summary)
-    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
     assert msgs == ["new summary"]
 
 
@@ -3931,7 +3931,7 @@ def test_failed_card_with_worker_failure_text_remains_graded(
 
 
 def test_extract_infra_failure_reason_classifier() -> None:
-    """_extract_infra_failure_reason matches exact hermes failure prefix and billing reasons."""
+    """_extract_infra_failure_reason matches exact hermes failure prefix and rate_limit reasons."""
     assert harness._extract_infra_failure_reason(None) is None
     assert harness._extract_infra_failure_reason("") is None
     assert harness._extract_infra_failure_reason("   ") is None
@@ -3945,19 +3945,19 @@ def test_extract_infra_failure_reason_classifier() -> None:
         )
         == "rate_limit"
     )
-    # failure_reason=billing -> billing
-    assert (
-        harness._extract_infra_failure_reason(
-            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=billing): credit exhausted"
-        )
-        == "billing"
-    )
     # failure_reason=rate_limit -> rate_limit
     assert (
         harness._extract_infra_failure_reason(
             f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429"
         )
         == "rate_limit"
+    )
+    # failure_reason=billing (unwritten by hermes under rate limit prefix) -> None
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=billing): credit exhausted"
+        )
+        is None
     )
     # failure_reason=context_length (non-infra reason under prefix) -> None
     assert (

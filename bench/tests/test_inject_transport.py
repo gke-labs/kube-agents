@@ -2811,10 +2811,10 @@ def test_a_failed_card_with_worker_429_error_on_inject_remains_graded(
     assert not infra(result)
 
 
-def test_worker_authored_kanban_block_with_transient_kind_and_infra_prefix_is_infrastructure(
+def test_transient_blocked_card_with_infra_prefix_on_inject_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A worker-authored kanban_block with transient kind and hermes rate limit prefix is infra."""
+    """A card blocked transient with hermes rate limit prefix on inject lane is classified as infra."""
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
