@@ -548,9 +548,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: incident-triage
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The case plants its own namespaces rather than reading the seeded fleet, as
 # the sibling drift case does, which is why this list is empty.
 # `infrastructure.deployer` above is tofu and carries an `infrastructure.stack`

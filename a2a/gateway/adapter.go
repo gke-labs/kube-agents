@@ -305,7 +305,9 @@ type TaskObserver interface {
 	// CancelPublished says a kind:cancel envelope for taskID is on the
 	// task's `in` subject. Called after the publish returns, on both cancel
 	// routes (the active task's and a named task the conversation no longer
-	// holds).
+	// holds), and for the card-stop control a stop sends (cardstop.go), with
+	// the control's id: that stop reached the bus too, whether or not a task
+	// was running to cancel.
 	//
 	// Signalled on success only, like TaskAccepted, and read against the end
 	// of the turn: the gateway's answer to a cancel it did not publish is a

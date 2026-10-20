@@ -91,9 +91,11 @@ run directories; the pull request cites them.
 
 **4. Register.** A new case is registered in `hack/eval/nightly-cases.txt` in the same pull
 request: in that file's sorted section, at its place in case-id order, with its reason as the
-`#` lines above it. The case has `owner:` set and a `docs/designs/domains.yaml` slug (a new
-row there, with its owner, backup and meaning, when none describes the case). The nightly is where a new case lands
-([`docs/designs/bench-case-format.md`](../../docs/designs/bench-case-format.md),
+`#` lines above it. The case has a `docs/designs/domains.yaml` slug (a new row there, with its
+owner, backup and meaning, when none describes the case); you may set `owner:` to yourself so
+the case's bugs reach you before the domain owner
+([`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership)). The nightly is where a
+new case lands ([`docs/designs/bench-case-format.md`](../../docs/designs/bench-case-format.md),
 "Registration"): it runs every night from the night it merges and builds its record; a
 presubmit seat is a later pull request that cites that record — one edit that moves the
 line to `hack/eval/presubmit-cases.txt` and adds the name to `hack/eval/blocking-roster.txt`
