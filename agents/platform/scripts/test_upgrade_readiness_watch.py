@@ -134,8 +134,9 @@ class FakeSandbox:
             # On the id the report resolves, as `get_target_projects` checks it: a number
             # resolves through `projects describe` (the aliases) unless describe is down, when
             # the digits reach the rule, which refuses them.
-            resolved_id = asked[0] if asked[0] in self.describe_down else self.aliases.get(asked[0], asked[0])
-            reason = scope.override_error(resolved_id)
+            # Over every --project, as `get_target_projects` decides: one refusal refuses the run.
+            resolved_ids = sorted({a if a in self.describe_down else self.aliases.get(a, a) for a in asked})
+            reason = next((r for r in (scope.override_error(p) for p in resolved_ids) if r is not None), None)
             if reason is not None:
                 # The script's usage exit, no report, the reason on stderr.
                 body = {"exit": 2, "tables": "", "report": None}
@@ -1486,8 +1487,9 @@ class Failures(Base):
 class DeclaredScope(Base):
     """On an install with a ``spec.scope`` block the sandbox refuses the report
     script a bare ``--project`` (``fleet_scope_args``), so the tick hands it
-    the resolved scope beside the project, as the fleet_scope tool spells it;
-    an install that declares none keeps the bare flag."""
+    the resolved scope beside the project, as the fleet_scope tool spells it
+    less the cluster exclusion; an install that declares none keeps the bare
+    flag."""
 
     def test_a_declared_scope_hands_the_report_the_resolved_scope_beside_the_project(self) -> None:
         self.declare_scope(["p1", "p2"], unread=["p3"])
@@ -1702,6 +1704,19 @@ class DeclaredScope(Base):
         self.assertIn(["--project", "legacy-proj", "--scope-projects", "mgmt"], [argv for kind, argv, _ in sandbox.calls if kind == "versions"])
         self.assertIn("legacy-proj", self.ledger()["standing_outside"])
 
+    def test_both_spellings_of_a_refused_project_run_once_on_the_tick_its_id_is_learned(self) -> None:
+        """Roster 123456 and legacy-proj, one project outside the scope: the number runs first,
+        its refusal teaches the id, and the id spelling is the same project, already run."""
+        self.declare_scope(["mgmt"])
+        versions = envelope([member("a", "current", project="mgmt")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "mgmt,123456,legacy-proj"}):
+            sandbox = FakeSandbox(versions, aliases={"123456": "legacy-proj"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        asked = [argv[1] for kind, argv, _ in sandbox.calls if kind == "versions"]
+        self.assertEqual(sorted(asked), ["123456", "mgmt"], "legacy-proj is the number's project, run once")
+        self.assertEqual(out.count("does not list legacy-proj"), 1)
+
     def test_an_all_refused_ticks_failure_line_is_keyed_on_the_refusal_not_its_text(self) -> None:
         """The failure line names the resolved set, which moves with the scope's
         membership; the marker is keyed on what the partial line keys a refusal on,
@@ -1756,6 +1771,24 @@ class DeclaredScope(Base):
         self.assertEqual(out.splitlines(), ["upgrade readiness watch: the tick runs again"])
         self.assertEqual(self.ledger()["standing_outside"], {})
         self.assertFalse(self.marker().exists())
+
+    def test_an_all_refused_number_keeps_its_learned_id_so_the_hold_survives_a_failed_lookup(self) -> None:
+        """Roster 123456 alone, the number legacy-proj, outside a folder-scoped declaration:
+        the failed tick saves the id it learned beside the record filed under it, so the next
+        tick, the folder lookup failing, still finds the record and posts nothing."""
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        failed = dict(resolved, outcome="unreachable")
+        outs = []
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "123456"}):
+            for containers in ([resolved], [failed]):
+                self.declare_scope(["p1"], containers=containers)
+                code, out = self.run_tick(FakeSandbox(envelope([]), aliases={"123456": "legacy-proj"}))
+                self.assertEqual(code, 0)
+                outs.append(out)
+                self.assertEqual(self.ledger()["project_ids"], {"123456": "legacy-proj"})
+                self.assertEqual(self.ledger()["standing_outside"], {"legacy-proj": ["folders/123456789012"]})
+        self.assertIn("does not list legacy-proj", outs[0])
+        self.assertEqual(outs[1], "", "the hold holds through the failed lookup: no second line")
 
     def test_an_all_failed_tick_keeps_the_record_of_the_project_it_refused_beside_the_failure_it_names(self) -> None:
         """p1's sandbox run fails beside p2's refusal: the tick fails with the
