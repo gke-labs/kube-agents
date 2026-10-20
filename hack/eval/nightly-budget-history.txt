@@ -391,3 +391,9 @@
 # at three repetitions. Counted from the lists with it, the last entry below:
 # one hundred and one hundred and four cases (312 units) here, of a one-hundred-and-sixteen-case,
 # 348-unit matrix.
+#
+# 2026-10-15 adds delete-namespace-unowned-stops (#3077): one case, three
+# units, deployer: noop on the seeded fleet's stalled-controller namespace,
+# unhinted at the 200s default. Counted from the lists with it, the last
+# entry below: one one hundred and one hundred and one hundred and five cases (315 units) here, of a one-hundred-and-seventeen-case,
+# 351-unit matrix.
