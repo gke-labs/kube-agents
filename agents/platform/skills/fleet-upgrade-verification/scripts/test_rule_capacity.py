@@ -182,7 +182,7 @@ class CapacityRuleTest(unittest.TestCase):
         self.assertEqual(finding["displaced"], {"cpu_m": 250, "memory_bytes": 256 * 1024**2})
         self.assertEqual(finding["stranded"], {"cpu_m": 250, "memory_bytes": 256 * 1024**2})
         self.assertEqual(finding["room"], {"cpu_m": 0, "memory_bytes": 0})
-        self.assertEqual(finding["workloads"], [{"owner": "Deployment seeded-upgrade/pinned-batch-runner", "cpu_m": 250, "memory_bytes": 256 * 1024**2, "pinned": True}])
+        self.assertEqual(finding["workloads"], [{"owner": "Deployment seeded-upgrade/pinned-batch-runner", "cpu_m": 250, "memory_bytes": 256 * 1024**2, "extended": {}, "pinned": True}])
         self.assertEqual(finding["other_short_nodes"], [])
         text = capacity.describe(finding)
         self.assertIn("pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node(s), not autoscaled) removes a node before its replacement exists", text)
@@ -222,6 +222,33 @@ class CapacityRuleTest(unittest.TestCase):
         items[-1]["spec"]["tolerations"] = [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}]
         out = evaluate(record, items)
         self.assertEqual((out["blocking"], len(out["notes"])), ([], 1))
+
+    def test_a_gpu_pod_lands_only_on_a_node_with_a_free_gpu(self):
+        # Two GPU nodes with CPU and memory to spare, one 1-GPU pod each: draining one finds the
+        # other's GPU taken and the CPU-only default node without one, so the pod is stranded and
+        # the non-autoscaled maxSurge-0 pool blocks; a free GPU on the other node places it.
+        gpu_taint = {"key": "nvidia.com/gpu", "value": "present", "effect": "NoSchedule"}
+        gpu_label = {"cloud.google.com/gke-accelerator": "nvidia-l4"}
+        record = cluster(pools=[pool_record("default-pool", LAGGING), pool_record("gpu", LAGGING, upgrade=NO_SURGE)])
+        nodes = [node("gpu-1", "gpu", cpu="8", memory="32Gi", labels=gpu_label, taints=[gpu_taint]), node("gpu-2", "gpu", cpu="8", memory="32Gi", labels=gpu_label, taints=[gpu_taint]), node("default-1", "default-pool", cpu="8", memory="32Gi")]
+        for n in nodes[:2]:
+            n["status"]["allocatable"]["nvidia.com/gpu"] = "1"
+        pods = []
+        for i, node_name in enumerate(("gpu-1", "gpu-2")):
+            trainer = scheduled_pod("ml", f"trainer-{i}", node_name, node_selector=gpu_label, tolerations=[{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}], cpu="1", memory="4Gi")
+            trainer["spec"]["containers"][0]["resources"]["requests"]["nvidia.com/gpu"] = "1"
+            pods.append(trainer)
+        out = evaluate(record, nodes + pods)
+        self.assertEqual((out["risks"], out["unknown"], out["notes"]), ([], [], []))
+        finding = out["blocking"][0]
+        self.assertEqual((finding["stranded_count"], finding["workloads"][0]["extended"], finding["workloads"][0]["pinned"]), (1, {"nvidia.com/gpu": 1.0}, True))
+        self.assertIn("(1000m / 4096Mi, 1 nvidia.com/gpu, pinned to the pool)", capacity.describe(finding))
+        # The second node's GPU freed: the displaced pod lands there, and the pool is a note.
+        out = evaluate(record, nodes + pods[:1])
+        self.assertEqual((out["blocking"], out["risks"], len(out["notes"])), ([], [], 1))
+        # An unparsable extended quantity is the rule's unknown, like a CPU one.
+        nodes[1]["status"]["allocatable"]["nvidia.com/gpu"] = "one"
+        self.assertIn("the allocatable of node gpu-2 did not parse", evaluate(record, nodes + pods)["unknown"][0])
 
     def test_a_cordoned_node_is_out_through_unschedulable_and_through_its_taint(self):
         # The projected node read carries spec.unschedulable, and a cordon also adds the

@@ -22,39 +22,39 @@ new rule adds its entry in that order.
   its nodes in turn, largest first, onto the schedulable nodes left that each pod may schedule on
   (its node selector, its required node affinity and the taints it tolerates decide which; a tainted
   pool's spare capacity never counts for a pod without the toleration), each onto the eligible node
-  with the most room left by CPU and memory requests (native sidecars and the pod's `overhead`
-  counted as the scheduler counts them), DaemonSet and mirror pods excepted; a pod no eligible node
-  can take is stranded. It blocks when `maxSurge` is 0, `maxUnavailable` above 0, the autoscaler
-  cannot grow the pool (at its ceiling, or not autoscaled) and a pod is stranded; a stranded pod
-  with some surge left, a growable autoscaler or an autoscaled blue-green rollout is a risk; a pool
-  whose every node's pods are placed is a note. The node measured is the one whose stranded pods are
-  the largest in either resource, so a memory-bound node counts as a CPU-bound one does, and the
-  cell names the pool, its settings, that node, the stranded requests, the room on the nodes the
-  pods may schedule on, the largest stranded workloads and any other node of the pool that strands
-  pods. Autopilot members are not graded. A pool at or above the target is not graded; no target, an
-  unparsable pool version or quantity, or Nodes or Pods not read is unknown, and the rule can block,
-  so that unknown moves the verdict. GKE's defaults (`maxSurge` 1, `maxUnavailable` 0) never trigger
-  the placement half. The same pools are read for the surge node that must exist before a drain:
-  every pool below the target on the surge strategy with `maxSurge` above 0 (the default is 1; a
-  blue-green pool creates its green pool instead and is not counted). A pool carrying accelerators
-  (`config.accelerators`) that surges with no reservation affinity (`config.reservationAffinity`
-  consuming neither `ANY_RESERVATION` nor `SPECIFIC_RESERVATION`) blocks, since a surge node needs
-  accelerator capacity the zone may not have and a pool upgrade that cannot create one stalls
-  between versions; one under a reservation is a note. Per Pod range (the pool's
-  `networkConfig.podIpv4CidrBlock`, else the cluster's `clusterIpv4Cidr`), the free aligned blocks
-  of the pools' per-node size (each node's `spec.podCIDR`, which the projected node read carries,
-  else the block GKE sizes for the pool's pod limit; the largest block among the pools is the unit)
-  are counted against the sum of the pools' `maxSurge`, and fewer free blocks than surge nodes
-  blocks: a surge node with no block never registers. The cell names the range with its free, held
-  and total blocks, the surge need and the pools, or the pool with its accelerators and `maxSurge`,
-  and the action: lower `max-surge` or add a secondary Pod range; set the in-place strategy
-  (`max-surge` 0, `max-unavailable` 1) or hold a reservation. No target is one unknown for the surge
-  pools; Nodes not read, or a record with no Pod range, is unknown for the range half while the
-  accelerator half still grades. Quota is not read here: the stockout-prevention audit reads it.
-  Action: Keep `maxSurge` at least 1 and `maxUnavailable` 0 with one node of headroom, or give the
-  stranded pods a node they may schedule on. For a short Pod range, lower `max-surge` or add a
-  secondary Pod range. For an accelerator pool, set the in-place strategy (`max-surge` 0,
-  `max-unavailable` 1) or hold a reservation.
+  with the most room left by CPU and memory requests whose extended resources (`nvidia.com/gpu`,
+  `google.com/tpu`) are free too (native sidecars and the pod's `overhead` counted as the scheduler
+  counts them), DaemonSet and mirror pods excepted; a pod no eligible node can take is stranded. It
+  blocks when `maxSurge` is 0, `maxUnavailable` above 0, the autoscaler cannot grow the pool (at its
+  ceiling, or not autoscaled) and a pod is stranded; a stranded pod with some surge left, a growable
+  autoscaler or an autoscaled blue-green rollout is a risk; a pool whose every node's pods are
+  placed is a note. The node measured is the one whose stranded pods are the largest in either
+  resource, so a memory-bound node counts as a CPU-bound one does, and the cell names the pool, its
+  settings, that node, the stranded requests, the room on the nodes the pods may schedule on, the
+  largest stranded workloads and any other node of the pool that strands pods. Autopilot members are
+  not graded. A pool at or above the target is not graded; no target, an unparsable pool version or
+  quantity, or Nodes or Pods not read is unknown, and the rule can block, so that unknown moves the
+  verdict. GKE's defaults (`maxSurge` 1, `maxUnavailable` 0) never trigger the placement half. The
+  same pools are read for the surge node that must exist before a drain: every pool below the target
+  on the surge strategy with `maxSurge` above 0 (the default is 1; a blue-green pool creates its
+  green pool instead and is not counted). A pool carrying accelerators (`config.accelerators`) that
+  surges with no reservation affinity (`config.reservationAffinity` consuming neither
+  `ANY_RESERVATION` nor `SPECIFIC_RESERVATION`) blocks, since a surge node needs accelerator
+  capacity the zone may not have and a pool upgrade that cannot create one stalls between versions;
+  one under a reservation is a note. Per Pod range (the pool's `networkConfig.podIpv4CidrBlock`,
+  else the cluster's `clusterIpv4Cidr`), the free aligned blocks of the pools' per-node size (each
+  node's `spec.podCIDR`, which the projected node read carries, else the block GKE sizes for the
+  pool's pod limit; the largest block among the pools is the unit) are counted against the sum of
+  the pools' `maxSurge`, and fewer free blocks than surge nodes blocks: a surge node with no block
+  never registers. The cell names the range with its free, held and total blocks, the surge need and
+  the pools, or the pool with its accelerators and `maxSurge`, and the action: lower `max-surge` or
+  add a secondary Pod range; set the in-place strategy (`max-surge` 0, `max-unavailable` 1) or hold
+  a reservation. No target is one unknown for the surge pools; Nodes not read, or a record with no
+  Pod range, is unknown for the range half while the accelerator half still grades. Quota is not
+  read here: the stockout-prevention audit reads it. Action: Keep `maxSurge` at least 1 and
+  `maxUnavailable` 0 with one node of headroom, or give the stranded pods a node they may schedule
+  on. For a short Pod range, lower `max-surge` or add a secondary Pod range. For an accelerator
+  pool, set the in-place strategy (`max-surge` 0, `max-unavailable` 1) or hold a reservation.
 - `data-on-the-node` (Data on the node), entry 4, risk. Reads: Deployments and StatefulSets are read
   for state, not scratch: a StatefulSet's `emptyDir` (its identity survives the rebuild, its
   node-local data does not), a `hostPath` a container mounts writable, a `hostPath` under a Local

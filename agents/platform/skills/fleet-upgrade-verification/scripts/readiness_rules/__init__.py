@@ -66,7 +66,8 @@ rule's `CAN_BLOCK`, so the per-rule record and its entries never disagree. A rul
 runs no command of its own except through `context["run_cmd"]`.
 
 This file holds what the modules share: the result shape, the read kinds and context keys,
-the quantity parser, a pod's owner and requests, node helpers, pod templates with their
+the quantity parser, a pod's owner and requests (CPU and memory, and the extended resources
+such as `nvidia.com/gpu` by name), node helpers, pod templates with their
 selectors and node-pool pins, image tags, the cgroup transition, `shell_scripts(command)`,
 the scripts a container's command hands a shell through `-c`, `shell_words(script)`, the
 programs such a script names, and `shell_forks(script)`,
@@ -208,6 +209,11 @@ CPU_FORMAT = "{millis}m"
 MEMORY_FORMAT = "{mebibytes}Mi"
 CPU_KEY = "cpu"
 MEMORY_KEY = "memory"
+# An extended resource (`nvidia.com/gpu`, `google.com/tpu`, a device plugin's) carries a
+# domain in its name; the scheduler counts it as it counts CPU and memory, per pod against
+# the node's allocatable, so a placement that ignores it lands a GPU pod on a node whose GPU
+# is taken.
+EXTENDED_RESOURCE_SEPARATOR = "/"
 # A restartable init container (a native sidecar) runs alongside the app containers and
 # every init container started after it; `overhead` is what the RuntimeClass reserves on top.
 RESTART_POLICY_FIELD = "restartPolicy"
@@ -515,6 +521,53 @@ def _slots_max(a: tuple, b: tuple) -> tuple:
     return tuple(None if x is None or y is None else max(x, y) for x, y in zip(a, b))
 
 
+def _extended(requests: dict) -> dict | None:
+    """{resource: quantity} for the extended resources among `requests`; None when one does not parse."""
+    out = {}
+    for key, value in (requests or {}).items():
+        if EXTENDED_RESOURCE_SEPARATOR not in str(key):
+            continue
+        quantity = parse_quantity(value)
+        if quantity is None:
+            return None
+        out[str(key)] = quantity
+    return out
+
+
+def _extended_add(a: dict, b: dict) -> dict:
+    return {key: a.get(key, 0) + b.get(key, 0) for key in set(a) | set(b)}
+
+
+def _extended_max(a: dict, b: dict) -> dict:
+    return {key: max(a.get(key, 0), b.get(key, 0)) for key in set(a) | set(b)}
+
+
+def pod_extended_requests(spec: dict) -> dict | None:
+    """{resource: quantity} of the extended resources a pod spec asks for, counted as
+    `pod_requests` counts CPU and memory (containers plus native sidecars, or an init
+    container's peak, plus the overhead); None when a quantity does not parse."""
+    app: dict = {}
+    for container in spec.get("containers") or []:
+        requests = _extended(((container.get("resources") or {}).get("requests")) or {})
+        if requests is None:
+            return None
+        app = _extended_add(app, requests)
+    sidecars: dict = {}
+    init_peak: dict = {}
+    for container in spec.get("initContainers") or []:
+        requests = _extended(((container.get("resources") or {}).get("requests")) or {})
+        if requests is None:
+            return None
+        if container.get(RESTART_POLICY_FIELD) == RESTART_POLICY_ALWAYS:
+            sidecars = _extended_add(sidecars, requests)
+        else:
+            init_peak = _extended_max(init_peak, _extended_add(requests, sidecars))
+    overhead = _extended(spec.get(OVERHEAD_FIELD) or {})
+    if overhead is None:
+        return None
+    return _extended_add(_extended_max(_extended_add(app, sidecars), init_peak), overhead)
+
+
 def pod_requests(spec: dict) -> tuple[int | None, int | None]:
     """(cpu millicores, memory bytes) a pod spec asks for, as the scheduler counts it: the
     containers' sum plus the restartable init containers (native sidecars, `restartPolicy:
@@ -643,6 +696,11 @@ def selected_values(spec: dict, key: str) -> list[str]:
 def node_allocatable(node: dict) -> tuple[int | None, int | None]:
     allocatable = (node.get("status") or {}).get("allocatable") or {}
     return cpu_millis(allocatable.get("cpu")), memory_bytes(allocatable.get("memory"))
+
+
+def node_extended_allocatable(node: dict) -> dict | None:
+    """{resource: quantity} of the extended resources a node offers; None when one does not parse."""
+    return _extended((node.get("status") or {}).get("allocatable") or {})
 
 
 def node_pool(node: dict) -> str:

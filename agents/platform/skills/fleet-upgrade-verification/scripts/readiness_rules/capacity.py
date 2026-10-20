@@ -13,8 +13,9 @@ on (its node selector, its required node affinity and the taints it tolerates de
 which; a tainted accelerator pool's spare capacity never counts for a pod without the
 toleration; a cordoned node is out twice over, through the `spec.unschedulable` the
 projected node read carries and through the `unschedulable` taint a cordon adds), each
-onto the eligible node with the most room left, by CPU and memory
-requests against allocatable minus what runs there. A pod no eligible node can take is
+onto the eligible node with the most room left, by CPU, memory and extended-resource
+requests (`nvidia.com/gpu`, `google.com/tpu`: a pod holding one lands only on a node with
+one free) against allocatable minus what runs there. A pod no eligible node can take is
 stranded. DaemonSet and mirror pods are left out: the kubelet recreates them on the
 rebuilt node, so a drain never has to find them room. The node measured is the one
 whose stranded pods are the largest in either resource, so a memory-bound node is
@@ -76,9 +77,11 @@ from readiness_rules import (
     items_of_kind,
     new_result,
     node_allocatable,
+    node_extended_allocatable,
     node_pool,
     node_schedulable,
     owner_label,
+    pod_extended_requests,
     pod_owner,
     pod_requests,
     read_error,
@@ -145,7 +148,8 @@ FINDING_TEXT = (
     "{summary} removes a node before its replacement exists; draining its node {node} leaves "
     "{cpu} CPU / {memory} of pods with no node to take them ({room_cpu} / {room_memory} free on the nodes they may schedule on): {workloads}{also}"
 )
-WORKLOAD_TEXT = "{owner} ({cpu} / {memory}{pinned})"
+WORKLOAD_TEXT = "{owner} ({cpu} / {memory}{extended}{pinned})"
+EXTENDED_TEXT = ", {amount:g} {resource}"
 WORKLOAD_PINNED_SUFFIX = ", pinned to the pool"
 MORE_WORKLOADS = " and {count} more"
 ALSO_SHORT_TEXT = "; node(s) {nodes} strand pods as well"
@@ -409,22 +413,26 @@ def _node_name(node: dict) -> str:
     return (node.get("metadata") or {}).get("name", "")
 
 
-def _free_capacity(nodes: list[dict], pods_by_node: dict) -> dict[str, tuple[int, int]] | str:
-    """Per node, allocatable minus every active pod's requests, floored at 0; a string
-    names the quantity that did not parse."""
-    free: dict[str, tuple[int, int]] = {}
+def _free_capacity(nodes: list[dict], pods_by_node: dict) -> dict[str, tuple] | str:
+    """Per node, (CPU, memory, {extended resource: amount}): allocatable minus every active
+    pod's requests, floored at 0; a string names the quantity that did not parse."""
+    free: dict[str, tuple] = {}
     for node in nodes:
         cpu, memory = node_allocatable(node)
-        if cpu is None or memory is None:
+        extended = node_extended_allocatable(node)
+        if cpu is None or memory is None or extended is None:
             return QUANTITY_NODE.format(name=_node_name(node))
         for pod in pods_by_node.get(_node_name(node), []):
-            pod_cpu, pod_memory = pod_requests(pod.get("spec") or {})
-            if pod_cpu is None or pod_memory is None:
+            spec = pod.get("spec") or {}
+            pod_cpu, pod_memory = pod_requests(spec)
+            pod_extended = pod_extended_requests(spec)
+            if pod_cpu is None or pod_memory is None or pod_extended is None:
                 meta = pod.get("metadata") or {}
                 return QUANTITY_POD.format(namespace=meta.get("namespace", ""), name=meta.get("name", ""))
             cpu -= pod_cpu
             memory -= pod_memory
-        free[_node_name(node)] = (max(cpu, 0), max(memory, 0))
+            extended = {key: extended.get(key, 0) - pod_extended.get(key, 0) if key in pod_extended else extended[key] for key in set(extended) | set(pod_extended)}
+        free[_node_name(node)] = (max(cpu, 0), max(memory, 0), {key: max(amount, 0) for key, amount in extended.items()})
     return free
 
 
@@ -436,16 +444,18 @@ def _displaced(node: dict, pods_by_node: dict) -> list[dict] | str:
             continue
         spec = pod.get("spec") or {}
         cpu, memory = pod_requests(spec)
-        if cpu is None or memory is None:
+        extended = pod_extended_requests(spec)
+        if cpu is None or memory is None or extended is None:
             meta = pod.get("metadata") or {}
             return QUANTITY_POD.format(namespace=meta.get("namespace", ""), name=meta.get("name", ""))
-        displaced.append({"owner": owner_label(pod_owner(pod)), "cpu_m": cpu, "memory_bytes": memory, "spec": spec})
+        displaced.append({"owner": owner_label(pod_owner(pod)), "cpu_m": cpu, "memory_bytes": memory, "extended": extended, "spec": spec})
     return displaced
 
 
-def place(displaced: list[dict], candidates: list[dict], free: dict[str, tuple[int, int]], pool_name: str) -> list[dict]:
+def place(displaced: list[dict], candidates: list[dict], free: dict[str, tuple], pool_name: str) -> list[dict]:
     """First-fit placement of the displaced pods, largest first, each onto the eligible
-    candidate with the most room left; returns the pods no node could take.
+    candidate with the most room left by CPU and memory that also has its extended resources
+    free (a GPU pod lands only on a node with a GPU to spare); returns the pods no node could take.
 
     A stranded pod carries `pinned` (no schedulable node outside the pool admits it,
     whatever the room) and `room`, the free capacity the nodes it may schedule on had
@@ -456,10 +466,10 @@ def place(displaced: list[dict], candidates: list[dict], free: dict[str, tuple[i
     for pod in sorted(displaced, key=lambda d: (-d["cpu_m"], -d["memory_bytes"], d["owner"])):
         eligible = [n for n in candidates if node_fits_pod(n, pod["spec"])]
         placed = False
-        for node in sorted(eligible, key=lambda n: remaining[_node_name(n)], reverse=True):
-            cpu, memory = remaining[_node_name(node)]
-            if cpu >= pod["cpu_m"] and memory >= pod["memory_bytes"]:
-                remaining[_node_name(node)] = (cpu - pod["cpu_m"], memory - pod["memory_bytes"])
+        for node in sorted(eligible, key=lambda n: remaining[_node_name(n)][:2], reverse=True):
+            cpu, memory, extended = remaining[_node_name(node)]
+            if cpu >= pod["cpu_m"] and memory >= pod["memory_bytes"] and all(extended.get(key, 0) >= amount for key, amount in pod["extended"].items()):
+                remaining[_node_name(node)] = (cpu - pod["cpu_m"], memory - pod["memory_bytes"], {key: extended.get(key, 0) - pod["extended"].get(key, 0) for key in set(extended) | set(pod["extended"])})
                 placed = True
                 break
         if placed:
@@ -469,6 +479,7 @@ def place(displaced: list[dict], candidates: list[dict], free: dict[str, tuple[i
                 "owner": pod["owner"],
                 "cpu_m": pod["cpu_m"],
                 "memory_bytes": pod["memory_bytes"],
+                "extended": pod["extended"],
                 "pinned": not any(node_pool(n) != pool_name for n in eligible),
                 "eligible_nodes": [_node_name(n) for n in eligible],
                 "room": {"cpu_m": sum(free[_node_name(n)][0] for n in eligible), "memory_bytes": sum(free[_node_name(n)][1] for n in eligible)},
@@ -525,7 +536,7 @@ def measure(pool_name: str, pool_nodes: list[dict], nodes: list[dict], pods: lis
         "room": room,
         "stranded_count": len(chosen["stranded_pods"]),
         "workloads": [
-            {key: s[key] for key in ("owner", "cpu_m", "memory_bytes", "pinned")}
+            {key: s[key] for key in ("owner", "cpu_m", "memory_bytes", "extended", "pinned")}
             for s in sorted(chosen["stranded_pods"], key=lambda s: (-s["cpu_m"], -s["memory_bytes"], s["owner"]))[:NAMED_WORKLOADS]
         ],
         "other_short_nodes": [r["node"] for r in short if r["node"] != chosen["node"]],
@@ -686,7 +697,13 @@ def describe(finding: dict) -> str:
     if kind == FINDING_ACCELERATOR:
         return ACCELERATOR_FINDING_TEXT.format(pool=finding["pool"], accelerators=finding["accelerators"], max_surge=finding["max_surge"])
     workloads = LIST_SEPARATOR.join(
-        WORKLOAD_TEXT.format(owner=w["owner"], cpu=format_cpu(w["cpu_m"]), memory=format_memory(w["memory_bytes"]), pinned=WORKLOAD_PINNED_SUFFIX if w["pinned"] else "")
+        WORKLOAD_TEXT.format(
+            owner=w["owner"],
+            cpu=format_cpu(w["cpu_m"]),
+            memory=format_memory(w["memory_bytes"]),
+            extended="".join(EXTENDED_TEXT.format(amount=amount, resource=resource) for resource, amount in sorted((w.get("extended") or {}).items()) if amount),
+            pinned=WORKLOAD_PINNED_SUFFIX if w["pinned"] else "",
+        )
         for w in finding["workloads"]
     )
     more = finding["stranded_count"] - len(finding["workloads"])
