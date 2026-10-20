@@ -77,34 +77,53 @@ class ExistingInstallsKeepTodayTest(unittest.TestCase):
                 mode = version["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["mode"]
                 self.assertNotIn("default", mode)
 
-    def test_the_example_a_new_user_copies_installs_next(self):
-        # install.sh reads a file with no mode as an existing today install, so
-        # the documented `cp install.env.example install.env` first install has
-        # to name next itself.
+    def test_the_example_leaves_the_mode_to_the_cluster(self):
+        # INSTALL.md copies install.env.example onto running installs too. A
+        # live key there would switch a today install to next; commented, the
+        # cluster decides (adopt_live_platform_agent_mode).
         example = (_REPO_ROOT / "install.env.example").read_text()
-        self.assertIn("\nPLATFORM_AGENT_MODE=next\n", example)
+        self.assertNotRegex(example, r"(?m)^\s*PLATFORM_AGENT_MODE=")
+        self.assertIn("\n# PLATFORM_AGENT_MODE=next\n", example)
 
-    def test_only_install_shs_first_install_resolver_reads_the_new_install_default(self):
-        # A front door that falls back to DEFAULT_PLATFORM_AGENT_MODE for a
-        # mode install.env did not record treats an existing today install as
-        # next: it prompts and warns for next, or renders it. upgrade.sh's
-        # last-resort fallback is for an install.defaults.env that predates
-        # DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE, where the default was still today.
+    def test_only_install_shs_first_install_resolver_reads_the_first_install_default(self):
+        # A front door that falls back to the first-install default for a mode
+        # install.env did not record treats an existing today install as next.
         reads = {
-            "install.sh": ['    PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_PLATFORM_AGENT_MODE:-}"'],
-            "upgrade.sh": ["${DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"] * 4,
+            "install.sh": [
+                '  PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"'
+            ],
         }
-        for path in ("install.sh", "upgrade.sh", "scripts/installer/installer_common.sh"):
-            with self.subTest(path=path):
+        for path in sorted(_REPO_ROOT.glob("*.sh")) + sorted((_REPO_ROOT / "scripts").rglob("*.sh")):
+            rel = path.relative_to(_REPO_ROOT).as_posix()
+            with self.subTest(path=rel):
                 lines = [
                     line
-                    for line in (_REPO_ROOT / path).read_text().splitlines()
-                    if "$DEFAULT_PLATFORM_AGENT_MODE" in line or "${DEFAULT_PLATFORM_AGENT_MODE" in line
+                    for line in path.read_text().splitlines()
+                    if "$DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE" in line
+                    or "${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE" in line
                 ]
-                expected = reads.get(path, [])
-                self.assertEqual(len(lines), len(expected), lines)
-                for line, needle in zip(lines, expected):
-                    self.assertIn(needle, line)
+                self.assertEqual(lines, reads.get(rel, []))
+
+    def test_released_scripts_still_read_today_as_an_existing_installs_mode(self):
+        # install.sh and upgrade.sh source the target tree's
+        # install.defaults.env, so a released script installing this tree reads
+        # DEFAULT_PLATFORM_AGENT_MODE as it always has: the mode of an install
+        # whose install.env records none. Sourced, under a strict shell, with
+        # the expression those scripts use.
+        script = (
+            "set -euo pipefail\n"
+            f". {_DEFAULTS}\n"
+            "unset PLATFORM_AGENT_MODE PARAM_PLATFORM_AGENT_MODE\n"
+            'echo "INSTALL=[${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}] '
+            'UPGRADE=[${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}]"\n'
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("INSTALL=[today] UPGRADE=[today]", proc.stdout)
+        # And upgrade.sh in this tree is such a reader.
+        self.assertIn(
+            '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"', (_REPO_ROOT / "upgrade.sh").read_text()
+        )
 
     def test_the_operator_reads_an_absent_mode_as_today(self):
         text = _MODE_GO.read_text()
@@ -121,9 +140,8 @@ class CompositionTextTest(unittest.TestCase):
         self.assertIn("nullable    = false", self.variable)
         enum = _crd_enum()
         self.assertIn(f"contains({json.dumps(enum)}, var.platform_agent_mode)".replace('","', '", "'), self.variable)
-        # The word an install.env with no mode resolves to is the same; a first
-        # install's default (DEFAULT_PLATFORM_AGENT_MODE) is install.sh's alone.
-        self.assertIn('DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE="today"', _DEFAULTS.read_text())
+        # The front doors' default is the same word.
+        self.assertIn('DEFAULT_PLATFORM_AGENT_MODE="today"', _DEFAULTS.read_text())
 
     def test_platform_agent_is_merged_with_the_mode_only_when_it_is_not_today(self):
         self.assertIn("    platformAgent = merge({\n", self.main_tf)

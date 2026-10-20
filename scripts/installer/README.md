@@ -23,8 +23,8 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_PLATFORM_AGENT_MODE`                                             | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
-| `DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE`                                  | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
+| `DEFAULT_PLATFORM_AGENT_MODE`                                             | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
+| `DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`                               | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
@@ -530,13 +530,24 @@ cannot refuse a teardown.
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
-renders). A first install with no `install.env` records `next` unless `--mode` says otherwise;
-`install.env.example` sets `next` too. A file that assigns no `PLATFORM_AGENT_MODE`, such as one
-written before `install.sh` recorded the key, resolves to `today` in every front door, so a
-re-run or an upgrade of such an install keeps it on `today` rather than moving it to the new
-default. The generator writes `platform_agent_mode` on every run, and the
+renders). An `install.sh` run that chooses no mode (no `--mode`, no `PLATFORM_AGENT_MODE` in
+`install.env`, whose line `install.env.example` leaves commented out, and on a first install none
+exported) settles it from the target cluster. A cluster already running a `PlatformAgent` keeps
+its `spec.mode` (absent is `today`); one whose `PlatformAgent` was deleted while the
+`kube-agents` release is still installed keeps the mode the release records. Only a cluster with
+neither, or none yet, is a first install, which gets `next`
+(`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`), or `today` when it mirrors its third-party images
+with `--third-party-registry-prefix`, because nothing points `next`'s NATS images at the mirror;
+`--mode=next` overrides that. The read uses a kubeconfig of its own, so `--dry-run` and
+`--generate-only` leave the current context alone. A cluster that exists but cannot be read is
+never taken for a first install: over an `install.env` with no key the run keeps `today`; with no
+`install.env`, `--dry-run` and `--generate-only` assume `today` with a warning and an applying run
+is refused until `--mode` names one. `install.sh` then records the mode it settled on in an
+`install.env` that assigns none. `upgrade.sh`, the menu and the generator read a file with no key,
+or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as an
+existing install's mode). The generator writes `platform_agent_mode` on every run, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
-takes `--mode` and records it, or the default, on a first install. Over an existing
+takes `--mode` and records it, or the settled mode, on a first install. Over an existing
 `install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
 with what the file resolves to (an empty key is `today`) is refused rather than applied for one
 run, because the next run, and every `upgrade.sh`, which takes no `--mode`, would switch the

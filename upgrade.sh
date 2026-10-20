@@ -2142,14 +2142,12 @@ main() {
     fi
     # Each mode call is guarded: installer_common.sh is the target tree's,
     # and one from before spec.mode support (this script piped, or run with
-    # --image-tag onto an older release) defines neither the notice nor a
-    # mode default, so the run skips the notice rather than abort. One from
-    # between spec.mode support and the next default defines the notice and
-    # DEFAULT_PLATFORM_AGENT_MODE, which was today there, but not
-    # DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE, hence the nested fallback. retag_values' refusal of a dropped `next` lives in this file and
+    # --image-tag onto an older release) defines neither the notice nor
+    # DEFAULT_PLATFORM_AGENT_MODE, so the run skips the notice rather than
+    # abort. retag_values' refusal of a dropped `next` lives in this file and
     # still runs there.
     if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
-      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-${DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}}"
+      announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
     fi
     # The Slack settings the full arm refuses when next hands Slack to the
     # A2A gateway, warned here, as the scope check is.
@@ -2213,7 +2211,7 @@ main() {
       # and says when a full upgrade would move it (from the values just read).
       # Guarded, as at the plan's notice: an older target's helpers lack it.
       if declare -F note_platform_agent_mode_for_retag >/dev/null; then
-        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-${DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
       fi
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"
@@ -2237,7 +2235,7 @@ main() {
       retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"
       # Guarded, as at the plan's notice: an older target's helpers lack it.
       if declare -F note_platform_agent_mode_for_retag >/dev/null; then
-        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-${DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
+        note_platform_agent_mode_for_retag "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"
       fi
       harness_retag_keys "$RETAG_VALUES_JSON"
       # After the reads, not before them: they are the last things this arm
@@ -2295,7 +2293,7 @@ main() {
       # Nothing asks between here and the apply, so the notice says that.
       # Guarded, as at the plan's notice: an older target's helpers lack it.
       if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
-        announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-${DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+        announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
       fi
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host

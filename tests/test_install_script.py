@@ -6055,19 +6055,37 @@ class PlatformAgentModeTest(unittest.TestCase):
         return env
 
     def _run(self, body, install_env=None, extra_env=None):
-        """Source install.sh against install_env (a path that may not exist,
-        which is a first install) and installer_common.sh, then run body."""
+        """Source install.sh against install_env and installer_common.sh, then
+        run body. With no install_env, install.sh is a copy alone in a
+        directory that is not a checkout, under an empty HOME, so no
+        install.env is found anywhere: sourcing the checkout's install.sh
+        would land on <repo>/install.env, the file a developer who installs
+        from this clone has."""
         env = {"KUBE_AGENTS_INSTALL_ENV": str(install_env)} if install_env else {}
         env.update(extra_env or {})
-        script = (
-            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
-            "source scripts/installer/installer_common.sh\n"
-            f"{body}\n"
-        )
-        return subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True,
-            env=self._env(env), cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            install_sh, cwd = _INSTALL_SH, _REPO_ROOT
+            if not install_env:
+                cwd = pathlib.Path(tmp) / "bare"
+                home = pathlib.Path(tmp) / "home"
+                cwd.mkdir()
+                home.mkdir()
+                install_sh = cwd / "install.sh"
+                shutil.copy(_INSTALL_SH, install_sh)
+                shutil.copy(_REPO_ROOT / "install.defaults.env", cwd / "install.defaults.env")
+                env["HOME"] = str(home)
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{install_sh}"\n'
+                f'source "{_REPO_ROOT / "scripts" / "installer" / "installer_common.sh"}"\n'
+                f"{body}\n"
+            )
+            run_env = self._env(env)
+            if not install_env:
+                run_env.pop("KUBE_AGENTS_INSTALL_ENV", None)
+            return subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                env=run_env, cwd=str(cwd), stdin=subprocess.DEVNULL, check=False,
+            )
 
     def _file(self, tmp, content):
         path = pathlib.Path(tmp) / "install.env"
@@ -6479,29 +6497,33 @@ class PlatformAgentModeTest(unittest.TestCase):
             dest = self._bootstrap_with_export(tmp, "INSTALL_ENV_FOUND_AT_START=false; resolve_platform_agent_mode_fallback")
             self.assertIn("PLATFORM_AGENT_MODE=next\n", dest.read_text())
 
-    def test_an_unset_mode_over_a_file_recording_none_stays_today(self):
-        # An install.env from before install.sh recorded the mode is an install
-        # that has only run today; a re-run must not move it to the new default.
+    def test_the_fallback_starts_as_a_first_installs_and_a_recorded_key_wins(self):
+        # Before the cluster is asked, an empty mode resolves to the first
+        # install's default whether or not an install.env exists: whether this
+        # is a first install is adopt_live_platform_agent_mode's to settle.
         with tempfile.TemporaryDirectory() as tmp:
-            dest = self._bootstrap_with_export(tmp, ":")
-            self.assertIn("PLATFORM_AGENT_MODE=today\n", dest.read_text())
-
-    def test_the_fallback_is_next_for_a_first_install_and_today_over_an_unrecorded_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            for content, body, expected in (
-                (None, "INSTALL_ENV_FOUND_AT_START=false; resolve_shared_defaults", "next"),
-                ("PROJECT_ID=p\n", "resolve_shared_defaults", "today"),
-                ("PLATFORM_AGENT_MODE=next\n", "resolve_shared_defaults", "next"),
-                ("PLATFORM_AGENT_MODE=today\n", "INSTALL_ENV_FOUND_AT_START=false; resolve_shared_defaults", "today"),
+            for content, expected in (
+                (None, "next"),
+                ("PROJECT_ID=p\n", "next"),
+                ("PLATFORM_AGENT_MODE=next\n", "next"),
+                ("PLATFORM_AGENT_MODE=today\n", "today"),
             ):
-                with self.subTest(content=content, body=body):
+                with self.subTest(content=content):
                     install_env = self._file(tmp, content) if content is not None else None
                     proc = self._run(
-                        f'{body}; validate_platform_agent_mode && echo "MODE=[${{PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}}]"',
+                        'resolve_shared_defaults; validate_platform_agent_mode && echo "MODE=[${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}]"',
                         install_env=install_env,
                     )
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertIn(f"MODE=[{expected}]", proc.stdout)
+
+    def test_a_run_with_no_install_env_never_reads_the_checkouts_own(self):
+        # _run with no install_env must not land on <repo>/install.env, which a
+        # developer who installs from this clone has: a recorded today there
+        # would make every first-install case here read today.
+        proc = self._run('echo "ENV=[$INSTALL_ENV_FILE] FOUND=[$INSTALL_ENV_FOUND_AT_START]"')
+        self.assertIn("FOUND=[false]", proc.stdout, proc.stderr)
+        self.assertNotIn(str(_REPO_ROOT / "install.env"), proc.stdout)
 
     def test_the_menu_refuses_the_flag_it_would_drop(self):
         # --menu applies the mode install.env records; a --mode there would be
@@ -6517,136 +6539,237 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
 
     def test_the_first_install_check_reads_whether_the_file_exists(self):
-        # Through the real check at parse time, not a hand-set
-        # INSTALL_ENV_FOUND_AT_START: install.sh and install.defaults.env alone
-        # in a directory that is not a checkout, under an empty HOME, so no
-        # install.env is found anywhere.
+        # Through the real check at parse time, with no install.env anywhere
+        # (_run's isolated copy), then with one. The fallback is a first
+        # install's either way until the cluster is asked.
         probe = 'echo "FOUND=[$INSTALL_ENV_FOUND_AT_START] FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"'
         with tempfile.TemporaryDirectory() as tmp:
-            bare = pathlib.Path(tmp) / "bare"
-            home = pathlib.Path(tmp) / "home"
-            bare.mkdir()
-            home.mkdir()
-            shutil.copy(_INSTALL_SH, bare / "install.sh")
-            shutil.copy(_REPO_ROOT / "install.defaults.env", bare / "install.defaults.env")
-            env = self._env({"HOME": str(home)})
-            env.pop("KUBE_AGENTS_INSTALL_ENV", None)
-            first = subprocess.run(
-                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{bare / "install.sh"}"\n{probe}\n'],
-                capture_output=True, text=True, env=env, cwd=str(bare), stdin=subprocess.DEVNULL,
-            )
+            first = self._run(probe)
             self.assertIn("FOUND=[false] FALLBACK=[next]", first.stdout, first.stderr)
             later = self._run(probe, install_env=self._file(tmp, "PROJECT_ID=p\n"))
-            self.assertIn("FOUND=[true] FALLBACK=[today]", later.stdout, later.stderr)
+            self.assertIn("FOUND=[true] FALLBACK=[next]", later.stdout, later.stderr)
 
-    # adopt_live_platform_agent_mode with the cluster probe and the CR read
-    # stubbed: $1 of _adopt is gcloud's exit status, $2 the CR read's outcome,
-    # $3 the CR list.
+    # adopt_live_platform_agent_mode with the cluster probe and the reads
+    # stubbed: status is gcloud's exit status, read the CR read's outcome,
+    # json the CR list, record the release read's outcome and values its
+    # values. gcloud's get-credentials writes the context into whatever
+    # $KUBECONFIG names, as the real one does, and each call is logged to fd 3,
+    # past the function's own redirections.
     _ADOPT = (
         "export PROJECT_ID=p REGION=r CLUSTER_NAME=c\n"
-        "gcloud() {{ echo \"GCLOUD $*\" >&2; return {status}; }}\n"
+        "exec 3>&2\n"
+        "gcloud() {{ echo \"GCLOUD KUBECONFIG=[${{KUBECONFIG:-}}] $*\" >&3; "
+        "case \"$*\" in *get-credentials*) echo 'current-context: gke_p_r_c' > \"${{KUBECONFIG:-$HOME/.kube/config}}\" ;; esac; "
+        "return {status}; }}\n"
         "gke_dns_endpoint_flag() {{ :; }}\n"
         "read_platform_agent_install_state() {{ PLATFORM_AGENT_CR_READ='{read}'; "
-        "PLATFORM_AGENT_CR_JSON='{json}'; PLATFORM_AGENT_READ_ERROR='forbidden'; }}\n"
-        "PARAM_DRY_RUN={dry_run}\n"
+        "PLATFORM_AGENT_CR_JSON='{json}'; PLATFORM_AGENT_RECORD_READ='{record}'; "
+        "PLATFORM_AGENT_RECORD_JSON='{values}'; PLATFORM_AGENT_READ_ERROR='{error}'; }}\n"
+        "PARAM_DRY_RUN={dry_run}; PARAM_GENERATE_ONLY={generate_only}\n"
         "{pre}\n"
         'rc=0; adopt_live_platform_agent_mode || rc=$?; '
-        'echo "rc=$rc FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"\n'
+        'echo "rc=$rc FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK] KUBECONFIG_AFTER=[${{KUBECONFIG:-}}] '
+        'MODE=[${{PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}}]"\n'
     )
 
-    def _adopt(self, tmp, status=0, read="ok", json_list='{"items":[]}', dry_run="false", pre=":", content=None):
-        # No content is a first install: the file check is pinned above, so
-        # here it is set rather than arranged.
+    def _adopt(self, tmp, status=0, read="ok", json_list='{"items":[]}', record="none", values="{}",
+               error="", dry_run="false", generate_only="false", pre=":", content=None, extra_env=None):
+        # No content is a first install, with no install.env: the file check is
+        # pinned above, so here it is set rather than arranged.
         if content is None:
             content = ""
-            pre = f"INSTALL_ENV_FOUND_AT_START=false; resolve_platform_agent_mode_fallback; {pre}"
+            pre = f"INSTALL_ENV_FOUND_AT_START=false; {pre}"
         path = self._file(tmp, content)
         return self._run(
-            self._ADOPT.format(status=status, read=read, json=json_list, dry_run=dry_run, pre=pre),
-            install_env=path,
+            self._ADOPT.format(status=status, read=read, json=json_list, record=record, values=values,
+                               error=error, dry_run=dry_run, generate_only=generate_only, pre=pre),
+            install_env=path, extra_env=extra_env,
         )
 
     def test_a_cluster_already_running_a_platform_agent_keeps_its_mode(self):
-        # No install.env against a live install (a new checkout, another
-        # machine): the CR's mode, absent being today, not the new default.
+        # No mode recorded against a live install (a new checkout, another
+        # machine, a copied example): the CR's mode, absent being today, not
+        # the new default. With or without an install.env.
         with tempfile.TemporaryDirectory() as tmp:
-            for json_list, expected in (
-                ('{"items":[{"spec":{}}]}', "today"),
-                ('{"items":[{"spec":{"mode":"today"}}]}', "today"),
-                ('{"items":[{"spec":{"mode":"next"}}]}', "next"),
-            ):
-                with self.subTest(cr=json_list):
-                    proc = self._adopt(tmp, json_list=json_list)
+            for content in (None, "PROJECT_ID=p\n"):
+                for json_list, expected in (
+                    ('{"items":[{"spec":{}}]}', "today"),
+                    ('{"items":[{"spec":{"mode":"today"}}]}', "today"),
+                    ('{"items":[{"spec":{"mode":"next"}}]}', "next"),
+                ):
+                    with self.subTest(content=content, cr=json_list):
+                        proc = self._adopt(tmp, json_list=json_list, content=content)
+                        self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
+                        if expected == "today":
+                            self.assertIn(
+                                "already runs kube-agents on spec.mode today (from its PlatformAgent)",
+                                proc.stdout + proc.stderr,
+                            )
+
+    def test_the_copied_example_on_a_live_today_install_stays_today(self):
+        # INSTALL.md's way to create an install.env for a running install is
+        # to copy install.env.example. The copy records no mode, so the live
+        # CR decides; on a cluster with no install it is a first install.
+        example = (_REPO_ROOT / "install.env.example").read_text()
+        self.assertNotRegex(example, r"(?m)^\s*PLATFORM_AGENT_MODE=")
+        with tempfile.TemporaryDirectory() as tmp:
+            live = self._adopt(tmp, json_list='{"items":[{"spec":{}}]}', content=example)
+            self.assertIn("rc=0 FALLBACK=[today]", live.stdout, live.stderr)
+            first = self._adopt(tmp, status=1, content=example)
+            self.assertIn("rc=0 FALLBACK=[next]", first.stdout, first.stderr)
+
+    def test_a_hand_deleted_cr_with_the_release_still_installed_keeps_the_releases_mode(self):
+        # The next apply recreates the CR from the release, so its recorded
+        # mode (absent is today) decides, not the first-install default.
+        with tempfile.TemporaryDirectory() as tmp:
+            for values, expected in (("{}", "today"), ('{"platformAgent":{"mode":"next"}}', "next")):
+                with self.subTest(values=values):
+                    proc = self._adopt(tmp, record="ok", values=values)
                     self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
                     if expected == "today":
-                        self.assertIn("already runs a PlatformAgent on spec.mode today", proc.stdout + proc.stderr)
+                        self.assertIn("from its kube-agents release", proc.stdout + proc.stderr)
+            # A release that cannot be read is no answer either.
+            failed = self._adopt(tmp, record="failed", error="helm: forbidden")
+            self.assertIn("rc=1", failed.stdout, failed.stderr)
+            self.assertIn("helm: forbidden", failed.stdout + failed.stderr)
 
-    def test_a_cluster_with_no_platform_agent_is_a_first_install(self):
+    def test_a_cluster_with_no_install_is_a_first_install(self):
         with tempfile.TemporaryDirectory() as tmp:
             for status, read in ((1, "ok"), (0, "none"), (0, "ok")):
                 with self.subTest(gcloud=status, read=read):
                     proc = self._adopt(tmp, status=status, read=read)
                     self.assertIn("rc=0 FALLBACK=[next]", proc.stdout, proc.stderr)
 
-    def test_a_cr_that_cannot_be_read_is_refused_and_a_dry_run_warns(self):
+    def test_a_cluster_that_cannot_be_read_is_never_guessed_a_first_install(self):
+        # Applying with no install.env: refused. --dry-run and --generate-only:
+        # today, with a warning, not refused. An install.env with no mode:
+        # today on every route, as before the cluster was asked.
         with tempfile.TemporaryDirectory() as tmp:
             for read in ("failed", "no-context"):
                 with self.subTest(read=read):
-                    proc = self._adopt(tmp, read=read)
+                    proc = self._adopt(tmp, read=read, error="forbidden" if read == "failed" else "")
                     out = proc.stdout + proc.stderr
                     self.assertIn("rc=1", proc.stdout, out)
                     self.assertIn("Pass --mode=today or --mode=next", out)
-                    preview = self._adopt(tmp, read=read, dry_run="true")
-                    self.assertIn("rc=0 FALLBACK=[next]", preview.stdout, preview.stderr)
-                    self.assertIn("an applying run would be refused", preview.stdout + preview.stderr)
+                    for route in ({"dry_run": "true"}, {"generate_only": "true"}):
+                        preview = self._adopt(tmp, read=read, **route)
+                        self.assertIn("rc=0 FALLBACK=[today]", preview.stdout, preview.stderr)
+                        self.assertIn("An applying run would be refused.", preview.stdout + preview.stderr)
+                    keyless = self._adopt(tmp, read=read, content="PROJECT_ID=p\n")
+                    self.assertIn("rc=0 FALLBACK=[today]", keyless.stdout, keyless.stderr)
+                    self.assertIn("records no PLATFORM_AGENT_MODE", keyless.stdout + keyless.stderr)
 
-    def test_a_chosen_mode_or_an_existing_file_skips_the_cluster_read(self):
+    def test_the_cluster_read_leaves_the_operators_kubeconfig_alone(self):
+        # --dry-run and --generate-only promise no side effects; the read
+        # writes its credentials into a kubeconfig of its own and removes it.
+        with tempfile.TemporaryDirectory() as tmp:
+            kubeconfig = pathlib.Path(tmp) / "operator-kubeconfig"
+            kubeconfig.write_text("current-context: the-operators-context\n")
+            for route in ({"dry_run": "true"}, {"generate_only": "true"}, {}):
+                with self.subTest(**route):
+                    proc = self._adopt(
+                        tmp, json_list='{"items":[{"spec":{}}]}', extra_env={"KUBECONFIG": str(kubeconfig)}, **route
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0 FALLBACK=[today]", proc.stdout, out)
+                    self.assertEqual(kubeconfig.read_text(), "current-context: the-operators-context\n")
+                    self.assertIn(f"KUBECONFIG_AFTER=[{kubeconfig}]", proc.stdout, out)
+                    creds = [line for line in proc.stderr.splitlines() if "get-credentials" in line]
+                    self.assertEqual(len(creds), 1, out)
+                    self.assertNotIn(f"KUBECONFIG=[{kubeconfig}]", creds[0])
+                    self.assertRegex(creds[0], r"KUBECONFIG=\[[^\]]+/kubeconfig\]")
+
+    def test_a_chosen_mode_skips_the_cluster_read(self):
+        # --mode, an exported mode (first install only) and a key install.env
+        # records all win; a key assigned empty is today, as every front door
+        # reads it, and nothing can be recorded over it.
         with tempfile.TemporaryDirectory() as tmp:
             cr = '{"items":[{"spec":{}}]}'
             for kwargs, expected in (
-                ({"pre": "PARAM_PLATFORM_AGENT_MODE=next"}, "today"),
-                ({"content": "PROJECT_ID=p\n"}, "today"),
+                ({"pre": "PARAM_PLATFORM_AGENT_MODE=next"}, "next"),
+                ({"content": "PLATFORM_AGENT_MODE=next\n", "pre": "resolve_shared_defaults"}, "next"),
+                ({"content": "PLATFORM_AGENT_MODE=\n"}, "today"),
             ):
                 with self.subTest(**kwargs):
                     proc = self._adopt(tmp, json_list=cr, **kwargs)
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertNotIn("GCLOUD", proc.stderr)
-            # The explicit --mode, not the fallback, is what applies.
-            proc = self._adopt(tmp, json_list=cr, pre="PARAM_PLATFORM_AGENT_MODE=next")
-            self.assertIn("FALLBACK=[next]", proc.stdout, proc.stderr)
+                    self.assertIn(f"MODE=[{expected}]", proc.stdout, proc.stderr)
+
+    def test_an_install_env_with_no_mode_records_the_settled_one(self):
+        # upgrade.sh reads a file with no key as today, so the mode this run
+        # settled on is queued for record_flags_into_install_env, and written.
+        call = (
+            "rc=0; queue_unrecorded_platform_agent_mode || rc=$?; "
+            'echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(
+                f"PLATFORM_AGENT_MODE_FALLBACK=next; {call}; export PLATFORM_AGENT_MODE=next; "
+                "record_flags_into_install_env",
+                install_env=path,
+            )
+            self.assertIn("rc=0 QUEUED=[PLATFORM_AGENT_MODE]", proc.stdout, proc.stderr)
+            self.assertIn("PLATFORM_AGENT_MODE=next\n", path.read_text())
+            for content, pre, says in (
+                ("PLATFORM_AGENT_MODE=today\n", ":", ""),
+                ("PROJECT_ID=p\n", "PARAM_DRY_RUN=true", "a run without --dry-run records the one it applies"),
+                (None, ":", ""),
+            ):
+                with self.subTest(content=content, pre=pre):
+                    install_env = self._file(tmp, content) if content is not None else None
+                    before = install_env.read_text() if install_env else None
+                    proc = self._run(f"{pre}; {call}", install_env=install_env)
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stderr)
+                    if says:
+                        self.assertIn(says, proc.stdout + proc.stderr)
+                    if install_env:
+                        self.assertEqual(install_env.read_text(), before)
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            path.chmod(0o400)
+            try:
+                proc = self._run(call, install_env=path)
+            finally:
+                path.chmod(0o600)
+            self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stderr)
+            self.assertIn("is not writable", proc.stdout + proc.stderr)
 
     def test_the_mode_is_settled_before_step_6_reads_it(self):
-        # Step 6's prompts and Slack refusals follow the mode, so the live CR
+        # Step 6's prompts and Slack refusals follow the mode, so the cluster
         # and the mirror are consulted once the target is known and before it.
         text = _INSTALL_SH.read_text()
         main_start = text.index('  print_step "5. GKE Cluster Topology & Capacity Setup"')
         adopt = text.index('    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n', main_start)
         self.assertIn('  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \\\n', text[adopt - 90 : adopt])
         mirror = text.index('  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"\n', adopt)
+        queue = text.index("  queue_unrecorded_platform_agent_mode\n", mirror)
         step_6 = text.index('  print_step "6. Chat & Messaging Integrations Setup"')
-        self.assertLess(mirror, step_6)
+        self.assertLess(queue, step_6)
         self.assertNotIn("PLATFORM_AGENT_MODE_FALLBACK", text[main_start:adopt])
         self.assertEqual(text.count("adopt_live_platform_agent_mode \""), 1)
         self.assertEqual(text.count("  mirrored_first_install_mode \""), 1)
+        self.assertEqual(text.count("  queue_unrecorded_platform_agent_mode\n"), 1)
 
     def test_a_mirrored_first_install_defaults_to_today(self):
         # next's bus images are not pointed at the mirror, so a first install
-        # that mirrors defaults to today; anything that chose a mode wins.
+        # that mirrors defaults to today, with or without an install.env that
+        # records no mode; anything that chose a mode, or a live install, wins.
         call = "rc=0; mirrored_first_install_mode {prefix} || rc=$?; " 'echo "rc=$rc FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"'
-        first = "INSTALL_ENV_FOUND_AT_START=false; resolve_platform_agent_mode_fallback; "
+        first = "INSTALL_ENV_FOUND_AT_START=false; "
         with tempfile.TemporaryDirectory() as tmp:
             path = self._file(tmp, "")
             for pre, prefix, expected in (
                 (first, "mirror.example/third-party", "today"),
                 (first, "''", "next"),
                 (first + "PARAM_PLATFORM_AGENT_MODE=next; ", "mirror.example/third-party", "next"),
-                (first + "PLATFORM_AGENT_MODE_FROM_CR=true; ", "mirror.example/third-party", "next"),
+                (first + "PLATFORM_AGENT_MODE_SETTLED=true; ", "mirror.example/third-party", "next"),
                 ("", "mirror.example/third-party", "today"),
             ):
                 with self.subTest(pre=pre, prefix=prefix):
                     proc = self._run(pre + call.format(prefix=prefix), install_env=path)
                     self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
-                    if pre == first and prefix != "''":
+                    if expected == "today":
                         self.assertIn("Pass --mode=next to install next anyway.", proc.stdout + proc.stderr)
 
     def test_y_refuses_a_switch_nobody_asked_for(self):
@@ -6754,7 +6877,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             block,
         )
         self.assertIn(
-            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
+            'announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
             "        check_scope_container_access || exit 1\n",
             text[:main_start],
         )
@@ -6828,6 +6951,16 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
     _MENU_ARM = '      6)\n        print_step "Saving & Re-applying Configuration State"\n'
     _CHAT_STEP = '  print_step "6. Chat & Messaging Integrations Setup"\n'
+    # main settles the mode before step 6 (adopt_live_platform_agent_mode).
+    # The harnesses run against a live today install, so an install.env
+    # that records no mode is today, as it is on the clusters such files
+    # describe; a key or --mode still wins.
+    _SETTLE = (
+        "gcloud() { return 0; }\n"
+        "read_platform_agent_install_state() { PLATFORM_AGENT_CR_READ=ok; "
+        "PLATFORM_AGENT_CR_JSON='{\"items\":[{\"spec\":{}}]}'; }\n"
+        "PROJECT_ID=p CLUSTER_NAME=c REGION=r adopt_live_platform_agent_mode || exit 1\n"
+    )
 
     _env = staticmethod(PlatformAgentModeTest._env)
     _run = PlatformAgentModeTest._run
@@ -6856,6 +6989,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 "resolve_shared_defaults\n"
                 "validate_platform_agent_mode || exit 1\n"
                 "check_flags_against_install_env || exit 1\n"
+                f"{self._SETTLE}"
                 # Set by steps 4 and 5; the no-chat arm prints them.
                 "project_id=p region=r cluster_name=c\n"
                 '_chat_step; echo "went on"',
@@ -7019,6 +7153,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 "resolve_shared_defaults\n"
                 "validate_platform_agent_mode || exit 1\n"
                 "check_flags_against_install_env || exit 1\n"
+                f"{self._SETTLE}"
                 "project_id=p region=r cluster_name=c\n"
                 '_chat_step; echo "went on ASKED=$ASKED"',
                 install_env=path,

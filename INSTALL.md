@@ -497,9 +497,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   keep the value the file records rather than reverting to a default, so bumping `--image-tag`
   alone changes only the image tag. To change configuration, edit `install.env` (copy
   `install.env.example` and `chmod 600` it if the first install has not written one yet — the
-  example is tracked world-readable and the file it becomes holds your API keys; it also sets
-  `PLATFORM_AGENT_MODE=next`, so delete that line to keep a running `today` install on `today`)
-  and re-run, run
+  example is tracked world-readable and the file it becomes holds your API keys; its
+  `PLATFORM_AGENT_MODE` line stays commented out, so the re-run keeps the mode the install already
+  runs and records it) and re-run, run
   the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`)
   where Save & Apply re-applies through the same engine, or edit your
   hand-written tfvars and re-apply.
@@ -524,8 +524,10 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 
 - **Component stack (`--mode`)**: a first `install.sh` install runs `spec.mode: next`, which puts the NATS bus
   and the A2A gateway in front of the agent; `--mode=today` installs the previous stack, kept as
-  a rollback. An `install.env` that sets no `PLATFORM_AGENT_MODE` installs and stays on `today`;
-  `install.env.example` sets `next`. With an `install.env` you wrote
+  a rollback. A first install that mirrors its third-party images (`--third-party-registry-prefix`)
+  runs `today` unless `--mode=next` is given, because `next`'s NATS images are not mirrored. When
+  neither `--mode` nor `install.env` names a mode, a cluster that already runs kube-agents keeps
+  the mode it runs. With an `install.env` you wrote
   yourself, `--mode` adds `PLATFORM_AGENT_MODE` to it when it sets none, and is refused when it
   sets a different one. Terraform takes `platform_agent_mode`,
   the chart `platformAgent.mode`. To switch a running install, edit `PLATFORM_AGENT_MODE` in

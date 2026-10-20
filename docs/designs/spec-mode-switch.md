@@ -162,14 +162,16 @@ rendered without one (`helm template`, Argo CD) would move an existing install:
   anything else.
 - The Terraform composition's `platform_agent_mode`, `"today"` by default, which passes
   the chart nothing; `"next"` passes `platformAgent.mode: next`.
-- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`. A
-  first install with no `install.env` records `next` when no `--mode` is given
-  (`DEFAULT_PLATFORM_AGENT_MODE`), and `install.env.example` sets `next`. A file that assigns no
-  mode, typically one written before the key existed by an install that has only run `today`,
-  resolves to `today` (`DEFAULT_UNRECORDED_PLATFORM_AGENT_MODE`) in every front door. A run
-  with no `install.env` and no `--mode` against a cluster that already runs a `PlatformAgent`
-  (a new checkout of a live install) keeps that CR's mode, and refuses when the CR cannot be
-  read; under `-y`, `install.sh` refuses a switch that neither `--mode` nor the file asked for.
+- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`. When
+  neither the flag nor the file names a mode (`install.env.example` leaves the line commented
+  out), the target cluster decides: a live `PlatformAgent` keeps its mode (absent is `today`),
+  a deleted one whose release is still installed keeps the release's, and only a cluster with
+  neither is a first install, which records `next` (`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`),
+  or `today` when it mirrors its third-party images, whose NATS images are not mirrored. A
+  cluster that cannot be read is never taken for a first install. `upgrade.sh` and the other
+  front doors read a file with no key as `today` (`DEFAULT_PLATFORM_AGENT_MODE`), so
+  `install.sh` records the mode it settled on there; under `-y` it refuses a switch that
+  neither `--mode` nor the file asked for.
 
 A mode switch on a running install is made by editing `PLATFORM_AGENT_MODE`, not by
 passing `--mode`, which is refused when it disagrees with the file, and the run that
