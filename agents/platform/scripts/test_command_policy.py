@@ -2069,5 +2069,49 @@ class LocalRenderTests(unittest.TestCase):
             self.assertFalse(command_policy.local_render(argv), argv)
 
 
+class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
+    """submit-suggestion's "Deleting a resource" (#3077) answers a delete
+    request with a stated stop. It must run no cluster or cloud command, and
+    the direct delete it rules out must be one the policy refuses, or the
+    section would rest on a refusal that is not there. Its fences sit inside
+    a numbered list, so they are indented.
+    """
+
+    SKILL = Path(__file__).resolve().parents[1] / "skills" / "submit-suggestion" / "SKILL.md"
+    INDENTED_FENCE = re.compile(r"^( *)```(?:bash|sh|shell)\n(.*?)^\1```", re.MULTILINE | re.DOTALL)
+
+    def _section(self):
+        text = self.SKILL.read_text(encoding="utf-8")
+        start = text.index("### Deleting a resource")
+        return text[start:text.index("\n### ", start + 1)]
+
+    def test_the_section_runs_no_cluster_or_cloud_command(self):
+        # Every case in the section ends in a stated stop: its fences are the
+        # preflight and a search of the working copy, and none runs kubectl
+        # or gcloud, so nothing in it can coach a write the policy refuses.
+        lines = []
+        for _, block in self.INDENTED_FENCE.findall(self._section()):
+            lines += [line.strip() for line in block.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(lines), 3, "the section's fences moved or the parser is stale")
+        for line in lines:
+            with self.subTest(command=line):
+                argv = shlex.split(line)
+                self.assertNotIn(argv[0], GOVERNED_TOOLS)
+
+    def test_the_direct_delete_is_refused(self):
+        for argv in (
+            ["kubectl", "delete", "namespace", "scratch-ns"],
+            ["kubectl", "delete", "ns", "scratch-ns", "--wait=false"],
+            ["kubectl", "annotate", "namespace", "scratch-ns", "kube-agents.x-k8s.io/state=deleted"],
+        ):
+            with self.subTest(command=" ".join(argv)):
+                self.assertFalse(evaluate(argv).allowed)
+
+    def test_the_section_writes_no_marker_manifest(self):
+        # The #3077 failure was a manifest carrying an invented annotation.
+        # The section names no annotation or label of its own to write.
+        self.assertNotRegex(self._section(), r"kube-agents\.x-k8s\.io/|state: deleted")
+
+
 if __name__ == "__main__":
     unittest.main()
