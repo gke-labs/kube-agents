@@ -698,6 +698,12 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 					msg.Answer = s.answersOpenQuestion(msg)
 					handler(msg)
 				}
+			case *slackevents.AgentSessionStoppedEvent:
+				// Not notePending: a Stop is no message, so there is
+				// nothing to draw a mark or a refusal on.
+				if msg, ok := s.inboundStop(inner); ok {
+					handler(msg)
+				}
 			case *slackevents.AssistantThreadStartedEvent:
 				s.suggestPrompts(inner)
 			case *slackevents.AppHomeOpenedEvent:

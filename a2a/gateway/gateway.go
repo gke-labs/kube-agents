@@ -948,6 +948,13 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
+	case stopping && !msg.TopLevel && !mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
+		// On Slack only the people who asked for work in the thread may
+		// stop it (stopgate.go). Anyone else's stop cancels nothing and
+		// posts nothing, and never falls through to become a task that
+		// reads "stop".
+		g.log.Info("stop refused: not a requester in this conversation",
+			"backend", backend, "conversation", rec.Key, "intent", msg.Intent)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
