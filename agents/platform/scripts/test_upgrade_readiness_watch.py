@@ -134,8 +134,9 @@ class FakeSandbox:
             # On the id the report resolves, as `get_target_projects` checks it: a number
             # resolves through `projects describe` (the aliases) unless describe is down, when
             # the digits reach the rule, which refuses them.
-            resolved_id = asked[0] if asked[0] in self.describe_down else self.aliases.get(asked[0], asked[0])
-            reason = scope.override_error(resolved_id)
+            # Over every --project, as `get_target_projects` decides: one refusal refuses the run.
+            resolved_ids = sorted({a if a in self.describe_down else self.aliases.get(a, a) for a in asked})
+            reason = next((r for r in (scope.override_error(p) for p in resolved_ids) if r is not None), None)
             if reason is not None:
                 # The script's usage exit, no report, the reason on stderr.
                 body = {"exit": 2, "tables": "", "report": None}
@@ -1701,6 +1702,19 @@ class DeclaredScope(Base):
         self.assertEqual(second, "", "the same refusal under the same cause posts nothing")
         self.assertIn(["--project", "legacy-proj", "--scope-projects", "mgmt"], [argv for kind, argv, _ in sandbox.calls if kind == "versions"])
         self.assertIn("legacy-proj", self.ledger()["standing_outside"])
+
+    def test_both_spellings_of_a_refused_project_run_once_on_the_tick_its_id_is_learned(self) -> None:
+        """Roster 123456 and legacy-proj, one project outside the scope: the number runs first,
+        its refusal teaches the id, and the id spelling is the same project, already run."""
+        self.declare_scope(["mgmt"])
+        versions = envelope([member("a", "current", project="mgmt")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "mgmt,123456,legacy-proj"}):
+            sandbox = FakeSandbox(versions, aliases={"123456": "legacy-proj"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        asked = [argv[1] for kind, argv, _ in sandbox.calls if kind == "versions"]
+        self.assertEqual(sorted(asked), ["123456", "mgmt"], "legacy-proj is the number's project, run once")
+        self.assertEqual(out.count("does not list legacy-proj"), 1)
 
     def test_an_all_refused_ticks_failure_line_is_keyed_on_the_refusal_not_its_text(self) -> None:
         """The failure line names the resolved set, which moves with the scope's

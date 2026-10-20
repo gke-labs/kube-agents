@@ -28,7 +28,7 @@ server's `fleet_scope` tool (platform_mcp_server.py), which hands the agent
 the resolved set and the arguments to pass the collectors, and by the
 `upgrade-readiness-watch` job (upgrade_readiness_watch.py), a `no_agent`
 script on the same pod that hands the readiness report script
-`collector_args` beside each project it reads. The collectors
+`collector_args`, less the cluster exclusion, beside each project it reads. The collectors
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool

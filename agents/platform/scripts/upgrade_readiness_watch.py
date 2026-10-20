@@ -51,7 +51,8 @@ scope on this pod, where the reconcile's snapshot is
 (``fleet_scope_targets.declared_scope_targets()``, which reads the operator's
 render until a reconcile tick writes a snapshot that answers), and hands the report the resolved
 scope beside each ``--project``, the ``collector_args`` the platform_control
-``fleet_scope`` tool hands the SOPs (``--scope-projects``, ``--scope-unread``):
+``fleet_scope`` tool hands the SOPs less ``--scope-exclude-clusters``, which the
+report does not take beside ``--project`` (``--scope-projects``, ``--scope-unread``):
 the report reads a project inside the scope and refuses one outside it with
 the reason, which the table carries as that project's failure; an install
 that declares none keeps the bare flag, and a render this pod cannot read
@@ -1582,6 +1583,9 @@ def versions_by_project(
             # and the two spellings of one project run once.
             if exc.project and not is_project_number(exc.project):
                 learn_project_id(ids, project, [exc.project])
+                # The id just learned is tabled too, as a read tables it, so the other
+                # spelling of the same project is not run again this tick.
+                tabled.add(keyed(project))
             file_refusal(standing, keyed(project), exc.cause, scope)
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
                 {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_REFUSED.format(cause=exc.cause), MESSAGE_KEY: TABLE_REFUSED_DETAIL.format(project=project, error=str(exc))}

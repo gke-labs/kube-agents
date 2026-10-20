@@ -187,8 +187,8 @@ Cluster Agent from is still read here. On an install that declares a scope (a
 `--project` in the sandbox, so the job reads the declared scope on the agent
 pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
 resolved scope beside each `--project`, the `collector_args` the
-platform_control `fleet_scope` tool hands the SOPs (`--scope-projects`,
-`--scope-unread`): the script reads a project inside the scope and refuses one
+platform_control `fleet_scope` tool hands the SOPs less the cluster exclusion
+(`--scope-projects`, `--scope-unread`): the script reads a project inside the scope and refuses one
 outside it with the reason, which the table carries as that project's failure;
 an install that declares none keeps the bare flag, and a scope render the pod
 cannot read fails the tick with the reason. That read is `gcloud` cluster metadata
