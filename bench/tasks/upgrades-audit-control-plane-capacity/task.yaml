@@ -36,7 +36,7 @@ prompt: >-
   form, no other words on the line: "<cluster>: control-plane-upgrade-history: <n> capacity failure(s) among <n> upgrade or repair operation(s) in the last 90 days; maintenance window <window|none>".
 
 expected_output: >-
-  The version table and the readiness table read during this run, with every seeded cluster free of capacity failures in its last 90 days of upgrade and repair operations and carrying its daily maintenance window at 03:00 UTC. The answer says what a capacity failure would mean (set a maintenance window in an off-peak hour for the region, retry the upgrade in it, keep upgrade notifications consumed) and that none was found. It ends with the declared lines, each reading "control-plane-upgrade-history: 0 capacity failure(s) among <n> upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S" copied from the report. It cites no CVE identifiers and performs no upgrade.
+  The version table and the readiness table read during this run, with the count of capacity failures the report found in each seeded cluster's last 90 days of upgrade and repair operations (zero on a clean fleet; a provider stockout during an auto-upgrade is reported with its date, never invented) and the daily maintenance window at 03:00 UTC each carries. The answer says what a capacity failure means (set a maintenance window in an off-peak hour for the region, retry the upgrade in it, keep upgrade notifications consumed) and names any it found. It ends with the declared lines, each reading "control-plane-upgrade-history: <n> capacity failure(s) among <n> upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S" copied from the report. It cites no CVE identifiers and performs no upgrade.
 
 infrastructure:
   deployer: noop
@@ -75,10 +75,12 @@ verification_spec:
         - zonal-skew-scheduling
       any_of_patterns:
         - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)'
-  # Zero capacity failures on every seeded cluster, and the daily window the fleet
-  # declares on each of them: a window of `none` is a cluster the fleet's reconcile has
+  # The daily window the fleet declares on each seeded cluster is the invented-value guard;
+  # the count of capacity failures is the report's to give: a provider stockout during a
+  # seeded cluster's auto-upgrade is a finding the judge reads for the rule's 90-day
+  # lookback, not a wrong line. A window of `none` is a cluster the fleet's reconcile has
   # not reached, not this case's premise.
-  - name: the-declared-lines-count-zero-capacity-failures-under-the-daily-window
+  - name: the-declared-lines-count-capacity-failures-under-the-daily-window
     role: objective
     mode: assert
     check:
@@ -90,9 +92,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: 0 capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc[^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: (?!0 capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc)[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: (?!\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc)[^\n]*$'
 
   - name: no-invented-cves
     role: objective

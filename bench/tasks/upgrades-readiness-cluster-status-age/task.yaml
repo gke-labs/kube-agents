@@ -32,11 +32,13 @@ name: Upgrade readiness names the operation that holds a cluster, and its age, o
 prompt: >-
   For every cluster in this project, run the upgrade readiness check against each cluster's release channel default and include, per cluster, its status, the newest GKE operation the report found on it (its id, type and start time) and how long ago that operation started, as the cluster-status-age rule's note in the report's note column or its JSON states them; a cluster not RUNNING for more than four hours is that rule's blocker, with the operation that holds it. Read only; change and upgrade nothing. A member may be blocked or carry
   risks from other rules on the same report; the slots are about this rule
-  only. End your answer with one line per seeded cluster in exactly this
+  only. A cluster RECONCILING on an operation younger than four hours (a
+  patch rolling in its maintenance window) reports that status and the
+  operation's age as the rule notes them. End your answer with one line per seeded cluster in exactly this
   form, no other words on the line: "<cluster>: cluster-status-age: status <STATUS>; newest operation <operation id|none>; type <operation type|none>; started <RFC 3339 time|none>; age <age|none>".
 
 expected_output: >-
-  The version table and the readiness table read during this run, with every seeded cluster RUNNING and its newest operation named from the report: the operation id, its type (an UPGRADE_MASTER, UPDATE_CLUSTER or similar), its start time and its age. The answer says what a status other than RUNNING for hours would mean (no change can be applied; freeze changes and, past a few hours, open a support case quoting the operation id) and that no cluster is in that state. It ends with the declared lines, each reading "cluster-status-age: status RUNNING; newest operation <id>; type <type>; started <time>; age <age>" copied from the report. It cites no CVE identifiers and performs no upgrade.
+  The version table and the readiness table read during this run, with every seeded cluster RUNNING, or RECONCILING on an operation younger than four hours during the fleet's 03:00 UTC maintenance window, and its newest operation named from the report: the operation id, its type (an UPGRADE_MASTER, UPGRADE_NODES, UPDATE_CLUSTER or similar), its start time and its age. The answer says what a status other than RUNNING for hours would mean (no change can be applied; freeze changes and, past a few hours, open a support case quoting the operation id) and that no cluster is in that state. It ends with the declared lines, each reading "cluster-status-age: status <RUNNING|RECONCILING>; newest operation <id>; type <type>; started <time>; age <age>" copied from the report. It cites no CVE identifiers and performs no upgrade.
 
 infrastructure:
   deployer: noop
@@ -75,9 +77,12 @@ verification_spec:
         - zonal-skew-scheduling
       any_of_patterns:
         - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)'
-  # RUNNING on every seeded cluster: the fleet's reconcile keeps them so, and a status
-  # other than RUNNING is a finding the judge reads, not this case's premise.
-  - name: the-declared-lines-say-every-cluster-is-running
+  # RUNNING on every seeded cluster outside its maintenance window; inside it (03:00 UTC,
+  # four hours) a cluster under a patch roll is RECONCILING on an operation younger than
+  # the threshold, which the rule notes and the line reports with an age under four hours.
+  # What no line may say is the blocker form: a cluster held past the threshold, or not
+  # RUNNING with nothing running on it. Any other status is a wrong read.
+  - name: the-declared-lines-say-every-cluster-is-running-or-reconciling-under-the-threshold
     role: objective
     mode: assert
     check:
@@ -90,8 +95,12 @@ verification_spec:
         - zonal-skew-scheduling
       any_of_patterns:
         - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status running; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status reconciling; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age (?:under a minute|\d{1,2}m|[1-3]h(?: \d{1,2}m)?)$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status (?!running;)[^;\n]+; newest operation [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status (?!running;|reconciling;)[^;\n]+; newest operation [^\n]+$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status reconciling; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age (?:\d+d|[4-9]h|\d{2,}h)[^\n]*$'
+        - 'has been (?:reconciling|degraded|error|provisioning|stopping) for [^\n]*past the \d+h threshold'
+        - "is (?:reconciling|degraded|error|provisioning|stopping) with no operation running on it or its node pools"
   # The operation slot is an operation id as GKE spells one, or `none` for a cluster whose
   # operations the list no longer reaches; an invented value fails here.
   - name: the-declared-lines-name-an-operation-the-report-listed
