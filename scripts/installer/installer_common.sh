@@ -2266,7 +2266,12 @@ live_github_app_id() {
 # GitOps came from install.sh's flags, which earlier releases did not record
 # in install.env, so the next upgrade.sh rendered from the file alone. Run
 # after the generator (TFVARS_ENABLE_GITHUB_MINTER). Prints the exact lines to
-# append, with the live values filled in, so the fix needs no docs.
+# set, with the live values filled in, so the fix needs no docs. A minter
+# that this install did not make (see below) is not removed by the apply, so
+# it asks for no GITHUB_APP_ID; there it refuses a run that would drop or
+# change the PlatformAgent's GitOps repository (its owner, name or host), a
+# PlatformAgent or repository it cannot read, and a run that would render the
+# chart's own minter over the other one.
 # $1 namespace, $2 the install.env path, $3 SCOPE_CHECK_MODE_WARN for a run
 # that applies nothing (it warns and returns 0).
 refuse_apply_dropping_live_gitops() {
@@ -2316,10 +2321,14 @@ refuse_apply_dropping_live_gitops() {
     return 1
   fi
   [ -z "$minter_out" ] || minter="present"
+  local cr_read="true"
   cr_json="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) || true)"
-  # "<org> <owner/repo or repo>" of the GitOps repository, from either spelling.
-  IFS=$'\t' read -r live_org live_repo <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) )" || cr_read="false"
+  # "<org> <owner/repo or repo> <declared> <host>" of the GitOps repository,
+  # from either spelling; declared is 1 when the CR names one, readable or not,
+  # and host is its forge's host, "" for github.com in any spelling.
+  local live_declared="" live_host=""
+  IFS=$'\t' read -r live_org live_repo live_declared live_host <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
 import json, sys
 try:
     items = (json.load(sys.stdin) or {}).get("items") or []
@@ -2327,6 +2336,7 @@ except ValueError:
     items = []
 integ = ((items[0].get("spec") or {}).get("integration") or {}) if items else {}
 gh = integ.get("github") or {}
+host = ""
 repo, org = gh.get("gitRepo") or "", gh.get("org") or ""
 ns = ""
 if repo.strip() in ("None", "none"):
@@ -2341,6 +2351,9 @@ if not repo:
             # The namespace qualifies a bare name only; a path with an owner
             # names its own (as the operator resolves it).
             ns = r.get("namespace") or forge.get("namespace") or ""
+            host = (forge.get("host") or "").strip().lower()
+            if host in ("github.com", "www.github.com", "ssh.github.com"):
+                host = ""
             break
 def path_of(ref):
     # As the operator reads a reference (ParseRepoRef): a clone URL or an scp
@@ -2366,16 +2379,108 @@ elif not org:
 # operator would refuse (anything but A-Za-z0-9_.-) is printed as unknown.
 import re
 ok = re.compile(r"^[A-Za-z0-9_.-]+$")
-print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-"))
-' 2>/dev/null) || printf '%s\t%s' - -)"
+print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-") + "\t" + ("1" if repo else "0")
+      + "\t" + (host if re.match(r"^[a-z0-9.-]*$", host) else "-"))
+' 2>/dev/null) || printf '%s\t%s\t%s\t%s' - - 1 -)"
   [ "$live_org" = "-" ] && live_org=""
   [ "$live_repo" = "-" ] && live_repo=""
-  # Only a running minter is something the apply destroys. A GitOps repository
-  # with no minter (the App ID left blank, or the minter deferred) renders the
-  # same either way, so there is nothing here to protect.
+  # Only an install where a minter runs is guarded here. A GitOps repository
+  # with no minter (the App ID left blank, or the minter deferred) is out of
+  # this check's scope.
   [ -n "$minter" ] || return 0
   repo_name="$live_repo"
   [ -z "$live_org" ] || [ -z "$live_repo" ] || live_repo="${live_org}/${live_repo}"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    say=print_warning
+    lead="An applying run would be refused: "
+  fi
+  # A minter that this install did not make. Three signals, and all must say
+  # so: the release record (helm get values) has githubMinter.enabled false,
+  # which the chart's minter and the composition's minter module (its service
+  # account and Cloud KMS key) both follow, and the Deployment carries no
+  # meta.helm.sh annotations that name this release, so Helm does not delete
+  # it. That is a minter made by hand, by the kustomize dev path (make
+  # deploy-github) or by another Helm release. The apply removes nothing of
+  # it, so the run needs no GITHUB_APP_ID. A read that fails keeps the
+  # refusals further down.
+  local record_minter="" owner=""
+  record_minter="$( (trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$ctx" -o json 2>/dev/null) |
+    (trap - ERR; python3 -c '
+import json, sys
+try:
+    values = json.load(sys.stdin) or {}
+except ValueError:
+    sys.exit(0)
+print("true" if ((values.get("githubMinter") or {}).get("enabled") is True) else "false")
+' 2>/dev/null) || true)"
+  # A third signal for the composition's half: the minter module (its service
+  # account, Cloud KMS key and their bindings) must not be in this install's
+  # Terraform state. An apply that turned the minter off and stopped after
+  # the Helm release, before the module's destroy, leaves the record false and
+  # the module in state, and the next apply would destroy it under a minter
+  # made by hand on the same names. A state that cannot be read keeps the
+  # refusals further down.
+  local state_rc=0
+  if [ "$record_minter" = "false" ]; then
+    tf_state_manages_module "module.github_minter" >/dev/null 2>&1 || state_rc=$?
+  fi
+  if [ "$record_minter" = "false" ] && [ "$state_rc" -eq 1 ] &&
+    owner="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+      get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" \
+      -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}/{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null) )" &&
+    [ "$owner" != "${KUBE_AGENTS_HELM_RELEASE}/${namespace}" ]; then
+    if [ "$minter_stays_on" = "true" ]; then
+      # The chart renders its own minter under the same names, and Helm does
+      # not take over objects that another owner made: the apply would fail
+      # on them, after the cluster work.
+      "$say" "${lead}a GitHub token minter that this install did not make runs in namespace '${namespace}', and this run renders the chart's own minter under the same names. Helm does not take over objects it does not own, so the apply would fail on them."
+      print_info "Remove the other minter first, all of its objects: make -C k8s-operator undeploy-github with the same GITHUB_MINTER_KSA_NAME exported if it came from the kustomize path, or turn it off in the Helm release that made it; and delete the github-app-credentials Secret if you made it by hand. Or keep the other minter: set GITHUB_APP_ID empty in ${file} (and, with install.sh, give no --github-app-id). Then re-run the same command."
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    # The apply removes no minter, but it renders the PlatformAgent's GitOps
+    # repository from GITOPS_ORG and GITOPS_REPO, so a run that does not name
+    # the live repository would take it out of the CR, or point the CR at
+    # another one. A CR that cannot be read, or a repository that cannot be
+    # named, is refused, as it cannot be compared.
+    if [ "$cr_read" != "true" ]; then
+      "$say" "${lead}the PlatformAgent in namespace '${namespace}' could not be read, so this run cannot tell whether the apply keeps its GitOps repository."
+      print_info "Fix the read (kubectl get platformagents -n ${namespace} --context ${ctx}) and re-run the same command."
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    local remove_hint="KUBE_AGENTS_REMOVE_GITOPS=true in the environment skips this check: the apply then renders the repository that GITOPS_ORG and GITOPS_REPO name, or none when GITOPS_ORG is empty."
+    if [ "$live_declared" = "1" ] && { [ -z "$live_org" ] || [ -z "$repo_name" ] || [ "$live_host" = "-" ]; }; then
+      # A repository the CR names in a form this check cannot read: no keys
+      # can be compared with it, so none are offered.
+      "$say" "${lead}the PlatformAgent names a GitOps repository that this check cannot read, so this run cannot tell whether the apply keeps it. The ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' is not this install's, and the apply leaves it as it is."
+      print_info "See what it names: kubectl get platformagents -n ${namespace} --context ${ctx} -o jsonpath='{.items[0].spec.integration}'. To go on, remove the other minter (this check then does not run), or: ${remove_hint}"
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    local run_host=""
+    [ "${GITOPS_FORGE:-github}" = "github" ] && run_host="${GITOPS_HOST:-}"
+    if [ "$live_declared" = "1" ] &&
+      { [ "${GITOPS_ORG:-}" != "$live_org" ] || [ "${GITOPS_REPO:-}" != "$repo_name" ] || [ "$run_host" != "$live_host" ]; }; then
+      "$say" "${lead}the PlatformAgent opens pull requests on ${live_repo}${live_host:+ at ${live_host}}, but this run's GITOPS_ORG, GITOPS_REPO and GITOPS_HOST (from ${file}, or the installer's defaults where it sets none) do not name that repository, so the apply would take it out of the PlatformAgent or point the PlatformAgent at another one. The ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' is not this install's, and the apply leaves it as it is."
+      print_info "Set these lines in ${file} (add them, or replace the ones it has), then re-run the same command:"
+      [ "${GITOPS_ORG:-}" = "$live_org" ] || print_info "  GITOPS_ORG=${live_org}"
+      [ "${GITOPS_REPO:-}" = "$repo_name" ] || print_info "  GITOPS_REPO=${repo_name}"
+      if [ "$run_host" != "$live_host" ]; then
+        if [ -n "$live_host" ]; then
+          print_info "  GITOPS_FORGE=github"
+          print_info "  GITOPS_HOST=${live_host}"
+        else
+          print_info "  GITOPS_HOST= (empty: the repository is on github.com)"
+        fi
+      fi
+      print_info "$remove_hint"
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    print_info "A ${GITHUB_MINTER_DEPLOYMENT} Deployment runs in namespace '${namespace}', but this install did not make it (the ${KUBE_AGENTS_HELM_RELEASE} release renders no minter, and does not own the Deployment), so the apply leaves it as it is${live_repo:+, and the PlatformAgent keeps its GitOps repository ${live_repo}}."
+    return 0
+  fi
   # The minter stays on, so nothing is destroyed; but a run that fell back to
   # an auto-selected organisation or the default repository name would point
   # the running minter at another repository, and record it. Said before the
@@ -2388,10 +2493,6 @@ print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "
     return 0
   fi
   app_id="$(live_github_app_id "$namespace")"
-  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
-    say=print_warning
-    lead="An applying run would be refused: "
-  fi
   # All three keys set and matching what runs: the keys are right, and the
   # generator left the minter off because its Cloud KMS key check found no
   # ENABLED key version (or could not list them). Say that, not "set these".
@@ -3459,6 +3560,34 @@ managed = any(
 )
 sys.exit(0 if managed else 1)
 ' "$1" "$2" "$TF_STATE_RC_UNREADABLE"
+}
+
+# Whether this install's Terraform state manages any resource in module $1
+# (for example module.github_minter, which the state records as
+# module.github_minter[0]): managed mode, with at least one instance. Returns
+# 1 when it does not or there is no state, and TF_STATE_RC_UNREADABLE when the
+# state could not be read or parsed, which a caller must not read as "no".
+tf_state_manages_module() {
+  local state
+  state=$(tf_state_read) || return $?
+  printf '%s' "$state" | python3 -c '
+import json, sys
+module, unreadable = sys.argv[1], int(sys.argv[2])
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(unreadable)
+def in_module(address):
+    address = address or ""
+    return address == module or address.startswith(module + "[") or address.startswith(module + ".")
+managed = any(
+    in_module(r.get("module"))
+    and r.get("mode") == "managed"
+    and len(r.get("instances", [])) > 0
+    for r in doc.get("resources", [])
+)
+sys.exit(0 if managed else 1)
+' "$1" "$TF_STATE_RC_UNREADABLE"
 }
 
 # The account ids of every google_service_account this install's state

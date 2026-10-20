@@ -59,8 +59,9 @@ domain: upgrades
 
 # report_contains: a chat prompt, so the sections are the reply. Three
 # objectives, one for each thing the report must do: name its source, give a
-# verdict, invent nothing; and two for the route it must take: delegate, and
-# run the scan. Split rather than one check so a red says which.
+# verdict, invent nothing; and three for the route it must take: delegate, run
+# the scan, and keep its files to this run. Split rather than one check so a
+# red says which.
 verification_spec:
   - name: the-section-names-its-source
     role: objective
@@ -99,6 +100,28 @@ verification_spec:
       required_runs:
         - script: api_deprecation_scan.py
           word_patterns: ["^--(versions|current-version)(=.*)?$"]
+  # The scratch-name check. /opt/data/scratch is shared by every card, so a
+  # fleet_versions*.json or api_deprecations*.json path without the run's
+  # mark names a file another card can write or has written. The mark is the
+  # pair the skill dictates, $(date +%s) then $$, or a run of 9+ digits (the
+  # expanded timestamp). Any other spelling is forbidden, a unique one such as
+  # $RANDOM included. Forbidden: a run of either script with such a path as a
+  # word. It reads names only: it does not see a read of another run's file
+  # (cat, search_files, read_file), whether --versions names a file this run
+  # wrote, or where the reply's section came from (#3404).
+  - name: the-scan-files-have-per-run-names
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: api_deprecation_scan.py
+          word_patterns:
+            &unsuffixed_scratch_name [
+              '^(?!.*(\$\(date \+%s\)\S*\$\$|\d{9,}))(?:--[a-z-]+=)?(?:\S*/)?(api_deprecations|fleet_versions)[^/]*\.json$',
+            ]
+        - script: fleet_upgrade_report.py
+          word_patterns: *unsuffixed_scratch_name
   - name: the-section-gives-a-verdict
     role: objective
     mode: assert

@@ -6,6 +6,9 @@ upgrade, and a GitHub App ID that is not the App's number is refused up front.
 - refuse_apply_dropping_live_gitops (installer_common.sh) refuses an apply
   that would render GitOps off over a live PlatformAgent that uses it -- the
   apply that destroyed the token minter -- and prints the exact lines to add.
+  Over a minter that this install did not make, it asks for no App ID and
+  refuses only a run that drops or changes the GitOps repository, or that
+  renders the chart's minter over the other one.
 - validate_github_app_id (installer_common.sh) refuses a name or slug.
 """
 
@@ -135,7 +138,9 @@ class RecordGithubGitopsKeysTest(unittest.TestCase):
 
 class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
     def _run(self, keys, git_repo="sackheads/ka-test-infra", org="sackheads", app_id_b64="NTMxOTE1NA==",
-             mode="", context_present=True, minter=True, integration=None, minter_read_fails=False):
+             mode="", context_present=True, minter=True, integration=None, minter_read_fails=False,
+             record_minter=True, minter_owner="kube-agents/kubeagents-system", cr_read_fails=False,
+             minter_module_in_state="absent"):
         if integration is None:
             integration = {"github": {"gitRepo": git_repo, "org": org}} if git_repo else {}
         cr = json.dumps({"items": [{"spec": {"integration": integration}}]})
@@ -154,12 +159,47 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
                 f'  *"config get-contexts"*) exit {0 if context_present else 1} ;;\n'
+                # The Helm ownership annotations of the running minter.
+                f'  *"get deployment github-token-minter"*"meta"*) printf %s {minter_owner!r} ;;\n'
                 f'  *"get deployment github-token-minter"*) {deploy_case} ;;\n'
-                f'  *"get platformagents"*) cat "{bin_dir}/cr.json" ;;\n'
-                f"  *\"github-app-credentials\"*) printf '%s' '{app_id_b64}' ;;\n"
+                + (f'  *"get platformagents"*) exit 1 ;;\n' if cr_read_fails
+                   else f'  *"get platformagents"*) cat "{bin_dir}/cr.json" ;;\n')
+                + f"  *\"github-app-credentials\"*) printf '%s' '{app_id_b64}' ;;\n"
                 "esac\nexit 0\n"
             )
             kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            # The release record's githubMinter.enabled (helm get values); None
+            # makes the read fail.
+            helm = bin_dir / "helm"
+            if record_minter is None:
+                helm.write_text("#!/usr/bin/env bash\nexit 1\n")
+            else:
+                record = json.dumps({"githubMinter": {"enabled": record_minter}})
+                # Only the read this install makes: its release, namespace
+                # and context. Anything else fails, which keeps the refusal.
+                helm.write_text("#!/usr/bin/env bash\n"
+                                'case "$*" in\n'
+                                '  "get values kube-agents -n kubeagents-system --kube-context gke_p_r_c -o json")'
+                                f" printf '%s' '{record}'; exit 0 ;;\n"
+                                "esac\nexit 1\n")
+            helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
+            # The Terraform state object (gcloud storage cat): "absent" (no
+            # state), "present" (the minter module is in it), "other" (state
+            # without the module), or "unreadable".
+            gcloud = bin_dir / "gcloud"
+            state = {"present": {"resources": [{"module": "module.github_minter[0]", "mode": "managed",
+                                                "type": "google_service_account", "name": "minter",
+                                                "instances": [{"attributes": {}}]}]},
+                     "other": {"resources": [{"mode": "managed", "type": "helm_release", "name": "kube_agents",
+                                              "instances": [{"attributes": {}}]}]}}
+            if minter_module_in_state in state:
+                (bin_dir / "state.json").write_text(json.dumps(state[minter_module_in_state]))
+                gcloud.write_text(f'#!/usr/bin/env bash\n[ "$1 $2" = "storage cat" ] && cat "{bin_dir}/state.json"\n')
+            elif minter_module_in_state == "absent":
+                gcloud.write_text("#!/usr/bin/env bash\necho 'ERROR: The following URLs matched no objects or files' >&2\nexit 1\n")
+            else:
+                gcloud.write_text("#!/usr/bin/env bash\necho 'ERROR: HTTPError 503' >&2\nexit 1\n")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "p", "CLUSTER_NAME": "c", "REGION": "r",
                    "GITOPS_ORG": "", "GITOPS_REPO": "", "GITHUB_APP_ID": "", "GITOPS_FORGE": "",
                    "TFVARS_ENABLE_GITHUB_MINTER": "false", "KUBE_AGENTS_REMOVE_GITOPS": ""}
@@ -315,6 +355,127 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
                 self.assertNotIn("ERROR", proc.stdout)
                 self.assertNotIn("WARN", proc.stdout)
 
+    _FOREIGN = {"record_minter": False, "minter_owner": "/"}
+
+    def test_a_minter_this_install_did_not_make_with_the_repository_kept_passes(self):
+        # F1: a minter made outside this install (the release record has
+        # githubMinter.enabled false, and the Deployment carries no Helm
+        # annotations for this release) and an install.env that names the live
+        # repository but no App ID. The apply removes nothing and keeps the
+        # repository, so the run goes on.
+        for owner in ("/", "other-release/kubeagents-system", "kube-agents/other-namespace"):
+            with self.subTest(owner=owner):
+                proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"},
+                                 record_minter=False, minter_owner=owner)
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("ERROR", proc.stdout)
+                self.assertIn("this install did not make it", proc.stdout)
+        # A CR that names no GitOps repository has nothing to drop.
+        proc = self._run({}, git_repo="", **self._FOREIGN)
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_a_minter_this_install_did_not_make_still_keeps_the_repository(self):
+        # The apply removes no minter there, but it renders the CR's GitOps
+        # repository from GITOPS_ORG and GITOPS_REPO: a run that drops or
+        # changes it is refused, naming the repository, not the minter.
+        for keys, lines in (
+            ({}, ("INFO:   GITOPS_ORG=sackheads", "INFO:   GITOPS_REPO=ka-test-infra")),
+            ({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "other"}, ("INFO:   GITOPS_REPO=ka-test-infra",)),
+        ):
+            with self.subTest(keys=keys):
+                proc = self._run(keys, **self._FOREIGN)
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("so the apply would take it out of the PlatformAgent or point the PlatformAgent at another one",
+                              proc.stdout)
+                self.assertNotIn("destroy the minter", proc.stdout)
+                for line in lines:
+                    self.assertIn(line + "\n", proc.stdout)
+                self.assertNotIn("GITHUB_APP_ID=", proc.stdout)
+        proc = self._run({}, mode="warn", **self._FOREIGN)
+        self.assertIn("rc=0", proc.stdout)
+        self.assertIn("WARN: An applying run would be refused", proc.stdout)
+
+    def test_a_repository_that_cannot_be_compared_is_refused(self):
+        # A CR that cannot be read, or a repository the run cannot name (a bare
+        # name with no organization), cannot be compared with the keys.
+        proc = self._run({}, cr_read_fails=True, **self._FOREIGN)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("could not be read, so this run cannot tell whether the apply keeps its GitOps repository",
+                      proc.stdout)
+        for label, kwargs in (
+            ("a bare name with no organization", {"git_repo": "ka-test-infra", "org": ""}),
+            # A shape the parser cannot read falls back to "declared, unknown".
+            ("an unparsable integration", {"integration": {"repositories": ["x"]}}),
+        ):
+            with self.subTest(label):
+                proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"}, **kwargs, **self._FOREIGN)
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("names a GitOps repository that this check cannot read", proc.stdout)
+                self.assertNotIn("GITOPS_ORG=<", proc.stdout)
+
+    def test_a_github_enterprise_server_repository_needs_its_host(self):
+        # Without GITOPS_HOST the run renders the github.com alias, which moves
+        # the CR off the instance, though owner and name match.
+        integration = {
+            "forges": [{"name": "github", "provider": "github", "host": "ghes.example.com", "namespace": "sackheads"}],
+            "repositories": [{"forge": "github", "repository": "ka-test-infra", "role": "gitops"}],
+        }
+        keys = {"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"}
+        proc = self._run(keys, integration=integration, **self._FOREIGN)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("at ghes.example.com", proc.stdout)
+        self.assertIn("INFO:   GITOPS_HOST=ghes.example.com\n", proc.stdout)
+        proc = self._run({**keys, "GITOPS_FORGE": "github", "GITOPS_HOST": "ghes.example.com"},
+                         integration=integration, **self._FOREIGN)
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+        # And a github.com repository with GITOPS_HOST set would move the CR
+        # onto the instance.
+        proc = self._run({**keys, "GITOPS_FORGE": "github", "GITOPS_HOST": "ghes.example.com"}, **self._FOREIGN)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("GITOPS_HOST= (empty", proc.stdout)
+
+    def test_a_chart_minter_over_one_this_install_did_not_make_is_refused_before_the_apply(self):
+        # Helm does not take over objects it does not own, so the apply would
+        # fail after the cluster work.
+        keys = {"TFVARS_ENABLE_GITHUB_MINTER": "true", "GITOPS_ORG": "sackheads",
+                "GITOPS_REPO": "ka-test-infra", "GITHUB_APP_ID": "5319154"}
+        proc = self._run(keys, **self._FOREIGN)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("Helm does not take over objects it does not own", proc.stdout)
+        self.assertIn("make -C k8s-operator undeploy-github", proc.stdout)
+        self.assertIn("github-app-credentials Secret", proc.stdout)
+        proc = self._run(keys, mode="warn", **self._FOREIGN)
+        self.assertIn("rc=0", proc.stdout)
+        self.assertIn("WARN: An applying run would be refused", proc.stdout)
+
+    def test_a_minter_module_left_in_the_terraform_state_keeps_the_refusal(self):
+        # An apply that turned the minter off and stopped after the Helm
+        # release leaves the record false and the module (service account,
+        # Cloud KMS key) in state: the next apply would destroy it under a
+        # minter made by hand on the same names. A state that cannot be read
+        # cannot rule that out.
+        for in_state in ("present", "unreadable"):
+            with self.subTest(in_state=in_state):
+                proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"},
+                                 minter_module_in_state=in_state, **self._FOREIGN)
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("destroy the minter", proc.stdout)
+        proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"},
+                         minter_module_in_state="other", **self._FOREIGN)
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_any_sign_that_the_minter_is_this_installs_keeps_the_refusal(self):
+        # The record says this install renders the minter, or it cannot be
+        # read; or the Deployment still carries this release's annotations
+        # (an upgrade that failed before Helm removed it). The apply would
+        # then remove the minter, so the earlier refusal stands.
+        for record, owner in ((True, "/"), (None, "/"), (False, "kube-agents/kubeagents-system")):
+            with self.subTest(record=record, owner=owner):
+                proc = self._run({"GITOPS_ORG": "sackheads", "GITOPS_REPO": "ka-test-infra"},
+                                 record_minter=record, minter_owner=owner)
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("destroy the minter", proc.stdout)
+
     def test_every_applying_front_door_calls_it(self):
         install = _INSTALL_SH.read_text()
         # main() refuses on an applying run and warns otherwise, and the menu refuses.
@@ -322,8 +483,8 @@ class RefuseApplyDroppingLiveGitopsTest(unittest.TestCase):
         # for an applying run and for --generate-only, and warns on --dry-run.
         self.assertEqual(install.count('refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1'), 1)
         self.assertIn('if ! refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE"; then\n'
-                      '        # The tfvars just written render GitOps off; --generate-only would\n'
-                      '        # hand them to lifecycle.sh apply, so they go.\n'
+                      '        # The tfvars just written are the ones the check refused;\n'
+                      '        # --generate-only would hand them to lifecycle.sh apply, so they go.\n'
                       '        rm -f "$tfvars_file"', install)
         self.assertEqual(install.count('"$INSTALL_ENV_FILE" "$SCOPE_CHECK_MODE_WARN"'), 1)
         upgrade = _UPGRADE_SH.read_text()
