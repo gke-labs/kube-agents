@@ -13,8 +13,11 @@ Container-Optimized OS with the driver the template's `gke-gpu-driver-version` s
 major's floor is `blocking`; one below the toolkit's own minimum is a `risk` (the build runs
 under minor version compatibility and loses the features newer than the driver); an image
 naming no CUDA version is a `risk`, as is a Standard template whose accelerator no pool
-carries; a target outside the driver table, an operator-installed driver, or a record with no
-install mode is `unknown`. A pin the driver serves is a note, with the reminder that
+carries, and so is a target past the driver table's last row (GKE's page has no row for it
+yet, so the finding names the page to verify the floor against, rather than turning every
+GPU member unknown on every run); a target below the table's first row, an
+operator-installed driver, or a record with no install mode is `unknown`. A pin the driver
+serves is a note, with the reminder that
 forward-compatibility packages inside the image are not readable from the tag. The rule can
 block, so `CAN_BLOCK` is True and its unknowns move the member's verdict. The rule needs the
 CronJobs of the workload read; when that read failed it grades what it has and says so.
@@ -47,6 +50,7 @@ REASON_DISABLED = "the pool installs no driver (INSTALLATION_DISABLED); the oper
 REASON_NO_MODE = "the pool record carries no gpuDriverVersion"
 REASON_NO_IMAGE_TABLE = "no driver table for node image type {image_type}"
 REASON_NO_TARGET_ROW = "the {image_type} driver table covers {first} to {last}, not the target {target}"
+PAST_TABLE_DETAIL = "requests {resource} with {pins} on {pool}; the {image_type} driver table has no row for {target} (its rows end at {last}); verify the driver floor the pin needs against GKE's GPU page ({source})"
 REASON_UNKNOWN_CUDA = "CUDA {cuda} is outside the table (majors {majors})"
 BLOCKING_DETAIL = "requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), below the {floor} floor for CUDA {major}.x; the device does not open"
 RISK_DETAIL = "requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), below the {minimum} CUDA {cuda} names; the build runs under minor version compatibility and features newer than the driver fail"
@@ -107,43 +111,57 @@ def accelerator_pools(spec: dict, pools: list[dict]) -> tuple[list[dict], list[s
     return out, wanted
 
 
-def _table_driver(image_type: str, mode: str, target) -> tuple[int | None, str]:
-    """(driver branch, reason when None) from the per-image-type table at the target's minor."""
+def _table_driver(image_type: str, mode: str, target) -> tuple[int | None, str, str | None]:
+    """(driver branch, reason when None, the table's last minor when the target is past it) from
+    the per-image-type table at the target's minor. A target past the last row is the third value,
+    which the caller files as a risk naming the page; every other miss is a reason, an unknown."""
     if target is None:
-        return None, REASON_NO_TARGET
+        return None, REASON_NO_TARGET, None
     table = tables.GKE_GPU_DRIVERS_BY_IMAGE_TYPE.get(image_type)
     if table is None:
-        return None, REASON_NO_IMAGE_TABLE.format(image_type=image_type or "?")
+        return None, REASON_NO_IMAGE_TABLE.format(image_type=image_type or "?"), None
     row = table.get(tuple(target[:2]))
     if row is None:
         minors = sorted(table)
-        return None, REASON_NO_TARGET_ROW.format(image_type=image_type, first=rules.minor_text(minors[0]), last=rules.minor_text(minors[-1]), target=rules.minor_text(target))
-    return row[0] if mode == tables.GPU_DRIVER_DEFAULT else row[1], ""
+        if tuple(target[:2]) > minors[-1]:
+            return None, "", rules.minor_text(minors[-1])
+        return None, REASON_NO_TARGET_ROW.format(image_type=image_type, first=rules.minor_text(minors[0]), last=rules.minor_text(minors[-1]), target=rules.minor_text(target)), None
+    return row[0] if mode == tables.GPU_DRIVER_DEFAULT else row[1], "", None
 
 
-def driver_at_target(pool: dict, target) -> tuple[int | None, str, str]:
-    """(driver branch, install mode text, reason when None) for `pool` at the target's minor."""
+def driver_at_target(pool: dict, target) -> tuple[int | None, str, str, tuple | None]:
+    """(driver branch, install mode text, reason when None, (image type, the table's last minor)
+    when the target is past the table) for `pool` at the target's minor."""
     config = rules.pool_config(pool)
     modes = {(a.get("gpuDriverInstallationConfig") or {}).get("gpuDriverVersion") for a in config.get("accelerators") or [] if isinstance(a, dict)}
     mode = next((m for m in modes if m), None)
     mode_text = MODE_TEXT.format(mode=mode)
     if mode == tables.GPU_DRIVER_INSTALLATION_DISABLED:
-        return None, mode_text, REASON_DISABLED
+        return None, mode_text, REASON_DISABLED, None
     if mode not in (tables.GPU_DRIVER_DEFAULT, tables.GPU_DRIVER_LATEST):
-        return None, mode_text, REASON_NO_MODE
-    driver, reason = _table_driver(config.get("imageType") or "", mode, target)
-    return driver, mode_text, reason
+        return None, mode_text, REASON_NO_MODE, None
+    image_type = config.get("imageType") or ""
+    driver, reason, last = _table_driver(image_type, mode, target)
+    return driver, mode_text, reason, (image_type, last) if last else None
 
 
-def autopilot_driver(spec: dict, target) -> tuple[int | None, str, str]:
+def autopilot_driver(spec: dict, target) -> tuple[int | None, str, str, tuple | None]:
     """The driver Autopilot installs on the node it provisions: the COS table at the target,
-    in the mode the template's gke-gpu-driver-version selector names (`default` when absent)."""
+    in the mode the template's gke-gpu-driver-version selector names (`default` when absent);
+    the fourth value is as `driver_at_target` gives it."""
     selected = rules.selected_values(spec, tables.AUTOPILOT_GPU_DRIVER_LABEL)
     latest = tables.AUTOPILOT_GPU_DRIVER_LATEST in selected
     mode = tables.GPU_DRIVER_LATEST if latest else tables.GPU_DRIVER_DEFAULT
     mode_text = AUTOPILOT_MODE_TEXT.format(label=tables.AUTOPILOT_GPU_DRIVER_LABEL, value=tables.AUTOPILOT_GPU_DRIVER_LATEST if latest else AUTOPILOT_MODE_DEFAULT)
-    driver, reason = _table_driver(tables.IMAGE_TYPE_COS_CONTAINERD, mode, target)
-    return driver, mode_text, reason
+    driver, reason, last = _table_driver(tables.IMAGE_TYPE_COS_CONTAINERD, mode, target)
+    return driver, mode_text, reason, (tables.IMAGE_TYPE_COS_CONTAINERD, last) if last else None
+
+
+def _past_table(result: dict, obj: dict, pins_text: str, pool_text: str, past: tuple, target, pool_name) -> None:
+    """The risk for a target past the driver table's last row: the page has no row for it yet."""
+    image_type, last = past
+    detail = PAST_TABLE_DETAIL.format(resource=tables.GPU_RESOURCE, pins=pins_text, pool=pool_text, image_type=image_type, target=rules.minor_text(target), last=last, source=tables.GKE_GPU_DRIVER_SOURCE)
+    result["risks"].append(rules.new_finding(RULE_ID, ENTRY, rules.GRADE_RISK, obj, detail, pool=pool_name, table_ends_at=last))
 
 
 def _unknown(obj: dict, detail: str, **extra) -> dict:
@@ -190,8 +208,10 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
             continue
         pins_text = rules.LIST_SEPARATOR.join(where for _, where in pins)
         if autopilot:
-            driver, mode_text, reason = autopilot_driver(spec, target)
-            if driver is None:
+            driver, mode_text, reason, past = autopilot_driver(spec, target)
+            if past is not None:
+                _past_table(result, obj, pins_text, AUTOPILOT_POOL_TEXT, past, target, None)
+            elif driver is None:
                 detail = UNKNOWN_DRIVER_DETAIL.format(resource=tables.GPU_RESOURCE, pins=pins_text, pool=AUTOPILOT_POOL_TEXT, reason=reason)
                 result["unknown"].append(_unknown(obj, detail, pool=None))
             else:
@@ -206,7 +226,10 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
             continue
         for pool in pools:
             pool_text = POOL_TEXT.format(pool=pool.get("name", ""))
-            driver, mode_text, reason = driver_at_target(pool, target)
+            driver, mode_text, reason, past = driver_at_target(pool, target)
+            if past is not None:
+                _past_table(result, obj, pins_text, pool_text, past, target, pool.get("name", ""))
+                continue
             if driver is None:
                 detail = UNKNOWN_DRIVER_DETAIL.format(resource=tables.GPU_RESOURCE, pins=pins_text, pool=pool_text, reason=reason)
                 result["unknown"].append(_unknown(obj, detail, pool=pool.get("name", "")))

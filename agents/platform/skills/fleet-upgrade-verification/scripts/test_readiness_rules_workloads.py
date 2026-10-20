@@ -513,12 +513,30 @@ class GpuDriverMismatchTest(unittest.TestCase):
         out = run(gpu_driver_mismatch, [latest], pools=[], target=target, autopilot=True)
         self.assertEqual(out["blocking"], [])
         self.assertIn("driver R580 (cloud.google.com/gke-gpu-driver-version latest), which serves CUDA 13.0", out["notes"][0])
+        # Past the table on Autopilot: the same risk as on a Standard pool, naming the page.
         out = run(gpu_driver_mismatch, [self.trainer()], pools=[], autopilot=True)
-        self.assertIn("the COS_CONTAINERD driver table covers 1.26 to 1.33, not the target 1.34", out["unknown"][0]["detail"])
+        self.assertEqual((out["blocking"], out["unknown"]), ([], []))
+        self.assertIn("on the node Autopilot provisions; the COS_CONTAINERD driver table has no row for 1.34 (its rows end at 1.33); verify the driver floor the pin needs against GKE's GPU page (https://docs.cloud.google.com/kubernetes-engine/docs/how-to/gpus)", out["risks"][0]["detail"])
 
-    def test_unknown_when_the_table_does_not_cover_the_target_or_the_driver_is_not_in_the_record(self):
+    def test_a_target_past_the_driver_table_is_a_risk_naming_the_page_not_an_unknown(self):
+        # The page has no row for 1.34 or later (read 2026-10-20), so every GPU member graded
+        # against a current channel default would otherwise be unknown on every run.
         out = run(gpu_driver_mismatch, [self.trainer()], pools=[self.gpu_pool()])
-        self.assertIn("the COS_CONTAINERD driver table covers 1.26 to 1.33, not the target 1.34", out["unknown"][0]["detail"])
+        self.assertEqual((out["blocking"], out["unknown"], out["notes"]), ([], [], []))
+        finding = out["risks"][0]
+        self.assertEqual((finding["object"], finding["pool"], finding["table_ends_at"]), ("seeded-shapes/cuda-pinned-trainer", "gpu-pool", "1.33"))
+        self.assertEqual(gpu_driver_mismatch.describe(finding), "CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu with image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 on pool gpu-pool; the COS_CONTAINERD driver table has no row for 1.34 (its rows end at 1.33); verify the driver floor the pin needs against GKE's GPU page (https://docs.cloud.google.com/kubernetes-engine/docs/how-to/gpus)")
+        out = run(gpu_driver_mismatch, [self.trainer()], pools=[self.gpu_pool(image_type="UBUNTU_CONTAINERD")], target=parse_version("1.36.4-gke.1"))
+        self.assertIn("the UBUNTU_CONTAINERD driver table has no row for 1.36 (its rows end at 1.33)", out["risks"][0]["detail"])
+        # The last row itself is graded from the table, and a target below the first row stays unknown.
+        out = run(gpu_driver_mismatch, [self.trainer()], pools=[self.gpu_pool()], target=parse_version("1.33.9-gke.1"))
+        self.assertEqual((out["risks"], out["unknown"], len(out["notes"])), ([], [], 1))
+        out = run(gpu_driver_mismatch, [self.trainer()], pools=[self.gpu_pool()], target=parse_version("1.25.0-gke.1"))
+        self.assertIn("the COS_CONTAINERD driver table covers 1.26 to 1.33, not the target 1.25", out["unknown"][0]["detail"])
+
+    def test_unknown_when_the_driver_is_not_in_the_record_or_the_table(self):
+        out = run(gpu_driver_mismatch, [self.trainer()], pools=[self.gpu_pool()], target=parse_version("1.25.0-gke.1"))
+        self.assertIn("the COS_CONTAINERD driver table covers 1.26 to 1.33, not the target 1.25", out["unknown"][0]["detail"])
         self.assertTrue(out["unknown"][0]["reason"].startswith("CronJob seeded-shapes/cuda-pinned-trainer: "))
         out = run(gpu_driver_mismatch, [self.trainer()], pools=[self.gpu_pool(mode="INSTALLATION_DISABLED")], target=parse_version("1.33.0-gke.1"))
         self.assertIn("the operator-installed driver is not in the record", out["unknown"][0]["detail"])

@@ -469,11 +469,15 @@ GPU_DRIVER_INSTALLATION_DISABLED = "INSTALLATION_DISABLED"
 AUTOPILOT_GPU_DRIVER_LABEL = "cloud.google.com/gke-gpu-driver-version"
 AUTOPILOT_GPU_DRIVER_LATEST = "latest"
 # The NVIDIA driver branch GKE installs per minor, (default, latest), from the GPU how-to
-# (docs.cloud.google.com/kubernetes-engine/docs/how-to/gpus, "Install drivers
-# automatically", read 2026-10-09). The rows entered are 1.26 to 1.33 for
-# Container-Optimized OS and 1.31 to 1.33 for Ubuntu; the page also lists Ubuntu rows below
-# 1.31, not entered here, so an Ubuntu target there is `unknown` until a reader copies them
-# from the page. A target outside a table is `unknown`.
+# (GKE_GPU_DRIVER_SOURCE, "Install drivers automatically", read 2026-10-09 and again on
+# 2026-10-20: both tables on the page end at 1.33, with no row for 1.34 or later, and the
+# `latest` entered is the highest branch the page lists for the minor). The rows entered are
+# 1.26 to 1.33 for Container-Optimized OS and 1.31 to 1.33 for Ubuntu; the page also lists
+# Ubuntu rows below 1.31 as "R470 or R535" without saying which the default is, so they are
+# not entered and an Ubuntu target there is `unknown`. A target below a table's first row is
+# `unknown`; one past its last row is a risk naming the page, since the page has no row yet and
+# the rule cannot tell a driver floor the target image falls below from one it clears.
+GKE_GPU_DRIVER_SOURCE = "https://docs.cloud.google.com/kubernetes-engine/docs/how-to/gpus"
 GKE_COS_GPU_DRIVERS = {
     (1, 26): (470, 550),
     (1, 27): (470, 550),
