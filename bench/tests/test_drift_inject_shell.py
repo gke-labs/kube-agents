@@ -727,6 +727,19 @@ drift_require_daemon
         self.assertIn("This install predates the drift dispatch", proc.stderr)
         self.assertNotIn("could not read http://daemon:8080/healthz", proc.stderr)
 
+    def test_refuses_when_daemon_advertises_near_match_kind_without_exact_match(self):
+        self.set_kubectl_config({
+            "curl": {
+                "http_code": 200,
+                "body": json.dumps({"inject_kinds": ["gitops-drift-v2", "pod-event"]}),
+            }
+        })
+        proc = self.run_daemon()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("ERROR: the Session KV daemon at http://daemon:8080 does not advertise the 'gitops-drift' inject kind", proc.stderr)
+        self.assertIn("(it advertises: gitops-drift-v2\npod-event)", proc.stderr)
+        self.assertNotIn("could not read http://daemon:8080/healthz", proc.stderr)
+
     def test_refuses_when_daemon_returns_scalar_inject_kinds(self):
         self.set_kubectl_config({
             "curl": {
