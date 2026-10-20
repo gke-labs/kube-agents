@@ -88,13 +88,14 @@ OWNER_MAINTAINERS = "maintainers"
 GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 
 # The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
-# contributed case brings with it lives in one of these two trees -- the case
-# directory, and the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
-# put under bench/tf/prebuilt/<stack>/. Nothing else under bench/tf/ is
-# scanned: the shared modules and the seeded fleet are in-house and carry
-# in-house addresses on purpose.
+# contributed case brings with it lives in one of these trees -- the case
+# directory, the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
+# put under bench/tf/prebuilt/<stack>/, and shared modules under
+# bench/tf/modules/. Nothing else under bench/tf/ is scanned: the seeded
+# fleet is in-house and carries in-house addresses on purpose.
 PREBUILT_DIR = REPO_ROOT / "bench" / "tf" / "prebuilt"
-SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR)
+MODULES_DIR = REPO_ROOT / "bench" / "tf" / "modules"
+SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR, MODULES_DIR)
 # Local artefacts of running a stack, never committed and full of real
 # addresses by construction. A path component beginning with a dot
 # (.terraform/, .terraform.lock.hcl) is skipped for the same reason.
@@ -315,6 +316,14 @@ FIXTURE_NOT_READY = {
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
         "rather than manual"
+    ),
+    "obtainability-pdb-kustomize-overlay": (
+        "#2686: needs checkout-gateway declared in a Kustomize root under "
+        "clusters/seeded-a/seeded-reliability/ in each pool project's *-infra "
+        "repository (the two files are in the case's header), so a new "
+        "PodDisruptionBudget there renders only if the kustomization lists it; "
+        "the fixture cannot share a repository with "
+        "obtainability-major-pdb-auto-pr's (#2228)"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
