@@ -419,7 +419,7 @@ func TestDeskRefusesAnUnverifiedRater(t *testing.T) {
 func TestExportSinceSkipsOlderRatings(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
-	if _, _, err := r.g.feedback.Load().Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001",
+	if _, err := r.g.feedback.Load().Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001",
 		Conversation: "discord:g1/fb7", TaskID: "t-3", Rating: FeedbackDown}); err != nil {
 		t.Fatal(err)
 	}
