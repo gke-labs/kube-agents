@@ -1487,8 +1487,9 @@ class Failures(Base):
 class DeclaredScope(Base):
     """On an install with a ``spec.scope`` block the sandbox refuses the report
     script a bare ``--project`` (``fleet_scope_args``), so the tick hands it
-    the resolved scope beside the project, as the fleet_scope tool spells it;
-    an install that declares none keeps the bare flag."""
+    the resolved scope beside the project, as the fleet_scope tool spells it
+    less the cluster exclusion; an install that declares none keeps the bare
+    flag."""
 
     def test_a_declared_scope_hands_the_report_the_resolved_scope_beside_the_project(self) -> None:
         self.declare_scope(["p1", "p2"], unread=["p3"])
