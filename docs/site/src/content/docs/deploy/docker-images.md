@@ -227,11 +227,11 @@ assumes that flat layout.
 Pick the row for how you install. Each has two prefixes: one for the images this project builds,
 one for the images it does not.
 
-| Install path                      | First-party            | Third party                      | If the second is unset              | Reaches cert-manager |
-| --------------------------------- | ---------------------- | -------------------------------- | ----------------------------------- | -------------------- |
-| `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | falls back to the first-party value | **yes**              |
-| Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | falls back to the first-party value | n/a                  |
-| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | falls back to the first-party value | **yes**              |
+| Install path                      | First-party            | Third party                      | If the second is unset     | Reaches cert-manager |
+| --------------------------------- | ---------------------- | -------------------------------- | -------------------------- | -------------------- |
+| `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | leaves upstream registries | **yes**              |
+| Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | leaves upstream registries | n/a                  |
+| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | leaves upstream registries | **yes**              |
 
 The rows are one path in three coats: `install.sh` generates the Terraform composition's
 `terraform.tfvars` from its flags, and the composition passes both values to the chart's

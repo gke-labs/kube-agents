@@ -204,6 +204,7 @@ ADDED_AFTER_THE_MOVE = [
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
     "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
     "helm-chart-no-reconciler-stops",  # gitops-helm-chart stops where nothing renders charts, #2938
+    "delete-namespace-unowned-stops",  # a delete the repository cannot carry ends in a stated stop, #3077
     "topology-zonal-skew-probe",  # topology-drift zonal skew attribution on seeded-d, #1356 / #3415
 ]
 # Taken back out of the nightly file after registering there, each with a
