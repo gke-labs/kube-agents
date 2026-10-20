@@ -12,6 +12,9 @@ import streamlit as st
 # application modules so local, container, and proxied launches behave alike.
 PACKAGE_PARENT = Path(__file__).resolve().parents[1]
 APP_DIRECTORY = Path(__file__).resolve().parent
+# Not "pages": streamlit treats a pages/ folder beside the main script as the
+# legacy multipage layout, and AppTest then reruns a page without this file.
+VIEWS_DIRECTORY = APP_DIRECTORY / "views"
 if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
@@ -42,42 +45,42 @@ with st.sidebar:
 pages = {
     "Setup": [
         st.Page(
-            APP_DIRECTORY / "pages" / "connections.py",
+            VIEWS_DIRECTORY / "connections.py",
             title="Connection",
             icon=":material/cable:",
             default=True,
         ),
         st.Page(
-            APP_DIRECTORY / "pages" / "llm_gateway.py",
+            VIEWS_DIRECTORY / "llm_gateway.py",
             title="LLM Gateway",
             icon=":material/model_training:",
         ),
     ],
     "Agentic": [
         st.Page(
-            APP_DIRECTORY / "pages" / "chat.py",
+            VIEWS_DIRECTORY / "chat.py",
             title="Chat",
             icon=":material/forum:",
         ),
     ],
     "Observability": [
         st.Page(
-            APP_DIRECTORY / "pages" / "overview.py",
+            VIEWS_DIRECTORY / "overview.py",
             title="Overview",
             icon=":material/space_dashboard:",
         ),
         st.Page(
-            APP_DIRECTORY / "pages" / "activity.py",
+            VIEWS_DIRECTORY / "activity.py",
             title="Activity Explorer",
             icon=":material/account_tree:",
         ),
         st.Page(
-            APP_DIRECTORY / "pages" / "kanban.py",
+            VIEWS_DIRECTORY / "kanban.py",
             title="Task Kanban",
             icon=":material/view_kanban:",
         ),
         st.Page(
-            APP_DIRECTORY / "pages" / "autonomous.py",
+            VIEWS_DIRECTORY / "autonomous.py",
             title="Scheduled Cron",
             icon=":material/autorenew:",
             url_path="scheduled-cron",
@@ -85,7 +88,7 @@ pages = {
     ],
     "Integration": [
         st.Page(
-            APP_DIRECTORY / "pages" / "google_chat.py",
+            VIEWS_DIRECTORY / "google_chat.py",
             title="Google Chat",
             icon=":material/chat:",
         ),

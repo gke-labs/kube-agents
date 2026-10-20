@@ -999,7 +999,7 @@ class ListedChecksTest(HarnessTestCase):
         self.assertEqual(code, harness.EXIT_FAIL, text)
         line = self.line(text, "FAIL thread")
         self.assertIn(f"thread {root} holds no gateway status line", line)
-        self.assertIn("takes an unmentioned reply only in a thread it started a task in", line)
+        self.assertIn("nothing to judge the follow-up's answer by", line)
         self.assertNotIn("TYPE ", text)
         # At once: no settle wait.
         self.assertEqual(self.fake.slept, [])

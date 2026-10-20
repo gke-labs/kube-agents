@@ -9,7 +9,7 @@
 > section as either aspirational or done.
 
 > **Written as a north star; the a2a plane arrived under it.** This presumes agents are separate
-> workloads. That is now true of one hop - the a2a chat gateway (C20) spawns a session pod per task, and
+> workloads. That is now true of one hop - the a2a chat gateway (C20) spawns a session pod per conversation, and
 > the session pod is a separate workload with its own principal - and still false of the
 > multi-agent fan-out the worked example in §3 draws. So the design got a first hop to be real
 > about and no second one. Core invariant #3 used to ban agent-to-agent calls outright and would
@@ -60,9 +60,10 @@ spec flipped for `authority.grants` on the strength of it.
 
 **The per-request principal §4 and §5 both demand exists, and it was not new work.** The a2a chat
 gateway (C20) allocates a session pod name and a taskId in the same breath at spawn; one incarnation
-serves exactly one task; and the bus derives a pod's identity from the API server's attested
+served exactly one task until 10/9, and now serves every turn of its conversation while its pod is
+live (a coarser partition, below); and the bus derives a pod's identity from the API server's attested
 `authentication.kubernetes.io/pod-name` claim rather than from anything the pod says. So the
-per-incarnation principal _is_ the per-request principal, the parent can predict its name because
+per-incarnation principal _was_ the per-request principal, the parent can predict its name because
 the parent allocates it, and §5's "read the last five words of the claim as the target" is
 discharged. That is a happier answer than §5 expected: it asked for a new credential-issuing
 mechanism and the runtime already had one.
@@ -458,8 +459,13 @@ the shape this section asked for:
 - The a2a chat gateway (C20) allocates the session pod's name and the taskId **in the same breath at
   spawn**, so the parent can predict the delegate's name -- which is precisely the derivability
   this section identified as the real obstacle, rather than the credential existing yet.
-- **One incarnation serves exactly one task.** A session pod is spawned per task and reaped with
-  it, so per-incarnation and per-request are the same partition, not an approximation of it.
+- **One incarnation served exactly one task**, so per-incarnation and per-request were the same
+  partition. **Amended 10/9 (#2825):** a session pod now serves every turn of its conversation
+  while it is live, up to `A2A_SESSION_MAX_LIFETIME` (4 hours), so the principal is per
+  conversation, a coarser partition than per request. Every turn's root names the same pod as its
+  `delegate`, so the delegate check no longer tells one turn's capability from another's inside a
+  conversation. What bounds that today is that a session presents a capability only to verify the
+  task the gateway handed it, and holds no grant to mint or attenuate one.
 - The bus derives a pod's principal from the API server's attested
   `authentication.kubernetes.io/pod-name` claim on its ServiceAccount token, so the identity is
   not something the pod asserts about itself.
@@ -640,7 +646,9 @@ sweeps it, so every capability ever minted is still resolvable. What limits the 
 is only that the delegate is a session pod name and session pods are reaped: a stale root names a
 principal that is usually not running, so usually nothing presents it. That is an accident of the
 topology rather than a property of the design, and it stops being true the moment a delegate
-outlives the request. Do not read it as expiry.
+outlives the request. Do not read it as expiry. **Amended 10/9:** that moment has come. A session
+pod serves every turn of its conversation (#2825), so an earlier turn's root names a principal that
+stays live for the rest of the conversation, up to `A2A_SESSION_MAX_LIFETIME`.
 
 **And "nothing can present it" is the wrong strength** (10/2). The entry's `delegate` is the pod
 name alone. The API server attests the pod UID too, and `a2a/authcallout` requires it to be

@@ -16,12 +16,16 @@ suite rather than about the product:
   * every expected failure is registered with an invariant and a reference
   * the bucket-2 scenarios are skipped for the stated reason and not because
     they failed to load
+  * every mutation in hack/conformance-mutations.py still finds the text it
+    edits, so none goes STALE unnoticed
 """
 
 from __future__ import annotations
 
 import importlib
+import os
 import pkgutil
+import sys
 import unittest
 from pathlib import Path
 
@@ -367,6 +371,54 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
             if len(node.args) >= 4 and isinstance(node.args[3], ast.Constant):
                 targets.append(node.args[3].value)
         return targets
+
+    def test_every_mutation_still_finds_the_text_it_edits(self) -> None:
+        """The harness's STALE check, run on every pull request.
+
+        The harness edits tracked files, so it stays out of CI, and a mutation
+        whose anchor a refactor moved reports STALE only when someone runs it
+        by hand. A3-session-sends-a-notify sat STALE from #2469 to #3261 that
+        way, and for those six days nothing checked the property it guards.
+        Finding the text needs no edit, so it can run here: each mutation's
+        path must exist and contain `edit[0]`, the same test the harness
+        applies before it mutates. must_survive controls included, since a
+        stale control passes for the wrong reason.
+        """
+        if os.environ.get("CONFORMANCE_MUTATION_RUN") == "1":
+            self.skipTest("inside hack/conformance-mutations.py, which checks each anchor itself and removes it on purpose")
+        import ast
+
+        repo = Path(__file__).resolve().parents[2]
+        source = repo / "hack" / "conformance-mutations.py"
+        stale = []
+        seen = 0
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, ast.Call) or getattr(node.func, "id", "") != "Mutation":
+                continue
+            seen += 1
+            mutation_id = ast.literal_eval(node.args[0])
+            path = repo / ast.literal_eval(node.args[1])
+            old = ast.literal_eval(node.args[2])[0]
+            if not path.is_file():
+                stale.append(f"{mutation_id}: {path.relative_to(repo)} does not exist")
+            elif old not in path.read_text():
+                stale.append(f"{mutation_id}: the text it edits is not in {path.relative_to(repo)}")
+        # Every mutation the harness runs, not just the ones written as a
+        # literal Mutation(...) call: loading the script by path is cheap here
+        # and catches a helper or alias that would hide a mutation from the walk.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("conformance_mutations", source)
+        harness = importlib.util.module_from_spec(spec)
+        # dataclasses looks the defining module up in sys.modules.
+        sys.modules[spec.name] = harness
+        try:
+            spec.loader.exec_module(harness)
+        finally:
+            sys.modules.pop(spec.name, None)
+        self.assertEqual(seen, len(harness.MUTATIONS),
+                         "a mutation is built some way other than a literal Mutation(...) call")
+        self.assertEqual(stale, [], "rewrite these mutations against the current source")
 
     def test_every_bucket_one_assertion_is_named_by_a_mutation(self) -> None:
         _load_every_test_module()

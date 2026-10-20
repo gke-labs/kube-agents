@@ -183,13 +183,17 @@ because the report script's own fallback is every project the credential can
 list. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
 Cluster Agent from is still read here. That read is `gcloud` cluster metadata
-for the version table and, on a report day, one `get-credentials` and two
-`kubectl get` per cluster for the readiness grade, one of
-`pdb,deploy,statefulset -A` and one of
-`validatingwebhookconfigurations,mutatingwebhookconfigurations,services,endpointslices,namespaces -A`;
-the budget names those objects, and a fail-closed webhook with no reachable
-backend names its configuration and its Service, in the saved report, which is
-tenant-written text, so the entry declares `risk: high` as `stall-watch` does. A project
+for the version table and, on a report day, the readiness report's read set,
+the same as a run on request: one `get-credentials` and six `kubectl get`s
+per cluster (budgets, Deployments and StatefulSets; webhook configurations
+with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
+claims, NetworkPolicies and Namespaces; every pod; the nodes through a
+jsonpath projection; StorageClasses and PersistentVolumes), plus
+`gcloud logging read` over the Admin Activity log when a registered rule reads
+it; the saved report names those objects, pods and nodes among them, and a
+fail-closed webhook with no reachable backend names its configuration and its
+Service, which is tenant-written text, so the entry declares `risk: high` as
+`stall-watch` does. A project
 spelled by its number is keyed by the id `gcloud projects describe` resolves,
 learned on its first table run. A number the credential cannot resolve is
 never a key, so its clusters earn no report until it resolves: when nothing
@@ -204,10 +208,11 @@ without it is a custom grant) or the project id in place of the number
 (`spec.harness.projectId` has to be the id; `UPGRADE_READINESS_PROJECTS` for a
 hand run).
 
-It runs the skill the way `stall-watch` runs `stall_report.py`: the two scripts
-are read from the agent image's `/opt/platform-template/skills/` copy and
-handed to `python3 -I -` in the sandbox on stdin, behind a loader that
-registers `upgrade_readiness` before running `fleet_upgrade_report.main`. The
+It runs the skill the way `stall-watch` runs `stall_report.py`: every module
+under the skill's `scripts/` except its tests, with the data files beside them,
+is read from the agent image's `/opt/platform-template/skills/` copy and handed
+to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
+serving the shipped set) before running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
 the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
@@ -377,12 +382,15 @@ the message a week after the upgrade that brings it.
 
 Every other tick prints nothing and relays nothing, so once the message has
 landed the job costs one silent subprocess a day, like `github-repo-watcher`'s idle
-ticks. Two environment variables, set per install through the CR's
-`spec.deployment.env` and passed to the agent container by the operator's
-allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
+ticks. Two environment variables, set per install through the chart value
+`platformAgent.deployment.env` (on an `install.sh` install, a
+`TF_VAR_extra_helm_values` line in `install.env`; on a hand-driven Terraform
+apply, `extra_helm_values` in `terraform.tfvars`) and passed to the agent container by the
+operator's allowlist, are the whole configuration surface: `FEEDBACK_PROMPT_ENABLED`
 (default `true`; `false` neither arms nor claims, so an install that turns it
 on later still gets exactly one) and `FEEDBACK_PROMPT_DELAY` (default `7d`;
-`<n>d`, `<n>h` or `<n>m`). A delay that does not parse is a failed run, exit 1
+`<n>d`, `<n>h` or `<n>m`). A hand edit of the CR's `spec.deployment.env` can
+be lost at the next chart apply. A delay that does not parse is a failed run, exit 1
 with the reason on stderr, which the scheduler reports in chat like any other
 script failure until the value is fixed; it does not fall back, because the
 scheduler keeps a zero-exit script's stderr nowhere and a silent fallback
@@ -407,12 +415,13 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
+values (`"chat"` alone for a fleet-audit job, see below), with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
 scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
-on the same leg.
+on the same leg, and the relay posts that line as written for a fleet-audit job
+too.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
@@ -447,18 +456,26 @@ child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
 `deliver: "chat"` hands the run's report to the relay instead, which posts it as
-written (on Slack, a fleet-audit report is replaced by a headline linking its
-ledger issue) and stores the full report against its thread, so the user's reply there reaches the
-Chat Agent with the report attached. It is a delivery mode, not a
+written and stores the full report against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. A fleet-audit job the image ships is the
+exception: its scheduled delivery posts the report the run's `finish` rendered,
+not the final message,
+which holds whatever else the model wrote in its last turn. A run over several
+repositories posts each finished repository's report, then a line naming any it
+did not finish. A failed run posts the scheduler's failure line, which says why,
+and a run that finished no repository without failing posts a one-line notice
+that it did not finish. On Slack the report is then replaced by a headline linking its
+ledger issue when the run covered one repository; a message with that line, or
+with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
 dual-platform install whose cron child can address both, a job left on `"all"`
-is heard twice on _each_ of them rather than twice in one place. Two entries here name `"all"`
-(`gcp-networking-fabric-audit` and `gce-compute-fleet-audit`) and accept that;
-the rest name `"chat"`.
+is heard twice on _each_ of them rather than twice in one place. Under `"all"`
+the scheduler also posts the final message itself, past the relay's choice of
+report, so every entry here names `"chat"`.
 
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
@@ -473,7 +490,7 @@ instruction, and what the plugin route costs — is
 
 ## Moving the roster onto `"chat"` needed no migration
 
-Every report-producing job here names `"chat"` or `"all"`, and getting there was an edit to this file alone
+Every report-producing job here names `"chat"`, and getting there was an edit to this file alone
 — no script, no one-off Job, nothing run against a live volume. `deliver` is an
 image-owned key on this profile: `merge_cron_store` gives the image every key it
 ships and leaves the volume only the keys it does not, so the next pod start
@@ -588,7 +605,7 @@ rule outlives the memory of why:
   Platform Agent marks the job due for the next tick instead of running the SOP
   itself. The one run that does happen in a session (#1876, #1887): a card that
   delegates exactly one stream per its SOP is run by that worker through
-  `audit_report.py start … finish` (`skills/fleet-audit/SKILL.md`, "Running a
+  `audit_report.py start … finish` (`skills/fleet-audit/references/on-demand.md`, "Running a
   stream on demand"); several streams still queue.
   Such a run holds no per-job lock, so `start` keeps its own guard: an
   in-flight note per stream on the sandbox pod's own volume, at

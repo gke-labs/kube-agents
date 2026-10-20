@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -56,6 +57,13 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
+	// defaultGatewayWait outlasts two of the agent container's startup probe
+	// budgets (agentAPIProbe(10, 90) in platformagent_manifests.go, 905s)
+	// plus the kill grace period and restart backoff between them. A boot
+	// that overruns one budget is restarted, and the restarted entrypoint
+	// redoes its profile steps before the gateway binds, so a single budget
+	// would give up on exactly the slowest boots.
+	defaultGatewayWait = 35 * time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -93,6 +101,8 @@ type flags struct {
 	dryRun           bool
 	metricsAddr      string
 	snapshotInterval time.Duration
+	gatewayURL       string
+	gatewayWait      time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -135,6 +145,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.dryRun, "dry-run", false, "Print inject payloads to stdout without calling the daemon.")
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "Prometheus /metrics + /healthz listener address (host:port). Empty = disabled.")
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
+	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
+	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -195,6 +207,20 @@ func (f *flags) validate() error {
 	}
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
+	}
+	if f.gatewayURL != "" && f.gatewayWait <= 0 {
+		return errors.New("--gateway-wait must be > 0 when --gateway-url is set")
+	}
+	if strings.HasSuffix(f.gatewayURL, "/") {
+		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
+	}
+	// Checked here because a URL the probe cannot use fails every attempt the
+	// way a gateway that is not up yet does, and would hold the informers for
+	// the whole wait.
+	if f.gatewayURL != "" {
+		if u, err := url.Parse(f.gatewayURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("--gateway-url must be an http:// or https:// URL with a host (got %q)", f.gatewayURL)
+		}
 	}
 	// Cluster sources are additive, not exclusive: --profiles-dir contributes
 	// every Cluster Agent profile, and --in-cluster / --kubeconfig contributes
@@ -332,7 +358,8 @@ func (tc targetCluster) identity() string {
 }
 
 // discovery is the profile scan discoverClusterProfiles runs. Its zero value
-// reaches the real GKE API with this pod's own credentials; the tests replace
+// reaches the real GKE API with this pod's own credentials, or through the
+// credential proxy when clusterprofiles.BrokerFromEnv names one; the tests replace
 // its Describe and TokenSource fields so the scan needs neither. OnSkip is set
 // per call instead, because it needs the metrics registry the caller holds.
 var discovery clusterprofiles.Discoverer
@@ -373,6 +400,16 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 	// A copy, so setting OnSkip does not write to the package-level seam.
 	d := discovery
 	d.OnSkip = skip
+	// The credential proxy, when the operator names one, in place of this
+	// pod's Workload Identity; a half-set pair is fatal (BrokerFromEnv). A
+	// Broker already on the seam is a test's and is kept.
+	if d.Broker == nil {
+		broker, err := clusterprofiles.BrokerFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		d.Broker = broker
+	}
 	discovered, err := d.Discover(ctx, dir)
 	if err != nil {
 		return nil, err
@@ -838,6 +875,22 @@ func realMain(argv []string) error {
 	if err != nil {
 		return err
 	}
+
+	// After buildWatchSet, so a watch set that cannot be built still exits
+	// at once and counts as a failed start to the entrypoint's supervisor;
+	// before any dedup cache, so nothing is restored or snapshotted while
+	// the process may yet be a standby. cluster_up is published at 0 first,
+	// so the wait reads as "registered, not yet watching" rather than as no
+	// watcher at all.
+	if f.gatewayURL != "" && !f.dryRun {
+		for _, tc := range clusters {
+			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+		}
+		waitForGateway(ctx, f.gatewayURL, f.gatewayWait, gatewayProbeInterval)
+		if ctx.Err() != nil {
+			return nil
+		}
+	}
 	if f.dryRun {
 		log.Printf("k8s-event-watcher: running in --dry-run mode; watching %d cluster(s) without calling the daemon", len(clusters))
 	}
@@ -986,10 +1039,12 @@ func realMain(argv []string) error {
 // The two entries are not interchangeable, so which one survives matters. The
 // profile carries the project/location/cluster identity that stamps the payload
 // and labels every metric; the direct entry knows only a name. But the profile
-// also carries a credential that can be refused: it authenticates as the GSA,
-// so a permission set without roles/container.viewer, or master authorized
-// networks that exclude the pod's egress, denies it. The direct entry uses the pod's own service account against
-// kubernetes.default.svc and never leaves the cluster.
+// also carries a credential that can be refused: it authenticates as a GSA
+// (the broker's, through the credential proxy, or the pod's without one), so a
+// permission set without roles/container.viewer, or master authorized networks
+// that exclude that identity's egress, denies it. The direct entry uses the
+// pod's own service account against kubernetes.default.svc and never leaves the
+// cluster.
 //
 // Nothing here would notice the difference. discoverClusterProfiles contacts
 // the GKE API for the control plane's address, but nothing exercises that

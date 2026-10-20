@@ -155,9 +155,16 @@
         "modelDefaultName": {
           "type": "string"
         },
+        "envFromSecret": {
+          "type": "string"
+        },
         "maxTokens": {
           "type": "integer",
           "minimum": 0
+        },
+        "reasoningEffort": {
+          "type": "string",
+          "enum": ["", "low", "medium", "high"]
         },
         "vertex": {
           "type": "object",
@@ -174,6 +181,38 @@
             },
             "location": {
               "type": "string"
+            }
+          }
+        },
+        "openaiCompatible": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "apiBase": {
+              "type": "string"
+            },
+            "targetPort": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "egressCIDRs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "caBundleSecretRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                }
+              }
             }
           }
         },
@@ -495,6 +534,29 @@
         "podMonitoring": {
           "type": ["boolean", "null"]
         },
+        "serviceMonitor": {
+          "type": ["boolean", "null"]
+        },
+        "serviceMonitorLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "vmPodScrape": {
+          "type": ["boolean", "null"]
+        },
+        "vmPodScrapeLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "monitoringScraperNamespace": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"
+        },
         "harness": {
           "type": "object",
           "additionalProperties": false,
@@ -635,6 +697,32 @@
               "type": "array",
               "items": {
                 "type": "object"
+              }
+            },
+            "alertDailyLimits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "critical": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "warning": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "info": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                },
+                "drift": {
+                  "type": ["integer", "null"],
+                  "minimum": 0,
+                  "maximum": 2147483647
+                }
               }
             },
             "credentialProxy": {

@@ -406,7 +406,7 @@ class FirstReportTests(NudgeHarness):
         self.assertEqual(self.marks, [])
         # A held run says so, so a stuck onboarding is not a silent one.
         err = self.err.getvalue()
-        self.assertIn("adding nothing until the first inventory report's delivery is claimed", err)
+        self.assertIn("adding nothing until the first inventory report is out (its delivery claimed", err)
         self.assertIn("or until 2026-10-07 09:00 UTC", err)
         self.assertIn(nudge.DELIVERED_MARKER, err)
         self.assertEqual(err.count(nudge.LOG_PREFIX), 1)
@@ -457,6 +457,15 @@ class FirstReportTests(NudgeHarness):
         self.run_at(at(6, 12), [finding()])
         self.assertIn("New: 1 critical finding.", self.out.getvalue())
         self.assertEqual(self.err.getvalue(), "")
+
+    def test_a_conversation_claim_holds_until_its_outcome_is_recorded(self):
+        # Under spec.mode next a claim can be released and retried, so it is not the delivery.
+        self.file_scan(at(6, 9))
+        (self.gateway / nudge.DELIVERED_MARKER).write_text("")
+        (self.gateway / "onboarding_conversation.json").write_text("{}")
+        self.assertTrue(nudge.first_report_hold(self.gateway, at(6, 12))[0])
+        (self.gateway / nudge.CONVERSATION_DONE_MARKER).write_text("posted\n")
+        self.assertEqual(nudge.first_report_hold(self.gateway, at(6, 12)), (False, ""))
 
     def test_an_install_that_never_ran_onboarding_is_not_held(self):
         self.assertEqual(nudge.first_report_hold(self.gateway, at(6, 12)), (False, ""))

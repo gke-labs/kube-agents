@@ -91,6 +91,10 @@ const (
 // 1800s), restated here because the two halves of one contract must agree.
 const defaultTaskDeadline = 30 * time.Minute
 
+// defaultSessionMaxLifetime is what SessionMaxLifetime means when unset; the
+// field's comment carries the rationale.
+const defaultSessionMaxLifetime = 4 * time.Hour
+
 // defaultAskTTL is what AskTTL means when unset; the field's comment carries
 // the horizon rationale.
 const defaultAskTTL = 24 * time.Hour
@@ -102,6 +106,17 @@ const defaultSessionTTL = 7 * 24 * time.Hour
 // defaultFirstEventGrace is what FirstEventGrace means when unset; the
 // field's comment carries the sizing rationale.
 const defaultFirstEventGrace = 10 * time.Minute
+
+// defaultCardStopTimeout is what CardStopTimeout means when unset: above the
+// bridge's worst case for a card-stop control, about 60 s (its capability
+// check's 5 s, its 20 s wait for the session's turn and its 35 s POST to
+// session-kv; a2a/hermes-bridge/cardstop.go), with room for the bus.
+const defaultCardStopTimeout = 75 * time.Second
+
+// cardStopTimeoutFloor is the least A2A_CARD_STOP_TIMEOUT FromEnv takes: a
+// wait shorter than the bridge's own turn wait gives up on every stop that
+// has to wait for the turn it just cancelled.
+const cardStopTimeoutFloor = 30 * time.Second
 
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
@@ -274,10 +289,32 @@ type Config struct {
 	// lazily so that an install with it off never depends on the RBAC.
 	SpawnSessions bool
 
-	// IdleTTL is the reap threshold since the session's last activity: a
-	// verified turn, or an executor ending a live task (decided 8/24: 30
-	// minutes, config-backed; the task's end counts since 2026-09-30).
+	// IdleTTL is the reap threshold since the session's last user message
+	// (decided 8/24: 30 minutes, config-backed; spec-chatops-gateway.md,
+	// Session lifecycle). The answer to that message does not move it: with
+	// one pod serving every turn, the pod is the conversation's, and a
+	// conversation nobody has spoken in for the TTL is idle however recently
+	// its last answer landed. A running task still exempts its pod.
 	IdleTTL time.Duration
+
+	// SessionReuse keeps one pod per conversation across turns
+	// (A2A_SESSION_REUSE, on unless "false"): a turn whose pod is live and
+	// idle goes to it, and only a conversation with no live pod gets a new
+	// one. Off, every turn is a fresh pod, as before 10/9, and the pods
+	// spawned are never handed a second task. Either way the gateway only
+	// reuses pods spawned with the flag, so turning it on never reaches a
+	// pod an older gateway spawned.
+	SessionReuse bool
+
+	// SessionMaxLifetime bounds a reused session pod's whole life
+	// (A2A_SESSION_MAX_LIFETIME, 4h by default), as its activeDeadlineSeconds.
+	// A one-task pod's deadline is TaskDeadline plus a grace, which a pod
+	// serving many turns cannot have; this is the backstop in its place, and
+	// a per-task overdue check in the reap scan bounds a wedged task inside
+	// it (Gateway.taskOverdue). A pod near the end of its lifetime is not
+	// handed another task. Never below TaskDeadline plus twice the grace, so
+	// the pod deadline and the overdue check cannot fire together.
+	SessionMaxLifetime time.Duration
 
 	// AttributionSalt keys the HMAC pseudonyms in authority blocks. The
 	// salt is SESSION_KV_SALT, the one the install already provisions into
@@ -302,9 +339,11 @@ type Config struct {
 	// pod-level activeDeadlineSeconds it sizes above it, and two knobs for
 	// one contract would drift. Unset means 1800s, the adapter's own
 	// default. The adapter kills the harness and publishes the terminal at
-	// this deadline; the pod deadline (this plus a fixed grace) is the
-	// backstop that hands a wedged ADAPTER to Sweep instead of letting it
-	// hold its bus credential indefinitely. Raising it buys longer tasks at
+	// this deadline; for a pod that serves one task, the pod deadline (this
+	// plus a fixed grace) is the backstop that hands a wedged ADAPTER to
+	// Sweep instead of letting it hold its bus credential indefinitely. A
+	// reused pod's backstop is SessionMaxLifetime plus the reap scan's
+	// overdue check at the same bound (Gateway.taskOverdue). Raising it buys longer tasks at
 	// the price of how long a wedged worker can hold a cap slot; lowering
 	// it turns long-running asks into failed tasks sooner.
 	TaskDeadline time.Duration
@@ -363,6 +402,27 @@ type Config struct {
 	// raising it is how long a user waits before the conversation answers
 	// again. Values under 1m are refused at boot.
 	FirstEventGrace time.Duration
+
+	// CardStop arms the card stop (A2A_CARD_STOP, off unless "true";
+	// gke-labs#3263): a `stop` in a conversation on the default addressee
+	// also sends that addressee a card-stop control, a task whose message is
+	// the cardStop data part alone, and the reply names the kanban cards the
+	// executor stopped (cardstop.go). Off, a stop cancels the active task
+	// only and says a card keeps working, as before. A rollout switch: the
+	// control needs a hermes-bridge and an agent image that answer it, and an
+	// older bridge rejects it, which answers cardStopUnconfirmedNotice.
+	CardStop bool
+
+	// CardStopTimeout bounds the wait for a card-stop control's terminal
+	// (A2A_CARD_STOP_TIMEOUT, a Go duration, 75s by default and at least
+	// 30s). Past it the gateway cancels the control and answers that it
+	// could not confirm the stop: the cards may have stopped, and the
+	// executor's answer is what was lost. The operator renders it at the
+	// 75s default and offers no override, as the bridge's own bound
+	// (BRIDGE_CARD_STOP_TIMEOUT_SECONDS, 35s by default) has none; the env
+	// is read so a hand-built Deployment can set it. A change to either
+	// bound is a code change made to both together.
+	CardStopTimeout time.Duration
 
 	// OwnerDeployment names the gateway's own Deployment
 	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
@@ -437,9 +497,10 @@ type Config struct {
 	// (A2A_MAX_SESSIONS). "Delegate:" makes pod creation user-triggerable and
 	// threads are free, so the principal map bounds WHO can spawn and this
 	// bounds HOW MANY - without it, one mapped user's afternoon can fill the
-	// namespace. At the cap a new delegation (or a session-routed first ask)
-	// is refused with a chat reply naming the numbers; nothing queues,
-	// nothing drops silently.
+	// namespace. At the cap the session pod idle longest is evicted to make
+	// room, and its conversation told; only with none idle is the new
+	// delegation (or session-routed turn) refused, with a chat reply naming
+	// the numbers. Nothing queues, nothing drops silently.
 	//
 	// Zero means 10, the harness spike's "busy day": at the worker shape's
 	// requests (250m/512Mi) ten concurrent sessions hold 2.5 CPU / 5Gi, which
@@ -724,6 +785,17 @@ func FromEnv() (*Config, error) {
 	}
 	cfg.TaskDeadline = time.Duration(secs) * time.Second
 
+	cfg.SessionReuse = os.Getenv("A2A_SESSION_REUSE") != "false"
+	lifetime := envOr("A2A_SESSION_MAX_LIFETIME", defaultSessionMaxLifetime.String())
+	lt, err := time.ParseDuration(lifetime)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q: %w", lifetime, err)
+	}
+	if floor := cfg.TaskDeadline + 2*podDeadlineGrace; lt < floor {
+		return nil, fmt.Errorf("A2A_SESSION_MAX_LIFETIME %q is under %v, A2A_TASK_DEADLINE_SECONDS plus twice the pod deadline grace; a pod that cannot outlive one task cannot serve a conversation", lifetime, floor)
+	}
+	cfg.SessionMaxLifetime = lt
+
 	askTTL := envOr("A2A_ASK_TTL", defaultAskTTL.String())
 	at, err := time.ParseDuration(askTTL)
 	if err != nil {
@@ -756,6 +828,17 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q is under the 1m floor; it would release a task still cold-starting", grace)
 	}
 	cfg.FirstEventGrace = fg
+
+	cfg.CardStop = os.Getenv("A2A_CARD_STOP") == "true"
+	cardStopTimeout := envOr("A2A_CARD_STOP_TIMEOUT", defaultCardStopTimeout.String())
+	cst, err := time.ParseDuration(cardStopTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_CARD_STOP_TIMEOUT %q: %w", cardStopTimeout, err)
+	}
+	if cst < cardStopTimeoutFloor {
+		return nil, fmt.Errorf("A2A_CARD_STOP_TIMEOUT %q is under the %v floor; the bridge alone may wait 20s for the turn the stop cancelled", cardStopTimeout, cardStopTimeoutFloor)
+	}
+	cfg.CardStopTimeout = cst
 
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 

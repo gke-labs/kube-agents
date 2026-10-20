@@ -1,0 +1,128 @@
+name: Auto Enqueue
+
+# Put approved pull requests into the merge queue, and take held ones out
+# (#1363). No author here has write access, the robot included, so nobody can
+# press "Merge when ready" on their own pull request. `scripts/merge_gate.py
+# sweep` turns auto-merge on for every pull request on `main` that passes the
+# `Merge labels` test, which with a queue means "enqueue once the required
+# checks pass", and turns it off and dequeues one that lost a label or gained
+# a `do-not-merge` label. It also re-posts the gate statuses of the approved
+# pull requests, in case `merge-gate.yml` missed an event. A pull request the
+# queue removed, or that someone took out by hand, stays out until its head
+# moves; to keep one out past that, add a hold label.
+#
+# Inert until the repository variable `MERGE_QUEUE` is `on`, which is the last
+# step of the cut-over: the queue is enabled on `main` and the repository is
+# out of Tide's query first. Before that, a manual run either logs what it
+# would change, or sweeps the scratch branch `merge-queue-dry-run` for real.
+#
+# The auto-merge and dequeue calls use a token minted for a GitHub App
+# (`vars.MERGE_QUEUE_APP_ID`, `secrets.MERGE_QUEUE_APP_PRIVATE_KEY`; the App
+# needs Pull requests, Contents and Workflows write on this repository:
+# GitHub refuses auto-merge on a pull request that changes a workflow file
+# unless the token can write workflows).
+# `GITHUB_TOKEN` cannot do them: an event it causes starts no workflow run, so
+# its queue entries could get no `merge_group` runs. The job's own
+# `GITHUB_TOKEN` only reads and posts the gate statuses.
+#
+# Two triggers, as in `hold-unresolved-threads.yml`. The schedule is the
+# guarantee; the label fast path enqueues the moment the last label lands and
+# dequeues the moment a person or Prow adds a hold. The `do-not-merge` label
+# that `hold-unresolved-threads.yml` writes with `GITHUB_TOKEN` starts no run,
+# so it waits for the schedule. `pull_request_target` carries a write token
+# whatever the head's origin, and nothing from the pull request is checked out.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  #checkov:skip=CKV_GHA_7:Two inputs, the dry-run boolean and a choice of base branch, which decide whether and where the sweep writes; both reach the step through env, none is interpolated into a shell, and nothing is built
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log what would change and change nothing
+        type: boolean
+        default: true
+      base:
+        description: The branch to sweep; the scratch branch takes writes before the cut-over
+        type: choice
+        options: [main, merge-queue-dry-run]
+        default: main
+  # zizmor: ignore[dangerous-triggers] - the job checks out the default
+  # branch only (the script) and reads pull-request state through the API;
+  # no pull-request content reaches the write token's context.
+  pull_request_target:
+    types: [labeled, unlabeled]
+    branches: [main]
+
+permissions: {}
+
+# Sweeps reconcile the same state; two at once would race each other's reads.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Reconcile the merge queue with the labels
+    # The repository guard, required of a credentialed workflow that starts
+    # on its own (AGENTS.md, Pull Request Hygiene); `vars.` makes this one
+    # credentialed. Before the switch is on, a manual run may log only, or
+    # write to the scratch branch.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      (vars.MERGE_QUEUE == 'on' ||
+        (github.event_name == 'workflow_dispatch' &&
+          (inputs.dry_run || inputs.base == 'merge-queue-dry-run'))) &&
+      (github.event_name != 'pull_request_target' ||
+        github.event.label.name == 'lgtm' ||
+        github.event.label.name == 'approved' ||
+        startsWith(github.event.label.name, 'do-not-merge'))
+    runs-on: ubuntu-latest
+    # One concurrency group and no cancel: a hung call would hold every
+    # enqueue until the 6-hour job limit. A sweep takes well under a minute.
+    timeout-minutes: 10
+    permissions:
+      contents: read # check out the default branch: the script
+      pull-requests: read # the open pull requests, their labels and queue state
+      statuses: write # re-post the gate statuses
+    steps:
+      # The default branch, never a pull request head: this job holds a
+      # writable token and must not run code from a fork. `ref:` is explicit
+      # because on `pull_request_target` the fallback is the pull request's
+      # base branch.
+      - name: Checkout the default branch
+        continue-on-error: ${{ github.event_name == 'pull_request_target' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # A dry run makes no call that needs it, so it runs without the App.
+      - name: Mint the enqueue token
+        id: enqueue-token
+        if: ${{ !inputs.dry_run }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MERGE_QUEUE_APP_ID }}
+          private-key: ${{ secrets.MERGE_QUEUE_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+          permission-contents: write
+          permission-workflows: write
+
+      # On `pull_request_target` the run's check sits on the head of the pull
+      # request whose label started it, and a failure is about the whole
+      # sweep, not that pull request, so it is logged and left to the next
+      # run. A scheduled or dispatched run goes red, so a failure that repeats
+      # stays visible.
+      - name: Sweep the open pull requests
+        continue-on-error: ${{ github.event_name == 'pull_request_target' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ENQUEUE_TOKEN: ${{ steps.enqueue-token.outputs.token }}
+          ACTOR: ${{ steps.enqueue-token.outputs.app-slug }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          BASE: ${{ inputs.base || 'main' }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then set -- --dry-run; fi
+          set -- "$@" sweep --base "$BASE"
+          if [ -n "$ACTOR" ]; then set -- "$@" --actor "$ACTOR"; fi
+          python3 scripts/merge_gate.py "$@"

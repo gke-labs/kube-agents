@@ -157,7 +157,9 @@ def main() -> None:
     #    findings queue's pacing limits take it to `findings_nudge.py` and to
     #    `bootstrap_handoff.py`, which hands them to the first inventory
     #    report's selection; a scrubbed one would silently fall back to its
-    #    default.
+    #    default. Onboarding's delivery under next runs `a2a notify` from the
+    #    `oobe` child, which needs the bus and the conversation route's
+    #    platform; scrubbed, the report would wait for good.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",
@@ -167,6 +169,10 @@ def main() -> None:
         "FINDINGS_DAILY_CRITICALS",
         "FINDINGS_NONCRITICAL_MAX",
         "FINDINGS_NONCRITICAL_AFTER_HOUR",
+        "A2A_NOTIFY_CONVERSATIONS",
+        "A2A_NOTIFY_PLATFORM",
+        "NATS_URL",
+        "A2A_BUS_USER",
     ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(
@@ -339,6 +345,55 @@ def main() -> None:
         ),
         "an alert that quotes the marker in prose is not silence",
     )
+
+    # 11. The adapter flags the scheduler's failure line by its exact opening
+    # (adapter.SCHEDULER_FAILURE_PREFIXES), and the relay then posts it as
+    # written in place of a fleet-audit record. Each branch of the
+    # summarizer is its own f-string, so drive every one, and the
+    # blocked-config line, which _compose_run_delivery builds without it.
+    import inspect
+
+    import cron.scheduler as scheduler
+    from plugins.platforms.chat.adapter import is_scheduler_failure
+
+    title = "Security & RBAC Posture Audit"
+    failed_job = {"id": "compliance-audit", "name": title}
+    for error in (
+        "Script timed out after 30s: /x.py",
+        "HTTP 429 TPM quota exhausted",
+        "Cron job 'x' idle for 600s (limit 600s)",
+        "ReadTimeout talking to the provider",
+        "403 authentication failed",
+        "RuntimeError: something else broke",
+    ):
+        line = scheduler._summarize_cron_failure_for_delivery(failed_job, error)
+        check(is_scheduler_failure(title, line), f"the adapter flags the scheduler's failure line {line[:60]!r}")
+    check(
+        not is_scheduler_failure(title, "Security & RBAC Posture Audit: 0 new, 0 resolved."),
+        "the adapter does not flag a report",
+    )
+    source = inspect.getsource(scheduler._compose_run_delivery)
+    check(
+        "⛔ Cron '" in source and "' blocked by " in source and '"configuration validation' in source,
+        "_compose_run_delivery still builds the blocked-config line the adapter flags",
+    )
+    check(
+        is_scheduler_failure(title, f"⛔ Cron '{title}' blocked by configuration validation (no LLM call was made): x"),
+        "the adapter flags the blocked-config line",
+    )
+
+    # 12. On the failure leg the relay reads the delivering run's start from
+    # the scheduler's ledger: the job's `running` row and its `started_at`.
+    # A rename makes the read find nothing, and the failure line is posted.
+    import re
+
+    import cron.executions as executions
+
+    table = re.search(r"CREATE TABLE IF NOT EXISTS executions \((.*?)\)\s*\"\"\"", inspect.getsource(executions), re.S)
+    columns = table.group(1) if table else ""
+    check(re.search(r"^\s*job_id TEXT", columns, re.M) is not None, "the run ledger still has job_id")
+    check(re.search(r"^\s*started_at TEXT", columns, re.M) is not None, "the run ledger still has started_at")
+    check("'running'" in columns, "the run ledger's status set still has 'running'")
 
     print("\nverify_chat_relay: all checks passed")
 

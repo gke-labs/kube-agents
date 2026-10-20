@@ -24,8 +24,10 @@ controls (such as SecretProviderClass volume mounts, Network Policies, and Pod
 Security Standards), refer to the `gke-workload-security` skill; for Workload
 Identity Service Account bindings, the `gke-workload-identity` skill.
 
-> **MCP Tools:** `gke:get_cluster`, `k8s:check_k8s_auth`,
-> `k8s:get_k8s_resource`, `k8s:apply_k8s_manifest`, `gke:update_cluster`
+> **MCP Tools:** `get_cluster`, `check_k8s_auth`, `get_k8s_resource` (all on the `gke`
+> server)
+>
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Golden Path Security Defaults
 
@@ -51,13 +53,12 @@ secret rotation.
 gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
   --format="value(secretManagerConfig.enabled)" \
   --quiet
-
-# Enable if not already (Day-1 change)
-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
-  --enable-secret-manager \
-  --secret-manager-rotation-interval=120s \
-  --quiet
 ```
+
+If it is not enabled, Secret Manager with a 120s rotation interval is a Day-1 cluster setting.
+Config Connector's `ContainerCluster` has no field for it, so it has no declarative path in a
+Config Connector repository: say so, and block rather than invent a field. A Terraform repository
+carries it on the cluster resource.
 
 > **Note:** For configuring `SecretProviderClass` manifests and mounting secrets
 > as volumes inside application deployments, see the `gke-workload-security`
@@ -80,10 +81,10 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
 -   Use namespace-scoped Roles over cluster-wide ClusterRoles.
 -   Bind to specific Groups or ServiceAccounts, never to `system:authenticated`
     or `system:unauthenticated`.
--   Audit permissions via MCP: `k8s:check_k8s_auth(parent="...", verb="list",
+-   Audit permissions via MCP: `check_k8s_auth(parent="...", verb="list",
     resourceType="pods", namespace="...")` (or `kubectl auth can-i --list
     --as=<user>`).
--   Review bindings via MCP: `k8s:get_k8s_resource(parent="...",
+-   Review bindings via MCP: `get_k8s_resource(parent="...",
     resourceType="clusterrolebinding")` (or `kubectl get
     clusterrolebindings,rolebindings --all-namespaces`).
 
@@ -93,31 +94,17 @@ gcloud container clusters describe <CLUSTER_NAME> --region <REGION> \
 ## Binary Authorization
 
 Not enabled in golden path by default but recommended for enforcing production
-image provenance across the cluster:
-
-```bash
-# Enable Binary Authorization
-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
-  --binauthz-evaluation-mode=PROJECT_SINGLETON_POLICY_ENFORCE \
-  --quiet
-```
+image provenance across the cluster. It is turned on with the evaluation mode
+`PROJECT_SINGLETON_POLICY_ENFORCE` (`spec.binaryAuthorization.evaluationMode`), changed as
+Config Connector YAML on the cluster's `ContainerCluster` through `gcp-config-connector`.
 
 ## Shielded Nodes & GKE Sandbox Enablement
 
-Enabling verifiable node boot integrity and kernel isolation features at the
-cluster level:
-
-```bash
-# Enable Shielded Nodes on an existing cluster
-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
-  --enable-shielded-nodes \
-  --quiet
-
-# Enable GKE Sandbox (gVisor) runtime on an existing cluster
-gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
-  --enable-gke-sandbox \
-  --quiet
-```
+Verifiable node boot integrity is a cluster setting and kernel isolation a node pool one. Shielded Nodes (`spec.enableShieldedNodes`) are changed as Config Connector
+YAML on the cluster's `ContainerCluster` through `gcp-config-connector`. The GKE Sandbox
+(gVisor) runtime is a node pool setting, `spec.nodeConfig.sandboxConfig.sandboxType: gvisor` on
+a `ContainerNodePool`; the field is immutable and the default pool cannot run it, so propose a
+new sandboxed node pool rather than editing an existing one.
 
 > **Note:** To run workloads inside the gVisor sandbox, specify
 > `runtimeClassName: gvisor` in your Pod specs as detailed in the
@@ -169,26 +156,10 @@ The five most common predefined IAM roles for GKE platform and cluster access:
 
 Common project-level IAM policy binding patterns for granting backend Google
 Service Accounts (GSAs) access to external Google Cloud services before linking
-via Workload Identity:
-
-```bash
-# Grant a GSA access to Cloud Storage objects
-gcloud projects add-iam-policy-binding <PROJECT_ID> \
-  --member "serviceAccount:<GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com" \
-  --role "roles/storage.objectViewer" \
-  --quiet
-
-# Grant a GSA access to Cloud SQL databases
-gcloud projects add-iam-policy-binding <PROJECT_ID> \
-  --member "serviceAccount:<GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com" \
-  --role "roles/cloudsql.client" \
-  --quiet
-
-# Grant a GSA access to Pub/Sub subscriptions
-gcloud projects add-iam-policy-binding <PROJECT_ID> \
-  --member "serviceAccount:<GSA_NAME>@<PROJECT_ID>.iam.gserviceaccount.com" \
-  --role "roles/pubsub.subscriber" \
-  --quiet
+via Workload Identity: grant the GSA `roles/storage.objectViewer` for Cloud Storage objects,
+`roles/cloudsql.client` for Cloud SQL databases, or `roles/pubsub.subscriber` for Pub/Sub
+subscriptions, each as a project-level IAM binding in Config Connector YAML through
+`gcp-config-connector`.
 
 ## Resources
 
@@ -198,7 +169,6 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 - [Binary Authorization on GKE](https://cloud.google.com/binary-authorization/docs/setting-up)
 - [Shielded GKE Nodes](https://cloud.google.com/kubernetes-engine/docs/how-to/shielded-gke-nodes)
 - [GKE Sandbox (gVisor)](https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods)
-```
 
 <!-- kube-agents: local addition (auto-injected by sync-upstream-skills.py) -->
 
@@ -211,26 +181,22 @@ here.
 Cloud KMS key. The key must be in the cluster's region (`KMS_LOCATION`; for a zonal cluster, the
 region that contains its zone, since Cloud KMS has no zonal locations), and the GKE service agent
 of the cluster's project (`CLUSTER_PROJECT_NUMBER`, not the key project's number) needs
-`roles/cloudkms.cryptoKeyEncrypterDecrypter` on it before the cluster can use it:
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` on it before the cluster can use it. Both go out as
+Config Connector YAML through `gcp-config-connector`: the key's IAM binding for
+`service-CLUSTER_PROJECT_NUMBER@container-engine-robot.iam.gserviceaccount.com`, and on the
+cluster's `ContainerCluster` the key
+(`projects/KMS_PROJECT_ID/locations/KMS_LOCATION/keyRings/KEYRING_NAME/cryptoKeys/KEY_NAME`) in
+`spec.databaseEncryption.keyName` with `spec.databaseEncryption.state: ENCRYPTED`. Verify:
 
 ```bash
-gcloud kms keys add-iam-policy-binding KEY_NAME \
-  --keyring KEYRING_NAME --location KMS_LOCATION --project KMS_PROJECT_ID \
-  --member serviceAccount:service-CLUSTER_PROJECT_NUMBER@container-engine-robot.iam.gserviceaccount.com \
-  --role roles/cloudkms.cryptoKeyEncrypterDecrypter
-
-gcloud container clusters update CLUSTER_NAME --location LOCATION \
-  --database-encryption-key projects/KMS_PROJECT_ID/locations/KMS_LOCATION/keyRings/KEYRING_NAME/cryptoKeys/KEY_NAME
-
 # CURRENT_STATE_ENCRYPTED once encryption completes (`state` is the requested setting, not the observed one)
 gcloud container clusters describe CLUSTER_NAME --location LOCATION \
   --format="value(databaseEncryption.currentState)"
 ```
 
 **Security Posture (`--security-posture`)** turns on configuration auditing (`standard`) and,
-with `--workload-vulnerability-scanning`, OS vulnerability scanning of running workloads:
-
-```bash
-gcloud container clusters update CLUSTER_NAME --location LOCATION \
-  --security-posture=standard --workload-vulnerability-scanning=standard
-```
+with `--workload-vulnerability-scanning`, OS vulnerability scanning of running workloads. Both
+are changed as Config Connector YAML on the cluster's `ContainerCluster` through
+`gcp-config-connector`: `spec.securityPostureConfig.mode: BASIC` and
+`spec.securityPostureConfig.vulnerabilityMode: VULNERABILITY_BASIC` (Config Connector's values,
+not gcloud's `standard`).
