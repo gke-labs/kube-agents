@@ -846,10 +846,16 @@ class BaseTestCase(unittest.TestCase):
                 "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
                 # `sop_path` reads it; an export must not move the SOP path `start` prints.
                 "PLATFORM_AGENT_HOME": "",
+                # The sweep is on unless a test says otherwise: a host with the
+                # switch off would otherwise fail every auto-promotion test.
+                audit_report.AUTO_PROMOTE_ENV: "",
             },
         )
         env.start()
         self.addCleanup(env.stop)
+        switch = patch.object(audit_report, "AUTO_PROMOTE_FILE", str(self.tmp_path / "no-audit-auto-promote"))
+        switch.start()
+        self.addCleanup(switch.stop)
         # Many tests run `start` more than once against one scratch directory
         # and never `finish`; the in-flight note would refuse the second. The
         # tests about the note itself put the real check back.
@@ -4307,6 +4313,24 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertIn(
             f'<!-- audit-findings: ["{derived_id()}"] -->', bodies[0]
         )
+
+    def test_the_install_switch_stops_finish_from_opening_a_pull_request(self):
+        """`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, read from the sandbox's root-owned
+        file: the same run that promotes above opens nothing, and the ledger it
+        publishes says the sweep is off and that `/remediate` still works (#3439)."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with tempfile.TemporaryDirectory() as tmp:
+            switch = os.path.join(tmp, "audit-auto-promote")
+            pathlib.Path(switch).write_text("false\n")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch), patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+                self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.harness.bodies_for("proposal-create"), [])
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
+        self.assertTrue(any("## Awaiting `/remediate`" in b and f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), published)
 
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
@@ -10195,6 +10219,65 @@ class TestPromotion(BaseTestCase):
         self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
         self.assertEqual(plan.below_floor, ["min"])
+
+    def test_the_install_switch_turns_the_sweep_off_but_not_a_request(self):
+        """`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` is the inject lane's install: the
+        sweep opens nothing, a `/remediate` still opens what it names, and the
+        ledger says which switch is off and what still works (#3439)."""
+        findings = [
+            manifest_finding("crit", "a.yaml", severity="critical"),
+            manifest_finding("maj", "b.yaml", severity="major"),
+        ]
+        findings.append(manifest_finding("min", "c.yaml", severity="minor"))
+        findings.append(manifest_finding("unb", "d.yaml", severity="critical"))
+        plan = audit_report.promotion_candidates(
+            findings, {}, sweep_off=True, vouched={"crit", "maj", "min"}, uncorroborated={"unb"}
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.switched_off, ["crit", "maj"], "what the sweep would have opened, still classified")
+        self.assertEqual(plan.withheld, [], "the cap never applied, so nothing is over it")
+        self.assertEqual((plan.below_floor, plan.uncorroborated), (["min"], ["unb"]), "the other blocks read as on any install")
+        asked = audit_report.promotion_candidates(
+            findings, {}, ["maj"], sweep_off=True, vouched={"crit", "maj", "min"}, uncorroborated={"unb"}
+        )
+        self.assertEqual(asked.promote, ["maj"], "a request still opens what it names")
+        self.assertEqual(asked.switched_off, ["crit"])
+        body = render_body(make_doc(findings=findings), generated_at=NOW, switched_off=plan.switched_off, below_floor=plan.below_floor)
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
+        self.assertIn("/remediate <finding-id>", body)
+        section = body[body.index("## Awaiting `/remediate`"):]
+        self.assertLess(section.index("the automatic sweep is off"), section.index("`min`"), "the switch block comes first, the floor block still reads")
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+        on = render_body(make_doc(findings=findings), generated_at=NOW, below_floor=plan.below_floor)
+        self.assertNotIn(audit_report.AUTO_PROMOTE_ENV, on, "an install with the switch on never mentions it")
+        closing = audit_report.render_stale_close_comment("fleet-audit", findings[:1], NOW, pr_number=8, sweep_off=True)
+        self.assertNotIn("re-proposed automatically", closing, "a close on this install promises no automatic re-proposal")
+        self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", closing)
+        self.assertIn("/remediate <finding-id>", closing)
+        self.assertIn("re-proposed automatically", audit_report.render_stale_close_comment("fleet-audit", findings[:1], NOW, pr_number=8))
+
+    def test_the_switch_reads_the_root_owned_file_before_the_variable(self):
+        """A session can export the variable in one word; the sandbox entrypoint's
+        file is root-owned, so it is read first and the variable only without it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "audit-auto-promote")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", path):
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "false"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled())
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "FALSE"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled())
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "0"}):
+                    self.assertTrue(audit_report.auto_promotion_enabled(), "only the word false turns it off")
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(audit_report.AUTO_PROMOTE_ENV, None)
+                    self.assertTrue(audit_report.auto_promotion_enabled())
+                pathlib.Path(path).write_text("false\n")
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled(), "the file wins over the variable")
+                pathlib.Path(path).write_text("true\n")
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "false"}):
+                    self.assertTrue(audit_report.auto_promotion_enabled(), "the file wins over the variable")
 
     def test_the_floor_is_major(self):
         self.assertEqual(audit_report.AUTO_PROMOTION_FLOOR, "major")
@@ -19887,6 +19970,29 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertTrue(self.harness.forge_calls("issue-create"))
         self.assertIn(DECLINE_REASON, "".join(self.harness.bodies_for("issue-*")))
         self.assertIn("published with a manual remediation instead", self.err)
+
+    def test_the_install_switch_keeps_the_refusal_and_lists_the_written_fix_as_awaiting_a_request(self):
+        """On an install whose `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is off a
+        `/remediate` needs the written fix as much as the sweep does, so an
+        unwritten one is refused as on any install; once written it publishes
+        with no pull request, named on the ledger as awaiting a request (#3474)."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        with tempfile.TemporaryDirectory() as tmp:
+            switch = os.path.join(tmp, "audit-auto-promote")
+            pathlib.Path(switch).write_text("false\n")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch):
+                self.assertEqual(self.run_finish(doc), 2)
+                self.assertIn("need their fix written before a `/remediate`", self.err)
+                self.assertNotIn("automatic pull request", self.err, "no sweep opens one on this install")
+                self.touch(doc["findings"][0]["remediation"]["path"])
+                self.assertEqual(self.run_finish(doc), 0, self.err)
+                self.assertFalse(self.harness.forge_calls("proposal-create"))
+                body = "".join(self.harness.bodies_for("issue-*"))
+                self.assertIn("## Awaiting `/remediate`", body)
+                self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
+                self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 
     def test_finish_publishes_once_the_fix_is_written(self):
         self.harness.replies = {"issue-list": issues_view([])}

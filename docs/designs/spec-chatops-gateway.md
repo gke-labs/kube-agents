@@ -378,6 +378,13 @@ judgment, like all model output, is never an authorization signal: the gateway's
 verification runs before dispatch exactly as before, and the `authority` block is stamped at
 ingress as before (advisory today; see "Requester identity on the bus").
 
+The gateway owns a second slash command, `/feedback` (added 10/19). Bare, it answers
+deterministically with the two places a kube-agents report goes, the issue tracker and the
+public feedback form, and starts no task; with text after it, the gateway passes the message
+through as typed, and the Planning Agent composes the report and asks for a yes before the
+platform worker files it through the credential broker. The command, the persona flow and the
+broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md).
+
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
 channel its turns arrive on, naming the addressee and the task text. The gateway is the only

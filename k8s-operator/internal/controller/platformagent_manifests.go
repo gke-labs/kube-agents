@@ -5943,6 +5943,25 @@ func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptio
 
 // buildPlatformLeaderRole generates the Role manifest for leader election leases in the agent namespace
 func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "Role",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name),
+			Namespace: agent.Namespace,
+		},
+		Rules: leaderRoleRules(replicas),
+	}
+}
+
+// leaderRoleRules is the leader Role's rule set for a gateway rendered at
+// replicas. Split from buildPlatformLeaderRole so the multi-replica rule set
+// stays testable while supportedGatewayReplicas keeps every render at one
+// (TestLeaderRolePodsRuleVerbsAboveOneReplica).
+func leaderRoleRules(replicas int32) []rbacv1.PolicyRule {
 	rules := []rbacv1.PolicyRule{
 		{
 			APIGroups: []string{"coordination.k8s.io"},
@@ -5976,25 +5995,14 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	// the two policies in config/admission/agent-rbac-policy.yaml govern the
 	// content of a Role and the subject of a RoleBinding, not the objects a
 	// bound identity may then reach.
-	if replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment); replicas > 1 {
+	if replicas > 1 {
 		rules = append(rules, rbacv1.PolicyRule{
 			APIGroups: []string{""},
 			Resources: []string{"pods"},
 			Verbs:     []string{"get", "patch"},
 		})
 	}
-
-	return &rbacv1.Role{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "Role",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name),
-			Namespace: agent.Namespace,
-		},
-		Rules: rules,
-	}
+	return rules
 }
 
 // buildLeaderRoleBinding binds the leader Role to the gateway's own
