@@ -106,7 +106,7 @@ class ContractTest(unittest.TestCase):
     def test_every_rule_runs_over_two_shared_reads_through_the_fold(self):
         context = sample_context()
         items = ClientAddonSkewTest.ITEMS + [psa_namespace("seeded-defaults", "baseline", "latest")]
-        folded = readiness.evaluate_extra_rules(ClientAddonSkewTest.CLUSTER, member("1.33.5-gke.100"), read(items), TARGET_1_35, context, rules=list(RULES_C))
+        folded = readiness.evaluate_extra_rules(ClientAddonSkewTest.CLUSTER, member("1.31.5-gke.100", ("1.31.5-gke.100",)), read(items), TARGET_1_35, context, rules=list(RULES_C))
         self.assertEqual(len(context[shared.CONTEXT_RUN_CMD].calls), 2)
         self.assertEqual([f["rule"] for f in folded["blocking"]], ["removed-api-callers"])
         self.assertIn(TUNER, folded["blocking"][0]["text"])
@@ -118,8 +118,12 @@ class ContractTest(unittest.TestCase):
 
 
 class RemovedApiCallersTest(unittest.TestCase):
+    # The sample's removal is 1.32: this upgrade's block on a 1.31 control plane, a crossing on
+    # the helper's default 1.33.
+    BEHIND = dict(master="1.31.5-gke.100", pools=("1.31.5-gke.100",))
+
     def test_a_recent_operator_caller_of_a_removed_api_blocks(self):
-        result = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, sample_context())
+        result = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), TARGET_1_35, sample_context())
         self.assertEqual(len(result["blocking"]), 1)
         item = result["blocking"][0]
         self.assertEqual((item["principal"], item["caller_class"], item["removed_release"], item["replacement"]), (TUNER, audit_log.CLASS_OPERATOR, "1.32", "flowcontrol.apiserver.k8s.io/v1"))
@@ -131,13 +135,26 @@ class RemovedApiCallersTest(unittest.TestCase):
         self.assertIn("replacement flowcontrol.apiserver.k8s.io/v1", text)
         self.assertEqual(result["notes"], ["2 removed-release entries read over 7d (writes only; a caller that only reads is not in this log)"])
 
+    def test_a_removal_the_control_plane_crossed_is_a_note_not_this_upgrades_block(self):
+        # The member's 1.33 control plane crossed the 1.32 removal: the API is gone and the
+        # window's entries predate the crossing, so neither a blocker nor a risk, one note.
+        result = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, sample_context())
+        self.assertEqual((result["blocking"], result["risks"], result["unknown"]), ([], [], []))
+        self.assertIn(f"{TUNER} via legacy-flowcontrol-tuner/0.3 wrote flowcontrol.apiserver.k8s.io/v1beta3 flowschemas, removed in 1.32, which the control plane's 1.33 has crossed: the API is already gone and the writes predate the crossing, so this is not the upgrade's block", result["notes"])
+        # The context's parsed master wins over the member's text: a 1.31 control plane there
+        # makes the same caller this upgrade's block; a removal in (running, target] blocks.
+        context = {**sample_context(), shared.CONTEXT_MASTER: (1, 31, 5, 100)}
+        self.assertEqual(len(removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, context)["blocking"]), 1)
+        # With neither a context master nor a member version, the target alone grades it.
+        self.assertEqual(len(removed_api_callers.evaluate({}, {}, read([]), TARGET_1_35, sample_context())["blocking"]), 1)
+
     def test_a_caller_silent_for_more_than_48_hours_is_a_risk_naming_its_last_write(self):
         later = datetime(2026, 10, 5, 16, 0, tzinfo=timezone.utc)
-        result = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, sample_context(at=later))
+        result = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), TARGET_1_35, sample_context(at=later))
         self.assertEqual(result["blocking"], [])
         self.assertEqual([r["principal"] for r in result["risks"]], [TUNER])
         self.assertIn("the last write was 2026-09-29T14:04:19.112Z, more than 48h before 2026-10-05T16:00:00Z", result["risks"][0]["detail"])
-        exactly = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, sample_context(at=datetime(2026, 10, 1, 14, 4, 19, 112000, tzinfo=timezone.utc)))
+        exactly = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), TARGET_1_35, sample_context(at=datetime(2026, 10, 1, 14, 4, 19, 112000, tzinfo=timezone.utc)))
         self.assertEqual(len(exactly["blocking"]), 1)
 
     def test_removal_after_the_target_is_a_risk_not_a_blocker(self):
@@ -155,7 +172,7 @@ class RemovedApiCallersTest(unittest.TestCase):
         removed, _ = split_sample()
         provider = with_principal(removed[0], "system:cloud-controller-manager")
         unplaced = with_principal(removed[0], "legacy-flowcontrol-tuner")
-        result = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, context_with(FakeRunner([provider, unplaced])))
+        result = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), TARGET_1_35, context_with(FakeRunner([provider, unplaced])))
         self.assertEqual(result["blocking"], [])
         by_principal = {r["principal"]: r for r in result["risks"]}
         self.assertEqual(by_principal["system:cloud-controller-manager"]["detail"], removed_api_callers.PROVIDER_DETAIL)
@@ -171,14 +188,14 @@ class RemovedApiCallersTest(unittest.TestCase):
     def test_a_failed_later_page_keeps_the_blocker_and_adds_an_unknown(self):
         removed, _ = split_sample()
         runner = FakeRunner(pages={audit_log.READ_REMOVED: [full_page(removed[0], tables.AUDIT_LOG_PAGE_LIMIT), FAIL]})
-        result = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, context_with(runner))
+        result = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), TARGET_1_35, context_with(runner))
         self.assertEqual(len(result["blocking"]), 1)
         self.assertIn("page 2", result["unknown"][0]["reason"])
 
     def test_a_sampled_read_is_graded_and_noted_not_unknown(self):
         removed, _ = split_sample()
         pages = [full_page(removed[0], tables.AUDIT_LOG_PAGE_LIMIT, start=datetime(2026, 9, 29, 12 - i, 0, tzinfo=timezone.utc)) for i in range(3)]
-        result = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_35, context_with(FakeRunner(pages={audit_log.READ_REMOVED: pages})))
+        result = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), TARGET_1_35, context_with(FakeRunner(pages={audit_log.READ_REMOVED: pages})))
         self.assertEqual(len(result["blocking"]), 1)
         self.assertEqual(result["unknown"], [])
         self.assertIn("sampled 3000 entries over 3 page(s) of the removed read; more callers possible", result["notes"])
@@ -420,14 +437,26 @@ class ReportTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.state_dir, True)
         self.kubeconfig_dir = os.path.join(tempfile.mkdtemp(), "kubeconfigs")
         self.addCleanup(shutil.rmtree, os.path.dirname(self.kubeconfig_dir), True)
-        current = cluster("seeded-a", "us-central1-a", self.TARGET, [("default-pool", self.TARGET)])
+        # Both members sit one minor below the target, inside the skew window: seeded-a is the
+        # audit subject, served a removal at 1.34, in (running, target]; the sample's own 1.32
+        # would be a crossing on a 1.33 control plane and grade as a note.
+        subject = cluster("seeded-a", "us-central1-a", "1.33.5-gke.100", [("default-pool", "1.33.5-gke.100")])
         behind = cluster("seeded-c", "us-central1-a", "1.33.5-gke.100", [("default-pool", "1.33.5-gke.100")])
-        self.clusters = {"p1": [current, behind]}
+        self.clusters = {"p1": [subject, behind]}
         self.objects = {
             "seeded-a": [k8s_workload("Deployment", "shop", "web", 3, {"app": "web"}), k8s_pdb("shop", "web-pdb", {"maxUnavailable": 1, "selector": {"matchLabels": {"app": "web"}}}, 3)],
             "seeded-c": [k8s_workload("Deployment", "shop", "web", 3, {"app": "web"})],
         }
         self.namespaced = {"seeded-c": [psa_namespace("seeded-defaults", "baseline", "latest"), workload("CronJob", "seeded-shapes", "stale-kubectl-client", "registry.k8s.io/kubectl:v1.29.0")]}
+
+    @staticmethod
+    def served(release="1.34"):
+        """The sample with its removed-release stamps moved to `release`."""
+        entries = sample_entries()
+        for entry in entries:
+            if audit_log.LABEL_REMOVED_RELEASE in entry.get("labels", {}):
+                entry["labels"][audit_log.LABEL_REMOVED_RELEASE] = release
+        return entries
 
     def _run(self, fake, *extra):
         out_path = os.path.join(tempfile.mkdtemp(), "report.json")
@@ -439,7 +468,7 @@ class ReportTest(unittest.TestCase):
         return rc, stdout.getvalue(), data
 
     def test_a_recent_removed_api_caller_blocks_and_the_rest_are_risks_in_the_two_columns(self):
-        fake = FakeReadinessCommands(self.clusters, {}, self.objects, namespaced_objects_by_cluster=self.namespaced, audit_by_cluster={"seeded-a": sample_entries()})
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, namespaced_objects_by_cluster=self.namespaced, audit_by_cluster={"seeded-a": self.served()})
         rc, text, data = self._run(fake)
         self.assertEqual(rc, report.EXIT_OK)
         by_name = {m["cluster"]: m["readiness"] for m in data["members"]}
@@ -455,7 +484,7 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(data["readiness"]["summary"], {"blocked": 1, "ready": 1, "unknown": 0})
         self.assertEqual(data["readiness"]["members_with_risks"], 2)
         row = next(l for l in text.splitlines() if l.startswith("| p1 | seeded-a |") and "| blocked |" in l)
-        self.assertIn(f"{TUNER} via legacy-flowcontrol-tuner/0.3 writes flowcontrol.apiserver.k8s.io/v1beta3 flowschemas, removed in 1.32", row)
+        self.assertIn(f"{TUNER} via legacy-flowcontrol-tuner/0.3 writes flowcontrol.apiserver.k8s.io/v1beta3 flowschemas, removed in 1.34", row)
         self.assertIn(f"{WRITER} via Python-urllib/3.12 writes core/v1 endpoints", row)
         self.assertIn("kubectl v1.29 from principal " + STALE_KUBECTL, row)
         self.assertIn("deprecated-api-callers: 1 provider caller of deprecated APIs not filed", row)
@@ -464,13 +493,19 @@ class ReportTest(unittest.TestCase):
         self.assertIn("kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client", c_row)
 
     def test_a_removed_api_caller_silent_for_six_days_is_a_risk_and_the_member_ready(self):
-        fake = FakeReadinessCommands(self.clusters, {}, self.objects, audit_by_cluster={"seeded-a": sample_entries()})
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, audit_by_cluster={"seeded-a": self.served()})
         rc, text, data = self._run(fake, "--at", "2026-10-05T16:00:00Z")
         a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
         self.assertEqual(a["status"], "ready")
         self.assertEqual(a["rule_blocking"], [])
         stale = next(f for f in a["risks"] if f["rule"] == "removed-api-callers")
         self.assertIn("more than 48h before 2026-10-05T16:00:00Z", stale["detail"])
+        # The sample's own 1.32 removal on this 1.33 control plane is a crossing: a note, and the member ready.
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, audit_by_cluster={"seeded-a": sample_entries()})
+        rc, text, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual((a["status"], a["rule_blocking"], [f["rule"] for f in a["risks"] if f["rule"] == "removed-api-callers"]), ("ready", [], []))
+        self.assertIn("removed in 1.32, which the control plane's 1.33 has crossed", a["note"])
 
     def test_a_failed_audit_read_is_unknown_for_the_member_through_the_blocking_rule(self):
         fake = FakeReadinessCommands(self.clusters, {}, self.objects, failing_logging=["seeded-a"])

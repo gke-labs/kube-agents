@@ -70,14 +70,15 @@ new rule adds its entry in that order.
   namespaces (`kube-system`, `kube-public`, `kube-node-lease`, `gatekeeper-system`, `cnrm-system`,
   `asm-system`, and the `gke-`, `gmp-` and `config-management-` namespaces); every other `system:`
   principal, the node identities and Google-managed service agents are the provider's. An operator
-  caller of an API removed at or before the target minor whose last write is within 48 hours blocks,
-  named with the release and, where `removed_apis.json` knows one, the replacement; one silent for
-  longer is a risk naming its last write, since a migrated caller must not block for a week. A
-  removal after the target, a provider caller (GKE moves its own components) and a principal the
-  rule cannot place are risks, never blockers. A read that failed or timed out is `unknown`, graded
-  on the pages before it; a sampled read is a note. Action: Migrate the caller before the upgrade:
-  bump the client, rewrite the manifest or the Helm release state to the replacement API the finding
-  names.
+  caller of an API removed after the running control plane's minor and at or before the target's
+  whose last write is within 48 hours blocks, named with the release and, where `removed_apis.json`
+  knows one, the replacement; one silent for longer is a risk naming its last write, since a
+  migrated caller must not block for a week. A removal after the target, a provider caller (GKE
+  moves its own components) and a principal the rule cannot place are risks, never blockers; a
+  removal the control plane has already crossed is a note, since the API is gone and the window's
+  writes predate the crossing. A read that failed or timed out is `unknown`, graded on the pages
+  before it; a sampled read is a note. Action: Migrate the caller before the upgrade: bump the
+  client, rewrite the manifest or the Helm release state to the replacement API the finding names.
 - `changed-defaults` (Changed defaults), entry 8, risk. Reads: The minors the upgrade crosses, from
   the control plane for an admission default and from the lowest node pool for a kubelet default,
   are looked up in `upgrade_shape_tables.DEFAULT_CHANGES_BY_MINOR`, each row with its source (the

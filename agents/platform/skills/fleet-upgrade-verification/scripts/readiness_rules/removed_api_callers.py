@@ -7,13 +7,18 @@ The API server stamps every request for a version it will stop serving with the 
 annotation `k8s.io/removed-release=<minor>`, which Cloud Logging keeps as an entry label.
 The rule reads those entries through the shared removed-release read (`audit_log.py`: a
 paged `gcloud logging read` over the seven days ending at the evaluation instant, the
-provider's principals excluded) and grades each caller against the target. An operator
-caller of an API removed at or before the target minor whose latest write is within the
-last 48 hours blocks the upgrade, named with its principal, user agent, API and release,
-and with the replacement where the GitOps scan's removal table names one; a caller silent
-for longer is a risk naming its last write, because a migrated caller must not block for a
-week. A removal after the target, a provider caller (GKE moves its own components), and a
-principal the rule cannot place are risks, never blockers.
+provider's principals excluded) and grades each caller against the running control plane
+and the target. An operator caller of an API removed after the control plane's minor and
+at or before the target's, whose latest write is within the last 48 hours, blocks the
+upgrade, named with its principal, user agent, API and release, and with the replacement
+where the GitOps scan's removal table names one; a caller silent for longer is a risk
+naming its last write, because a migrated caller must not block for a week. A removal the
+control plane has already crossed is a note: the API is gone, its writes now fail unstamped,
+and the entries the seven-day window still holds predate the crossing, so they are not this
+upgrade's block. A removal after the target, a provider caller (GKE moves its own
+components), and a principal the rule cannot place are risks, never blockers. The control
+plane's minor is the context's `master`, else the member's `control_plane_version`; with
+neither, every removal at or before the target is graded as this upgrade's.
 
 The log carries writes only: a caller that only reads a removed API is not in it, and GKE
 Deprecation Insights are the cross-check. A read that fails or times out is `unknown` with
@@ -49,6 +54,7 @@ UNPLACED_DETAIL = "a principal of a class this rule cannot place ({principal}); 
 RELEASE_UNPARSABLE_DETAIL = "the stamped release {release!r} did not parse; not graded against the target"
 NO_TARGET_DETAIL = "removed in {release}; whether this upgrade crosses it needs a target"
 NOTE_NO_TARGET = "no target; stamped callers filed as risks"
+CROSSED_NOTE = "{principal} via {user_agent} wrote {api}, removed in {release}, which the control plane's {master} has crossed: the API is already gone and the writes predate the crossing, so this is not the upgrade's block"
 NOTE_ENTRIES_READ = "{entries} removed-release entr{plural} read over {days}d ({writes_only})"
 ENTRY_SINGULAR = "y"
 ENTRY_PLURAL = "ies"
@@ -92,6 +98,9 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     target_text = tables.format_minor(target_minor) if target_minor else None
     at = context.get(readiness_rules.CONTEXT_AT)
     at_text = audit_log.format_rfc3339(at) if at else None
+    master = context.get(readiness_rules.CONTEXT_MASTER)
+    master_text = (member.get("control_plane_version") if isinstance(member, dict) else None) if not master else None
+    master_minor = (master[0], master[1]) if master else (tables.parse_minor(master_text) if master_text else None)
     for caller in log["callers"]:
         release_text = caller["removed_release"]
         if not release_text:
@@ -103,6 +112,9 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
             tier, detail = finding.TIER_RISK, NO_TARGET_DETAIL.format(release=release_text)
         elif release > target_minor:
             tier, detail = finding.TIER_RISK, AFTER_TARGET_DETAIL.format(target=target_text)
+        elif master_minor is not None and release <= master_minor:
+            finding.add_note(result, CROSSED_NOTE.format(principal=caller["principal"], user_agent=caller["user_agent"], api=caller["api"], release=release_text, master=tables.format_minor(master_minor)))
+            continue
         elif caller["caller_class"] == audit_log.CLASS_PROVIDER:
             tier, detail = finding.TIER_RISK, PROVIDER_DETAIL
         elif caller["caller_class"] == audit_log.CLASS_UNPLACED:
