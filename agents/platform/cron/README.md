@@ -309,8 +309,10 @@ the user dismissed stays dismissed; and the hourly nudge paces what is named and
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
 family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week
 no longer reports loses confidence and stops being reminded without touching another family's rows
-on that cluster, or the `upgrade-` rows another writer filed there; a cluster with more findings than one batch holds (500) is sent in pieces that claim
-nothing. The script writes the technical report under `upgrade-readiness/weekly/` beside the
+on that cluster, or the `upgrade-` rows another writer filed there. Three kinds of cluster claim nothing: one
+with more findings than one batch holds (500), sent in pieces; two of one name in one project, whose
+claims the queue could not tell apart; and one with a row the queue would refuse, since the claim
+would book that finding's row absent. The script writes the technical report under `upgrade-readiness/weekly/` beside the
 watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
 the sandbox at `/opt/data/upgrade-readiness/weekly/` so the agent can read it when asked. It prints
 nothing on success: the brief speaks for the week and the queue for each finding. A project it could

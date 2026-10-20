@@ -474,13 +474,15 @@ class Registration(unittest.TestCase):
 
         with mock.patch.object(review, "kv_request", fake_request), mock.patch.object(review.findings_queue, "validate_finding", strict):
             outcomes, problems, claimed = review.register([odd], [], findings)
-        self.assertEqual(len(problems), 1)
+        self.assertEqual(len(problems), 2)
         self.assertIn("freeze", problems[0])
         self.assertEqual(len(calls), 1)
         self.assertNotIn("freeze", [f["object"] for f in calls[0]["findings"]])
         # The refused row is a finding read and not sent: a claim would book its row from last week absent.
+        # The claim is withheld, and counted as one that did not reach the queue: last week's rows keep their confidence.
         self.assertNotIn("scope", calls[0])
         self.assertEqual(claimed, set())
+        self.assertIn(review.CLAIM_FAILED_MARK, problems[1])
         self.assertEqual(sum(1 for v in outcomes.values() if v == review.REGISTRATION_FAILED), 1)
         self.assertEqual(sum(1 for v in outcomes.values() if v == "created"), len(findings) - 1)
 
@@ -692,6 +694,10 @@ class TheRecord(unittest.TestCase):
         self.assertEqual(review.ordered_names(["a", "b"], None), ["a", "b"])
         # A spelling by number runs after the ids in its group.
         self.assertEqual(review.ordered_names(["123456789012", "acme-prod"], None), ["acme-prod", "123456789012"])
+        # A run whose every project failed writes no record: the marker it left carries its failures.
+        review.announce_failure_once("x", {"a": "sandbox exited 255 without a report", "c": cut})
+        self.assertEqual(review.ordered_names(["a", "b", "c"], {"project_failures": {}}), ["c", "a", "b"])
+        review.clear_failure_marker()
         # Last week's failure is keyed by the id the watch learned for the number the roster spells.
         with mock.patch.object(review, "learned_project_ids", return_value={"123456789012": "acme-prod"}):
             self.assertEqual(review.ordered_names(["acme-dev", "123456789012"], {"project_failures": {"acme-prod": cut}}), ["123456789012", "acme-dev"])
@@ -986,37 +992,22 @@ class TheTick(unittest.TestCase):
         self.assertEqual(latest["projects"], [PROJECT])
         self.assertEqual(len(latest["clusters"]["reviewed"]), 2)
 
-    def test_under_a_declared_scope_a_project_that_failed_is_not_asked_again_by_its_other_spelling(self):
+    def test_a_project_that_failed_is_not_run_again_by_its_other_spelling(self):
+        """On any install: a second run would replace the first failure's cause, and a budget
+        that cut the second short would move the project ahead of every other next week."""
         numbered = "123456789012"
         self.learn_ids({numbered: PROJECT})
         calls = []
 
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):
             calls.append(names[0])
-            raise RuntimeError("sandbox exited 255 without a report")
-
-        with mock.patch.object(watch, "declared_scope", return_value=SCOPE), mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
-            code, out = self.run_main()
-        self.assertEqual(code, 0)
-        self.assertEqual(calls, [PROJECT])  # the number is asked for by the same id: the same call
-        self.assertIn("failed: acme-prod: sandbox exited 255", out)
-        self.assertNotIn(numbered, out)
-
-    def test_a_project_whose_two_spellings_both_fail_is_one_failure(self):
-        numbered = "123456789012"
-        self.learn_ids({numbered: PROJECT})
-        calls = []
-
-        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
-            calls.append(names[0])
-            raise RuntimeError("sandbox exited 255 without a report")
+            raise RuntimeError("sandbox exited 137: OOMKilled" if names[0] == PROJECT else f"describe {names[0]}: PERMISSION_DENIED")
 
         with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
             code, out = self.run_main()
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [PROJECT, numbered])  # undeclared, the number enumerates under itself: a second call
-        self.assertIn("failed: acme-prod: sandbox exited 255", out)
-        self.assertEqual(out.count("acme-prod"), 1)
+        self.assertEqual(calls, [PROJECT])
+        self.assertIn("failed: acme-prod: sandbox exited 137: OOMKilled", out)
         self.assertNotIn(numbered, out)
 
     def test_a_project_whose_two_spellings_both_fail_is_counted_once_beside_a_project_read(self):

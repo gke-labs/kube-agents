@@ -359,6 +359,8 @@ COPY_FAILED_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads
 FAILURE_DIGITS = re.compile(r"\d+")
 FAILURE_DIGIT_MARK = "#"
 PARTIAL_DETAIL_SEPARATOR = "; "
+RESOLVED_IDS_SEPARATOR = ", "  # a report table's heading: the ids its report resolved
+CLAIM_WITHHELD_DETAIL = "withheld, since {count} row(s) were refused before sending"
 DRY_RUN_HEADER = "dry run: nothing registered, nothing written"
 
 
@@ -773,7 +775,7 @@ def ordered_names(names: list[str], previous: dict | None) -> list[str]:
     so a project the roster spells both ways is read under its id first; the
     number is then skipped when the watch's ledger maps it to that id
     (``run_projects``), else run and dropped once its report resolves it."""
-    failures = (previous or {}).get("project_failures") or {}
+    failures = last_failures(previous)
     budget = {p for p, detail in failures.items() if str(detail) == BUDGET_EXHAUSTED_DETAIL or str(detail).startswith(BUDGET_FAILURE_PREFIXES)}
     known_ids = learned_project_ids()
     first = [n for n in names if n in budget or watch.canonical_project(n, known_ids) in budget]
@@ -782,6 +784,21 @@ def ordered_names(names: list[str], previous: dict | None) -> list[str]:
         return [n for n in selected if not watch.is_project_number(n)] + [n for n in selected if watch.is_project_number(n)]
 
     return group(first) + group([n for n in names if n not in first])
+
+
+def last_failures(previous: dict | None) -> dict[str, str]:
+    """The last run's failures: the record's, or, when that run failed in every
+    project and so wrote no record, the pairs its failure marker holds
+    (``failure_signature``); a run that reads clears the marker. The marker
+    folds digits, and the budget details carry none, so they still read as
+    budget failures."""
+    try:
+        pairs = json.loads(failure_marker().read_text(encoding="utf-8"))
+        if isinstance(pairs, list) and pairs:
+            return {str(project): str(detail) for project, detail in pairs}
+    except (OSError, ValueError, TypeError):  # no marker, another failure's text, or not pairs
+        pass
+    return (previous or {}).get("project_failures") or {}
 
 
 def learned_project_ids() -> dict[str, str]:
@@ -806,11 +823,13 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     once, and a table is headed by the id its report resolved, which is what
     the rows carry. Under a declared scope a spelling is asked for by that id,
     as the watch asks: the scope lists ids, so the report reads it with no
-    describe. A spelling whose project is already read this run is not run at
-    all, nor, under a declared scope, one whose project already failed, which
-    would be the same call; one the ledger does not map yet is run, and
-    dropped whole once its report resolves it to an id already read: no
-    table, no errors, no failure, nothing registered."""
+    describe. A spelling whose project is already read or already failed this
+    run is not run at all, as the watch's table hop skips a tabled key: a
+    second failure would replace the first one's cause, and one the budget cut
+    short would put the project ahead of every other next week. One the
+    ledger does not map yet is run, and dropped whole once its report
+    resolves it to an id already read: no table, no errors, no failure,
+    nothing registered."""
     members: list[dict] = []
     errors: list[dict] = []
     tables: dict[str, str] = {}
@@ -820,10 +839,8 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     for project in names:
         key = watch.canonical_project(project, known_ids)
-        if key in read_ids or (scope is not None and key in failures):
-            # The same project, already read this run under its other spelling
-            # (this run would cost a full readiness run and leave nothing), or
-            # already asked for by this id under a declared scope, and failed.
+        if key in read_ids or key in failures:
+            # The same project, already read or failed this run under its other spelling.
             continue
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
@@ -852,7 +869,7 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
             # read and registered under the first run. The second leaves nothing.
             continue
         errors.extend(read_errors)
-        tables[", ".join(sorted(resolved))] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
+        tables[RESOLVED_IDS_SEPARATOR.join(sorted(resolved))] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
         unlisted = watch.unlisted_projects(read_errors)
         if unlisted:
             # The sandbox ran but the project's cluster listing failed: the
@@ -892,7 +909,9 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
     batches and no claim: one twin's claim would lower the other's rows, and
     a row left at full confidence is the lesser error. Each row is validated
     here before it is sent, so one the queue would refuse fails alone instead
-    of its whole batch."""
+    of its whole batch; its cluster then sends no claim, which would book that
+    finding's row absent, and the claim is counted as one that did not reach
+    the queue."""
     outcomes: dict[str, str] = {}
     problems: list[str] = []
     claimed: set[str] = set()
@@ -914,9 +933,15 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                 outcomes[item_id(item)] = REGISTRATION_FAILED
                 continue
             batch.append(item)
-        # A row refused here is a finding read and not sent: a claim would book its
-        # row from last week absent, so the cluster claims nothing.
-        complete = member_complete(member, errors) and (project, cluster) not in twins and len(batch) == len(rows)
+        complete = member_complete(member, errors) and (project, cluster) not in twins
+        if complete and len(batch) < len(rows):
+            # A row refused here is a finding read and not sent: a claim would book its row
+            # from last week absent, so the cluster claims nothing. Counted as a claim that
+            # did not reach the queue where one would have been sent, since last week's rows
+            # on the cluster keep their confidence all the same.
+            complete = False
+            if len(batch) <= KV_BATCH_LIMIT:
+                problems.append(f"{project}/{cluster}: {CLAIM_FAILED_MARK}: {CLAIM_WITHHELD_DETAIL.format(count=len(rows) - len(batch))}")
         if not batch and not complete:
             continue
         # A complete read of a cluster with nothing to report is sent too: it is
@@ -1271,7 +1296,9 @@ def failure_signature(detail: str, failures: dict[str, str] | None = None) -> st
     """The marker's key: the text with every number folded, or, for a run whose
     every project failed, each project as ``run_projects`` keys it, digits
     unfolded, beside its folded reason, so a timeout's figure re-posts nothing
-    while a different project failing the same way is a new line."""
+    while a different project failing the same way is a new line. Those pairs
+    are also what orders the next run (``last_failures``), since such a run
+    writes no record."""
     if failures:
         return json.dumps(sorted([p, FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, str(d))] for p, d in failures.items()))
     return FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, detail)
