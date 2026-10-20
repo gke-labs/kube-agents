@@ -134,10 +134,12 @@ type FeedbackRecord struct {
 // controls: whether it takes ratings from a sender, record a rating, add the
 // rater's note to their kept 👎, how many days a rating is kept (for the
 // rater to be told), and how many of each rating were given since a time.
+// Rate reports whether the kept record holds the rated chain's ask, so the
+// rater is told only what is kept.
 // Every call is safe from any goroutine and bounded by its own deadline.
 type FeedbackRecorder interface {
 	Admits(backend, rater string) bool
-	Rate(r FeedbackRating) error
+	Rate(r FeedbackRating) (askKept bool, err error)
 	Note(r FeedbackRating, note string) error
 	KeptDays() int
 	Tally(ctx context.Context, since time.Time) (up, down int, err error)
@@ -348,13 +350,14 @@ func (d *feedbackDesk) Admits(backend, rater string) bool {
 	return d.g.resolvePrincipal(backend, rater) != ""
 }
 
-// Rate records one rating from a verified sender.
-func (d *feedbackDesk) Rate(r FeedbackRating) error {
+// Rate records one rating from a verified sender, and reports whether the
+// kept record holds the chain's ask.
+func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 	g := d.g
 	if !d.Admits(r.Backend, r.Rater) {
 		g.log.Info("dropping an answer rating from an unverified sender",
 			"backend", r.Backend, "author", r.Rater, "conversation", r.Conversation)
-		return errFeedbackUnverified
+		return false, errFeedbackUnverified
 	}
 	g.metrics.answerRated(r.Platform, r.Rating)
 	key := feedbackKey(r.TaskID, r.Rater)
@@ -365,7 +368,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	defer cancel()
 	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
-		return fmt.Errorf("feedback bucket: %w", err)
+		return false, fmt.Errorf("feedback bucket: %w", err)
 	}
 	// The ask is the human message that started the rated chain, as the
 	// session record holds it (TaskRef.Request, until AskTTL clears it),
@@ -387,6 +390,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 	}
 	// Merged, not replaced: a 👎 tapped again keeps the note already there.
 	// A 👍 drops it, since the note said what went wrong.
+	askKept := false
 	if _, err := mergeFeedback(ctx, kv, key, true, func(rec *FeedbackRecord) bool {
 		note := rec.Note
 		if rating != FeedbackDown {
@@ -401,6 +405,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 		if contextID == "" {
 			contextID = rec.ContextID
 		}
+		askKept = strings.TrimSpace(ask) != ""
 		*rec = FeedbackRecord{
 			Rating:       rating,
 			Note:         note,
@@ -416,11 +421,11 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 		}
 		return true
 	}); err != nil {
-		return err
+		return false, err
 	}
 	g.log.Info("answer rated", "platform", r.Platform, "rating", r.Rating, "taskId", r.TaskID,
 		"conversation", r.Conversation, "kept", true)
-	return nil
+	return askKept, nil
 }
 
 // Note adds the rater's note (empty: none) to their kept 👎 on r's answer.

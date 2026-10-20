@@ -2040,7 +2040,9 @@ answer and drops its note, which said what went wrong. A 👎 is
 counted and kept with the rated answer first, one KV write, and only once it is kept opens a modal
 on the tap's trigger, which lapses three seconds after the tap ("What went wrong?" over one
 optional field, "Anything else?", of up to 500 characters, and a line telling the rater how long
-their question and the answer are kept, read from the bucket's max age); a write that fails opens
+their question and the answer are kept, read from the bucket's max age, or, when the kept record
+holds no ask (past `AskTTL`, a reaped session), how long the answer is kept: "This answer is kept on
+your install for 30 days so an operator can turn it into a test."); a write that fails opens
 nothing. The gateway takes the ask from the session record: the human message that started the
 rated chain (`TaskRef.Request` on the root entry, as written and held to its 1 KiB cap, until
 `AskTTL` clears it), so a later message in the thread, or another person's, is never taken for

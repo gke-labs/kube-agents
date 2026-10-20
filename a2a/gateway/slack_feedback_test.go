@@ -22,6 +22,8 @@ type fakeRecorder struct {
 	notes   []string
 	rateErr error
 	noteErr error
+	// noAsk makes Rate report that the kept record holds no ask.
+	noAsk bool
 	// up, down and tallyErr are what Tally answers; tallies counts its calls.
 	up, down int
 	tallyErr error
@@ -34,14 +36,14 @@ type fakeRecorder struct {
 func (f *fakeRecorder) Admits(_, rater string) bool { return f.admit[rater] }
 func (f *fakeRecorder) KeptDays() int               { return 30 }
 
-func (f *fakeRecorder) Rate(r FeedbackRating) error {
+func (f *fakeRecorder) Rate(r FeedbackRating) (bool, error) {
 	if f.onRate != nil {
 		f.onRate()
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ratings = append(f.ratings, r)
-	return f.rateErr
+	return !f.noAsk, f.rateErr
 }
 
 func (f *fakeRecorder) Tally(context.Context, time.Time) (int, int, error) {
@@ -228,6 +230,23 @@ func TestSlackUpRatingIsRecordedAndIsNoTurn(t *testing.T) {
 	}
 }
 
+// A 👎 whose ask is no longer on record tells the rater only the answer is kept.
+func TestSlackDownRatingWithNoAskOnRecordSaysOnlyTheAnswerIsKept(t *testing.T) {
+	a, rec, api := newFeedbackSlackAdapter()
+	rec.noAsk = true
+	if _, ok := a.interactive(ratingPayload(t, "U1", FeedbackDown)); ok {
+		t.Fatal("a rating is never a turn")
+	}
+	if len(api.views) != 1 {
+		t.Fatalf("views = %d, want the note modal", len(api.views))
+	}
+	view, _ := json.Marshal(api.views[0])
+	if !strings.Contains(string(view), "This answer is kept on your install for 30 days so an operator can turn it into a test.") ||
+		strings.Contains(string(view), "Your question") {
+		t.Errorf("modal's kept line must name the answer alone: %s", view)
+	}
+}
+
 func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 	a, rec, api := newFeedbackSlackAdapter()
 	viewsAtRate := -1
@@ -242,7 +261,7 @@ func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 		t.Fatalf("views = %+v, want the note modal opened on the tap's trigger", api.views)
 	}
 	view, _ := json.Marshal(api.views[0])
-	for _, want := range []string{slackFeedbackTitle, slackFeedbackLabel, `"optional":true`, "kept on your install for 30 days", slackFeedbackSubmit, slackFeedbackClose} {
+	for _, want := range []string{slackFeedbackTitle, slackFeedbackLabel, `"optional":true`, "Your question and this answer are kept on your install for 30 days", slackFeedbackSubmit, slackFeedbackClose} {
 		if !strings.Contains(string(view), want) {
 			t.Errorf("modal lacks %q: %s", want, view)
 		}
@@ -338,7 +357,7 @@ func TestSlackAnsweredLineStaysAboveTheFeedbackButtons(t *testing.T) {
 }
 
 func TestSlackModalSaysOneDay(t *testing.T) {
-	view, _ := json.Marshal(slackFeedbackModal(slackFeedbackMeta{Task: "t"}, 1))
+	view, _ := json.Marshal(slackFeedbackModal(slackFeedbackMeta{Task: "t"}, 1, true))
 	if !strings.Contains(string(view), "for 1 day so") {
 		t.Errorf("modal = %s", view)
 	}

@@ -44,6 +44,9 @@ const (
 	slackFeedbackSubmit     = "Send"
 	slackFeedbackClose      = "Cancel"
 	slackFeedbackKeptLine   = "Your question and this answer are kept on your install for %s so an operator can turn them into a test."
+	// slackFeedbackKeptNoAsk is the kept line when the ask is no longer on
+	// record (AskTTL, a reaped session), so only the answer is kept.
+	slackFeedbackKeptNoAsk = "This answer is kept on your install for %s so an operator can turn it into a test."
 	slackFeedbackDays       = "%d days"
 	slackFeedbackOneDay     = "1 day"
 	slackFeedbackThanksLine = "Thanks. I kept this answer for your team to review."
@@ -243,7 +246,8 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		// the 👎 already there: a session read and a merge (a read and a
 		// write, again on a race), which must finish inside the three seconds the
 		// modal's trigger lasts.
-		if err := recorder.Rate(rating); err != nil {
+		askKept, err := recorder.Rate(rating)
+		if err != nil {
 			// The modal says the answer is kept; with nothing kept it
 			// does not open.
 			s.log.Warn("slack: recording a rating failed", "channel", p.Channel.ID, "taskId", taskID, "err", err)
@@ -255,7 +259,7 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		ctx, cancel := context.WithTimeout(context.Background(), slackFeedbackDeadline)
 		defer cancel()
 		meta := slackFeedbackMeta{Conversation: conversation, Task: taskID, Channel: p.Channel.ID, Thread: thread, Message: p.Message.TS}
-		if _, err := s.feedbackAPI.OpenViewContext(ctx, p.TriggerID, slackFeedbackModal(meta, recorder.KeptDays())); err != nil {
+		if _, err := s.feedbackAPI.OpenViewContext(ctx, p.TriggerID, slackFeedbackModal(meta, recorder.KeptDays(), askKept)); err != nil {
 			s.log.Warn("slack: opening the feedback note failed; the 👎 is kept without one", "channel", p.Channel.ID, "err", err)
 		}
 	})
@@ -266,12 +270,17 @@ func slackFeedbackThanks() string {
 	return slackFeedbackThanksLine + " " + fmt.Sprintf(slackFeedbackFormLine, slackFeedbackFormURL)
 }
 
-// slackFeedbackModal is the note a 👎 asks for.
-func slackFeedbackModal(meta slackFeedbackMeta, days int) slack.ModalViewRequest {
+// slackFeedbackModal is the note a 👎 asks for; its kept line names the
+// question only when askKept.
+func slackFeedbackModal(meta slackFeedbackMeta, days int, askKept bool) slack.ModalViewRequest {
 	raw, _ := json.Marshal(meta)
 	kept := fmt.Sprintf(slackFeedbackDays, days)
 	if days == 1 {
 		kept = slackFeedbackOneDay
+	}
+	line := slackFeedbackKeptLine
+	if !askKept {
+		line = slackFeedbackKeptNoAsk
 	}
 	input := slack.NewInputBlock(slackFeedbackNoteID, slack.NewTextBlockObject(slackPlainText, slackFeedbackLabel, false, false), nil,
 		slack.NewPlainTextInputBlockElement(nil, slackFeedbackNoteID).WithMaxLength(feedbackNoteChars))
@@ -285,7 +294,7 @@ func slackFeedbackModal(meta slackFeedbackMeta, days int) slack.ModalViewRequest
 		PrivateMetadata: string(raw),
 		Blocks: slack.Blocks{BlockSet: []slack.Block{
 			input,
-			slack.NewContextBlock("", slack.NewTextBlockObject(slackPlainText, fmt.Sprintf(slackFeedbackKeptLine, kept), false, false)),
+			slack.NewContextBlock("", slack.NewTextBlockObject(slackPlainText, fmt.Sprintf(line, kept), false, false)),
 		}},
 	}
 }

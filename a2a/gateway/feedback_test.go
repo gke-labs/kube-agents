@@ -176,7 +176,7 @@ func TestDeskKeepsADownRatingWithItsNoteAndAnUpReplacesIt(t *testing.T) {
 	origin := completeTurn(t, r, "discord:g1/fb5", "d-1", "it is OOMKilled")
 	down := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb5",
 		MessageID: "m9", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "it is OOMKilled"}
-	if err := desk.Rate(down); err != nil {
+	if _, err := desk.Rate(down); err != nil {
 		t.Fatal(err)
 	}
 	if err := desk.Note(down, "  the limit is 256Mi  "); err != nil {
@@ -229,7 +229,7 @@ func TestDeskKeepsADownRatingWithItsNoteAndAnUpReplacesIt(t *testing.T) {
 
 	up := down
 	up.Rating = FeedbackUp
-	if err := desk.Rate(up); err != nil {
+	if _, err := desk.Rate(up); err != nil {
 		t.Fatal(err)
 	}
 	kv, err := r.client.KV(context.Background(), lib.FeedbackBucket)
@@ -266,13 +266,13 @@ func TestDeskReRatingKeepsTheNote(t *testing.T) {
 	if err := desk.Note(down, "too early"); !errors.Is(err, errFeedbackNotKept) {
 		t.Fatalf("a note with no 👎 kept = %v, want errFeedbackNotKept", err)
 	}
-	if err := desk.Rate(down); err != nil {
+	if _, err := desk.Rate(down); err != nil {
 		t.Fatal(err)
 	}
 	if err := desk.Note(down, "stale limit"); err != nil {
 		t.Fatal(err)
 	}
-	if err := desk.Rate(down); err != nil {
+	if _, err := desk.Rate(down); err != nil {
 		t.Fatal(err)
 	}
 	kv, err := r.client.KV(context.Background(), lib.FeedbackBucket)
@@ -292,12 +292,12 @@ func TestDeskKeepsAnUpAsAGoodAnswerAndTalliesTheWeek(t *testing.T) {
 	origin := completeTurn(t, r, "discord:g1/fb11", "d-1", "it is OOMKilled")
 	up := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb11",
 		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackUp, Answer: "it is OOMKilled"}
-	if err := desk.Rate(up); err != nil {
+	if _, err := desk.Rate(up); err != nil {
 		t.Fatal(err)
 	}
 	other := up
 	other.Rater, other.Rating = "1002", FeedbackDown
-	if err := desk.Rate(other); err != nil {
+	if _, err := desk.Rate(other); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -344,6 +344,25 @@ func TestDeskKeepsAnUpAsAGoodAnswerAndTalliesTheWeek(t *testing.T) {
 	}
 }
 
+// Rate reports whether the kept record holds the ask: a chain's own ask, or
+// none for a conversation with no session on record.
+func TestDeskReportsWhetherTheAskIsKept(t *testing.T) {
+	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
+	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	origin := completeTurn(t, r, "discord:g1/fb14", "d-1", "it is OOMKilled")
+	down := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb14",
+		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "it is OOMKilled"}
+	if kept, err := desk.Rate(down); err != nil || !kept {
+		t.Errorf("Rate = %v, %v; want the ask kept", kept, err)
+	}
+	gone := down
+	gone.Rater, gone.Conversation = "1002", "discord:g1/reaped"
+	if kept, err := desk.Rate(gone); err != nil || kept {
+		t.Errorf("Rate with no session = %v, %v; want no ask kept", kept, err)
+	}
+}
+
 func TestDeskReRatingAfterTheAskIsGoneKeepsTheKeptAsk(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
@@ -351,13 +370,13 @@ func TestDeskReRatingAfterTheAskIsGoneKeepsTheKeptAsk(t *testing.T) {
 	origin := completeTurn(t, r, "discord:g1/fb13", "d-1", "it is OOMKilled")
 	down := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb13",
 		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "it is OOMKilled"}
-	if err := desk.Rate(down); err != nil {
+	if _, err := desk.Rate(down); err != nil {
 		t.Fatal(err)
 	}
 	// The session no longer holds the ask, as after AskTTL or a reap.
 	up := down
 	up.Rating, up.Conversation = FeedbackUp, "discord:g1/reaped"
-	if err := desk.Rate(up); err != nil {
+	if _, err := desk.Rate(up); err != nil {
 		t.Fatal(err)
 	}
 	kv, err := r.client.KV(context.Background(), lib.FeedbackBucket)
@@ -384,7 +403,7 @@ func TestFeedbackTurnsOnWhenTheBucketAppearsLater(t *testing.T) {
 func TestDeskRefusesAnUnverifiedRater(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
-	err := r.g.feedback.Load().Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "9999",
+	_, err := r.g.feedback.Load().Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "9999",
 		Conversation: "discord:g1/fb6", TaskID: "t-2", Rating: FeedbackDown, Answer: "x"})
 	if !errors.Is(err, errFeedbackUnverified) {
 		t.Fatalf("Rate from an unmapped sender = %v, want errFeedbackUnverified", err)
@@ -400,7 +419,7 @@ func TestDeskRefusesAnUnverifiedRater(t *testing.T) {
 func TestExportSinceSkipsOlderRatings(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
-	if err := r.g.feedback.Load().Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001",
+	if _, _, err := r.g.feedback.Load().Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001",
 		Conversation: "discord:g1/fb7", TaskID: "t-3", Rating: FeedbackDown}); err != nil {
 		t.Fatal(err)
 	}
