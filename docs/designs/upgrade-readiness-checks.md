@@ -338,7 +338,9 @@ Four ways a workload breaks on a new version:
   removal. Anything expecting cgroup v1 or a dockershim-era socket mount belongs here too.
   `--readiness` already pairs each pool's containerd major, read from its nodes, with the major the
   target's node image ships (`upgrade_shape_tables.py`, by minor and image family) and names the pods
-  mounting the runtime socket when the major changes; the cgroup mode is unread.
+  mounting the runtime socket when the major changes, and reads each pool's `effectiveCgroupMode`
+  against the target for the Java and .NET images below the cgroup v2 floor (the `cgroup-v2-runtime`
+  rule); the node's cgroup filesystem and the heap flags are unread.
 - **NetworkPolicies no dataplane enforces.** A legacy-dataplane cluster with the network policy
   add-on off and policies in its namespaces enforces nothing today, and all of them take effect at
   the node rebuild that follows enabling the add-on, or on the Dataplane V2 cluster that replaces
