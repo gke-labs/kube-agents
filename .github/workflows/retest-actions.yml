@@ -1,0 +1,68 @@
+name: Retest Actions Checks
+
+# `/retest` on a pull request re-runs its failed GitHub Actions checks. GitHub
+# lets Write and above re-run a workflow and most collaborators here hold
+# Triage, so a flaked check on someone else's pull request waited for an admin;
+# Prow's `/retest` re-runs only Prow jobs. The same comment still reaches Prow,
+# so one word covers both kinds of check. `scripts/rerun_failed_checks.py`
+# says what is re-run, what is left alone and why.
+#
+# `issue_comment` is the one trigger that runs in the base repository's context
+# with a writable token on a fork pull request, which is every pull request
+# here. The job checks out the default branch only, so no pull-request code
+# runs under that token, and a re-run executes the original run again with
+# its original actor's privileges, so the commenter gains none.
+on:
+  # zizmor: ignore[dangerous-triggers] - the command has to run on fork PRs, and only
+  # issue_comment keeps a write token there; the checkout is the default branch, so no
+  # pull-request code is fetched or executed and no other secret is exposed
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+# One run at a time per pull request, queued rather than cancelled: two
+# `/retest` comments in quick succession would otherwise both read the same
+# red run and the second re-run request would be refused mid-run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  retest:
+    name: Re-run failed checks on /retest
+    permissions:
+      contents: read # check out the default branch: the script
+      actions: write # re-run the workflow runs
+      pull-requests: read # the pull request's head commit
+      issues: write # 👀 (re-ran) or 😕 (nothing to re-run) on the comment that asked
+    # The command, on a pull request, from someone with a standing in the
+    # repository. `COLLABORATOR` is any invited collaborator whatever their
+    # level, which is the Triage set this exists for.
+    if: >-
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '/retest') &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      # The default branch, never the pull request head: this job holds a
+      # writable token and must not run code from a fork.
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Re-run the failed checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment, not interpolated into the script: event
+          # fields are attacker-controlled input on a comment trigger.
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          python3 scripts/rerun_failed_checks.py --pr "$PR_NUMBER" --react-to "$COMMENT_ID"

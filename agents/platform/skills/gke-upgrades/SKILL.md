@@ -228,7 +228,7 @@ table rather than reasoning from memory:
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
-  --output /opt/data/scratch/fleet_versions.json
+  --output /opt/data/scratch/fleet_versions_$(date +%s)_$$.json
 ```
 
 Without `--target-version` it measures each cluster against its own release channel's default and

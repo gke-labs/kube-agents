@@ -47,6 +47,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 import unittest.mock
 
 import yaml
@@ -264,15 +265,15 @@ class TestEveryTaskIsValid(unittest.TestCase):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
 
-    def test_every_task_names_an_owner(self):
+    def test_every_task_owner_is_a_person(self):
         for needle, guidance in (
             (
-                "declares no 'owner:'",
-                "These cases name nobody to answer when they flake -- see "
-                "bench/CONTRIBUTING.md:",
+                "is no longer allowed",
+                "These cases still say 'owner: maintainers'; delete the line -- "
+                "see bench/CONTRIBUTING.md:",
             ),
             ("leading at sign", "These cases write the owner as a mention:"),
-            ("neither a GitHub login", "These cases carry an owner that is not a login:"),
+            ("is not a GitHub login (", "These cases carry an owner that is not a login:"),
         ):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
@@ -466,7 +467,6 @@ class TestTheValidatorItself(unittest.TestCase):
             "id": "made-up-case",
             "name": "A case",
             "domain": "security",
-            "owner": "maintainers",
             "fixtures": ["rbac-overgrant"],
             "verification_spec": [
                 {
@@ -516,7 +516,6 @@ class TestTheRulesReject(unittest.TestCase):
         "id": "made-up-case",
         "name": "A case",
         "domain": "security",
-        "owner": "maintainers",
         "fixtures": ["rbac-overgrant"],
         "verification_spec": [
             {
@@ -620,8 +619,55 @@ class TestTheRulesReject(unittest.TestCase):
         # value, which would be a traceback instead of a finding.
         self._only("is not a slug string", domain=["security", "cost"])
 
-    def test_a_missing_owner_is_rejected(self):
-        self._only("declares no 'owner:'", owner=DELETE)
+    def test_a_missing_owner_passes(self):
+        # Optional: the case's bugs go to its domain's owner.
+        self.assertEqual(self._validate(owner=DELETE), [])
+
+    def _text_with(self, line):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        return yaml.safe_dump(spec) + line
+
+    def test_a_bare_owner_line_passes_like_a_missing_one(self):
+        # Both readers see a bare `owner:` as absent.
+        self.assertEqual(self._validate(text=self._text_with("owner:\n")), [])
+
+    def test_an_owner_the_filer_would_read_differently_is_rejected(self):
+        # YAML reads these as absent or as bob; case_owner's scan does not.
+        for line in ("owner: null\n", "owner: Null\n", "owner: >-\n  bob\n", "owner: &a bob\n", '"owner": bob\n'):
+            with self.subTest(line=line):
+                self._only("to scripts/case_owner.py", text=self._text_with(line))
+
+    def test_a_domain_the_filer_would_read_differently_is_rejected(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "domain"}
+        text = yaml.safe_dump(spec) + "domain: >-\n  " + self.VALID["domain"] + "\n"
+        problem = self._only("'domain:' reads as", text=text)
+        self.assertNotIn("'owner:'", problem)
+
+    def test_a_domains_row_the_filer_would_read_differently_fails_the_lint(self):
+        rows = {
+            "slug not first": "domains:\n  - name: Security\n    slug: security\n    owner: alice\n",
+            "quoted slug": 'domains:\n  - slug: "security"\n    owner: alice\n',
+        }
+        for label, text in rows.items():
+            with self.subTest(row=label), tempfile.TemporaryDirectory() as tmp:
+                path = pathlib.Path(tmp) / "domains.yaml"
+                path.write_text(text)
+                with mock.patch.object(validator, "DOMAINS_FILE", path):
+                    with self.assertRaisesRegex(validator.CaseError, "security"):
+                        self._validate()
+
+    def test_an_owner_line_inside_another_field_names_the_cause(self):
+        spec = {k: v for k, v in self.VALID.items() if k != "owner"}
+        text = yaml.safe_dump(spec) + 'notes: "first\nowner: mallory"\n'
+        self.assertIn("inside another field", self._only("to scripts/case_owner.py", text=text))
+
+    def test_an_empty_string_owner_is_rejected(self):
+        self._only("is not a GitHub login string", owner="")
+
+    def test_the_retired_maintainers_owner_is_rejected(self):
+        for owner in ("maintainers", "Maintainers"):
+            with self.subTest(owner=owner):
+                self._only("is no longer allowed", owner=owner)
 
     def test_an_owner_with_a_leading_at_sign_is_rejected(self):
         self._only("leading at sign", owner="@someone")
@@ -631,13 +677,17 @@ class TestTheRulesReject(unittest.TestCase):
         # shapes a contributor is likely to write; GitHub accepts none of them.
         for owner in ("someone@example.com", "Some One", "some--one", "-someone"):
             with self.subTest(owner=owner):
-                self._only("neither a GitHub login", owner=owner)
+                self._only("is not a GitHub login (", owner=owner)
 
     def test_an_owner_that_is_not_a_string_is_rejected(self):
         self._only("is not a GitHub login string", owner=["a", "b"])
 
-    def test_a_login_owner_passes(self):
-        self.assertEqual(self._validate(owner="some-one1"), [])
+    def test_any_login_passes(self):
+        # Any GitHub login, not only people in OWNERS: whether GitHub accepts
+        # it as an assignee is checked when a bug is filed, not offline.
+        for owner in ("some-one1", "GinnyJI"):
+            with self.subTest(owner=owner):
+                self.assertEqual(self._validate(owner=owner), [])
 
     # -- audit_streams --
 
@@ -867,7 +917,6 @@ class TestTheRulesReject(unittest.TestCase):
             text=(
                 "id: made-up-case\n"
                 "domain: security\n"
-                "owner: maintainers\n"
                 "verification_spec: [{name: n, role: objective, "
                 "check: {type: report_contains, required_phrases: [x]}}]\n"
             ),
@@ -1107,6 +1156,27 @@ class TestTheSanitizer(unittest.TestCase):
             },
         )
         self.assertTrue(found.startswith("tf/prebuilt/stack/main.tf:1:"), found)
+
+    def test_a_module_file_is_scanned(self):
+        # Rooted the way the repository scan is, so what is under test is
+        # SANITIZED_ROOTS rather than a walk of the whole temporary tree.
+        roots = [r.relative_to(validator.REPO_ROOT) for r in validator.SANITIZED_ROOTS]
+        found = self._findings(
+            {
+                "bench/tasks/case/task.yaml": "ok: 192.0.2.1\n",
+                "bench/tf/modules/drift-inject/main.tf": 'ip = "10.0.0.1"\n',
+            },
+            roots=roots,
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("IPv4 literal 10.0.0.1", found[0])
+        self.assertTrue(found[0].startswith("bench/tf/modules/drift-inject/main.tf:1:"), found[0])
+
+    def test_sanitized_roots_includes_modules_dir(self):
+        self.assertEqual(
+            validator.SANITIZED_ROOTS,
+            (validator.TASKS_DIR, validator.PREBUILT_DIR, validator.MODULES_DIR),
+        )
 
     def test_dot_directories_and_local_tofu_artefacts_are_skipped(self):
         files = {

@@ -10,7 +10,8 @@
 # Each row carries, besides `slug`, `name` and `journey`:
 #   owner    the GitHub login (no at sign) who answers for the domain's cases
 #            as a set: what is covered, what is missing, what a red means.
-#            A case's own `owner:` still answers when that case flakes.
+#            A case's own `owner:`, when set, is first for that case's bugs;
+#            without one the case falls to this owner (bench/CONTRIBUTING.md).
 #   backup   the GitHub login who covers when the owner is out; not the owner.
 #   meaning  one plain sentence saying what the domain checks, for a reader
 #            who does not know the code.
@@ -95,14 +96,14 @@ domains:
     journey: A targeted probe asks whether a control plane is current and reports the lag it actually read
   - slug: consistency
     name: Consistency (fleet-consistency-drift)
-    owner: toshiowang
+    owner: lapis2002
     backup: dshnayder
     meaning: Spots a cluster configured differently from its peers.
     journey: A targeted probe compares one cluster's configuration against its live peers and names the differing facet
   - slug: fleet-audits
     name: Fleet audits (SOP machinery)
-    owner: dshnayder
-    backup: lapis2002
+    owner: toshiowang
+    backup: dshnayder
     meaning: Runs a scheduled audit end to end and files a report people can act on.
     journey: "A scheduled audit SOP runs end to end: delegates to a worker, sweeps the fleet, and files a ledger issue a human can act on"
   - slug: remediation
@@ -137,8 +138,8 @@ domains:
     journey: A question about scraping, trace latency or an alert policy is answered from the live configuration, or written to the observability skill's guidance
   - slug: source-control
     name: Source control (forge and version-control work)
-    owner: lapis2002
-    backup: toshiowang
+    owner: dshnayder
+    backup: lapis2002
     meaning: Works with issues, pull requests, review feedback and branches on the code forge.
     journey: An issue, pull request, review comment or branch is read and written through the version-control verbs, never a credentialed clone or a forge CLI in the sandbox
 
