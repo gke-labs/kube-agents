@@ -101,20 +101,24 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     master = context.get(readiness_rules.CONTEXT_MASTER)
     master_text = (member.get("control_plane_version") if isinstance(member, dict) else None) if not master else None
     master_minor = (master[0], master[1]) if master else (tables.parse_minor(master_text) if master_text else None)
+    filed_without_target = 0
     for caller in log["callers"]:
         release_text = caller["removed_release"]
         if not release_text:
             continue
         release = tables.parse_minor(release_text)
+        # A removal the running control plane has crossed needs no target to grade: the API is
+        # already gone, so it is a note with or without one.
         if release is None:
             tier, detail = finding.TIER_RISK, RELEASE_UNPARSABLE_DETAIL.format(release=release_text)
-        elif target_minor is None:
-            tier, detail = finding.TIER_RISK, NO_TARGET_DETAIL.format(release=release_text)
-        elif release > target_minor:
-            tier, detail = finding.TIER_RISK, AFTER_TARGET_DETAIL.format(target=target_text)
         elif master_minor is not None and release <= master_minor:
             finding.add_note(result, CROSSED_NOTE.format(principal=caller["principal"], user_agent=caller["user_agent"], api=caller["api"], release=release_text, master=tables.format_minor(master_minor)))
             continue
+        elif target_minor is None:
+            tier, detail = finding.TIER_RISK, NO_TARGET_DETAIL.format(release=release_text)
+            filed_without_target += 1
+        elif release > target_minor:
+            tier, detail = finding.TIER_RISK, AFTER_TARGET_DETAIL.format(target=target_text)
         elif caller["caller_class"] == audit_log.CLASS_PROVIDER:
             tier, detail = finding.TIER_RISK, PROVIDER_DETAIL
         elif caller["caller_class"] == audit_log.CLASS_UNPLACED:
@@ -128,7 +132,7 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
             else:
                 tier, detail = finding.TIER_RISK, LAST_SEEN_UNPARSABLE_DETAIL.format(target=target_text, last_seen=caller["last_seen"])
         result[finding.RESULT_BLOCKING if tier == finding.TIER_BLOCKING else finding.RESULT_RISKS].append(_finding(caller, tier, detail, log))
-    if target_minor is None and any(c["removed_release"] for c in log["callers"]):
+    if filed_without_target:
         finding.add_note(result, NOTE_NO_TARGET)
     if log["sampled"]:
         finding.add_note(result, audit_log.sampled_note(log))

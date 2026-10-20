@@ -158,15 +158,22 @@ class RemovedApiCallersTest(unittest.TestCase):
         self.assertEqual(len(exactly["blocking"]), 1)
 
     def test_removal_after_the_target_is_a_risk_not_a_blocker(self):
-        result = removed_api_callers.evaluate({}, member(), read([]), TARGET_1_31, sample_context())
+        result = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), TARGET_1_31, sample_context())
         self.assertEqual(result["blocking"], [])
         self.assertIn("removed after the target 1.31", result["risks"][0]["detail"])
 
     def test_without_a_target_callers_are_risks_and_the_rule_notes_it(self):
-        result = removed_api_callers.evaluate({}, member(), read([]), None, sample_context())
+        result = removed_api_callers.evaluate({}, member(**self.BEHIND), read([]), None, sample_context())
         self.assertEqual((result["blocking"], result["unknown"]), ([], []))
         self.assertEqual(len(result["risks"]), 1)
+        self.assertIn("removed in 1.32; whether this upgrade crosses it needs a target", result["risks"][0]["detail"])
         self.assertIn(removed_api_callers.NOTE_NO_TARGET, result["notes"])
+        # A removal the running control plane has crossed needs no target: the same note as with
+        # one, no risk, and no note claiming a risk was filed.
+        result = removed_api_callers.evaluate({}, member(), read([]), None, sample_context())
+        self.assertEqual((result["blocking"], result["risks"], result["unknown"]), ([], [], []))
+        self.assertNotIn(removed_api_callers.NOTE_NO_TARGET, result["notes"])
+        self.assertEqual(len([n for n in result["notes"] if "which the control plane's 1.33 has crossed" in n]), 1)
 
     def test_provider_and_unplaced_principals_never_block(self):
         removed, _ = split_sample()
