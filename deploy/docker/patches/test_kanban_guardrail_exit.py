@@ -1113,6 +1113,10 @@ class FailedTurnErrorTextTest(unittest.TestCase):
         """A match parks the card in ready for good (check_respawn_guard)."""
         self.assertIsNone(RESPAWN_BLOCKER_COPY.search(kge.FAILED_TURN_ERROR))
 
+    def test_the_no_turn_error_text_is_not_a_respawn_blocker(self):
+        """No-turn error text must not match _RESPAWN_BLOCKER_RE either."""
+        self.assertIsNone(RESPAWN_BLOCKER_COPY.search(kge.NO_TURN_ERROR))
+
     def test_the_copy_does_match_the_incident_text(self):
         """Proves the copy is live: the provider text the charge must not carry."""
         self.assertIsNotNone(RESPAWN_BLOCKER_COPY.search(AUTH_ERROR))
@@ -1124,8 +1128,14 @@ class FailedTurnErrorTextTest(unittest.TestCase):
     def test_the_charged_text_does_not_count_as_a_protocol_violation(self):
         self.assertNotIn("protocol violation", kge.FAILED_TURN_ERROR)
 
+    def test_the_no_turn_error_text_does_not_count_as_a_protocol_violation(self):
+        self.assertNotIn("protocol violation", kge.NO_TURN_ERROR)
+
     def test_the_charged_text_fits_what_the_board_keeps(self):
         self.assertLessEqual(len(kge.FAILED_TURN_ERROR), kge.RECORDED_ERROR_MAX_CHARS)
+
+    def test_the_no_turn_error_text_fits_what_the_board_keeps(self):
+        self.assertLessEqual(len(kge.NO_TURN_ERROR), kge.RECORDED_ERROR_MAX_CHARS)
 
 
 class RecordFailedTurnTest(unittest.TestCase):
@@ -1152,6 +1162,60 @@ class RecordFailedTurnTest(unittest.TestCase):
         self.assertEqual(kwargs["expected_run_id"], 28)
         self.assertEqual(kwargs["event_payload_extra"]["failure_reason"], "auth")
         self.assertTrue(conn.closed)
+
+    def test_record_no_turn_charges_card_and_adds_comment(self):
+        conn = ClosableConn(board([("t_80ff98c9", "running", 28)]))
+        com = CommentRecorder()
+        rec = Recorder()
+        did = kge.record_no_turn(
+            task_id="t_80ff98c9",
+            run_id=28,
+            comment="no turn ran",
+            author="platform",
+            connect=lambda: conn,
+            add_comment=com,
+            record_failure=rec,
+        )
+        self.assertTrue(did)
+        self.assertEqual(com.calls, [("t_80ff98c9", "platform", "no turn ran")])
+        task_id, kwargs = rec.calls[0]
+        self.assertEqual(task_id, "t_80ff98c9")
+        self.assertEqual(kwargs["outcome"], kge.NO_TURN_OUTCOME)
+        self.assertEqual(kwargs["error"], kge.NO_TURN_ERROR)
+        self.assertEqual(kwargs["expected_run_id"], 28)
+        self.assertEqual(kwargs["event_payload_extra"]["failure_reason"], kge.NO_TURN_FAILURE_REASON)
+        self.assertTrue(conn.closed)
+
+    def test_record_no_turn_with_no_run_id_charges_nothing(self):
+        conn = ClosableConn(board([("t_80ff98c9", "running", 28)]))
+        com = CommentRecorder()
+        rec = Recorder()
+        did = kge.record_no_turn(
+            task_id="t_80ff98c9",
+            run_id=None,
+            comment="no turn ran",
+            author="platform",
+            connect=lambda: conn,
+            add_comment=com,
+            record_failure=rec,
+        )
+        self.assertFalse(did)
+        self.assertEqual(len(rec.calls), 0)
+        self.assertEqual(len(com.calls), 0)
+
+    def test_no_turn_comment_formats_run_and_exit_code(self):
+        comment = kge.no_turn_comment(run_id=28, exit_code=1)
+        self.assertIn("Run 28 ended before any turn ran", comment)
+        self.assertIn("exited with code 1", comment)
+
+    def test_close_no_turn_chat_non_kanban_returns_none(self):
+        code = kge.close_no_turn_chat(environ={"HERMES_KANBAN_TASK": ""})
+        self.assertIsNone(code)
+
+    def test_close_no_turn_chat_goal_or_cron_returns_none(self):
+        self.assertIsNone(kge.close_no_turn_chat(environ={"HERMES_KANBAN_TASK": "t_1"}, goal_mode=True))
+        self.assertIsNone(kge.close_no_turn_chat(environ={"HERMES_KANBAN_TASK": "t_1"}, cron_run=True))
+        self.assertIsNone(kge.close_no_turn_chat(environ={"HERMES_KANBAN_TASK": "t_1"}, delegated_child=True))
 
     def test_the_comment_is_written_after_the_charge_lands(self):
         """The comment says the run counted; it must not precede the charge."""
@@ -1870,17 +1934,27 @@ class ApplierTest(unittest.TestCase):
             self.assertEqual(len(charges.calls), 1, "the worker charges its own failure")
             self.assertEqual(charges.calls[0][1]["expected_run_id"], 28)
 
-            # A worker whose chat() returned before any turn keeps exit 0:
-            # an exit 1 with no board write would reach the reaper's burst
-            # breaker (see the module docstring).
+            # A worker whose chat() returned before any turn runs charges its
+            # own failure and exits 1, matching the -Q branch (gke-labs/kube-agents#3505).
             class NoTurnCLI(CLI):
                 def chat(self, query, images=None):
                     return None
 
+            db.execute(
+                "UPDATE tasks SET status = 'running', current_run_id = 28 WHERE id = 't_80ff98c9'"
+            )
             no_turn = NoTurnCLI()
             with mock.patch.dict(os.environ, WORKER_ENV):
-                cli_mod._run_single_query_mode(no_turn, "work kanban task t_80ff98c9", None, False, False)
+                with self.assertRaises(SystemExit) as ctx:
+                    cli_mod._run_single_query_mode(no_turn, "work kanban task t_80ff98c9", None, False, False)
+            self.assertEqual(ctx.exception.code, 1)
             self.assertTrue(no_turn.finalized)
+            self.assertEqual(len(comments), 2)
+            self.assertIn("ended before any turn ran", comments[1])
+            self.assertEqual(len(charges.calls), 2)
+            self.assertEqual(charges.calls[1][1]["expected_run_id"], 28)
+            self.assertEqual(charges.calls[1][1]["error"], kge.NO_TURN_ERROR)
+            self.assertEqual(charges.calls[1][1]["outcome"], kge.NO_TURN_OUTCOME)
 
             # A worker whose turn succeeded keeps exit 0.
             class DoneTurn:
@@ -1914,11 +1988,18 @@ class ApplierTest(unittest.TestCase):
             cli.index("sys.exit(_kube_kanban_exit_code)"),
         )
         self.assertEqual(cli.count("sys.exit(_kube_kanban_exit_code)"), 1)
+        self.assertLess(
+            cli.index("sys.exit(_kube_kanban_exit_code)"),
+            cli.index("sys.exit(_kube_no_turn_code)"),
+        )
+        self.assertEqual(cli.count("sys.exit(_kube_no_turn_code)"), 1)
 
     def test_the_inserts_and_the_module_agree_on_the_attribute(self):
         files = self._apply_all()
         self.assertIn(f"self.{kge.EXIT_CODE_ATTR} = ", files["chat"])
+        self.assertIn(f"self.{kge.TURN_SEEN_ATTR} = ", files["chat"])
         self.assertIn(f'getattr(cli, "{kge.EXIT_CODE_ATTR}", None)', files["cli"])
+        self.assertIn(f'getattr(cli, "{kge.TURN_SEEN_ATTR}", False)', files["cli"])
 
     def test_a_raising_rate_limit_block_does_not_skip_the_exit(self):
         """Separate try blocks: one failing hook must not swallow the other."""
