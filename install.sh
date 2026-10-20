@@ -4674,6 +4674,8 @@ prompt_litellm_env_secret_provider() {
     # credential prompts; accepting them here would skip those.
     if is_table_model_provider "$provider"; then
       print_error "'${provider}' has its own entry in the provider menu; this entry is for sap and any other LiteLLM provider slug."
+    elif [ "$provider" = "chatgpt" ]; then
+      print_error "'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
     else
       print_error "'${provider}' is not a LiteLLM provider slug (lowercase letters, digits and underscores)."
     fi
@@ -6852,7 +6854,11 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, openai_compatible, sap, or a LiteLLM provider slug (lowercase letters, digits and underscores) with --model-default-name."
+    if [ "$model_provider" = "chatgpt" ]; then
+      print_error "Model provider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
+    else
+      print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, openai_compatible, sap, or a LiteLLM provider slug (lowercase letters, digits and underscores) with --model-default-name."
+    fi
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"

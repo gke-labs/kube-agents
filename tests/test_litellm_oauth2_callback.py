@@ -250,11 +250,15 @@ class TestHook(unittest.TestCase):
         self.assertEqual(out["api_key"], "tok-2")
 
     def test_only_an_alias_served_wholly_by_hosted_vllm_gets_the_bearer(self):
+        # An alias the router does not serve is left alone without a warning:
+        # the proxy refuses it next, and the one-shot "blind" warning must stay
+        # available for a router the hook really cannot read.
         for alias in ("gemini", "mixed", "unknown", ""):
-            with self.subTest(alias=alias):
+            with self.subTest(alias=alias), self.assertNoLogs(self.hook.logger, level="WARNING"):
                 out = self._run({"model": alias})
                 self.assertNotIn("api_key", out)
         self.assertEqual(self.endpoint.requests, [])
+        self.assertFalse(self.hook._blind_warned)
 
     def test_a_hook_that_cannot_see_the_router_leaves_the_request_and_says_so_once(self):
         instance = self.hook.proxy_handler_instance

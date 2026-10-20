@@ -229,10 +229,10 @@ def hosted_vllm_deployments(model_name: str, router: Any) -> list[dict]:
         return []
     params = [d.get(DEPLOYMENT_PARAMS_KEY) or {} for d in deployments]
     models = [p.get(DEPLOYMENT_MODEL_KEY, "") for p in params]
-    if not models or not any(models):
-        _warn_blind(f"the router returned no deployment model for {model_name!r}")
-        return []
-    if not all(str(m).startswith(HOSTED_VLLM_PREFIX) for m in models):
+    # No deployments is what the router answers for an alias it does not
+    # serve, which the proxy refuses right after this hook: not this hook's
+    # concern and not a sign it is blind, so no warning.
+    if not models or not any(models) or not all(str(m).startswith(HOSTED_VLLM_PREFIX) for m in models):
         return []
     return params
 
