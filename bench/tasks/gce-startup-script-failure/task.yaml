@@ -38,9 +38,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: fleet-audits
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 verification_spec:
   # The slug against the LEDGER's finding ids (scope: finding_ids), as
   # consistency-no-environment-label explains: an id carries the check slug,

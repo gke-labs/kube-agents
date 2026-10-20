@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The merge queue's two gate checks.
+"""The merge queue's two gate checks, and the sweep that enqueues pull requests.
 
 Part of the Tide-to-merge-queue migration (#1363). Tide decides two things
 that `main`'s required GitHub checks do not: the smoke test passed, and the
@@ -30,12 +30,28 @@ decides the same two for the pull request named in the
 queue branch, as jobs that carry the check names. That judges only the last
 pull request in a group, which is enough under the `ALLGREEN` grouping the
 queue must use: every pull request ahead of it passed its own group first.
+
+`sweep` is the queue's way in. No author here has write access, the robot
+included, so nobody can press "Merge when ready". For every pull request on
+`main` that passes the label test it turns auto-merge on, which with a queue
+means "enqueue once the required checks pass", and it takes a pull request
+that lost a label or gained a hold back out. It also re-posts the head
+statuses of those pull requests, in case an event was missed. The auto-merge
+and dequeue calls use a GitHub App token, `ENQUEUE_TOKEN`: GitHub starts no
+workflow run for an event `GITHUB_TOKEN` causes, so a queue entry it made could
+get no `merge_group` runs, and turning on auto-merge needs `contents: write`
+(and `workflows: write` for a pull request that changes a workflow file).
+
+A pull request the queue removed, or that someone took out by hand, stays out
+until its head moves (its first check suite is newer than the removal): its head checks are still green, so turning auto-merge on
+again would put the same failing tree back in the queue every five minutes.
 """
 
 import argparse
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -85,6 +101,51 @@ SHORT_SHA = 12
 SUCCESS = "success"
 PENDING = "pending"
 FAILURE = "failure"
+ENABLE = "enable"
+DISABLE = "disable"
+LEFT_OUT = "left out"
+#: The sweep's own login when `--actor` names no App: `GITHUB_TOKEN`'s, which makes no queue
+#: call. A write run always passes the App's slug, whose own dequeue of a held pull request does
+#: not keep it out; a dry run has no App token, so it may report that dequeue as a removal.
+SWEEP_ACTOR = "github-actions"
+#: The suffix REST puts on a bot's login and GraphQL leaves off.
+BOT_SUFFIX = "[bot]"
+#: How long after the head's first check suite a queue removal still counts as caused by that
+#: push: a push to a queued pull request removes it, and the two land within seconds.
+PUSH_REMOVAL_WINDOW = timedelta(minutes=2)
+#: Enough of the head's check suites to find the first; Actions and the CLA app each add one.
+CHECK_SUITES_READ = 10
+
+#: The smoke and the gates are commit statuses; the rollup also carries check runs, which this skips.
+PULLS_QUERY = """
+query($owner: String!, $name: String!, $base: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, baseRefName: $base, first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id number isDraft headRefOid
+        labels(first: 100) { nodes { name } }
+        autoMergeRequest { enabledAt }
+        mergeQueueEntry { id }
+        timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+          nodes { ... on RemovedFromMergeQueueEvent { createdAt actor { login } } }
+        }
+        commits(last: 1) { nodes { commit {
+          checkSuites(first: %d) { nodes { createdAt } }
+          statusCheckRollup { contexts(first: 100) { nodes {
+          __typename
+          ... on StatusContext { context state description }
+        } } } } } }
+      }
+    }
+  }
+}
+"""
+ENABLE_MUTATION = "mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"
+DISABLE_MUTATION = "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"
+DEQUEUE_MUTATION = "mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }"
+#: The GraphQL type name of a commit status in a rollup.
+STATUS_CONTEXT = "StatusContext"
 
 
 def labels_verdict(labels):
@@ -139,6 +200,17 @@ def verdicts(pull, files):
         SMOKE_GATE: smoke_gate,
         LABELS_GATE: labels_verdict(pull["labels"]),
     }
+
+
+def enqueue_action(pull):
+    """ENABLE, DISABLE, LEFT_OUT or None: what the sweep does with one pull request's auto-merge."""
+    wanted = not pull["draft"] and labels_verdict(pull["labels"])[0] == SUCCESS
+    queued = pull["auto_merge"] or pull["queue_entry"] is not None
+    if wanted and not queued:
+        return LEFT_OUT if pull.get("removed_since_push") else ENABLE
+    if queued and not wanted:
+        return DISABLE
+    return None
 
 
 def latest_statuses(api, sha):
@@ -229,6 +301,111 @@ def cmd_group(api, ref, gate):
     return state == SUCCESS, f"#{number} {gate}: {state}: {description}"
 
 
+def rollup_statuses(nodes):
+    """{context: (state, description)} from a GraphQL rollup, read as `latest_statuses` reads REST.
+
+    GraphQL spells states in capitals; the REST form is what gets compared and
+    posted.
+    """
+    return {
+        node["context"]: (node["state"].lower(), node.get("description") or "")
+        for node in nodes
+        if node.get("__typename") == STATUS_CONTEXT
+    }
+
+
+def removed_since_push(node, actor=SWEEP_ACTOR):
+    """Whether someone other than the sweep removed the pull request from the queue after its last push.
+
+    The push time is the head's first check suite: the timeline places a commit
+    by its commit date, not by when it was pushed. A head with no check suite
+    counts as pushed after any removal.
+    """
+    removals = ((node.get("timelineItems") or {}).get("nodes")) or []
+    if not removals or not removals[-1].get("createdAt"):
+        return False
+    login = ((removals[-1].get("actor")) or {}).get("login") or ""
+    if login.removesuffix(BOT_SUFFIX) == actor.removesuffix(BOT_SUFFIX):
+        return False
+    commits = node["commits"]["nodes"]
+    suites = ((commits[0]["commit"].get("checkSuites") or {}).get("nodes") or []) if commits else []
+    pushed = [parse_time(suite["createdAt"]) for suite in suites if suite.get("createdAt")]
+    if not pushed:
+        return False
+    return parse_time(removals[-1]["createdAt"]) - min(pushed) > PUSH_REMOVAL_WINDOW
+
+
+def parse_time(stamp):
+    """A GitHub timestamp, `2026-10-13T20:13:25Z`, as an aware datetime."""
+    return datetime.fromisoformat(stamp)
+
+
+def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
+    """Every open pull request on `base`, with what the sweep reads, in one query per 50."""
+    owner, name = api.repo.split("/", 1)
+    pulls = []
+    after = None
+    while True:
+        page = api.graphql(PULLS_QUERY % CHECK_SUITES_READ, {"owner": owner, "name": name, "base": base, "after": after})
+        page = page["repository"]["pullRequests"]
+        for node in page["nodes"]:
+            commits = node["commits"]["nodes"]
+            rollup = commits[0]["commit"]["statusCheckRollup"] if commits else None
+            pulls.append({
+                "id": node["id"],
+                "number": node["number"],
+                "sha": node["headRefOid"],
+                "base": base,
+                "draft": node["isDraft"],
+                "labels": {label["name"] for label in node["labels"]["nodes"]},
+                "auto_merge": node["autoMergeRequest"] is not None,
+                "queue_entry": (node["mergeQueueEntry"] or {}).get("id"),
+                "removed_since_push": removed_since_push(node, actor),
+                "statuses": rollup_statuses(((rollup or {}).get("contexts") or {}).get("nodes") or []),
+            })
+        if not page["pageInfo"]["hasNextPage"]:
+            return pulls
+        after = page["pageInfo"]["endCursor"]
+
+
+def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False):
+    """Re-post head statuses and reconcile auto-merge for every pull request. (lines, failures).
+
+    `api` reads and posts statuses; `enqueuer`, the App token, makes the
+    auto-merge and dequeue calls.
+
+    Statuses are refreshed only for pull requests that pass the label test:
+    those are the ones the queue can take, and refreshing every open pull
+    request every five minutes would spend most of `GITHUB_TOKEN`'s hourly
+    allowance.
+    """
+    enqueuer = enqueuer or api
+    lines = []
+    failures = 0
+    for pull in graphql_pulls(api, base, actor):
+        try:
+            if not pull["draft"] and labels_verdict(pull["labels"])[0] == SUCCESS:
+                lines += gate_pull(api, pull, dry_run=dry_run)
+            action = enqueue_action(pull)
+            if action == ENABLE and not dry_run:
+                enqueuer.graphql(ENABLE_MUTATION, {"id": pull["id"]})
+            elif action == DISABLE and not dry_run:
+                if pull["queue_entry"]:
+                    enqueuer.graphql(DEQUEUE_MUTATION, {"id": pull["id"]})
+                if pull["auto_merge"]:
+                    enqueuer.graphql(DISABLE_MUTATION, {"id": pull["id"]})
+            if action:
+                if action == LEFT_OUT:
+                    lines.append(f"#{pull['number']}: left out, removed from the queue since its last push")
+                else:
+                    verb = {ENABLE: "auto-merge on", DISABLE: "auto-merge off and out of the queue"}[action]
+                    lines.append(f"#{pull['number']}: {'would turn ' if dry_run else ''}{verb}")
+        except Exception as error:  # one pull request must not stop the sweep
+            failures += 1
+            lines.append(f"#{pull['number']}: failed: {error}")
+    return lines, failures
+
+
 def _parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"), help="owner/name")
@@ -241,6 +418,9 @@ def _parse_args(argv):
     group = sub.add_parser("group", help="judge one gate on a merge queue commit; exit 1 unless it passes")
     group.add_argument("--ref", required=True, help="the queue branch, github.event.merge_group.head_ref")
     group.add_argument("--gate", required=True, choices=GATES)
+    sweep_ = sub.add_parser("sweep", help="refresh statuses and reconcile auto-merge for every pull request on a base")
+    sweep_.add_argument("--base", default=BASE, choices=BASES)
+    sweep_.add_argument("--actor", default=SWEEP_ACTOR, help="the login ENQUEUE_TOKEN acts as: the App's slug")
     return parser.parse_args(argv)
 
 
@@ -256,9 +436,16 @@ def main(argv=None):
         lines = cmd_pull(api, args.number, dry_run=args.dry_run)
     elif args.command == "status":
         lines = cmd_status(api, args.sha, dry_run=args.dry_run)
-    else:
+    elif args.command == "group":
         passed, line = cmd_group(api, args.ref, args.gate)
         lines, failures = [line], 0 if passed else 1
+    else:
+        enqueue_token = os.environ.get("ENQUEUE_TOKEN")
+        if not enqueue_token and not args.dry_run:
+            print("ENQUEUE_TOKEN is required unless --dry-run", file=sys.stderr)
+            return 2
+        enqueuer = GitHubAPI(args.repo, enqueue_token, user_agent=USER_AGENT) if enqueue_token else None
+        lines, failures = sweep(api, args.base, enqueuer, args.actor, dry_run=args.dry_run)
     for line in lines:
         log(line)
     return 1 if failures else 0

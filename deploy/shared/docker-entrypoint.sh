@@ -21,6 +21,12 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
+# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
+# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
+readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# The first four bytes of an ELF executable, in hex: step 4.4's check that a file
+# named tirith is a binary before it removes it.
+readonly ELF_MAGIC_HEX=7f454c46
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -975,7 +981,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # do, because cron_jobs_sync.py never prunes: its ledger stops a retired job
 # coming BACK, it never removes one the volume already has.
 #
-# `--cron-retire` deletes the governance ids from this roster outright. They ran
+# `--cron-retire` deletes the listed ids from this roster outright. The governance ids ran
 # here only while the platform profile's store had no ticker; now that
 # `profile-cron-tick` gives it one, they are back on the Platform Agent's own
 # roster where the scheduler can reach their `skills`, `model` and `max_turns`
@@ -990,6 +996,10 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # this image ships it. Retiring it and shipping it on the Platform Agent's roster
 # is the same move, applied late.
 #
+# first-run-quick-value-audit is retired, not moved: `oobe` runs the same first-run audits. A
+# volume that never booted an image shipping it disabled still holds it enabled, and nothing
+# else can reach that copy once the image stops shipping it.
+#
 # It runs BEFORE 2c-bis deliberately, and the two lists must not overlap. The
 # order only decides how fast an accidental overlap bites, not whether it does:
 # retire-last would delete a job the image still ships on every single boot,
@@ -1000,7 +1010,8 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # an id belongs on this list only once no roster in this image ships it.
 #
 # This list shrinks to nothing once no live volume can still be carrying the
-# entries; until then removing a name from it silently restores the double-fire.
+# entries; until then removing a name from it silently restores the double-fire, or for
+# first-run-quick-value-audit an enabled copy nothing can reach.
 #
 # `--home` overlays the default profile in place, because that profile IS
 # $TARGET_DIR and has no entry under profiles/ to name. `--cron-jobs` names the
@@ -1016,7 +1027,7 @@ if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
         --template /opt/defaults \
         --items "cron" \
         --cron-jobs "profile-cron-tick" \
-        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver" \
+        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver first-run-quick-value-audit" \
         >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
 fi
 
@@ -1034,21 +1045,17 @@ fi
 # reading it back off the volume is the one place a partial upgrade can hide. It also frees
 # this step from depending on step 2b having worked.
 #
-# Writing jobs.json without a lock is safe WITHIN THIS POD, on two facts. The scheduler in
-# THIS container is not running yet — everything here is ahead of `exec "$@"`. And no OTHER
-# container in this pod is running this code: step 1.5 hands the shared tree to a single
-# owner, so the dashboard, which has no scheduler and no reason to touch the schedule, stops
-# before it gets here.
+# Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
+# coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# Both facts stop at the pod boundary. Step 1.5 elects an owner per pod, not per volume, so
-# at availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
+# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
 # rather than a volume each — every replica's gateway is an owner and several of them run
-# this against the same file, with a rolling update overlapping new pods and old. The
-# exposure and why it is not fixable from inside the script are set out in cron_jobs_sync.py's
-# Concurrency section; the short version is that the reconcile wants to run once per volume,
-# which is a topology change rather than a lock. Single-replica installs, the default, are
-# unaffected. Do not restore a bare "there is no second writer" claim here: it was written
-# once, it was wrong, and it read as verified.
+# this against the same file, with a rolling update overlapping new pods and old. While
+# .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
+# cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
+# which is a topology change. Single-replica installs, the default, are unaffected. Do not
+# restore a bare "there is no second writer" claim here: it was written once, it was wrong,
+# and it read as verified.
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
@@ -1056,13 +1063,12 @@ fi
 # be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
 # different reason: an install that onboarded before the job existed must never get it. oobe.py
 # skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
-# it is not owed. `first-run-quick-value-audit` ships disabled; seeding it keeps an onboarded
-# install from gaining even the disabled entry.
+# it is not owed.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe,first-run-quick-value-audit"
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe"
     fi
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$CRON_SYNC" \
@@ -1518,11 +1524,22 @@ fi
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
+    CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
+    [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        # The cp -f above replaces each cluster-* profile's SOUL.md with the blank
+        # image template (/opt/cluster-template/SOUL.md) on every gateway restart.
+        # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
+        # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
+        # keep their identity in SOUL.md.
+        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
+                || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
+        fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by
@@ -1850,6 +1867,26 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
         echo "ERROR: a profile's scheduled runs would not use the managed ssh terminal, or the managed block is unusable (see the lines above); refusing to start" >&2
         exit 1
     fi
+fi
+
+# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
+# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
+# so with the image's copy there a home's bin/tirith is dead cache, never used
+# again, and it was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data
+# volume at 209 clusters (gke-labs#3325). Removed only when PATH resolves the
+# image's copy, and only a regular file named exactly tirith in $TARGET_DIR/bin
+# or a profile's bin/ that starts with the ELF magic. The file is never run: it
+# sits on a volume workers can write, and this is the bootstrap container. Each
+# removal is logged with its size, so an operator can see where the space went.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
+    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
+        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
+        [ "$(od -An -tx1 -N4 "$stale_tirith" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
+        stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
+        if rm -f "$stale_tirith"; then
+            echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
+        fi
+    done
 fi
 
 # Everything that writes shared volume state is done; release the bootstrap lock

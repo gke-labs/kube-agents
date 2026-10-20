@@ -1,9 +1,11 @@
 # The GitLab lane's matrix: what pull-kube-agents-smoke-test-gitlab runs on
 # a pull request and ci-kube-agents-eval-nightly-gitlab runs once a night
-# (kube-agents#2394, #2832). hack/ci-eval-pr.sh reads this file in place of
-# the catalogue whenever EVAL_FORGE=gitlab, on either tier: nothing else
-# grades the forge, so the twelve other presubmit cases and the nightly-only
-# cases run on GitHub only. The nightly never appends to the evidence store.
+# (kube-agents#2394, #2832), and ci-kube-agents-eval-nightly-gitlab-next runs
+# once a night under spec.mode next (EVAL_MODE_NEXT=1, through the inject
+# door). hack/ci-eval-pr.sh reads this file in place of the catalogue
+# whenever EVAL_FORGE=gitlab, on either tier: nothing else grades the forge,
+# so the presubmit cases and the other nightly-only cases run on GitHub
+# only. Neither nightly appends to the evidence store.
 #
 # One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
 # a comment, blank lines are skipped. Every entry must be a registered case,
@@ -22,9 +24,11 @@
 # WHAT CAN RED THE LANE. The blocking roster still applies, intersected with
 # this list: a roster case here arms rung 4 on the lane; a held-out case here
 # runs and reports without arming it, as it does on the GitHub presubmit.
-# Rungs 1-3 red the lane like every case. Since 2026-10-14 pdb-remediation-pr
-# is on the roster (#2016), so its collapse reds the lane's verdict; the other
-# two cases below are held out and report without arming it.
+# Rungs 1-3 red the lane like every case. pdb-remediation-pr was on the
+# roster from 2026-10-14 (#2016) until its demotion to the nightly on
+# 2026-10-17 (#3120), so today no case below is on the roster: all three are
+# held out, rung 4 is disarmed on the lane (the script says so in the log),
+# and the case returns to arming it with its roster line.
 # The job runs on demand (`/test pull-kube-agents-smoke-test-gitlab`) and
 # nightly, never as a blocking presubmit: the agent goes through the same
 # forge abstraction on both forges, so the GitHub presubmit grades what a
@@ -33,15 +37,15 @@
 #
 # WHO APPROVES. The normal approvers (root OWNERS), as for nightly-cases.txt
 # and the inject-lane files: this file changes what one on-demand lane and
-# the nightly run, not what can red a pull request.
+# the two nightlies run, not what can red a pull request.
 #
 # BUDGET. Three cases, nine units at EVAL_REPETITIONS of 3, every one in the
 # fan-out's second phase (each requests a merge request; unit_phase in the
 # script), so they run one at a time: pdb-remediation-pr (hinted 1250s),
 # vcs-spent-branch-reuse (1000s) and vcs-review-feedback-read-back (700s)
 # are ~150 minutes of units at the hints, plus ~16 minutes of lease, build
-# and deploy: inside the job's 360-minute deadline, and longer than the
-# GitHub presubmit's ~136-minute median.
+# and deploy: inside the presubmit's 360-minute deadline and the nightlies'
+# 480, and longer than the GitHub presubmit's ~136-minute median.
 #
 # WHY THESE. The two vcs cases exist to exercise the forge (a branch reused
 # after its first proposal closed; a second revision read back before it is
@@ -61,5 +65,7 @@
 # before it is described (pull_request_opened).
 ./tasks/vcs-review-feedback-read-back/task.yaml
 # The remediation path: the fix lands as a merge request on the project's
-# GitLab repository, never on the cluster (pull_request_opened).
+# GitLab repository, never on the cluster (pull_request_opened). Registered
+# in nightly-cases.txt since its demotion (#3120); the lane picks from either
+# file.
 ./tasks/pdb-remediation-pr/task.yaml

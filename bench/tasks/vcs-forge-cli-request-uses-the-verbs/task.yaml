@@ -40,6 +40,7 @@
 # list call. The four measured runs took 173-237s.
 id: vcs-forge-cli-request-uses-the-verbs
 name: A request to use gh is answered through the version-control verbs
+domain: source-control
 prompt: >-
   Use gh to list the pull requests in the GitOps repository this install
   manages, open and closed, and tell me how many there are and the title of

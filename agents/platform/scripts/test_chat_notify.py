@@ -2,6 +2,7 @@
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -413,6 +414,65 @@ class SlackRouteTest(unittest.TestCase):
         self.assertEqual(post, self.skv.AuditPost("4.4"))
         self.assertEqual(post_blocks.call_args.args[:3], ("C1", "t", [{"type": "divider"}]))
         chat.assert_not_called()
+
+class ConversationRouteTest(unittest.TestCase):
+    """The route the hermes-bridge records, and the post into that conversation."""
+
+    ROUTE = {"platform": "slack", "conversation": "slack:C0HOME/1.1", "context_id": "ctx-1", "ask": "question"}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db = os.path.join(tmp.name, "session_kv.db")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("CREATE TABLE session_metadata (session_id TEXT PRIMARY KEY, metadata TEXT)")
+            conn.execute("INSERT INTO session_metadata VALUES (?, ?)",
+                         ("a2a-ctx-1", json.dumps({"conversation_route": self.ROUTE, "other": 1})))
+            conn.execute("INSERT INTO session_metadata VALUES (?, ?)",
+                         ("a2a-ctx-2", json.dumps({"conversation_route": {**self.ROUTE, "context_id": ""}})))
+            conn.execute("INSERT INTO session_metadata VALUES (?, ?)", ("a2a-ctx-3", "not json"))
+        patcher = mock.patch.dict(os.environ, {chat_notify.SESSION_KV_DB_ENV: self.db})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_recorded_route_is_read_without_its_ask(self):
+        self.assertEqual(
+            chat_notify.conversation_route("a2a-ctx-1"),
+            {"platform": "slack", "conversation": "slack:C0HOME/1.1", "context_id": "ctx-1"},
+        )
+
+    def test_no_usable_route_is_empty(self):
+        for session in ("a2a-ctx-2", "a2a-ctx-3", "a2a-ctx-absent", ""):
+            with self.subTest(session=session):
+                self.assertEqual(chat_notify.conversation_route(session), {})
+        with mock.patch.dict(os.environ, {chat_notify.SESSION_KV_DB_ENV: self.db + ".absent"}):
+            self.assertEqual(chat_notify.conversation_route("a2a-ctx-1"), {})
+
+    def test_conversation_command(self):
+        self.assertEqual(
+            chat_notify.conversation_command("slack", "slack:D0DM/1.1", "ctx-1", "-- the report"),
+            ["a2a", "notify", "--platform", "slack", "--conversation", "slack:D0DM/1.1", "--context", "ctx-1",
+             "--", "-- the report"],
+        )
+        argv = chat_notify.conversation_command("slack", "slack:D0DM/1.1", "ctx-1", "x", "/tmp/c.json", "key", 60)
+        self.assertEqual(argv[argv.index("--chat-file") + 1], "/tmp/c.json")
+        self.assertEqual(argv[argv.index("--update") + 1], "key")
+        self.assertEqual(argv[argv.index("--timeout") + 1], "60s")
+        argv = chat_notify.conversation_command("slack", "slack:D0DM/1.1", "ctx-1", "x", timeout_s=0.5)
+        self.assertEqual(argv[argv.index("--timeout") + 1], "1s")
+
+    def test_the_bus_and_the_served_platform_come_from_the_env(self):
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: " slack ", "NATS_URL": "nats://n:4222",
+                                          "A2A_BUS_USER": "agent", "NATS_USER": ""}):
+            self.assertEqual(chat_notify.gateway_platform(), "slack")
+            self.assertEqual(chat_notify.bus_unreachable_reason(), "")
+            with mock.patch.dict(os.environ, {"A2A_BUS_USER": "", "NATS_USER": "legacy"}):
+                self.assertEqual(chat_notify.bus_unreachable_reason(), "")
+            with mock.patch.dict(os.environ, {"A2A_BUS_USER": ""}):
+                self.assertIn("no bus identity", chat_notify.bus_unreachable_reason())
+            with mock.patch.dict(os.environ, {"NATS_URL": ""}):
+                self.assertIn("NATS_URL", chat_notify.bus_unreachable_reason())
+
 
 if __name__ == "__main__":
     unittest.main()

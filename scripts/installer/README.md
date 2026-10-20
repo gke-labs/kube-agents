@@ -43,7 +43,11 @@ their own copies:
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
 | `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
-| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
+| `is_table_model_provider <provider>`                                      | The providers with a menu entry (`openai_compatible` and `sap` included)               |
+| `is_valid_model_provider <provider>`                                      | Those, or any other LiteLLM provider slug (`^[a-z][a-z0-9_]*$`)                        |
+| `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                  |
+| `validate_model_provider_inputs <provider> <model>`                       | A slug outside the menu needs `MODEL_DEFAULT_NAME`                                     |
+| `validate_litellm_env_secret_name <name>`                                 | `LITELLM_ENV_SECRET_NAME`: a Kubernetes Secret name, or empty                          |
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
@@ -373,8 +377,13 @@ github.com, it refuses both.
 - A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`, and a recorded
   GitHub Enterprise Server host and CA Secret. A switch back to GitHub drops the GitLab keys.
 - A run on GitHub that changes the GitHub host or the CA Secret rewrites `GITOPS_ORG`,
-  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys, and drops
-  `GITHUB_PEM_PATH`.
+  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys. It keeps
+  `GITHUB_PEM_PATH` (the path, never the key): the path this run uses (from `--github-pem-path` or
+  the PEM prompt), or else the recorded one. A move to another GitHub host does not keep the
+  recorded path, because it is the old App's key: give the new App's key with
+  `--github-pem-path`, or export `GITHUB_PEM_PATH` for the run when `install.env` records no
+  path (a recorded line wins over the shell). A run that does not need the file (the KMS key already has an `ENABLED`
+  version and the file is gone) records no path.
 - Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
   `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
 
@@ -388,7 +397,21 @@ path is never recorded. A declined run, or `--dry-run`, leaves the file as it wa
 
 Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
 that would render GitOps off while the minter is running, and prints the lines to set with the
-live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+live values filled in. A minter that this install did not make (one made by hand, by
+`make deploy-github`, or by another Helm release: the `kube-agents` release record has
+`githubMinter.enabled` false, the Deployment carries no Helm annotations for this release, and
+the install's Terraform state holds no `module.github_minter`) is not something the apply removes, so the run does not ask for `GITHUB_APP_ID`. Over such a
+minter, the run refuses when its `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not name the
+PlatformAgent's live GitOps repository, or when it cannot read the PlatformAgent or that
+repository, because the apply would take the repository out of the PlatformAgent or point it at
+another one. It also refuses to render the chart's own minter over the other one, because Helm
+does not take over objects it does not own: remove all of the other minter's objects first
+(`make -C k8s-operator undeploy-github` with the same `GITHUB_MINTER_KSA_NAME` for the kustomize
+path, and a `github-app-credentials` Secret made by hand), or set `GITHUB_APP_ID` empty (and, with
+`install.sh`, give no `--github-app-id`). With no readable release record (a first install), these
+cases get the checks above. `KUBE_AGENTS_REMOVE_GITOPS=true` skips all of these checks; the apply
+then renders the repository that `GITOPS_ORG` and `GITOPS_REPO` name, or none when `GITOPS_ORG` is
+empty. `install.sh --generate-only` is refused too, and removes the tfvars it
 wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
 Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
 in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
@@ -658,6 +681,21 @@ made of custom IAM roles cannot declare a scope: a custom IAM role is never carr
 projects (only the predefined read roles in `scope.tf`'s allowlist are, those of them the host
 project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
 `roles/container.clusterViewer` or `roles/container.viewer`.
+
+### Daily alert ceilings
+
+`ALERT_DAILY_LIMIT_CRITICAL`, `ALERT_DAILY_LIMIT_WARNING`, `ALERT_DAILY_LIMIT_INFO` and
+`ALERT_DAILY_LIMIT_DRIFT` set the daily alert ceilings. `write_tfvars_from_state` writes each key
+that is set into `alert_daily_limits`, and the chart renders it into the `PlatformAgent`'s
+`spec.deployment.env`. An empty key is not written, so the agent image keeps its default for that
+bucket. For this reason, `install.defaults.env` has no entry for these keys. The generator refuses a
+value that is not a whole number of 0 or more, and names the key. `install.sh` records all four
+keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
+value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
+apply these keys. The operator and harness modes of `upgrade.sh` use the values that the release
+recorded. But each `upgrade.sh` run calls the generator before it selects the mode, so a bad value
+stops the run in every mode. The [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+gives the buckets, the defaults, and what happens to entries added to the CR by hand.
 
 ### Cluster adoption and component toggles
 

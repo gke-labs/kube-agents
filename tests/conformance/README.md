@@ -68,7 +68,7 @@ ownership check, and pinning it would have encoded that gap as an intention.
 
 ## Known violations are expected failures
 
-Eleven assertions currently fail. They are decorated `@known_violation`, which
+Ten assertions currently fail. They are decorated `@known_violation`, which
 is `unittest.expectedFailure` plus a registration, so CI is green and the gap
 still has a name, a line number and a citation. Fixing the control turns the
 expected failure into an _unexpected success_, which unittest reports as a
@@ -83,7 +83,7 @@ reads with an anchor string that `test_harness_selfcheck.py` verifies. Rename
 a symbol and the self-check goes red before anything gets a chance to pass
 quietly.
 
-Three sets of inputs are not registered. The group-B workflow tests glob
+Four sets of inputs are not registered. The group-B workflow tests glob
 `.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
 slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
@@ -95,8 +95,9 @@ an absence is true of the empty set, so `_workflows()` in
 `test_B_write_path.py` raises on its behalf. C4's SHA-pin sweep keeps its own
 copy of the glob and guards it the same way. C4 is the invariant; its
 stricter form, which also requires the version comment beside each SHA and a
-digest on a `docker://` ref, and the fork-guard check on every auto-triggered
-credentialed workflow, run under `make test-python` in
+digest on a `docker://` ref, the fork-guard check on every auto-triggered
+credentialed workflow, and the check that every Docker Hub pull goes through
+`mirror.gcr.io`, run under `make test-python` in
 `tests/test_workflow_pins_and_fork_guards.py`.
 
 Another is the site's content tree, which D2 walks for the read-only
@@ -109,6 +110,10 @@ The third is the mirrored `gke-*` skills, which C4 globs under
 `agents/platform/skills/` to require an `upstream.lock` beside each one. The
 test asserts the glob is non-empty, and `gke-basics`'s lock is registered and
 required to be in the set, so the self-check names the tree when it moves.
+
+The fourth is `scripts/`, which B2 globs for merge calls a workflow scan cannot
+see. The test requires the one allowed call to be found, so an empty or moved
+set goes red, and `scripts/merge_gate.py`, which holds that call, is registered.
 
 ## Invariant → test → bucket → historical attack
 
@@ -156,6 +161,7 @@ currently fails.
 | A3  | the executor's derived grant does not reach its own `…in`                                 | 1        | `test_A3_the_executors_grant_does_not_reach_its_own_in_subject`                                     | the per-task wildcard `a2a.tasks.{addressee}.{taskId}.>`, which lets a worker steer and cancel itself as if from the user                                                                                                                                |
 | A3  | `…events` has no rendered writer (the executor's is derived)                              | 1        | `test_A3_the_events_subject_has_no_rendered_writer`                                                 | static `worker` held `a2a.tasks.*.*.events` for every addressee (gke-labs/kube-agents#1316). Closed by A5: the static half is `bridge`, whose grant names one addressee literally, and the callout half is `agent`, which holds no task-plane publish    |
 | A3  | the chat.notify subject has one writer, its reply namespace one                           | 1        | `test_A3_a_notify_has_one_writer_and_its_answer_has_one`                                            | a second principal able to make the install's bot speak in the home channel, or anyone, the agent included, forging the gateway's answer on where a post landed                                                                                          |
+| A3  | the chat.board subject has one writer, its reply namespace one                            | 1        | `test_A3_a_board_request_has_one_writer_and_its_answer_has_one`                                     | a second principal putting words on an admitted member's Home tab, or making the bridge read session-kv for it                                                                                                                                           |
 | A4  | the operator cannot escalate its own grants                                               | 1        | `test_A4_the_operator_cannot_escalate_its_own_grants`                                               | a controller with RBAC CRUD and `escalate` makes every ceiling advisory                                                                                                                                                                                  |
 | A4  | the chart grants the same ceiling as the kustomize role                                   | 1        | `test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role`                                   | a ceiling asserted on one install path only                                                                                                                                                                                                              |
 | A4  | triggering is delegation                                                                  | 1        | `test_A4_triggering_is_covered_by_the_A3_inject_finding`                                            | see A3 above — the one instance in this codebase                                                                                                                                                                                                         |
@@ -174,7 +180,10 @@ currently fails.
 | B1  | the operator's relay URL is the route the policy guards                                   | 1        | `test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route`                                | the route renamed on one side, leaving every `gke` call failing with no policy refusal to read                                                                                                                                                           |
 | B2  | no workflow approves or merges a pull request                                             | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                                             | a model verdict causing a merge                                                                                                                                                                                                                          |
 | B2  | `pull-requests: write` has exactly six holders                                            | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                                           | —                                                                                                                                                                                                                                                        |
-| B2  | a certified predicate in a human-only path                                                | **3**    | —                                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built.                                                                                                                                                       |
+| B2  | no script merges, bar the label-gated enqueue sweep                                       | 1        | `test_B2_no_script_merges_except_the_enqueue_sweep`                                                 | a merge call moved into a script the workflow scan cannot read                                                                                                                                                                                           |
+| B2  | the enqueue sweep assents only on `lgtm` + `approved`                                     | 1        | `test_B2_the_enqueue_sweep_assents_only_on_both_human_labels`                                       | a held or half-approved pull request enqueued                                                                                                                                                                                                            |
+| B2  | App-token write grants are pinned                                                         | 1        | `test_B2_app_token_write_grants_are_pinned`                                                         | a workflow minting Pull requests or Contents write that no `permissions:` block shows                                                                                                                                                                    |
+| B2  | a certified predicate in a human-only path                                                | **3**    | —                                                                                                   | no such mechanism exists. Auto-merge over a certified predicate is a D2 tier that was never built; the enqueue sweep acts on human labels, not on one.                                                                                                   |
 | B3  | substrate paths enumerated as code                                                        | 1 **KV** | `test_B3_the_substrate_paths_are_enumerated_as_code`                                                | `failurePolicy: Fail` → `Ignore`, commit message "unblock apply during upgrade window"                                                                                                                                                                   |
 | B3  | the agent cannot reach admission or RBAC through kubectl                                  | 1        | `test_B3_the_agent_cannot_reach_the_admission_policy_through_kubectl`                               | — (the API half; the artifact half is the KV above)                                                                                                                                                                                                      |
 | B4  | every `workflow_run` deploy gates on repo, conclusion and branch                          | 1        | `test_B4_every_workflow_run_deploy_gates_on_repository_and_branch`                                  | a fork's completed run reaching a job that mints a deploy credential                                                                                                                                                                                     |
@@ -195,7 +204,7 @@ currently fails.
 | C1  | the executor refuses an executable it does not ship                                       | 1        | `test_C1_the_executor_refuses_an_executable_it_does_not_ship`                                       | `sh -c` as the landing pad for the two above                                                                                                                                                                                                             |
 | C1  | `git` in the broker cannot execute arbitrary code                                         | 1        | `test_C1_git_in_the_broker_cannot_execute_arbitrary_code`                                           | **slice 2b 1.1, closed on main**: was `git -c protocol.ext.allow=always clone "ext::sh -c"` — RCE in the credential holder — until the git hardening landed                                                                                              |
 | C1  | the rendered egress policy is default-deny                                                | 1 **KV** | `test_C1_the_rendered_egress_policy_is_default_deny`                                                | **slice 2b 1.3, and back**: `0.0.0.0/0 except 169.254.169.254/32` adds the internet rather than subtracting the address — #676 gave the gateway policy exactly that rule, so this is a violation again                                                   |
-| C1  | the rendered egress policy reaches no metadata address                                    | 1 **KV** | `test_C1_the_rendered_egress_policy_reaches_no_metadata_address`                                    | a guard written against one of the three spellings; a violation again since #676 for the same reason as the row above                                                                                                                                    |
+| C1  | the rendered egress policy reaches no metadata address                                    | 1        | `test_C1_the_rendered_egress_policy_reaches_no_metadata_address`                                    | closed when the gateway lost its Workload Identity: its policy carries no metadata rule; a rule restored on 80 or 988 is the regression                                                                                                                  |
 | C1  | every operator-supplied CIDR reaches the refusal guards                                   | 1        | `test_C1_every_operator_supplied_cidr_reaches_the_refusal_guards`                                   | a new CRD field that accepts a CIDR and never calls the guard                                                                                                                                                                                            |
 | C1  | the gateway redactor matches the leaked credential shapes                                 | 1        | `test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes`                                 | #603: a 200-character `ya29.` token, a projected-token JWT, an `AIza` key, a PEM block and a Secret `data:` block, each measured in the clear in a durable artifact; the gateway hook runs this module at egress                                         |
 | C1  | the gateway redactor leaves ordinary manifest content alone                               | 1        | `test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone`                               | the over-eager redactor that eats every IAM principal and gets switched off — the service-account exemption's anchored lookahead is the control                                                                                                          |
@@ -292,28 +301,21 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-115 mutations: 89 KILLED, 24 NOISY, two `must_survive` controls (one on the
-harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-25 against
-this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
-KILLED when it was added on 2026-09-30, `D1-platform-role-reaches-secrets`,
-KILLED when it was added on 2026-10-05, the four `C1-a2a-gateway-*` mutations and
-the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
-`B1-slack-method-shape-dropped`, KILLED when it was added on 2026-10-07,
-`A3-agent-answers-its-own-notify` (KILLED) and
-`A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
-they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
-`C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
-`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
-`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13;
-re-run the harness rather than trusting these numbers, which is the sentence this
-paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 113 of the 115: a
+206 mutations: 175 KILLED, 28 NOISY, three `must_survive` controls
+(`A3-fastpath-redundant`, `B1-denylist-rule` and
+`B1-gke-mcp-overlay-copy-redundant`), zero genuine survivors, zero stale.
+Measured 2026-10-19 on `main` at `1b783dac` plus #3261's re-aimed
+`A3-session-sends-a-notify`. Re-run the harness rather than trusting these
+numbers, which is the sentence this paragraph exists to make cheap.
+Note that the summary line the harness prints accounts for 203 of the 206: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
 not run in CI — it edits tracked files in place — so it is a thing to run
-when adding a test, which step 4 below says to do.
+when adding a test, which step 4 below says to do. Its STALE check needs no
+edit, so that part does run on every pull request:
+`test_every_mutation_still_finds_the_text_it_edits` fails when a refactor
+moves the text a mutation edits, naming the mutation to rewrite.
 
 **The coverage of that set is checked by the suite, because it rotted once.**
 The first version of this file claimed every test had been mutation-verified

@@ -72,8 +72,15 @@ RECEIPT = (
 )
 
 
+WORKER_CHILD_ASSIGNEE = "cluster-kube-agents-evals-13-seeded-a-us-central1-a"
+
+
 def tool_create(**args):
-    out = json.loads(kt._handle_create({"assignee": "platform", **args}))
+    # Inside a worker the child goes to a Cluster Agent: a platform worker's
+    # card for `platform` that would run alongside it is refused (#3164,
+    # kanban_self_copy).
+    assignee = WORKER_CHILD_ASSIGNEE if os.environ.get("HERMES_KANBAN_TASK") else "platform"
+    out = json.loads(kt._handle_create({"assignee": assignee, **args}))
     if not out.get("ok"):
         raise AssertionError(f"kanban_create failed: {out}")
     return out
@@ -266,7 +273,7 @@ check(
 # dependency block over it would re-queue the card at once: refused.
 os.environ.pop("HERMES_KANBAN_TASK", None)
 stage_b = tool_create(title="Pipeline stage B")["task_id"]
-tool_create(title="Pipeline stage C", parents=[stage_b])
+tool_create(title="Pipeline stage C", parents=[stage_b], assignee=WORKER_CHILD_ASSIGNEE)
 K.claim_task(conn, stage_b)
 os.environ["HERMES_KANBAN_TASK"] = stage_b
 planned = tool_block("dependency")

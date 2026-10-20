@@ -129,7 +129,7 @@ they disagree.
 - **Offset spacing.** The validator reads an `offset` duration up to the next whitespace, so it
   rejects `offset 1w))`. Leave a space or line break after the duration (`offset 1w ))`), as the
   traffic-drop query above does.
-- **Validator path.** Wherever a reference runs `python3 scripts/validate_config.py`, run
+- **Validator path.** Wherever a reference runs the validator as `scripts/validate_config.py`, run
   `python3 "$HERMES_HOME"/skills/gke-alert-configuration/scripts/validate_config.py` instead.
   Where it passes `--file <file>` (the prerequisites' Verification Runbook does), pass
   `--directory` with the absolute path of the directory that holds the file, so the scan prints

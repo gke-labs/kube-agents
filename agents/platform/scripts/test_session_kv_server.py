@@ -2,6 +2,7 @@ import copy
 import importlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -58,6 +59,7 @@ except Exception:  # pragma: no cover
     _stub.MCPServer = _MCPServer
     sys.modules["mcp.server"] = _stub
 
+import chat_notify
 import session_kv_server
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
 
@@ -1115,6 +1117,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/cron-reports", {"job_id": "j", "report": "r"}),
         ("POST", "/v1/findings", {"findings": []}),
         ("GET", "/v1/findings/ranked", None),
+        ("GET", "/v1/board", None),
         ("GET", "/v1/findings", None),
         ("POST", "/v1/findings/f-1/surfaced", {}),
         ("GET", "/v1/findings/additions", None),
@@ -3247,6 +3250,132 @@ class TestRelayReachesEveryEnabledPlatform(unittest.TestCase):
         self.assertEqual([call.args[0] for call in sender.call_args_list], ["google_chat"])
 
 
+class TestRelayWithNoChatRoute(unittest.TestCase):
+    """An install with no chat route sends nothing and says why (#3385).
+
+    The case that found it: `spec.mode: next`, the gateway holding Slack, no
+    home channel. The managed scope turns both Hermes platforms off and
+    `A2A_NOTIFY_PLATFORM` is absent, so the platform walk resolves nothing and
+    the fallback used to post the report to Google Chat.
+    """
+
+    SLACK_REFUSAL = (
+        "composed but not delivered to slack "
+        "(no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)"
+    )
+    BOTH_OFF = "platforms:\n  google_chat:\n    enabled: false\n  slack:\n    enabled: false\n"
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + (
+            chat_notify.NOTIFY_PLATFORM_ENV, chat_notify.NOTIFY_CONVERSATIONS_ENV,
+        ):
+            os.environ.pop(key, None)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.managed = os.path.join(tmp.name, "config.yaml")
+        with open(self.managed, "w") as handle:
+            handle.write(self.BOTH_OFF)
+        for attribute, path in (
+            ("MANAGED_CONFIG_PATH", self.managed),
+            ("CONFIG_PATH", "/nonexistent/kube-agents-test-absent.yaml"),
+        ):
+            patcher = patch.object(session_kv_server, attribute, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def _post(self):
+        """POST a report with every outbound step recorded rather than run."""
+        outbound = {
+            name: patch.object(session_kv_server, name, return_value=None)
+            for name in (
+                "_send_to_chat",
+                "_post_audit_blocks",
+                "_post_failed_audit_via_gateway",
+                "_slack_audit_headline",
+                "_failed_audit_line",
+            )
+        }
+        mocks = {name: patcher.start() for name, patcher in outbound.items()}
+        try:
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "fleet-wide-cost-analysis", "profile": "platform", "report": "finding"},
+            )
+        finally:
+            for patcher in outbound.values():
+                patcher.stop()
+        return response, mocks
+
+    def test_slack_with_no_home_channel_sends_nothing_and_names_the_field(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
+        response, mocks = self._post()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.json()["detail"], f"chat relay failed: {self.SLACK_REFUSAL}")
+        for name, mock in mocks.items():
+            mock.assert_not_called()
+
+    def test_google_chat_with_no_home_channel_names_its_own_field(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat"
+        response, mocks = self._post()
+        self.assertEqual(response.status_code, 502)
+        self.assertIn(
+            "composed but not delivered to google_chat (no home channel: set "
+            "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL)",
+            response.json()["detail"],
+        )
+        mocks["_send_to_chat"].assert_not_called()
+
+    def test_no_gateway_backend_gets_the_neutral_refusal(self):
+        """No chat at all and a malformed home channel both leave the variable
+        unset, and the text must be true for either, so it names no platform."""
+        response, mocks = self._post()
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json()["detail"], f"chat relay failed: {session_kv_server.NO_CHAT_ROUTE_ERROR}")
+        mocks["_send_to_chat"].assert_not_called()
+
+    def test_a_backend_with_no_known_setting_gets_the_neutral_refusal(self):
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "discord"
+        response, _ = self._post()
+        self.assertEqual(
+            response.json()["detail"], f"chat relay failed: {session_kv_server.NO_CHAT_ROUTE_ERROR}")
+
+    def test_the_ledger_reads_the_platform_from_the_refusal(self):
+        """`chat_delivery_watch` names the missed platform in its issue from this
+        wording; any other shows a dash."""
+        import chat_delivery_watch
+
+        self.assertEqual(chat_delivery_watch.platforms_from(self.SLACK_REFUSAL), ["slack"])
+        self.assertEqual(chat_delivery_watch.platforms_from(session_kv_server.NO_CHAT_ROUTE_ERROR), [])
+
+    def test_a_routed_platform_is_not_refused(self):
+        """The control: with a home channel the operator renders
+        `A2A_NOTIFY_PLATFORM`, the walk resolves Slack, and the relay sends."""
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "slack"
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        _, mocks = self._post()
+        self.assertEqual(
+            [call.args[0] for call in mocks["_send_to_chat"].call_args_list], ["slack"])
+
+    def test_an_install_no_source_describes_keeps_the_fallback(self):
+        """No file says anything, so nothing is explicitly off: the relay still
+        tries DEFAULT_CHAT_PLATFORM, as it did before the guard."""
+        os.remove(self.managed)
+        _, mocks = self._post()
+        self.assertEqual(
+            [call.args[0] for call in mocks["_send_to_chat"].call_args_list],
+            [session_kv_server.DEFAULT_CHAT_PLATFORM],
+        )
+
+
 class TestTheFanOutSkipsWhatTheSchedulerAlreadySent(unittest.TestCase):
     """`deliver: "all"` posts the raw report itself; the relay must not repeat it.
 
@@ -3472,6 +3601,288 @@ class TestIsFleetAuditJob(unittest.TestCase):
                     self.assertFalse(session_kv_server._is_fleet_audit_job(profile, job_id))
 
 
+class TestAuditChatReport(unittest.TestCase):
+    """A fleet-audit job posts the report its run's `finish` left, never its final message."""
+
+    FINAL = (
+        "silent_ok is false (resolved: 3).\nPer instructions: report normally.\n"
+        "Let's format the final response!## Security & RBAC Posture Audit\nhttps://github.com/acme/fleet/issues/3"
+    )
+    REPORT = "Security & RBAC Posture Audit: 0 new, 3 resolved; 2 findings (0 critical) across 4 cluster(s).\nLedger: https://github.com/acme/fleet/issues/3"
+    THREAD = "spaces/S/threads/T"
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(os.environ.pop, "SESSION_KV_API_KEY", None)
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        self.scratch = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.scratch, True)
+        scratch = patch.object(session_kv_server, "FLEET_AUDIT_SCRATCH_DIR", self.scratch)
+        scratch.start()
+        self.addCleanup(scratch.stop)
+        import sandbox_exec
+
+        local = patch.object(sandbox_exec, "sandbox_enabled", return_value=False)
+        local.start()
+        self.addCleanup(local.stop)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+            conn.execute("DELETE FROM audit_report_runs")
+
+    def leave(self, parts, run="20261015T062000.000000Z", updated=None, job="compliance-audit"):
+        record = {
+            "audit": job,
+            "run": run,
+            "started_at": time.time(),
+            "updated_at": time.time() if updated is None else updated,
+            "parts": [
+                {"repo": part[0], "text": part[1]} if isinstance(part, tuple) else {"repo": "acme/fleet", "text": part}
+                for part in parts
+            ],
+        }
+        with open(os.path.join(self.scratch, f"chat_report_{job}.json"), "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+
+    def post(self, fleet_audit=True, send=None, job="compliance-audit", shipped=True, scheduler=True,
+             report=None, failure=False):
+        sent = []
+
+        def default_send(platform, message, chat_id="", thread_id="", timeout=None):
+            sent.append(message)
+            return self.THREAD
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit), \
+             patch.object(session_kv_server, "_is_shipped_audit_job", return_value=shipped), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send or default_send):
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={
+                    "job_id": job, "title": "Security & RBAC Posture Audit", "report": report or self.FINAL,
+                    **({"also_delivered_to": []} if scheduler else {}),
+                    **({"scheduler_failure": True} if failure else {}),
+                },
+            )
+        return response, sent
+
+    def stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return [row[0] for row in conn.execute("SELECT report FROM incidents")]
+
+    def notice(self):
+        return session_kv_server.AUDIT_NOT_FINISHED_NOTICE.format(
+            label="Security & RBAC Posture Audit", job="compliance-audit"
+        )
+
+    def test_finishs_report_is_posted_and_stored_in_place_of_the_final_message(self):
+        self.leave([self.REPORT])
+        response, sent = self.post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(sent, [self.REPORT])
+        self.assertEqual(self.stored(), [self.REPORT])
+
+    def test_each_repositorys_part_is_posted_in_order(self):
+        self.leave(["first part", "second part"])
+        _, sent = self.post()
+        self.assertEqual(
+            sent,
+            ["first part\n\nsecond part\n\n"
+             "Security & RBAC Posture Audit: 2 repositories reported in this run."],
+        )
+
+    def test_a_complete_multi_repository_run_does_not_end_with_a_ledger_link(self):
+        self.leave([self.REPORT, self.REPORT.replace("issues/3", "issues/4")])
+        _, sent = self.post()
+        self.assertIsNone(session_kv_server.slack_audit_report.ledger_ref(sent[0]))
+
+    def test_a_truncated_audit_report_names_the_record_and_its_ledger(self):
+        long = "x" * (session_kv_server.CRON_REPORT_MAX_CHARS + 10) + "\nLedger: https://github.com/acme/fleet/issues/3"
+        self.leave([long])
+        _, sent = self.post()
+        self.assertIn("chat_report_compliance-audit.json", sent[0])
+        self.assertIn("https://github.com/acme/fleet/issues/3", sent[0].split("\n\n", 1)[0])
+        self.assertNotIn("cron/output/", sent[0])
+
+    FAILURE = (
+        "⚠️ Cron 'Security & RBAC Posture Audit' failed: provider quota limit. "
+        "Fallback chain exhausted. Full details saved in cron output."
+    )
+
+    def test_a_failed_runs_line_is_posted_in_place_of_an_unposted_record(self):
+        # A silent run left a finished record; this run died before `start`.
+        self.leave([self.REPORT])
+        _, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(sent, [self.FAILURE])
+
+    def test_the_failure_marks_the_record_so_a_later_run_does_not_post_it(self):
+        self.leave([self.REPORT])
+        self.post(report=self.FAILURE, failure=True)
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_failure_shaped_message_from_a_run_that_finished_posts_its_report(self):
+        # The model's own last message can open like the failure line; a run
+        # that wrote its record after it started reached `finish`.
+        self.leave([self.REPORT])
+        with patch.object(session_kv_server, "_delivering_run_start", return_value=time.time() - 60):
+            _, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(sent, [self.REPORT])
+
+    def test_a_record_from_before_this_run_started_still_gets_the_failure_line(self):
+        self.leave([self.REPORT], updated=time.time() - 600)
+        with patch.object(session_kv_server, "_delivering_run_start", return_value=time.time() - 60):
+            _, sent = self.post(report=self.FAILURE, failure=True)
+        self.assertEqual(sent, [self.FAILURE])
+
+    def test_the_delivering_run_start_reads_only_running_rows(self):
+        import gitops_workspace
+        import sqlite3
+        from datetime import datetime, timezone
+
+        cron = os.path.join(self.scratch, "profiles", "platform", "cron")
+        os.makedirs(cron)
+        with sqlite3.connect(os.path.join(cron, "executions.db")) as conn, conn:
+            conn.execute("CREATE TABLE executions (job_id TEXT, status TEXT, started_at TEXT)")
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'running', ?)",
+                         (datetime(2026, 10, 16, 6, 20, tzinfo=timezone.utc).isoformat(),))
+            conn.execute("INSERT INTO executions VALUES ('compliance-audit', 'claimed', ?)",
+                         (datetime(2026, 10, 16, 7, 0, tzinfo=timezone.utc).isoformat(),))
+        with patch.object(gitops_workspace, "agent_home", return_value=self.scratch):
+            started = session_kv_server._delivering_run_start("platform", "compliance-audit")
+        self.assertEqual(started, datetime(2026, 10, 16, 6, 20, tzinfo=timezone.utc).timestamp())
+
+    def test_the_flag_without_the_scheduler_leg_changes_nothing(self):
+        self.leave([])
+        _, sent = self.post(report=self.FAILURE, failure=True, scheduler=False)
+        self.assertEqual(sent, [self.FAILURE])
+
+    def test_a_mid_run_report_to_chat_is_posted_as_written(self):
+        self.leave([])
+        _, sent = self.post(scheduler=False)
+        self.assertEqual(sent, [self.FINAL])
+
+    def test_a_repository_that_did_not_finish_is_named_after_the_reports(self):
+        self.leave([("acme/a", "report A"), ("acme/b", None), ("acme/c", self.REPORT)])
+        _, sent = self.post()
+        self.assertEqual(
+            sent,
+            ["report A\n\n" + self.REPORT + "\n\nSecurity & RBAC Posture Audit did not finish for acme/b. "
+             "See the run log for job `compliance-audit`."],
+        )
+        # No trailing ledger link, so Slack posts the whole message rather than
+        # a card that would drop the unfinished line.
+        self.assertIsNone(session_kv_server.slack_audit_report.ledger_ref(sent[0]))
+
+    def test_a_finished_report_ends_with_a_ledger_link_slack_reads(self):
+        self.leave([self.REPORT])
+        _, sent = self.post()
+        ref = session_kv_server.slack_audit_report.ledger_ref(sent[0])
+        self.assertEqual(ref.url, "https://github.com/acme/fleet/issues/3")
+        self.assertEqual(
+            session_kv_server.slack_audit_report._ledger_line(sent[0]), self.REPORT.splitlines()[0]
+        )
+
+    def test_a_run_with_no_finished_repository_posts_the_notice(self):
+        self.leave([("acme/a", None)])
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_run_is_posted_once(self):
+        self.leave([self.REPORT])
+        self.post()
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_failed_delivery_leaves_the_run_unposted(self):
+        self.leave([self.REPORT])
+        response, _ = self.post(send=lambda *a, **k: None)
+        self.assertEqual(response.status_code, 502)
+        _, sent = self.post()
+        self.assertEqual(sent, [self.REPORT])
+
+    def test_a_run_that_never_reached_finish_posts_the_notice(self):
+        self.leave([])
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+        self.assertNotIn("silent_ok", sent[0])
+
+    def test_no_record_posts_the_notice(self):
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_record_older_than_a_run_can_last_posts_the_notice(self):
+        self.leave([self.REPORT], updated=time.time() - session_kv_server.CHAT_REPORT_MAX_AGE_S - 1)
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_an_unparseable_record_posts_the_notice(self):
+        with open(os.path.join(self.scratch, "chat_report_compliance-audit.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_runtime_audit_job_the_image_does_not_ship_posts_its_final_message(self):
+        _, sent = self.post(job="nightly-compliance", shipped=False)
+        self.assertEqual(sent, [self.FINAL])
+
+    def test_the_image_roster_decides_which_audit_jobs_are_shipped(self):
+        roster = os.path.join(self.scratch, "jobs.json")
+        with open(roster, "w", encoding="utf-8") as handle:
+            json.dump({"jobs": [{"id": "compliance-audit", "skills": ["fleet-audit"]},
+                                {"id": "stall-watch", "no_agent": True}]}, handle)
+        with patch.object(session_kv_server, "IMAGE_PLATFORM_ROSTER", roster):
+            self.assertTrue(session_kv_server._is_shipped_audit_job("compliance-audit"))
+            self.assertFalse(session_kv_server._is_shipped_audit_job("stall-watch"))
+            self.assertFalse(session_kv_server._is_shipped_audit_job("nightly-compliance"))
+
+    def test_a_record_over_the_size_cap_posts_the_unreadable_notice(self):
+        self.leave([self.REPORT])
+        with patch.object(session_kv_server, "CHAT_REPORT_MAX_BYTES", 64):
+            _, sent = self.post()
+        self.assertIn("could not read the run's report (over 64 bytes)", sent[0])
+
+    def test_a_non_finite_stamp_posts_the_notice(self):
+        self.leave([self.REPORT], updated=float("inf"))
+        _, sent = self.post()
+        self.assertEqual(sent, [self.notice()])
+
+    def test_a_job_that_is_not_an_audit_posts_its_final_message(self):
+        self.leave([self.REPORT], job="drift-fixer")
+        _, sent = self.post(fleet_audit=False, job="drift-fixer")
+        self.assertEqual(sent, [self.FINAL])
+
+    def test_a_failed_sandbox_read_says_so_and_leaves_the_run_unposted(self):
+        import sandbox_exec
+
+        self.leave([self.REPORT])
+        with patch.object(sandbox_exec, "sandbox_enabled", return_value=True), \
+             patch.object(sandbox_exec, "read_bytes", side_effect=sandbox_exec.SandboxUnavailable("down")):
+            _, sent = self.post()
+        self.assertIn("could not read the run's report", sent[0])
+        self.assertIn("SandboxUnavailable", sent[0])
+        _, sent = self.post()
+        self.assertEqual(sent, [self.REPORT])
+
+    def test_the_report_is_read_from_the_sandbox_when_there_is_one(self):
+        import sandbox_exec
+
+        record = {"run": "r1", "updated_at": time.time(), "parts": [{"repo": "acme/fleet", "text": self.REPORT}]}
+        with patch.object(sandbox_exec, "sandbox_enabled", return_value=True), \
+             patch.object(sandbox_exec, "read_bytes", return_value=json.dumps(record).encode()) as read:
+            _, sent = self.post()
+        self.assertEqual(sent, [self.REPORT])
+        self.assertEqual(
+            read.call_args.args[0], os.path.join(self.scratch, "chat_report_compliance-audit.json")
+        )
+
+
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
@@ -3537,8 +3948,12 @@ class TestSlackAuditHeadline(unittest.TestCase):
         def send(platform, message, chat_id="", thread_id="", timeout=None):
             return answers[platform]
 
+        # These cases are about how a fleet-audit report is presented, so the
+        # report is the one `finish` left (TestAuditChatReport covers that).
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
              patch.object(session_kv_server, "_is_fleet_audit_job", return_value=fleet_audit) as is_audit, \
+             patch.object(session_kv_server, "_is_shipped_audit_job", return_value=True), \
+             patch.object(session_kv_server, "audit_chat_report", return_value=(composed.strip(), "")), \
              patch.object(session_kv_server, "_is_managed_github_repo", return_value=managed) as is_managed, \
              patch.object(session_kv_server, "_fetch_ledger_issue", return_value=issue) as fetch, \
              patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
@@ -3656,7 +4071,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
         report = f"Drift fixed in the payments namespace.\nTracked here — {self.LEDGER}"
         _, calls = self._post(composed=report, fleet_audit=False, job_id="drift-fixer")
         self.assertEqual([c.args for c in calls], [("slack", report, "", "")])
-        self.is_audit.assert_called_once_with("platform", "drift-fixer")
+        self.is_audit.assert_called_with("platform", "drift-fixer")
         self.fetch.assert_not_called()
 
     def test_flag_on_a_headline_error_posts_the_report(self):
@@ -4520,6 +4935,10 @@ class TestFindingsQueueApi(unittest.TestCase):
         self.assertEqual(self.client.get("/v1/findings/publication/backlog").status_code, 200)
 
 
+# setUp below patches the module attribute; this keeps the real check for the test of it.
+_REAL_GITOPS_REPO_REGISTERED = session_kv_server._gitops_repo_registered
+
+
 class TestDriftInject(unittest.TestCase):
     """The `gitops-drift` half of /sessions/{id}/inject.
 
@@ -4571,6 +4990,12 @@ class TestDriftInject(unittest.TestCase):
 
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        # The card's options depend on whether a GitOps repository is
+        # registered; the tests below that do not say otherwise are about an
+        # install that has one.
+        registered = patch.object(session_kv_server, "_gitops_repo_registered", return_value=True)
+        registered.start()
+        self.addCleanup(registered.stop)
         # The ceiling is fleet-wide and the database is shared by the whole
         # file, so today's spend has to be cleared or these order-depend on
         # whatever ran before them.
@@ -4588,6 +5013,60 @@ class TestDriftInject(unittest.TestCase):
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def test_without_a_gitops_repository_the_card_explains_and_offers_nothing(self):
+        with patch.object(session_kv_server, "_gitops_repo_registered", return_value=False):
+            card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn(session_kv_server.DRIFT_NO_GITOPS_LINE, card)
+        self.assertNotIn("To authorize:", card)
+        self.assertNotIn("Option A", card)
+        self.assertNotIn("Revert", card)
+        self.assertNotIn("Recommended", card)
+        # The audit facts are still the opening of the card.
+        self.assertIn(self.DRIFT_PAYLOAD["principal"], card)
+        self.assertIn("**Read the live object before you conclude anything.**", card)
+
+    def test_a_report_written_to_that_card_earns_no_incident_row(self):
+        # The notifier's gate is what draws the buttons; a report that follows
+        # the no-repository template has nothing it accepts.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "docker" / "patches"))
+        import kanban_notifier
+
+        report = (
+            "## What's wrong\n\nme changed replicas, still live\n\n## Why\n\n- 3 replicas\n- cost\n\n"
+            f"## What to do\n\n- {session_kv_server.DRIFT_NO_GITOPS_LINE}\n"
+        )
+        self.assertFalse(kanban_notifier.actionable_report(report))
+
+    def test_an_unreadable_registry_keeps_the_options(self):
+        with patch.object(session_kv_server, "_gitops_repo_registered", return_value=None):
+            card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("To authorize:", card)
+        self.assertNotIn(session_kv_server.DRIFT_NO_GITOPS_LINE, card)
+
+    def test_a_preflight_that_raises_is_unknown_and_keeps_the_options(self):
+        import gitops_preflight
+
+        with patch.object(gitops_preflight, "preflight", side_effect=RuntimeError("boom")):
+            self.assertIsNone(_REAL_GITOPS_REPO_REGISTERED())
+
+    def test_the_no_repository_line_names_the_registration_paths_the_preflight_names(self):
+        import gitops_preflight
+
+        for path in ("spec.integration.repositories", "--gitops-repo"):
+            self.assertIn(path, gitops_preflight.REGISTRATION_STEPS)
+            self.assertIn(path, session_kv_server.DRIFT_NO_GITOPS_LINE)
+
+    def test_the_registration_answer_comes_from_gitops_preflight(self):
+        import gitops_preflight
+
+        for code, want in (
+            (gitops_preflight.EXIT_REGISTERED, True),
+            (gitops_preflight.EXIT_NO_REGISTERED_REPO, False),
+            (gitops_preflight.EXIT_STATE_UNREADABLE, None),
+        ):
+            with patch.object(gitops_preflight, "preflight", return_value=(code, "line")):
+                self.assertIs(_REAL_GITOPS_REPO_REGISTERED(), want)
 
     def _payload(self, **overrides):
         payload = json.loads(json.dumps(self.DRIFT_PAYLOAD))
@@ -4745,6 +5224,30 @@ class TestDriftInject(unittest.TestCase):
             [line for line in card.splitlines() if line.startswith("## ")],
             ["## What's wrong", "## Why", "## What to do"],
         )
+
+    def test_the_card_sends_the_agent_to_a_skill_the_cluster_profile_ships(self):
+        """The named skill has to exist, and to exist for a Cluster Agent.
+
+        The body is copied verbatim onto a card the Cluster Agent works, and
+        `cluster_agent_profile.OVERLAY_ITEMS` scaffolds `agents/cluster/skills`
+        into that profile -- so a name here that no directory there matches
+        sends the agent to load something it does not have. Renaming the
+        bundle without rewording the card, or the reverse, is the failure:
+        neither side is read by the other at runtime, and nothing else in the
+        tree pins them together. A platform-only bundle of the same name would
+        not help, which is why the path is the cluster tree and not a glob.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("`gke-load-bearing-change`", card)
+        bundle = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "cluster"
+            / "skills"
+            / "gke-load-bearing-change"
+            / "SKILL.md"
+        )
+        self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_has_its_own_ceiling(self, trigger):
@@ -5229,6 +5732,51 @@ class TestReadOnlyActivityFeed(unittest.TestCase):
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def test_board_reads_the_board_the_findings_and_the_audit(self):
+        import sqlite3
+
+        self._create_kanban_schema()
+        with sqlite3.connect(self.kanban_path) as conn:
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, created_at, started_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("t-1", "Diagnose the crashloop", "platform", "running", 1792155000, 1792155000),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+                ("t-1", "pr_opened", json.dumps({"url": "https://github.com/a/b/pull/4", "number": 4, "title": "Fix"}), 1792155000),
+            )
+        audit = {"name": "n", "findings": 0, "critical": 0, "issue_url": "", "issue": 0, "finished_at": "2026-10-16T10:24:00+00:00"}
+        with patch.object(session_kv_server.board_snapshot, "default_audit", lambda: audit), patch.object(
+            session_kv_server.board_snapshot, "PROFILES_DIR", self.root / "profiles"
+        ):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual([c["title"] for c in body["running"]], ["Diagnose the crashloop"])
+        self.assertEqual([p["number"] for p in body["prs"]], [4])
+        self.assertEqual(body["audit"], audit)
+        self.assertIn("clusters", body)
+
+    def test_board_an_unreadable_source_is_a_503(self):
+        with patch.object(
+            session_kv_server.board_snapshot, "snapshot", side_effect=session_kv_server.board_snapshot.BoardError("gone")
+        ):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 503, resp.text)
+
+    def test_board_a_malformed_source_row_is_a_503_not_a_500(self):
+        with patch.object(session_kv_server.board_snapshot, "snapshot", side_effect=ValueError("rubric is not JSON")):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 503, resp.text)
+
+    def test_board_with_no_kanban_board_yet_is_empty(self):
+        with patch.object(session_kv_server.board_snapshot, "default_audit", lambda: None), patch.object(
+            session_kv_server.board_snapshot, "PROFILES_DIR", self.root / "profiles"
+        ):
+            resp = self.client.get("/v1/board")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual((resp.json()["running"], resp.json()["prs"]), ([], []))
 
     def _create_kanban_schema(self):
         import sqlite3

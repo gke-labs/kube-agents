@@ -201,12 +201,16 @@ class InjectLaneTest(unittest.TestCase):
         # them and the log says so. obtainability-remediation-proposal left
         # the list when the persona's rule put its manifest in the reply
         # (#2037), so it is graded at zero writes with the rest of the first
-        # phase; pdb-remediation-pr asks for its pull request by its own check.
+        # phase. pdb-remediation-pr, which asks for its pull request by its
+        # own check, was the presubmit's one requesting case until its
+        # demotion to the nightly (2026-10-17, #3120), so today the list is
+        # empty and the log says "none";
+        # test_the_requesting_cases_are_named_for_the_second_phase below
+        # covers a matrix that holds them.
         requesting = requesting_among(presubmit_tasks())
         self.assertNotIn("obtainability-remediation-proposal", requesting.split(","))
-        self.assertIn("pdb-remediation-pr", requesting.split(","))
         self.assertEqual(value(result, "REQUESTING"), requesting)
-        self.assertIn(f"run after every other unit: {requesting}\n", result.stdout)
+        self.assertIn(f"run after every other unit: {requesting or 'none'}\n", result.stdout)
 
     def test_the_requesting_cases_are_named_for_the_second_phase(self):
         # Every pinned requesting case the presubmit matrix does not seat,
@@ -390,6 +394,36 @@ class WiringTest(unittest.TestCase):
         self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"\n  wait\nfi\n'), call)
         self.assertLess(call, src.index("# ─── Per-case verdicts"))
         self.assertLess(src.index("EVAL_RUN_STARTED_AT=\"$(date"), src.index("# 2. Cluster Auth"))
+
+    def run_leftovers(self, forge: str | None, mint_rc: int = 0, list_rc: int = 0) -> list[str]:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                constants(),
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"',
+                'BENCH_GITOPS_REPO="acme/infra"',
+                'EVAL_RUN_STARTED_AT="2026-01-01T00:00:00Z"',
+                "unset EVAL_FORGE" if forge is None else f'EVAL_FORGE="{forge}"',
+                f"mint_ledger_token() {{ return {mint_rc}; }}",
+                f"uv() {{ return {list_rc}; }}",
+                lifted_block(r"^report_github_leftovers\(\) \{.*?^\}$"),
+                "report_github_leftovers",
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def test_the_leftovers_report_names_the_forge_in_use(self):
+        for forge, name, kind, other in ((None, "GitHub", "repository", "GitLab"), ("gitlab", "GitLab", "project", "GitHub")):
+            for mint_rc, list_rc in ((0, 0), (1, 0), (0, 1)):
+                with self.subTest(forge=forge, mint_rc=mint_rc, list_rc=list_rc):
+                    lines = self.run_leftovers(forge, mint_rc, list_rc)
+                    self.assertEqual(len(lines), 2, lines)
+                    self.assertIn(f"{name} writes this run left on the {name} {kind} acme/infra", lines[0])
+                    self.assertIn(f"{name} leftovers:", lines[1])
+                    self.assertFalse(any(other in line for line in lines), lines)
 
     def test_the_lane_file_is_the_path_the_roster_module_names(self):
         self.assertIn(f'readonly EVAL_INJECT_LANE_SAFEGUARDS_FILE="eval/{eval_rosters.INJECT_LANE_SAFEGUARDS_FILE.name}"', constants())

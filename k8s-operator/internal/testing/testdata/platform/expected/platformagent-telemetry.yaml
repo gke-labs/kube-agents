@@ -1,3 +1,21 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gateway-agent
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -89,6 +107,40 @@ rules:
       - get
       - list
       - watch
+  - apiGroups:
+      - argoproj.io
+    resources:
+      - applications
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - kustomize.toolkit.fluxcd.io
+    resources:
+      - kustomizations
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - source.toolkit.fluxcd.io
+    resources:
+      - gitrepositories
+      - ocirepositories
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - configsync.gke.io
+    resources:
+      - rootsyncs
+      - reposyncs
+    verbs:
+      - get
+      - list
+      - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -108,6 +160,9 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent
+    namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
     namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -165,6 +220,9 @@ subjects:
   - kind: ServiceAccount
     name: kubeagents-platform-agent
     namespace: kubeagents-system
+  - kind: ServiceAccount
+    name: platformagent-gateway-agent
+    namespace: kubeagents-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -220,7 +278,7 @@ roleRef:
   name: kubeagents:leader:kubeagents-system:platformagent
 subjects:
   - kind: ServiceAccount
-    name: kubeagents-platform-agent
+    name: platformagent-gateway-agent
     namespace: kubeagents-system
 ---
 apiVersion: v1
@@ -314,6 +372,7 @@ data:
     KUBEAGENTS_MODE=today
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
+    GKE_PROJECT_ID=example-project
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
@@ -999,7 +1058,7 @@ spec:
             - name: CREDENTIAL_PROXY_CHAT_AUDIENCE
               value: kubeagents-credential-proxy-chat
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:kubeagents-platform-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
@@ -1657,7 +1716,7 @@ spec:
         runAsUser: 10000
         seccompProfile:
           type: RuntimeDefault
-      serviceAccountName: kubeagents-platform-agent
+      serviceAccountName: platformagent-gateway-agent
       volumes:
         - name: platform-agent-data-vol
           persistentVolumeClaim:
@@ -1858,20 +1917,6 @@ spec:
             cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
-    - ports:
-        - port: 80
-          protocol: TCP
-      to:
-        - ipBlock:
-            cidr: 169.254.169.254/32
-    - ports:
-        - port: 988
-          protocol: TCP
-      to:
-        - ipBlock:
-            cidr: 169.254.169.252/32
-        - ipBlock:
-            cidr: 169.254.169.254/32
     - ports:
         - port: 80
           protocol: TCP
