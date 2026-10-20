@@ -1040,6 +1040,13 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# A delegated card written to outrun the worker budget: the worker runs under
+# the platform profile's 150 turns, read from Hermes' checkpoint notice in its
+# tool results or from the card's run row, not under the 250 the fleet audits
+# carry on their roster entries (#1947). deployer: noop, no fixture; the run
+# spends up to 150 trivial model calls by design, twice.
+./tasks/platform-worker-turn-budget/task.yaml
+
 # A gcloud write the command policy refuses for a flag it cannot read: the
 # report claims no success and no delegated worker re-runs the write without
 # the flag after it (#2979, #3260). deployer: noop, transcript-only.

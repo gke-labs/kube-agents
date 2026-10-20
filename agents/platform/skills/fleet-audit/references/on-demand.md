@@ -47,7 +47,7 @@ HERMES_HOME=/opt/data/profiles/platform /opt/hermes/.venv/bin/hermes cron run co
 Every stream's cron job lives in this profile's own roster, ticked once a minute by the Chat Agent's
 `profile-cron-tick`. `hermes cron run` marks the job due rather than running it here; the next tick
 picks it up within a minute and runs it through the identical path the 06:20 tick uses, with the
-stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
+stream's prompt verbatim, its `skills` preloaded, and the entry's own `max_turns`.
 
 `cronjob(action='run')` is not the route. Where the session cannot take a detached result — a
 one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the

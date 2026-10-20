@@ -2986,6 +2986,11 @@ unit_cost_hint() {
     # A plain chat request that runs the compliance collector's sweep (#2386):
     # the audit band, without the ledger write.
     security-chat-request-runs-collector) echo 900 ;;
+    # Written to outrun the worker turn budget: about 150 trivial model calls,
+    # twice (the dispatcher retries the timed-out card once), on the agent's
+    # own cluster. 13-26 min a repetition at 90 turns on a dev install on
+    # 2026-10-20; priced for 150.
+    platform-worker-turn-budget) echo 2400 ;;
     # A plain chat request that now runs the waste collector's sweep (#2386):
     # the waste audit's band, without the ledger write.
     cost-chat-request-runs-collector) echo 900 ;;
@@ -3182,6 +3187,10 @@ unit_delegation_timeout() {
     fleet-audit-unchanged-finding-keeps-wording) echo 3000 ;;
     upgrades-master-behind-offered-elsewhere | upgrades-audit-reports-upgrade-blocked) echo 3000 ;;
     obtainability-planted-orphan-service) echo 3000 ;;
+    # Two attempts of about 150 trivial calls each before the card settles; the
+    # default would cut the second attempt on a slow night and grade the
+    # repetition as infrastructure instead of reading the cap.
+    platform-worker-turn-budget) echo 3000 ;;
     *) echo "${AGENT_DELEGATION_TIMEOUT:-1800}" ;;
   esac
 }
