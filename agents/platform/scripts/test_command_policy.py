@@ -25,8 +25,9 @@ from command_policy import (
 CONFIG_CONNECTOR_SKILL_DIR = (
     Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
 )
-# A fence may be indented, as one inside a numbered list is.
-FENCED_SHELL_BLOCK = re.compile(r"^[ \t]*```(?:bash|sh|shell)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
+# A fence may be indented, as one inside a numbered list is. The languages
+# are deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
+FENCED_SHELL_BLOCK = re.compile(r"^[ \t]*```(?:bash|sh|shell|zsh)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
 GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # Fewer fenced commands than this means the parser or the path went stale
 # and the allowed-commands test would pass by finding nothing.
@@ -37,12 +38,13 @@ MIN_FENCED_COMMANDS = 8
 TERRAFORM_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "gcp-terraform"
 SHIPPED_SKILLS_ROOT = Path(__file__).resolve().parents[2]
 MIN_TERRAFORM_FENCED_COMMANDS = 3
-# A tofu or terraform invocation at a command position: the positions
-# HELM_INVOCATION knows, with global options (`-chdir=DIR`) skipped to reach
-# the subcommand.
+# tofu or terraform as a word followed by whitespace, wherever it stands on a
+# fenced line (after `if !`, `time`, `bash -lc '`, `eval "`, a path), with
+# global options (`-chdir=DIR`) skipped to reach the subcommand. A path that
+# merely contains the name (`$REPO/terraform/examples`) is not followed by
+# whitespace and does not match.
 IAC_INVOCATION = re.compile(
-    r"(?i)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)"
-    r"\s*(tofu|terraform)\b(?:(?:\s+-\S+)*\s+([^\s'\"`]+))?"
+    r"(?i)(?<![\w.-])(tofu|terraform)\s(?:\s*-(?:[^\s'\"]|\"[^\"]*\"|'[^']*')+)*\s*([^\s'\"`;|&)]+)?"
 )
 # The gitops-helm-chart skill declares a chart for a reconciler to install and
 # never runs helm, which the policy does not govern. Its reads are checked the

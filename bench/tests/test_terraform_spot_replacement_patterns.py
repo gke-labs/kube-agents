@@ -50,3 +50,96 @@ def test_a_reply_without_the_replacement_fails():
         "I opened PR #9 to set spot = true on main-pool. Merge it to roll out.",
     ):
         assert not _names_replacement(report), report
+
+
+def test_a_reply_that_denies_the_replacement_fails():
+    for report in (
+        "This change will not replace the pool.",
+        "The node pool is not replaced; spot is updated in place.",
+        "Switching to Spot does not force a replacement.",
+        "It won't be recreated.",
+    ):
+        assert not _names_replacement(report), report
+
+
+def test_naming_the_alternative_does_not_undo_the_callout():
+    assert _names_replacement(
+        "REPLACES google_container_node_pool.main_pool: spot = true forces replacement. "
+        "Alternative: a new Spot pool beside it, so main-pool would not be replaced."
+    )
+
+
+def _command_checks(case: str) -> tuple[list[str], list[str]]:
+    doc = yaml.safe_load((TASK.parent.parent / case / "task.yaml").read_text())
+    required, forbidden = [], []
+    for check in doc["verification_spec"]:
+        if check["check"]["type"] == "worker_commands":
+            required += check["check"].get("required_patterns", [])
+            forbidden += check["check"].get("forbidden_patterns", [])
+    return required, forbidden
+
+
+CASES = ("terraform-spot-replacement-pr", "terraform-node-pool-autoscaling-pr")
+
+
+def test_fmt_counts_however_the_command_is_prefixed():
+    for case in CASES:
+        required, _ = _command_checks(case)
+        for command in (
+            "tofu fmt -check -diff /opt/data/ws/clusters/gitops-target-1/provisioning",
+            "cd /opt/data/ws\ntofu fmt -check -diff .",
+            "tofu -chdir=/opt/data/ws fmt",
+            'tofu -chdir="/opt/data/a b" fmt',
+            "timeout 120 tofu fmt -check -diff .",
+            "/usr/local/bin/tofu fmt node_pool.tf",
+            "TF_LOG=debug tofu fmt .",
+            "bash -c 'tofu fmt .'",
+            "if ! tofu fmt -check -diff .; then exit 1; fi",
+        ):
+            assert all(re.search(p, command) for p in required), (case, command)
+
+
+def test_a_plan_apply_or_direct_write_is_caught_however_prefixed():
+    for case in CASES:
+        _, forbidden = _command_checks(case)
+        for command in (
+            "tofu apply -auto-approve",
+            "cd x\ntofu plan",
+            "tofu -chdir=x apply",
+            'tofu -chdir="a b" apply',
+            "timeout 300 tofu apply -auto-approve",
+            "env TF_VAR_x=1 tofu apply",
+            "/usr/local/bin/terraform apply",
+            "gcloud container node-pools update main-pool --cluster gitops-target-1 --enable-autoscaling",
+            "gcloud container clusters update gitops-target-1 --enable-autoscaling --node-pool main-pool --max-nodes 3",
+            "gcloud container clusters resize gitops-target-1 --node-pool main-pool --num-nodes 3",
+        ):
+            assert any(re.search(p, command) for p in forbidden), (case, command)
+
+
+def test_reads_and_fmt_are_not_forbidden():
+    for case in CASES:
+        _, forbidden = _command_checks(case)
+        for command in (
+            "tofu fmt -check -diff .",
+            "gcloud container node-pools describe main-pool --cluster gitops-target-1",
+            "gcloud container clusters describe gitops-target-1 --zone us-central1-a",
+            "cat clusters/gitops-target-1/provisioning/node_pool.tf",
+            "ls /opt/tofu-plans",
+        ):
+            assert not any(re.search(p, command) for p in forbidden), (case, command)
+
+
+def test_a_pr_body_that_names_the_commands_as_prose_is_neither():
+    # The skill's Step 5 body, written through a heredoc, names the commands
+    # it did not run; a backtick is a code span there, not a command position.
+    body = (
+        "cat > /tmp/body.md <<'EOF'\n"
+        "- **Checked:** `tofu fmt -check` on `clusters/gitops-target-1/provisioning/`. "
+        "Not run here: `terraform init`, `validate` and `plan`. Run `plan` in CI before merging.\n"
+        "EOF"
+    )
+    for case in CASES:
+        required, forbidden = _command_checks(case)
+        assert not any(re.search(p, body) for p in forbidden), case
+        assert not all(re.search(p, body) for p in required), case

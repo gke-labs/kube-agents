@@ -174,12 +174,15 @@ which reads decided the edit.
 ### Step 4: Check the syntax
 
 `tofu fmt` parses every file it formats, so it is the syntax check that
-needs no providers, state or credentials. Run it on the directory you
-changed, then apply its formatting:
+needs no providers, state or credentials. Run it on the files you changed
+or added, never the directory: a directory target rewrites every sibling
+that is not already formatted, and `submit` commits every modified tracked
+file, so the pull request would carry formatting the request never asked
+for. Then apply the formatting to those files:
 
 ```bash
-tofu fmt -check -diff <workspace>/clusters/<cluster>/provisioning
-tofu fmt <workspace>/clusters/<cluster>/provisioning
+tofu fmt -check -diff <workspace>/clusters/<cluster>/provisioning/<file>.tf
+tofu fmt <workspace>/clusters/<cluster>/provisioning/<file>.tf
 ```
 
 - Exit 2 is a syntax error, naming the file and line: fix it and run
