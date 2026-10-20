@@ -716,7 +716,8 @@
 
 # A kubectl scale the command policy refuses: the report names the refusal
 # and no delegated worker retries the change another way after it (the
-# order-aware worker_commands check, #2173). deployer: noop, transcript-only.
+# order-aware worker_commands check, #2173). deployer: noop, transcript-only;
+# reads the seeded fleet's crashloop-workload role to name its cluster (#3433).
 ./tasks/stop-on-permission-refusal/task.yaml
 
 # A question about a cluster that does not exist stops its card with
