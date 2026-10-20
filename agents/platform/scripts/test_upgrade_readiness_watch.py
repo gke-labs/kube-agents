@@ -1792,7 +1792,7 @@ class DeclaredScope(Base):
             watch.refusal_detail(label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012"), resolved),
             (
                 "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
-                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reconcile resolves the number",
+                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run): under a declared scope the reporter refuses a number before anything resolves it, so no grant lets it read one",
                 "project number unresolved",
             ),
         )

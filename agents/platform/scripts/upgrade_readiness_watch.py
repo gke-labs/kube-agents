@@ -334,7 +334,7 @@ REMEDY_OUTSIDE_UNRESOLVED = (
     "named here again with its remedy; a lookup that keeps failing needs the install's read access on that folder, "
     "organisation or selector"
 )
-REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reconcile resolves the number"
+REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run): under a declared scope the reporter refuses a number before anything resolves it, so no grant lets it read one"
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
 # The unresolved note for a declaration the reconcile did resolve in part: a
 # container or selector lookup did not finish on its last run, so the set it
