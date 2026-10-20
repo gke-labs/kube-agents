@@ -145,13 +145,14 @@ def lost_jobs(parts: dict[str, list[dict]]) -> list[dict]:
     return out
 
 
-def first_clean_after_lost(nights: list[dict]) -> dict | None:
-    """The first clean night after the part's last lost one, when its newest
-    night is clean; None otherwise, or when no night in the window was lost."""
+def first_clean_after_lost(nights: list[dict], news=lambda n: True) -> dict | None:
+    """The first clean night after the part's last lost one that ``news``
+    accepts (the caller's "after the issue opened"), when its newest night
+    is clean; None otherwise, or when no night in the window was lost."""
     if not nights or nights[-1]["lost"]:
         return None
     last = max((i for i, n in enumerate(nights) if n["lost"]), default=None)
-    return None if last is None else nights[last + 1]
+    return None if last is None else next((n for n in nights[last + 1:] if news(n)), None)
 
 
 def infra_event(tasks: list[dict]) -> bool:
@@ -237,10 +238,11 @@ def kept_streak(verdicts: list[dict]) -> list[dict] | None:
     return None
 
 
-def first_graded_after_kept(verdicts: list[dict]) -> dict | None:
-    """The first graded night after the case's last kept one, when its
-    newest eligible night graded; None otherwise."""
+def first_graded_after_kept(verdicts: list[dict], news=lambda v: True) -> dict | None:
+    """The first graded night after the case's last kept one that ``news``
+    accepts (the caller's "after the issue opened"), when its newest
+    eligible night graded; None otherwise."""
     if not verdicts or verdicts[-1]["state"] != STATE_GRADED:
         return None
     last = max((i for i, v in enumerate(verdicts) if v["state"] in KEPT_STATES), default=None)
-    return None if last is None else verdicts[last + 1]
+    return None if last is None else next((v for v in verdicts[last + 1:] if news(v)), None)

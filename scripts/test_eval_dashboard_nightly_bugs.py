@@ -320,6 +320,13 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
         self.assertEqual(len(self.filed(gh)), 1)
 
+    def test_a_bug_closed_while_the_newest_red_night_ran_is_filed_again(self):
+        # Closed at 00:30 on the 17th, between that night's start (00:00:30)
+        # and its finish (00:59): the close did not see the night's verdict.
+        closed = {"number": 3996, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T00:30:00Z"}
+        gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh)), 1)
+
     def test_another_cases_bot_issue_quoting_this_case_is_not_a_match(self):
         other = {"number": 3995, "title": "Nightly: case-maint fails every run", "body": nightly_bugs.MARKER.format(case="case-maint") + "\nreason: see case-red too"}
         gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[other]))
@@ -366,6 +373,17 @@ class RecoveryTest(Harness):
         gh, out, _ = self.run_once(self.recovered_data(), FakeGh(open_issues=[human]))
         self.assertEqual(gh.writes(), [], "the 10-17 pass predates the issue")
         self.assertNotIn("recovered:", out)
+
+    def test_a_pass_the_issue_already_saw_does_not_hide_a_later_one(self):
+        # Opened after the 17th and 18th passes finished; the 19th's pass
+        # is the first one news to the issue, and is commented.
+        human = {"number": 3989, "title": "case-red is broken", "body": "", "created_at": "2026-10-18T12:00:00Z"}
+        doc = self.recovered_data()
+        doc["runs"].append(night(19, [green("case-red")]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[human]))
+        [(_, path, body)] = gh.writes()
+        self.assertEqual(path, f"{ISSUES}/3989/comments")
+        self.assertIn("2026-10-19 nightly", body["body"])
 
     def test_unreadable_comments_are_reported_failed(self):
         _, out, err = self.run_once(self.recovered_data(), FakeGh(open_issues=[self.ISSUE], fail_comments=True))
@@ -584,6 +602,11 @@ class LostJobTest(Harness):
         gh, out, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
         self.assertEqual(gh.writes(), [])
         self.assertNotIn("recovered:", out)
+        # The next clean night is news to the issue: one recovery comment.
+        doc["runs"].append(night(18, [green()]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("ran to its verdict on the 2026-10-18 nightly", comment)
 
     def test_a_later_lost_night_is_noted_without_the_threshold_again(self):
         issue = {"number": 3981, "title": "t", "body": f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", "created_at": "2026-10-14T12:00:00Z"}
@@ -670,6 +693,14 @@ class InfraCaseTest(Harness):
         self.assertEqual(self.filed(gh, infra=True), [])
         again, _, _ = self.run_once(doc, FakeGh(open_issues=[issue], comments={3970: [{"body": comment}]}))
         self.assertEqual(again.writes(), [])
+
+    def test_a_graded_night_the_issue_already_saw_does_not_hide_a_later_one(self):
+        # Opened after the 17th was graded: the 18th is the recovery.
+        issue = {"number": 3973, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-17T12:00:00Z"}
+        doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [red()]), night(18, [green("case-red")]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("`case-red` was graded on the 2026-10-18 nightly", comment)
 
     def test_a_later_kept_night_is_noted_without_a_new_streak(self):
         issue = {"number": 3971, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-14T12:00:00Z"}

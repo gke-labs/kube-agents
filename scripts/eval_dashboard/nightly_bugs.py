@@ -407,16 +407,17 @@ def red_streak(verdicts: list[dict]) -> list[dict] | None:
     return None
 
 
-def recovery_night(verdicts: list[dict]) -> dict | None:
-    """The first all-pass night after the case's last failing night, when
-    its newest graded night passed; None otherwise, or when no failing night
-    is in the window."""
+def recovery_night(verdicts: list[dict], news=lambda v: True) -> dict | None:
+    """The first all-pass night after the case's last failing night that
+    ``news`` accepts (``opened_before`` the issue: an earlier pass the issue
+    already saw must not hide a later one), when its newest graded night
+    passed; None otherwise, or when no failing night is in the window."""
     if not verdicts or verdicts[-1]["outcome"] != classify.OUTCOME_PASSED:
         return None
     last_fail = max((i for i, v in enumerate(verdicts) if v["outcome"] == classify.OUTCOME_FAILED), default=None)
     if last_fail is None:
         return None
-    return next(v for v in verdicts[last_fail + 1:] if v["outcome"] == classify.OUTCOME_PASSED)
+    return next((v for v in verdicts[last_fail + 1:] if v["outcome"] == classify.OUTCOME_PASSED and news(v)), None)
 
 
 # --------------------------------------------------------------------------
@@ -500,9 +501,12 @@ def opened_before(issue: dict, night: dict) -> bool:
 
 
 def closed_after(issue: dict | None, night: dict) -> bool:
-    """Whether a closed issue was closed after ``night``'s run started."""
-    closed, started = nightly.parse_iso((issue or {}).get("closed_at")), nightly.parse_iso(night.get("started"))
-    return bool(closed and started and closed > started)
+    """Whether a closed issue was closed after ``night``'s run finished (its
+    start when no finish is recorded): only then has the close seen that
+    night's verdict, as ``opened_before`` reads an opening."""
+    closed = nightly.parse_iso((issue or {}).get("closed_at"))
+    ended = nightly.parse_iso(night.get("finished")) or nightly.parse_iso(night.get("started"))
+    return bool(closed and ended and closed > ended)
 
 
 class Filer:
@@ -560,7 +564,7 @@ class Filer:
                     filed = self.file(case, fields, streak)
                     result["filed" if filed["issue"] or self.gh.dry_run else "failed"].append(filed)
                 continue
-            recovered = recovery_night(verdicts)
+            recovered = recovery_night(verdicts, lambda v: opened_before(issue, v)) if issue else None
             if recovered and issue:
                 done = self.recover(case, issue, recovered)
                 if done:
@@ -580,7 +584,7 @@ class Filer:
             result["tracked"].append({"case": job, "issue": issue["number"]})
             if part_list[-1]["lost"]:
                 self.note_night(KIND_LOST, KEY_JOB, job, issue, part_list[-1], part_list[-1]["how"], result)
-            clean = nightly_infra.first_clean_after_lost(part_list)
+            clean = nightly_infra.first_clean_after_lost(part_list, lambda n: opened_before(issue, n))
             if clean:
                 self.recover_infra(KIND_LOST, KEY_JOB, job, issue, clean, JOB_RECOVERED.format(part=part, job=job), result)
         for lost in nightly_infra.lost_jobs(parts):
@@ -608,7 +612,7 @@ class Filer:
                 result["tracked"].append({"case": case, "issue": issue["number"]})
                 if verdicts[-1]["state"] in nightly_infra.KEPT_STATES:
                     self.note_night(KIND_INFRA, KEY_CASE, case, issue, verdicts[-1], quoted(verdicts[-1]["reason"]), result)
-                graded = nightly_infra.first_graded_after_kept(verdicts)
+                graded = nightly_infra.first_graded_after_kept(verdicts, lambda v: opened_before(issue, v))
                 if graded:
                     self.recover_infra(KIND_INFRA, KEY_CASE, case, issue, graded, CASE_RECOVERED.format(case=case), result)
                 continue
