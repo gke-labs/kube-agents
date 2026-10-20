@@ -9737,6 +9737,7 @@ _DATAPLANE_CASE = "upgrades-readiness-legacy-dataplane"
 _CONTAINERD_CASE = "upgrades-readiness-containerd-socket"
 _INTREE_CASE = "upgrades-readiness-intree-volume"
 _DEFAULTS_CASE = "upgrades-readiness-changed-defaults"
+_DEPRECATED_CASE = "upgrades-readiness-deprecated-api-callers"
 _SLOT_NAMES = dict(zip(_SLOT_LETTERS, _SLOTS))
 _SURGE_CELL = (
     "surge-capacity: pool no-surge-pool (maxSurge 0, maxUnavailable 1; 1 node(s), not autoscaled) removes a node before its replacement exists; "
@@ -9780,6 +9781,17 @@ _DEFAULTS_RISK_CELL = (
     "follows the running minor, so the enforced baseline rule set changes at 1.34; 1.34: the host field of probes and lifecycle hooks must be unset "
     "(https://kubernetes.io/docs/concepts/security/pod-security-standards/)"
 )
+# The deprecated-api-callers rule's risk for the planted writer (the user agent, the count and
+# the last write are the fleet's; the case's pattern stops after the API), the same line cut at
+# the rule's first `; ` as an agent that splits the column there hands it back, and the note the
+# other clusters carry, where only the provider's endpoint-controller writes Endpoints.
+_DEPRECATED_CELL = (
+    "deprecated-api-callers: system:serviceaccount:seeded-deprecation:legacy-endpoints-writer via Python-urllib/3.12 writes core/v1 endpoints "
+    "(1008 writes in 7d, last 2026-10-20T19:50:03Z): deprecated and still served; the next removal is the outage, so plan the migration now; "
+    "successor discovery.k8s.io/v1 EndpointSlice (Endpoints deprecated in 1.33, KEP-4974)"
+)
+_DEPRECATED_CELL_CUT = _DEPRECATED_CELL.split("; ", 1)[0]
+_DEPRECATED_NOTE_LINE = "deprecated-api-callers: 1 provider caller of deprecated APIs not filed (system:serviceaccount:kube-system:endpoint-controller on core/v1 endpoints)"
 _CELL_WRAPS = ("{cell}", '"{cell}"', "'{cell}'", "\u201c{cell}\u201d", "<{cell}>", "`{cell}`")
 
 
@@ -9843,6 +9855,16 @@ def _intree_report(cell: str = _INTREE_CELL, addon: str = "on", blocks: str = "n
     return "\n".join(lines)
 
 
+def _deprecated_report(cell: str = _DEPRECATED_CELL, grade: str = "risk", count: str = "1", rule: str = "deprecated-api-callers") -> str:
+    lines = []
+    for letter, cluster in _SLOT_NAMES.items():
+        if letter == "a":
+            lines.append(f"{cluster}: kind Cluster; deprecated-api callers the report names: {count}; readiness rule: {rule}; graded as: {grade}; cell: {cell}")
+        else:
+            lines.append(f"{cluster}: kind Cluster; deprecated-api callers the report names: 0; readiness rule: deprecated-api-callers; graded as: note; cell: {_DEPRECATED_NOTE_LINE}")
+    return "\n".join(lines)
+
+
 _GROUP_CASE_REPORTS = {
     _SURGE_CASE: (
         ("every-seeded-cluster-has-a-declared-line", "the-laggard-names-no-surge-pool-as-a-blocker", "the-laggards-line-quotes-the-reports-cell", "the-other-clusters-declare-no-such-pool"),
@@ -9877,6 +9899,16 @@ _GROUP_CASE_REPORTS = {
         ),
         lambda wrap: _defaults_report(wrap.format(cell=_DEFAULTS_NOTE_CELL)),
     ),
+    _DEPRECATED_CASE: (
+        (
+            "every-seeded-cluster-has-a-declared-line",
+            "the-planted-clusters-line-counts-the-writer",
+            "the-planted-clusters-line-names-the-reports-rule",
+            "the-planted-clusters-line-grades-it-a-risk",
+            "the-planted-clusters-line-quotes-the-reports-cell",
+        ),
+        lambda wrap: _deprecated_report(wrap.format(cell=_DEPRECATED_CELL)),
+    ),
 }
 
 
@@ -9909,6 +9941,10 @@ def test_containerd_case_accepts_the_rules_entry_cut_at_its_first_separator(cell
         (_INTREE_CASE, "the-planted-volumes-line-quotes-the-reports-cell", _intree_report(_bare(_INTREE_CELL))),
         (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_NOTE_CELL))),
         (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _defaults_report(_bare(_DEFAULTS_RISK_CELL), grade="risk")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_bare(_DEPRECATED_CELL))),
+        # The entry cut at the rule's own first `; `, with and without the prefix: the pattern stops after the API.
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_DEPRECATED_CELL_CUT)),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_bare(_DEPRECATED_CELL_CUT))),
     ],
 )
 def test_rule_cases_accept_the_bare_json_text_without_the_rule_prefix(case, objective, text):
@@ -9963,6 +9999,18 @@ def test_defaults_case_accepts_the_rules_other_forms_on_a_fleet_that_crosses_a_b
         (_DEFAULTS_CASE, "the-planted-clusters-line-counts-the-namespace", _defaults_report(count="none")),
         (_DEFAULTS_CASE, "the-planted-clusters-line-does-not-block", _without_cell_slot(_defaults_report())),
         (_DEFAULTS_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _without_cell_slot(_defaults_report())),
+        # The deprecated-api-callers case: a missing or foreign cell (the rule's own note for a cluster
+        # with no operator caller included), a blocker or note grade, a rule the report did not name,
+        # a count that denies the writer, and the frame without the cell slot.
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report("none")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report('"deprecated-api-callers: something else"')),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _deprecated_report(_DEPRECATED_NOTE_LINE)),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _deprecated_report(grade="blocker")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _deprecated_report(grade="note")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-names-the-reports-rule", _deprecated_report(rule="none")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-counts-the-writer", _deprecated_report(count="0")),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-grades-it-a-risk", _without_cell_slot(_deprecated_report())),
+        (_DEPRECATED_CASE, "the-planted-clusters-line-quotes-the-reports-cell", _without_cell_slot(_deprecated_report())),
     ],
 )
 def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):

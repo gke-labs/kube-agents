@@ -936,15 +936,6 @@
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
-# Upgrade-failure catalogue entry 9 (a feature is deprecated but still served):
-# the audit log's k8s.io/deprecated stamps on seeded-a's legacy-endpoints-writer,
-# read through the readiness report's deprecated-api-callers rule or by hand,
-# graded on a declared line per seeded cluster. deployer: noop; reads the
-# deprecated-api-caller role and the three slot roles beside it, mutates
-# nothing. Nightly from its first merge; a presubmit seat is a later pull
-# request that cites its record.
-./tasks/upgrades-deprecated-api-caller-named/task.yaml
-
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
@@ -1067,6 +1058,16 @@
 # channel default, so the report names it in a note, never as a blocker.
 # Read-only chat prompt graded on declared lines. Nightly from its first merge.
 ./tasks/upgrades-readiness-containerd-socket/task.yaml
+
+# Upgrade-failure catalogue entry 9 (a feature is deprecated but still served)
+# through the readiness report's deprecated-api-callers rule: seeded-a's
+# legacy-endpoints-writer (role deprecated-api-caller) patches Endpoints v1
+# every ten minutes, and the rule names it from the audit log's
+# k8s.io/deprecated stamps as a risk; graded on a declared line per seeded
+# cluster that quotes the rule's cell. deployer: noop; reads the role and the
+# three slot roles beside it, mutates nothing. Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-readiness-deprecated-api-callers/task.yaml
 
 # Catalogue entry 19 through the readiness report's in-tree-volumes rule:
 # intree-pd on slot a is an in-tree gcePersistentDisk volume (role
