@@ -913,7 +913,13 @@ def validate_repo_org(repo: str) -> str:
     applies to GitHub repositories only.
     """
     host, path = split_host(repo) if repo else ("", "")
-    github = not host or host == repo_ref.GITHUB_CANONICAL_HOST
+    # github.com, as before, or the install's GitHub Enterprise Server host;
+    # the other spellings of github.com keep the answer they had.
+    github = (
+        not host
+        or host == repo_ref.GITHUB_CANONICAL_HOST
+        or (host not in repo_ref.GITHUB_HOSTS and host == github_host())
+    )
     primary_org = os.environ.get("GITOPS_ORG") or (
         os.environ.get("GITHUB_ORG") if github else None
     )
@@ -950,7 +956,70 @@ def extract_github_slug(entry: str) -> str | None:
     )
 
 
-DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
+#: The gitops-state ConfigMap key that names the install's GitHub host. The
+#: operator writes it only for a GitHub Enterprise Server host, so a github.com
+#: install has no such key and reads as github.com.
+GITHUB_HOST_KEY = "github_host"
+
+
+def github_host() -> str:
+    """The install's one GitHub host: github.com, or its GitHub Enterprise Server host.
+
+    Read from the operator's `github_host` key in the mounted gitops-state
+    ConfigMap, and never inferred from a repository entry: an entry is
+    administrator-writable, and one hand-added URL must not move the host
+    every refresh and publish goes to. github.com when the key is absent,
+    unreadable, or not a fully qualified hostname. No kubectl fallback, so a
+    hot path such as a chat message parser can ask.
+    """
+    try:
+        value = _state_key_path(GITHUB_HOST_KEY).read_text(encoding="utf-8").strip().lower()
+    except (OSError, UnicodeDecodeError):
+        return repo_ref.GITHUB_CANONICAL_HOST
+    if not HOSTNAME_RE.fullmatch(value) or value in repo_ref.GITHUB_HOSTS:
+        return repo_ref.GITHUB_CANONICAL_HOST
+    return value
+
+
+def is_github_host(host: str) -> bool:
+    """Whether `host` is github.com in a spelling, or the install's GitHub Enterprise Server host."""
+    folded = str(host or "").strip().lower()
+    return folded in repo_ref.GITHUB_HOSTS or (bool(folded) and folded == github_host())
+
+
+def _warn_not_on_install_host(key: str, url: str, install_host: str) -> None:
+    """Say why a github.com or bare GitHub entry is skipped on a GitHub Enterprise Server install."""
+    LOGGER.warning(
+        "Skipping %s repository %r: it names github.com or no host, and this "
+        "install's GitHub host is %s; register the repository by its URL on %s.",
+        key, url, install_host, install_host,
+    )
+
+
+def github_enterprise_ref(entry: str, host: str | None = None) -> tuple[str, str] | None:
+    """`(host, owner/name)` for a GitHub entry URL on the install's GitHub Enterprise Server host.
+
+    None for any other URL: a github.com one (`extract_github_slug` reads
+    those), a bare name, a URL on another host, a port, or a path that is not
+    `owner/name`. `host` is the install's GitHub host, read with
+    `github_host` when not given; on a github.com install nothing matches.
+    """
+    host = (github_host() if host is None else host).lower()
+    if host == repo_ref.GITHUB_CANONICAL_HOST or _names_a_port(entry):
+        return None
+    ref = repo_ref.try_parse(str(entry or ""))
+    if ref is None or not ref.host or ref.host.lower() != host:
+        return None
+    if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH or not repo_ref.is_github_slug(ref.path):
+        return None
+    return host, ref.path
+
+
+# The operator's read-only projection of the gitops-state ConfigMap
+# (`gitopsStateDir` in `platformagent_manifests.go`). The agent container, the
+# shell sandbox and the credential proxy all mount it here.
+GITOPS_STATE_DIR = "/etc/gitops"
+DEFAULT_GITOPS_STATE_PATH = GITOPS_STATE_DIR + "/managed_repos"
 # How long `_read_state_key`'s ConfigMap fallback read waits on the API server
 # before giving up.
 # One namespaced GET against an in-cluster endpoint, so this is not a budget so
@@ -1042,6 +1111,19 @@ def _context_ref(item: dict, url: str, key: str) -> tuple[str | None, str | None
     return None, refused
 
 
+_IGNORED_STATE_PATHS: set[str] = set()
+
+
+def in_operator_pod() -> bool:
+    """Whether this runs in a pod the operator built, which mounts the state dir.
+
+    The mount rather than an environment variable, because the shell sandbox
+    forwards only an allowlist of the pod's environment into sessions, and the
+    mount is there in every container that reads the list.
+    """
+    return Path(GITOPS_STATE_DIR).is_dir()
+
+
 def _state_key_path(key: str) -> Path:
     """Where ConfigMap key `key` lands on disk.
 
@@ -1051,6 +1133,19 @@ def _state_key_path(key: str) -> Path:
     the same parent — `/etc/gitops/context_repos` beside
     `/etc/gitops/managed_repos` — and one environment variable locates both.
     """
+    if in_operator_pod():
+        # gke-labs/kube-agents#2989: in the pod the variable can come from the
+        # model's own shell, so it is not read at all. Honouring it even under
+        # the mount would let it name a sibling key (context_repos as the
+        # managed list) or a path that does not exist, which falls through to
+        # a kubectl read whose ConfigMap, namespace and context are all
+        # environment too. The operator only ever sets the default.
+        configured = os.environ.get("GITOPS_STATE_PATH")
+        if configured and configured != DEFAULT_GITOPS_STATE_PATH and configured not in _IGNORED_STATE_PATHS:
+            # Once per value: one list read asks for the path several times.
+            _IGNORED_STATE_PATHS.add(configured)
+            LOGGER.warning("ignoring GITOPS_STATE_PATH=%s in the pod; reading %s", configured, GITOPS_STATE_DIR)
+        return Path(GITOPS_STATE_DIR) / key
     state_file = Path(os.environ.get("GITOPS_STATE_PATH", DEFAULT_GITOPS_STATE_PATH))
     if key == MANAGED_REPOS_KEY:
         return state_file
@@ -1059,13 +1154,21 @@ def _state_key_path(key: str) -> Path:
 
 def _read_state_key(key: str) -> list[dict[str, str]]:
     """Read one repository list from the mounted state file, else from the ConfigMap via kubectl."""
+    return _parse_repos_json(_read_state_text(key), key)
+
+
+def _read_state_text(key: str) -> str:
+    """One key's raw value: the mounted state file, else the ConfigMap via kubectl."""
     state_file = _state_key_path(key)
     if state_file.is_file():
         try:
-            content = state_file.read_text(encoding="utf-8")
-            return _parse_repos_json(content, key)
-        except Exception:
-            pass
+            return state_file.read_text(encoding="utf-8")
+        except Exception as err:
+            if in_operator_pod():
+                # The mount is the only source in the pod: the kubectl read
+                # below takes its ConfigMap, namespace and context from an
+                # environment the model can set (gke-labs/kube-agents#2989).
+                raise RuntimeError(f"Could not read the repository list from {state_file}: {err}") from err
     elif state_file.parent.is_dir():
         # The mount is there and the key is not, which is what kubelet projects
         # for a ConfigMap with no data: an install with nothing registered. That
@@ -1074,8 +1177,7 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
         # to kubectl here would turn it into the unreadable one -- the broker
         # pod has no context of its own to pass, so the fallback fails and every
         # gated call answers 503 instead of refusing the repository.
-        return []
-
+        return ""
     cfg_name = os.environ.get("GITOPS_STATE_CONFIGMAP", "platform-agent-gitops-state")
     ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
     cmd = ["kubectl", "get", "configmap", cfg_name, "-n", ns, "-o", "json"]
@@ -1118,8 +1220,24 @@ def _read_state_key(key: str) -> list[dict[str, str]]:
             f"Failed to parse ConfigMap {cfg_name} JSON output: {e}"
         ) from e
 
-    repos_str = (cm.get("data") or {}).get(key, "")
-    return _parse_repos_json(repos_str, key)
+    return str((cm.get("data") or {}).get(key, ""))
+
+
+def managed_repos_registered() -> bool:
+    """Whether `managed_repos` holds anything but an empty list, readable or not.
+
+    `get_managed_repos` answers `[]` for a value it could not parse and for
+    entries it skips (an unserved forge type, no type at all), and neither is
+    an install with nothing registered. Raises like `get_managed_repos` when
+    the value cannot be read at all.
+    """
+    text = _read_state_text(MANAGED_REPOS_KEY).strip()
+    if not text:
+        return False
+    try:
+        return json.loads(text) != []
+    except json.JSONDecodeError:
+        return True
 
 
 def mounted_repo_entries(key: str) -> list[dict[str, str]]:
@@ -1155,7 +1273,7 @@ def get_context_repo_entries() -> list[dict[str, str]]:
 
 
 def _github_entries(
-    entries: list[dict[str, str]], key: str, *, fold_case: bool
+    entries: list[dict[str, str]], key: str, *, fold_case: bool, enterprise: bool = False
 ) -> list[dict]:
     """The GitHub entries in `entries` as `{repo, ref}`, in order, one per slug.
 
@@ -1180,6 +1298,7 @@ def _github_entries(
     """
     res: list[dict] = []
     seen: set[str] = set()
+    install_host = github_host()
     for entry in entries:
         url = entry.get("url", "")
         if entry.get("type") != GITHUB_REPO_TYPE:
@@ -1191,6 +1310,20 @@ def _github_entries(
             )
             continue
         slug = extract_github_slug(url)
+        found = None if slug else github_enterprise_ref(url, install_host)
+        if found is not None:
+            # A GitHub Enterprise Server repository: never a bare slug, which
+            # reads as github.com everywhere a link or a CLI call is built
+            # from it. A reader that asks for `enterprise` gets it named with
+            # its host, `<host>/owner/name`, as the verbs take it; the
+            # bare-slug readers (the `--repo` allowlists, the token scope)
+            # leave it to `get_managed_repos`.
+            if not enterprise:
+                continue
+            slug = "/".join(found)
+        elif slug and install_host != repo_ref.GITHUB_CANONICAL_HOST:
+            _warn_not_on_install_host(key, url, install_host)
+            continue
         if not slug:
             LOGGER.warning(
                 "Skipping %s repository %r: not a GitHub repository URL.", key, url
@@ -1207,10 +1340,16 @@ def _github_entries(
 
 
 def _github_slugs(
-    entries: list[dict[str, str]], key: str, *, fold_case: bool
+    entries: list[dict[str, str]], key: str, *, fold_case: bool, enterprise: bool = False
 ) -> list[str]:
-    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates."""
-    return [entry["repo"] for entry in _github_entries(entries, key, fold_case=fold_case)]
+    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates.
+
+    With `enterprise`, a repository on the install's GitHub Enterprise Server
+    host is included as `<host>/owner/name`."""
+    return [
+        entry["repo"]
+        for entry in _github_entries(entries, key, fold_case=fold_case, enterprise=enterprise)
+    ]
 
 
 def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
@@ -1226,11 +1365,14 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
     lowercased, since both forges this is written for compare names that way.
 
     A GitHub entry may be written as a bare `owner/name`, as it always could,
-    and is keyed under its canonical host. Any other forge's entry must name
+    and is keyed under its canonical host. A GitHub entry on the install's
+    GitHub Enterprise Server host (`github_host`) is keyed under that host;
+    one on any other host is skipped. Any other forge's entry must name
     its host -- a self-managed instance has no canonical one -- and one that
     does not is skipped with a warning, as an unreadable GitHub URL is.
     """
     keys: list[str] = []
+    install_host = github_host()
     for entry in entries:
         url = entry.get("url", "")
         kind = str(entry.get("type") or "")
@@ -1239,7 +1381,16 @@ def _repository_keys(entries: list[dict[str, str]], key: str) -> list[str]:
             continue
         if kind == GITHUB_REPO_TYPE:
             slug = extract_github_slug(url)
+            if slug and install_host != repo_ref.GITHUB_CANONICAL_HOST:
+                _warn_not_on_install_host(key, url, install_host)
+                continue
             item = f"{repo_ref.GITHUB_CANONICAL_HOST}/{slug}" if slug else None
+            enterprise = None if slug else github_enterprise_ref(url, install_host)
+            if enterprise is not None:
+                # Keyed under its own host: the broker's GitHub forge at that
+                # host asks `github:<host>/owner/name`, and a github.com forge
+                # never does, so the entry admits nothing on github.com.
+                item = "/".join(enterprise)
         else:
             ref = repo_ref.try_parse(url)
             item = f"{ref.host}/{'/'.join(ref.segments)}" if ref and ref.host else None
@@ -1301,7 +1452,8 @@ def get_managed_repos() -> list[str]:
     repository does not change when an administrator adds a second forge.
     The entry of each other forge has the form `host/path`, because that
     forge has no canonical host to remove: `gitlab.com/acme/infra`, or the
-    host of a self-managed instance.
+    host of a self-managed instance. A GitHub entry on a GitHub Enterprise
+    Server host has that form too: `ghe.example.com/acme/infra`.
 
     A broker that serves more than one forge refuses a name without a host.
     The sandbox client sends a bare GitHub name as its registered URL
@@ -1370,9 +1522,18 @@ def _forge_repo_names(
         [e for e in entries if e.get("type") == GITHUB_REPO_TYPE], key, fold_case=False
     )]
     others: list[str] = []
+    install_host = github_host()
     for entry in entries:
         kind, url = entry.get("type"), entry.get("url", "")
         if kind == GITHUB_REPO_TYPE:
+            # A GitHub Enterprise Server repository is named with its host, as
+            # another forge's is: the links and the broker read the host from
+            # the name.
+            enterprise = None if extract_github_slug(url) else github_enterprise_ref(url, install_host)
+            if enterprise is not None:
+                name = "/".join(enterprise)
+                if name not in others:
+                    others.append(name)
             continue
         if kind not in served:
             LOGGER.warning("Skipping %s repository %r: no provider for type %r.", key, url, kind)
@@ -1467,6 +1628,18 @@ def get_managed_github_repos() -> list[str]:
     return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False)
 
 
+def get_managed_github_repo_names() -> list[str]:
+    """The managed GitHub repositories, named as the verbs take them.
+
+    `owner/name` on github.com, and `<host>/owner/name` on the install's
+    GitHub Enterprise Server host. For a reader that picks a repository to act
+    on (the delivery ledger), not for a reader that
+    compares a bare slug: `get_managed_github_repos` stays bare, and on a GitHub
+    Enterprise Server install it is empty.
+    """
+    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY, fold_case=False, enterprise=True)
+
+
 def get_context_github_repos() -> list[str]:
     """The GitHub `owner/name` slugs under `context_repos`, in ConfigMap order.
 
@@ -1487,7 +1660,7 @@ def get_context_github_repo_entries() -> list[dict]:
     `refused_ref` instead, and that caller skips the repository. Same skip
     rule, same warning, same one-way relationship to the managed list.
     """
-    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True)
+    return _github_entries(get_context_repo_entries(), CONTEXT_REPOS_KEY, fold_case=True, enterprise=True)
 
 
 def resolve_repo(workspace: str | Path | None = None) -> str:
@@ -1498,7 +1671,9 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
     2. Workspace lease record (fallback if workspace is the lease holder directory).
     3. Git remote origin of workspace (if workspace is provided).
     4. ConfigMap state ($GITOPS_STATE_CONFIGMAP).
-    5. Local git remote origin fallback (for local development/inside clone).
+    5. Local git remote origin fallback, for local development only. In the
+       pod the cwd is wherever the model put it, so its origin says nothing
+       about what the install manages (gke-labs/kube-agents#2989).
     """
     if workspace is not None:
         try:
@@ -1539,6 +1714,22 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
         raise RuntimeError(
             f"Multiple repositories configured in ConfigMap ({', '.join(managed)}): "
             "please specify the target repository explicitly (e.g. via --repo <owner/repo>)."
+        )
+
+    if in_operator_pod():
+        if managed_repos_registered():
+            raise RuntimeError(
+                "Could not resolve the target repository as owner/name: managed_repos in "
+                "the GitOps state ConfigMap ($GITOPS_STATE_CONFIGMAP) holds a value this "
+                "image cannot use: it does not parse as a list of {type, url} entries, or "
+                "an entry names a forge type this image does not serve or a URL that is not "
+                "a repository. Fixing the entry is the user's call; report that."
+            )
+        raise RuntimeError(
+            "Could not resolve the target repository as owner/name: no repository "
+            "is registered in the GitOps state ConfigMap ($GITOPS_STATE_CONFIGMAP). "
+            "Registering one is the user's call; report that, or pass --repo <owner/repo> "
+            "for a repository that is registered."
         )
 
     from github_token_refresh import get_current_git_repo

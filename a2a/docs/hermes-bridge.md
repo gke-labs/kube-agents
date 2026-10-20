@@ -211,8 +211,15 @@ do.
 The bridge connects as the static `bridge` user, whose grants are written for this
 program and nothing else: subscribe `a2a.tasks.platform.*.in`, publish
 `a2a.tasks.platform.*.events`, `$KV.runtime-state.>` both ways for the in-flight
-registry below, and `_INBOX.bridge.>`. Nothing wider - a bridge that can publish
+registry below, `_INBOX.bridge.>`, and the board route's two subjects below. Nothing wider - a bridge that can publish
 submissions is a bridge that can impersonate the gateway.
+
+The board route is the Slack Home tab's read of this pod: the bridge subscribes `chat.board`
+and answers each request with session-kv's `GET /v1/board`, published on the request's reply
+subject under `chat.board.reply.gateway.`, the one namespace it may publish there; a request
+replying anywhere else is dropped. It is bound only when the bridge has session-kv's URL and
+key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and reads nothing else
+([spec-nats-deployment.md](../../docs/designs/spec-nats-deployment.md), "The board route").
 
 Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
 subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,
@@ -377,13 +384,16 @@ no key is refused at start.
 A kanban card the persona creates completes after the turn has answered, and the API server
 has no channel to push that completion back. So before a task's first turn the bridge records the
 conversation its session answers (the platform, the gateway's conversation key from the task's
-`authority.audience.conversation`, and the `contextId`) in the pod's session-kv, with
+`authority.audience.conversation`, the `contextId`, and the kind of the prompt's ask, which the
+cards' posts keep marked while they run) in the pod's session-kv, with
 `PUT /v1/sessions/{id}/route` on `BRIDGE_ROUTE_URL` (default `http://127.0.0.1:8699`) and the
 `SESSION_KV_API_KEY` (inherited from the agent container on a rendered bridge). The card's report then goes back to that conversation through the
 gateway's chat.notify route (`docs/designs/spec-chatops-gateway.md`). The PUT is best effort: the
 turn runs either way, and when it fails the answer ends with a line saying a card's answer cannot
 be posted back. A Google Chat or Slack conversation is posted back. A
 conversation on a door with no notify route (inject, the A2A door, Discord) records nothing. The `cli` executor records no route, so its cards still do not report back.
+
+Hermes can also run a wake turn in the session that filed a card: a synthetic message saying how the card ended, with the worker's result. On a conversation with no notify route, Slack included, a finished card (or one sent for review) wakes the session. On Google Chat only a card that failed, timed out or blocked does, because #2734 posts the finished card's report itself. The wake turn's reply isn't delivered anywhere, since the bridge only reads answers to its own task turns, but it stays in the session's history for the next turn. The wake turn can't file a card: in an `a2a-ctx-*` session, or one descended from it such as its compressed continuation, `kanban_create` refuses on a wake turn and says to wait for the person to ask (#2610, `deploy/docker/patches/kanban_wake_guard.py`). So does `kanban_unblock`: a blocked card's question is for the person, and their reply, a turn of its own, can unblock it.
 
 What the `api` executor does not do. A turn the bridge stops waiting
 for, on cancel or the deadline, may keep running in the server, and the next task on the same
@@ -454,9 +464,10 @@ gateway's doors cap a text at 65,536 runes, the server's own cap on a message
 (`MAX_NORMALIZED_TEXT_LENGTH`, 65,536 characters), and the bus's 1 MiB message limit keeps the
 request far under the server's 10 MB body limit. Each earlier turn's answer is published as a
 `turn` artifact as soon as the next turn is about to run; the last turn's answer is the `result`,
-then the one terminal. At each turn boundary the bridge asks the verifier once per distinct
-capability among the queued follow-ups, not once per follow-up, so a verifier that does not answer
-holds the previous turn's answer back for one timeout. A turn's answer the bridge holds between
+then the one terminal. At each turn boundary the bridge checks each distinct capability among the
+queued follow-ups once, not once per follow-up, so a verifier it cannot reach holds the previous
+turn's answer back for one reach window per capability (`DefaultReachWindow` in
+`a2a/capability/service.go`): the check keeps asking for that long before it refuses. A turn's answer the bridge holds between
 turns, while the next follow-up's capability is checked, is not lost to a shutdown: the worker ends
 the task with it as the `result`, and the queue is refused `task-ended`. Nor is it lost when its
 `turn` artifact fails to publish (the task completes with it as the `result`), or when a cancel,
@@ -571,6 +582,71 @@ failures name themselves in the status message:
 | `hermes-api-oversize`    | a 2xx body over the 8 MiB read cap (`apiResponseCap` in `api.go`); refused rather than truncated, with the limit named            | persona            |
 | `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice                                                 | graded (unlisted)  |
 | `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise                                                  | graded (unlisted)  |
+| `card-stop-unavailable`  | a card-stop control got no usable answer from session-kv ("Stopping a conversation's cards" below)                                | not an eval task   |
+| `card-stop-unsupported`  | a card-stop control reached the `cli` executor, which has no conversation session                                                 | not an eval task   |
+
+## Stopping a conversation's cards
+
+`stop` in a chat conversation cancels the front door's turn, and by then that turn has usually
+answered. What still runs is the kanban cards it filed, which the gateway can neither see nor
+reach (#3263). So the gateway can send the bridge a control task: a new submission whose
+message is one data part, `{"cardStop":{"v":1}}`, and no text (`lib.CardStopPart`,
+`lib.CardStopRequested`). The gateway is the only publisher on `a2a.tasks.*.*.in`, and it builds
+its other payloads from text alone, so no one can type a control. The same part on a follow-up
+is not a control: it has no text, so it is refused `no-text`.
+
+The bridge runs a control on a goroutine of its own, not on a worker, so it never waits behind
+long turns. It is still a task: the capability check, then `submitted`, `working` and one
+terminal. No Hermes turn runs. Instead the bridge:
+
+1. publishes `working`, then waits up to 20 s for the conversation's session turn
+   (`apiSessionID` of the `contextId`, so `a2a-<contextId>` or the hashed `a2a-h-…`). That is
+   the one exception to the rule that an `api` task waiting for its session stays `submitted`:
+   the stop has started, and the person who typed it sees it acknowledged while the turn they
+   stopped winds down. The wait lets the bridge's own request for the turn the gateway just
+   cancelled end first, and holds off the next bridge turn in the session while the cards are
+   archived. It does not prove the Hermes run behind that request has stopped: the session turn
+   is released when the bridge's request ends, and whether Hermes abandons the run then is not
+   guaranteed. A card such a run files a little later is caught by session-kv's re-scan only if
+   it lands within that window; one filed after the call has answered is not. Only bridge turns: a
+   wake turn Hermes starts on its own does not take the bridge's turn. Another conversation's
+   stop doesn't wait. The wait is not first come, first served: a message sent right after
+   `stop` can take the session first, and a turn that keeps it past 20 s ends the control
+   `card-stop-unavailable`.
+2. sends `POST /v1/sessions/{id}/cards/stop` to session-kv, on the same `BRIDGE_ROUTE_URL` and
+   `SESSION_KV_API_KEY` bearer as the route PUT, with `{"context_id", "conversation"}`. The
+   conversation is the gateway's key from `authority.audience.conversation` on a Google Chat or
+   Slack conversation, and `""` otherwise. session-kv archives the cards in the agent container
+   (`agents/platform/scripts/session_kv_server.py`), because only there can Hermes kill a card's
+   worker; this sidecar shares the hostname but not the pid namespace.
+3. ends the task `completed`. The `result` artifact holds a short text and the cardStop result
+   part:
+   `{"cardStop":{"v":1,"stopped":[{"id","title","priorStatus"}],"settled":[{"id","title"}],"failed":N,"pending":N,"unresolved":N,"truncated":bool,"deadline":bool,"listsCut":bool}}`.
+   The text counts what session-kv answered, and says plainly what the stop could not promise:
+   `unresolved` cards were stopped just after a worker was claimed for them, so a worker may
+   still start; `pending` archives were still running when session-kv ran out of time;
+   `failed` cards could not be archived; `truncated` means the conversation had more open
+   cards than one stop takes. Each list is cut at 200 cards, which sets `listsCut` (the cards
+   themselves are as the counts say), and each title at 200 runes, its "…" included. If the bus
+   refuses the result with the part, it goes out as the text alone, so the gateway must expect
+   a completed control with no cardStop part.
+
+The time budget, from the control's submission to its terminal, is about 60 s at worst: the
+capability check's 5 s, the 20 s turn wait, and the POST, bounded by
+`BRIDGE_CARD_STOP_TIMEOUT_SECONDS` (default 35). session-kv answers inside its own worst case,
+`CARD_STOP_WORST_CASE_S` (24 s), and the gateway waits 75 s for the control. Raise them
+together.
+
+A stop that gets no usable answer ends `failed` with `reason: card-stop-unavailable - <detail>`.
+That covers no `BRIDGE_ROUTE_URL` or key, a session turn that did not end inside the wait, a
+non-200 answer, a timeout, an answer over 1 MiB and an unreadable one. The `cli` executor runs no
+conversation session and ends a control `card-stop-unsupported`. A cancel that reaches a control
+still at its capability check ends it `canceled-before-start`. One during the turn wait or the
+POST ends it `canceled-by-request`. After the POST went out that ends only the bridge's wait:
+session-kv's route is a synchronous handler and carries on, so the cards may be archived
+all the same. A follow-up to a control is refused `task-ending`. A bridge older than the
+control rejects it `no-text-parts`. The gateway reads each of these as "the cards could not be
+stopped".
 
 ## Sizing against the eval harness
 
@@ -690,7 +766,18 @@ heartbeat and never the trace. Past the trace's share, calls are counted and one
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 
-The heartbeat is a `progress` text part every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
+Each of these also carries a `kube-agents.chat/v1` chat message where the payload spec's
+"Chat messages" section puts one (`chat.go`): a completed `result`'s last chunk holds the
+answer laid out (its first sentence as the headline, the rest as the detail), and is
+published without it if the bus refuses the chunk as too large; every heartbeat holds the
+prompt's kind of ask as `mark.ask`; and the terminal of a completed task that filed a kanban
+card (a `kanban_create` call that did not fail) from a Slack conversation, with
+`KAGE_SLACK_UX` on in the agent environment the bridge inherits and the route recorded (so on
+the `api` executor only), holds that `mark.ask` alone,
+so the ask stays marked until the cards' posts settle it. Anywhere else no card post settles
+it, so the terminal carries no mark and the ask comes off.
+
+The heartbeat is a `progress` text part, with the ask's mark beside it, every `BRIDGE_PROGRESS_INTERVAL_SECONDS` (default
 60; 0 turns it off, and a count a duration cannot hold is refused with a log line and the
 default): `running 1m30s, 3 tool call(s), last mcp__gke__list_clusters`. With the door closed,
 or under `api` with no `A2A_ACTIVITY_SECRET` to check a delivery against, the count has nothing

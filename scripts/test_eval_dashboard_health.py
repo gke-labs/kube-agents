@@ -29,7 +29,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from eval_dashboard import health
+from eval_dashboard import health, post_health
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
@@ -40,6 +40,7 @@ LOST_FIXTURE = TESTDATA / "lost-pods-2026-09-11.json.gz"
 DEADLINE_FIXTURE = TESTDATA / "deadline-kills-2026-09-22.json.gz"
 # The week ending 2026-09-14 18:20Z: every run green, every run long (#1586).
 SLOW_FIXTURE = TESTDATA / "slow-gate-2026-09-14.json.gz"
+NEAR_DEADLINE_FIXTURE = TESTDATA / "near-deadline-2026-09-17.json.gz"
 ROSTER_0911 = [
     "reliability-pdb-probe",
     "security-overgrant-probe",
@@ -1238,6 +1239,267 @@ class SlowGate(unittest.TestCase):
         self.assertTrue(result["evidence"][-1].endswith("; 3 reps lost to infra"), result["evidence"])
 
 
+class NearDeadline(unittest.TestCase):
+    def window(self, durations, recent_end=T0, tasks=None, storm=False):
+        """Runs finishing within the 24h window before `recent_end`."""
+        runs = []
+        for i, m in enumerate(durations):
+            t = tasks if tasks is not None else full_tasks()
+            if storm:
+                t = [task("case-infra", "eee")]
+            runs.append(
+                run(
+                    1000 + i,
+                    100 + i,
+                    recent_end - timedelta(hours=i * 2 + 1),
+                    minutes=m,
+                    tasks=t,
+                )
+            )
+        return data(*runs)
+
+    def test_fires_when_slowest_qualifying_run_is_at_least_300_minutes(self):
+        doc = self.window([120, 200, 305])
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN", "near_deadline is a note, not a state")
+        self.assertEqual(
+            result["near_deadline"],
+            {
+                "since": health.iso(T0),
+                "runs": 3,
+                "max_s": 305 * 60,
+                "max_build": "1002",
+                "deadline_s": 360 * 60,
+                "headroom_s": 55 * 60,
+                "kills": 0,
+                "max_killed": False,
+            },
+        )
+        self.assertIn(
+            "close to deadline: slowest run 305 min in the last 24h (55 min under the 360-minute Prow timeout; 3 runs)",
+            result["evidence"],
+        )
+
+    def test_quiet_under_300_minutes(self):
+        self.assertIsNone(adjudicate(self.window([120, 200, 299]), T0)["near_deadline"])
+
+    def test_clear_with_hysteresis(self):
+        first = adjudicate(self.window([150, 305]), T0)
+        self.assertIsNotNone(first["near_deadline"])
+
+        later = T0 + timedelta(hours=1)
+        held = adjudicate(self.window([150, 290], recent_end=later), later, first)
+        self.assertEqual(
+            (held["near_deadline"]["since"], held["near_deadline"]["max_s"]),
+            (first["near_deadline"]["since"], 290 * 60),
+        )
+
+        cleared = adjudicate(self.window([150, 279], recent_end=later), later, held)
+        self.assertIsNone(cleared["near_deadline"])
+
+    def test_empty_window_keeps_previous_note(self):
+        first = adjudicate(self.window([305]), T0)
+        self.assertIsNotNone(first["near_deadline"])
+
+        weekend = T0 + timedelta(hours=48)
+        held = adjudicate(self.window([305], recent_end=T0), weekend, first)
+        self.assertEqual(held["near_deadline"], first["near_deadline"])
+
+    def test_storm_runs_are_ignored(self):
+        r = run(2001, 501, T0 - timedelta(hours=2), minutes=350, tasks=[task("case-0", "eee")])
+        doc = data(r)
+        self.assertIsNone(adjudicate(doc, T0)["near_deadline"])
+
+    def test_killed_partial_runs_counted(self):
+        killed_run = run(3001, 601, T0 - timedelta(hours=2), minutes=358, result="FAILURE", tasks=[task("case-0", "ppp")])
+        killed_run["eval_verdict"] = None
+        doc = data(killed_run)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(
+            result["near_deadline"],
+            {
+                "since": health.iso(T0),
+                "runs": 1,
+                "max_s": 358 * 60,
+                "max_build": "3001",
+                "deadline_s": 360 * 60,
+                "headroom_s": 2 * 60,
+                "kills": 1,
+                "max_killed": True,
+            },
+        )
+        self.assertIn(
+            "close to deadline: slowest run 358 min in the last 24h (2 min under the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_killed_run_exceeding_prow_timeout_counted_with_zero_headroom(self):
+        killed_run = run(3002, 602, T0 - timedelta(hours=2), minutes=365, result="FAILURE", tasks=[task("case-0", "ppp")])
+        killed_run["eval_verdict"] = None
+        doc = data(killed_run)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(
+            result["near_deadline"],
+            {
+                "since": health.iso(T0),
+                "runs": 1,
+                "max_s": 365 * 60,
+                "max_build": "3002",
+                "deadline_s": 360 * 60,
+                "headroom_s": 0,
+                "kills": 1,
+                "max_killed": True,
+            },
+        )
+        self.assertIn(
+            "close to deadline: slowest run 365 min in the last 24h (5 min past the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_non_integer_minute_wall_clock_evidence_does_not_drift(self):
+        # 21330s = 355.5m -> 270s headroom = 4.5m -> both floor to 4 min
+        finished = T0 - timedelta(hours=2)
+        started = finished - timedelta(seconds=21330)
+        r = run(3003, 603, finished, minutes=355, tasks=full_tasks())
+        r["started"] = started.isoformat()
+        r["duration_s"] = 21330
+        doc = data(r)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["near_deadline"]["headroom_s"], 270)
+        self.assertIn(
+            "close to deadline: slowest run 355 min in the last 24h (4 min under the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_short_runs_ignored(self):
+        short_tasks = [task(f"case-{k}", "ppp") for k in range(health.SLOW_MIN_TASKS - 1)]
+        short_run = run(4001, 701, T0 - timedelta(hours=2), minutes=320, result="SUCCESS", tasks=short_tasks)
+        doc = data(short_run)
+        self.assertIsNone(adjudicate(doc, T0)["near_deadline"])
+
+        aborted_run = run(4002, 702, T0 - timedelta(hours=2), minutes=320, result="ABORTED", tasks=full_tasks())
+        self.assertIsNone(adjudicate(data(aborted_run), T0)["near_deadline"])
+
+    def test_no_note_outside_green(self):
+        earlier = T0 - timedelta(hours=1)
+        before = adjudicate(self.window([350], recent_end=earlier), earlier)
+        self.assertIsNotNone(before["near_deadline"])
+
+        doc = self.window([350])
+        doc["runs"] += [run(500 + i, pr, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE") for i, pr in enumerate([1, 1, 2])]
+        degraded = adjudicate(doc, T0, before)
+        self.assertEqual((degraded["state"], degraded["condition"]), ("DEGRADED", "setup_deaths"))
+        self.assertIsNone(degraded["near_deadline"])
+        self.assertFalse(any("close to deadline" in line for line in degraded["evidence"]))
+
+    def test_sub_minute_headroom_renders_at_the_deadline(self):
+        # 21570s = 359.5m -> 30s headroom -> renders "at the 360-minute Prow timeout", not "0 min under"
+        finished = T0 - timedelta(hours=2)
+        started = finished - timedelta(seconds=21570)
+        r = run(3004, 604, finished, minutes=359, tasks=full_tasks())
+        r["started"] = started.isoformat()
+        r["duration_s"] = 21570
+        doc = data(r)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIn(
+            "close to deadline: slowest run 359 min in the last 24h (at the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_exact_timeout_without_kills_does_not_claim_killed(self):
+        # 21600s = 360m exactly, completed with a verdict (kills = 0)
+        finished = T0 - timedelta(hours=2)
+        started = finished - timedelta(seconds=21600)
+        r = run(3005, 605, finished, minutes=360, tasks=full_tasks())
+        r["started"] = started.isoformat()
+        r["duration_s"] = 21600
+        doc = data(r)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["near_deadline"]["kills"], 0)
+        self.assertIn(
+            "close to deadline: slowest run 360 min in the last 24h (at the 360-minute Prow timeout; 1 runs)",
+            result["evidence"],
+        )
+
+    def test_deadline_kill_outage_recovery_does_not_fire_near_deadline(self):
+        # Three deadline kills that graded all matrix cases cause an OUTAGE
+        outage_runs = [
+            kill(3101 + i, 701 + i, T0 - timedelta(hours=3 - i * 0.5), minutes=363, tasks=full_tasks())
+            for i in range(3)
+        ]
+        # Then three distinct-PR green runs finish to recover the gate
+        recovery_runs = [
+            run(3201 + i, 801 + i, T0 - timedelta(minutes=40 - i * 10), minutes=120, result="SUCCESS", tasks=full_tasks())
+            for i in range(3)
+        ]
+        doc = data(*(outage_runs + recovery_runs))
+        # Previous state was OUTAGE
+        prev_outage = {
+            "state": "OUTAGE",
+            "condition": "deadline_kill",
+            "since": health.iso(T0 - timedelta(hours=2)),
+            "cause": "deadline_kill",
+            "failing_cases": [],
+        }
+        # First tick recovers from OUTAGE to GREEN; near_deadline must NOT fire using the outage's own kills
+        result = adjudicate(doc, T0, prev_outage)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIsNone(result["near_deadline"])
+
+        # Second tick (30 min later): state is GREEN, prev is result (since = T0).
+        # Outage kills remain in the 24h window but finished <= non_green_end (prev.since),
+        # so near_deadline remains None over the subsequent 24 hours.
+        t1 = T0 + timedelta(minutes=30)
+        result1 = adjudicate(doc, t1, result)
+        self.assertEqual(result1["state"], "GREEN")
+        self.assertIsNone(result1["near_deadline"])
+
+        # Third tick (1h later): a new deadline kill finishes AFTER recovery (finished > non_green_end).
+        # This fresh kill while GREEN qualifies and fires near_deadline with kills: 1.
+        t2 = T0 + timedelta(hours=1)
+        fresh_kill = kill(3301, 901, t2 - timedelta(minutes=5), minutes=363, tasks=full_tasks())
+        doc_with_fresh = data(*(outage_runs + recovery_runs + [fresh_kill]))
+        result2 = adjudicate(doc_with_fresh, t2, result1)
+        self.assertEqual(result2["state"], "GREEN")
+        self.assertIsNotNone(result2["near_deadline"])
+        self.assertEqual(result2["near_deadline"]["kills"], 1)
+        self.assertTrue(result2["near_deadline"]["max_killed"])
+
+    def test_slowest_graded_run_with_separate_deadline_kill_does_not_claim_killed(self):
+        # A 360m graded SUCCESS run alongside a 345m deadline kill in the same 24h window.
+        # The graded run is slowest (max_s = 21600), so the margin must NOT say "killed at the deadline".
+        graded_run = run(3401, 801, T0 - timedelta(hours=2), minutes=360, result="SUCCESS", tasks=full_tasks())
+        killed_run = kill(3402, 802, T0 - timedelta(hours=1), minutes=345, tasks=[task("case-0", "ppp")])
+        doc = data(graded_run, killed_run)
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertIsNotNone(result["near_deadline"])
+        self.assertEqual(result["near_deadline"]["kills"], 1)
+        self.assertFalse(result["near_deadline"]["max_killed"])
+        self.assertEqual(result["near_deadline"]["max_s"], 360 * 60)
+        self.assertEqual(
+            health.near_deadline_margin(result["near_deadline"]),
+            "at the 360-minute Prow timeout",
+        )
+        self.assertEqual(
+            health.near_deadline_headroom_text(result["near_deadline"]),
+            "at the timeout",
+        )
+        self.assertIn(
+            "close to deadline: slowest run 360 min in the last 24h (at the 360-minute Prow timeout; 2 runs)",
+            result["evidence"],
+        )
+        post = post_health.render_near_deadline(result)
+        self.assertIn("slowest run 360 min in the last 24h, at the 360-minute Prow timeout.", post)
+        self.assertNotIn("killed at the deadline", post)
+        self.assertNotIn("Not a break", post)
+
+
 # --------------------------------------------------------------------------- #
 # Rule 8: pool pressure
 # --------------------------------------------------------------------------- #
@@ -1457,7 +1719,7 @@ class PoolNote(unittest.TestCase):
                 "total": 30,
                 "lease_failures": None,
                 "lease_failures_hours": None,
-                "held_by_hand": None,
+                "no_build_id": None,
                 "cause": "CAPACITY",
                 "max_concurrency": 30,
             },
@@ -1475,25 +1737,25 @@ class PoolNote(unittest.TestCase):
         recent = {"hours": 3, "runs": 1, "lease_failures": 2, "judged": False,
                   "p50_minutes": None, "p95_minutes": None, "worst_minutes": None}
         result = pooled(verdict="BREACH", cause="CAPACITY", free=0, bad_day=None,
-                        recent=recent, held_by_hand={"hangdng-rebuild": 2})
+                        recent=recent, no_build_id={"hangdng-rebuild": 2})
         note = result["pool"]
         self.assertEqual((note["lease_failures"], note["lease_failures_hours"]), (2, 3))
-        self.assertEqual(note["held_by_hand"], 2)
+        self.assertEqual(note["no_build_id"], 2)
         self.assertIsNone(note["p50_s"])
         self.assertEqual(
             health.pool_measurement(note), "2 runs refused a project in the last 3h"
         )
         self.assertIn(
             "backed-up pool: 2 runs refused a project in the last 3h;"
-            " 0 of 30 projects free, 2 held by hand",
+            " 0 of 30 projects free, 2 leased with no build ID in the owner",
             result["evidence"],
         )
 
     def test_a_note_from_an_older_artifact_has_no_refusals_or_holds_rather_than_a_crash(self):
         note = pooled(verdict="BREACH", cause="CAPACITY", free=0)["pool"]
         self.assertIsNone(note["lease_failures"])
-        self.assertIsNone(note["held_by_hand"])
-        self.assertNotIn("held by hand", health.pool_evidence(note))
+        self.assertIsNone(note["no_build_id"])
+        self.assertNotIn("no build ID", health.pool_evidence(note))
 
     def test_the_recent_stretch_beats_the_worst_day_when_the_periodic_judged_it(self):
         # The verdict lasts a week, so Monday's row is still the worst day on
@@ -1630,6 +1892,13 @@ class PoolNote(unittest.TestCase):
         note = health.pool_note(artifact, T0, None)
         measured = health.parse_iso(note["measured_at"])
         self.assertEqual(health.parse_iso(note["waiting_since"]), measured - timedelta(minutes=40))
+        # The waits are measured against the moment Deck was read, which on a
+        # live run comes after the sweep that window_end was fixed before; the
+        # queue block says when, and the backlog is dated from that clock, or
+        # it would read as starting before its oldest run was created.
+        artifact["queue"]["read_at"] = health.iso(measured + timedelta(minutes=3))
+        later = health.pool_note(artifact, T0, None)
+        self.assertEqual(health.parse_iso(later["waiting_since"]), measured + timedelta(minutes=3) - timedelta(minutes=40))
         # Nothing to date: no backlog, and no reading of the queue at all.
         artifact["queue"]["waiting_runs"] = [{"minutes": 9, "pull": 2}]
         self.assertIsNone(health.pool_note(artifact, T0, None)["waiting_since"])
@@ -2264,6 +2533,81 @@ class SlowGateReplay(unittest.TestCase):
         self.assertEqual([int(r.wall_clock.total_seconds() // 60) for r in full[-3:]], [207, 152, 167])
         self.assertEqual(int(p90 // 60), 198)
         self.assertFalse(all(r.wall_clock.total_seconds() > p90 for r in full[-3:]))
+
+
+class NearDeadlineReplay(unittest.TestCase):
+    """2026-09-17 (#2873): synthetic replay scenario modeling runs reaching 356 minutes while the gate stayed GREEN.
+    The note appears on 09-17 16:00Z with 4 minutes of headroom under the 360-minute
+    Prow timeout."""
+
+    @classmethod
+    def setUpClass(cls):
+        data = health.load_json(NEAR_DEADLINE_FIXTURE)
+        assert data is not None
+        cls.data = data
+        cls.every = list(health.replay(cls.data, timedelta(minutes=30), health.Roster.fixed(ROSTER_0911), start=health.parse_iso("2026-09-17T04:00:00+00:00")))
+
+    def tick(self, when):
+        return next(h for now, h in self.every if now == when)
+
+    def test_the_fixture_is_what_trim_produces(self):
+        trimmed = self.data["trimmed"]
+        self.assertEqual(trimmed["source"], "synthetic scenario modeling data.json for 2026-09-17")
+        start = health.parse_iso(trimmed["from"])
+        end = health.parse_iso(trimmed["to"])
+        assert start is not None and end is not None
+        again = health.trim(self.data, start, end, trimmed["source"])
+        self.assertEqual(again["runs"], self.data["runs"])
+
+    def test_09_17_reads_near_deadline_from_16_00z(self):
+        tick = self.tick(health.parse_iso("2026-09-17T16:00:00+00:00"))
+        self.assertEqual(tick["state"], "GREEN")
+        self.assertEqual(
+            tick["near_deadline"],
+            {
+                "since": "2026-09-17T16:00:00+00:00",
+                "runs": 4,
+                "max_s": 21360,
+                "max_build": "2100456789012345678",
+                "deadline_s": 21600,
+                "headroom_s": 240,
+                "kills": 0,
+                "max_killed": False,
+            },
+        )
+        self.assertIn("close to deadline: slowest run 356 min in the last 24h (4 min under the 360-minute Prow timeout; 4 runs)", tick["evidence"])
+
+    def test_the_replay_timeline_shows_near_deadline_beside_the_state(self):
+        entries = health.timeline(self.every)
+        edge = next(e for e in entries if e["near_deadline"])
+        self.assertEqual(
+            edge["near_deadline"],
+            {
+                "since": "2026-09-17T16:00:00+00:00",
+                "max_s": 21360,
+                "max_build": "2100456789012345678",
+                "runs": 4,
+                "deadline_s": 21600,
+                "headroom_s": 240,
+                "kills": 0,
+                "max_killed": False,
+            },
+        )
+        self.assertIn(
+            "2026-09-17T16:00:00+00:00  GREEN      (near deadline since 2026-09-17T16:00:00+00:00: slowest run 356 min, 4 min of headroom)",
+            health.format_timeline([edge]),
+        )
+
+    def test_quiet_at_04_00z(self):
+        self.assertIsNone(self.tick(health.parse_iso("2026-09-17T04:00:00+00:00"))["near_deadline"])
+
+    def test_replays_over_data_and_slow_gate_show_no_note(self):
+        data_runs = health.load_json(TESTDATA / "data.json.gz")
+        slow_runs = health.load_json(SLOW_FIXTURE)
+        assert data_runs is not None and slow_runs is not None
+        for d in (data_runs, slow_runs):
+            ticks = list(health.replay(d, timedelta(hours=1), health.Roster.fixed(ROSTER_0911)))
+            self.assertTrue(all(h.get("near_deadline") is None for _, h in ticks))
 
 
 class CommandLine(unittest.TestCase):

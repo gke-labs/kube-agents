@@ -73,12 +73,23 @@ type SessionRecord struct {
 	Addressee    string    `json:"addressee"`
 	Kind         string    `json:"kind"`
 	LastActivity time.Time `json:"lastActivity"`
+	// LastUserMessage is when someone in the conversation last wrote to it:
+	// every verified turn, and nothing an executor or the gateway does. It
+	// is the idle clock the reap and the cap eviction read (idleSince),
+	// which the design of record counts from the last user message; zero on
+	// records written before the field existed.
+	LastUserMessage time.Time `json:"lastUserMessage,omitzero"`
+	// PodReuse marks PodName as a pod spawned to serve every turn of the
+	// conversation (Config.SessionReuse at spawn). Only such a pod is
+	// handed a later task, and only such a pod's running task is held to
+	// the reap scan's overdue bound; a one-task pod has its own deadline.
+	PodReuse bool `json:"podReuse,omitempty"`
 	// LastTaskActivity is when a task last started or, from an executor's
 	// terminal, ended in this session. It is what the Slack adapter's
 	// session-thread rule bounds on (Gateway.hasSession), separately from
 	// LastActivity, which every verified turn moves: a "@bot stop" with
-	// nothing running is activity for the reap but must not re-admit a
-	// thread whose last task ended hours ago. Zero on records written before
+	// nothing running is activity (and, for the reap, a user message) but
+	// must not re-admit a thread whose last task ended hours ago. Zero on records written before
 	// the field existed, which reads as "no task activity": such a thread
 	// needs a fresh mention after the upgrade, once.
 	LastTaskActivity time.Time   `json:"lastTaskActivity,omitempty"`
@@ -111,6 +122,15 @@ type SessionRecord struct {
 	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
 	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
 	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+}
+
+// idleSince is when the conversation went quiet: its last user message, or,
+// on a record from before that was kept, its last activity.
+func (rec *SessionRecord) idleSince() time.Time {
+	if !rec.LastUserMessage.IsZero() {
+		return rec.LastUserMessage
+	}
+	return rec.LastActivity
 }
 
 // sessionAuthorCap bounds SessionRecord.SessionAuthors. It holds a turn's
@@ -232,6 +252,11 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// TerminalObserved marks that observeTaskTerminal has already been called
+	// for this task (e.g. by healActiveTask when recovering a stale terminal
+	// from the stream), so a queued or redelivered relayTerminal does not
+	// double-count in task_terminals_total.
+	TerminalObserved bool `json:"terminalObserved,omitempty"`
 	// Requester, Attribution and StartedAt are what a child task minted on
 	// this turn's behalf, or the wake-up turn after it, inherits: the
 	// allowlist is checked against Requester, the child's authority block is
@@ -305,6 +330,25 @@ type TaskRef struct {
 	// observer the turn ends failed with this reason and delivers nothing
 	// (handOffEnd), and the read route reports the same. Empty otherwise.
 	DelegationEnd string `json:"delegationEnd,omitempty"`
+	// AskMessageID is the backend id of the human message that started the
+	// chain, on its root entry only: the message the chain's mark is drawn
+	// on (spec-a2a-payloads.md, "mark"). Mark is the reaction state last
+	// drawn there, so the next mark draws only the difference, across a
+	// restart too. Both empty on a child, a wake, an entry written before
+	// they existed, and a chain whose root was evicted from the history cap
+	// (whose marks then draw nothing).
+	AskMessageID string     `json:"askMessageId,omitempty"`
+	Mark         *MarkState `json:"mark,omitempty"`
+	// NotifyKeys are the update keys of the conversation notifies whose
+	// marks belong to this chain, on its root entry only: a key is bound to
+	// the conversation's latest chain the first time a notify carrying it
+	// and a mark arrives, and every later mark with that key marks this
+	// chain's ask, whatever chain has started since (applyNotifyMark). At
+	// most notifyUpdateKeysMax, the least recently used dropped first, as
+	// the notifier keeps its keys. MarkedAt is when Mark was last drawn,
+	// what bounds an older ask's hold on the Agent Session (sessionMark).
+	NotifyKeys []string  `json:"notifyKeys,omitempty"`
+	MarkedAt   time.Time `json:"markedAt,omitzero"`
 }
 
 // handOffEnd is the one rule for a session turn's own end when it asked to
@@ -402,6 +446,17 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].Canceled = true
+			return
+		}
+	}
+}
+
+// MarkTerminalObserved records that observeTaskTerminal has been called
+// for the task, preventing double-counting if a queued relay terminal follows.
+func (rec *SessionRecord) MarkTerminalObserved(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].TerminalObserved = true
 			return
 		}
 	}

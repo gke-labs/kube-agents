@@ -265,7 +265,7 @@ flowchart LR
 
 ### The presubmit check
 
-- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte.
+- `make skills-check` verifies each upstream copy against its lock's checksum, rebuilds each generated skill from ① and ② in a temp directory, and compares the result with ③ byte for byte. The same target also fails any shipped skill document over 40,000 characters (`scripts/check_skill_size.py`), a mirrored skill included.
 - Reads only committed files: no network, so it cannot fail because GitHub is slow.
 - Patches are refreshed on every sync, so the check applies them without merging; a patch that needs a merge to apply is itself a failure.
 

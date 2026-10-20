@@ -1,0 +1,300 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "payments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "What's wrong",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "payments-api in seeded-debug keeps crashing: secret payments-db-creds has been missing since 14:02. Nothing else changed.",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n\n",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Why",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "text": "The container exits reading ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "code": true
+                        },
+                        "text": "payments-db-creds",
+                        "type": "text"
+                      },
+                      {
+                        "text": ", which ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "no longer exists",
+                        "type": "text"
+                      },
+                      {
+                        "text": ".",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "What to do",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Option A (Roll back to 14:02):",
+                        "type": "text"
+                      },
+                      {
+                        "text": " Revert the Deployment to revision 7.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Option B (Restore the secret):",
+                        "type": "text"
+                      },
+                      {
+                        "text": " Recreate payments-db-creds from the GitOps repo.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "text": "✅ ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Recommended: Option B",
+                        "type": "text"
+                      },
+                      {
+                        "text": " — it fixes the cause rather than hiding it.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "To authorize:",
+                        "type": "text"
+                      },
+                      {
+                        "text": " reply ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "'apply'",
+                        "type": "text"
+                      },
+                      {
+                        "text": " to open a GitOps Pull Request with the recommended fix, or name one directly with ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "'apply Option A'",
+                        "type": "text"
+                      },
+                      {
+                        "text": " / ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "'apply Option B'",
+                        "type": "text"
+                      },
+                      {
+                        "text": ".",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "text": "🔗 ",
+                    "type": "text"
+                  },
+                  {
+                    "text": "GKE Workloads",
+                    "type": "link",
+                    "url": "https://console.cloud.google.com/kubernetes/workload/overview"
+                  },
+                  {
+                    "text": " | ",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Cloud Logs",
+                    "type": "link",
+                    "url": "https://console.cloud.google.com/logs/query;query=x"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "why · what each option does",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "text": {
+              "emoji": true,
+              "text": "Roll back to 14:02",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Roll back to 14:02 — apply Option A"
+          },
+          {
+            "action_id": "kage.choice.1",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Restore the secret",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Restore the secret — apply Option B"
+          },
+          {
+            "action_id": "kage.link.0",
+            "text": {
+              "emoji": true,
+              "text": "GKE Workloads ↗",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "url": "https://console.cloud.google.com/kubernetes/workload/overview"
+          },
+          {
+            "action_id": "kage.link.1",
+            "text": {
+              "emoji": true,
+              "text": "Cloud Logs ↗",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "url": "https://console.cloud.google.com/logs/query;query=x"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

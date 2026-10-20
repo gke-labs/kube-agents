@@ -395,6 +395,16 @@ func (a *ConsoleAdapter) Edit(conversation, messageID, text string) error {
 	return a.publish(conversation, messageID, text, true)
 }
 
+// PostMessage and EditMessage publish text only: a chat message falls back
+// to its text (ErrTextOnly).
+func (a *ConsoleAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	return postTextOnly(a.Post, conversation, m)
+}
+
+func (a *ConsoleAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	return editTextOnly(a.Edit, conversation, messageID, m)
+}
+
 // Roster is the one author: a console conversation is a DM by construction.
 func (a *ConsoleAdapter) Roster(conversation string) ([]string, bool, error) {
 	if _, ok := consoleConversationToken(conversation); !ok {
@@ -408,3 +418,7 @@ func (a *ConsoleAdapter) Roster(conversation string) ([]string, bool, error) {
 func (a *ConsoleAdapter) OpenDirect(string) (string, error) {
 	return "", errors.New("console adapter: no direct channel beyond the conversation")
 }
+
+// React and RemoveReaction: the console has no reactions (Adapter).
+func (a *ConsoleAdapter) React(string, string, string) error          { return nil }
+func (a *ConsoleAdapter) RemoveReaction(string, string, string) error { return nil }

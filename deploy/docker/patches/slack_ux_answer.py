@@ -25,15 +25,29 @@ The first sentence is ``slack_presenter.split_lead``'s, the sentence
 ``slack_presenter.split_answer`` takes its headline from. A bold headline is
 plain text with its code spans kept as code, so an answer it cannot carry whole
 keeps the upstream post: one whose first line is a heading, a list item, a
-code fence, a quote or a table row, one opening on a bold label, or whose first sentence is longer than ``HEADLINE_MAX``, runs onto
-a second line, or holds a link or a mention. So does one with nothing after
+code fence, a quote or a table row, one opening on a bold label, or whose first sentence is longer than ``HEADLINE_MAX``
+with no clause to cut it at (``slack_presenter.clause_cut``; with one, the headline is the sentence up to the cut and the rest
+of it leads the fold), runs onto a second line, or holds a link or a mention. So does one with nothing after
 that sentence, one whose first line ends in a colon (what it introduces is the
 answer), one longer than :data:`FOLD_TEXT_MAX`, a
 fold ``block_kit`` cannot render or that would hold a block outside
 :data:`FOLD_CHILD_TYPES` (a divider), and an adapter not rendering
 ``rich_blocks``, since upstream would then post text alone. A refused fold
 logs why; a failed post falls back to the upstream send. A closing question posts after
-the fold, unfolded, so an offer is never hidden. The folded post
+the fold, unfolded, so an offer is never hidden. An answer that ends by asking which of
+two to five options to take (``slack_moments.answer_choices``, the rule next's emitter
+applies too) keeps its opening paragraph and the options' shown lines above the fold, the
+question below it, and the options as choice buttons (``kage_answer.choice.<n>``, value
+the label) in a thread, which ``slack_ux_clicks`` answers as the clicker's reply; outside one the options stay text.
+An answer that declares its next step on a last line of its own (``slack_moments.next_step``,
+``[next: check seeded-a]``) gets that step as one such button in a thread, the line left
+out of the blocks, after the question when there is one; an answer ``split`` refuses is
+then drawn whole, as upstream's renderer draws it, with the button under it. Options the
+answer offers win over a declared step. The line itself is plumbing and is never posted as
+text: outside a thread, for a step-shaped line the parser refuses, and on the upstream post an
+answer keeps for any other reason (an actionable report, one that cannot be drawn whole within
+Slack's 50 blocks, an adapter not rendering rich blocks), it is taken off and nothing takes its
+place. The folded post
 carries what upstream's adds: link-preview settings, ``reply_broadcast``, the
 feedback buttons, the status clear and the reply tracking for the thread. An incident report
 that edits its alert never reaches this send, and a report a reply can act on
@@ -54,9 +68,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 try:
+    import slack_moments as _moments
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
-    _presenter = None
+    _moments = _presenter = None
 
 #: The Slack plugin's markdown renderer, beside this module's ``gateway/``
 #: directory. It imports only ``re`` and ``typing``, so it loads by path.
@@ -99,6 +114,10 @@ BOLD_LABEL = re.compile(
 LABEL_LINE = re.compile(r"^\S+(?: \S+){0,2}:\s+\S")
 #: A quote or a table row: lines the presenter reads as text that are not a prose sentence either.
 NOT_PROSE_LINE = re.compile(r"^\s*[>|]")
+#: The choice buttons' action-id prefix: ``<prefix>.choice.<n>``, which ``slack_ux_clicks`` answers.
+ACTION_PREFIX = "kage_answer"
+#: Slack's cap on a message's blocks: an answer drawn whole at it has no room for a step's button.
+MESSAGE_BLOCKS_MAX = 50
 #: Upstream's per-post ``config.extra`` switches the folded post carries as well.
 REPLY_BROADCAST = "reply_broadcast"
 #: The Slack adapter module's link-preview helper, read from the adapter's own module.
@@ -121,7 +140,7 @@ def _not_prose(line: str) -> bool:
 
 
 def _refuse(reason: str) -> None:
-    logger.info("slack_ux_answer: keeping the upstream post, the fold is refused: %s", reason)
+    logger.info("slack_ux_answer: the fold is refused: %s", reason)
 
 
 _block_kit = None
@@ -166,14 +185,20 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
         return _refuse("it opens with a heading, a list item, a code fence, a quote or a table row")
     if BOLD_LABEL.match(opener):
         return _refuse("it opens with a bold label, not a sentence")
-    lead, _body = _presenter.split_lead(answer)
+    lead, _body = _presenter.split_lead(answer, cut=False)
     if LOSES_CONTENT.search(lead):
         return _refuse("the first sentence holds a link or a mention")
     headline = _headline_runs(lead)
     if not headline:
         return _refuse("it does not open with a sentence")
+    overflow = ""
     if sum(len(text) for text, _code in headline) > _presenter.HEADLINE_MAX:
-        return _refuse("the first sentence is longer than HEADLINE_MAX")
+        # split_lead's cut: the headline is the sentence up to a clause, and the rest of it leads the fold.
+        clause = _presenter.clause_cut(lead)
+        if clause is None:
+            return _refuse("the first sentence is longer than HEADLINE_MAX and no clause of it fits")
+        cut, overflow = clause
+        headline = _headline_runs(cut)
     # The rest is cut from the answer as written, so its line breaks reach block_kit as they
     # would upstream; split_lead's body joins a first paragraph's lines into one.
     first_line, _, after = answer.strip().partition("\n")
@@ -186,7 +211,9 @@ def split(answer: str) -> tuple[list[tuple[str, bool]], str] | None:
             break
     if not first_line.startswith(written):
         return _refuse("the first sentence runs onto a second line")
-    tail = first_line[len(written):].strip()
+    if overflow and reopen:
+        return _refuse("the first sentence was cut inside an emphasis run")
+    tail = " ".join(part for part in (overflow, first_line[len(written):].strip()) if part)
     rest = "\n".join(part for part in (tail, after) if part).strip()
     if not rest:
         return _refuse("nothing follows the first sentence")
@@ -239,11 +266,36 @@ def render_fold(rest: str, mrkdwn_fn: Any = None) -> list[dict] | None:
     return blocks
 
 
+def render_whole(markdown: str, mrkdwn_fn: Any = None) -> list[dict] | None:
+    """``markdown`` as the blocks the adapter's own send would post at the top level, or None for
+    none; unlike :func:`render_fold`, any block type the plugin renders (a divider) is kept."""
+    block_kit = _load_block_kit()
+    blocks = block_kit.sanitize_blocks(block_kit.render_blocks(markdown, mrkdwn_fn=mrkdwn_fn))
+    return blocks or _refuse("the Slack plugin rendered no blocks")
+
+
+def choice_blocks(options: list[tuple[str, bool]]) -> list[dict]:
+    """``slack_moments.answer_choices``'s options as choice buttons, the primary one drawn as Slack's
+    primary; each button's value is its label, so a click answers with what the button says."""
+    return _presenter._actions([
+        _presenter._button(
+            label, f"{ACTION_PREFIX}.{_presenter.CHOICE_ACTION}.{i}", value=label,
+            style=_presenter.PRIMARY_STYLE if primary else None,
+        )
+        for i, (label, primary) in enumerate(options)
+    ])
+
+
 def blocks_answer(
-    headline: list[tuple[str, bool]], fold_blocks: list[dict], question_blocks: list[dict] = ()
+    headline: list[tuple[str, bool]],
+    fold_blocks: list[dict],
+    question_blocks: list[dict] = (),
+    detail_blocks: list[dict] = (),
+    action_blocks: list[dict] = (),
 ) -> list[dict]:
-    """``headline`` in bold, its code runs as code too, ``fold_blocks`` folded under :data:`FOLD_TITLE`,
-    then ``question_blocks`` unfolded. No fold when ``fold_blocks`` is empty."""
+    """``headline`` in bold, its code runs as code too, ``detail_blocks`` unfolded, ``fold_blocks``
+    folded under :data:`FOLD_TITLE`, then ``question_blocks`` unfolded and ``action_blocks``. No fold
+    when ``fold_blocks`` is empty."""
     bold = [
         {"type": "text", "text": text, "style": {"bold": True, "code": True} if code else {"bold": True}}
         for text, code in headline
@@ -257,8 +309,10 @@ def blocks_answer(
     }
     return [
         {"type": "rich_text", "elements": [{"type": "rich_text_section", "elements": bold}]},
+        *detail_blocks,
         *([fold] if fold_blocks else []),
         *question_blocks,
+        *action_blocks,
     ]
 
 
@@ -270,22 +324,26 @@ def _renders_rich_blocks(adapter: Any) -> bool:
 class _AnswerFolder:
     """The notifier's adapter, with ``send`` posting the answer folded."""
 
-    def __init__(self, adapter: Any, chat_id: str):
+    def __init__(self, adapter: Any, chat_id: str, fold: bool = True):
         self._adapter = adapter
         self._chat_id = chat_id
+        self._fold = fold
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._adapter, name)
 
     async def send(self, chat_id: Any, content: Any, metadata: Any = None, **kwargs: Any) -> Any:
         if str(chat_id) == self._chat_id and isinstance(content, str) and not kwargs:
-            try:
-                posted = await self._post(content.strip(), metadata)
-            except Exception as exc:  # noqa: BLE001 — the upstream post still delivers it
-                logger.warning("slack_ux_answer: could not post the answer folded, posting it whole: %s", exc)
-                posted = None
+            posted = None
+            if self._fold:
+                try:
+                    posted = await self._post(content.strip(), metadata)
+                except Exception as exc:  # noqa: BLE001 — the upstream post still delivers it
+                    logger.warning("slack_ux_answer: could not post the answer folded, posting it whole: %s", exc)
             if posted is not None:
                 return posted
+            # Whatever posts it, the declared step's line is plumbing no one reads as text.
+            content = _moments.visible_text(content) or content
         return await self._adapter.send(chat_id, content, metadata=metadata, **kwargs)
 
     async def _post(self, content: str, metadata: Any) -> Any:
@@ -296,17 +354,47 @@ class _AnswerFolder:
         # opens on: the predicate the incident editor and the incidents store read it by.
         if actionable_report(content):
             return _refuse("it is a report with options to act on")
-        parts = split(content)
-        if parts is None:
-            return None
-        headline, rest = parts
         adapter = self._adapter
         mrkdwn_fn = getattr(adapter, "format_message", None)
-        rest, question = trailing_question(rest)
-        fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
-        question_blocks = render_fold(question, mrkdwn_fn) if question else []
-        if fold_blocks is None or question_blocks is None:
-            return None
+        in_thread = bool(adapter._resolve_thread_ts(None, metadata))
+        # The declared next step is a button in a thread, where a click answers. Its line, and any
+        # step-shaped line the parser refuses, is never shown as text: it is taken off before the
+        # closing question is found, so the question still posts unfolded.
+        _shown, step = _moments.next_step(content)
+        shown_answer = _moments.visible_text(content)
+        step_blocks = choice_blocks([(step, False)]) if step and in_thread else []
+        parts = split(shown_answer)
+        layout, offered, drawn = None, None, "folded"
+        if parts is not None:
+            headline, rest = parts
+            offered = _moments.answer_choices(rest, buttons=in_thread)
+            if offered is not None:
+                # An answer asking which of its options to take: the opening paragraph and the
+                # options' shown lines stay in sight, the rest folds, and the options are buttons,
+                # which a declared step does not join.
+                shown, rest, question, options = offered
+                detail_blocks = render_fold(shown, mrkdwn_fn) if shown else []
+                # A click answers in the thread it was clicked in, so outside a thread the options
+                # stay in sight as written, as a needs-you question's and a failure reply's offer do.
+                action_blocks = choice_blocks(options) if in_thread else []
+            else:
+                rest, question = trailing_question(rest)
+                detail_blocks, action_blocks = [], step_blocks
+            fold_blocks = render_fold(rest, mrkdwn_fn) if rest else []
+            question_blocks = render_fold(question, mrkdwn_fn) if question else []
+            if fold_blocks is not None and question_blocks is not None and detail_blocks is not None:
+                layout = blocks_answer(headline, fold_blocks, question_blocks, detail_blocks, action_blocks)
+        if layout is None:
+            # split or the fold refused (a divider cannot fold): with a declared step and no options,
+            # the answer as upstream draws it, without the step's line, and the step's button.
+            # Options the answer asks the user to choose from win here too, as on the fold path.
+            if not step_blocks or offered is not None or _moments.answer_choices(shown_answer) is not None:
+                return None
+            whole_blocks = render_whole(shown_answer, mrkdwn_fn)
+            if whole_blocks is None or len(whole_blocks) >= MESSAGE_BLOCKS_MAX:
+                return None
+            layout = [*whole_blocks, *step_blocks]
+            drawn = "drawn whole with its step's button"
         if adapter._outbound_blocked(self._chat_id, OUTBOUND_LABEL):
             # Upstream's send refuses it as well, and says so in its result.
             return None
@@ -324,8 +412,8 @@ class _AnswerFolder:
                 kwargs[REPLY_BROADCAST] = True
         response = await adapter._client_for(channel, metadata).chat_postMessage(
             channel=channel,
-            text=mrkdwn_fn(content) if callable(mrkdwn_fn) else content,
-            blocks=adapter._append_feedback_block(blocks_answer(headline, fold_blocks, question_blocks)),
+            text=mrkdwn_fn(shown_answer) if callable(mrkdwn_fn) else shown_answer,
+            blocks=adapter._append_feedback_block(layout),
             **kwargs,
         )
         ts = str(response.get("ts") or "")
@@ -340,17 +428,18 @@ class _AnswerFolder:
                 adapter._trim_bot_message_timestamps()
         except Exception as exc:  # noqa: BLE001 — posted; only the status clear or reply tracking is lost
             logger.debug("slack_ux_answer: could not finish after posting %s: %s", ts, exc)
-        logger.info("slack_ux_answer: posted the answer folded in %s", channel)
+        logger.info("slack_ux_answer: posted the answer %s in %s", drawn, channel)
         return SimpleNamespace(success=True, message_id=ts, error=None)
 
 
 def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) -> Any:
     """``adapter``, or one whose ``send`` posts a finished card's answer folded.
 
-    The folder is returned only with the flag on, on Slack, for a ``completed``
-    event bound for a chat, through an adapter rendering ``rich_blocks``. Whether
-    an answer folds is decided when it is sent, since that is when its text is
-    known. Everything else, including any error deciding, gets ``adapter`` itself.
+    The folder is returned with the flag on, on Slack, for a ``completed`` event
+    bound for a chat. Through an adapter rendering ``rich_blocks`` it folds; through
+    any other it only takes a declared step's line off the text. Whether an answer
+    folds is decided when it is sent, since that is when its text is known.
+    Everything else, including any error deciding, gets ``adapter`` itself.
     """
     try:
         if not enabled() or str(platform or "").lower() != SLACK:
@@ -358,9 +447,10 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         if getattr(event, "kind", None) != COMPLETED or not isinstance(sub, dict):
             return adapter
         chat_id = str(sub.get("chat_id") or "").strip()
-        if not chat_id or not _renders_rich_blocks(adapter):
+        if not chat_id:
             return adapter
-        return _AnswerFolder(adapter, chat_id)
+        # An adapter not rendering rich blocks gets no fold, only the step line taken off.
+        return _AnswerFolder(adapter, chat_id, fold=_renders_rich_blocks(adapter))
     except Exception as exc:  # noqa: BLE001 — never fail a delivery on presentation
         logger.warning("slack_ux_answer: not folding the answer: %s", exc)
         return adapter

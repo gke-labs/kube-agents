@@ -10,7 +10,7 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The **drift detector** is a second producer on the watcher's side of that bridge, posting out-of-band cluster changes to the same routes; see [the second producer](#the-second-producer-gitops-drift). The `stall-watch` cron script is a third, posting namespaces whose controllers stopped making progress; see [the third producer](#the-third-producer-controller-stall). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`). No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`) and relays the Slack Home tab's board (`GET /v1/board`). No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -20,7 +20,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
 5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
-7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports` and gives the Chat Agent one turn to present it, so a scheduled finding lands in a thread the Chat Agent can answer follow-up questions about. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
+7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (for the scheduled delivery of a fleet-audit job the image ships, it posts the report `finish` rendered for each repository, with a line naming any it did not finish, or a notice that the run did not finish, and on Slack a one-repository report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
 
 ### Triage Routing
@@ -52,14 +52,25 @@ A [`controller-stall` inject](#the-third-producer-controller-stall) claims no al
 | `Critical`    | `ALERT_DAILY_LIMIT_CRITICAL` | `10`    |
 | `Warning`     | `ALERT_DAILY_LIMIT_WARNING`  | `5`     |
 | `Info`        | `ALERT_DAILY_LIMIT_INFO`     | `5`     |
-| `GitOpsDrift` | `ALERT_DAILY_LIMIT_DRIFT`    | `5`     |
+| `GitOpsDrift` | `ALERT_DAILY_LIMIT_DRIFT`    | `20`    |
 
 Three of the four are severities and the fourth is not; `GitOpsDrift` is what drift records bill,
 whatever they display as.
 
+The `GitOpsDrift` default of 20 is a judgment, not a measurement. One apply spends one inject for
+each object, because the detector does not combine records. `install.sh` and `upgrade.sh` enable the
+detector by default, so this value applies to the installs that these scripts manage. Only changes by
+people alert, so 20 covers a few hand applies a day. A record that the detector cannot join to a live
+object still sends a card with less detail, unless its cluster is outside the install's scope. That
+card spends the same budget. Each admitted record starts a triage turn. The detector also reads the
+audit logs of each scoped project, so a wider scope sends more records. These are the reasons not to
+go higher.
+
 `Info` events do arrive — nothing on the path from the kubelet to `inject_message` filters on `Event.Type`, and `BackOff` is on the watcher's default reason list emitted as `type: Normal` for image-pull back-off — but none of them ever bills this bucket, because the [severity gate](#severity-gate) drops every `Info` event before the claim. The `Info` row is kept regardless: deleting it would turn the entry into a `.get(severity, 0)` miss, and `_claim_alert_quota` treats that miss exactly as it treats a limit of `0` — allowed through, uncapped. Narrowing that gate afterwards would therefore send an unbounded `Info` stream to chat rather than restore a ceiling. Setting a limit to `0` turns that severity's cap off entirely, by the same branch.
 
-All four are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped, and a ceiling left off that allowlist is an override that renders, validates and silently does nothing:
+All four are tunable without rebuilding the image. Set them at install time: the `ALERT_DAILY_LIMIT_*` keys in `install.env`, the chart value `platformAgent.deployment.alertDailyLimits`, or the Terraform variable `alert_daily_limits`. Each route renders the keys that are set into the CR's `spec.deployment.env`. The [site's chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives the routes and a sizing method. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped, and a ceiling left off that allowlist is an override that renders, validates and silently does nothing.
+
+An entry on the CR itself also works:
 
 ```yaml
 spec:
@@ -70,6 +81,8 @@ spec:
       - name: ALERT_DAILY_LIMIT_WARNING
         value: "0" # uncapped
 ```
+
+On an install that the installer, the chart or Terraform manages, do not edit the CR. Each apply that changes the env list that the chart renders replaces the full list on the CR, and entries added by hand are lost. The [site's chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) tells when this occurs. Use the install-time route for a ceiling, and `platformAgent.deployment.env` for another name.
 
 Behaviour worth knowing before relying on it:
 
@@ -108,7 +121,7 @@ What the drift branch does differently:
   front door is told to copy verbatim, so a backtick in either would close the span it sits in and
   the rest of the value would read as instruction text. The drift renderers substitute the
   characters that end a span or start a line of their own, replace the chat-template control tokens
-  `_defang_report` already handles, and truncate, so a field stuffed with instructions cannot
+  `_CONTROL_TOKEN_RE` matches, and truncate, so a field stuffed with instructions cannot
   outweigh the prompt around it. Replacement is with U+FFFD rather than deletion, because the card
   is evidence and a reader should see that the value was altered. The event path does not do this
   and is unchanged; its fields come from the kubelet rather than from the caller being reported on.
@@ -370,7 +383,7 @@ CREATE TABLE intercepted_events(
 );
 ```
 
-For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
+For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
 
 ##### Two bounds, not one
 

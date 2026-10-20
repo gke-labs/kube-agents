@@ -12,10 +12,11 @@ metadata:
   {{- $annotations = deepCopy . }}
   {{- end }}
   {{- /*
-    Two keys the operator reads are also derived from chart values, and the value
+    Three keys the operator reads are also derived from chart values, and the value
     wins because it drives the rest of the release too: litellm.networkPolicy is
     the static render gate, telemetry.collectorNamespace the static policy's
-    egress namespace. A platformAgent.annotations entry that disagrees with the
+    egress namespace, and litellm.openaiCompatible the static policy's rule to
+    the model server. A platformAgent.annotations entry that disagrees with the
     value it duplicates fails the render rather than being overwritten in silence.
   */}}
   {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
@@ -36,6 +37,23 @@ metadata:
   {{- end }}
   {{- end }}
   {{- $_ := set $annotations $collectorNamespaceKey . }}
+  {{- end }}
+  {{- /*
+    Empty, and so not stamped, for any other provider and for a public port-443
+    endpoint, which the operator's 443 rule already reaches.
+  */}}
+  {{- $upstreamEgressKey := "kubeagents.x-k8s.io/litellm-upstream-egress" }}
+  {{- if and .Values.litellm .Values.litellm.enabled (eq .Values.litellm.modelProvider "openai_compatible") }}
+  {{- with include "kube-agents.openaiCompatibleEgress" $ }}
+  {{- $upstreamEgress := . }}
+  {{- with get $annotations $upstreamEgressKey }}
+  {{- /* The operator reads this value trimmed; agree with it. */}}
+  {{- if ne (toString . | trim) $upstreamEgress }}
+  {{- fail (printf "platformAgent.annotations[%q]=%q contradicts litellm.openaiCompatible, from which the chart derives %q. Drop the annotation; the chart stamps it from litellm.openaiCompatible." $upstreamEgressKey (toString .) $upstreamEgress) }}
+  {{- end }}
+  {{- end }}
+  {{- $_ := set $annotations $upstreamEgressKey $upstreamEgress }}
+  {{- end }}
   {{- end }}
   {{- with $annotations }}
   annotations:
@@ -169,8 +187,40 @@ spec:
       cluster has no collector, so this is for the cases it will not decide:
       discovery switched off, a pinned endpoint, or a collector you would rather
       this agent did not export to.
+
+      The daily alert ceilings in deployment.alertDailyLimits come first in the
+      list, as ALERT_DAILY_LIMIT_<KEY>. A key that is not set adds no entry, so
+      a default render has no env. A name that deployment.env also lists is
+      skipped, so the explicit entry wins. The CRD keys env on name, and the
+      API server refuses a duplicate name. A valueFrom entry for a name whose
+      key is set fails the render. The operator forwards only literal values
+      and drops that entry, so the agent would ignore both the entry and the
+      key. The value goes through int64 because Helm reads a number from a
+      values file as float64, and toString writes a large float64 in exponent
+      form, which the daemon cannot read.
     */}}
-    {{- with .Values.platformAgent.deployment.env }}
+    {{- $userEnv := .Values.platformAgent.deployment.env | default list }}
+    {{- $userEnvNames := dict }}
+    {{- $userValueFromNames := dict }}
+    {{- range $userEnv }}
+    {{- $_ := set $userEnvNames (toString .name) true }}
+    {{- if .valueFrom }}
+    {{- $_ := set $userValueFromNames (toString .name) true }}
+    {{- end }}
+    {{- end }}
+    {{- $alertDailyLimits := .Values.platformAgent.deployment.alertDailyLimits | default dict }}
+    {{- $env := list }}
+    {{- range $bucket := list "critical" "warning" "info" "drift" }}
+    {{- $name := printf "ALERT_DAILY_LIMIT_%s" (upper $bucket) }}
+    {{- $limit := index $alertDailyLimits $bucket }}
+    {{- if and (not (kindIs "invalid" $limit)) (hasKey $userValueFromNames $name) }}
+    {{- fail (printf "platformAgent.deployment.alertDailyLimits.%s is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the agent keeps its default. Remove the valueFrom entry or the key." $bucket $name) }}
+    {{- end }}
+    {{- if and (not (kindIs "invalid" $limit)) (not (hasKey $userEnvNames $name)) }}
+    {{- $env = append $env (dict "name" $name "value" ($limit | int64 | toString)) }}
+    {{- end }}
+    {{- end }}
+    {{- with concat $env $userEnv }}
     env:
       {{- /*
         `value` is quoted rather than passed through toYaml because the CRD types
@@ -528,8 +578,9 @@ spec:
   upgraded that way still serves the CRD it was first installed with, and a
   schema without `forges` prunes it: the CR loses its repositories and
   nothing reports it. The alias carries everything such a declaration says
-  except the host, and every host GitHub serves is the same forge, which
-  kube-agents.forgeProviders has already checked.
+  except the host, and every spelling of github.com is the same forge, which
+  kube-agents.forgeProviders has already checked. A GitHub Enterprise Server
+  host is another forge, so a forge declared at one renders as the lists.
 
   Only a repository the operator would accept for GitHub folds: `name`,
   `owner/name`, or an http(s), ssh or git URL, a schemeless host or an scp
@@ -577,7 +628,9 @@ spec:
   {{- $name := trimSuffix ".git" (base $repo) }}
   {{- $plain = and (le (len $repo) 2048) (regexMatch (printf `^(%s%s|/*(%s)?)[A-Za-z0-9_.][A-Za-z0-9_.-]*/*$` $github $owner $owner) $repo) (not (has $name (list "" "." ".." ".git"))) (le (len $name) 100) (not (hasSuffix ".git" $name)) (not (and (hasSuffix "/" $repo) (has (lower (trimAll "/" $repo)) (list "github.com" "www.github.com" "ssh.github.com")))) }}
   {{- end }}
-  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (le (len $repos) 1) $onlyGitOps (not $pinned) $plain (or $f.namespace $repo) }}
+  {{- /* The alias has no host field: a GitHub Enterprise Server forge, and one with a CA bundle, render as the lists. */}}
+  {{- $dotcom := or (not $f.host) (has (lower $f.host) (list "github.com" "www.github.com" "ssh.github.com")) }}
+  {{- $asAlias = and (eq ($f.provider | default "github") "github") (not ($f.credentialsRef | default dict).name) (not ($f.caBundleRef | default dict).name) $dotcom (le (len $repos) 1) $onlyGitOps (not $pinned) $plain (or $f.namespace $repo) }}
   {{- end }}
   {{- $aliasOrg := "" }}
   {{- $aliasRepo := "" }}
@@ -620,6 +673,18 @@ spec:
   {{- end }}
   {{- if and $caBundled (not (hasKey (dig "forges" "items" "properties" (dict) $props) "caBundleRef")) }}
   {{- fail "platformAgent.integration.forges[].caBundleRef needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
+  {{- /* The same for a GitHub Enterprise Server forge: a CRD from before it refuses caBundleRef on a github forge with a CEL rule, after helm has started. The CRD that serves it carries the rule that a forge at another host names its provider. */}}
+  {{- $ghes := false }}
+  {{- range $forges }}
+  {{- if and (eq (.provider | default "github") "github") .host (not (has (lower .host) (list "github.com" "www.github.com" "ssh.github.com"))) }}{{ $ghes = true }}{{ end }}
+  {{- end }}
+  {{- $rules := list }}
+  {{- range (dig "forges" "items" "x-kubernetes-validations" (list) $props) }}
+  {{- $rules = append $rules (.rule | default "") }}
+  {{- end }}
+  {{- if and $ghes (not (contains "has(self.provider) || !has(self.host)" (join "\n" $rules))) }}
+  {{- fail "platformAgent.integration.forges declares a GitHub Enterprise Server forge, but the installed PlatformAgent CRD is older than this chart's GitHub Enterprise Server support, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
   {{- if and $pinned (not (hasKey (dig "repositories" "items" "properties" (dict) $props) "baseBranch")) }}
   {{- fail "platformAgent.integration.repositories[].baseBranch needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}

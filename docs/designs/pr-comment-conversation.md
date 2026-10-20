@@ -864,15 +864,17 @@ to run is refused. A fake provider cannot produce any of them.
 3. `--body-file` in `/tmp` names a file the sidecar cannot open — §4.
 4. **A card dispatch does not start in the profile directory.** Every skill here writes its script
    invocation `./skills/…/scripts/…`, and that has always worked because a cron turn starts in the
-   profile directory. A kanban worker starts in the task's workspace
+   profile directory. (Correction, #2989: it didn't. On the shell sandbox a cron turn started in the
+   unwritable `/home/agent`, and it now starts in a directory of its own under `cron/runs/`.) A kanban worker starts in the task's workspace
    (`…/kanban/workspaces/<task-id>`), so the first thing the worker did was
    `No such file or directory`, exit 127 — for `pr_conversation.py` and again for
    `submit_suggestion.py`, which the amend path depends on. It blocked the card `needs_input`.
    `pr-conversation`, `submit-suggestion` and `github-issue-resolver` now spell the path
    `"$HERMES_HOME"/skills/…`, which is the profile directory in both contexts —
    `github-issue-resolver` because §2 is what turned it from a cron-prompt skill into a card-driven
-   one, and would otherwise have shipped the same 127. `fleet-audit` keeps the relative form: it is
-   still only reached from a cron turn, and its SKILL.md says so in as many words.
+   one, and would otherwise have shipped the same 127. `fleet-audit` names its script and its SOPs by
+   absolute path under `/opt/data/profiles/platform` instead: the worker reads the SOP with a file
+   tool, which does not expand `$HERMES_HOME`, and the sandbox's data root is fixed at `/opt/data`.
 5. **A blocked step became a false claim, not a failure.** When `submit_suggestion.py prepare` was
    refused, the worker replied that it had made the change and stamped the marker that closes the
    request. Nothing in the design caught it: a marker is permanent, no later sweep re-opens the

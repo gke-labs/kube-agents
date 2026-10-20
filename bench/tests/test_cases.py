@@ -140,6 +140,22 @@ def test_a_non_boolean_expected_fail_is_fatal(write_task, literal):
         load_case(path)
 
 
+def test_tool_calls_optional_defaults_to_false(write_task):
+    assert load_case(write_task("plain", {"id": "plain"})).tool_calls_optional is False
+
+
+def test_tool_calls_optional_true_is_read(write_task):
+    path = write_task("greet", {"id": "greet", "tool_calls_optional": True})
+    assert load_case(path).tool_calls_optional is True
+
+
+def test_a_non_boolean_tool_calls_optional_is_fatal(write_task):
+    """A quoted `"false"` would waive the trajectory signal for the case."""
+    path = write_task("quoted", 'id: quoted\ntool_calls_optional: "false"\n')
+    with pytest.raises(CaseSpecError, match="must be a YAML boolean"):
+        load_case(path)
+
+
 def test_a_missing_task_file_is_fatal(tmp_path):
     with pytest.raises(CaseSpecError, match="no such task file"):
         load_case(tmp_path / "nope" / "task.yaml")
@@ -282,6 +298,50 @@ def test_the_blind_set_splits_by_what_the_doors_trace_can_serve(write_task):
     assert spec.worker_blind_checks == {"worker-scope", "all-scope", "commands", "profile", "mixed-blind"}
     assert spec.transport_blind_checks == spec.trace_blind_checks | spec.worker_blind_checks
     assert "mixed-applicable" not in spec.transport_blind_checks
+
+
+def test_a_router_scope_result_pattern_is_worker_blind(write_task):
+    """The door's trace records every call's result as None, so a result
+    pattern graded from it errors on every call. A router-scope leaf that
+    sets one is blind on every inject record, trace or none."""
+    path = write_task(
+        "router-result",
+        {
+            "id": "router-result",
+            "verification_spec": [
+                {
+                    "name": "default-scope",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["skill_view"], "result": "^<persisted-output>"},
+                },
+                {
+                    "name": "never-spilled",
+                    "role": "safeguard",
+                    "severity": "catastrophic",
+                    "check": {
+                        "type": "none",
+                        "checks": [
+                            {
+                                "type": "tool_called",
+                                "tool_names": ["skill_view"],
+                                "scope": "router",
+                                "result": "^<persisted-output>",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "name": "no-pattern",
+                    "role": "objective",
+                    "check": {"type": "tool_called", "tool_names": ["skill_view"], "result": None},
+                },
+            ],
+        },
+    )
+    spec = load_case(path)
+    assert spec.worker_blind_checks == {"default-scope", "never-spilled"}
+    assert spec.trace_blind_checks == {"no-pattern"}
+    assert spec.negated_trace_blind_checks == frozenset()
 
 
 def test_a_task_with_no_such_check_has_an_empty_set(write_task):

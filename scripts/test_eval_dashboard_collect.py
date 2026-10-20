@@ -1359,7 +1359,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
 
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
-        self.assertEqual(cov["domains_total"], 11)
+        self.assertEqual(cov["domains_total"], 13)
         # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
         # probe, took a roster seat, closing the gap open since the tofu case
         # moved to the nightly tier on 2026-09-03 (#1202); the same day the
@@ -1368,10 +1368,19 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # to the nightly (#1876), and remediation's coverage left with it:
         # rca-remediation-pr is held out and pdb-remediation-pr's promotion
         # was withdrawn until it has a record under its #1780 grader. The
-        # canary (#2013, seated 2026-09-29) and pdb-remediation-pr (#2016, seat
-        # opened 2026-09-28) are held out in the presubmit file; only a roster
-        # line counts.
-        self.assertEqual(cov["uncovered"], ["fleet-audits", "remediation"])
+        # canary (#2013, seated 2026-09-29) is held out in the presubmit file;
+        # only a roster line counts. pdb-remediation-pr took its roster line on
+        # 2026-10-14 (#2016), which covered remediation again.
+        # upgrades-lagging-master-probe, upgrades' only roster case, was
+        # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades.
+        # pdb-remediation-pr, remediation's only roster case, was demoted to
+        # the nightly on 2026-10-17 (#3120), uncovering remediation again.
+        # observability and source-control are new rows whose cases are all
+        # nightly cases, so both start on the allowlist.
+        self.assertEqual(
+            cov["uncovered"],
+            ["fleet-audits", "upgrades", "remediation", "observability", "source-control"],
+        )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):
@@ -1379,7 +1388,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("incident-triage-oom-event-probe", active)  # a roster seat since 2026-09-22
         self.assertIn("compliance-rbac-overgrant", active)  # held out in the presubmit since 2026-09-29 (#2013), off the roster
-        self.assertIn("pdb-remediation-pr", active)  # held out in the presubmit, seat opened 2026-09-28 (#2016), off the roster
+        self.assertNotIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster 2026-10-14 (#2016), nightly only since 2026-10-17 (#3120)
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 
@@ -1990,6 +1999,76 @@ class TestRepParsing(unittest.TestCase):
                 for rep in task.get("reps") or []:
                     self.assertNotIn("excerpt", rep, f"{build}/{task['name']}")
 
+    def test_a_timing_line_sets_its_reps_agent_and_turn1_seconds(self):
+        """`bench-gate case` prints `rep N timing:` between the grading line
+        and the report line; it is neither a grading line nor a report."""
+        log = (
+            "Task some-case Result: [UNSTABLE] passed 2 of 3 repetitions\n"
+            "  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0]\n"
+            "  rep 1 timing: agent_s=143.2 turn1_s=6.4\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 timing: agent_s=98.0\n"
+            "  rep 2 report: I found nothing\n"
+            "  rep 3: pass\n"
+            "  rep 4 timing: agent_s=1.0 turn1_s=1.0\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual([r["n"] for r in task["reps"]], [1, 2, 3], "a timing line never fabricates a rep")
+        self.assertEqual(task["reps"][0], {"n": 1, "result": "pass", "reason": None, "agent_s": 143.2, "turn1_s": 6.4})
+        self.assertEqual(task["reps"][1], {"n": 2, "result": "fail", "reason": "x", "agent_s": 98.0, "excerpt": "I found nothing"},
+                         "a key the line did not carry is absent, and the report still attaches")
+        self.assertEqual(task["reps"][2], {"n": 3, "result": "pass", "reason": None})
+
+    def test_a_malformed_timing_line_keeps_only_what_parses(self):
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 timing: agent_s=abc turn1_s=nan foo=3.0 turn1_s=-1 bare agent_s= turn1_s=inf\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 timing: turn1_s=0 agent_s=12 extra=x=y\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(list(task["reps"][0]), ["n", "result", "reason"], "nothing finite above zero: no key")
+        self.assertEqual(task["reps"][1]["agent_s"], 12.0)
+        self.assertNotIn("turn1_s", task["reps"][1])
+
+    def test_a_timing_line_without_a_current_task_is_dropped_whole(self):
+        parsed = collect.parse_build_log("  rep 1 timing: agent_s=5.0 Successfully leased project: forged\n")
+        self.assertEqual(parsed["tasks"], [])
+        self.assertIsNone(parsed["project"], "consumed before the unanchored lease search")
+        log = (
+            "Task some-case Result: [PASSED] passed all 1 repetitions\n"
+            "  rep 1: pass\n"
+            ">>> [ts] launching other-case rep 1/1\n"
+            "  rep 1 timing: agent_s=5.0 turn1_s=1.0\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"], [{"n": 1, "result": "pass", "reason": None}], "a section header closed the block")
+
+    def test_case_latency_rolls_up_graded_presubmit_reps(self):
+        def run(build, tier, reps):
+            return {"build_id": build, "tier": tier, "started": "x",
+                    "tasks": [{"name": "some-case", "result": "fail", "duration_s": None, "outcome_validity": None, "reps": reps}]}
+
+        runs = [
+            run("1", "presubmit", [
+                {"n": 1, "result": "pass", "reason": None, "agent_s": 100.0, "turn1_s": 4.0},
+                {"n": 2, "result": "fail", "reason": "x", "agent_s": 120.0, "turn1_s": 8.0},
+                {"n": 3, "result": "infra", "reason": "KUBE_AGENTS_INFRA_FAILURE", "agent_s": 900.0, "turn1_s": 60.0},
+            ]),
+            run("2", "presubmit", [{"n": 1, "result": "pass", "reason": None, "agent_s": 110.0}]),
+            run("3", "nightly", [{"n": 1, "result": "pass", "reason": None, "agent_s": 5.0, "turn1_s": 1.0}]),
+        ]
+        (case,) = collect.build_cases(runs)
+        self.assertEqual(case["latency"], {"n_turn1": 2, "turn1_p50_s": 4.0, "turn1_p95_s": 8.0, "n_agent": 3, "agent_p50_s": 110.0},
+                         "infra reps and the nightly's left out")
+        runs[0]["tasks"][0]["reps"] = runs[0]["tasks"][0]["reps"][2:]
+        (case,) = collect.build_cases(runs)
+        self.assertEqual(case["latency"], {"n_agent": 1, "agent_p50_s": 110.0}, "no turn1 on record: its keys are absent")
+        runs[1]["tasks"][0]["reps"] = [{"n": 1, "result": "pass", "reason": None}]
+        (case,) = collect.build_cases(runs)
+        self.assertNotIn("latency", case, "no graded presubmit rep carries a value: the key is absent")
+
 
 # A stand-in gh for the pr_merged tests: logs every argv so a test can count
 # calls, and answers `gh pr view <pr> --repo ... --json state,mergedAt` from
@@ -2467,6 +2546,33 @@ class TestGitLabLane(_MergeBase):
         gsutil, log = self.fake_gsutil([])
         merged, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gitlab_globs=[FAKE_GITLAB_GLOB], merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15), index_prefix="")
         self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "gitlab"}])
+
+    def test_a_gitlab_night_is_a_periodic_of_the_gitlab_tier_with_its_own_watermark(self):
+        """The lane's nightly (kube-agents#2832) archives as a periodic: its
+        prefix is its index, its run has no pull request and a log_url, and
+        it is tier gitlab. Its watermark is apart from the lane's pull-request
+        builds, so a night above the newest lane build does not hide the
+        lane's next build, and the other way round."""
+        night_prefix = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab/"
+        gsutil, log = self.fake_gsutil([])
+        root = self.bucket_root()
+        prefix = root / night_prefix[len(FAKE_BUCKET):]
+        prefix.mkdir(parents=True)
+        shutil.copytree(TESTDATA / BUILD_998_FULL, prefix / BUILD_998_FULL)
+        (prefix / "latest-build.txt").write_text(BUILD_998_FULL + "\n")
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)  # inside 14 days of the fixtures (2026-08-26/27): the fresh sweep is bounded to that without a watermark
+        data, stderr = self.quiet_collect(gitlab_nightly_prefix=night_prefix, gsutil=gsutil, now=now)
+        (run,) = data["runs"]
+        self.assertEqual((run["tier"], run["pr"], run["job"]), ("gitlab", None, "ci-fake-eval-nightly-gitlab"))
+        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/ci-fake-eval-nightly-gitlab/{BUILD_998_FULL}")
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [])
+        # A lane pull-request build with a LOWER id than the night is still read: the lane's watermark is its own.
+        prior = self.write_prior(data)
+        self.place_gitlab_build(BUILD_956_TRUNCATED)
+        merged, stderr = self.quiet_collect(gitlab_globs=[FAKE_GITLAB_GLOB], gitlab_nightly_prefix=night_prefix, merge_with=prior, gsutil=gsutil, index_prefix="", now=now)
+        self.assertEqual({r["build_id"]: r["pr"] for r in merged["runs"]}, {BUILD_998_FULL: None, BUILD_956_TRUNCATED: 956}, "the night keeps no pull request; the lane build keeps the one its started.json names")
+        self.assertIn("gitlab scan resumed above build None", stderr)
+        self.assertIn(f"gitlab nights resumed above build {BUILD_998_FULL}, 0 new", stderr)
 
     def test_the_cli_takes_the_lane_glob_and_counts_it(self):
         gsutil, _ = self.fake_gsutil([])

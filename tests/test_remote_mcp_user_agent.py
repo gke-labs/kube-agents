@@ -2,8 +2,8 @@
 
     python3 -m unittest discover -s tests -p 'test_*.py'
 
-Calls to `developerknowledge.googleapis.com/mcp` and `container.googleapis.com/mcp`
-used to go out with undici's default `node` User-Agent, so the API teams serving
+Calls to the remote MCP servers (`developerknowledge.googleapis.com/mcp` and
+`container.googleapis.com/mcp`, now reached through the credential proxy) used to go out with undici's default `node` User-Agent, so the API teams serving
 those endpoints could not tell kube-agents traffic from any other Node process.
 Each `mcp_servers` entry that launches the mcp-remote proxy now passes a
 `--header User-Agent: …` naming the product, the build it came from, and the
@@ -57,6 +57,16 @@ CLOUDBUILDS = (
 )
 
 PROXY_ARG = "/opt/mcp-remote/dist/proxy.js"
+# The flags the configs pass after the URL. mcp-remote reads them with
+# `includes`/`indexOf` and does not splice them out, so `--allow-http` also
+# lands where it reads the callback port, parses to NaN and is ignored; this
+# file models them as flags so a stray positional still stands out.
+VALUELESS_FLAGS = ("--allow-http",)
+VALUED_FLAGS = ("--header", "--transport")
+# Where every remote server is pointed: the credential proxy's MCP relay, which
+# holds the credential and the tool allowlist (mcp_policy.py). The operator
+# sets the variable; Hermes interpolates it.
+RELAY_URL_PREFIX = "${KUBE_AGENTS_MCP_RELAY_URL}/"
 VERSION_VAR = "KUBE_AGENTS_VERSION"
 # The execution mode, in the RFC 9110 §5.6.5 comment after the product token.
 # The Developer Knowledge telemetry parser reads it out of the parentheses,
@@ -110,8 +120,11 @@ def positional_args(args):
     positional = []
     index = 1
     while index < len(args):
-        if args[index] == "--header":
+        if args[index] in VALUED_FLAGS:
             index += 2
+            continue
+        if args[index] in VALUELESS_FLAGS:
+            index += 1
             continue
         positional.append(args[index])
         index += 1
@@ -172,8 +185,9 @@ class RemoteMcpUserAgentTest(unittest.TestCase):
             "the server URL",
         )
         self.assertTrue(
-            positional[0].startswith("https://"),
-            f"{where} would send mcp-remote to {positional[0]!r}",
+            positional[0].startswith(RELAY_URL_PREFIX),
+            f"{where} would send mcp-remote to {positional[0]!r} rather than to the "
+            "credential proxy's MCP relay",
         )
 
     def test_the_build_time_merge_yields_one_header_per_server(self):

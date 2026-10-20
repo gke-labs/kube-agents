@@ -204,6 +204,9 @@ run "gitlab_inputs_need_the_gitlab_forge" {
   expect_failures = [helm_release.kube_agents]
 }
 
+# gitops_host under the default forge is a GitHub Enterprise Server host
+# (github_enterprise.tftest.hcl), which needs github_repo: a host alone is
+# still refused.
 run "a_gitlab_host_needs_the_gitlab_forge" {
   command = plan
   variables {

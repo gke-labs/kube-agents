@@ -1175,8 +1175,8 @@ def note_suppressed_completion(
 # summary of it. The reply this exists to resolve names a letter — ``Option
 # B`` — so the stored text has to be the one the reader was looking at when they
 # picked it. That is a third answer to a question the table's writers already
-# answer two ways: the relay stores the Chat Agent's composed message rather
-# than the specialist's finding, and ``send_notification`` stores the
+# answer two ways: the relay stores the specialist's full report, and
+# ``send_notification`` stores the
 # notification body. Nothing reads a row expecting a particular one of the
 # three, and both readers are written for the union — ``incident_context``
 # fences whatever it gets as untrusted, and ``list_recent_reports`` returns no
@@ -1537,8 +1537,19 @@ def completion_text(head: str, title: str, handoff: str, platform: object = None
     """
     upstream = COMPLETION_HEAD.format(head=head, title=title) + (handoff or "")
     if not slack_ux_on(platform):
-        return upstream
+        # No Slack presenter reads this one, so the declared step's line, plumbing, comes off here.
+        return _visible(upstream)
     return str(handoff or "").strip() or upstream
+
+
+def _visible(text: str) -> str:
+    """``slack_moments.visible_text``: ``text`` without a declared step's line at its end, which no
+    surface shows as text; ``text`` as written when nothing else is left or the module is absent."""
+    try:
+        import slack_moments
+    except ImportError:  # the scripts directory is not on PYTHONPATH
+        return text
+    return slack_moments.visible_text(text) or text
 
 
 def explained_by_wake(

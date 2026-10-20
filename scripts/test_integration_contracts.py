@@ -61,8 +61,10 @@ BROKEN_MAIN_WATCHED_WORKFLOWS = (
 )
 # The flaky-check reporter's contract is the inverse of the broken-main one:
 # not a fixed list it must contain, but that every pull-request check is
-# either watched or named here as left out on purpose. The reasons are in the
-# workflow's header comment; this tuple is the machine-readable copy of it.
+# either watched or named here as left out on purpose. The watched list is
+# `WATCHED_WORKFLOWS` in `scripts/notify_flaky_check.py`, which the sweep
+# reads; the reasons for the exclusions are beside it, and this tuple is the
+# machine-readable copy of them.
 FLAKY_CHECK_NOTIFIER = "flaky-check-notify.yml"
 FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # A title edit legitimately turns it green without a commit.
@@ -71,7 +73,9 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     "Security Scanning",
     # pull_request_target automations, not checks on the tree.
     "Auto Assign Milestone on Merge",
+    "Auto Enqueue",
     "Hold Unresolved Threads",
+    "Merge Gate",
     "Risk Classification",
 )
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
@@ -87,6 +91,15 @@ def _yaml():
     import yaml
 
     return yaml
+
+
+def _flaky_check_reporter():
+    sys.path.insert(0, str(REPO_SCRIPTS))
+    try:
+        import notify_flaky_check
+    finally:
+        sys.path.remove(str(REPO_SCRIPTS))
+    return notify_flaky_check
 
 
 class SpecToolRegistryTest(unittest.TestCase):
@@ -110,6 +123,13 @@ class SpecToolRegistryTest(unittest.TestCase):
         "*skill_manage_image_owned*": {"skill_manage"},
     }
     HERMES_BUILTIN_TOOLS = set().union(*HERMES_BUILTIN_EVIDENCE.values())
+
+    # Hermes core tools no image patch touches, so the patches carry no
+    # evidence of them. Evidence of each is the agent text that tells the agent
+    # to use it, backticked or called
+    # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
+    HERMES_CORE_TOOLS = {"skill_view"}
+    CORE_TOOL_EVIDENCE = ("agents/platform/skills/github-issue-resolver/SKILL.md",)
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
     # as (server alias, tool): nothing in this repository can enumerate them,
@@ -301,6 +321,7 @@ class SpecToolRegistryTest(unittest.TestCase):
             self._registered_mcp_tools()
             | self._remote_mcp_tools()
             | self.HERMES_BUILTIN_TOOLS
+            | self.HERMES_CORE_TOOLS
             | self.SESSION_HARNESS_TOOLS
             | self.TRANSPORT_MARKERS
         )
@@ -348,6 +369,17 @@ class SpecToolRegistryTest(unittest.TestCase):
         self.assertTrue(self._names_builtin("kanban_create", 'if action == "create":'))
         self.assertFalse(self._names_builtin("skill_manage", 'if action == "create":'))
 
+
+    def test_the_core_allowlist_still_has_evidence_in_the_agent_text(self):
+        corpus = "\n".join(
+            (REPO_ROOT / rel).read_text(errors="replace") for rel in self.CORE_TOOL_EVIDENCE
+        )
+        for name in sorted(self.HERMES_CORE_TOOLS):
+            self.assertTrue(
+                f"`{name}`" in corpus or f"{name}(" in corpus,
+                f"{name} is allowlisted as a hermes core tool but the agent text "
+                "carries no evidence of it — stale allowlist entry",
+            )
 
     def test_the_remote_allowlist_still_has_evidence_in_the_agent_text(self):
         remote = self._remote_mcp_aliases()
@@ -573,8 +605,7 @@ class WorkflowNameJoinTest(unittest.TestCase):
         new check has to choose. The reverse holds too: an exclusion that no
         longer names a workflow is stale."""
         documents = self._workflows()
-        triggers = documents[FLAKY_CHECK_NOTIFIER].get("on") or documents[FLAKY_CHECK_NOTIFIER].get(True) or {}
-        watched = set((triggers.get("workflow_run") or {}).get("workflows") or [])
+        watched = set(_flaky_check_reporter().WATCHED_WORKFLOWS)
         pull_request_checks = set()
         for filename, document in documents.items():
             if filename == FLAKY_CHECK_NOTIFIER:
@@ -663,7 +694,7 @@ class WorkflowNameJoinTest(unittest.TestCase):
 class PoolPressureJobOwnersContractTest(unittest.TestCase):
     """pool_pressure.py's BOSKOS_JOB_OWNERS copies the fixed Boskos owners the
     hack/ scripts lease under. A rename there and not here would move that
-    job's leases under "held by hand" with nothing red."""
+    job's leases under "no build ID in the owner" with nothing red."""
 
     @staticmethod
     def _script(name):
@@ -683,7 +714,7 @@ class PoolPressureJobOwnersContractTest(unittest.TestCase):
     def test_the_fixed_job_owners_are_the_scripts_defaults(self):
         # Discovered, not enumerated: every hack/ script that leases through
         # boskos_pool and names a default owner is in the tuple, so the next
-        # such script goes red here rather than into "held by hand".
+        # such script goes red here rather than into "no build ID in the owner".
         sys.path.insert(0, str(REPO_SCRIPTS))
         import pool_pressure
 
@@ -796,7 +827,7 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "total": doc["pool"]["total"],
                 "lease_failures": doc["recent"]["lease_failures"],
                 "lease_failures_hours": doc["recent"]["hours"],
-                "held_by_hand": sum(doc["held_by_hand"].values()),
+                "no_build_id": sum(doc["no_build_id"].values()),
                 "max_concurrency": doc["max_concurrency"],
             },
             {key: note[key] for key in note if key not in ("since", "measured_at")},

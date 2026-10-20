@@ -477,8 +477,11 @@ func TestBuildDeployment(t *testing.T) {
 	if dep.Spec.Template.Spec.RuntimeClassName == nil || *dep.Spec.Template.Spec.RuntimeClassName != "gvisor" {
 		t.Errorf("expected RuntimeClassName gvisor, got %v", dep.Spec.Template.Spec.RuntimeClassName)
 	}
-	if dep.Spec.Template.Spec.ServiceAccountName != "custom-sa" {
-		t.Errorf("expected shared pod service account custom-sa, got %s", dep.Spec.Template.Spec.ServiceAccountName)
+	// The gateway runs as its own operator-minted ServiceAccount whatever
+	// spec.security.serviceAccountName says: that name, and its cloud binding,
+	// are the broker's.
+	if dep.Spec.Template.Spec.ServiceAccountName != gatewayServiceAccountName(agent) {
+		t.Errorf("expected the gateway's own service account %s, got %s", gatewayServiceAccountName(agent), dep.Spec.Template.Spec.ServiceAccountName)
 	}
 	if dep.Spec.Template.Spec.AutomountServiceAccountToken == nil || *dep.Spec.Template.Spec.AutomountServiceAccountToken {
 		t.Errorf("expected sandbox service account token automount to be disabled")
@@ -1297,8 +1300,8 @@ func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	}
 	// Drift bills a bucket of its own rather than the Warning one it displays
 	// as, so its ceiling is a fourth variable and has to be overridable by the
-	// same route. Off the allowlist, one multi-object `kubectl apply` spends
-	// the default of 5 and every later drift record that day is lost for good
+	// same route. Off the allowlist, one large `kubectl apply` can spend
+	// the default and every later drift record that day is lost for good
 	// — the detector cannot re-offer one — with no way to raise the cap short
 	// of a new image.
 	if values["ALERT_DAILY_LIMIT_DRIFT"] != "50" {
@@ -4438,6 +4441,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
 				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "KUBE_AGENTS_MCP_RELAY_URL", Value: "http://attacker.invalid/v1/mcp"},
 				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
@@ -4465,6 +4469,13 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 	// leave the plugin as the only writer.
 	if value, ok := env["CREDENTIAL_PROXY_URL"]; !ok || value != "" {
 		t.Errorf("plugin must not be able to set CREDENTIAL_PROXY_URL, got %q (present=%v)", value, ok)
+	}
+
+	// KUBE_AGENTS_MCP_RELAY_URL is appended after the merge too. A plugin that
+	// could set it would point every mcp-remote child at a listener of its own,
+	// which would then receive the projected token mcp-remote presents.
+	if value := env["KUBE_AGENTS_MCP_RELAY_URL"]; value != mcpRelayURL(agent) {
+		t.Errorf("plugin must not be able to set KUBE_AGENTS_MCP_RELAY_URL, got %q", value)
 	}
 
 	// PATH is appended by the same mechanism and for the same reason, and it is
@@ -6462,6 +6473,23 @@ func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
 	}
 }
 
+// TestPlatformFrontDoorOverlayEnablesBackfillPlugins: an existing front-door volume never
+// gains a list entry from the image's config.yaml, so the overlay is what turns these on.
+func TestPlatformFrontDoorOverlayEnablesBackfillPlugins(t *testing.T) {
+	agent := frontDoorAgent("fd-backfill", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, want := range append(slices.Clone(frontDoorPlugins), "pr_opened") {
+		if !slices.Contains(enabled, want) {
+			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
+		}
+	}
+}
+
 // TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets guards the second half of the
 // clobber TestPlatformFrontDoorOverlayKeepsTargetedPlugins covers for plugins.enabled.
 //
@@ -6577,7 +6605,7 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 // TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
 //
 // The list is derived, not chosen: every ingress plugin the chat profile enables, less the
-// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// two named below, less the ones agents/platform/config.yaml already enables. Adding an
 // ingress plugin to the chat profile and not here is the drift that matters — it hooks a
 // message the front door is the one receiving, so the behaviour is simply lost, with
 // nothing logged.

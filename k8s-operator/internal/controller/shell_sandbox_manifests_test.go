@@ -410,10 +410,17 @@ func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
 	if !strings.Contains(callers, sandboxCaller) {
 		t.Errorf("the broker must serve the sandbox's identity %q, got %q", sandboxCaller, callers)
 	}
-	// And still the agent's: the gateway's chat relays call the same listener.
-	agentCaller := "system:serviceaccount:" + agent.Namespace + ":" + agentServiceAccountName(agent)
-	if !strings.Contains(callers, agentCaller) {
-		t.Errorf("the broker must still serve the agent's identity %q, got %q", agentCaller, callers)
+	// And the gateway's: its chat relays and watchers call the same listener.
+	// Matched as a whole entry, not a substring: the gateway's name extends
+	// the broker's, and the broker's own is not a caller.
+	entries := strings.Split(callers, ",")
+	gatewayCaller := "system:serviceaccount:" + agent.Namespace + ":" + gatewayServiceAccountName(agent)
+	if !slices.Contains(entries, gatewayCaller) {
+		t.Errorf("the broker must serve the gateway's identity %q, got %q", gatewayCaller, callers)
+	}
+	brokerSelf := "system:serviceaccount:" + agent.Namespace + ":" + agentServiceAccountName(agent)
+	if slices.Contains(entries, brokerSelf) {
+		t.Errorf("the broker's own identity %q is not a caller, got %q", brokerSelf, callers)
 	}
 }
 
@@ -1686,6 +1693,9 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-policy",
 		"credential-proxy-runtime",
 		"credential-proxy-ksa-token",
+		// The watchers' broker token: mounted into the agent container it
+		// would hand the model the broker's watcher role.
+		watcherTokenVolume,
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := federatedTestAgent()

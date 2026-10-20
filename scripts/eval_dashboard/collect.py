@@ -184,6 +184,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import pathlib
 import re
 import statistics
@@ -193,9 +194,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 try:
-    from . import tiers
+    from . import nightly, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/collect.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import nightly
     import tiers
 try:
     import eval_rosters
@@ -227,6 +229,10 @@ DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
 # over a main build the listing has not named yet.
 DEFAULT_NIGHTLY_WRITERS_JOB = "ci-kube-agents-eval-nightly-writers"
 DEFAULT_NIGHTLY_WRITERS_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITERS_JOB}/"
+# The GitLab lane's nightly (kube-agents#2832): the lane's list once a night,
+# archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
+DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
+DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
 # Where Prow's Spyglass shows a build directory: the gs:// path after the
 # scheme, so a link follows the bucket the build was read from.
 SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
@@ -441,6 +447,15 @@ _REP_LINE = re.compile(
 # was cut. Its own shape, `rep N report:`, so `_REP_LINE` never matches it.
 #   rep 2 report: I looked for a pool named pinned-inference-pool and found ...
 _REP_REPORT_LINE = re.compile(r"^\s+rep (?P<n>\d+) report: (?P<text>.*)$")
+# How long a repetition took: one optional line right under a repetition's
+# grading line, printed by `bench-gate case` with each of two values it knows,
+# one decimal each -- `agent_s` the agent run's wall clock (results.json's
+# `latency`: no provisioning, verification or judge in it),
+# `turn1_s` the opening chat turn on the api transport. Its own shape, `rep N
+# timing:`, so `_REP_LINE` never matches it.
+#   rep 2 timing: agent_s=143.2 turn1_s=6.4
+_REP_TIMING_LINE = re.compile(r"^\s+rep (?P<n>\d+) timing: (?P<fields>.*)$")
+_REP_TIMING_KEYS = ("agent_s", "turn1_s")
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -550,6 +565,32 @@ def _attach_excerpt(task: dict, n: int, text: str) -> None:
             return
 
 
+def _attach_timing(task: dict, n: int, fields: str) -> None:
+    """Record a `rep N timing:` line's known values on the rep it follows.
+
+    Only `_REP_TIMING_KEYS` with a finite value above zero are kept, as
+    floats; an unknown key or a value that does not parse is skipped, never
+    raised on. A key is absent when the line did not carry it -- absence
+    means unknown -- and a line for a repetition the log never graded is
+    dropped.
+    """
+    values = {}
+    for pair in fields.split():
+        key, _, raw = pair.partition("=")
+        if key not in _REP_TIMING_KEYS:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if math.isfinite(value) and value > 0:
+            values[key] = value
+    for rep in reversed(task.get("reps") or []):
+        if rep["n"] == n:
+            rep.update(values)
+            return
+
+
 def parse_build_log(text: str) -> dict:
     """Extract the eval facts from one build-log.txt, best effort.
 
@@ -558,7 +599,8 @@ def parse_build_log(text: str) -> dict:
     <name> Result:` line they follow; a task whose log has none (single-rep
     era, or a log truncated before grading) simply gets no `reps` key --
     absence means unknown, never fabricated. A `rep N report:` line under a
-    grading line becomes that rep's `excerpt`, the agent's own words.
+    grading line becomes that rep's `excerpt`, the agent's own words, and a
+    `rep N timing:` line its `agent_s` and `turn1_s`.
     """
     project = None
     tasks = []
@@ -570,11 +612,17 @@ def parse_build_log(text: str) -> dict:
         # The agent's own words first, and consumed whole: every other
         # pattern below that is an unanchored `search` (the lease, the final
         # verdict) would otherwise read the report as if the log had said
-        # it. A report line that follows no grading block is dropped.
+        # it. A report line that follows no grading block is dropped, and so
+        # is a timing line.
         m = _REP_REPORT_LINE.match(line)
         if m:
             if current is not None:
                 _attach_excerpt(current, int(m.group("n")), m.group("text"))
+            continue
+        m = _REP_TIMING_LINE.match(line)
+        if m:
+            if current is not None:
+                _attach_timing(current, int(m.group("n")), m.group("fields"))
             continue
         m = _LEASE.search(line)
         if m:
@@ -774,6 +822,7 @@ def build_run(
     pr_hint: int | None = None,
     tier: str = tiers.TIER_PRESUBMIT,
     job: str | None = None,
+    periodic: bool = False,
 ) -> dict | None:
     """Assemble one `runs[]` entry.
 
@@ -900,7 +949,7 @@ def build_run(
     pull = started.get("pull")
     if isinstance(pull, (int, str)) and str(pull).isdigit():
         pr = int(pull)
-    if tier == tiers.TIER_NIGHTLY:
+    if periodic:
         # A periodic runs main; the number a hint or a stray `pull` key
         # might carry is nobody's pull request.
         pr = None
@@ -1151,7 +1200,9 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
 
     INFRA results never count against a case: they are excluded from the
     pass_rate denominator and from the duration stats, though they do appear
-    in runs_on_record and last3 (they are still history).
+    in runs_on_record and last3 (they are still history). Nor do they count
+    in `latency`, the reps' timing (nightly.latency_rollup), which is absent
+    when no graded presubmit rep carries one.
 
     The per-case fields are the PRESUBMIT's record, as they were before the
     nightly existed; the nightly's record sits beside them under `nightly`,
@@ -1174,6 +1225,7 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
             if task["result"] != "infra" and task["duration_s"] is not None
         ]
         nightly_results = [task["result"] for _, task in nightly_history.get(name, [])]
+        latency = nightly.latency_rollup([rep for _, task in entries for rep in task.get("reps") or []])
         cases.append(
             {
                 "name": name,
@@ -1202,6 +1254,8 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
                 },
             }
         )
+        if latency:
+            cases[-1]["latency"] = latency
     return cases
 
 
@@ -1424,6 +1478,7 @@ def _read_build(
     since_cutoff: datetime | None,
     tier: str = tiers.TIER_PRESUBMIT,
     job: str | None = None,
+    periodic: bool = False,
 ) -> tuple[str, dict | None, str]:
     """One build's reads: (build_id, run or None, _RECORDED/_UNFINISHED/_FILTERED).
 
@@ -1444,14 +1499,14 @@ def _read_build(
         if started_at is not None and started_at < since_cutoff:
             return build_id, None, _FILTERED
     try:
-        run = build_run(build_id, reader, pr_hint, tier=tier, job=job)
+        run = build_run(build_id, reader, pr_hint, tier=tier, job=job, periodic=periodic)
     except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
         print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
         return build_id, None, _UNFINISHED
     if run is None:
         print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
         return build_id, None, _UNFINISHED
-    if tier == tiers.TIER_NIGHTLY:
+    if periodic:
         run["log_url"] = spyglass_url(base)
     return build_id, run, _RECORDED
 
@@ -1463,6 +1518,7 @@ def _read_builds(
     unfinished: set[str] | None,
     tier: str = tiers.TIER_PRESUBMIT,
     job: str | None = None,
+    periodic: bool = False,
 ) -> list[dict]:
     """Read `(build_id, base_url)` candidates READ_WORKERS at a time.
 
@@ -1474,7 +1530,7 @@ def _read_builds(
     runs = []
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         results = pool.map(
-            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff, tier=tier, job=job),
+            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff, tier=tier, job=job, periodic=periodic),
             candidates,
         )
         for build_id, run, status in results:
@@ -1677,6 +1733,7 @@ def runs_from_periodic(
     retry_builds: frozenset[str] = frozenset(),
     unfinished: set[str] | None = None,
     job: str | None = None,
+    tier: str = tiers.TIER_NIGHTLY,
 ) -> list[dict]:
     """The nightly periodic's builds: list its log prefix, then read them.
 
@@ -1723,7 +1780,7 @@ def runs_from_periodic(
         file=sys.stderr,
     )
     return _read_builds(
-        candidates, gsutil, since_cutoff, unfinished, tier=tiers.TIER_NIGHTLY, job=job
+        candidates, gsutil, since_cutoff, unfinished, tier=tier, job=job, periodic=True
     )
 
 
@@ -2007,6 +2064,7 @@ def collect(
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
     gitlab_globs: list[str] | None = None,
+    gitlab_nightly_prefix: str | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -2051,6 +2109,7 @@ def collect(
     nightly_after = None
     writers_after = None
     gitlab_after = None
+    gitlab_night_after = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gsutil)
         if prior_data is not None:
@@ -2058,7 +2117,10 @@ def collect(
             after_build = newest_build_id(tiers.presubmit_runs(prior))
             nightly_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") != writers_job])
             writers_after = newest_build_id([r for r in tiers.nightly_runs(prior) if r.get("job") == writers_job])
-            gitlab_after = newest_build_id(tiers.gitlab_runs(prior))
+            # The lane's pull-request builds and its nights are two sources
+            # of one tier, each above its own watermark; `pr` tells them apart.
+            gitlab_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is not None])
+            gitlab_night_after = newest_build_id([r for r in tiers.gitlab_runs(prior) if r.get("pr") is None])
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -2186,6 +2248,23 @@ def collect(
             )
         gitlab_pending |= unfinished - listed_before
         fresh.extend(gitlab_fresh)
+    # The GitLab nightly: the lane's list once a night, read as a periodic
+    # (its prefix is its index, pr null, log_url set), tagged tier gitlab
+    # above the nights' own watermark; the nightly's rule on a listing that
+    # fails (runs_from_periodic) applies, so a night that has not run yet is
+    # a note.
+    gitlab_night_fresh: list[dict] = []
+    if gitlab_nightly_prefix:
+        listed_before = set(unfinished)
+        gitlab_night_fresh.extend(
+            runs_from_periodic(
+                gitlab_nightly_prefix, gsutil, after_build=gitlab_night_after, since_cutoff=since_cutoff,
+                retry_builds=frozenset(b for b in retry if b in gitlab_pending), unfinished=unfinished,
+                tier=tiers.TIER_GITLAB,
+            )
+        )
+        gitlab_pending |= unfinished - listed_before
+        fresh.extend(gitlab_night_fresh)
     # The nightly periodics, each above its own watermark. The shared retry
     # list is safe to hand over whole: a pending id is only re-read where
     # its source's listing names it, and no id is in two listings.
@@ -2235,6 +2314,12 @@ def collect(
                 f"; gitlab scan resumed above build {gitlab_after},"
                 f" {len(gitlab_fresh)} new"
                 if gitlab_globs
+                else ""
+            )
+            + (
+                f"; gitlab nights resumed above build {gitlab_night_after},"
+                f" {len(gitlab_night_fresh)} new"
+                if gitlab_nightly_prefix
                 else ""
             )
             + ")",
@@ -2358,6 +2443,17 @@ def main(argv: list[str] | None = None) -> int:
         " tier=nightly, pr=null, and their own incremental watermark",
     )
     parser.add_argument(
+        "--gitlab-nightly-prefix",
+        nargs="?",
+        const=DEFAULT_GITLAB_NIGHTLY_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the GitLab lane's nightly periodic from this Prow log"
+        f" prefix (given without a value: {DEFAULT_GITLAB_NIGHTLY_PREFIX}). Its"
+        " runs carry tier=gitlab, pr=null, job the prefix's last segment, and"
+        " their own watermark apart from the lane's pull-request builds",
+    )
+    parser.add_argument(
         "--nightly-job",
         default=None,
         metavar="NAME",
@@ -2460,11 +2556,12 @@ def main(argv: list[str] | None = None) -> int:
         and not args.rc_glob
         and args.rc_from_dir is None
         and not args.gitlab_pr_glob
+        and args.gitlab_nightly_prefix is None
     ):
         parser.error(
-            "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --nightly-prefix,"
-            " --nightly-writers-prefix, --from-dir, --rc-glob, --rc-from-dir"
-            " and/or --merge-with"
+            "nothing to collect: pass --pr-glob, --gitlab-pr-glob, --gitlab-nightly-prefix,"
+            " --nightly-prefix, --nightly-writers-prefix, --from-dir, --rc-glob,"
+            " --rc-from-dir and/or --merge-with"
         )
     if args.rc_limit < 1:
         parser.error("--rc-limit must be at least 1")
@@ -2486,6 +2583,7 @@ def main(argv: list[str] | None = None) -> int:
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,
         gitlab_globs=args.gitlab_pr_glob,
+        gitlab_nightly_prefix=args.gitlab_nightly_prefix,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     nightly = len(tiers.nightly_runs(data["runs"]))

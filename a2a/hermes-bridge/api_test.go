@@ -1474,7 +1474,9 @@ func TestPromptFromMessage_BlankRunes(t *testing.T) {
 }
 
 // countingVerifier holds the verify subject and never replies, counting the
-// checks it is sent: each one blocks its caller for capability.DefaultTimeout.
+// asks it is sent. One check against it asks once per capability.DefaultTimeout
+// until its reach window (capability.DefaultReachWindow) is spent, so it
+// blocks its caller for the window and sends asksPerSilentCheck asks.
 func countingVerifier(t *testing.T, url string) *atomic.Int32 {
 	t.Helper()
 	nc, err := nats.Connect(url, nats.Name("cap-verifier-counting"))
@@ -1493,11 +1495,15 @@ func countingVerifier(t *testing.T, url string) *atomic.Int32 {
 	return &n
 }
 
+// asksPerSilentCheck is how many asks one capability check sends a verifier
+// that never answers: one per ask timeout, inside the reach window.
+var asksPerSilentCheck = int32(capability.DefaultReachWindow / capability.DefaultTimeout)
+
 // gh#2723 item 1: a turn boundary asks the verifier once per distinct
 // capability, not once per queued follow-up. Four follow-ups carrying the
 // task's one capability, behind a verifier that never answers, cost one
-// verifier timeout before turn 1's answer posts, not four; all four are
-// refused capability on that one verdict.
+// check (its reach window) before turn 1's answer posts, not four; all four
+// are refused capability on that one verdict.
 func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 	_, url := startServerNoVerifier(t)
 	checks := countingVerifier(t, url)
@@ -1536,7 +1542,7 @@ func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 	start := time.Now()
 	release()
 	var task *lib.Task
-	waitFor(t, 6*capability.DefaultTimeout, "terminal", func() bool {
+	waitFor(t, 3*capability.DefaultReachWindow, "terminal", func() bool {
 		got, err := c.TasksGet(testCtx(t), "platform", taskID)
 		if err != nil || !got.Final {
 			return false
@@ -1545,11 +1551,12 @@ func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 		return true
 	})
 	elapsed := time.Since(start)
-	if n := checks.Load(); n != 1 {
-		t.Errorf("%d verifier checks at one boundary, want 1 for one distinct capability", n)
+	if n := checks.Load(); n != asksPerSilentCheck {
+		t.Errorf("%d verifier asks at one boundary, want %d: one check for one distinct capability",
+			n, asksPerSilentCheck)
 	}
-	if bound := capability.DefaultTimeout + 3*time.Second; elapsed > bound {
-		t.Errorf("turn 1's answer took %s to post, want under %s (one verifier timeout)", elapsed, bound)
+	if bound := capability.DefaultReachWindow + 3*time.Second; elapsed > bound {
+		t.Errorf("turn 1's answer took %s to post, want under %s (one check's reach window)", elapsed, bound)
 	}
 	if task.State != lib.StateCompleted {
 		t.Fatalf("state %s (%q), want completed", task.State, terminalText(t, url, taskID))
@@ -1566,6 +1573,72 @@ func TestAPI_TurnBoundaryChecksEachCapabilityOnce(t *testing.T) {
 	}
 	if refused != queued {
 		t.Fatalf("notices %+v, want all %d follow-ups refused capability", ns, queued)
+	}
+}
+
+// boundaryCancelMargin is how long past one ask's timeout the turn-boundary
+// cancel test waits before counting asks: long enough for a second ask to
+// have gone out had the check kept going.
+const boundaryCancelMargin = 500 * time.Millisecond
+
+// A cancel while a follow-up's capability is being checked at a turn boundary
+// ends that check: the task reaches its terminal promptly rather than after
+// the check's reach window, and the verifier is not asked again on behalf of a
+// task that is over. Unlike a pending submission, whose cancel handleCancel
+// finalizes at once, here the terminal waits on the worker, so a check that
+// ignored the cancel would hold it for the whole window.
+func TestAPI_ACancelDuringTheBoundaryCheckEndsIt(t *testing.T) {
+	_, url := startServerNoVerifier(t)
+	asks := countingVerifier(t, url)
+	stub, in, release := holdingStub(t)
+	startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.CapabilityOptional = true // the opening runs unchecked
+		cfg.TaskDeadline = time.Minute
+	})
+	c := gatewayClient(t, url)
+	const taskID = "task-api-boundary-cancel"
+	origin, err := lib.NewMessageEnvelope(gatewayParty, taskID, "ctx-boundary-cancel", "corr-"+taskID,
+		messagePayload(t, taskID, "ctx-boundary-cancel", "long question"), lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), origin); err != nil {
+		t.Fatal(err)
+	}
+	<-in
+	steer, err := lib.NewFollowUpEnvelope(origin, gatewayParty,
+		messagePayload(t, taskID, "ctx-boundary-cancel", "follow-up"),
+		lib.WithTo(lib.Party{Session: "platform"}),
+		lib.WithAuthority(authorityFor(t, capability.Ref{Key: "root." + taskID, Revision: 1})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), steer); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "queued", func() bool { return len(steerNotices(t, url, taskID)) == 1 })
+	release()
+	waitFor(t, capability.DefaultTimeout, "the boundary check's first ask", func() bool { return asks.Load() >= 1 })
+
+	start := time.Now()
+	cancelEnv, err := lib.NewCancelEnvelope(gatewayParty, origin.TaskID, origin.ContextID,
+		origin.CorrelationID, lib.WithTo(lib.Party{Session: "platform"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), cancelEnv); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*capability.DefaultReachWindow, "terminal", func() bool {
+		got, err := c.TasksGet(testCtx(t), "platform", taskID)
+		return err == nil && got.Final
+	})
+	if elapsed := time.Since(start); elapsed >= capability.DefaultTimeout {
+		t.Errorf("the terminal came %s after the cancel; the boundary check did not end", elapsed)
+	}
+	time.Sleep(capability.DefaultTimeout + boundaryCancelMargin)
+	if n := asks.Load(); n != 1 {
+		t.Errorf("the verifier was asked %d times; the boundary check kept asking after the cancel", n)
 	}
 }
 
@@ -1770,7 +1843,7 @@ func TestAPI_CancelBetweenTurnsStaysCanceledWhenTheResultCopyFails(t *testing.T)
 	_, url := startServer(t)
 	stub := newAPIStub(t, nil)
 	b, _ := startAPIBridgeHooked(t, url, stub, nil, func(b *Bridge) {
-		b.resultPublish = func(context.Context, *taskRun, string) error {
+		b.resultPublish = func(context.Context, *taskRun, string, []byte) error {
 			return errors.New("injected result publish failure")
 		}
 	}, func(net.Addr) bool { return true })

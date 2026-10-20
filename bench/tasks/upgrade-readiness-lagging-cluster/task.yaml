@@ -7,7 +7,8 @@
 # harness was deaf, the SOP worked, which is what pins the failure on
 # transport rather than this scenario. The audit shape budgets at 600-1300s
 # (bench/tasks/DRAFTS.md, the 2026-08-26 smoke run), so the upgrades domain
-# is covered in presubmit by upgrades-lagging-master-probe; this full sweep
+# was covered in presubmit by upgrades-lagging-master-probe (nightly since
+# 2026-10-16, #3269); this full sweep
 # is the SOP-fidelity version and runs nightly. It was
 # held by A1 and A4 (bench/tasks/DRAFTS.md) and by nothing else -- its checks
 # read GKE control-plane versions through the ledger, so A5's

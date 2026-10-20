@@ -59,12 +59,12 @@ class D1Attributable(unittest.TestCase):
         kubelet's mount alone: this asserts that no Role or ClusterRole it
         mints names `secrets` at all, or a wildcard that would.
 
-        Two reads, because the rendered `mode: next` object set is in no
-        golden (C5's auth-delegator test records that gap): every Role in the
-        five goldens, which is the legacy product set, and the Go builders of
-        the two Roles the next stack adds, read by function body with a
-        precondition that each body carries the rule it is known to grant, so
-        a rename or a reshape cannot turn this into a scan of nothing.
+        This reads every Role in the five goldens, which is the legacy product
+        set. The two Roles the next stack adds (`buildA2AGatewayRole`,
+        `buildA2ACalloutRole`) are read structurally by Go's
+        `TestNoRenderedRoleReachesASecret` in `platformagent_a2a_slack_test.go`,
+        because the rendered `mode: next` object set is in no golden (C5's
+        auth-delegator test records that gap).
 
         Outside this assertion: the operator's own ClusterRole holds
         `secrets` write by design (it mints the bus credentials, the callout
@@ -84,16 +84,6 @@ class D1Attributable(unittest.TestCase):
                             self.assertNotIn("secrets", resources)
                             self.assertNotIn("*", resources)
         self.assertGreater(checked, 0, "no rendered Role was examined")
-
-        for source, builder, known_rule in (
-            ("a2a_gateway_role", "buildA2AGatewayRole", '"pods"'),
-            ("a2a_callout_role", "buildA2ACalloutRole", '"configmaps"'),
-        ):
-            body = h.go_function_body(h.text(source), builder)
-            with self.subTest(builder=builder):
-                self.assertIn(known_rule, body, f"{builder} no longer grants its known rule; the read is misaimed")
-                self.assertNotIn('"secrets"', body)
-                self.assertNotIn('Resources: []string{"*"}', body)
 
     def test_D1_a_log_hint_cannot_forge_a_record(self) -> None:
         """Untrusted bytes reach the log, so the log has one sanitiser in front of it.
@@ -117,18 +107,20 @@ class D1Attributable(unittest.TestCase):
     def test_D1_the_refusal_log_hint_names_no_caller_supplied_value(self) -> None:
         """KNOWN VIOLATION. A short gcloud path puts a positional in the log.
 
-        The refusal caps the logged command path at three words and the code
-        comment says this is "to exclude positionals". That holds for a
+        The refusal caps the logged command path at three words (a fourth
+        when it is a write verb that sits that deep). That holds for a
         three-word path -- `container clusters delete prod` logs
         `container.clusters.delete` -- and not for a two-word one:
         `gcloud projects delete acme-prod` logs
         `projects.delete.acme-prod`, and the third word is the caller's.
 
         Low severity. The value is sanitised and length-capped before it is
-        written, so it cannot forge a record, and it never reaches the caller's
-        refusal body -- A1's bound is intact. It is filed because the comment
+        written, so it cannot forge a record. The same words go to the caller
+        in the refusal body's `verb` field (the shim prints them as
+        `policy verb:`), so this is the one place A1's bound is not met;
+        the message and rule id stay fixed. It is filed because the cap
         asserts a property the code does not have, which is how the next person
-        widens the cap without checking.
+        widens it without checking.
 
         The fix is to cap at the length of the matched command path rather than
         at a constant, or to log only the words that matched an allowlist
@@ -346,16 +338,20 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         parser-differential class -- and it only works while the audience is
         set.
 
-        There are two audiences in every golden since #913 split the broker's routes by caller (a third, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat; seeing it needs a next golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
+        There are three audiences in every golden: #913 split the broker's routes by caller, and #2940 added the watchers' (a fourth, the A2A gateway's `-a2a-chat`, exists under `mode: next` with Google Chat; seeing it needs a next golden and this harvest's volume-name filter widened past `credential-proxy` to the `a2a-chat-relay-token` volume):
         the exec audience for the agent, and a `-chat` one for the gateway, so
         the sandbox cannot reach `/v1/chat/**` and the gateway cannot reach
-        `/v1/exec`. Both are asserted, and both are required to be present --
+        `/v1/exec`. A third, `-watcher`, is the gateway's agent-api-auth
+        container's, for the watcher routes. All are asserted, and all are required to be present --
         collapsing them back to one audience would restore the reachability the
         split removed while every individual token still looked audience-bound.
         """
         audiences = {
             "kubeagents-credential-proxy",
             "kubeagents-credential-proxy-chat",
+            # The gateway's watchers (agent-api-auth only), whose Google calls
+            # go through the broker; C1 pins where that token is mounted.
+            "kubeagents-credential-proxy-watcher",
         }
         broker_tokens = [
             (fixture, volume, token)
@@ -374,7 +370,7 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         self.assertEqual(
             audiences,
             {token.get("audience") for _, _, token in broker_tokens},
-            "the two broker audiences are not both rendered; the caller split "
+            "the broker audiences are not all rendered; the caller split "
             "is what keeps the sandbox off /v1/chat and the gateway off /v1/exec",
         )
 

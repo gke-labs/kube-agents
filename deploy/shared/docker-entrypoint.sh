@@ -21,6 +21,12 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
+# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
+# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
+readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# The first four bytes of an ELF executable, in hex: step 4.4's check that a file
+# named tirith is a binary before it removes it.
+readonly ELF_MAGIC_HEX=7f454c46
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -638,6 +644,8 @@ if not isinstance(template, dict) or not isinstance(live, dict):
     raise SystemExit(0)
 
 added = []
+PLUGINS_KEY = "plugins"
+ENABLED_KEY = "enabled"
 
 
 def fill(src, dst, path):
@@ -652,6 +660,20 @@ def fill(src, dst, path):
 
 
 fill(template, live, [])
+
+# plugins.enabled is the one list the image owns: a plugin directory the image
+# ships is inert until the profile's list names it, and the fill above never
+# enters a list, so a volume scaffolded before a plugin existed would carry it
+# into every image and never load it. Add the template's names the live list
+# lacks, after the agent's own, and remove none: a name the agent dropped on
+# purpose comes back, which is the price of a plugin that ships enabled.
+template_enabled = (template.get(PLUGINS_KEY) or {}).get(ENABLED_KEY) if isinstance(template.get(PLUGINS_KEY), dict) else None
+live_plugins = live.get(PLUGINS_KEY)
+if isinstance(template_enabled, list) and isinstance(live_plugins, dict) and isinstance(live_plugins.get(ENABLED_KEY), list):
+    for name in template_enabled:
+        if name not in live_plugins[ENABLED_KEY]:
+            live_plugins[ENABLED_KEY].append(name)
+            added.append(".".join([PLUGINS_KEY, ENABLED_KEY, str(name)]))
 
 if added:
     # Atomic, because a truncated config.yaml is worse than a hollow one: os.replace
@@ -686,6 +708,14 @@ PYEOF
 # gets the template's inserted where the template carries it, so the proxy invocation
 # keeps the same shape. Identity, overlays, timeouts, every other arg: untouched.
 #
+# One wider repair rides in the same pass. A server whose template args name the
+# credential proxy's MCP relay (`${KUBE_AGENTS_MCP_RELAY_URL}`) has image-owned args
+# end to end: the URL, its flags and the header all move together with the `env`
+# entry that names the proxy token. The fill above adds that `env` key to a profile
+# scaffolded before the relay existed while leaving its Google URL in place, and that
+# pairing would send the gateway's ServiceAccount token to Google. So for those
+# servers the whole `args` list, and the token entry in `env`, become the template's.
+#
 # A caller reports its own failure, as with the fill: only it knows which profile.
 repair_remote_mcp_user_agent() {
     "$INSTALL_DIR/.venv/bin/python3" - "$1" "$2" <<'UAEOF'
@@ -697,6 +727,10 @@ import yaml
 HEADER_FLAG = "--header"
 HEADER_NAME = "user-agent"
 TMP_SUFFIX = ".user-agent.tmp"
+# A template arg starting with this marks a server reached through the credential
+# proxy's MCP relay, whose args and token entry are image-owned whole.
+RELAY_URL_MARKER = "${KUBE_AGENTS_MCP_RELAY_URL}"
+BEARER_FILE_ENV = "MCP_REMOTE_BEARER_FILE"
 
 template_path, live_path = sys.argv[1], sys.argv[2]
 
@@ -727,12 +761,28 @@ if not isinstance(template_servers, dict) or not isinstance(live_servers, dict):
     raise SystemExit(0)
 
 repaired = []
+relayed = []
 for name, template_server in template_servers.items():
     live_server = live_servers.get(name)
     if not isinstance(template_server, dict) or not isinstance(live_server, dict):
         continue
     template_args, live_args = template_server.get("args"), live_server.get("args")
-    if not isinstance(template_args, list) or not isinstance(live_args, list):
+    if not isinstance(template_args, list):
+        continue
+    if any(isinstance(arg, str) and arg.startswith(RELAY_URL_MARKER) for arg in template_args):
+        template_env = template_server.get("env") or {}
+        live_env = live_server.get("env")
+        if not isinstance(live_env, dict):
+            live_env = {}
+        wanted_env = dict(live_env)
+        if BEARER_FILE_ENV in template_env:
+            wanted_env[BEARER_FILE_ENV] = template_env[BEARER_FILE_ENV]
+        if live_args != template_args or live_env != wanted_env:
+            live_server["args"] = list(template_args)
+            live_server["env"] = wanted_env
+            relayed.append(name)
+        continue
+    if not isinstance(live_args, list):
         continue
     template_slot = header_slot(template_args)
     if template_slot is None:
@@ -747,7 +797,7 @@ for name, template_server in template_servers.items():
         live_args[live_slot] = wanted
         repaired.append(name)
 
-if repaired:
+if repaired or relayed:
     # Atomic, for the fill's reason and one more: a torn write of a cluster profile's
     # config.yaml loses `cluster_identity`, and the reconciler then scaffolds a
     # duplicate it can never prune.
@@ -755,7 +805,10 @@ if repaired:
     with open(tmp_path, "w") as fh:
         yaml.safe_dump(live, fh, sort_keys=False, default_flow_style=False)
     os.replace(tmp_path, live_path)
-    print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+    if repaired:
+        print(f"[ENTRYPOINT] User-Agent repair: {live_path} now sends the image's header on {', '.join(repaired)}")
+    if relayed:
+        print(f"[ENTRYPOINT] MCP relay repair: {live_path} now takes the image's args and proxy token entry on {', '.join(relayed)}")
 UAEOF
 }
 
@@ -928,7 +981,7 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # do, because cron_jobs_sync.py never prunes: its ledger stops a retired job
 # coming BACK, it never removes one the volume already has.
 #
-# `--cron-retire` deletes the governance ids from this roster outright. They ran
+# `--cron-retire` deletes the listed ids from this roster outright. The governance ids ran
 # here only while the platform profile's store had no ticker; now that
 # `profile-cron-tick` gives it one, they are back on the Platform Agent's own
 # roster where the scheduler can reach their `skills`, `model` and `max_turns`
@@ -943,6 +996,10 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # this image ships it. Retiring it and shipping it on the Platform Agent's roster
 # is the same move, applied late.
 #
+# first-run-quick-value-audit is retired, not moved: `oobe` runs the same first-run audits. A
+# volume that never booted an image shipping it disabled still holds it enabled, and nothing
+# else can reach that copy once the image stops shipping it.
+#
 # It runs BEFORE 2c-bis deliberately, and the two lists must not overlap. The
 # order only decides how fast an accidental overlap bites, not whether it does:
 # retire-last would delete a job the image still ships on every single boot,
@@ -953,7 +1010,8 @@ SCAFFOLD="/opt/defaults/scripts/profile_scaffold.py"
 # an id belongs on this list only once no roster in this image ships it.
 #
 # This list shrinks to nothing once no live volume can still be carrying the
-# entries; until then removing a name from it silently restores the double-fire.
+# entries; until then removing a name from it silently restores the double-fire, or for
+# first-run-quick-value-audit an enabled copy nothing can reach.
 #
 # `--home` overlays the default profile in place, because that profile IS
 # $TARGET_DIR and has no entry under profiles/ to name. `--cron-jobs` names the
@@ -969,7 +1027,7 @@ if [ -f "/opt/defaults/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
         --template /opt/defaults \
         --items "cron" \
         --cron-jobs "profile-cron-tick" \
-        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver" \
+        --cron-retire "compliance-audit obtainability-audit security-patch-orchestrator fleet-wide-cost-analysis fleet-consistency-drift ai-security-audit stockout-prevention github-issue-resolver first-run-quick-value-audit" \
         >/dev/null || echo "WARN: default-profile cron merge failed; jobs added by this image will not run" >&2
 fi
 
@@ -987,33 +1045,30 @@ fi
 # reading it back off the volume is the one place a partial upgrade can hide. It also frees
 # this step from depending on step 2b having worked.
 #
-# Writing jobs.json without a lock is safe WITHIN THIS POD, on two facts. The scheduler in
-# THIS container is not running yet — everything here is ahead of `exec "$@"`. And no OTHER
-# container in this pod is running this code: step 1.5 hands the shared tree to a single
-# owner, so the dashboard, which has no scheduler and no reason to touch the schedule, stops
-# before it gets here.
+# Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
+# coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# Both facts stop at the pod boundary. Step 1.5 elects an owner per pod, not per volume, so
-# at availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
+# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
 # rather than a volume each — every replica's gateway is an owner and several of them run
-# this against the same file, with a rolling update overlapping new pods and old. The
-# exposure and why it is not fixable from inside the script are set out in cron_jobs_sync.py's
-# Concurrency section; the short version is that the reconcile wants to run once per volume,
-# which is a topology change rather than a lock. Single-replica installs, the default, are
-# unaffected. Do not restore a bare "there is no second writer" claim here: it was written
-# once, it was wrong, and it read as verified.
+# this against the same file, with a rolling update overlapping new pods and old. While
+# .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
+# cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
+# which is a topology change. Single-replica installs, the default, are unaffected. Do not
+# restore a bare "there is no second writer" claim here: it was written once, it was wrong,
+# and it read as verified.
 #
 # --assume-retired covers the one case the script's ledger cannot know on its first run: a
 # deployment that finished onboarding before this existed has no record that
 # bootstrap_delivery.py:_retire_jobs retired the two onboarding jobs, so they would look new and
-# be reinstalled. .bootstrap_completed is that record. `oobe` and `first-run-quick-value-audit`
-# are seeded on the same record so an install that onboarded before those jobs existed does not
-# start first-run fleet audits on upgrade.
+# be reinstalled. .bootstrap_completed is that record. `oobe` is seeded on the same record for a
+# different reason: an install that onboarded before the job existed must never get it. oobe.py
+# skips a sweep more than a day old, but one that onboarded recently would start four fleet audits
+# it is not owed.
 CRON_SYNC="/opt/defaults/scripts/cron_jobs_sync.py"
 if [ -f "$CRON_SYNC" ] && [ -f "/opt/defaults/cron/jobs.json" ]; then
     ASSUME_RETIRED=""
     if [ -f "$TARGET_DIR/.bootstrap_completed" ]; then
-        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe,first-run-quick-value-audit"
+        ASSUME_RETIRED="bootstrap-inventory-scan,bootstrap-inventory-delivery,oobe"
     fi
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$CRON_SYNC" \
@@ -1469,11 +1524,22 @@ fi
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
+    CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
+    [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
     for d in "$TARGET_DIR"/profiles/cluster-*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         for f in SOUL.md AGENTS.md CAPABILITIES.md; do
             [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
         done
+        # The cp -f above replaces each cluster-* profile's SOUL.md with the blank
+        # image template (/opt/cluster-template/SOUL.md) on every gateway restart.
+        # Re-stamp this Cluster Agent's Target Cluster Identity from its preserved
+        # $d/config.yaml via cluster_agent_profile.py so existing cluster-* profiles
+        # keep their identity in SOUL.md.
+        if [ -f "$d/SOUL.md" ] && [ -w "$d/SOUL.md" ] && [ -f "$d/config.yaml" ] && [ -f "$CLUSTER_PROFILE_SCRIPT" ]; then
+            "$INSTALL_DIR/.venv/bin/python3" "$CLUSTER_PROFILE_SCRIPT" stamp-soul --profile-dir "$d" \
+                || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
+        fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by
@@ -1511,11 +1577,14 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         # this, every cluster onboarded before an image changed the header keeps
         # sending the old one for the life of the volume, while the platform profile
         # and every newly onboarded cluster send the new one — two header shapes from
-        # one build, on a value the API teams key dashboards on. The helper writes
-        # only when the value differs, so a profile already current is not rewritten.
+        # one build, on a value the API teams key dashboards on. For a server the
+        # template routes through the credential proxy's MCP relay it does more: the
+        # whole args list and the proxy token entry become the template's (see the
+        # helper). It writes only when something differs, so a profile already
+        # current is not rewritten.
         if [ -f "$CLUSTER_TEMPLATE/config.yaml" ] && [ -f "$d/config.yaml" ] && [ -w "$d/config.yaml" ]; then
             repair_remote_mcp_user_agent "$CLUSTER_TEMPLATE/config.yaml" "$d/config.yaml" \
-                || echo "WARN: failed to repair the remote MCP User-Agent in $d/config.yaml; this cluster agent keeps sending the header it was scaffolded with" >&2
+                || echo "WARN: failed to repair the remote MCP entries in $d/config.yaml; this cluster agent keeps the header and server URLs it was scaffolded with, and if the back-fill added MCP_REMOTE_BEARER_FILE beside a Google URL its gke and developer_knowledge calls fail until the repair succeeds" >&2
         fi
         # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
         # cron store if one exists on the PVC.
@@ -1569,13 +1638,14 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
         backfill_config_from_template \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
             || echo "WARN: could not backfill profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door may be missing keys the image template owns" >&2
-        # The fill leaves lists alone, so the one image-owned value inside one — the
-        # remote MCP User-Agent — is repaired in place, exactly as the cluster loop
-        # above does for its profiles. Force-synced, flag off, the file already
+        # The fill leaves lists alone, so the image-owned values inside one — the
+        # remote MCP User-Agent, and a relayed server's whole args and token entry —
+        # are repaired in place, exactly as the cluster loop above does for its
+        # profiles. Force-synced, flag off, the file already
         # carries it; this is the front door taking the same repair.
         repair_remote_mcp_user_agent \
             "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
-            || echo "WARN: could not repair the remote MCP User-Agent in profiles/platform/config.yaml; the front door keeps sending the header it was scaffolded with" >&2
+            || echo "WARN: could not repair the remote MCP entries in profiles/platform/config.yaml; the front door keeps the header and server URLs it was scaffolded with, and its gke and developer_knowledge calls may fail until the repair succeeds" >&2
     else
         echo "[ENTRYPOINT] profiles/platform/config.yaml is missing; seeding it from the image template." >&2
         cp "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
@@ -1707,16 +1777,18 @@ fi
 #     0400/0755 on root-owned files against RunAsUser 10000 besides (the volume's
 #     DefaultMode in platformagent_manifests.go), so it failed the ownership test too.
 #
-# Step 2d has since made that an ordinary writable file on the PVC, which only makes
-# restoring this worse rather than newly safe: the guard would now pass, and the step would
-# rewrite — non-atomically, over a file step 2d has just staged-and-renamed into place — a
-# config it has nothing to add to. Where the guard did pass before (compose, `docker run`)
-# that is exactly what it did, and yaml.safe_dump round-trips the file: it sorted the keys
-# and dropped every comment in a config people read.
+# Step 2d has since made that an ordinary writable file on the PVC, and step 2d's
+# back-fill is now the one writer that appends the template's plugins.enabled names the
+# live list lacks: a plugin the image ships enabled reaches a volume scaffolded before it
+# existed through that step, on the path that works. What this step was faulted for does
+# not hold there: the back-fill stages the file and renames it into place, so a reader
+# sees all of the old file or all of the new one, and it dumps with sort_keys=False, so
+# the keys keep their order. Comments are still dropped, the price every back-fill in
+# step 2d already pays.
 #
-# Do not restore it as a "belt and braces" measure. If a profile ever needs a plugin the
-# image does not ship enabled, the operator overlay in step 2.7 is the mechanism, and it is
-# one that works on the path this ran on.
+# Do not restore this step beside it: two writers of one list, one of them a plain
+# rewrite over the other's rename. A profile that needs a plugin the image does not ship
+# enabled is the operator overlay in step 2.7.
 
 # 4. Point the hermes_otel plugin at the resolved collector and stamp the service name.
 #
@@ -1797,6 +1869,26 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
     fi
 fi
 
+# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
+# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
+# so with the image's copy there a home's bin/tirith is dead cache, never used
+# again, and it was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data
+# volume at 209 clusters (gke-labs#3325). Removed only when PATH resolves the
+# image's copy, and only a regular file named exactly tirith in $TARGET_DIR/bin
+# or a profile's bin/ that starts with the ELF magic. The file is never run: it
+# sits on a volume workers can write, and this is the bootstrap container. Each
+# removal is logged with its size, so an operator can see where the space went.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
+    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
+        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
+        [ "$(od -An -tx1 -N4 "$stale_tirith" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
+        stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
+        if rm -f "$stale_tirith"; then
+            echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
+        fi
+    done
+fi
+
 # Everything that writes shared volume state is done; release the bootstrap lock
 # before starting anything long-lived, so a peer container is not blocked behind
 # this one for the life of the pod. Closing the fd releases it too, but do both
@@ -1820,6 +1912,21 @@ fi
 # peer uid may refuse the chmod, and that is fine.
 mkdir -p "$TARGET_DIR/scratch"
 chmod 0775 "$TARGET_DIR/scratch" 2>/dev/null || true
+
+# 4.5 Say so loudly when the remote MCP servers cannot start. Every profile's
+# `gke` and `developer_knowledge` entries interpolate KUBE_AGENTS_MCP_RELAY_URL,
+# the credential proxy's MCP relay, which the operator sets on this container.
+# Hermes leaves an unset variable as literal text, mcp-remote cannot parse that as
+# a URL, and every call to those tools fails with nothing here saying why. The
+# usual cause is this image running under an operator from before the relay.
+# Primary only: the dashboard sidecar runs no agent, and is not given the
+# variable. And only with HERMES_MANAGED_DIR set, the operator's marker as for the
+# managed-scope check above: an image started any other way has no relay by
+# design, and an alert on every such boot would make the alarm routine.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -n "${HERMES_MANAGED_DIR:-}" ] \
+    && [ -z "${KUBE_AGENTS_MCP_RELAY_URL:-}" ]; then
+    echo "[ENTRYPOINT] ALERT KUBE_AGENTS_MCP_RELAY_URL is unset, so the gke and developer_knowledge MCP servers will fail on every call. The operator sets it; upgrade the operator to a build that does." >&2
+fi
 
 # 5. Start background microservices (FastAPI proxy)
 #

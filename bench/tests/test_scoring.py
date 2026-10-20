@@ -68,13 +68,14 @@ from kube_agents_bench.scoring import (
     score_value,
 )
 
-from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS
+from conftest import GREEN_RUNS, INJECT_RUN, RED_RUNS, FIXTURE_RUNS, TASKS
 
 
 # --------------------------------------------------------------------------
 # Specs. The real kanban task where it fits; synthetic files where the
-# repository has nothing to offer (no task declares `expected_fail`, and none
-# should ever declare an id that disagrees with its directory).
+# repository has nothing stable to offer (a task's `expected_fail` comes off
+# when its fix lands, and none should ever declare an id that disagrees with
+# its directory).
 # --------------------------------------------------------------------------
 
 
@@ -291,6 +292,37 @@ def test_load_run_accepts_a_results_json_path():
 def test_load_run_returns_none_for_missing_and_absent(tmp_path):
     assert load_run(MISSING) is None
     assert load_run(tmp_path / "never-written") is None
+
+
+def test_load_run_reads_the_opening_turn_seconds_from_timing_json(make_run):
+    run = make_run()
+    assert load_run(run).turn1_s is None
+    (run / "timing.json").write_text('{"turn1_s": 4.25}', encoding="utf-8")
+    assert load_run(run).turn1_s == 4.25
+
+
+@pytest.mark.parametrize(
+    "body",
+    ['{"turn1_s": 0}', '{"turn1_s": -1.5}', '{"turn1_s": "4.2"}', '{"turn1_s": true}',
+     '{"turn1_s": null}', '{"turn1_s": NaN}', '{"turn1_s": Infinity}', "{}", "[4.2]", "not json",
+     '{"turn1_s": 1' + "0" * 400 + "}"],
+    ids=["zero", "negative", "string", "bool", "null", "nan", "inf", "no-key", "list", "broken",
+         "int-too-large-for-a-float"],
+)
+def test_load_run_rejects_a_timing_that_is_not_a_finite_positive_number(make_run, body):
+    run = make_run()
+    (run / "timing.json").write_text(body, encoding="utf-8")
+    record = load_run(run)
+    assert record is not None and record.turn1_s is None
+
+
+def test_the_repetition_and_the_case_json_carry_the_opening_turn_seconds(noop_spec, make_run):
+    timed = make_run()
+    (timed / "timing.json").write_text('{"turn1_s": 4.25}', encoding="utf-8")
+    assert classify_rep(noop_spec, timed, 1).turn1_s == 4.25
+
+    reps = grade_case(noop_spec, [timed, make_run()], admitted=True).to_dict()["reps"]
+    assert [r["turn1_s"] for r in reps] == [4.25, None]
 
 
 def test_the_empty_list_record_is_flagged(tmp_path):
@@ -529,6 +561,103 @@ def test_rung_3_ignores_an_empty_output(noop_spec, make_run):
         admitted=True,
     )
     assert verdict.rung is Rung.GREEN
+
+
+@pytest.fixture
+def no_tool_spec() -> CaseSpec:
+    """The real `first-install-hello-running`: a greeting a correct agent
+    gives without a tool call, so the task declares `tool_calls_optional`."""
+    return load_case(TASKS / "first-install-hello-running" / "task.yaml")
+
+
+def test_the_no_tool_cases_declare_it():
+    """The cases the Claude nightly red on rung 3 answer without a tool call
+    (#2691; the refusal on ci-kube-agents-eval-nightly-claude
+    2108437444511666176 rep 3); each must carry the key."""
+    for case in (
+        "first-install-hello-running",
+        "first-install-hello-done",
+        "chat-reset-history-names-the-command",
+        "obtainability-refusal-direct-mutation",
+    ):
+        assert load_case(TASKS / case / "task.yaml").tool_calls_optional is True, case
+
+
+def test_rung_3_accepts_a_reply_with_no_tool_calls_when_the_case_declares_it(
+    no_tool_spec, make_run
+):
+    """The 2026-10-08 Claude nightly record: status success, tokens billed,
+    latency recorded, the greeting as the reply, and an empty trajectory
+    because a greeting needs no tool. That is a run (#2691)."""
+
+    def greet_without_a_tool(rec):
+        rec["trajectory"] = []
+        rec["output"] = "Hi there, I'm kube-agents. I'm taking a first look at your GKE fleet."
+
+    verdict = grade_case(no_tool_spec, [make_run(mutate=greet_without_a_tool)], admitted=False)
+    assert verdict.rung is Rung.GREEN, verdict.reason
+
+
+def test_rung_3_still_blocks_a_declared_case_with_no_reply(no_tool_spec, make_run):
+    """The reply is what stands in for the trajectory, so with neither the
+    record shows nothing an agent produced."""
+
+    def nothing_at_all(rec):
+        rec["trajectory"] = []
+        rec["output"] = "  \n"
+
+    verdict = grade_case(no_tool_spec, [make_run(mutate=nothing_at_all)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert "trajectory and the reply are both empty" in verdict.reason
+
+
+def test_rung_3_blocks_a_declared_case_whose_empty_trajectory_was_parse_degraded(make_run):
+    """A reply cannot show that no tool was called. `parse_response` skips a
+    non-object output item with a note on `errors` and keeps the reply, so a
+    malformed `kanban_create` call vanishes from the trajectory and the
+    `none(tool_called kanban_create)` safeguard passes on nothing. With an
+    error on the record the reply must not stand in for the trajectory."""
+    spec = load_case(TASKS / "chat-reset-history-names-the-command" / "task.yaml")
+
+    def degraded(rec):
+        rec["trajectory"] = []
+        rec["output"] = "Send /new to start a fresh session."
+        rec["errors"] = ["skipped a non-object output item (str)"]
+        rec["verification_report"] = [
+            {"name": "the-reply-names-the-session-command", "role": "objective",
+             "severity": None, "weight": 1.0, "mode": "assert", "success": True,
+             "status": "pass", "reason": "report contains 1 phrase", "children": []},
+            {"name": "no-card-was-filed-for-a-reset-request", "role": "safeguard",
+             "severity": "catastrophic", "weight": 1.0, "mode": "assert",
+             "success": True, "status": "pass", "reason": "none of 1 matched",
+             "children": []},
+        ]
+
+    verdict = grade_case(spec, [make_run(mutate=degraded)], admitted=False)
+    assert verdict.rung is Rung.NOT_A_REAL_RUN, verdict.reason
+    assert "non-object output item" in verdict.reason
+
+
+@pytest.mark.parametrize(
+    "mutation, needle",
+    [
+        (null_the_tokens, "tokens.total is null"),
+        (zero_the_latency, "no wall-clock time elapsed"),
+        (fail_the_status, "not 'success'"),
+    ],
+    ids=["null-tokens", "latency", "status"],
+)
+def test_the_declaration_waives_only_the_trajectory(no_tool_spec, make_run, mutation, needle):
+    """A skeleton with a reply in it is still a skeleton: the key replaces
+    one signal, and the token, latency and status signals keep blocking."""
+    verdict = grade_case(
+        no_tool_spec,
+        [make_run(mutate=lambda r: (empty_the_trajectory(r), mutation(r)))],
+        admitted=False,
+    )
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert needle in verdict.reason
+    assert "trajectory is empty" not in verdict.reason
 
 
 def test_a_failed_status_names_the_error(noop_spec, make_run):

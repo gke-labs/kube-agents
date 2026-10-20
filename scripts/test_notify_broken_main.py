@@ -480,7 +480,8 @@ class QueryTest(unittest.TestCase):
             return _response(json.dumps(pages[len(calls) - 1]).encode())
 
         api = notifier.GitHubAPI("gke-labs/kube-agents", "t", opener=opener, sleep=lambda _: None)
-        with mock.patch.object(notifier, "PER_PAGE", 2):
+        # The pager lives on the shared client now, so its page size does too.
+        with mock.patch("github_api.PER_PAGE", 2):
             workflows = api.workflows()
         self.assertEqual([w["id"] for w in workflows], [1, 2, 3])
         self.assertEqual(len(calls), 2)
