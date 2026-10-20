@@ -271,6 +271,22 @@ class ClientAddonSkewTest(unittest.TestCase):
         self.assertIn("1 kubectl client within one minor of the target", result["notes"])
         self.assertIn("1 client-go caller whose user agent carries the binary's version, not the library's; not graded", result["notes"])
 
+    def test_one_kubectl_principal_writing_two_apis_is_one_client_naming_both(self):
+        # The audit read's records are per API: the stale kubectl's ConfigMap writes plus a Secret
+        # write of the same principal and user agent fold into one client, not two identical risks.
+        removed, deprecated = split_sample()
+        stale = next(e for e in deprecated if STALE_KUBECTL in json.dumps(e))
+        secrets = json.loads(json.dumps(stale))
+        secrets["insertId"] = stale["insertId"] + "-secrets"
+        secrets["protoPayload"]["resourceName"] = "core/v1/namespaces/seeded-shapes/secrets/stale-client-token"
+        secrets["protoPayload"]["methodName"] = "io.k8s.core.v1.secrets.patch"
+        context = context_with(FakeRunner(removed, deprecated + [secrets]))
+        result = client_addon_skew.evaluate(self.CLUSTER, member(), read(self.ITEMS), TARGET_1_35, context)
+        from_log = [r for r in result["risks"] if r["kind"] == client_addon_skew.KIND_CLIENT and "principal" in r["where"]]
+        self.assertEqual(len(from_log), 1)
+        self.assertIn("2 writes to core/v1 configmaps, core/v1 secrets in ", from_log[0]["where"])
+        self.assertIn("1 kubectl client within one minor of the target", result["notes"])
+
     def test_an_addon_without_a_table_is_a_note_and_the_verdict_stays(self):
         result = client_addon_skew.evaluate(self.CLUSTER, member(), read(self.ITEMS), TARGET_1_35, context_with())
         self.assertEqual([r for r in result["risks"] if r.get("kind") == client_addon_skew.KIND_ADDON], [])

@@ -7,7 +7,8 @@ Clients. kubectl is supported within one minor, older or newer, of kube-apiserve
 (`upgrade_shape_tables.KUBECTL_SKEW_SOURCE`). The rule reads kubectl versions from two
 places and grades each against the target minor: the `kubectl/vX.Y.Z` user agents in the
 shared deprecated-or-kubectl audit read (`audit_log.py`; the Admin Activity log carries
-writes, so a kubectl that only reads is not there), and the image tags of workloads that
+writes, so a kubectl that only reads is not there; the read's records are per API, so one
+principal with one user agent is folded into one client naming the APIs it wrote), and the image tags of workloads that
 run a kubectl binary, from the PDB read (Deployments, StatefulSets) and the namespaced read
 (DaemonSets, CronJobs). A kubectl further than one minor from the target is a risk naming
 the version and the principal or workload. A client-go user agent carries the binary's
@@ -71,7 +72,7 @@ OBJECTS_NOT_READ = "cluster objects not read ({reason}); kubectl images and add-
 KIND_NOT_READ = "{kind}s not read ({reason}); their kubectl images and add-ons not graded"
 NOTE_NO_TARGET = "no target; {count} kubectl client{plural} not graded against a skew window"
 CLIENT_NAME = "kubectl"
-CLIENT_FROM_AUDIT = "principal {principal} (user agent {user_agent}, {count} write{plural} in {days}d)"
+CLIENT_FROM_AUDIT = "principal {principal} (user agent {user_agent}, {count} write{plural} to {apis} in {days}d)"
 CLIENT_FROM_IMAGE = "{workload} (image {image})"
 CLIENT_SKEW_DETAIL = (
     "{gap} minor{plural} {direction} the target {target}; kubectl is supported within "
@@ -209,15 +210,22 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     log = audit_log.read_deprecated(context)
     if log["error"]:
         result[finding.RESULT_UNKNOWN].append(finding.unknown(RULE_ID, AUDIT_READ_FAILED.format(reason=log["error"])))
+    # The read's records are per (principal, user agent, API); one binary is one client, so the
+    # records of a principal and user agent fold into one, its writes summed and its APIs listed.
+    kubectl_callers: dict[tuple[str, str], dict] = {}
     for caller in log["callers"]:
         if caller["caller_class"] == audit_log.CLASS_PROVIDER:
             continue
         match = KUBECTL_USER_AGENT_RE.match(str(caller["user_agent"]))
         if match:
-            where = CLIENT_FROM_AUDIT.format(principal=caller["principal"], user_agent=caller["user_agent"], count=caller["count"], plural="" if caller["count"] == 1 else CALL_PLURAL, days=log["window_days"])
-            clients.append(((int(match.group(1)), int(match.group(2))), where))
+            folded = kubectl_callers.setdefault((str(caller["principal"]), str(caller["user_agent"])), {"version": (int(match.group(1)), int(match.group(2))), "count": 0, "apis": set()})
+            folded["count"] += caller["count"]
+            folded["apis"].add(str(caller["api"]))
         elif CLIENT_GO_USER_AGENT_MARKER in str(caller["user_agent"]):
             client_go += 1
+    for (principal, user_agent), folded in kubectl_callers.items():
+        where = CLIENT_FROM_AUDIT.format(principal=principal, user_agent=user_agent, count=folded["count"], plural="" if folded["count"] == 1 else CALL_PLURAL, apis=LIST_SEPARATOR.join(sorted(folded["apis"])), days=log["window_days"])
+        clients.append((folded["version"], where))
     if log["sampled"]:
         finding.add_note(result, audit_log.sampled_note(log))
 
