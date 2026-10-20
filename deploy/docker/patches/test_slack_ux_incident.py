@@ -315,6 +315,14 @@ class RuntimeTest(unittest.TestCase):
         self.assertNotIn("[next:", json.dumps(update["blocks"]))
         self.assertTrue(update["text"].endswith(REPORT.strip()))
 
+    def test_a_report_at_the_result_limit_never_edits_the_alert(self):
+        # A report long enough to be clipped is past the fold's limit, so the clip can never
+        # leave a cut step-line fragment in an edited alert; the step line goes before the clip.
+        filler = "\n\n" + "x " * kanban_notifier.RESULT_LIMIT
+        adapter = _Adapter()
+        self.assertIs(self.wrap(adapter, result=REPORT.rstrip() + filler + "\n\n[next: apply option B]"), adapter)
+        self.assertGreater(kanban_notifier.RESULT_LIMIT, runtime.FOLD_TEXT_MAX)
+
     def test_under_next_a_declared_next_step_is_not_in_the_edit(self):
         class StandIn(_Adapter):
             async def send_chat(self, chat_id, content, chat, update="", metadata=None):
