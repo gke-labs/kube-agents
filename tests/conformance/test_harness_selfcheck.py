@@ -436,6 +436,26 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
             self.assertIn(control, text)
         self.assertIn(f"counts the other {len(harness.MUTATIONS) - len(controls)}", text)
 
+    def test_the_summary_flag_prints_the_filtered_set_and_runs_nothing(self) -> None:
+        """--summary -k prints the filtered set's summary and returns before the
+        clean-tree check, so it works on a dirty tree and edits nothing (#3553)."""
+        import contextlib
+        import io
+
+        harness = _load_mutation_harness()
+
+        def must_not_be_reached():
+            raise AssertionError("--summary reached the clean-tree check, so it isn't 'nothing run'")
+
+        harness._git_clean = must_not_be_reached
+        harness._run_suite = must_not_be_reached
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            self.assertEqual(harness.main(["--summary", "-k", "B1"]), 0)
+        selected = [m for m in harness.MUTATIONS if "B1" in m.id]
+        self.assertLess(len(selected), len(harness.MUTATIONS), "the filter selected everything")
+        self.assertEqual(printed.getvalue(), harness.summary(selected) + "\n")
+
     def test_the_readme_keeps_no_hand_written_mutation_count(self) -> None:
         """A count restated in the README conflicts on every pull request that
         adds a mutation and drifts anyway (#3553); --summary and a run's own
