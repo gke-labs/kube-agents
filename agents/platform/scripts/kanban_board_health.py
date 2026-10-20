@@ -103,17 +103,18 @@ nothing periodically asked (#656).
 ``stuck_in_blocked`` is therefore reported whatever the severity floor says: a
 worker or operator block is sticky, nothing retries it until a human acts, and
 a card nobody is looking at is the one finding this check exists for. The rule
-is stateless and a card still blocked is named once a day until someone
-unblocks, comments on, or archives it, which is the intended nag.
+is stateless and a card still blocked is named (directly or by task ID in the
+omitted list when long reports are bounded) once a day until someone unblocks,
+comments on, or archives it, which is the intended nag.
 Cards are listed newest first, each with its kind, reason, and age read from the
 board, so recent outages surface at the top. Where multiple cards share a title,
 they are grouped: small groups list each card's task ID, kind, age, and reason,
 while larger groups summarize the count, kind breakdown, and oldest age,
-followed by the newest card's details and task IDs. Long reports are bounded to
-keep recent outage cards and the footer commands within chat limits, summarizing
-any omitted older cards. The operator unblock and archive commands appear once
-in a footer (noting they run on the agent pod) rather than repeated under every
-card.
+followed by the newest card's details and all task IDs. Long reports are bounded
+to keep recent outage cards and the footer commands within chat limits,
+summarizing any omitted older cards with their task IDs. The operator unblock
+and archive commands appear once in a footer (noting they run on the agent pod)
+rather than repeated under every card.
 
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 """
@@ -158,6 +159,9 @@ AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
 MAX_STUCK_ITEMS = 15
 MAX_STUCK_CHARS = 5500
+MAX_DIAGNOSTIC_ITEMS = 20
+MAX_DIAGNOSTIC_CHARS = 3500
+MAX_REPORT_CHARS = 10000
 GROUP_EXPAND_MAX = 3
 # Pinned to the board file this run read, the way `diagnostics_lines` pins the
 # engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
@@ -339,8 +343,8 @@ def _card_age_hours(diag: dict) -> float:
     return float("inf")
 
 
-def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
-    """Render stuck cards: grouped by title when duplicated, newest first, bounded, commands once."""
+def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_chars: int = MAX_STUCK_CHARS) -> list:
+    """Render stuck cards: grouped by title when duplicated, newest first, commands once."""
     if not stuck_items:
         return []
 
@@ -383,6 +387,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
                 "key": card["task_id"],
                 "lines": [line],
                 "card_count": 1,
+                "cards": [card],
             })
         else:
             newest_age = group[0]["age_hours"]
@@ -408,16 +413,13 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
                     latest_sub += f' — "{newest_card["reason"]}"'
                 lines_for_group.append(latest_sub)
                 ids = [c["task_id"] for c in group]
-                if len(ids) <= 10:
-                    lines_for_group.append(f"    ids: {', '.join(ids)}")
-                else:
-                    shown_ids = ", ".join(ids[:10])
-                    lines_for_group.append(f"    ids: {shown_ids} (and {len(ids) - 10} more)")
+                lines_for_group.append(f"    ids: {', '.join(ids)}")
             renderable_items.append({
                 "age_hours": newest_age,
                 "key": title,
                 "lines": lines_for_group,
                 "card_count": len(group),
+                "cards": group,
             })
 
     for card in no_title_cards:
@@ -427,6 +429,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
             "key": card["task_id"],
             "lines": [line],
             "card_count": 1,
+            "cards": [card],
         })
 
     renderable_items.sort(key=lambda item: (item["age_hours"], item["key"]))
@@ -444,7 +447,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
     for item in renderable_items:
         item_chars = sum(len(ln) + 1 for ln in item["lines"])
         current_chars = sum(len(ln) + 1 for ln in shown_lines)
-        if items_rendered >= MAX_STUCK_ITEMS or (shown_lines and (current_chars + item_chars > MAX_STUCK_CHARS)):
+        if items_rendered >= MAX_STUCK_ITEMS or (shown_lines and (current_chars + item_chars > max_chars)):
             break
         shown_lines.extend(item["lines"])
         rendered_cards += item["card_count"]
@@ -454,9 +457,10 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
 
     omitted_cards = total_cards - rendered_cards
     if omitted_cards > 0:
+        omitted_ids = [c["task_id"] for item in renderable_items[items_rendered:] for c in item["cards"]]
         lines.append(
             f"  ... and {omitted_cards} older stuck card{'s' if omitted_cards != 1 else ''} omitted "
-            f"(run hermes kanban list on the agent pod to view all)"
+            f"(ids: {', '.join(omitted_ids)}; run hermes kanban list on the agent pod to view all)"
         )
 
     lines.append("  Commands to move a card (run on the agent pod):")
@@ -569,7 +573,7 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     if entries is not None and not isinstance(entries, list):
         return [f"  diagnostics unavailable: CLI returned "
                 f"{type(entries).__name__}, expected a JSON list"]
-    lines = []
+    diag_lines = []
     stuck_items = []
     for entry in entries or []:
         if not isinstance(entry, dict):
@@ -590,9 +594,31 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
             detail = first_line((diag.get("detail") or ""), DETAIL_MAX_CHARS)
             if detail:
                 parts.append(f" - {detail}")
-            lines.append("".join(parts))
+            diag_lines.append("".join(parts))
+
+    lines = []
+    shown_diag_lines = []
+    for dl in diag_lines:
+        current_chars = sum(len(ln) + 1 for ln in shown_diag_lines)
+        if len(shown_diag_lines) >= MAX_DIAGNOSTIC_ITEMS or (
+            shown_diag_lines and (current_chars + len(dl) + 1 > MAX_DIAGNOSTIC_CHARS)
+        ):
+            break
+        shown_diag_lines.append(dl)
+
+    lines.extend(shown_diag_lines)
+    omitted_diags = len(diag_lines) - len(shown_diag_lines)
+    if omitted_diags > 0:
+        lines.append(
+            f"  ... and {omitted_diags} other diagnostic{'s' if omitted_diags != 1 else ''} omitted "
+            f"(run hermes kanban diagnostics on the agent pod to view all)"
+        )
+
     if stuck_items:
-        lines.extend(render_stuck_cards(stuck_items, context or {}, home))
+        current_chars = sum(len(ln) + 1 for ln in lines)
+        remaining = max(2000, MAX_REPORT_CHARS - current_chars - 1000)
+        stuck_budget = min(MAX_STUCK_CHARS, remaining)
+        lines.extend(render_stuck_cards(stuck_items, context or {}, home, max_chars=stuck_budget))
     return lines
 
 

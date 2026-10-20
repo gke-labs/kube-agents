@@ -361,9 +361,10 @@ title, they are grouped to keep the report readable, with task IDs and reasons
 retained. The `hermes kanban unblock` and `archive` commands appear once in a
 footer (using `<task_id>` when multiple cards are stuck) rather than repeated
 under every card, so the room knows how to move a card while long reports stay
-bounded within chat limits.
+bounded within chat limits, summarizing any omitted older cards with their task IDs.
 
 Daily, and it repeats: the rule is stateless, so a card still blocked is named
+(directly or by task ID in the omitted list when long reports are bounded)
 every morning until someone unblocks, comments on, or archives it. That is the
 intended nag, the same rule `findings-morning-nudge` keeps for the top
 criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a

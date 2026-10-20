@@ -463,19 +463,21 @@ class DiagnosticsTests(unittest.TestCase):
             {"task_id": f"t_dns_{i}", "status": "blocked", "title": "Scale kube-dns",
              "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
                               "title": "x", "detail": "y", "data": {"age_hours": 24 * (i + 1)}}]}
-            for i in range(5)
+            for i in range(12)
         ])
         context = {
             f"t_dns_{i}": {"kind": "needs_input", "reason": f"Reason {i}"}
-            for i in range(5)
+            for i in range(12)
         }
         lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
                                       runner=self.runner_for(0, payload)[0],
                                       binary="/x/hermes", env={}, context=context)
         text = "\n".join(lines)
-        self.assertIn("Scale kube-dns — 5 cards (5 needs_input, oldest 5d)", text)
+        self.assertIn("Scale kube-dns — 12 cards (12 needs_input, oldest 12d)", text)
         self.assertIn('latest: [t_dns_0] (needs_input, 24h) — "Reason 0"', text)
-        self.assertIn("ids: t_dns_0, t_dns_1, t_dns_2, t_dns_3, t_dns_4", text)
+        expected_ids = ", ".join(f"t_dns_{i}" for i in range(12))
+        self.assertIn(f"ids: {expected_ids}", text)
+        self.assertNotIn("and 2 more", text)
 
     def test_distinct_title_outage_report_bounded_with_omitted_summary(self):
         # 30 cards with distinct titles (wide outage scenario)
@@ -500,15 +502,100 @@ class DiagnosticsTests(unittest.TestCase):
         text = "\n".join(lines)
         # Bounded well below 12,000 chars limit
         self.assertLess(len(text), 12000)
-        # Omission message indicates older cards omitted
-        self.assertIn("older stuck cards omitted (run hermes kanban list on the agent pod to view all)", text)
+        # Omission message indicates older cards omitted with task IDs
+        self.assertIn("older stuck cards omitted (ids: ", text)
+        self.assertIn("run hermes kanban list on the agent pod to view all", text)
         # Commands footer is preserved at the end
         self.assertIn("Commands to move a card (run on the agent pod):", text)
         self.assertIn("re-run it:", text)
         self.assertIn("drop it:", text)
-        # Newest cards appear, oldest omitted
-        self.assertIn("t_outage_0", text)
-        self.assertNotIn("t_outage_29", text)
+        # Newest cards appear in full detail, oldest omitted from detailed list but named in omitted ids
+        self.assertIn("Triage stalled controller 0 in prod", text)
+        self.assertNotIn("Triage stalled controller 29 in prod", text)
+        self.assertIn("t_outage_29", text)
+
+    def test_stuck_cards_bounded_by_max_chars_when_items_have_long_reasons(self):
+        # 8 groups of 3 cards each = 8 renderable items (< MAX_STUCK_ITEMS which is 15).
+        # Each card has a max-length reason (~200 chars), so each 3-card group renders
+        # header + 3 indented lines totaling ~840 characters.
+        # 8 items * ~840 chars = ~6720 chars, which exceeds MAX_STUCK_CHARS (5500).
+        # The character cap MUST trip before the item cap (breaking at around item 6 < 15).
+        cards = []
+        context = {}
+        for g in range(8):
+            title = f"Database replica lag incident {g}"
+            for c in range(3):
+                tid = f"t_grp_{g}_{c}"
+                cards.append({
+                    "task_id": tid,
+                    "status": "blocked",
+                    "title": title,
+                    "diagnostics": [{
+                        "kind": "stuck_in_blocked",
+                        "severity": "warning",
+                        "title": "x",
+                        "detail": "y",
+                        "data": {"age_hours": 24 * (g + 1) + c},
+                    }],
+                })
+                context[tid] = {
+                    "kind": "needs_input",
+                    "reason": f"Postgres read replica on shard {g} node {c} exceeds replication lag threshold by 500ms." * 2,
+                }
+        payload = json.dumps(cards)
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context=context)
+        text = "\n".join(lines)
+        # Verify fewer than MAX_STUCK_ITEMS (15) were rendered because character cap tripped
+        self.assertIn("Database replica lag incident 0", text)
+        # Later groups past the 5500 char cap must be omitted from full group rendering
+        self.assertNotIn("[t_grp_7_0]", text)
+        self.assertIn("older stuck cards omitted (ids: ", text)
+        self.assertIn("t_grp_7_0", text)
+        # Total text is strictly bounded under MAX_STUCK_CHARS + headers/footers
+        self.assertLess(len(text), 7000)
+
+    def test_non_stuck_diagnostics_and_stuck_cards_bounded_together(self):
+        # 30 non-stuck error diagnostics + 20 stuck cards
+        cards = []
+        for i in range(30):
+            cards.append({
+                "task_id": f"t_err_{i}",
+                "status": "failed",
+                "diagnostics": [{
+                    "kind": "repeated_failures",
+                    "severity": "error",
+                    "title": f"Worker crashed on iteration {i}",
+                    "detail": f"Pod OOMKilled in namespace kubeagents-system with exit code 137 on replica {i}." * 2,
+                }],
+            })
+        for i in range(20):
+            cards.append({
+                "task_id": f"t_stuck_{i}",
+                "status": "blocked",
+                "title": f"Triage deadlock {i}",
+                "diagnostics": [{
+                    "kind": "stuck_in_blocked",
+                    "severity": "warning",
+                    "title": "x",
+                    "detail": "y",
+                    "data": {"age_hours": 24 + i},
+                }],
+            })
+        payload = json.dumps(cards)
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context={})
+        text = "\n".join(lines)
+        # Non-stuck diagnostics are bounded
+        self.assertIn("other diagnostics omitted (run hermes kanban diagnostics on the agent pod to view all)", text)
+        # Stuck cards are also bounded
+        self.assertIn("older stuck cards omitted (ids: ", text)
+        # Commands footer remains intact
+        self.assertIn("Commands to move a card (run on the agent pod):", text)
+        # Whole report strictly respects budget well below 12,000 chars
+        self.assertLess(len(text), 10000)
 
 
 
