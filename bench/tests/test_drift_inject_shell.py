@@ -207,17 +207,28 @@ if not raw.strip():
     sys.exit(0)
 
 try:
-    data = json.loads(raw)
+    decoder = json.JSONDecoder()
+    pos = 0
+    while pos < len(raw):
+        while pos < len(raw) and raw[pos].isspace():
+            pos += 1
+        if pos >= len(raw):
+            break
+        data, end = decoder.raw_decode(raw, pos)
+        pos = end
+        if data is None:
+            continue
+        if not isinstance(data, dict):
+            sys.exit(5)
+        kinds = data.get("inject_kinds", [])
+        if isinstance(kinds, list):
+            for k in kinds:
+                sys.stdout.write(f"{k}\\n")
+        elif isinstance(kinds, dict):
+            for v in kinds.values():
+                sys.stdout.write(f"{v}\\n")
 except Exception:
     sys.exit(2)
-
-if not isinstance(data, dict):
-    sys.exit(5)
-
-kinds = data.get("inject_kinds", [])
-if isinstance(kinds, list):
-    for k in kinds:
-        sys.stdout.write(f"{k}\\n")
 """
 
 
@@ -776,11 +787,34 @@ drift_require_daemon
         self.assertIn("ERROR: could not read http://daemon:8080/healthz in platform-agent (exit 5)", proc.stderr)
         self.assertIn("This says nothing about which inject kinds the daemon advertises", proc.stderr)
 
+    def test_refuses_when_daemon_returns_null_body(self):
+        self.set_kubectl_config({
+            "curl": {
+                "http_code": 200,
+                "body": "null",
+            }
+        })
+        proc = self.run_daemon()
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("ERROR: the Session KV daemon at http://daemon:8080 does not advertise the 'gitops-drift' inject kind", proc.stderr)
+        self.assertNotIn("could not read http://daemon:8080/healthz", proc.stderr)
+
     def test_succeeds_when_daemon_advertises_gitops_drift(self):
         self.set_kubectl_config({
             "curl": {
                 "http_code": 200,
                 "body": json.dumps({"inject_kinds": ["pod-event", "gitops-drift", "warning-event"]}),
+            }
+        })
+        proc = self.run_daemon()
+        self.assertEqual(proc.returncode, 0, f"Expected 0, stderr: {proc.stderr}")
+        self.assertEqual(proc.stderr, "")
+
+    def test_succeeds_when_daemon_advertises_object_valued_inject_kinds(self):
+        self.set_kubectl_config({
+            "curl": {
+                "http_code": 200,
+                "body": json.dumps({"inject_kinds": {"primary": "gitops-drift"}}),
             }
         })
         proc = self.run_daemon()
