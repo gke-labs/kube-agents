@@ -530,7 +530,7 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 - **Component stack (`--mode`)**: a first `install.sh` install runs `spec.mode: next`, which puts the NATS bus
   and the A2A gateway in front of the agent; `--mode=today` installs the previous stack, kept as
   a rollback. A first install that mirrors its third-party images (`--third-party-registry-prefix`)
-  runs `today` unless `--mode=next` is given, because `next`'s NATS images are not mirrored. When
+  runs `today` unless `--mode=next` is given, because nothing in the install points `next`'s NATS images at the mirror. When
   neither `--mode` nor `install.env` names a mode, a cluster that already runs kube-agents keeps
   the mode it runs. With an `install.env` you wrote
   yourself, `--mode` adds `PLATFORM_AGENT_MODE` to it when it sets none, and is refused when it
@@ -1286,7 +1286,7 @@ kubectl get pods -n kubeagents-system
 take over fifteen minutes. The site's quickstart
 [Verify step](docs/site/src/content/docs/install/quickstart-gke.mdx) says what each pod is,
 which startup errors to ignore, and how to check that Slack connected. On a `next` install, which
-is what a first install runs unless `--mode=today` was passed, `Ready` also waits for the NATS bus, the auth callout, the bus provisioning Job's
+is what a first install runs unless `--mode=today` was passed or its third-party images are mirrored, `Ready` also waits for the NATS bus, the auth callout, the bus provisioning Job's
 first run and, with a chat backend, the A2A gateway; run the quickstart's "Verify a
 `spec.mode: next` install" checks as well, for those, the verifier and console it does not wait
 on, the conditions, and the Slack check that applies under `next`. If a pod stays unready, see
@@ -1495,7 +1495,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
   ```
-- **Default mode.** The credential broker holds the Slack connection, and its startup lines say whether the tokens work. `Slack relay enabled workspaces=N` means the relay is up with N workspaces. `Slack bot token authentication failed` means Slack's `auth.test` rejected one of the bot tokens in `SLACK_BOT_TOKEN`; the relay still starts on the others. `Slack relay initialization failed; retrying` means no bot token authenticated or the Socket Mode connection with the app token failed, and the broker tries again every 30 seconds. A `Slack relay operation failed` line is something else: one Slack call the agent made failed (its `error` field says why, such as `channel_not_found` or `missing_scope`), not the tokens.
+- **`today`.** The credential broker holds the Slack connection, and its startup lines say whether the tokens work. `Slack relay enabled workspaces=N` means the relay is up with N workspaces. `Slack bot token authentication failed` means Slack's `auth.test` rejected one of the bot tokens in `SLACK_BOT_TOKEN`; the relay still starts on the others. `Slack relay initialization failed; retrying` means no bot token authenticated or the Socket Mode connection with the app token failed, and the broker tries again every 30 seconds. A `Slack relay operation failed` line is something else: one Slack call the agent made failed (its `error` field says why, such as `channel_not_found` or `missing_scope`), not the tokens.
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -E 'Slack relay (enabled|initialization)|Slack bot token'
   ```
