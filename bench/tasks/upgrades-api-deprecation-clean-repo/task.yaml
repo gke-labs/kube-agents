@@ -104,13 +104,14 @@ verification_spec:
         - script: api_deprecation_scan.py
           word_patterns: ["^--(versions|current-version)(=.*)?$"]
   # The scratch-name check. /opt/data/scratch is shared by every card, so a
-  # fleet_versions*.json or api_deprecations*.json path with no per-run mark
-  # ($(date +%s), $$, or the digits they expand to) names a file another card
-  # can write or has written. Forbidden: a run of either script with such a
-  # path as a word. It reads names only: it does not see whether --versions
-  # names a file this run wrote, or where the reply's section came from
-  # (#3404). The pattern reads each word after the shell split, so
-  # `_$(date +%s).json` without $$ is not caught.
+  # fleet_versions*.json or api_deprecations*.json path without the run's
+  # mark names a file another card can write or has written. The mark is the
+  # pair the skill dictates, $(date +%s) then $$, or a run of 9+ digits (the
+  # expanded timestamp). Any other spelling is forbidden, a unique one such as
+  # $RANDOM included. Forbidden: a run of either script with such a path as a
+  # word. It reads names only: it does not see a read of another run's file
+  # (cat, search_files, read_file), whether --versions names a file this run
+  # wrote, or where the reply's section came from (#3404).
   - name: the-scan-files-have-per-run-names
     role: objective
     mode: assert
@@ -120,7 +121,7 @@ verification_spec:
         - script: api_deprecation_scan.py
           word_patterns:
             &unsuffixed_scratch_name [
-              '^(?!.*(\$\(date|\$\$|\d{9,}))(?:--[a-z-]+=)?(?:\S*/)?(api_deprecations|fleet_versions)[^/]*\.json$',
+              '^(?!.*(\$\(date \+%s\)\S*\$\$|\d{9,}))(?:--[a-z-]+=)?(?:\S*/)?(api_deprecations|fleet_versions)[^/]*\.json$',
             ]
         - script: fleet_upgrade_report.py
           word_patterns: *unsuffixed_scratch_name

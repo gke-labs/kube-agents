@@ -362,9 +362,10 @@ error (exit 2).
   [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations_$(date +%s)_$$.json
 ```
 
-A scan for a second target carries its own `_$(date +%s)_$$` suffix
-(`api_deprecations_<target>_$(date +%s)_$$.json`): a name without one is a file another card can
-write or has already written.
+A scan for a second target names the target as well as the run
+(`api_deprecations_<target>_$(date +%s)_$$.json`): two scans in one shell share `$$` and can
+share the second, and a name without the run's suffix is a file another card can write or has
+already written.
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
