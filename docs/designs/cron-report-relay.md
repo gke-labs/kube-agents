@@ -226,7 +226,12 @@ age and repository rule, with one exception: a later `finish` of a repository wh
 `start` opened and an earlier `finish` filled, while the record's last step is within the
 two hours, is the same run. It adds its report under the earlier one's, below a label line,
 and gives the record a new `run` stamp; when the earlier `finish` died before it wrote its
-report, the later one fills the entry in its place. The earlier `finish` saves its
+report, the later one fills the entry in its place. The first `finish` of the repository in the
+run saves the previous run's finding ids on the entry before it touches the ledger, and a later
+`finish` counts its chat report against them (`run_baseline`), so its line states the whole run's
+new and resolved findings and its label says so; its JSON line still counts against the earlier
+`finish`. A no-forge or HELD report, or an entry without those ids, keeps a label that says its
+counts are against the report above. The earlier `finish` saves its
 `silent_ok` on the entry as each pull request its sweep opens is created, and again before
 it writes the report store. When that was `false` the later one is not silent either and its automatic
 sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
