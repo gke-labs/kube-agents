@@ -5328,6 +5328,14 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 )
                 self.assertIn(f"[C0lower] [] LC_ALL={locale}", proc.stdout, proc.stderr)
 
+    def test_a_channel_id_padded_with_unicode_space_is_not_refused(self):
+        # The operator trims with strings.TrimSpace before it checks the id.
+        for home in ("\u00a0C0HOME", "C0HOME\u202f"):
+            with self.subTest(home=home):
+                proc = self._run(home=home)
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("SLACK_HOME_CHANNEL is", proc.stdout + proc.stderr)
+
     def test_a_home_channel_that_is_not_a_channel_id_is_refused_and_named(self):
         for home in ("D0123ABCD", "U0123ABCD", "#ops", "general", "c0lower", "C0lower", "Gcore", "C", "C0HOME/1.2"):
             with self.subTest(home=home):
@@ -5551,6 +5559,22 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
 
     def test_a_blank_home_channel_counts_as_unset(self):
         self.assertIn("key=SLACK_HOME_CHANNEL", self._run(slack_home="   ").stdout)
+
+    def test_a_home_channel_of_unicode_space_counts_as_unset(self):
+        # The operator trims with strings.TrimSpace, which strips these too,
+        # and sets HomeChannelUnset; the checklist trims the same way. In the
+        # C locale [[:space:]] matches none of them, and glibc's UTF-8 locales
+        # leave U+00A0 out, so the result must not depend on the locale.
+        for locale in ("C", "en_US.UTF-8"):
+            for args, key in (('next false true "" "\u00a0"', "GOOGLE_CHAT_HOME_CHANNEL"),
+                              ('next true false "\u3000\u202f" ""', "SLACK_HOME_CHANNEL")):
+                with self.subTest(locale=locale, key=key):
+                    proc = subprocess.run(
+                        ["bash", "-c", f'source "{_INSTALLER_COMMON}"; export LC_ALL={locale}; '
+                         f'echo "key=$(next_home_channel_unset_key {args})"'],
+                        capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                    )
+                    self.assertIn(f"key={key}", proc.stdout, proc.stderr)
 
     def test_the_summary_repeats_it_last(self):
         proc = self._run(summary=True)

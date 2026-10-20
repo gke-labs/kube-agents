@@ -22,7 +22,7 @@ the Google Chat path the install uses: the A2A gateway under
 PLATFORM_AGENT_MODE=next, the Hermes listener otherwise. It reads
 the install.env at the root of the checkout it sits in ($KUBE_AGENTS_INSTALL_ENV
 instead, when set) and scripts/installer/vars.sh, and prints the checklist
-only when GOOGLE_CHAT_ENABLED=true there. install.sh runs it at the end of an install
+only when GOOGLE_CHAT_ENABLED is on there (true, yes, 1 or on). install.sh runs it at the end of an install
 with Google Chat enabled; run it again at any time. It changes nothing on the
 cluster, but like every installer step it records REGISTRY_PREFIX in
 vars.sh (not under --dry-run), asking for it first on a terminal when

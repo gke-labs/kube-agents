@@ -203,6 +203,16 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         # turn every old install into next once that default changes.
         self._assert_today(self._run(self._env(mode=None)))
 
+    def test_a_standalone_run_keeps_an_exported_google_chat_the_file_does_not_set(self):
+        # install.sh applies an exported GOOGLE_CHAT_ENABLED when install.env
+        # does not assign the key, and Chat then holds the gateway.
+        out = self._run("SLACK_ENABLED=true\nPLATFORM_AGENT_MODE=next\n", {"GOOGLE_CHAT_ENABLED": "true"})
+        self._assert_today(out)
+
+    def test_a_home_channel_padded_with_unicode_space_is_the_channel(self):
+        out = self._run(self._env(mode="next", home=f'"\u00a0{self._NEXT_HOME}\u3000"'))
+        self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME},", out)
+
     def test_a_standalone_run_keeps_an_exported_home_channel_the_file_does_not_set(self):
         # install.sh applies an exported SLACK_HOME_CHANNEL when install.env
         # does not assign the key, so the checklist must not call it unset.

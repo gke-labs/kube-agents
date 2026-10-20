@@ -6775,7 +6775,8 @@ main() {
   # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
   # the warning before the apply and the closing summary say it then.
   _confirm_no_home_channel() {
-    local home="${2//[[:space:]]/}" keep=""
+    local home keep=""
+    home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
     print_warning "$(next_home_channel_unset_message "$1")"
     prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"

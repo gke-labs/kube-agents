@@ -1101,15 +1101,14 @@ slack_allowlist_emails() {
   printf '%s' "$emails"
 }
 
-# A Slack home channel ($1), trimmed, when it is set and is not a channel id
-# (SLACK_HOME_CHANNEL_ID_RE).
+# A Slack home channel ($1), trimmed as the operator trims it (trim_go_space),
+# when it is set and is not a channel id (SLACK_HOME_CHANNEL_ID_RE).
 slack_home_channel_not_an_id() {
   # The C locale: under a legacy collation (glibc before 2.28) the range
   # A-Z also matches lowercase, which the gateway's rune comparison refuses.
   local LC_ALL=C
-  local home="${1:-}"
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home
+  home="$(trim_go_space "${1:-}")"
   if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
     printf '%s' "$home"
   fi
@@ -1148,11 +1147,7 @@ gchat_home_channel_not_a_space_name() {
 # hcl_csv_list renders it, which drops blank items: the operator then renders
 # allow-all for the gateway.
 gchat_allowlist_is_empty() {
-  local item
-  while IFS= read -r item; do
-    [ -z "$item" ] || return 1
-  done <<< "$(csv_list_items "${1:-}")"
-  return 0
+  [ -z "$(csv_list_items "${1:-}")" ]
 }
 
 # The number of tokens a Slack bot token ($1) holds, when it is more than
@@ -1270,13 +1265,13 @@ next_home_channel_unset_key() {
   [ "${1:-}" = "next" ] || return 0
   if is_truthy "${3:-}"; then
     home="${5:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
     return 0
   fi
   if is_truthy "${2:-}"; then
     home="${4:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
   fi
   return 0

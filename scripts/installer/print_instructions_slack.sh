@@ -60,9 +60,8 @@ fi
 # that only SLACK_HOME_CHANNEL sets.
 print_a2a_gateway_steps() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
-  local home="${SLACK_HOME_CHANNEL:-}" not_an_id
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home not_an_id
+  home="$(trim_go_space "${SLACK_HOME_CHANNEL:-}")"
   not_an_id="$(slack_home_channel_not_an_id "$home")"
   echo -e "[ ] 1. Check the Slack app against the spec.mode next manifest:"
   echo -e "       ${SLACK_NEXT_APP_DOC}"
