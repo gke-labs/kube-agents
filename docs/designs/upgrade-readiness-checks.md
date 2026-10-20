@@ -414,9 +414,10 @@ rigid-scheduling and spreading checks already run (see Scope). The additions:
   project's instances once per project and joins the cluster's Nodes to them on the providerID's
   zone and instance name; a Node with no instance behind it is a blocker with
   `kubectl delete node <name>`, and the note counts nodes against instances on every member so a
-  clean cluster reads as graded. The list is read once per project before the members' node
-  reads, so a `Ready`, uncordoned Node the list does not carry joined after it (a scale-up, a
-  surge node): a note naming the list's read time, not a blocker.
+  clean cluster reads as graded. The list is read once per project, at its first graded member
+  (after that member's own node read, before the later members'), so a member's node read and the
+  list are minutes apart at most, and a `Ready`, uncordoned Node the list does not carry joined
+  or left in between (a scale-up, a surge node): a note naming the list's read time, not a blocker.
 
 ## Rollout and verification
 

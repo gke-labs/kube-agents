@@ -868,9 +868,10 @@ class OrphanNodeObjectsRuleTest(unittest.TestCase):
         self.assertEqual(orphan_node_objects.evaluate(record, {}, read(items=[bare]), None, context_for(record))["blocking"], [])
         self.assertEqual(len(orphan_node_objects.evaluate(record, {}, read(items=[node("gke-nowhere-1", "p", ready=False)]), None, context_for(record))["blocking"]), 1)
 
-    def test_a_ready_uncordoned_node_the_instance_list_predates_is_a_note_not_a_blocker(self):
-        # The instance list is read once per project before the members' node reads: a node that joined
-        # in between (a scale-up, a surge node) is Ready and uncordoned with no instance in the list.
+    def test_a_ready_uncordoned_node_the_instance_list_does_not_carry_is_a_note_not_a_blocker(self):
+        # The instance list is read once per project at its first graded member, minutes from any member's
+        # node read at most: a node that joined or left in between (a scale-up, a surge node) is Ready and
+        # uncordoned with no instance in the list.
         record = seeded_b()
         newcomer = copy.deepcopy(recorded("nodes_seeded_b.json")[0])
         newcomer["metadata"]["name"] = "gke-seeded-b-default-pool-4176890d-new1"
@@ -879,7 +880,7 @@ class OrphanNodeObjectsRuleTest(unittest.TestCase):
         reads[shared.PROJECT_READ_INSTANCES][shared.PROJECT_READ_AT_KEY] = "2026-10-20T11:58:00Z"
         result = orphan_node_objects.evaluate(record, {}, seeded_b_read([newcomer]), None, context_for(record, reads=reads))
         self.assertEqual(result["blocking"], [])
-        self.assertEqual(result["notes"], ["0 orphan Node(s) (3 nodes, 19 instances in the project)", "1 Ready, uncordoned Node(s) not in the instance list read at 2026-10-20T11:58:00Z (gke-seeded-b-default-pool-4176890d-new1): a node that joined after the list is not an orphan; the next run grades it"])
+        self.assertEqual(result["notes"], ["0 orphan Node(s) (3 nodes, 19 instances in the project)", "1 Ready, uncordoned Node(s) not in the instance list read at 2026-10-20T11:58:00Z (gke-seeded-b-default-pool-4176890d-new1): a node that joined or left between that list and this node read is not an orphan; the next run grades it"])
         # A context that does not say when the list was read says so.
         self.assertIn("read at an unrecorded time", orphan_node_objects.evaluate(record, {}, seeded_b_read([newcomer]), None, context_for(record))["notes"][1])
         # Cordoned, or not Ready True: the orphan shape, a blocker whatever the list's age.

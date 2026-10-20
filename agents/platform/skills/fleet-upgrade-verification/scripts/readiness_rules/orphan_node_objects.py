@@ -11,10 +11,11 @@ identifier: the cluster's Nodes (the report's node read, each with its `spec.pro
 names nor, for a Node with no providerID, the project at all under the Node's own name (a GKE
 node is named for its instance) is an orphan: one blocker per Node, naming its Ready condition
 and whether it is cordoned, with the one action, `kubectl delete node <name>`. The instance
-list is read once per project before the members' own reads, so a Node that is `Ready` `True`
-and not cordoned with no instance in the list joined the cluster after the list was made (a
-scale-up, a surge node) rather than losing its instance: it is a note naming the list's read
-time, not a blocker, and the next run grades it. The note carries the count either way, so a
+list is read once per project, at its first graded member (after that member's own node read,
+before the later members'), so a member's node read and the list are minutes apart at most, and
+a Node that is `Ready` `True` and not cordoned with no instance in the list joined or left in
+between (a scale-up, a surge node) rather than losing its instance: it is a note naming the
+list's read time, not a blocker, and the next run grades it. The note carries the count either way, so a
 clean cluster reads as graded rather than silent.
 """
 
@@ -53,8 +54,8 @@ FINDING_FORMAT = (
 NO_PROVIDER_ID = "none"
 UNKNOWN_READY = "unknown"
 COUNT_NOTE_FORMAT = "{orphans} orphan Node(s) ({nodes} nodes, {instances} instances in the project)"
-# A Ready, uncordoned Node the instance list does not carry: the list predates the node read.
-LATER_NODES_NOTE_FORMAT = "{later} Ready, uncordoned Node(s) not in the instance list read at {read_at} ({names}): a node that joined after the list is not an orphan; the next run grades it"
+# A Ready, uncordoned Node the instance list does not carry: the list and the node read are minutes apart at most.
+LATER_NODES_NOTE_FORMAT = "{later} Ready, uncordoned Node(s) not in the instance list read at {read_at} ({names}): a node that joined or left between that list and this node read is not an orphan; the next run grades it"
 NODES_NOT_READ_REASON = "the Nodes were not read ({error}), so no Node could be checked against the instances"
 INSTANCES_NOT_A_LIST = "the instances read returned {type}, not a list"
 
@@ -82,7 +83,8 @@ def is_live(node: dict, by_zone: set, names: set) -> bool:
 
 
 def joined_later(node: dict) -> bool:
-    """A Ready, uncordoned Node with no instance in the list: one the list predates, not an orphan."""
+    """A Ready, uncordoned Node with no instance in the list: one that moved between the list and
+    the node read, not an orphan."""
     return node_ready(node) == CONDITION_TRUE and not (node.get("spec") or {}).get("unschedulable")
 
 

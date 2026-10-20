@@ -52,7 +52,8 @@ narrowing selects whom to grade, not whom a rule may see),
 rules (PROJECT_READS: the project's backend services, compute instances and GKE operations,
 and the location's server config), each `{"data": <parsed JSON>, "error": None}` or
 `{"data": None, "error": <why>}`, with `read_at`, the instant the report made the read, on
-the project reads (the list is read once per project, before the members' own reads); a rule
+the project reads (each list is made once per project, at its first graded member, after that
+member's own kubectl reads and before the later members'); a rule
 asks `project_read(context, name)` and files one `unknown` naming the reason when the read it
 needs failed or was not made, grading what it has, and `project_read_at(context, name)` for
 the instant; `addons`, the member's add-on inventory (`known_issues_matrix.inventory`, which the

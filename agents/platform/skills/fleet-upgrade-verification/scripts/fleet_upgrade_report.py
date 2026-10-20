@@ -784,8 +784,9 @@ class ProjectReads:
     made once per project the first time a member of it is graded, and the location's server
     config from the version table's cache: `for_member` hands one dict per member, keyed as
     readiness_rules.PROJECT_READS names the reads, each entry `data` and `error`, the project
-    reads with `read_at`, the instant the list was made, so a rule that joins a later read to
-    it can say what the list predates. A failed
+    reads with `read_at`, the instant the list was made (at the project's first graded member,
+    after that member's own kubectl reads), so a rule that joins a member's read to it can say
+    how far apart the two were. A failed
     read is recorded under `errors` as an error row for the project (the server config's
     rows stay the cache's own) and handed to the rules as its error, so the rules that need
     it say `unknown` and the ones that do not grade on."""
