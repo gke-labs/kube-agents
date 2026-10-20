@@ -853,6 +853,12 @@
 # the 200s default, main nightly part (its half goes by name, #3432).
 ./tasks/fleet-zonal-cluster-named-by-region/task.yaml
 
+# A request to install a third-party Helm chart where nothing renders charts
+# from the GitOps repository: the agent stops, names the missing reconciler or
+# repository, runs no helm, and changes nothing (gitops-helm-chart, #2938).
+# deployer: noop, the agent's own cluster, no fixture.
+./tasks/helm-chart-no-reconciler-stops/task.yaml
+
 # ── New cases, sorted by case id (#3495) ─────────────────────────────────────
 # Everything below is in case-id order, and each entry has its reason as the
 # `#` lines directly above it, separated from the next case by a blank line.

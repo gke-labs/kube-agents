@@ -2111,12 +2111,13 @@ Mutation(
     Mutation(
         "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
-        "derive a session pod a publish grant on the notify subject, so a "
-        "session can post its result to the home channel itself. The gateway "
-        "then posts as the install's bot for whatever runs in a session pod",
+        "derive a session pod (and, through the shared executorGrants, an "
+        "AgentProfile pod) a publish grant on the notify subject, so a session "
+        "can post its result to the home channel itself. The gateway then "
+        "posts as the install's bot for whatever runs in that pod",
     ),
     Mutation(
         "A3-agent-answers-the-board",
