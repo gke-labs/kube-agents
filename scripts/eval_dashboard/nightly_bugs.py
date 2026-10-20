@@ -631,7 +631,16 @@ class Filer:
             clean = [n for n in parts.get(lost["part"], []) if not n["lost"]]
             self.file_infra(KIND_LOST, job, losses[-1], title, body, lost["nights"], clean, closed_issues, result)
         candidates = sorted(c for c in active if c)
-        for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates).items()):
+        # A case with an open kept-case issue is read even with no line in
+        # the window, on the part its issue names, so the issue keeps its
+        # notes and gets its recovery.
+        tracked = {}
+        for case in candidates:
+            open_issue = tracking_issue(open_issues, case, KIND_INFRA)
+            if open_issue:
+                body_text = open_issue.get("body") or ""
+                tracked[case] = nightly.PART_WRITERS if f"`{nightly.NIGHTLY_WRITERS_JOB}`" in body_text else nightly.PART_MAIN
+        for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates, tracked).items()):
             fields = task_fields(case, self.repo_root)
             if fields is None or fields["expected_fail"]:
                 continue

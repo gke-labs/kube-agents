@@ -213,25 +213,45 @@ def infra_reason(task: dict) -> str:
     return INFRA_REASON.format(infra=counts["infra"] + counts["ceiling"], reps=reps, ceiling=ceiling, reason=reason)
 
 
-def case_verdicts(parts: dict[str, list[dict]], cases: list[str]) -> dict[str, list[dict]]:
+def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[str, str] | None = None) -> dict[str, list[dict]]:
     """``{case: [verdict, ...]}``, oldest first, over the eligible nights
     (module docstring). A verdict is ``{date, started, finished, build, job,
     run_url, transcript_url, state, reason}``, the build being the one that
     recorded the case (the night's own when none did); ``state`` is infra,
-    absent or graded."""
+    absent or graded.
+
+    Each date reads the case from whichever part recorded it (a case that
+    changed lanes, or one both parts ran), and is skipped when that part's
+    night is not eligible; a date no part recorded it on is judged on the
+    part that last did. ``tracked`` is ``{case: part}`` for cases with an
+    open kept-case issue: one with no line anywhere in the window still has
+    its nights read (on that part), from the window's start."""
     homes = case_homes(parts)
-    eligible = {}
+    eligible: dict[str, dict[str, dict]] = {}
     for part, nights in parts.items():
         fullest = max((len(n["tasks"]) for n in nights), default=0)
-        eligible[part] = [n for n in nights if not n["lost"] and not n["unrescued"] and not infra_event([t for t, _ in n["tasks"].values()])
-                          and not thin_night(list(n["tasks"]), fullest)]
+        eligible[part] = {n["date"]: n for n in nights if not n["lost"] and not n["unrescued"]
+                          and not infra_event([t for t, _ in n["tasks"].values()]) and not thin_night(list(n["tasks"]), fullest)}
+    every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
+    dates = sorted({n["date"] for nights in parts.values() for n in nights})
     out: dict[str, list[dict]] = {}
     for case in cases:
-        if case not in homes:
+        if case in (tracked or {}):
+            home, first = homes.get(case, (tracked[case], None))[0], None
+        elif case in homes:
+            home, first = homes[case]
+        else:
             continue
-        part, first = homes[case]
-        for night in eligible.get(part, []):
-            if datetime.date.fromisoformat(night["date"]) < first:
+        for day in dates:
+            if first and datetime.date.fromisoformat(day) < first:
+                continue
+            recorders = [p for p in nightly.PARTS if case in every.get(p, {}).get(day, {}).get("tasks", {})]
+            usable = [p for p in recorders if day in eligible.get(p, {})]
+            if recorders and not usable:
+                continue
+            part = usable[0] if usable else home
+            night = eligible.get(part, {}).get(day)
+            if night is None:
                 continue
             task, run = night["tasks"].get(case, (None, night["run"]))
             if task is None:

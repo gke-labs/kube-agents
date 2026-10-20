@@ -799,6 +799,26 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
+    def test_a_case_that_changed_parts_is_read_from_the_part_that_ran_it(self):
+        # Graded by the writers part on the 11th-16th, then moved to main,
+        # whose 17th was cut off after recording it: never kept from running.
+        writers = [night(d, [green("case-red")], job=WRITERS_JOB, filler=False) for d in range(11, 17)]
+        main = [night(d, []) for d in range(11, 17)] + [night(17, [green("case-red")], truncated=True)]
+        gh, _, _ = self.run_once(data(*sorted(writers + main, key=lambda r: r["build_id"])))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_an_open_issue_for_a_case_absent_all_window_keeps_its_notes_and_recovery(self):
+        # Recorded on the 1st, absent since; its issue opened on the 4th.
+        # The 14-night window no longer holds a line for it.
+        issue = {"number": 3975, "title": "t", "body": f"<!-- kube-agents-bot:nightly-infra case=case-red --> (`{JOB}`)", "created_at": "2026-10-04T12:00:00Z"}
+        runs = [night(1, [green("case-red")])] + [night(d, []) for d in range(2, 18)]
+        gh, _, _ = self.run_once(data(*runs), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("Again on the 2026-10-17 nightly", comment)
+        gh, _, _ = self.run_once(data(*runs, night(18, [green("case-red")])), FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("`case-red` was graded on the 2026-10-18 nightly", comment)
+
     def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
         # Two jobs of the main part each date: the first runs clean, the
         # second (which runs case-red) is cut off. case-red's job did not run

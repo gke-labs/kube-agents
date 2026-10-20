@@ -755,8 +755,8 @@ rules). Neither changes the domain streak above.
   newest night is not among the last 3 nightly dates (its job stopped running)
   is not judged on its old nights.
 - **A case kept from running.** A case is kept from running on a night when its
-  part (the one that last recorded it) ran to its verdict and the case graded
-  nothing: every repetition classified as infrastructure, or no line for it. 3
+  part (the one that recorded it that night; on a night neither did, the one
+  that last recorded it) ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
   such nights in a row file one issue naming the case and the classifier's
   reason. A night is skipped, not counted, when the part did not run or was
   lost (or any job of the part lost its build that date and was not re-run
@@ -766,7 +766,8 @@ rules). Neither changes the domain streak above.
   cases (a pool-wide outage, which is not one case's problem), or when the part
   recorded under half the cases of its fullest night in the window (a short run
   would otherwise make every missing case "absent"). A graded night ends the
-  streak.
+  streak. A case with an open kept-case issue is still read when no night in
+  the window recorded it, so the issue keeps its notes and its recovery.
   `expected_fail` cases and cases off the matrix are not filed.
 
 An infra issue is deduplicated by its own marker alone: a bot issue of one
