@@ -1225,6 +1225,7 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
         self.assertFalse(known_issues_matrix.CAN_BLOCK)
         self.assertEqual((known_issues_matrix.RULE_ID, known_issues_matrix.ENTRY), ("known-issues-matrix", 10))
         # The table is read through the module loader, as the removal table is: a loader that serves nothing is unknown, naming the table.
+        known_issues_matrix._TABLE_CACHE.clear()  # the table is read once per process; this probe needs the read
         with patch.object(known_issues_matrix.pkgutil, "get_data", return_value=None):
             table, error = known_issues_matrix.load_table()
         self.assertEqual((table, error), (None, "known-issues table known_issues.json could not be read beside upgrade_shape_tables (the module loader served no data)"))

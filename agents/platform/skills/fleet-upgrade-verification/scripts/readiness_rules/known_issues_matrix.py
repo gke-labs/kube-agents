@@ -33,6 +33,7 @@ import re
 from datetime import date
 
 from readiness_rules import (
+    CONTEXT_ADDONS,
     CONTEXT_AT,
     CONTEXT_TARGET_TEXT,
     KIND_DAEMONSET,
@@ -105,6 +106,9 @@ GENERATED_UNPARSABLE_REASON = "known-issues table {name} carries no readable gen
 NO_TARGET = "none"
 NO_MASTER = "none"
 NO_NEWEST = "none"
+# The table once per process, keyed by what it was read as: the report grades every member
+# in one process, and the table does not change under it.
+_TABLE_CACHE: dict[tuple[str, str], dict] = {}
 
 
 def inventory(read) -> list[dict]:
@@ -137,7 +141,11 @@ def inventory_cell(addons: list[dict]) -> str:
 
 def load_table(name: str = TABLE_NAME, module: str = TABLE_MODULE) -> tuple[dict | None, str | None]:
     """The table, read through `module`'s loader (the file beside it on a checkout, the shipped
-    copy under the daily watch); (None, why) when it cannot be read or is not the table's shape."""
+    copy under the daily watch) once per process; (None, why) when it cannot be read or is not
+    the table's shape."""
+    cached = _TABLE_CACHE.get((module, name))
+    if cached is not None:
+        return cached, None
     try:
         raw = pkgutil.get_data(module, name)
         if raw is None:
@@ -147,6 +155,7 @@ def load_table(name: str = TABLE_NAME, module: str = TABLE_MODULE) -> tuple[dict
         return None, TABLE_UNREADABLE_REASON.format(name=name, module=module, error=e)
     if not isinstance(table, dict) or not isinstance(table.get(TABLE_ISSUES_KEY), list) or not table.get(TABLE_GENERATED_KEY) or not table.get(TABLE_SOURCE_KEY):
         return None, TABLE_SHAPE_REASON.format(name=name)
+    _TABLE_CACHE[(module, name)] = table
     return table, None
 
 
@@ -221,7 +230,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     daemonset_error = read_error(read, DAEMONSET_READ_KIND)
     if daemonset_error:
         out["unknown"].append(DAEMONSETS_NOT_READ_REASON.format(error=daemonset_error))
-    addons = inventory(read)
+    addons = context.get(CONTEXT_ADDONS) if isinstance(context.get(CONTEXT_ADDONS), list) else inventory(read)  # the report inventories once per member and hands it in
     at = context[CONTEXT_AT]
     age_days = (at.date() - generated).days
     if age_days > STALE_AFTER_DAYS:

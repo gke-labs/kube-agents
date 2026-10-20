@@ -49,6 +49,7 @@ REGIONS_SEGMENT = "regions"
 INSTANCE_GROUPS_SEGMENT = "instanceGroups"
 INSTANCE_GROUP_MANAGERS_SEGMENT = "instanceGroupManagers"
 NEG_SEGMENT = "networkEndpointGroups"
+URL_TAIL_PARTS = 4  # <scope value>/<kind>/<name>, and the segment before the scope that names its kind
 # The cluster record's and the backend service's fields.
 NODE_POOLS_KEY = "nodePools"
 POOL_NAME_KEY = "name"
@@ -85,7 +86,7 @@ def _url_parts(url: str) -> tuple[str, str, str]:
     """(scope segment's value, kind segment, name) of a compute URL: `.../zones/us-central1-a/instanceGroups/x`
     -> (`us-central1-a`, `instanceGroups`, `x`); empty strings when the URL has no such tail."""
     parts = str(url or "").rstrip(PATH_SEPARATOR).split(PATH_SEPARATOR)
-    if len(parts) < 4:
+    if len(parts) < URL_TAIL_PARTS:
         return "", "", parts[-1] if parts else ""
     return parts[-3], parts[-2], parts[-1]
 

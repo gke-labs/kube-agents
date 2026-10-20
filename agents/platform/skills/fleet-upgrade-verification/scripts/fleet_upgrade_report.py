@@ -356,7 +356,7 @@ NODE_KIND = readiness_rules.KIND_NODE
 # names the cause, and the kinds the read carried are recorded as cut.
 PROXY_TRUNCATION_MARKER = readiness_rules.PROXY_TRUNCATION_MARKER
 KUBECTL_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
-GCLOUD_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
+GCLOUD_OUTPUT_CUT = KUBECTL_OUTPUT_CUT  # one cap, one sentence, for a kubectl list and a gcloud list alike
 # The member's note names the one cause its reads failed for, so an operator goes to the
 # step that failed: the directory, the credentials, the first read, the second read, or the
 # second read skipped because the first failed before the server answered it (the note names
@@ -1198,13 +1198,13 @@ def _read_error_notes(read_errors: dict) -> list[str]:
     return [NOTE_READ_FAILED.format(kinds=readiness.LIST_SEPARATOR.join(kinds), error=_error_excerpt(error)) for error, kinds in kinds_by_error.items()]
 
 
-def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = None, pools: list[dict] | None = None, master=None, autopilot: bool = False, project_reads: dict | None = None) -> dict:
+def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = None, pools: list[dict] | None = None, master=None, autopilot: bool = False, project_reads: dict | None = None, addons: list[dict] | None = None) -> dict:
     """The per-member read context the per-entry rules share (readiness_rules documents the
     keys): the member's project, location and name for a log filter, this module's runner
     with its per-call cap, the instant, a cache a rule fills so another reads it once, every
     cluster record the run listed, the member's pools, target, control plane and Autopilot,
     and the project reads (`ProjectReads.for_member`; empty when none were made, which the
-    rules that need one report as `unknown`)."""
+    rules that need one report as `unknown`), and the member's add-on inventory, built once."""
     return {
         readiness_rules.CONTEXT_PROJECT: member["project"],
         readiness_rules.CONTEXT_LOCATION: member["location"],
@@ -1219,6 +1219,7 @@ def readiness_context(member: dict, at: datetime, clusters: list[dict] | None = 
         readiness_rules.CONTEXT_MASTER: master,
         readiness_rules.CONTEXT_AUTOPILOT: autopilot,
         readiness_rules.CONTEXT_PROJECT_READS: dict(project_reads) if project_reads else {},
+        readiness_rules.CONTEXT_ADDONS: list(addons) if addons is not None else None,
     }
 
 
@@ -1237,7 +1238,8 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
     webhooks = None if webhook_items is None else readiness.grade_webhooks(*readiness.split_webhook_items(webhook_items))
     maintenance = readiness.evaluate_maintenance(cluster.get("maintenancePolicy"), at, member["target_version"], target, master, pools)
     skew = readiness.evaluate_skew(target, pools, autopilot)
-    context = readiness_context(member, at, fleet if fleet is not None else [cluster], pools, master, autopilot, project_reads)
+    addons = known_issues_matrix.inventory(read)  # once per member: the rule reads it from the context, the JSON carries it
+    context = readiness_context(member, at, fleet if fleet is not None else [cluster], pools, master, autopilot, project_reads, addons)
     rules = readiness.evaluate_extra_rules(cluster, member, read, target, context)
     status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None, rules)
 
@@ -1292,7 +1294,7 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
         "risks": rules["risks"],
         "unknown": rules["unknown"],
         "notes": rules["notes"],
-        "addons": known_issues_matrix.inventory(read),
+        "addons": addons,
         # From the cache as the reads left it: an entry a rule wrote in another shape is that
         # rule's `unknown` (the fold checks the cache around each rule) and is not read here.
         "audit_log": audit_log.summaries(context),

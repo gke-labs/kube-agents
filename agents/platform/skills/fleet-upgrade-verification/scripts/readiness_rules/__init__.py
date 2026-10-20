@@ -55,7 +55,8 @@ and the location's server config), each `{"data": <parsed JSON>, "error": None}`
 the project reads (the list is read once per project, before the members' own reads); a rule
 asks `project_read(context, name)` and files one `unknown` naming the reason when the read it
 needs failed or was not made, grading what it has, and `project_read_at(context, name)` for
-the instant. Tests may add `clock`, a monotonic clock for a read's time budget.
+the instant; `addons`, the member's add-on inventory (`known_issues_matrix.inventory`, which the
+report builds once per member and writes to the JSON), None on a context built by hand. Tests may add `clock`, a monotonic clock for a read's time budget.
 
 A finding is a dict the rule shapes; the fold copies it before it stamps it, so a rule may
 return the same object twice or cache what it returns. The fold in
@@ -152,6 +153,7 @@ CONTEXT_TARGET_TEXT = "target_text"
 CONTEXT_MASTER = "master"
 CONTEXT_AUTOPILOT = "autopilot"
 CONTEXT_PROJECT_READS = "project_reads"
+CONTEXT_ADDONS = "addons"  # the member's add-on inventory (known_issues_matrix.inventory), built once by the report
 CONTEXT_KEYS = (
     CONTEXT_PROJECT,
     CONTEXT_LOCATION,
@@ -166,6 +168,7 @@ CONTEXT_KEYS = (
     CONTEXT_MASTER,
     CONTEXT_AUTOPILOT,
     CONTEXT_PROJECT_READS,
+    CONTEXT_ADDONS,
 )
 # The reads under `project_reads`, named once for the report that makes them and the rules
 # that ask for them: three per project (`gcloud compute backend-services list`, `gcloud
