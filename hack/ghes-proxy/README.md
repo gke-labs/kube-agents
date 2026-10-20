@@ -146,9 +146,137 @@ These steps are for GKE and Cloud DNS. They give the proxy an internal address i
 
    The command prints `200`. The check uses `--insecure` because the pod does not have the CA. The clients in the next step get it.
 
-7. Declare the forge on the install at `ghes.eval.internal`, with the CA in `caBundleRef`, as the "GitHub Enterprise Server" section of `INSTALL.md` tells. This needs a build that includes #3032 (on main); a build without it refuses the host and `caBundleRef`. Until #3104 merges, `install.sh` cannot write this forge, so use the Terraform and Helm steps in that section. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
+7. Declare the forge on the install at `ghes.eval.internal`, with the CA in `caBundleRef`, as the "GitHub Enterprise Server" section of `INSTALL.md` tells. This needs a build that includes #3032; a build without it refuses the host and `caBundleRef`. `install.sh` writes this forge with `--gitops-host` and `--gitops-ca-file`, or use the Terraform and Helm steps in that section. Use `ca.crt` from step 1. The GitHub App is the github.com App that the eval repositories already use, because the data is on github.com. The repository entry is `https://ghes.eval.internal/<owner>/<repo>`.
 
-8. If the cluster enforces NetworkPolicy, make sure that the platform agent pods and the token minter can reach the proxy's address on TCP 443, and that the proxy can reach github.com on TCP 443.
+8. If the cluster enforces NetworkPolicy, make sure that the credential broker and the token minter can reach the proxy, and that the proxy can reach github.com on TCP 443. The proxy runs in the same cluster as its clients, so a policy does not see the address and port that the client dials. On GKE Dataplane V2, traffic to a Service address, a ClusterIP or the internal load balancer of step 4, goes to the proxy pod. The policy sees a pod in the cluster on the container port `8443`, not an outside address on `443`. Thus the shipped minter policy, which allows TCP 443 to any address for a real instance outside the cluster, does not allow the proxy. Add an egress rule for each client whose policy limits egress (the minter's does; the broker's shipped policy limits ingress only):
+
+   ```bash
+   kubectl apply -f - <<'NP'
+   apiVersion: networking.k8s.io/v1
+   kind: NetworkPolicy
+   metadata:
+     name: github-token-minter-to-ghes-proxy
+     namespace: kubeagents-system
+   spec:
+     podSelector:
+       matchLabels:
+         app: github-token-minter
+     policyTypes: [Egress]
+     egress:
+       - to:
+           - namespaceSelector:
+               matchLabels:
+                 kubernetes.io/metadata.name: ghes-proxy
+             podSelector:
+               matchLabels:
+                 app.kubernetes.io/name: ghes-proxy
+         ports:
+           - {protocol: TCP, port: 8443}
+   NP
+   ```
+
+   Use the minter's pod labels on your install (`kubectl -n kubeagents-system get deploy github-token-minter -o jsonpath='{.spec.template.metadata.labels}'`). For a broker policy that limits egress, add the same rule with the broker's pod labels.
+
+## Run it in the cluster with an in-cluster DNS name
+
+These steps give the proxy a DNS name inside one cluster, with no Cloud DNS zone and no load balancer. Use them when the cluster is on a VPC that other people share: a private zone is visible on the whole VPC, and these objects go with the cluster. They are for a GKE cluster that uses kube-dns (with or without NodeLocal DNSCache). A cluster that uses Cloud DNS for GKE does not read the kube-dns ConfigMap; use the Cloud DNS steps above for it.
+
+1. Do steps 1 and 2 of the section above, and step 3 without its last command, which makes the load balancer. Then apply the Service as a ClusterIP Service:
+
+   ```bash
+   envsubst < hack/ghes-proxy/manifests/service.yaml.template \
+     | sed -e '/load-balancer-type/d' -e '/^  annotations:/d' -e 's/type: LoadBalancer/type: ClusterIP/' \
+     | kubectl apply -f -
+   PROXY_IP=$(kubectl -n "$NAMESPACE" get service ghes-proxy -o jsonpath='{.spec.clusterIP}')
+   ```
+
+2. Run a small CoreDNS server that answers the name with that address:
+
+   ```bash
+   kubectl apply -f - <<EOF
+   apiVersion: v1
+   kind: ConfigMap
+   metadata: {name: ghes-dns, namespace: ${NAMESPACE}}
+   data:
+     Corefile: |
+       ${GHES_PUBLIC_HOST}:53 {
+         hosts {
+           ${PROXY_IP} ${GHES_PUBLIC_HOST}
+           fallthrough
+         }
+         errors
+       }
+   ---
+   apiVersion: apps/v1
+   kind: Deployment
+   metadata: {name: ghes-dns, namespace: ${NAMESPACE}}
+   spec:
+     replicas: 1
+     selector: {matchLabels: {app: ghes-dns}}
+     template:
+       metadata: {labels: {app: ghes-dns}}
+       spec:
+         automountServiceAccountToken: false
+         containers:
+           - name: coredns
+             image: registry.k8s.io/coredns/coredns:v1.11.3
+             args: ["-conf", "/etc/coredns/Corefile"]
+             ports:
+               - {name: dns, containerPort: 53, protocol: UDP}
+               - {name: dns-tcp, containerPort: 53, protocol: TCP}
+             resources:
+               requests: {cpu: 20m, memory: 32Mi}
+               limits: {memory: 128Mi}
+             volumeMounts:
+               - {name: cfg, mountPath: /etc/coredns}
+         volumes:
+           - name: cfg
+             configMap: {name: ghes-dns}
+   ---
+   apiVersion: v1
+   kind: Service
+   metadata: {name: ghes-dns, namespace: ${NAMESPACE}}
+   spec:
+     selector: {app: ghes-dns}
+     ports:
+       - {name: dns, port: 53, protocol: UDP, targetPort: 53}
+       - {name: dns-tcp, port: 53, protocol: TCP, targetPort: 53}
+   EOF
+   ```
+
+3. Send the name's zone to that server with a kube-dns stub domain. `stubDomains` is one JSON string, and other zones can already be in it. The commands below read the value, add the entry to it with `jq`, and write the result back, so they keep all the entries that are there. If the cluster has no `kube-dns` ConfigMap in `kube-system`, they make it. They need `jq`.
+
+   ```bash
+   DNS_IP=$(kubectl -n "$NAMESPACE" get service ghes-dns -o jsonpath='{.spec.clusterIP}')
+   if kubectl -n kube-system get configmap kube-dns >/dev/null 2>&1; then
+     CURRENT=$(kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.stubDomains}')
+     echo "stubDomains before: ${CURRENT:-<none>}"
+     if MERGED=$(jq -nc --arg cur "$CURRENT" --arg host "$GHES_PUBLIC_HOST" --arg ip "$DNS_IP" \
+       '($cur | if . == "" then {} else fromjson end) + {($host): [$ip]}'); then
+       kubectl -n kube-system patch configmap kube-dns --type merge \
+         -p "$(jq -nc --arg v "$MERGED" '{data: {stubDomains: $v}}')"
+     fi
+   else
+     kubectl -n kube-system create configmap kube-dns \
+       --from-literal=stubDomains="$(jq -nc --arg host "$GHES_PUBLIC_HOST" --arg ip "$DNS_IP" '{($host): [$ip]}')"
+   fi
+   kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.stubDomains}'; echo
+   ```
+
+   If the value that is there is not valid JSON, `jq` fails and the commands change nothing. The last command prints the new value: it has the entries from before and the `${GHES_PUBLIC_HOST}` entry. kube-dns and NodeLocal DNSCache read the change in about 30 seconds. See [Setting up custom resolvers for kube-dns](https://cloud.google.com/kubernetes-engine/docs/how-to/kube-dns#stub-domains).
+
+4. Check from a pod, with the CA, as `INSTALL.md` tells ("The check" in "GitHub Enterprise Server"):
+
+   ```bash
+   kubectl run ghes-dns-check -n default --rm -i --restart=Never --image=busybox:1.36 -- nslookup ghes.eval.internal
+   kubectl run ghes-https-check -n default --rm -i --restart=Never --image=curlimages/curl:8.10.1 \
+     --command -- sh -c 'cat > /tmp/ca.crt && curl -sS --cacert /tmp/ca.crt -o /dev/null -w "%{http_code}\n" https://ghes.eval.internal/api/v3/meta' \
+     < ~/dev/ghes-proxy-certs/ca.crt
+   ```
+
+   The first command prints the ClusterIP of the proxy, and the second prints `200`.
+
+5. Do steps 7 and 8 of the section above. Step 8 applies here too: the policy sees the proxy pod on `8443`.
 
 ## Grade a run through the proxy
 
@@ -156,9 +284,30 @@ The bench reads the data from api.github.com, where it is. Set `BENCH_FORGE=gith
 
 ## Clean up
 
+For the Cloud DNS steps:
+
 ```bash
 gcloud dns record-sets delete ghes.eval.internal. --zone=ghes-proxy --type=A
 gcloud dns managed-zones delete ghes-proxy
 kubectl delete namespace ghes-proxy
+kubectl -n kubeagents-system delete networkpolicy github-token-minter-to-ghes-proxy
 rm -rf ~/dev/ghes-proxy-certs
 ```
+
+For the in-cluster DNS steps, delete the namespace, the NetworkPolicy and the certificates as above. Then remove the `ghes.eval.internal` entry from `stubDomains` in the `kube-dns` ConfigMap in `kube-system`, and keep the other entries. If it was the only entry, remove the `stubDomains` key:
+
+```bash
+CURRENT=$(kubectl -n kube-system get configmap kube-dns -o jsonpath='{.data.stubDomains}')
+if REST=$(jq -nc --arg cur "$CURRENT" --arg host ghes.eval.internal \
+  '($cur | if . == "" then {} else fromjson end) | del(.[$host])'); then
+  if [ "$REST" != "{}" ]; then
+    kubectl -n kube-system patch configmap kube-dns --type merge \
+      -p "$(jq -nc --arg v "$REST" '{data: {stubDomains: $v}}')"
+  elif [ -n "$CURRENT" ]; then
+    kubectl -n kube-system patch configmap kube-dns --type json \
+      -p '[{"op": "remove", "path": "/data/stubDomains"}]'
+  fi
+fi
+```
+
+If step 3 made the `kube-dns` ConfigMap, and it now has no other data, you can delete it.

@@ -49,9 +49,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: capacity
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 verification_spec:
   - name: the-calendar-mode-probe-actually-ran
     role: objective
