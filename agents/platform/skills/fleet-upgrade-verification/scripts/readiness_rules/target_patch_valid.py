@@ -5,11 +5,15 @@ withdrawn between the plan and the window; the withdrawn patch stays selectable,
 pool upgrade to it fails on an image the provider no longer serves. The rule reads the
 location's server config (the report's `server_config` read, `gcloud container
 get-server-config`, once per location) and grades two things against the cluster's own
-channel's `validVersions`: the report's target version for the member, a blocker when it is
-in neither that list nor `validNodeVersions` (a target given as `MAJOR.MINOR.PATCH` with no
-`-gke.` build, which the API reads as that patch's newest listed build, is in a list when the
-list carries a build of it; a full version is matched exactly); and the running control-plane
-version, a risk when the channel's list has moved past it. A cluster on no channel is graded against
+channel's `validVersions`: the report's target version for the member, a blocker when the
+channel's list does not carry it and the control plane has to move to it (the target is above
+the running control-plane version), or when neither that list nor `validNodeVersions` carries it
+and only pools move (the control plane is at or above it; the node list serves a pool move
+alone, and a cluster on a channel takes a control-plane version only from its channel's list); a
+target given as `MAJOR.MINOR.PATCH` with no `-gke.` build, which the API reads as that patch's
+newest listed build, is in a list when the list carries a build of it, and a full version is
+matched exactly; and the running control-plane version, a risk when the channel's list has
+moved past it. A cluster on no channel is graded against
 `validMasterVersions`, the list a static-version cluster takes versions from. The action
 names the newest active patch of the version's minor on the channel.
 
@@ -55,6 +59,12 @@ VERSION_PARTS = 4
 MINOR_PARTS = 2
 KIND_TARGET = "target"
 KIND_CONTROL_PLANE = "control-plane"
+# Which move the target asks of the member: the control plane's (it is above the running
+# control-plane version, so the channel's own list has to carry it) or the pools' alone.
+MOVE_CONTROL_PLANE = "control-plane move"
+MOVE_POOLS = "pool move"
+MOVE_NONE = "none"
+NODE_LIST_CLAUSE = " (validNodeVersions lists it, which serves a pool move alone)"
 # The action names an active version to move to: the newest patch of the version's own minor at
 # or above it (a channel can still list an older patch of the minor it has moved past, which is
 # no target), else the lowest active version above it, else nothing the channel lists.
@@ -66,11 +76,15 @@ TARGET_FINDING_FORMAT = (
     "target {version} is in neither the {channel} channel's validVersions nor validNodeVersions at {location}: "
     "a withdrawn patch stays selectable and a node pool upgrade to it fails on an image the provider no longer serves; {action}"
 )
+TARGET_CONTROL_PLANE_FINDING_FORMAT = (
+    "target {version} is not in the {channel} channel's validVersions at {location}, which the control plane's move to it needs{node_clause}: "
+    "the channel refuses the move, and a withdrawn patch stays selectable; {action}"
+)
 CONTROL_PLANE_FINDING_FORMAT = (
     "control plane {version} is not among the {channel} channel's validVersions at {location} "
     "(the channel has moved past it, whatever another channel still lists); {action}"
 )
-NOTE_FORMAT = "channel {channel}; target {target} {target_verdict}; control plane {master} {master_verdict} in validVersions at {location}"
+NOTE_FORMAT = "channel {channel}; target {target} {target_verdict}; control plane {master} {master_verdict} in validVersions at {location}; the target's move: {move}"
 TARGET_VALID = "valid"
 TARGET_WITHDRAWN = "withdrawn"
 TARGET_NONE = "none"
@@ -101,6 +115,21 @@ def version_listed(text, roster) -> bool:
         return False
     prefix = text + BUILD_SEPARATOR
     return any(isinstance(candidate, str) and candidate.startswith(prefix) for candidate in roster)
+
+
+def control_plane_moves(target_text, master_text, roster) -> bool:
+    """Whether the control plane has to move to the target: the target is above the running
+    control-plane version (a build-less target counts as the newest build of its patch the channel
+    lists, else build 0); a target or control plane that does not parse counts as a move."""
+    target = parse_version(target_text)
+    master = parse_version(master_text)
+    if target is None or master is None:
+        return True
+    if isinstance(target_text, str) and BUILD_SEPARATOR not in target_text:
+        builds = [parse_version(version) for version in roster if isinstance(version, str) and version.startswith(target_text + BUILD_SEPARATOR)]
+        builds = [build for build in builds if build is not None]
+        target = max(builds) if builds else target
+    return target > master
 
 
 def channel_roster(server_config: dict, channel: str) -> tuple[list[str] | None, str]:
@@ -167,13 +196,17 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     target_text = context.get(CONTEXT_TARGET_TEXT)
     master_text = cluster.get(CURRENT_MASTER_VERSION_KEY)
     target_verdict = TARGET_NONE
+    move = MOVE_NONE
     if target_text:
-        if version_listed(target_text, roster) or version_listed(target_text, node_versions):
+        moves_control_plane = control_plane_moves(target_text, master_text, roster)
+        move = MOVE_CONTROL_PLANE if moves_control_plane else MOVE_POOLS
+        in_node_list = version_listed(target_text, node_versions)
+        if version_listed(target_text, roster) or (in_node_list and not moves_control_plane):
             target_verdict = TARGET_VALID
         else:
             target_verdict = TARGET_WITHDRAWN
             newest, next_version = active_versions_above(target_text, roster)
-            out["blocking"].append({"kind": KIND_TARGET, "version": target_text, "channel": channel_label, "location": location, "newest": newest, "next_version": next_version})
+            out["blocking"].append({"kind": KIND_TARGET, "version": target_text, "channel": channel_label, "location": location, "newest": newest, "next_version": next_version, "move": move, "in_node_list": in_node_list})
     master_verdict = MASTER_NONE
     if master_text:
         if master_text in roster:
@@ -182,11 +215,13 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
             master_verdict = MASTER_NOT_LISTED
             newest, next_version = active_versions_above(master_text, roster)
             out["risks"].append({"kind": KIND_CONTROL_PLANE, "version": master_text, "channel": channel_label, "location": location, "newest": newest, "next_version": next_version})
-    out["notes"].append(NOTE_FORMAT.format(channel=channel_label, target=target_text or TARGET_NONE, target_verdict=target_verdict, master=master_text or MASTER_NONE, master_verdict=master_verdict, location=location))
+    out["notes"].append(NOTE_FORMAT.format(channel=channel_label, target=target_text or TARGET_NONE, target_verdict=target_verdict, master=master_text or MASTER_NONE, master_verdict=master_verdict, location=location, move=move))
     return out
 
 
 def describe(finding: dict) -> str:
     action = action_text(finding)
+    if finding.get("kind") == KIND_TARGET and finding.get("move") == MOVE_CONTROL_PLANE:
+        return TARGET_CONTROL_PLANE_FINDING_FORMAT.format(version=finding["version"], channel=finding["channel"], location=finding["location"], node_clause=NODE_LIST_CLAUSE if finding.get("in_node_list") else "", action=action)
     template = TARGET_FINDING_FORMAT if finding.get("kind") == KIND_TARGET else CONTROL_PLANE_FINDING_FORMAT
     return template.format(version=finding["version"], channel=finding["channel"], location=finding["location"], action=action)

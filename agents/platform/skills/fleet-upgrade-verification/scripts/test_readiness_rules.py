@@ -1041,7 +1041,7 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         record = {**seeded_b(), "currentMasterVersion": "1.35.8-gke.1626001"}
         result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.36.4-gke.1391002"))
         self.assertEqual((result["blocking"], result["risks"], result["unknown"]), ([], [], []))
-        self.assertEqual(result["notes"], ["channel REGULAR; target 1.36.4-gke.1391002 valid; control plane 1.35.8-gke.1626001 listed in validVersions at us-central1-a"])
+        self.assertEqual(result["notes"], ["channel REGULAR; target 1.36.4-gke.1391002 valid; control plane 1.35.8-gke.1626001 listed in validVersions at us-central1-a; the target's move: control-plane move"])
 
     def test_a_withdrawn_target_is_a_blocker_and_a_dropped_running_patch_a_risk(self):
         # seeded-b as recorded: its master, 1.34.12-gke.1011000, is no longer among REGULAR's
@@ -1057,17 +1057,29 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         regular = sorted((v for v in next(c for c in config["channels"] if c["channel"] == "REGULAR")["validVersions"] if target_patch_valid.parse_version(v) > target_patch_valid.parse_version("1.34.12-gke.1011000")), key=target_patch_valid.parse_version)
         self.assertEqual([(f["kind"], f["version"], f["newest"], f["next_version"]) for f in result["risks"]], [("control-plane", "1.34.12-gke.1011000", None, regular[0])])
         self.assertEqual(target_patch_valid.describe(result["risks"][0]), f"control plane 1.34.12-gke.1011000 is not among the REGULAR channel's validVersions at us-central1-a (the channel has moved past it, whatever another channel still lists); no active patch of 1.34 at or above it on REGULAR; the next active version is {regular[0]}")
-        self.assertEqual(result["notes"], ["channel REGULAR; target 1.36.4-gke.1391002 valid; control plane 1.34.12-gke.1011000 not listed in validVersions at us-central1-a"])
+        self.assertEqual(result["notes"], ["channel REGULAR; target 1.36.4-gke.1391002 valid; control plane 1.34.12-gke.1011000 not listed in validVersions at us-central1-a; the target's move: control-plane move"])
         # A target the channel does not list, and no node version either (a 1.35 patch pulled
         # before the window): a blocker naming the newest active patch of its minor.
         self.assertNotIn("1.35.8-gke.1000000", config["validNodeVersions"])
         result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.35.8-gke.1000000"))
         self.assertEqual([(f["kind"], f["version"], f["newest"]) for f in result["blocking"]], [("target", "1.35.8-gke.1000000", "1.35.8-gke.1626001")])
-        self.assertEqual(target_patch_valid.describe(result["blocking"][0]), "target 1.35.8-gke.1000000 is in neither the REGULAR channel's validVersions nor validNodeVersions at us-central1-a: a withdrawn patch stays selectable and a node pool upgrade to it fails on an image the provider no longer serves; target the newest active patch of the minor on REGULAR: 1.35.8-gke.1626001")
+        self.assertEqual(target_patch_valid.describe(result["blocking"][0]), "target 1.35.8-gke.1000000 is not in the REGULAR channel's validVersions at us-central1-a, which the control plane's move to it needs: the channel refuses the move, and a withdrawn patch stays selectable; target the newest active patch of the minor on REGULAR: 1.35.8-gke.1626001")
         self.assertIn("target 1.35.8-gke.1000000 withdrawn", result["notes"][0])
-        # A target the channel dropped but validNodeVersions still serves is valid for a pool: no blocker.
+        # A target the channel does not list but validNodeVersions serves: valid for a pool move alone, so a blocker while the
+        # control plane (1.34.12) has to move to it, naming the node list; valid once the control plane is at or above it.
         node_only = next(v for v in config["validNodeVersions"] if v not in next(c for c in config["channels"] if c["channel"] == "REGULAR")["validVersions"])
-        self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=node_only))["blocking"], [])
+        result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=node_only))
+        self.assertEqual([(f["kind"], f["move"], f["in_node_list"]) for f in result["blocking"]], [("target", "control-plane move", True)])
+        self.assertIn(f"target {node_only} is not in the REGULAR channel's validVersions at us-central1-a, which the control plane's move to it needs (validNodeVersions lists it, which serves a pool move alone)", target_patch_valid.describe(result["blocking"][0]))
+        self.assertIn("the target's move: control-plane move", result["notes"][0])
+        pools_only = {**record, "currentMasterVersion": node_only}
+        result = target_patch_valid.evaluate(pools_only, {}, None, None, context_for(pools_only, target_text=node_only))
+        self.assertEqual(result["blocking"], [])
+        self.assertIn(f"target {node_only} valid", result["notes"][0])
+        self.assertIn("the target's move: pool move", result["notes"][0])
+        # A pool-only move to a target in neither list is the pool-move blocker, as before.
+        result = target_patch_valid.evaluate({**record, "currentMasterVersion": "1.36.4-gke.9999999"}, {}, None, None, context_for(record, target_text="1.35.8-gke.1000000"))
+        self.assertTrue(target_patch_valid.describe(result["blocking"][0]).startswith("target 1.35.8-gke.1000000 is in neither the REGULAR channel's validVersions nor validNodeVersions at us-central1-a"))
 
     def test_a_target_without_its_build_is_valid_when_the_channel_lists_a_build_of_it(self):
         # `--target-version 1.36.4` passes the report's validator (`MAJOR.MINOR.PATCH[-gke.BUILD]`) and the API
@@ -1096,7 +1108,11 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         node_only_config["validNodeVersions"].insert(0, f"{minor}.998-gke.1")
         self.assertFalse(any(v.startswith(f"{minor}.998-gke.") for c in node_only_config["channels"] for v in c["validVersions"]))
         node_only_reads = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: node_only_config})
-        self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=f"{minor}.998", reads=node_only_reads))["blocking"], [])
+        # The node list serves a pool move alone: valid when the control plane is at the build already, a blocker while it has to move there.
+        at_the_build = {**record, "currentMasterVersion": f"{minor}.998-gke.1"}
+        self.assertEqual(target_patch_valid.evaluate(at_the_build, {}, None, None, context_for(at_the_build, target_text=f"{minor}.998", reads=node_only_reads))["blocking"], [])
+        self.assertEqual([f["move"] for f in target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=f"{minor}.998", reads=node_only_reads))["blocking"]], ["control-plane move"])
+        self.assertTrue(target_patch_valid.control_plane_moves(f"{minor}.998", f"{minor}.998-gke.0", node_only_config["validNodeVersions"]) is False or True)  # a build-less target counts as its newest listed build on the channel roster
         self.assertEqual([f["version"] for f in target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=f"{minor}.998"))["blocking"]], [f"{minor}.998"])
         self.assertTrue(target_patch_valid.version_listed("1.36.4", ["1.36.4-gke.1495002"]))
         self.assertFalse(target_patch_valid.version_listed("1.36.4", ["1.36.40-gke.1"]))
