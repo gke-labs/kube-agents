@@ -87,10 +87,12 @@ def _unknown(obj: dict, detail: str, **extra) -> dict:
     return finding
 
 
-def node_local_volumes(obj: dict, spec: dict, workload: dict, local_classes: set[str], claims: dict) -> tuple[list[str], list[str], list[str]]:
-    """(risks, scratch, claim names) for one template: the volumes that hold state on the
-    node, the ones that hold scratch, and the claims mounted (for the unread-storage case)."""
-    risks, scratch, claim_names = [], [], []
+def node_local_volumes(obj: dict, spec: dict, workload: dict, local_classes: set[str], claims: dict) -> tuple[list[str], list[str], list[str], list[str]]:
+    """(risks, scratch, claim names, claim template names) for one template: the volumes that
+    hold state on the node, the ones that hold scratch, the claims mounted (whose class the PVC
+    and StorageClass reads resolve) and the claim templates (whose class the template names, so
+    the StorageClass read alone resolves it)."""
+    risks, scratch, claim_names, template_names = [], [], [], []
     mounted, writable = _mounts(spec)
     for volume in spec.get("volumes") or []:
         if not isinstance(volume, dict):
@@ -125,10 +127,10 @@ def node_local_volumes(obj: dict, spec: dict, workload: dict, local_classes: set
             continue
         storage_class = (template.get("spec") or {}).get("storageClassName")
         template_name = (template.get("metadata") or {}).get("name", "")
-        claim_names.append(template_name)
+        template_names.append(template_name)
         if storage_class in local_classes:
             risks.append(CLAIM_TEMPLATE_TEXT.format(name=template_name, storage_class=storage_class))
-    return risks, scratch, claim_names
+    return risks, scratch, claim_names, template_names
 
 
 def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
@@ -138,21 +140,25 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
         result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, WORKLOADS_NOT_READ.format(reason=workloads_error)))
         return result
     items = rules.read_items(read)
-    unread = rules.unread_kinds(read, (STORAGE_CLASS_READ_KIND, CLAIM_READ_KIND))
+    storage_error = rules.read_error(read, STORAGE_CLASS_READ_KIND)
+    claim_error = rules.read_error(read, CLAIM_READ_KIND)
     local_classes = _local_storage_classes(items)
     claims = _claims(items)
     for obj, spec, workload in rules.templates(items, KINDS):
-        risks, scratch, claim_names = node_local_volumes(obj, spec, workload, local_classes, claims)
+        risks, scratch, claim_names, template_names = node_local_volumes(obj, spec, workload, local_classes, claims)
         if risks:
             statefulset = STATEFULSET_TEXT if obj["kind"] == rules.KIND_STATEFULSET else ""
             detail = DETAIL.format(volumes=rules.LIST_SEPARATOR.join(risks), statefulset=statefulset)
             result["risks"].append(rules.new_finding(RULE_ID, ENTRY, rules.GRADE_RISK, obj, detail, volumes=risks))
         if scratch:
             result["notes"].append(NOTE_SCRATCH.format(kind=obj["kind"], object=obj["object"], volumes=rules.LIST_SEPARATOR.join(scratch)))
-        if unread and claim_names:
-            kind, reason = next(iter(unread.items()))
-            detail = STORAGE_UNREAD_DETAIL.format(claims=rules.LIST_SEPARATOR.join(claim_names), kind=kind, reason=reason)
-            result["unknown"].append(_unknown(obj, detail, claims=claim_names))
+        # A mounted claim's class needs the PVC read and the StorageClass read; a claim template
+        # names its class, so only the StorageClass read decides whether it is local.
+        unresolved = (claim_names if (claim_error or storage_error) else []) + (template_names if storage_error else [])
+        if unresolved:
+            kind, reason = (STORAGE_CLASS_READ_KIND, storage_error) if storage_error else (CLAIM_READ_KIND, claim_error)
+            detail = STORAGE_UNREAD_DETAIL.format(claims=rules.LIST_SEPARATOR.join(unresolved), kind=kind, reason=reason)
+            result["unknown"].append(_unknown(obj, detail, claims=unresolved))
     return result
 
 

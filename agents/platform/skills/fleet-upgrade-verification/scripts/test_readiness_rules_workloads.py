@@ -171,6 +171,16 @@ class NodeLocalStateTest(unittest.TestCase):
         # A refused claim read costs the same question; a refused DaemonSet read costs this rule nothing.
         out = run(node_local_state, items, read_errors={"pvc": "pvcs is forbidden"})
         self.assertIn("the pvc read failed", out["unknown"][0]["detail"])
+        # A claim template names its class: with the StorageClass read in, a refused PVC read
+        # leaves it graded (a risk on a local class) and files no unknown; a refused StorageClass
+        # read is the unknown, with no risk beside it.
+        local = {"kind": "StorageClass", "metadata": {"name": "local-scsi"}, "provisioner": "kubernetes.io/no-provisioner"}
+        db = template("StatefulSet", "db", {"containers": [busybox()]}, workload_spec={"volumeClaimTemplates": [{"metadata": {"name": "data"}, "spec": {"storageClassName": "local-scsi"}}]})
+        out = run(node_local_state, [local, db], read_errors={"pvc": "pvcs is forbidden"})
+        self.assertEqual(([f["name"] for f in out["risks"]], out["unknown"]), (["db"], []))
+        out = run(node_local_state, [db], read_errors={"storageclass": "storageclasses is forbidden", "pv": "storageclasses is forbidden"})
+        self.assertEqual(out["risks"], [])
+        self.assertEqual([u["detail"] for u in out["unknown"]], ["mounts claim(s) data; the storageclass read failed (storageclasses is forbidden), so whether a claim is on a local class is unknown"])
         self.assertEqual(run(node_local_state, items, read_errors=WORKLOADS_UNREAD)["unknown"], [])
 
     def test_no_workload_read_is_one_unknown_not_a_clean_record(self):
