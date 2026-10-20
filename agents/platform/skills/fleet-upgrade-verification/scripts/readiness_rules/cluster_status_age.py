@@ -10,15 +10,18 @@ is RUNNING, and its age is from its start time. A cluster not `RUNNING` is a blo
 holder is older than STALE_AFTER_SECONDS, naming the operation, its type and pool, its start
 and its age; a younger holder is a note, a reconcile in progress, which is also why the
 report's own "upgrade in flight" treatment of `RECONCILING` stands for the version findings.
-A cluster not `RUNNING` with no RUNNING operation on it or its pools is first described again
-(`gcloud container clusters describe`, the rule's one read of its own, through the report's
-runner): the clusters list is made before any member is graded and the operations list at the
-project's first member, so an operation that ended in between leaves a list status the cluster
-no longer has. `RUNNING` now is a note; a describe that fails is `unknown`; a status still not
-`RUNNING` is held by something the operations list does not show (a `DEGRADED` cluster needs
-user action, an `ERROR` one is unusable, and the API puts the cause in `statusMessage`): a
-blocker quoting the cluster's `statusMessage` as described, with the newest operation of any
-status as context and never as the holder.
+A cluster not `RUNNING` with no RUNNING operation in the project's list is read again, through
+the report's runner (the rule's two reads of its own): the clusters list is made before any
+member is graded and the operations list at the project's first member, so an operation that
+ended in between leaves a list status the cluster no longer has, and one that started in between
+is in no list the rule saw. First `gcloud container clusters describe`: `RUNNING` now is a note,
+a failed describe is `unknown`. Then, for a status still not `RUNNING`, `gcloud container
+operations list` for this cluster alone: a RUNNING operation younger than the threshold is the
+note, an older one the blocker naming it, a failed list `unknown`, and none at all is a status
+held by something no operation shows (a `DEGRADED` cluster needs user action, an `ERROR` one is
+unusable, and the API puts the cause in `statusMessage`): a blocker quoting the cluster's
+`statusMessage` as described, with the newest operation of any status as context and never as
+the holder.
 A `RUNNING` cluster is a note naming its newest operation and that operation's status. The
 action is the gke-upgrades skill's Stuck operation procedure: freeze changes; past a few
 hours, open a support case quoting the operation id, or the status and its message when no
@@ -81,6 +84,13 @@ NO_RUNNER = "the context carries no command runner"
 DESCRIBE_EXIT_FORMAT = "exit {rc}"
 DESCRIBE_NO_STATUS = "the response carries no status"
 DESCRIBE_FAILED_REASON = "status {status} at list time with no RUNNING operation on it or its node pools; `gcloud container clusters describe` could not confirm it ({error}), so whether it still stands is unknown"
+# The rule's second read: this cluster's operations now, for a status the describe confirmed.
+RELIST_COMMAND = ("container", "operations", "list")
+RELIST_PROJECT_FLAG_FORMAT = "--project={project}"
+RELIST_LOCATION_FLAG_FORMAT = "--location={location}"
+RELIST_FILTER_FLAG_FORMAT = "--filter=targetLink~/clusters/{name}($|/nodePools/)"
+RELIST_FORMAT_FLAG = "--format=json(name,operationType,status,startTime,endTime,targetLink)"
+RELIST_FAILED_REASON = "status {status} now with no RUNNING operation in the project's list; `gcloud container operations list` for the cluster could not say what holds it ({error}), so that is unknown"
 SETTLED_RUNNING_NOTE_FORMAT = "status RUNNING now ({listed} at list time; newest operation {newest})"
 TYPE_ON_POOL_FORMAT = "{type} on {pool}"
 ACTION = "freeze changes; past a few hours open a support case quoting the operation id: see the gke-upgrades skill's Stuck operation section"
@@ -157,6 +167,26 @@ def describe_status(context, name: str, location: str) -> tuple[str | None, str 
     return str(record.get(STATUS_KEY)), str(record.get(STATUS_MESSAGE_KEY) or "") or None, None
 
 
+def list_operations(context, name: str, location: str) -> tuple[list | None, str | None]:
+    """(this cluster's operations as `gcloud container operations list` returns them now, None)
+    through the context's runner, or (None, why) when it could not say."""
+    run = context.get(CONTEXT_RUN_CMD)
+    if run is None:
+        return None, NO_RUNNER
+    cmd = [GCLOUD, *RELIST_COMMAND, RELIST_PROJECT_FLAG_FORMAT.format(project=context.get(CONTEXT_PROJECT) or ""), RELIST_LOCATION_FLAG_FORMAT.format(location=location), RELIST_FILTER_FLAG_FORMAT.format(name=name), RELIST_FORMAT_FLAG]
+    timeout = context.get(CONTEXT_TIMEOUT_SECONDS)
+    rc, stdout, stderr = run(cmd, timeout) if timeout else run(cmd)
+    if rc != 0:
+        return None, one_line(stderr or DESCRIBE_EXIT_FORMAT.format(rc=rc), ERROR_EXCERPT_CHARS)
+    try:
+        operations = json.loads(stdout) if stdout.strip() else []
+    except ValueError as e:
+        return None, one_line(str(e), ERROR_EXCERPT_CHARS)
+    if not isinstance(operations, list):
+        return None, OPERATIONS_NOT_A_LIST.format(type=type(operations).__name__)
+    return operations, None
+
+
 def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     out = new_result()
     name = str(cluster.get(CLUSTER_NAME_KEY) or context.get(CONTEXT_CLUSTER_NAME) or "")
@@ -176,15 +206,15 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     if running:
         out["notes"].append(RUNNING_NOTE_FORMAT.format(newest=_newest_text(newest)) if newest else RUNNING_NO_OPERATION_NOTE)
         return out
-    in_flight = [(operation, pool) for operation, pool in mine if operation.get(OPERATION_STATUS_KEY) == OPERATION_STATUS_RUNNING]
-    holder, holder_pool, holder_started = newest_operation(in_flight)
-    if in_flight and holder is None:
-        operation = in_flight[0][0]
-        out["unknown"].append(START_UNPARSABLE_REASON.format(status=status, operation=operation.get(OPERATION_NAME_KEY), started=operation.get(OPERATION_START_KEY)))
+    holder, holder_pool, holder_started, unparsable = _running_holder(mine)
+    if unparsable is not None:
+        out["unknown"].append(START_UNPARSABLE_REASON.format(status=status, operation=unparsable.get(OPERATION_NAME_KEY), started=unparsable.get(OPERATION_START_KEY)))
         return out
     message = str(cluster.get(STATUS_MESSAGE_KEY) or "") or None
+    listed_status = status
     if holder is None:
-        # Nothing RUNNING holds it: the list status may be older than the operation that ended since. Ask once.
+        # Nothing RUNNING in the project's list: the list status may be older than the operation that
+        # ended since. Describe the cluster once.
         fresh_status, fresh_message, error = describe_status(context, name, location)
         if error is not None:
             out["unknown"].append(DESCRIBE_FAILED_REASON.format(status=status, error=error))
@@ -192,15 +222,39 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         if fresh_status == STATUS_RUNNING:
             out["notes"].append(SETTLED_RUNNING_NOTE_FORMAT.format(listed=status, newest=_newest_text(newest)))
             return out
-        out["blocking"].append({"cluster": name, "status": fresh_status, "listed_status": status, "status_message": fresh_message or message, "operation": None, "operation_type": None, "pool": None, "started": None, "age_seconds": None, "newest": newest, "threshold_seconds": STALE_AFTER_SECONDS, "action": NO_HOLDER_ACTION})
-        return out
+        # Still not RUNNING: the project's list may predate the operation holding it now. List this
+        # cluster's operations once, and grade from that list.
+        status, message = fresh_status, fresh_message or message
+        listed_now, list_error = list_operations(context, name, location)
+        if list_error is not None:
+            out["unknown"].append(RELIST_FAILED_REASON.format(status=status, error=list_error))
+            return out
+        mine = cluster_operations(listed_now, name, location)
+        newest = _newest_fields(*newest_operation(mine), at) or newest
+        holder, holder_pool, holder_started, unparsable = _running_holder(mine)
+        if unparsable is not None:
+            out["unknown"].append(START_UNPARSABLE_REASON.format(status=status, operation=unparsable.get(OPERATION_NAME_KEY), started=unparsable.get(OPERATION_START_KEY)))
+            return out
+        if holder is None:
+            out["blocking"].append({"cluster": name, "status": status, "listed_status": listed_status, "status_message": message, "operation": None, "operation_type": None, "pool": None, "started": None, "age_seconds": None, "newest": newest, "threshold_seconds": STALE_AFTER_SECONDS, "action": NO_HOLDER_ACTION})
+            return out
     age = age_seconds(at, holder_started)
     fields = {"operation": holder.get(OPERATION_NAME_KEY), "type": _type_text(holder, holder_pool), "started": holder.get(OPERATION_START_KEY), "age": format_duration(age), "threshold": format_duration(STALE_AFTER_SECONDS), "status": status}
     if age <= STALE_AFTER_SECONDS:
         out["notes"].append(UNDER_THRESHOLD_NOTE_FORMAT.format(**fields))
     else:
-        out["blocking"].append({"cluster": name, "status": status, "status_message": message, "operation": fields["operation"], "operation_type": fields["type"], "pool": holder_pool, "started": fields["started"], "age_seconds": age, "newest": None, "threshold_seconds": STALE_AFTER_SECONDS, "action": ACTION})
+        out["blocking"].append({"cluster": name, "status": status, "listed_status": listed_status, "status_message": message, "operation": fields["operation"], "operation_type": fields["type"], "pool": holder_pool, "started": fields["started"], "age_seconds": age, "newest": None, "threshold_seconds": STALE_AFTER_SECONDS, "action": ACTION})
     return out
+
+
+def _running_holder(operations: list[tuple[dict, str | None]]):
+    """(holder, pool, started, None) for the newest RUNNING operation among `operations`, or
+    (None, None, None, operation) when one is RUNNING with no readable startTime."""
+    in_flight = [(operation, pool) for operation, pool in operations if operation.get(OPERATION_STATUS_KEY) == OPERATION_STATUS_RUNNING]
+    holder, pool, started = newest_operation(in_flight)
+    if in_flight and holder is None:
+        return None, None, None, in_flight[0][0]
+    return holder, pool, started, None
 
 
 def describe(finding: dict) -> str:

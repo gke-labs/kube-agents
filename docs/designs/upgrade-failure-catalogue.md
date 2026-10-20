@@ -452,9 +452,10 @@ back the automatic one, while a manual upgrade still runs, and one that ends ins
   report's `cluster-status-age` rule (`readiness_rules/cluster_status_age.py`) reads the after-signal
   before the window: a cluster whose `status` is not `RUNNING` is a blocker when an operation on it
   or on one of its node pools has been `RUNNING` for more than four hours, naming that operation,
-  its type and pool, start and age, and, when no operation is `RUNNING`, after one
-  `clusters describe` confirms the status still stands, quoting the cluster's `statusMessage`
-  (`RUNNING` now is a note); a younger operation is noted.
+  its type and pool, start and age, and, when the project's list shows nothing `RUNNING`, after a
+  `clusters describe` confirms the status and an `operations list` for the cluster finds no holder,
+  quoting the cluster's `statusMessage` (`RUNNING` now, or a younger holder in the fresh list, is a
+  note); a younger operation is noted.
 - GKE recommender: `CLUSTER_MAINTENANCE_WINDOW_AND_EXCLUSIONS` recommends configuring a window and `CLUSTER_RELEASE_CHANNEL_UNSPECIFIED` a channel; neither checks a window's length against the pool.
 - Why it is on the list: a common support case; no single public story verified.
 

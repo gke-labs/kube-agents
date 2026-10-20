@@ -52,8 +52,9 @@ A cluster whose `status` is not `RUNNING` (`RECONCILING`, `DEGRADED`, `ERROR`) a
 or node pool change, and only the provider can end an operation that has wedged inside it. The
 fleet-upgrade-verification report's `cluster-status-age` rule files such a cluster as a blocker
 once an operation on it or on one of its node pools has been `RUNNING` for more than four hours,
-naming that operation, and at once when no operation is `RUNNING` on it at all, quoting the
-cluster's `statusMessage`. What to do with it, in order:
+naming that operation; when the project's operations list shows nothing `RUNNING`, it describes
+the cluster and re-lists its operations first, and blocks at once only when the status still
+stands with nothing running, quoting the cluster's `statusMessage`. What to do with it, in order:
 
 1. **Read the operation, not only the status.** List the newest operations on the cluster and
    on its node pools (a node pool upgrade, resize or repair names the pool and holds the cluster as

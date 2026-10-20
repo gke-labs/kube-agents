@@ -2473,6 +2473,8 @@ class ReadinessTest(unittest.TestCase):
         a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
         self.assertEqual(a["status"], "blocked")
         self.assertEqual([(f["rule"], f["status"], f["listed_status"], f["status_message"]) for f in a["rule_blocking"]], [("cluster-status-age", "DEGRADED", "RECONCILING", "Node pool default-pool needs repair")])
+        # The status confirmed, the rule re-listed this cluster's operations through the report's runner before it blocked.
+        self.assertIn(["gcloud", "container", "operations", "list", "--project=p1", "--location=us-central1-a", "--filter=targetLink~/clusters/seeded-a($|/nodePools/)", "--format=json(name,operationType,status,startTime,endTime,targetLink)"], fake.calls)
         fake = FakeReadinessCommands(self.clusters, {}, self.objects, described_status_by_cluster={"seeded-a": None})
         rc, text, data = self._run(fake)
         a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]

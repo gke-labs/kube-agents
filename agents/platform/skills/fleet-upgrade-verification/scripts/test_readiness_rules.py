@@ -918,12 +918,19 @@ class ClusterStatusAgeRuleTest(unittest.TestCase):
 
     DESCRIBE_COMMAND = ["gcloud", "container", "clusters", "describe", "seeded-b", "--location", "us-central1-a", "--project", DEV_PROJECT, "--format=json(status,statusMessage)"]
 
-    def describing(self, context, status, message=None, rc=0, stdout=None):
-        """A runner that answers the rule's `clusters describe` with `status` (and records the calls)."""
+    RELIST_COMMAND = ["gcloud", "container", "operations", "list", f"--project={DEV_PROJECT}", "--location=us-central1-a", "--filter=targetLink~/clusters/seeded-b($|/nodePools/)", "--format=json(name,operationType,status,startTime,endTime,targetLink)"]
+
+    def describing(self, context, status, message=None, rc=0, stdout=None, operations=None, list_rc=0):
+        """A runner that answers the rule's `clusters describe` with `status` and its `operations list`
+        for the cluster with `operations` (the project's recorded list by default), recording the calls."""
         calls = []
 
         def run(cmd, timeout=None, env=None):
             calls.append(cmd)
+            if cmd[:4] == ["gcloud", "container", "operations", "list"]:
+                if list_rc:
+                    return list_rc, "", "ERROR: (gcloud.container.operations.list) forbidden"
+                return 0, json.dumps(recorded("project_operations.json") if operations is None else operations), ""
             if rc:
                 return rc, "", "ERROR: (gcloud.container.clusters.describe) forbidden"
             return 0, json.dumps({"status": status, **({"statusMessage": message} if message else {})}) if stdout is None else stdout, ""
@@ -965,7 +972,7 @@ class ClusterStatusAgeRuleTest(unittest.TestCase):
         # Another cluster's pool operation is not this cluster's holder: with nothing of its own RUNNING, the describe decides.
         other = self.reads_with(self.in_flight(timedelta(hours=5), target=self.POOL_TARGET.replace("clusters/seeded-b/", "clusters/seeded-a/")))
         context = context_for(record, reads=other)
-        self.describing(context, "RECONCILING")
+        self.describing(context, "RECONCILING", operations=[])
         self.assertIsNone(cluster_status_age.evaluate(record, {}, None, None, context)["blocking"][0]["operation"])
 
     def test_a_degraded_cluster_with_only_done_operations_blocks_quoting_its_status_message(self):
@@ -974,7 +981,7 @@ class ClusterStatusAgeRuleTest(unittest.TestCase):
         context = context_for(record)
         calls = self.describing(context, "DEGRADED", "Cluster certificate authority expired; rotate credentials")
         result = cluster_status_age.evaluate(record, {}, None, None, context)
-        self.assertEqual(calls, [self.DESCRIBE_COMMAND])
+        self.assertEqual(calls, [self.DESCRIBE_COMMAND, self.RELIST_COMMAND])  # the status confirmed, then this cluster's operations now
         self.assertEqual(len(result["blocking"]), 1)
         finding = result["blocking"][0]
         self.assertEqual((finding["operation"], finding["status"], finding["listed_status"], finding["status_message"], finding["newest"]["operation"], finding["newest"]["status"]), (None, "DEGRADED", "DEGRADED", "Cluster certificate authority expired; rotate credentials", self.NEWEST_OPERATION, "DONE"))
@@ -983,13 +990,46 @@ class ClusterStatusAgeRuleTest(unittest.TestCase):
         bare = {**seeded_b(), "status": "RECONCILING"}
         none_listed = project_reads(**{shared.PROJECT_READ_OPERATIONS: []})
         context = context_for(bare, reads=none_listed)
-        self.describing(context, "RECONCILING")
+        self.describing(context, "RECONCILING", operations=[])
         finding = cluster_status_age.evaluate(bare, {}, None, None, context)["blocking"][0]
         self.assertEqual(cluster_status_age.describe(finding), "seeded-b is RECONCILING with no operation RUNNING on it or its node pools (statusMessage: none; newest operation: none listed); " + cluster_status_age.NO_HOLDER_ACTION)
         context = context_for(seeded_b(), reads=none_listed)
         calls = self.describing(context, "RUNNING")
         self.assertEqual(cluster_status_age.evaluate(seeded_b(), {}, None, None, context)["notes"], ["status RUNNING; no operation of this cluster or its node pools is listed"])
         self.assertEqual(calls, [])  # a RUNNING cluster is not described
+
+    def test_an_operation_that_started_after_the_projects_list_is_found_by_the_relist(self):
+        # RECONCILING at list time, the holder DONE before the project's list, and the next operation (a chained pool
+        # upgrade) started after it: the describe confirms RECONCILING, and this cluster's own list names the holder.
+        record = {**seeded_b(), "status": "RECONCILING"}
+        snapshot = self.reads_with(self.in_flight(timedelta(minutes=20), status="DONE", name="operation-done-before-the-list"))
+        young = recorded("project_operations.json") + [self.in_flight(timedelta(minutes=6), name="operation-next-pool", target=self.POOL_TARGET.replace("default-pool", "no-surge-pool"))]
+        context = context_for(record, reads=snapshot)
+        calls = self.describing(context, "RECONCILING", operations=young)
+        result = cluster_status_age.evaluate(record, {}, None, None, context)
+        self.assertEqual(calls, [self.DESCRIBE_COMMAND, self.RELIST_COMMAND])
+        self.assertEqual((result["blocking"], result["unknown"]), ([], []))
+        self.assertEqual(result["notes"], ["status RECONCILING for 6m on operation-next-pool (UPGRADE_NODES on no-surge-pool, RUNNING since 2026-10-20T11:54:00.000000Z); under the 4h threshold a reconcile in progress is not a blocker"])
+        # The same holder past the threshold: the blocker names it, with the list status beside the described one.
+        old = recorded("project_operations.json") + [self.in_flight(timedelta(hours=5), name="operation-next-pool", target=self.POOL_TARGET.replace("default-pool", "no-surge-pool"))]
+        context = context_for(record, reads=snapshot)
+        self.describing(context, "RECONCILING", operations=old)
+        finding = cluster_status_age.evaluate(record, {}, None, None, context)["blocking"][0]
+        self.assertEqual((finding["operation"], finding["pool"], finding["age_seconds"], finding["listed_status"]), ("operation-next-pool", "no-surge-pool", 5 * 3600, "RECONCILING"))
+        self.assertTrue(cluster_status_age.describe(finding).startswith("seeded-b has been RECONCILING for 5h on operation-next-pool (UPGRADE_NODES on no-surge-pool, RUNNING since"))
+        # Nothing RUNNING in the fresh list either: the statusMessage blocker, as before.
+        context = context_for(record, reads=snapshot)
+        self.describing(context, "RECONCILING", operations=recorded("project_operations.json"))
+        self.assertIsNone(cluster_status_age.evaluate(record, {}, None, None, context)["blocking"][0]["operation"])
+        # The re-list failing: unknown, naming the described status and why.
+        context = context_for(record, reads=snapshot)
+        self.describing(context, "RECONCILING", list_rc=1)
+        self.assertEqual(cluster_status_age.evaluate(record, {}, None, None, context)["unknown"], ["status RECONCILING now with no RUNNING operation in the project's list; `gcloud container operations list` for the cluster could not say what holds it (ERROR: (gcloud.container.operations.list) forbidden), so that is unknown"])
+        # A described RUNNING needs no re-list.
+        context = context_for(record, reads=snapshot)
+        calls = self.describing(context, "RUNNING", list_rc=1)
+        self.assertEqual(cluster_status_age.evaluate(record, {}, None, None, context)["unknown"], [])
+        self.assertEqual(calls, [self.DESCRIBE_COMMAND])
 
     def test_a_list_status_the_operations_list_postdates_is_confirmed_before_it_blocks(self):
         # RECONCILING at clusters-list time, the holding operation DONE by the time the operations list was made (the
@@ -1002,9 +1042,9 @@ class ClusterStatusAgeRuleTest(unittest.TestCase):
         self.assertEqual((result["blocking"], result["unknown"]), ([], []))
         self.assertEqual(result["notes"], ["status RUNNING now (RECONCILING at list time; newest operation operation-just-done (UPGRADE_NODES on default-pool, DONE, started 2026-10-20T11:51:00.000000Z, 9m ago))"])
         self.assertEqual(calls, [self.DESCRIBE_COMMAND])
-        # Still not RUNNING when described: the blocker, from the described status and message.
+        # Still not RUNNING when described, and nothing RUNNING in this cluster's own list: the blocker, from the described status and message.
         context = context_for(record, reads=just_done)
-        self.describing(context, "DEGRADED", "Node pool default-pool needs repair")
+        self.describing(context, "DEGRADED", "Node pool default-pool needs repair", operations=[])
         finding = cluster_status_age.evaluate(record, {}, None, None, context)["blocking"][0]
         self.assertEqual((finding["status"], finding["listed_status"], finding["status_message"]), ("DEGRADED", "RECONCILING", "Node pool default-pool needs repair"))
         self.assertTrue(cluster_status_age.describe(finding).startswith("seeded-b is DEGRADED with no operation RUNNING on it or its node pools (statusMessage: Node pool default-pool needs repair; newest operation: operation-just-done"))
