@@ -2127,6 +2127,13 @@ func (g *Gateway) mintSession(ctx context.Context, msg InboundMessage) (*Session
 	}
 	err := g.reg.Create(ctx, rec)
 	if err == nil {
+		// One session per conversation, counted on the create that won,
+		// under the platform of the message that opened it; a door's
+		// conversations are not chat and are not counted, as handleInbound
+		// does not count their messages.
+		if platform, ok := metricsPlatformLabel(g.backendFor(msg)); ok {
+			g.metrics.sessionMinted(platform)
+		}
 		return rec, nil
 	}
 	if !errors.Is(err, ErrSessionExists) {

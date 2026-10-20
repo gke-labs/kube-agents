@@ -1048,8 +1048,9 @@ fi
 # Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
 # coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
-# rather than a volume each — every replica's gateway is an owner and several of them run
+# At availability.replicas > 1 — where the operator would give the replicas ONE ReadWriteMany PVC
+# rather than a volume each, a shape it does not render while it caps the gateway at one
+# replica — every replica's gateway is an owner and several of them run
 # this against the same file, with a rolling update overlapping new pods and old. While
 # .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
 # cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
@@ -1327,8 +1328,9 @@ sync_profile_skills() {
     [ -d "$_src" ] || return 0
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
-    # $_dst lives on the PVC, and at availability.replicas > 1 the operator hands
-    # every replica the SAME PVC (ReadWriteMany; see step 2c-bis and cron_jobs_sync.py's
+    # $_dst lives on the PVC, and at availability.replicas > 1 the operator handed
+    # every replica the SAME PVC (ReadWriteMany; the operator now caps the gateway at
+    # one replica, but this stays for when that lifts; see step 2c-bis and cron_jobs_sync.py's
     # Concurrency section), so fixed siblings named `skills.new` and `skills.old`
     # are shared names on a shared volume. The unconditional `rm -rf` below then
     # reaches into another pod's swap: pod A completes `mv skills skills.old`, so

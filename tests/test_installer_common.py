@@ -1675,7 +1675,7 @@ class InstallerCommonTest(unittest.TestCase):
         for args, expect in (
             # Installed today through the installer; the key now asks for next.
             ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
-                                  "renders the NATS bus and the A2A gateway", "Google Chat moves")),
+                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat, or Slack")),
             # Installed next through the installer; the key now asks for today,
             # which renders nothing and so removes the recorded field.
             ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
