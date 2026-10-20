@@ -648,8 +648,8 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
     text = text.strip()
     if text.startswith(_RATE_LIMIT_REASON_PREFIX):
         match = _FAILURE_REASON_PATTERN.search(text)
-        if match and match.group(1) in _INFRA_FAILURE_REASONS:
-            return match.group(1)
+        if match:
+            return match.group(1) if match.group(1) in _INFRA_FAILURE_REASONS else None
         return "rate_limit"
     return None
 
@@ -3233,7 +3233,7 @@ class KubeAgentsHarness(AgentHarness):
             unsettled=unsettled,
             live_statuses=live_statuses,
         )
-        if timed_out and outstanding:
+        if outstanding:
             unsettled = [t for t in unsettled if t not in outstanding]
         if unsettled:
             _record_unsettled(result, unsettled, prior_statuses, live_statuses)
