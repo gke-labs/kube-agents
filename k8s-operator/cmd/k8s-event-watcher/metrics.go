@@ -82,7 +82,15 @@ type metrics struct {
 	eventsPolicyReopened *prometheus.CounterVec
 	injectErrors         *prometheus.CounterVec
 	sessionCreates       *prometheus.CounterVec
-	activeIncidents      *prometheus.GaugeVec
+	// triageSessions counts the sessions this process opened whose event the
+	// daemon then delivered: one per injected event in per-incident mode,
+	// incremented after the inject returns delivered and never on the
+	// filtered, suppressed or failed paths, which leave a session nobody was
+	// told about. The operator reads it into status.usage.sessionsTotal
+	// (docs/designs/usage-counters-producer.md); sessionCreates stays the
+	// operational view of every create attempt by outcome.
+	triageSessions  *prometheus.CounterVec
+	activeIncidents *prometheus.GaugeVec
 	// clusterDiscoveryErrors and clusterUp are the two halves of "is this
 	// cluster actually being watched". Discovery skips profiles it cannot load
 	// and counts them here; everything after discovery — the dedup cache, the
@@ -154,6 +162,10 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "project", "location", "outcome"}),
+		triageSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_triage_sessions_total",
+			Help: "Total triage sessions opened: sessions this watcher created whose event the daemon then delivered (per-incident mode, one per injected event). A session whose inject was filtered, suppressed or failed is not counted.",
+		}, []string{"cluster", "project", "location"}),
 		activeIncidents: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "k8s_event_watcher_active_incidents",
 			Help: "Current number of incidents in a cluster's dedup cache.",
@@ -196,6 +208,7 @@ func newMetrics() *metrics {
 		m.eventsPolicyReopened,
 		m.injectErrors,
 		m.sessionCreates,
+		m.triageSessions,
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
 		m.clusterUp,

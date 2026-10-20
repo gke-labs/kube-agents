@@ -232,7 +232,7 @@ above; the gateway normalizes them to a single dispatch path.
 in any mode; mode 3's inference is the session agent's, which the gateway hands the turn to. A `/session`
 command that opts a conversation onto the session route is a slash command that names a route rather
 than a handle. It is built: the A2A gateway resolves `/session`, `/session <text>` and `/session off`
-ahead of its status, stop and steer matchers, and it is the only slash command that gateway resolves
+ahead of its status, stop and steer matchers, and, with a bare `/feedback` (answered with the two reporting links; `docs/designs/chat-feedback-command.md`), one of the two slash commands that gateway resolves
 today (every other `/word` is plain text to it); the grammar is in
 [`spec-chatops-gateway.md`](../designs/spec-chatops-gateway.md), "Sessions by default".
 

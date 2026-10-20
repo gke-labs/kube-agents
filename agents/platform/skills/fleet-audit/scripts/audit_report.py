@@ -1638,6 +1638,27 @@ UNVOUCHED_PROMOTION_FLOOR = "critical"
 # the bottom of a ComputeClass (`ccc-no-ondemand-floor`). A new check is held
 # to `critical` until someone argues it onto this list.
 MAJOR_SWEEP_CHECKS = frozenset({"no-pdb", "unbound-sa-automount", "ccc-no-ondemand-floor"})
+# The install's switch for the automatic sweep. "false" turns it off: `finish`
+# opens no pull request nobody asked for, and the ledger says so; an explicit
+# `/remediate` still opens what it names. The operator sets it in
+# spec.deployment.env and forwards it to the shell sandbox, whose entrypoint
+# writes it to the root-owned file first (a session can unset or override the
+# variable in one word, and the file is what an operator's choice rests on).
+# Unset, or anything but "false", is the sweep as it always ran. The eval's
+# inject lane turns it off (hack/ci-deploy.sh, #3439): its write safeguard
+# charges any pull request in a repetition's window to the case in flight.
+AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+AUTO_PROMOTE_FILE = "/run/kube-agents-sandbox/audit-auto-promote"
+AUTO_PROMOTE_OFF = "false"
+
+
+def auto_promotion_enabled() -> bool:
+    """Whether this install runs the automatic sweep: the root-owned file first, then the variable."""
+    try:
+        value = Path(AUTO_PROMOTE_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        value = os.environ.get(AUTO_PROMOTE_ENV, "")
+    return value.strip().lower() != AUTO_PROMOTE_OFF
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
@@ -9259,6 +9280,10 @@ class PromotionPlan(NamedTuple):
     # run and this does not, so it is reported apart. Empty when `auto_promote`
     # is off, because the `remediate` subcommand runs no sweep to be blocked by.
     below_floor: list[str] = []
+    # What the sweep would have opened on an install whose switch
+    # (`auto_promotion_enabled`) is off: classified like the rest, promoted by
+    # nothing but a `/remediate`, and named on the ledger as awaiting one.
+    switched_off: list[str] = []
 
 
 def promotion_candidates(
@@ -9271,6 +9296,7 @@ def promotion_candidates(
     uncorroborated: set[str] | None = None,
     triage_marked: set[str] | None = None,
     vouched: set[str] | None = None,
+    sweep_off: bool = False,
 ) -> PromotionPlan:
     """Decide which findings become pull requests this run.
 
@@ -9291,7 +9317,11 @@ def promotion_candidates(
     empty on a run without a collector manifest.
 
     `auto_promote=False` turns the sweep off entirely and is what the `remediate`
-    subcommand passes. That command is a person naming ids, and a person who
+    subcommand passes. `sweep_off` is the install's switch (`auto_promotion_enabled`),
+    which `finish` passes: the sweep still runs, so every finding lands in the
+    block that says why it needs reading, but what it would have opened goes to
+    `switched_off` instead of `promote`, for the ledger to name as awaiting a
+    `/remediate`. That command is a person naming ids, and a person who
     names one id and receives six pull requests has been surprised by their own
     tool — the five they did not ask for are indistinguishable, in the
     repository, from five they did. Auto-promotion belongs to the cron, where a
@@ -9402,6 +9432,17 @@ def promotion_candidates(
             continue
         auto.append(fid)
 
+    if sweep_off:
+        return PromotionPlan(
+            promote=promote,
+            withheld=[],
+            already_open=already_open,
+            superseded=superseded,
+            uncorroborated=unbacked,
+            needs_triage=triaged,
+            below_floor=below_floor,
+            switched_off=auto,
+        )
     promote.extend(auto[:cap])
     return PromotionPlan(
         promote=promote,
@@ -10624,9 +10665,15 @@ def _render_withheld(
     noun: str = DEFAULT_PROPOSAL_NOUN,
     below_floor: list[str] | None = None,
     triage_reasons: dict[str, str] | None = None,
+    switched_off: list[str] | None = None,
     swept_earlier: bool = False,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
+
+    `switched_off` is what the sweep would have opened on an install whose
+    switch (`auto_promotion_enabled`) is off: a fifth block, first, naming the
+    switch and the command that still works; the other four read as on any
+    install.
 
     A filter that silently drops work reads as "nothing more to do". Naming
     what it dropped, with the command to ask for one, is what keeps it honest.
@@ -10648,7 +10695,8 @@ def _render_withheld(
     unbacked = list(uncorroborated or [])
     triaged = list(needs_triage or [])
     floor = list(below_floor or [])
-    if not withheld and not unbacked and not triaged and not floor:
+    off = list(switched_off or [])
+    if not withheld and not unbacked and not triaged and not floor and not off:
         return []
     by_id = {str(f.get("id", "")): f for f in findings}
 
@@ -10667,6 +10715,15 @@ def _render_withheld(
         return out
 
     out = ["", "## Awaiting `/remediate`"]
+    if off:
+        out += [
+            "",
+            f"{len(off)} finding(s) qualify for an automatic remediation {noun}, and the automatic "
+            f"sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so none was "
+            "opened without a request. Comment `/remediate <finding-id>` to open any of them.",
+            "",
+            *rows(off),
+        ]
     if withheld:
         out += [
             "",
@@ -10955,6 +11012,7 @@ def render_issue_body(
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
     unlinked_paths: set[str] | frozenset[str] = frozenset(),
+    switched_off: list[str] | None = None,
     swept_earlier: bool = False,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
@@ -11010,6 +11068,7 @@ def render_issue_body(
         noun=noun,
         below_floor=list(below_floor or []),
         triage_reasons=triage_reasons,
+        switched_off=list(switched_off or []),
         swept_earlier=swept_earlier,
     )
     # Measured with the fixed sections, not against what the findings leave:
@@ -11666,12 +11725,15 @@ def render_stale_close_comment(
     reason: str = "",
     resolution: str = "",
     noun: str = DEFAULT_PROPOSAL_NOUN,
+    sweep_off: bool = False,
 ) -> str:
     """Why a remediation pull request is being closed unmerged.
 
     `resolution` replaces the closing paragraph, which by default describes a
     finding that stopped reproducing; a close for another reason (a shielded
-    finding, which is still on the ledger) says its own.
+    finding, which is still on the ledger) says its own. `sweep_off` is the
+    install's switch: the default paragraph then promises no automatic
+    re-proposal, because none happens there.
     """
     stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
     out = [
@@ -11710,7 +11772,11 @@ def render_stale_close_comment(
         "",
         resolution
         or (
-            f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
+            f"If the finding comes back: the automatic remediation sweep is off on this "
+            f"install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so nothing is re-proposed "
+            "without a request; `/remediate <finding-id>` re-opens it on this same branch."
+            if sweep_off
+            else f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
             f"or `{AUTO_PROMOTION_FLOOR}` for {_sweep_checks_text()} where the collector "
             "graded it so, with a manifest "
             "remediation is normally re-proposed automatically "
@@ -13392,6 +13458,7 @@ def close_stale_remediation_prs(
     shielded_only: bool = False,
     shielded_namespaces: set[tuple[str, str]] | None = None,
     finding_places: dict[str, tuple[str, str, str]] | None = None,
+    sweep_off: bool = False,
 ) -> list[str]:
     """Close every open remediation PR the current findings no longer justify.
 
@@ -13611,6 +13678,7 @@ def close_stale_remediation_prs(
                     reason=reason,
                     resolution=resolution,
                     noun=noun,
+                    sweep_off=sweep_off,
                 ),
                 what="stale-close comment",
             )
@@ -13834,9 +13902,12 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
 
 
 def unwritten_refusal_message(
-    unwritten: dict[str, "UnwrittenFix"], notes: dict[str, str] | None = None
+    unwritten: dict[str, "UnwrittenFix"], notes: dict[str, str] | None = None, *, sweep_off: bool = False
 ) -> str:
     """What the refusal tells the worker, one list per shape of the shortcut.
+
+    `sweep_off` is the install's switch: the fix is then owed to a `/remediate`,
+    not to a sweep, and the first sentence says so.
 
     The declared list names the object's own file, and says in so many words
     that a new object goes beside it: a worker told only "write the manifest at
@@ -13853,7 +13924,10 @@ def unwritten_refusal_message(
     declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
     notes = notes or {}
     parts = [
-        f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
+        f"{len(unwritten)} finding(s) need their fix written before a `/remediate` "
+        "can open a pull request for them."
+        if sweep_off
+        else f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
         "their fix is not written."
     ]
     if named:
@@ -16517,9 +16591,13 @@ def _handle_finish_dry_run(
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
     triage_reasons = triage_markers(findings, manifest)
+    sweep_on = auto_promotion_enabled()
+    if not sweep_on:
+        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
     plan = promotion_candidates(
         findings,
         {},
+        sweep_off=not sweep_on,
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
@@ -16576,6 +16654,7 @@ def _handle_finish_dry_run(
         needs_triage=plan.needs_triage,
         below_floor=plan.below_floor,
         triage_reasons=triage_reasons,
+        switched_off=plan.switched_off,
         held=preview_held,
         held_preview=True,
         states=states,
@@ -17880,6 +17959,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     held_carried_ids = [e["id"] for e in held_entries] if carried_without_manifest else []
 
     remediation_prs = list_remediation_prs(repo, audit_id)
+    sweep_on = auto_promotion_enabled()
     # The last point before anything is published. A fix the sweep would open
     # and the worker did not write is refused until it is written or declined
     # by name with a reason: refused once, a worker re-ran `finish` unchanged
@@ -17889,6 +17969,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # A promised path the containment check refused is no fix the sweep would
     # open: writing at it is what the check stops, so it is not refused again
     # as unwritten, and publishes `manual` with its SECURITY line as before.
+    # The install's switch (`sweep_on`) changes none of this: a `/remediate`
+    # there needs the written fix as much as the sweep does, so an unwritten
+    # one is refused, planned and written the same, and opened only on request.
     unwritten = without_refused_paths(
         unwritten_sweep_fixes(findings, manifest, promised, degraded, audit_id, remediation_prs)
         if findings
@@ -17928,7 +18011,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             if fid not in declines and fid not in planned and fid not in answered
         }
         if remaining and has_run_record(audit_id, repo):
-            raise ValidationError(unwritten_refusal_message(remaining, skipped))
+            raise ValidationError(unwritten_refusal_message(remaining, skipped, sweep_off=not sweep_on))
         write_generated_fixes(findings, planned, root)
         unlinked_paths = _unlinked_manifest_paths(findings, manifest, planned, probe)
         file_url = (
@@ -18019,6 +18102,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 # is made; it rests on the declaration, not on this run's read.
                 shielded_only=bool(gaps or unaccounted),
                 noun=noun,
+                sweep_off=not sweep_on,
             )
         )
         conversation_unread = False
@@ -18483,6 +18567,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         noun=noun,
     )
     triage_reasons = triage_markers(findings, manifest)
+    if not sweep_on:
+        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
     plan = promotion_candidates(
         findings,
         pr_by_finding,
@@ -18491,6 +18577,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         # ledger still lists it: the earlier `finish` already opened its share.
         cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
         requested_at=requests.requested_at,
+        sweep_off=not sweep_on,
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
         vouched=collector_vouched_findings(findings, manifest),
@@ -18558,6 +18645,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         needs_triage=plan.needs_triage,
         below_floor=plan.below_floor,
         triage_reasons=triage_reasons,
+        switched_off=plan.switched_off,
         held=carried,
         held_overflow=held_overflow,
         held_carried=carried_without_manifest,
@@ -18674,6 +18762,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             {},
             now,
             noun=noun,
+            sweep_off=not sweep_on,
             branch_by_finding={
                 str(finding.get("id", "")): group_branch_for(audit_id, group)
                 for group in remediation_groups(findings)
@@ -18732,9 +18821,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 needs_triage=plan.needs_triage,
                 below_floor=plan.below_floor,
                 triage_reasons=triage_reasons,
+                switched_off=plan.switched_off,
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
+                new_ids=new_marked,
                 blocked_by=blocked_by,
                 file_url=file_url,
                 file_ref=file_ref,

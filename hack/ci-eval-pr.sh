@@ -93,6 +93,17 @@ readonly EVAL_NOT_RUN_DIR="not-run"
 readonly EVAL_TIMING_FILE="timing.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
+# Where each unit writes a repetition's log (run_one_unit) and grading reads it
+# back (analyze_eval_phases). CI keeps /tmp. A run that shares the machine with
+# other runs sets a private directory: the tests point it at a mktemp -d. It is
+# made absolute and created here: the write runs in a subshell that cds into
+# BENCH_DIR, so a relative value would write in one place and read in another.
+# CDPATH is cleared for that cd: it would send a relative name to another
+# directory and print the path, which the substitution would capture.
+EVAL_LOG_DIR="${EVAL_LOG_DIR:-/tmp}"
+mkdir -p "${EVAL_LOG_DIR}"
+EVAL_LOG_DIR="$(CDPATH='' cd -- "${EVAL_LOG_DIR}" && pwd)"
+readonly EVAL_LOG_DIR
 
 # EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
 # `spec.mode: next` under, in the same job environment. Under it the matrix
@@ -3233,7 +3244,7 @@ grade_case() { # <task-path> <task-name>
     end_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.end" 2>/dev/null || echo 0)"
     rep_result=""
     [ -n "${run_dir}" ] && rep_result="${run_dir}/results.json"
-    analyze_eval_phases "/tmp/eval_${name}_rep${rep}.log" "${start_ms}" "${end_ms}" "${name} rep ${rep}" "${rep_result}"
+    analyze_eval_phases "${EVAL_LOG_DIR}/eval_${name}_rep${rep}.log" "${start_ms}" "${end_ms}" "${name} rep ${rep}" "${rep_result}"
     if [ -n "${run_dir}" ]; then
       result_args+=(--result "${run_dir}")
       cp "${run_dir}/results.json" "results_${name}_rep${rep}.json" 2>/dev/null || true
@@ -3381,7 +3392,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
 
 run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq> <streams>
   local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6" streams="${7:-}"
-  local log="/tmp/eval_${name}_rep${rep}.log"
+  local log="${EVAL_LOG_DIR}/eval_${name}_rep${rep}.log"
   # A distinct local port per unit: the harness's port-forward is owned by
   # the process that spawned it and its atexit teardown would drop a shared
   # listener under every sibling mid-conversation. On its own port, each

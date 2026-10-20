@@ -89,6 +89,19 @@ const (
 	// the Hermes gateway's (a2a/gateway/metrics.go). A body carries one of the
 	// two families; both fold into chatMessagesInboundTotal.
 	a2aMessagesInboundSeries = "kubeagents_a2a_gateway_messages_inbound_total"
+	// triageSessionsSeries is the watcher's count of the triage sessions it
+	// opened whose event the daemon delivered, by cluster: one per injected
+	// event in per-incident mode, never a session whose inject was filtered,
+	// suppressed or failed. The triage half of sessionsTotal sums it whole.
+	triageSessionsSeries = "k8s_event_watcher_triage_sessions_total"
+	// chatSessionsSeries is the session_store plugin's count of the
+	// conversations it first saw, by platform, served on the chat_metrics
+	// listener beside the inbound counter; a2aSessionsSeries is the A2A
+	// gateway's count of the conversations it minted a session for, on its
+	// own pod. Both fold into the chat half of sessionsTotal, summed over
+	// the platform label.
+	chatSessionsSeries = "kubeagents_chat_sessions_total"
+	a2aSessionsSeries  = "kubeagents_a2a_gateway_sessions_total"
 	// clusterUpSeries is the watcher's per-cluster gauge, one series per
 	// cluster it built a client for, 1 once that cluster's informer has
 	// synced and is delivering events. Read from the same body as the
@@ -153,6 +166,10 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return vcsMergedSeries, nil
 	case usageCounterChatMessagesInbound:
 		return chatInboundSeries, nil
+	case usageCounterSessionsTriage:
+		return triageSessionsSeries, nil
+	case usageCounterSessionsChat:
+		return chatSessionsSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
@@ -163,8 +180,11 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 // names: the chat counter comes from the chat_metrics plugin on a gateway pod
 // and from the A2A gateway on its own pod, under the same label set.
 func usageSiblingFamiliesFor(counter string) []string {
-	if counter == usageCounterChatMessagesInbound {
+	switch counter {
+	case usageCounterChatMessagesInbound:
 		return []string{a2aMessagesInboundSeries}
+	case usageCounterSessionsChat:
+		return []string{a2aSessionsSeries}
 	}
 	return nil
 }

@@ -76,8 +76,10 @@ concurrent mutation under ``.jobs.lock`` cannot land between them.
 **This lock coordinates writers that honour .jobs.lock, but cross-pod limits remain.**
 Step 1.5 of the entrypoint elects an owner per pod, not per volume: the operator sets
 ``AGENT_SHARED_STATE_SETUP=owner`` on the gateway container of the pod *template*
-(``platformagent_manifests.go``), so every replica's gateway is an owner. At
-``availability.replicas > 1`` the operator gives those replicas one shared volume —
+(``platformagent_manifests.go``), so every replica's gateway is an owner. The
+operator now caps the gateway at one replica, so what follows describes the
+multi-replica render this code still guards against. At
+``availability.replicas > 1`` the operator gave those replicas one shared volume —
 ``getDefaultStorageConfig`` switches the data PVC to ReadWriteMany on
 ``standard-rwx``, and ``useStatefulSet`` stays false without custom ReadWriteOnce
 storage, so it is several pods against one PVC rather than one volume each. A
