@@ -348,13 +348,8 @@ Each rule returns blockers,
 risks, reasons it could not decide, and notes, and declares whether it can block at all; a
 blocker joins the verdict, a risk never does, and the table prints them under `other blockers`
 and `risks`, each as `<rule id>: <the rule's description>`, so the cell names the rule the way the
-note column does. The rules registered today, with the catalogue entry each reads:
-
-- **Zonal control plane** (`zonal-control-plane`, entry 11). A cluster whose `location` is a zone
-  is a risk on every report, never a blocker: the Kubernetes API is unreachable for a short window
-  while the single control-plane replica is rebuilt, running pods are unaffected, and the cell
-  says what to do about it. A location that is neither a zone nor a region is unknown, and since
-  the rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
+note column does. The rules, one per catalogue entry or incident scenario, with their reads and
+actions: [`references/readiness-rules.md`](references/readiness-rules.md).
 
 A member is `blocked` when any rule blocks, whatever else could not be evaluated; `unknown` when
 nothing blocked but a rule that could have blocked could not be evaluated (the cluster read

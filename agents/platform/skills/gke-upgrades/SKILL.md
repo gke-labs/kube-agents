@@ -263,3 +263,33 @@ the linked GitOps repositories' manifests for apiVersions the target removes and
 its replacement and the commit it read; run it with `--target-version` and the version report's
 `--output` from a full run, since it refuses a `--cluster` run's file as one cluster's floor. It
 reads Git only: point at GKE Deprecation Insights for live client usage.
+
+## Stuck operation
+
+A cluster whose `status` is not `RUNNING` (`RECONCILING`, `DEGRADED`, `ERROR`) accepts no cluster
+or node pool change, and only the provider can end an operation that has wedged inside it. The
+fleet-upgrade-verification report's `cluster-status-age` rule files such a cluster as a blocker
+once the status has stood for more than four hours, naming the operation that holds it. What to
+do with it, in order:
+
+1. **Read the operation, not only the status.** List the cluster's newest operations:
+   `gcloud container operations list --project <project> --filter="targetLink~/clusters/<cluster>$" --sort-by=~startTime --limit=5 --format=json`,
+   then `gcloud container operations describe <operation id> --location <location> --project <project>`
+   for the newest: its `operationType`, `status`, `startTime`, `statusMessage` and `error`. The
+   age is now minus `startTime`; quote both.
+2. **Freeze changes on the cluster.** No node pool upgrade, resize, rollback or cluster update
+   until the operation ends, and say so in the answer and on any card about the cluster. A pull
+   request that changes the cluster's spec waits too: Config Connector would retry against a
+   cluster that refuses the change.
+3. **Past a few hours, draft the support-case text** (the rule's threshold is four): the project,
+   the cluster and its location, the operation id, its type, its start time and age, the
+   `statusMessage` and `error` text verbatim, what was being changed when it started, and that the
+   operation needs the provider to abort it. P2 while the workloads run; P1 when the API or the
+   nodes are affected.
+4. **File a kanban card for a person to open the case the same day**, titled
+   `Support case: <cluster> held by <operation id>`, carrying the drafted text, and block it as
+   needing input: the agent cannot open a support case, and in one production fleet a cluster
+   sat in `RECONCILING` for six days before anyone did.
+5. **After the operation ends**, re-run the readiness report: `RUNNING` with the operation listed
+   as `DONE` closes the finding; a status that returns is the same card, reopened with the new
+   operation id.
