@@ -2,8 +2,9 @@
 
 Claude Opus 5 answers `temperature`, `top_p` and `top_k` with a 400, and a
 caller can send them without knowing which model the gateway routes to. The chart renders LiteLLM's per-deployment `additional_drop_params` under
-every `model_list` alias when the model is Claude: `anthropic`, or `vertex_ai`
-with a `claude-` model name. Every other provider and model renders no such
+every `model_list` alias when the model is Claude: `anthropic`, `vertex_ai`
+with a `claude-` model name, or `sap` with an `anthropic--` one (SAP AI Core's
+`<publisher>--<model>` form). Every other provider and model renders no such
 key, which keeps a Gemini or OpenAI install's ConfigMap and rollout checksum
 unchanged. The render cases need `helm` and skip without it, as
 `test_litellm_max_tokens.py`'s do.
@@ -61,6 +62,8 @@ class TestClaudeDropParamsRender(unittest.TestCase):
             _model_args("anthropic"),
             _model_args("anthropic", "claude-sonnet-4-5"),
             _model_args("vertex_ai", "claude-opus-5"),
+            _model_args("sap"),
+            _model_args("sap", "anthropic--claude-opus-5"),
         ):
             with self.subTest(args=args):
                 params = self._params_by_alias(args)
@@ -77,6 +80,7 @@ class TestClaudeDropParamsRender(unittest.TestCase):
             _model_args("vertex_ai", "gemini-3.1-pro-preview"),
             # The prefix test is on the model name, not a substring anywhere.
             _model_args("vertex_ai", "my-claude-tune"),
+            _model_args("sap", "gpt-5.6-terra"),
         ):
             with self.subTest(args=args):
                 for alias, entry in self._params_by_alias(args).items():

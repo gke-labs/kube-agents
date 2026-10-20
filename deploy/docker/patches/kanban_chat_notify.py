@@ -795,7 +795,8 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
             chat_argv, chat_file = [], ""
         argv += chat_argv
-        argv += ["--", content]
+        # The chat message above was laid out from the text as written; what a person reads has no step line.
+        argv += ["--", _visible(content)]
         try:
             return await self._notify(argv, chat_id)
         finally:
@@ -837,6 +838,16 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         if not isinstance(answer, dict):
             answer = {}
         return SendResult(success=True, message_id=answer.get("message_id") or None, raw_response=answer)
+
+
+def _visible(content: str) -> str:
+    """``slack_moments.visible_text``: ``content`` without the declared step's line, which no
+    surface shows as text; ``content`` as written when nothing else is left or the module is absent."""
+    try:
+        import slack_moments
+    except ImportError:  # the scripts directory is not on PYTHONPATH
+        return content
+    return slack_moments.visible_text(content) or content
 
 
 def _failure_chat(content: str) -> Optional[dict]:

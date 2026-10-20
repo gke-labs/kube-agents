@@ -100,9 +100,6 @@ infrastructure:
   deployer: noop
 validated: false
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 verification_spec:
   - name: the-analyzer-ran-to-a-trace-breakdown
     role: objective

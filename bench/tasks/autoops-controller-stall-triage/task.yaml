@@ -59,9 +59,6 @@ validated: false
 # remediation options a human authorizes, never a cluster write.
 domain: incident-triage
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The board read, not the diagnosis, for the reasons gitops-drift-out-of-band-
 # triage gives at length: the triage was produced by the session the daemon
 # opened, the session this prompt reaches is the platform agent's, and an agent

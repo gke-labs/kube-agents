@@ -71,8 +71,10 @@ per sweep, and Hermes retries that card in place; a re-run by hand uses a suffix
 (`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the
 report itself and files no ranking card. The ranking worker writes `/opt/data/INVENTORY.md`, on the
 sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
-(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`) and claims
-`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run five minutes later removes both jobs.
+(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or under `spec.mode: next`
+`.user_aligned_conversation`) and claims
+`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
+later removes both jobs.
 
 ## 4. First-run audits
 
@@ -217,7 +219,9 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   `origin` from the old delivery job to `oobe` on any boot where `oobe` has no `origin` of its own.
   Without that, the report goes out with `deliver: local` and reaches nobody. The plugin binds
   every delivery job present, the old one included, so a rollback to an image from before the fold
-  finds the link where that image looks for it.
+  finds the link where that image looks for it. Under `spec.mode: next` the link is not a job origin:
+  the plugin records the conversation in `onboarding_conversation.json`, the jobs stay
+  `deliver: local`, and delivery posts into that conversation through the gateway itself.
 - **An install with no `oobe`.** An image from before the fold removed `oobe` as soon as its
   audits stage was done, without waiting for a human, so an install can arrive mid-onboarding with
   `oobe` gone. While no `oobe` job exists, the sync leaves the two old jobs enabled, and they
@@ -228,8 +232,9 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   for the stage), so a failed delivery posts only delivery's own error; an exception in either is
   caught so it neither posts nor blocks delivery. The plugin triggers only the first job it binds,
   because `trigger_job` also enables a job and the old delivery entry ships disabled.
-- **Removal.** Five minutes after the report is claimed (`.bootstrap_completed`), the delivery
-  stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
+- **Removal.** `RETIRE_AFTER_SECONDS` (about 16 minutes) after the report is claimed
+  (`.bootstrap_completed`), and, when the report goes to a recorded conversation, only once its post recorded an outcome
+  (`.bootstrap_conversation_done`), the delivery stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
   audits stage is also done, `oobe` removes itself.
   On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
 - **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
