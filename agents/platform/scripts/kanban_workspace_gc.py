@@ -59,6 +59,13 @@ is one run's scratch by definition, so here a listing is the authority, unlike
 the board half: an entry older than `CRON_RUNS_MAX_AGE_DAYS` goes.  Names are
 checked before any ``rm``, so a listing can only ever name an entry of that
 root.
+
+And it removes override trees (#3551): a top-level directory of a profile home
+named ``<something>_override``, on the agent pod and in the sandbox.  Nothing
+the product ships writes one or reads one.  They are a worker's copies of
+shipped skills or scripts, patched and run in place of the originals (#3444),
+and a later session could find them and run them too.  They go on the first
+night, whatever their age, and the log names each one.
 """
 
 from __future__ import annotations
@@ -183,6 +190,11 @@ CRON_RUNS_PARTS = ("cron", "runs")
 CRON_RUNS_MAX_AGE_DAYS = 7
 CRON_RUN_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# A worker's override copy of a shipped tree, at the top of a profile home
+# (#3551): `skills_override`, `scripts_override` and the like.  No product
+# writer uses the suffix there, which a test pins.
+OVERRIDE_NAME = re.compile(r"^[A-Za-z0-9.-]+_override$")
+
 LOGS_DIR = "logs"
 LOG_FILE_NAME = "kanban_workspace_gc.log"
 LOG_PREFIX = "kanban_workspace_gc"
@@ -195,6 +207,7 @@ class Sweep:
         self.local_removed: list[str] = []
         self.remote_removed: list[str] = []
         self.cron_runs_removed: list[str] = []
+        self.overrides_removed: list[str] = []
         self.warnings: list[str] = []
 
 
@@ -669,6 +682,78 @@ def sweep_cron_runs(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
             sweep.cron_runs_removed.extend(f"sandbox {name}/{run}" for run in removed)
 
 
+def _local_overrides(home: Path) -> list[Path]:
+    try:
+        entries = list(home.iterdir())
+    except OSError:
+        return []
+    return sorted(e for e in entries if OVERRIDE_NAME.match(e.name) and (e.is_symlink() or e.is_dir()))
+
+
+def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
+    """Names of override trees at the top of *home* in the sandbox.
+
+    Raises `_SandboxGone` when the sandbox did not answer, as `_old_remote_runs` does.
+    """
+    try:
+        result = sandbox_exec.run(
+            [REMOTE_FIND, str(home), "-mindepth", "1", "-maxdepth", "1", "-printf", FIND_FORMAT],
+            timeout=LS_TIMEOUT_SECONDS,
+            errors="surrogateescape",
+        )
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as exc:
+        sweep.warnings.append(f"override trees in the sandbox not removed, it did not answer: {exc}")
+        raise _SandboxGone from exc
+    except Exception as exc:  # noqa: BLE001 - a sweep must not die on one home
+        sweep.warnings.append(f"listing {home} in the sandbox failed: {exc}")
+        return []
+    if result.returncode != 0:
+        return []
+    return sorted(name for name, _, _, kind in _parse_listing(result.stdout)
+                  if OVERRIDE_NAME.match(name) and kind in ("d", "l"))
+
+
+def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep) -> None:
+    """Remove every profile home's override trees, on the agent pod and in the sandbox.
+
+    A symlink is unlinked, never followed.  A home that is itself a symlink is
+    left alone and reported, as a symlinked runs root is.
+    """
+    try:
+        names = sorted(e.name for e in agent_profiles.iterdir()
+                       if e.is_dir() and not e.name.startswith("."))
+    except OSError as exc:
+        sweep.warnings.append(f"could not read {agent_profiles}: {exc}")
+        return
+    for name in names:
+        home = agent_profiles / name
+        if _real_dirs_local([home]):
+            for path in _local_overrides(home):
+                before = len(sweep.local_removed)
+                _remove_local(path, sweep)
+                if len(sweep.local_removed) > before:
+                    sweep.overrides_removed.append(f"{name}/{sweep.local_removed.pop()}")
+        else:
+            sweep.warnings.append(f"{home} is reached through a symlink; its override trees were not removed")
+        if remote_root is None:
+            continue
+        remote_home = remote_root / "profiles" / name
+        try:
+            found = _remote_overrides(remote_home, sweep)
+        except _SandboxGone:
+            remote_root = None
+            continue
+        if found and not _real_dirs_remote([remote_root / "profiles", remote_home], sweep):
+            sweep.warnings.append(f"{remote_home} in the sandbox is reached through a symlink; its override trees were not removed")
+            found = []
+        if found:
+            before = len(sweep.remote_removed)
+            _remove_remote(remote_home, found, sweep)
+            removed = sweep.remote_removed[before:]
+            del sweep.remote_removed[before:]
+            sweep.overrides_removed.extend(f"sandbox {name}/{entry}" for entry in removed)
+
+
 def main() -> int:
     try:
         from hermes_cli import kanban_db  # noqa: PLC0415 - not importable in tests
@@ -695,6 +780,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001 - the sandbox halves never fail the job
         lines.append(f"{LOG_PREFIX}: inventory skipped: {exc}; sandbox cron runs not pruned either")
     sweep_cron_runs(agent_home() / "profiles", remote_root, sweep)
+    sweep_overrides(agent_home() / "profiles", remote_root, sweep)
     if sweep.local_removed or sweep.remote_removed:
         lines.append(
             f"{LOG_PREFIX}: removed {len(sweep.local_removed)} on the agent "
@@ -703,6 +789,9 @@ def main() -> int:
     if sweep.cron_runs_removed:
         lines.append(f"{LOG_PREFIX}: removed {len(sweep.cron_runs_removed)} cron run "
                      f"directories older than {CRON_RUNS_MAX_AGE_DAYS} days")
+    if sweep.overrides_removed:
+        lines.append(f"{LOG_PREFIX}: removed {len(sweep.overrides_removed)} override "
+                     f"trees: {', '.join(sweep.overrides_removed)}")
     if remote_root is not None:
         try:
             lines.extend(_format_inventory(take_inventory(agent_home() / "profiles", remote_root)))
