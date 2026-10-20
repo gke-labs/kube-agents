@@ -758,7 +758,8 @@ rules). Neither changes the domain streak above.
   is not judged on its old nights.
 - **A case kept from running.** A case is kept from running on a night when its
   part (the one that recorded it that night; on a night neither did, the one
-  that last recorded it, and only when the other part ran clean that date too)
+  that last recorded it, unless the other part was lost that date or has not
+  landed yet)
   ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
   such nights in a row file one issue naming the case and the classifier's
   reason. A night is skipped, not counted, when the part did not run or was
@@ -766,9 +767,11 @@ rules). Neither changes the domain streak above.
   clean: another job's clean build does not vouch for its cases), when it
   predates the case's first recorded night in the last 14 (a case new to the
   matrix, or back on it), when infrastructure took half or more of the part's
-  cases (a pool-wide outage, which is not one case's problem), or when the part
-  recorded under half the cases of its fullest night in the window (a short run
-  would otherwise make every missing case "absent"). A graded night ends the
+  cases, counting the all-infra lines and the cases with no line against its
+  fullest night in the window (a pool-wide outage, which is not one case's
+  problem), or when the part recorded under half the cases of that fullest
+  night (a short run would otherwise make every missing case "absent"). A
+  graded line counts even on such a night, and a graded night ends the
   streak. A case with an open kept-case issue is still read when no night in
   the window recorded it, so the issue keeps its notes and its recovery.
   `expected_fail` cases and cases off the matrix are not filed (an issue

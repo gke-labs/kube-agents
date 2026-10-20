@@ -715,6 +715,30 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")]), night(17, everything, filler=False)))
         self.assertEqual(self.filed(gh, infra=True), [])
 
+    def test_infra_and_missing_cases_together_make_a_pool_wide_night(self):
+        # 5 cases on a full night; the 17th recorded 3, one of them infra:
+        # 1 infra + 2 missing is 3 of 5 graded nothing, half or more.
+        doc = data(night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")]),
+                   night(17, [infra_task("case-red"), green("filler-1"), green("filler-2")], filler=False))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_a_graded_line_on_a_pool_wide_night_still_ends_the_streak(self):
+        # The 17th is pool-wide, but case-red graded on it: kept on the
+        # 15th, 16th and 18th is not three kept nights in a row.
+        pool_wide = [green("case-red")] + [infra_task(name) for name in FILLER]
+        doc = data(night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")]), night(17, pool_wide, filler=False), night(18, [infra_task("case-red")]))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_a_part_that_stopped_running_does_not_silence_the_absent_rule(self):
+        # The writers job last ran on the 13th; main ran clean without
+        # case-red on the 15th-17th after recording it on the 14th.
+        doc = data(night(13, []), night(13, [green("filler-1")], job=WRITERS_JOB, filler=False), night(14, [green("case-red")]),
+                   *(night(d, []) for d in (15, 16, 17)))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+
     def test_expected_fail_and_off_matrix_cases_are_not_filed(self):
         doc = data(night(14, [green("case-xfail"), green("case-red")]), *(night(d, []) for d in (15, 16, 17)), inactive=("case-red",))
         gh, _, _ = self.run_once(doc)

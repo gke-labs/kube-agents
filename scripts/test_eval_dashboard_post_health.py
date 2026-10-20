@@ -1559,7 +1559,9 @@ class InfraAddressee(unittest.TestCase):
         posts = [c[2] for c in gh.calls if c[0] == "POST"]
         self.assertEqual(len(posts), 2)
         self.assertNotIn("assignees", posts[1])
-        self.assertIn("@ivan", posts[1]["body"])
+        self.assertNotIn("@ivan", posts[1]["body"], "a refused login is not pinged")
+        self.assertIn("Unassigned: GitHub refused `ivan`", posts[1]["body"])
+        self.assertIn("backup @iris", posts[1]["body"], "the backup was not refused")
         self.assertEqual(issue["number"], 1300)
 
     def test_a_failure_that_is_not_a_refusal_is_not_retried_unassigned(self):

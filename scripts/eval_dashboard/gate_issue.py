@@ -81,6 +81,9 @@ INFRA_BACKUP_KEY = "infra_backup"
 # The login bare or in one pair of quotes, as YAML admits it.
 TOP_LEVEL_KEY_RE = r"""^{key}:\s*(["']?)([A-Za-z0-9-]+)\1\s*(?:#.*)?$"""
 INFRA_ADDRESSEE = "Infra owner: @{owner}{backup} (`infra_owner` in docs/designs/domains.yaml)."
+# The unassigned retry's line: the refused login as code, not a mention --
+# GitHub just said it is outside the project, and a mention still notifies it.
+INFRA_ADDRESSEE_REFUSED = "Unassigned: GitHub refused `{owner}`, the `infra_owner` in docs/designs/domains.yaml, as assignee{backup}."
 INFRA_BACKUP_NOTE = ", backup @{backup}"
 # Bare words YAML reads as null or a boolean, never as a login: a key set
 # to one of them names no owner.
@@ -518,14 +521,17 @@ class Tracker:
         self.gh = gh
         self.infra_owner, self.infra_backup = infra if infra is not None else infra_addressees()
 
-    def addressed(self, payload: dict) -> dict:
+    def addressed(self, payload: dict, refused: bool = False) -> dict:
         """An infrastructure issue's payload, assigned to the infra owner and
-        mentioning the backup; unchanged when domains.yaml names no owner."""
+        mentioning the backup; unchanged when domains.yaml names no owner.
+        ``refused``: the unassigned retry, which names the owner as refused
+        without pinging them."""
         if not self.infra_owner:
             return payload
         backup = INFRA_BACKUP_NOTE.format(backup=self.infra_backup) if self.infra_backup else ""
-        line = INFRA_ADDRESSEE.format(owner=self.infra_owner, backup=backup)
-        return dict(payload, body=f"{payload['body'].rstrip()}\n\n{line}\n", assignees=[self.infra_owner])
+        line = (INFRA_ADDRESSEE_REFUSED if refused else INFRA_ADDRESSEE).format(owner=self.infra_owner, backup=backup)
+        body = f"{payload['body'].rstrip()}\n\n{line}\n"
+        return dict(payload, body=body) if refused else dict(payload, body=body, assignees=[self.infra_owner])
 
     def file_addressed(self, payload: dict):
         """POST an infrastructure issue addressed to the infra owner. When
@@ -536,7 +542,7 @@ class Tracker:
         created = self.gh.call("POST", self.gh.path(ISSUES_PATH), addressed)
         if created is None and "assignees" in addressed and not self.gh.dry_run and self.gh.refused(ASSIGNEES_FIELD):
             log(f"warning: filing the issue assigned to {self.infra_owner} failed; retrying unassigned")
-            created = self.gh.call("POST", self.gh.path(ISSUES_PATH), {key: value for key, value in addressed.items() if key != "assignees"})
+            created = self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload, refused=True))
         return created
 
     def existing(self, names: list[str], title_only: bool = False, marker: re.Pattern | None = None) -> dict | None:

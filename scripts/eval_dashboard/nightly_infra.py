@@ -44,9 +44,10 @@ JOB_LOST_WINDOW = 3
 JOB_LOST_MIN = 2
 # Nights in a row a case must be kept from running.
 INFRA_STREAK_NIGHTS = 3
-# A part night whose recorded cases graded nothing at this fraction or more
-# is a pool-wide infrastructure event: skipped for every case. The worst
-# nightly night of 2026-10-10..19 had 4 of 81 cases ungraded.
+# A part night where this fraction or more of the part's cases (its fullest
+# night in the window) graded nothing -- every repetition infra, or no line
+# at all -- is a pool-wide infrastructure event: skipped for every case. The
+# worst nightly night of 2026-10-10..19 had 4 of 81 cases ungraded.
 INFRA_EVENT_FRACTION = 0.5
 # A part night that recorded fewer than this fraction of the cases the
 # part's fullest night in the window recorded (zero included) ran short in a
@@ -181,9 +182,13 @@ def first_clean_after_lost(nights: list[dict], news=lambda n: True) -> dict | No
     return None if last is None else next((n for n in nights[last + 1:] if news(n)), None)
 
 
-def infra_event(tasks: list[dict]) -> bool:
+def infra_event(tasks: list[dict], fullest: int) -> bool:
+    """Whether infra took INFRA_EVENT_FRACTION of the part's cases: the
+    all-infra lines plus the cases with no line, over the fullest night
+    (so a night half infra and half missing is not read as a quarter)."""
     ungraded = sum(1 for t in tasks if classify.outcome_of(classify.rep_counts(t)) == classify.OUTCOME_INFRA)
-    return bool(tasks) and ungraded / len(tasks) >= INFRA_EVENT_FRACTION
+    size = max(fullest, len(tasks))
+    return bool(size) and (ungraded + size - len(tasks)) / size >= INFRA_EVENT_FRACTION
 
 
 def thin_night(tasks: list, fullest: int) -> bool:
@@ -231,7 +236,7 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
     for part, nights in parts.items():
         fullest = max((len(n["tasks"]) for n in nights), default=0)
         eligible[part] = {n["date"]: n for n in nights if not n["lost"] and not n["unrescued"]
-                          and not infra_event([t for t, _ in n["tasks"].values()]) and not thin_night(list(n["tasks"]), fullest)}
+                          and not infra_event([t for t, _ in n["tasks"].values()], fullest) and not thin_night(list(n["tasks"]), fullest)}
     every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
     dates = sorted({n["date"] for nights in parts.values() for n in nights})
     out: dict[str, list[dict]] = {}
@@ -242,23 +247,31 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
             home, first = homes[case]
         else:
             continue
-        for day in dates:
+        for i, day in enumerate(dates):
             if first and datetime.date.fromisoformat(day) < first:
                 continue
             recorders = [p for p in nightly.PARTS if case in every.get(p, {}).get(day, {}).get("tasks", {})]
+            # A graded line is direct evidence the case ran: it claims the
+            # date even on a pool-wide, thin or unrescued night (not a lost
+            # one, whose lines the domain reader skips too), so "a graded
+            # night ends the streak" holds whatever the night's other cases did.
+            graders = [p for p in recorders if not every[p][day]["lost"] and graded(every[p][day]["tasks"][case][0])]
             usable = [p for p in recorders if day in eligible.get(p, {})]
-            if recorders and not usable:
+            if recorders and not usable and not graders:
                 continue
-            # No part recorded it: "absent" only when every other part ran
-            # clean that date too; one whose build has not landed, or was
-            # lost, may be where the case runs now (a lane change).
-            if not recorders and any(n is None or n["lost"] or n["unrescued"] for n in (every[p].get(day) for p in every if p != home)):
+            # No part recorded it: "absent" only when no other part may be
+            # where the case runs now (a lane change): skip the date when
+            # another part's night is lost or unrescued, or missing although
+            # that part ran the date before (its build has not landed yet).
+            if not recorders and any(
+                    (every[p][day]["lost"] or every[p][day]["unrescued"]) if day in every[p] else i > 0 and dates[i - 1] in every[p]
+                    for p in every if p != home):
                 continue
             # A verdict in either part claims the night, as graded_nights
             # reads it: an ungraded line in one part does not hide the other
             # part's grade.
-            part = next((p for p in usable if graded(eligible[p][day]["tasks"][case][0])), usable[0]) if usable else home
-            night = eligible.get(part, {}).get(day)
+            part = graders[0] if graders else usable[0] if usable else home
+            night = every[part][day] if graders else eligible.get(part, {}).get(day)
             if night is None:
                 continue
             task, run = night["tasks"].get(case, (None, night["run"]))
