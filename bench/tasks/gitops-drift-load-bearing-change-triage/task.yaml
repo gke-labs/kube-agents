@@ -129,11 +129,16 @@
 #
 # Isolation class: namespace-scoped. Eligible tier: nightly.
 #
-# NOT REGISTERED YET, and deliberately -- see the KNOWN_UNREGISTERED entry in
-# scripts/validate_bench_cases.py. Every case with a `stack:` holds lock-infra
-# for its whole run, so the nightly's stack-bearing cases run one at a time
-# whatever EVAL_TASK_PARALLELISM is, and that serial chain is already at or
-# past the 480m periodic deadline on cost hints alone.
+# REGISTERED in hack/eval/nightly-cases.txt on 2026-10-20, at the 900s drift
+# band, and listed in hack/eval/nightly-main-b.txt so the two halves' chains
+# stay balanced. It holds lock-infra for its whole run, as every case with a
+# `stack:` does.
+#
+# What it waited for was room on that chain, and what provided it was the
+# recorder periodic's ceiling going from 480m to 720m on 2026-10-20 -- the
+# first night at it ran 401 minutes and graded its part whole, where the three
+# before truncated at 484-485. One night of margin, so this case is among the
+# first to drop if the ceiling goes back.
 ---
 id: gitops-drift-load-bearing-change-triage
 name: A loosening the workload depends on is triaged to a fix that runs, not a revert

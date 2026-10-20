@@ -32,10 +32,16 @@ fleet-audit-unchanged-finding-keeps-wording
 first-install-hello-running
 first-install-hello-done
 # One of the two CUJ 1 halves registered on 2026-10-20 (#2889). Both landed
-# in main-a and took its chain 1950s past main-b's, so one moves here: 7950s
-# against 7800s. This one rather than its sibling because its plant is the
-# longer of the two -- three observed rollouts, two of them waiting out a
-# failure -- and because it leaves main-a with three drift cases rather than
-# four, which spends less of that install's ALERT_DAILY_LIMIT_DRIFT bucket
-# on one project.
+# in main-a and took its chain 1950s past main-b's, over the one-case
+# tolerance, so one moves here: 7950s against 7800s.
+#
+# This one rather than its sibling because its plant is the longer of the two
+# in real time -- three observed rollouts, two of them waiting out a failure,
+# against the sibling's single rollout -- so with both priced at the same 900s
+# the halves balance identically on the hint and this way balances better on
+# the clock.
+#
+# No periodic sets main-a or main-b today; the recorder logs "Nightly part:
+# main". This line is inert until they exist, which is why it is placed on
+# the arithmetic alone.
 gitops-drift-load-bearing-change-triage

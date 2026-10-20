@@ -905,23 +905,35 @@
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
-# The revert half of CUJ 1: a GitOps-owned NetworkPolicy deleted out of band,
-# where the live state is the accident and restoring what git declares is the
-# right answer. Its stack plants the policy under the GitOps field manager,
-# deletes it, and asserts the namespace holds none; the record carries
-# `join: no_object` and no `owners` key, which is what the detector emits for
-# a delete (#2889). Holds the infra lock; 900s, the drift band its two
+# The revert half of CUJ 1 (#2889): a GitOps-owned NetworkPolicy deleted out
+# of band, where the live state is the accident and restoring what git
+# declares is the right answer. Its stack plants the policy under the GitOps
+# field manager, deletes it, and asserts the namespace holds none; the record
+# carries `join: no_object` and no `owners` key, which is what the detector
+# emits for a delete. Holds the infra lock; 900s, the drift band every gitops-drift case
 # siblings carry.
+#
+# Both halves waited on room in that chain. The recorder periodic's ceiling
+# went 480m to 720m on 2026-10-20 and its first night at the new one ran 401
+# minutes, graded its part whole, and measured a 16-case infra-lock chain --
+# where 10-14, 10-16 and 10-19 had each stopped at 484-485m with a partial
+# verdict, which is 480m plus the grace. Six new units at the band add ~90
+# minutes, or ~45 at the rate the sibling drift cases actually run. One
+# night of margin, so this pair is the first to drop if the ceiling returns.
 ./tasks/gitops-drift-deleted-policy-triage/task.yaml
 
-# The codify half of CUJ 1, and the discriminating one: a hardening setting
-# loosened by hand that turns out to be the only reason the workload runs, so
-# the correct answer is to write the live state into git. Without it an agent
-# that answers "revert" to every security drift scores full marks on the
-# suite, which is the failure CUJ 1 exists to beat. The stack plants three
+# The codify half of CUJ 1 (#2889), and the discriminating one: a hardening
+# setting loosened by hand that turns out to be the only reason the workload
+# runs, so the correct answer is to write the live state into git. Without it
+# an agent that answers "revert" to every security drift scores full marks on
+# the suite, which is the failure CUJ 1 exists to beat. The stack plants three
 # rollout revisions -- declared (never started), non-root uid (crash-looped),
-# root (healthy) -- so the load-bearing property is observable (#2889).
-# Holds the infra lock; 900s, the drift band.
+# root (healthy) -- so the load-bearing property is observable. Holds the
+# infra lock; 900s, and listed in nightly-main-b.txt to balance the halves.
+#
+# It was red until #3227 shipped `gke-load-bearing-change` on 2026-10-16, and
+# carries no `expected_fail` marker because #3116, which owned that red, is
+# closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
 # Catalogue entry 12 (a node label is removed): seeded-a's
