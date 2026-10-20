@@ -309,8 +309,9 @@ numbers are true only of the commit they ran on, so a pull request that runs
 the harness puts its result line in its own description. (Until #3553 this
 paragraph restated them by hand, and every pull request that added a mutation
 conflicted with every other one over it.) A full run's last line doesn't count
-the `must_survive` controls: their verdict is `SURVIVED (expected)`, which is
-neither killed, noisy nor a survivor. Each mutation names the control it removes,
+a `must_survive` control that passes: its verdict is `SURVIVED (expected)`,
+which is neither killed, noisy nor a survivor. A control that goes red is
+`OVERSHOT` and counts as survived, and one whose anchor moved counts as stale. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
 not run in CI — it edits tracked files in place — so it is a thing to run
 when adding a test, which step 4 below says to do. Its STALE check needs no
@@ -358,7 +359,7 @@ suite once at the end: a run that ends red says so and exits non-zero.
 3. Assert the _refusal_, never the presence of the control. Twice in this
    project an object's existence has been mistaken for its enforcement.
 4. Add a mutation that removes the control, confirm your test goes red, and
-   record the verdict. This is not optional and not on the honour system —
+   put the verdict line in your pull request's description. This is not optional and not on the honour system —
    the suite fails until the mutation exists.
 5. If it fails against current code, decorate it `@known_violation` with the
    invariant and the document that records the finding — and give its class a

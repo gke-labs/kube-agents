@@ -295,7 +295,7 @@ class TheSuiteCoversEveryInvariant(unittest.TestCase):
 
 
 def _load_mutation_harness():
-    """hack/conformance-mutations.py loaded by path, the way the STALE test loads it."""
+    """hack/conformance-mutations.py loaded by path, for the tests that read its table."""
     import importlib.util
 
     source = Path(__file__).resolve().parents[2] / "hack" / "conformance-mutations.py"
@@ -421,16 +421,7 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         # Every mutation the harness runs, not just the ones written as a
         # literal Mutation(...) call: loading the script by path is cheap here
         # and catches a helper or alias that would hide a mutation from the walk.
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location("conformance_mutations", source)
-        harness = importlib.util.module_from_spec(spec)
-        # dataclasses looks the defining module up in sys.modules.
-        sys.modules[spec.name] = harness
-        try:
-            spec.loader.exec_module(harness)
-        finally:
-            sys.modules.pop(spec.name, None)
+        harness = _load_mutation_harness()
         self.assertEqual(seen, len(harness.MUTATIONS),
                          "a mutation is built some way other than a literal Mutation(...) call")
         self.assertEqual(stale, [], "rewrite these mutations against the current source")
@@ -452,7 +443,11 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         import re
 
         readme = (Path(__file__).resolve().parent / "README.md").read_text()
-        counts = re.findall(r"\b\d+ (?:mutations?|KILLED|NOISY|killed|noisy)\b", readme)
+        counts = re.findall(
+            r"\b\d+ (?:mutations?|KILLED|NOISY|killed|noisy)\b"  # "206 mutations: 175 KILLED"
+            r"|\b(?:killed|noisy|survived|stale)=\d+"  # a run's result line pasted in
+            r"|\b\d+ of the \d+\b",  # "accounts for 203 of the 206"
+            readme)
         self.assertEqual(
             counts, [],
             "tests/conformance/README.md restates a mutation count; point at "

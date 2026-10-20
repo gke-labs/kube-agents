@@ -58,8 +58,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
-    #: and B1-gke-mcp-overlay-copy-redundant.
+    #: and KILLED is the failure. `--summary` names the current ones.
     must_survive: bool = False
 
 
@@ -2426,8 +2425,9 @@ def summary(mutations: list[Mutation]) -> str:
         f"{len(mutations)} mutations, {len(controls)} must_survive control(s): "
         f"{', '.join(controls) or 'none'}.\n"
         f"A full run's last line counts the other {len(mutations) - len(controls)}: "
-        f"killed + noisy + survived + stale. A control's verdict, SURVIVED (expected), "
-        f"is none of those."
+        f"killed + noisy + survived + stale. A control that passes, SURVIVED (expected), "
+        f"is none of those; one that goes red (OVERSHOT) counts as survived, and one "
+        f"whose anchor moved counts as stale."
     )
 
 
