@@ -267,7 +267,9 @@ Already served (see Scope). The additions:
   planning time. A provider can withdraw a patch version between the plan and the window, and a
   withdrawn version stays selectable. `target-patch-valid` does the version half: it reads the
   location's server config when the report runs and grades the member's target as a blocker when
-  it is in neither the cluster's channel's `validVersions` nor `validNodeVersions`, and the running
+  it is in neither the cluster's channel's `validVersions` nor `validNodeVersions` (a target given
+  as `MAJOR.MINOR.PATCH` without its `-gke.` build is in a list when the list carries a build of it,
+  as the API reads it), and the running
   control-plane version as a risk when its own channel's list has moved past it, whatever another
   channel or `validMasterVersions` still lists (the exemption the Monday audit's `master-behind`
   check applies, which hides this failure). The action names the newest active patch of the

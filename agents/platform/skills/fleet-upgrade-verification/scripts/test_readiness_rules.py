@@ -969,6 +969,38 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         node_only = next(v for v in config["validNodeVersions"] if v not in next(c for c in config["channels"] if c["channel"] == "REGULAR")["validVersions"])
         self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=node_only))["blocking"], [])
 
+    def test_a_target_without_its_build_is_valid_when_the_channel_lists_a_build_of_it(self):
+        # `--target-version 1.36.4` passes the report's validator (`MAJOR.MINOR.PATCH[-gke.BUILD]`) and the API
+        # reads it as the patch's newest listed build: valid when REGULAR lists one, a blocker when it lists none.
+        record = seeded_b()
+        config = recorded("server_config_us_central1_a.json")
+        regular = next(c for c in config["channels"] if c["channel"] == "REGULAR")["validVersions"]
+        full = regular[0]
+        short = full.rsplit("-gke.", 1)[0]
+        self.assertNotIn(short, regular)
+        result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=short))
+        self.assertEqual(result["blocking"], [])
+        self.assertTrue(result["notes"][0].startswith(f"channel REGULAR; target {short} valid;"), result["notes"])
+        self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=full))["blocking"], [])
+        # A full version is matched exactly: an unlisted build of a listed patch is withdrawn.
+        self.assertEqual([f["version"] for f in target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=short + "-gke.1"))["blocking"]], [short + "-gke.1"])
+        # A patch of which no build is listed anywhere: withdrawn, naming the newest active patch of the minor.
+        minor = ".".join(short.split(".")[:2])
+        unlisted = f"{minor}.999"
+        self.assertFalse(any(v.startswith(unlisted + "-gke.") for v in regular + config["validNodeVersions"]))
+        result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=unlisted))
+        self.assertEqual([(f["kind"], f["version"], f["newest"]) for f in result["blocking"]], [("target", unlisted, None)])
+        self.assertIn(f"target {unlisted} withdrawn", result["notes"][0])
+        # A build the node list alone carries makes its patch valid too.
+        node_only = next(v for v in config["validNodeVersions"] if v not in regular)
+        node_only_short = node_only.rsplit("-gke.", 1)[0]
+        if not any(v.startswith(node_only_short + "-gke.") for v in regular):
+            self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=node_only_short))["blocking"], [])
+        self.assertTrue(target_patch_valid.version_listed("1.36.4", ["1.36.4-gke.1495002"]))
+        self.assertFalse(target_patch_valid.version_listed("1.36.4", ["1.36.40-gke.1"]))
+        self.assertFalse(target_patch_valid.version_listed("1.36.4-gke.2", ["1.36.4-gke.1495002"]))
+        self.assertFalse(target_patch_valid.version_listed(None, ["1.36.4-gke.1495002"]))
+
     def test_no_channel_unknown_channel_and_a_failed_read(self):
         record = {**seeded_b(), "releaseChannel": {"channel": "UNSPECIFIED"}}
         result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.36.4-gke.1391002"))

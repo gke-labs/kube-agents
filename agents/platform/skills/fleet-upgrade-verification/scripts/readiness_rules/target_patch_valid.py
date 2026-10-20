@@ -6,8 +6,10 @@ pool upgrade to it fails on an image the provider no longer serves. The rule rea
 location's server config (the report's `server_config` read, `gcloud container
 get-server-config`, once per location) and grades two things against the cluster's own
 channel's `validVersions`: the report's target version for the member, a blocker when it is
-in neither that list nor `validNodeVersions`; and the running control-plane version, a risk
-when the channel's list has moved past it. A cluster on no channel is graded against
+in neither that list nor `validNodeVersions` (a target given as `MAJOR.MINOR.PATCH` with no
+`-gke.` build, which the API reads as that patch's newest listed build, is in a list when the
+list carries a build of it; a full version is matched exactly); and the running control-plane
+version, a risk when the channel's list has moved past it. A cluster on no channel is graded against
 `validMasterVersions`, the list a static-version cluster takes versions from. The action
 names the newest active patch of the version's minor on the channel.
 
@@ -45,6 +47,8 @@ NO_CHANNEL_VALUES = ("", "UNSPECIFIED")
 NO_CHANNEL_LABEL = "no channel"
 # `MAJOR.MINOR.PATCH-gke.BUILD`, the shape every list carries; a version without the suffix is build 0.
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
+# What separates the patch from the build: a target without it names every build of the patch.
+BUILD_SEPARATOR = "-gke."
 VERSION_PARTS = 4
 MINOR_PARTS = 2
 KIND_TARGET = "target"
@@ -83,6 +87,18 @@ def parse_version(text) -> tuple | None:
     if not m:
         return None
     return tuple(int(part or 0) for part in m.groups())
+
+
+def version_listed(text, roster) -> bool:
+    """Whether `text` is in `roster`: a full version by exact match; a version with no `-gke.`
+    build (`MAJOR.MINOR.PATCH`, which the API reads as that patch's newest listed build) when a
+    listed version carries it as the prefix before `-gke.`."""
+    if text in roster:
+        return True
+    if not isinstance(text, str) or BUILD_SEPARATOR in text:
+        return False
+    prefix = text + BUILD_SEPARATOR
+    return any(isinstance(candidate, str) and candidate.startswith(prefix) for candidate in roster)
 
 
 def channel_roster(server_config: dict, channel: str) -> tuple[list[str] | None, str]:
@@ -150,7 +166,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     master_text = cluster.get(CURRENT_MASTER_VERSION_KEY)
     target_verdict = TARGET_NONE
     if target_text:
-        if target_text in roster or target_text in node_versions:
+        if version_listed(target_text, roster) or version_listed(target_text, node_versions):
             target_verdict = TARGET_VALID
         else:
             target_verdict = TARGET_WITHDRAWN
