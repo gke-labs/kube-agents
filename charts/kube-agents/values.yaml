@@ -196,8 +196,9 @@ operator:
   # Memory here is the manager's cache, and the cache holds one entry per
   # object in the cluster, not per install: every informer it starts is
   # cluster-wide, Owns() included (it filters events by owner, it does not
-  # scope the watch). Pods are the one kind kept out of it, read live instead
-  # because they outnumber the rest. What stays: Deployments, StatefulSets,
+  # scope the watch). Pods are read live instead, because they outnumber
+  # every other kind, as Secrets and the A2A bookkeeping objects already
+  # were. What stays: Deployments, StatefulSets,
   # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
   # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
   # ClusterRoleBindings, Roles and RoleBindings; and the three custom

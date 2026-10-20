@@ -97,35 +97,78 @@ func TestTheStatusPodScanReadsPodsLive(t *testing.T) {
 // watch: the fault appears to clear for a pass, then comes back. Returning
 // what the CR already holds makes the computed status equal the stored one,
 // and the caller's change check then writes nothing at all.
+// It holds only what it wrote itself. Degraded with Ready=False is also what
+// Reconcile's refusals write — a missing sandbox Secret, an unrecognised
+// mode — and those clear on evidence an earlier step of the same pass has
+// already gathered, so re-asserting one because a Pod list got a 429 would
+// contradict a check that ran, and on a spec edit the generation witness
+// forces that contradiction out to the CR.
 func TestAStatusScanThatReadNoPodsHoldsTheFaultTheCRCarries(t *testing.T) {
-	agent := podReadAgent()
-	agent.Status.Phase = "Degraded"
-	agent.Status.Conditions = []metav1.Condition{{
-		Type:               "Ready",
-		Status:             metav1.ConditionFalse,
-		Reason:             "ImagePullBackOff",
-		Message:            "Container 'platform-agent' in pod test-agent-gateway-abc123 is waiting: ImagePullBackOff - back-off pulling image",
-		LastTransitionTime: metav1.Now(),
-	}}
-	scheme := setupScheme()
-	refusing := interceptor.NewClient(
-		fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build(),
-		interceptor.Funcs{
-			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-				if _, ok := list.(*corev1.PodList); ok {
-					return fmt.Errorf("the API server refused the list")
-				}
-				return c.List(ctx, list, opts...)
-			},
-		})
-	r := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: scheme}
-
-	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
-	if phase != "Degraded" || reason != "ImagePullBackOff" {
-		t.Errorf("a pass that read no pod reports %q/%q, want the stored Degraded/ImagePullBackOff held (message %q)", phase, reason, message)
+	cases := []struct {
+		name       string
+		reason     string
+		message    string
+		wantPhase  string
+		wantReason string
+	}{
+		{
+			name:       "a fault this scan wrote is held",
+			reason:     "ImagePullBackOff",
+			message:    "Container 'platform-agent' in pod test-agent-gateway-abc123 is waiting: ImagePullBackOff - back-off pulling image",
+			wantPhase:  "Degraded",
+			wantReason: "ImagePullBackOff",
+		},
+		{
+			name:       "an unschedulable pod this scan wrote is held",
+			reason:     "PodUnschedulable",
+			message:    "Pod test-agent-gateway-abc123 cannot be scheduled onto any available node: insufficient cpu.",
+			wantPhase:  "Degraded",
+			wantReason: "PodUnschedulable",
+		},
+		{
+			name:       "a refusal another writer put there is not",
+			reason:     reasonShellSandboxKeysMissing,
+			message:    shellSandboxKeysMissingMessage("platform-agent-shell-sandbox-keys"),
+			wantPhase:  "Provisioning",
+			wantReason: "Provisioning",
+		},
 	}
-	if message != agent.Status.Conditions[0].Message {
-		t.Errorf("the held message is %q, want the stored %q", message, agent.Status.Conditions[0].Message)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := podReadAgent()
+			agent.Status.Phase = "Degraded"
+			agent.Status.Conditions = []metav1.Condition{{
+				Type:               "Ready",
+				Status:             metav1.ConditionFalse,
+				Reason:             tc.reason,
+				Message:            tc.message,
+				LastTransitionTime: metav1.Now(),
+			}}
+			scheme := setupScheme()
+			refusing := interceptor.NewClient(
+				fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build(),
+				interceptor.Funcs{
+					List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+						if _, ok := list.(*corev1.PodList); ok {
+							return fmt.Errorf("the API server refused the list")
+						}
+						return c.List(ctx, list, opts...)
+					},
+				})
+			r := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: scheme}
+
+			phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
+			if phase != tc.wantPhase || reason != tc.wantReason {
+				t.Errorf("a pass that read no pod reports %q/%q, want %q/%q (message %q)", phase, reason, tc.wantPhase, tc.wantReason, message)
+			}
+			if tc.wantPhase == "Degraded" && message != tc.message {
+				t.Errorf("the held message is %q, want the stored %q", message, tc.message)
+			}
+			if tc.wantPhase != "Degraded" && message == tc.message {
+				t.Errorf("the scan re-asserted another writer's message: %q", message)
+			}
+		})
 	}
 }
 

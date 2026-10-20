@@ -159,6 +159,19 @@ const (
 	reasonContainerError    = "Error"
 	reasonCrashLoopBackOff  = "CrashLoopBackOff"
 
+	// readyConditionType and degradedPhase are the condition and the phase
+	// getDeploymentStatusDetails reads back off the CR when a pod read failed.
+	readyConditionType = "Ready"
+	degradedPhase      = "Degraded"
+	// podScanMessagePrefixContainer and podScanMessagePrefixPod open every
+	// message getDeploymentStatusDetails writes, and nothing else that writes
+	// the Ready condition opens with either: the refusals in Reconcile name a
+	// Secret, a mode or a git URL. They are how a pass that could not read the
+	// pods tells a fault it is holding for itself from one another writer put
+	// there, which it must not re-assert after that writer's cause has gone.
+	podScanMessagePrefixContainer = "Container '"
+	podScanMessagePrefixPod       = "Pod "
+
 	// a2aVerifierContainerName is the verifier Deployment's only container
 	// (buildA2AVerifierDeployment). The pod scan names it to tell the one
 	// crash loop that is the a2a stack still coming up from a real fault;
@@ -4500,6 +4513,14 @@ func (r *PlatformAgentReconciler) podReader() client.Reader {
 	return r.Client
 }
 
+// podScanWroteMessage reports whether a stored Ready-condition message is one
+// getDeploymentStatusDetails wrote, which is the only kind it may hold on a
+// pass that could not read the pods.
+func podScanWroteMessage(message string) bool {
+	return strings.HasPrefix(message, podScanMessagePrefixContainer) ||
+		strings.HasPrefix(message, podScanMessagePrefixPod)
+}
+
 // capBucketProvisioned is "this install has provisioned the bus at least
 // once", which is this operator's only cheap proxy for "the capability bucket
 // exists". It qualifies exactly one container's crash loop; see the verifier
@@ -4591,6 +4612,16 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// CR already carries instead of to the default. That answer equals what is
 	// stored, which is what makes it safe: the change check finds nothing
 	// moved and writes nothing at all.
+	//
+	// Only a fault this scan itself wrote, though, which is what the message
+	// prefixes test. Degraded with Ready=False is also what Reconcile's
+	// refusals write (ShellSandboxKeysMissing, ModeNotRecognized,
+	// A2AProvisionFailed) and what this pass's own git checks write, and those
+	// clear on evidence this pass has already gathered -- the Secret now
+	// exists, the mode was corrected. Re-asserting one of those because a Pod
+	// list got a 429 would contradict a check that ran, and on a spec edit the
+	// generation witness forces the write out, stamping a refusal as current
+	// against the generation that fixed it.
 	var unread error
 	unreadSelectors := 0
 	for _, selector := range selectors {
@@ -4606,7 +4637,8 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		// every selector down together, and this runs on a 30s requeue.
 		logf.FromContext(ctx).Error(unread, "could not list every one of the agent's pods for the status scan; a fault this pass does not find is left as the CR last reported it",
 			"selectorsUnread", unreadSelectors, "selectorsTried", len(selectors))
-		if held := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); agent.Status.Phase == "Degraded" && held != nil {
+		if held := meta.FindStatusCondition(agent.Status.Conditions, readyConditionType); agent.Status.Phase == degradedPhase &&
+			held != nil && podScanWroteMessage(held.Message) {
 			phase, reason, message = agent.Status.Phase, held.Reason, held.Message
 		}
 	}
