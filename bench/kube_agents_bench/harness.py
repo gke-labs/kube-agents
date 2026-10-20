@@ -2641,6 +2641,7 @@ class KubeAgentsHarness(AgentHarness):
         statuses: Mapping[str, str],
         fallback_messages: Mapping[str, Sequence[str]] | None = None,
         poll_interval: float = 0.1,
+        unsettled: list[str] | None = None,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
 
@@ -2667,6 +2668,12 @@ class KubeAgentsHarness(AgentHarness):
             return board_messages
 
         for t in failure_cards:
+            live_status = final_bstate[0].get(t)
+            if live_status is not None and live_status not in _TERMINAL_STATUSES:
+                if unsettled is not None:
+                    unsettled.append(t)
+                if isinstance(statuses, dict):
+                    statuses[t] = live_status
             card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
             if card_msgs:
                 board_messages.extend(card_msgs)
@@ -2843,6 +2850,16 @@ class KubeAgentsHarness(AgentHarness):
                 {t: _status(t) for t in outstanding},
                 delegation_timeout,
             )
+        unsettled = [t for t in poll_failure_statuses if _status(t) not in _TERMINAL_STATUSES]
+        if unsettled:
+            _record_ceiling(
+                result,
+                observed,
+                awaited,
+                unsettled,
+                {t: _status(t) for t in unsettled},
+                delegation_timeout,
+            )
         # The scorer reads an inject record with no activity marker and
         # nothing outside the envelope as one whose door showed no trace, and
         # sets its router-scope ``tool_called`` aside (scoring._inject_blind).
@@ -2852,14 +2869,7 @@ class KubeAgentsHarness(AgentHarness):
         # checks that could read them are set aside on inject records anyway.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
-        bstatuses = {
-            t: (
-                poll_failure_statuses[t]
-                if t in poll_failure_statuses and _status(t) not in _FAILURE_STATUSES
-                else _status(t)
-            )
-            for t in awaited
-        }
+        bstatuses = {t: _status(t) for t in awaited}
         bsummaries = {
             t: str(read.cards[t]["summary"])
             for t in awaited
@@ -2970,9 +2980,12 @@ class KubeAgentsHarness(AgentHarness):
                 self._extract_trajectory_failure_summaries(result.trajectory, failure_awaited)
             )
         if not outstanding:
+            unsettled: list[str] = []
             board_messages = self._final_board_failures(
-                awaited, statuses, poll_failure_messages, poll_interval=poll_interval
+                awaited, statuses, poll_failure_messages, poll_interval=poll_interval, unsettled=unsettled
             )
+            if unsettled:
+                _record_ceiling(result, observed, awaited, unsettled, statuses, delegation_timeout)
             self._settle(
                 result,
                 observed,
@@ -3183,9 +3196,12 @@ class KubeAgentsHarness(AgentHarness):
         # the run stopped.
         if outstanding and timed_out:
             _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
+        unsettled: list[str] = []
         board_messages = self._final_board_failures(
-            awaited, latest, poll_failure_messages, poll_interval=poll_interval
+            awaited, latest, poll_failure_messages, poll_interval=poll_interval, unsettled=unsettled
         )
+        if unsettled:
+            _record_ceiling(result, observed, awaited, unsettled, latest, delegation_timeout)
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.

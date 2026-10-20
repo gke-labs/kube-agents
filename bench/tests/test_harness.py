@@ -3994,6 +3994,102 @@ def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
     result = KubeAgentsHarness().run("Check cards.")
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(t1 in e for e in result.errors)
+    assert "Finished." in result.output
+
+
+def test_a_429_blocked_card_unblocked_and_ready_at_settle_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card 429-blocked and retired, then unblocked to ready at settle, records ceiling and remains graded."""
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": "t2 finished"}, "runs": []},
+                "s2",
+            ),
+            _text("Finished."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                return ""
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
+                # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is ready.
+                payload = {
+                    "statuses": {t1: "ready"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(t1 in e for e in result.errors)
     assert "Finished." in result.output
 
 
