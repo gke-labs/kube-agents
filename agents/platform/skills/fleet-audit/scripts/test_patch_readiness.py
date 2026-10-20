@@ -1725,6 +1725,101 @@ class UpgradeBlockedTest(unittest.TestCase):
         self.assertIn("evicts Deployment/pinned-batch-runner anyway", hit["impact"])
         self.assertNotIn("checks_not_applicable", entry)
 
+    # The per-entry readiness rules' blocks (`readiness.rule_blocking`, one row per
+    # blocker with the registry's rule id and the rule's text), as the reporter writes
+    # them: a load balancer draining longer than GKE waits per node (entry 21) and a
+    # Node whose instance is gone (entry 22).
+    DRAIN_RULE = {
+        "rule": "lb-connection-draining",
+        "entry": 21,
+        "backend_service": "drain-timeout-seeded-b",
+        "text": "BackendService drain-timeout-seeded-b drains for 3600 s on pool default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out; set the timeout at or under the wait: `gcloud compute backend-services update drain-timeout-seeded-b --global --connection-draining-timeout=600`",
+    }
+    ORPHAN_RULE = {
+        "rule": "orphan-node-objects",
+        "entry": 22,
+        "node": "gke-lag-default-pool-aaaa-ghost",
+        "text": "Node gke-lag-default-pool-aaaa-ghost names no instance in the project (providerID gce://acme/us-central1-a/gke-lag-default-pool-aaaa-ghost; Ready=Unknown; unschedulable=true): a pool upgrade waits on it; delete the Node object: `kubectl delete node gke-lag-default-pool-aaaa-ghost`",
+    }
+
+    def member_with_rules(self, name, rules, **kwargs):
+        row = self.member(name, **kwargs)
+        row["readiness"]["rule_blocking"] = list(rules)
+        return row
+
+    def test_a_behind_cluster_blocked_by_a_readiness_rule_alone_is_a_critical_candidate_naming_the_rule(self):
+        """A rule's block is as definite as a budget's: the row is graded, the
+        candidate carries the rule id and the rule's own text, and nothing
+        lands in checks_unevaluated."""
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_rules("lag", [self.DRAIN_RULE])])
+        entry = by["lag"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        hits = [c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK]
+        self.assertEqual(len(hits), 1)
+        hit = hits[0]
+        self.assertEqual((hit["severity"], hit["object"]), (pr.CRITICAL, "Cluster/lag"))
+        self.assertTrue(hit["excerpt"].startswith("readiness.status=blocked: readiness rule lb-connection-draining blocks it: BackendService drain-timeout-seeded-b drains for 3600 s on pool default-pool"), hit["excerpt"])
+        self.assertIn("--connection-draining-timeout=600", hit["excerpt"])
+        self.assertTrue(hit["impact"].startswith("lag is 1 minor(s) behind and its upgrade would not go through cleanly: readiness rule lb-connection-draining blocks it: BackendService drain-timeout-seeded-b"), hit["impact"])
+        self.assertNotIn("held, not stopped", hit["impact"])
+        self.assertNotIn("{", hit["impact"])
+        self.assertNotIn("checks_not_applicable", entry)
+
+    def test_a_rule_block_beside_a_failed_budget_read_is_still_a_candidate(self):
+        """Blocked beats unknown for a rule's block as it does for the ceiling's:
+        a budget read that failed beside a definite block is no gap."""
+        by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_rules("lag", [self.ORPHAN_RULE], read_error="kubectl: forbidden")])
+        entry = by["lag"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        hit = next(c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertIn("readiness rule orphan-node-objects blocks it: Node gke-lag-default-pool-aaaa-ghost names no instance in the project", hit["excerpt"])
+        self.assertIn("kubectl delete node gke-lag-default-pool-aaaa-ghost", hit["impact"])
+
+    def test_a_rule_block_names_every_rule_after_the_ceiling_and_before_the_budgets(self):
+        row = self.member_with_rules("lag", [self.DRAIN_RULE, self.ORPHAN_RULE], pdbs=[self.BUDGET], skew=["old-pool"])
+        hit = next(c for c in self.collect([cluster(name="lag", master=self.BEHIND)], [row])["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        excerpt = hit["excerpt"]
+        self.assertLess(excerpt.index("skew ceiling"), excerpt.index("readiness rule lb-connection-draining"))
+        self.assertLess(excerpt.index("readiness rule lb-connection-draining"), excerpt.index("readiness rule orphan-node-objects"))
+        self.assertLess(excerpt.index("readiness rule orphan-node-objects"), excerpt.index("PodDisruptionBudget seeded-upgrade/pinned-batch-runner"))
+        # The ceiling's tail governs, as it does over a budget.
+        self.assertIn("would not complete", hit["impact"])
+        self.assertIn("evicts Deployment/pinned-batch-runner anyway", hit["impact"])
+        # Rules and a budget, no ceiling: the rules' sentence, with the budget in the cause.
+        row = self.member_with_rules("lag", [self.DRAIN_RULE], pdbs=[self.BUDGET])
+        hit = next(c for c in self.collect([cluster(name="lag", master=self.BEHIND)], [row])["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertIn("would not go through cleanly", hit["impact"])
+        self.assertNotIn("held, not stopped", hit["impact"])
+        self.assertIn("refuses eviction of Deployment/pinned-batch-runner", hit["impact"])
+
+    def test_many_rule_blocks_step_down_the_ladder_and_then_to_a_count_under_the_ledgers_clips(self):
+        # Forty rows of a few hundred characters: the ladder names one and counts the rest.
+        rules = [{**self.ORPHAN_RULE, "text": self.ORPHAN_RULE["text"].replace("ghost", f"ghost-{i:03d}") * 2} for i in range(40)]
+        hit = next(c for c in self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_rules("lag", rules)])["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertLessEqual(len(hit["excerpt"]), pr.EXCERPT_MAX_CHARS)
+        self.assertLessEqual(len(hit["impact"]), pr.IMPACT_MAX_CHARS)
+        self.assertIn("readiness rule orphan-node-objects blocks it: Node gke-lag-default-pool-aaaa-ghost-000", hit["excerpt"])
+        self.assertIn("and 39 more readiness rule block(s); the readiness report at", hit["excerpt"])
+        self.assertIn(self.report_path(), hit["excerpt"])
+        self.assertIn("and 39 more readiness rule block(s); the readiness report at", hit["impact"])
+        # Rows whose one text outgrows the clip on its own: counts alone, the floor nothing grows past.
+        rules = [{**self.ORPHAN_RULE, "text": self.ORPHAN_RULE["text"] * 8}]
+        hit = next(c for c in self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_rules("lag", rules)])["lag"]["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertLessEqual(len(hit["excerpt"]), pr.EXCERPT_MAX_CHARS)
+        self.assertLessEqual(len(hit["impact"]), pr.IMPACT_MAX_CHARS)
+        self.assertIn("1 readiness rule block(s), listed in the readiness report at", hit["excerpt"])
+        self.assertIn("1 readiness rule block(s), listed in the readiness report at", hit["impact"])
+
+    def test_rule_rows_without_a_rule_id_are_not_a_cause(self):
+        readiness = {"status": "blocked", "pdbs": {"blocking": []}, "skew": {"blocking": []}, "rule_blocking": ["junk", {"text": "no id"}, {"rule": "", "text": "blank"}]}
+        self.assertIsNone(pr._readiness_cause(readiness))
+        readiness["rule_blocking"].append({"rule": "cluster-status-age", "text": "lag has been RECONCILING for 6d 3h on operation-1 (UPDATE_CLUSTER, started 2026-10-14T00:00:00Z), past the 4h threshold; freeze changes"})
+        cause = pr._readiness_cause(readiness, budget_applies=False, skew_applies=False)
+        self.assertEqual(cause.rules, [("cluster-status-age", readiness["rule_blocking"][-1]["text"])])
+        self.assertEqual(cause.impact_format, pr.UPGRADE_BLOCKED_IMPACT_RULES_FORMAT)
+
     def test_the_recorded_command_names_the_reporter_with_rc_zero(self):
         by = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member("lag", pdbs=[self.BUDGET])])
         record = next(c for c in by["lag"]["commands"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
