@@ -24,9 +24,13 @@
 # upgrades-fleet-readiness-failclosed-webhook: the fold re-emits the leading name (everything
 # before the first `:` outside a bracket) bare, so a wrap on any `/`-joined component and an
 # aside after one are tolerated, and the prompt asks for the name as the API shows it. The
-# verifier lowercases the reply, so the kind is matched in lowercase. The forbid is the same
-# anchor with any entry number but 1, so a line that files the budget under another entry
-# fails however the right line reads. Lines about other objects match nothing and are
+# verifier lowercases the reply, so the kind is matched in lowercase. An aside after the
+# number (a parenthetical, or a clause after a comma, a semicolon or a dash) is tolerated: the
+# fold strips closers, not words. Two forbids share the anchor: an entry number other than 1,
+# so a line that files the budget under another entry fails however the right line reads;
+# and, after the right number, a second entry number, a `/`-joined alternative or a hedge
+# (`or`, `maybe`, `possibly`, `perhaps`, `probably`, `likely`, `tentative`, `?`), so a line
+# that keeps entry 1 open is refused as well. Lines about other objects match nothing and are
 # ignored; the verdicts and the advice around them are the judge's.
 #
 # The route check proves the answer came from the retrospective (its store, read in the
@@ -97,8 +101,9 @@ verification_spec:
       required_patterns:
         - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md'
 
-  # The verdict: the budget's line, entry 1. The forbid: the same object under any
-  # other entry number.
+  # The verdict: the budget's line, entry 1, an aside after the number tolerated. The
+  # forbids: the same object under any other entry number; a second number or a hedge
+  # after the right one.
   - name: slot-b-budget-is-catalogue-entry-1
     role: objective
     mode: assert
@@ -108,9 +113,10 @@ verification_spec:
       fixture_roles:
         - readiness-drain-blocked
       any_of_patterns:
-        - '(?m)^{cluster:b}/seeded-upgrade/poddisruptionbudget/pinned-batch-runner(?:\s*\([^)\n]*\))?: entry 1$'
+        - '(?m)^{cluster:b}/seeded-upgrade/poddisruptionbudget/pinned-batch-runner(?:\s*\([^)\n]*\))?: entry 1\b(?!/)[^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:b}/seeded-upgrade/poddisruptionbudget/pinned-batch-runner(?:\s*\([^)\n]*\))?: entry (?!1$)'
+        - '(?m)^{cluster:b}/seeded-upgrade/poddisruptionbudget/pinned-batch-runner(?:\s*\([^)\n]*\))?: entry (?!1\b)\d'
+        - '(?m)^{cluster:b}/seeded-upgrade/poddisruptionbudget/pinned-batch-runner(?:\s*\([^)\n]*\))?: entry 1\b[^\n]*(?:\bentry\s+\d|/\s*\d|\?|\b(?:or|maybe|possibly|perhaps|probably|likely|tentative|tentatively|unsure|unclear)\b)'
 
   - name: no-invented-cves
     role: objective

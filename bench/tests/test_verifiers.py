@@ -8555,6 +8555,75 @@ def test_worker_commands_required_run_names_what_did_not_run():
     assert res.status == "fail" and "no worker command ran fleet_upgrade_report.py --readiness across 2 command(s)" in res.reason
 
 
+# ------------------------------- the retrospective's drained-budget case's line
+#
+# The budget's declared line, read out of its task file: the planted object under
+# catalogue entry 1. An aside after the number is tolerated (the fold strips
+# closers, not words); another entry number fails the objective as the wrong
+# entry; a second number or a hedge after the right one fails it too. Same fold
+# and grounding as the webhook case.
+
+_BUDGET_CASE = TASKS / "upgrades-retrospective-drained-budget" / "task.yaml"
+_BUDGET_SPEC = yaml.safe_load(_BUDGET_CASE.read_text(encoding="utf-8"))
+_BUDGET_OBJECTIVE = "slot-b-budget-is-catalogue-entry-1"
+_BUDGET_LINE = "seeded-b/seeded-upgrade/PodDisruptionBudget/pinned-batch-runner: entry 1"
+_BUDGET_REPORT_LINE = "Report: /opt/data/upgrade-retrospective/upgrade-retro-report.md"
+_BUDGET_OTHER_LINE = "seeded-b/seeded-upgrade/Deployment/pinned-batch-runner: entry 1"
+
+
+def _budget_case_verdict(text: str):
+    check = next(e["check"] for e in _BUDGET_SPEC["verification_spec"] if e["name"] == _BUDGET_OBJECTIVE)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="budget-fleet-") as root:
+        _write_fleet_dir(Path(root), list(_BUDGET_SPEC["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _BUDGET_LINE,
+        _BUDGET_LINE + ".",
+        # an aside after the number: a parenthetical (its closer folded off), a clause
+        _BUDGET_LINE + " (the budget forbids the eviction)",
+        _BUDGET_LINE + " (maxUnavailable 0)",
+        _BUDGET_LINE + ", the drain stalled on it for 40 minutes",
+        _BUDGET_LINE + " \u2014 fix: give the budget room before the next upgrade",
+        # the line among others
+        _BUDGET_REPORT_LINE + "\n\n" + _BUDGET_LINE + "\n" + _BUDGET_OTHER_LINE + "\n",
+    ],
+)
+def test_drained_budget_declared_line_accepted(text):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "pass", (verdict.reason, text)
+
+
+@pytest.mark.parametrize(
+    "text, forbidden",
+    [
+        # another entry number, with or without an aside: the forbid names the wrong entry
+        (_BUDGET_LINE[:-1] + "7", True),
+        (_BUDGET_LINE[:-1] + "11", True),
+        (_BUDGET_LINE[:-1] + "7 (the budget forbids the eviction)", True),
+        # the right number kept open: a second number, a `/`-joined alternative, a hedge
+        (_BUDGET_LINE + " or 7", True),
+        (_BUDGET_LINE + " or entry 7", True),
+        (_BUDGET_LINE + "/7", True),
+        (_BUDGET_LINE + "?", True),
+        (_BUDGET_LINE + " (possibly 11)", True),
+        (_BUDGET_LINE + ", tentatively", True),
+        # no line for the budget: the objective's miss alone, no forbid
+        (_BUDGET_REPORT_LINE + "\n" + _BUDGET_OTHER_LINE, False),
+    ],
+)
+def test_drained_budget_declared_line_refused(text, forbidden):
+    verdict = _budget_case_verdict(text)
+    assert verdict.status == "fail", text
+    assert ("forbidden patterns matched" in verdict.reason) is forbidden, (verdict.reason, text)
+
+
 # The readiness case for the same catalogue entry grades the readiness report's
 # own output: a fifth declared-line slot quotes the cell the report prints for
 # the finding. That cell carries a `;`, which keeps `_VALUE_WRAP` from removing
