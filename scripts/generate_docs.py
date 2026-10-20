@@ -156,6 +156,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "fleet-audit-reports",
         "github-issue-resolver",
         "inspect-repository",
+        "kube-agents-feedback",
         "pr-conversation",
         "version-control",
     ],

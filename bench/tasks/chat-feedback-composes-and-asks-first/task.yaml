@@ -1,0 +1,128 @@
+# A /feedback ask is written up and shown for a yes before anything is filed.
+#
+# Domain: chat and routing. "/feedback <text>" is the chat command for a
+# report about kube-agents itself (docs/designs/chat-feedback-command.md).
+# The gateway passes the text through as typed; the Planning Agent composes
+# the exact submission the public form would get — a one-line summary, the
+# kind, what happened — says the report becomes a public issue, asks for a
+# yes, and ends its turn. Only the yes files a card for platform, whose
+# kube-agents-feedback skill files through the credential broker. The person
+# therefore sees, word for word, what will become public, and nothing is
+# filed that they did not see.
+#
+# WHY THIS IS RED ON MAIN, measured rather than argued. The Planning Agent on
+# main has no bullet for the command: it files a card at once and acks in one
+# line, routing the text to platform as "when in doubt", or answers that
+# there is no such command. Neither reply carries the composed submission.
+#
+# Run against `main-2471b53f` on 2026-10-19 (`run_20261019_171746_071193`,
+# the api transport on a `spec.mode: next` install) the objective failed and
+# the no-card safeguard failed with it:
+#
+#   the-reply-shows-the-submission-and-asks   fail
+#     required patterns absent: summary, what happened, posted twice,
+#     public issue, "?"
+#   no-card-before-the-yes                    fail
+#     1 call to kanban_create in the router trajectory
+#
+# The reply was "looking into the duplicate weekly cost report." Green on
+# the branch's build (`feedback-0f3242a`) four times:
+# `run_20261019_173116_791687`, `run_20261019_173239_070335`,
+# `run_20261019_174425_814891`, `run_20261019_174528_407945`. Two runs are
+# not in that count: the first after the deploy ended in
+# `KUBE_AGENTS_INFRA_FAILURE` (HTTP 429 from the agent endpoint, too many
+# concurrent runs) with an empty reply, and one composed the submission under
+# the heading "Title:" where the first draft of the objective accepted only
+# "Summary"; the heading pattern now takes either word, since the form calls
+# the line the summary and says it becomes the issue title, and the red's
+# reply carries neither.
+#
+# WHAT IS GRADED. The Planning Agent's own reply, which both transports carry
+# as the answer text: the submission (a summary line, the kind Bug, a "what
+# happened" section that keeps the user's words), the public-issue warning,
+# and a closing question. Two safeguards: no card before the yes (a tool_called
+# on kanban_create wrapped in `none`, router scope, which the inject lane
+# shows through the activity trace and the api lane through the trajectory),
+# and no issue URL or claim of filing in the reply. The run ends on the
+# question — the harness grades the pause and the text, not the filing: a
+# case that files a public issue on gke-labs/kube-agents every nightly run is
+# not acceptable, so the filing turn is the pull request's manual validation.
+#
+# The prompt names no cluster, no project and nothing read from a Secret, so
+# the composed text has nothing to redact and the redaction rule is not what
+# this case grades. No fixtures and no cluster: deployer noop.
+#
+# Slug per docs/designs/domains.yaml: the conversation around a routed ask.
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+id: chat-feedback-composes-and-asks-first
+name: A /feedback ask is written up and shown for a yes before anything is filed
+prompt: >-
+  /feedback The weekly cost report was posted twice in the same thread this
+  morning, about a minute apart, with identical text. Once would do.
+expected_output: >-
+  The front door answers with the exact submission it would file: a one-line
+  summary, the kind (Bug), and what happened in the user's own words. It says
+  the report becomes a public issue on gke-labs/kube-agents and asks for a
+  yes. It files no card, and nothing reaches the form or the tracker.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+
+owner: bradhoekstra
+
+verification_spec:
+  # The composed submission, the warning, and the question, in the reply the
+  # person reads. fold_decoration: the agent lays the submission out with
+  # bold labels and bullets, which must not hide the words.
+  # assert, not the converge default: the reply is immutable once the run
+  # ends, so polling a failed check would only wait out the timeout.
+  - name: the-reply-shows-the-submission-and-asks
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      required_patterns:
+        # The one-line heading: the form calls it the summary and says it
+        # becomes the issue title, and the agent labels it either way.
+        - '(?i)\b(?:summary|title)\b'
+        - '(?i)\bbug\b'
+        - "(?i)what happened"
+        - "(?i)posted twice"
+        - "(?i)public issue"
+        - '\?'
+  # Nothing filed, nothing claimed filed: no issue URL, no bare issue number
+  # (the reply has nothing to number before the yes), and no claim of a
+  # completed filing: a first-person verb (an adverb allowed) within two
+  # words of a report noun, a report noun that has been, was or is filed, an
+  # "it" that has been or is now filed, or a line that is the bare claim
+  # ("filed it for you.", "done - filed as a public issue."). Negated and
+  # conditional wording ("nothing has been filed yet", "once you say yes, it
+  # is filed", "i will file it") is the compliant wording and is not matched.
+  # bench/tests/test_chat_feedback_filing_claim_patterns.py holds both corpora.
+  - name: nothing-was-filed-or-claimed-filed
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - 'github\.com/gke-labs/kube-agents/issues/\d+'
+        - '(?<![\w/.#])#\d{2,}\b'
+        - "(?i)\\b(?:filed|opened|created|submitted)(?: it| this| the report| the issue)? as (?:issue )?#?\\d+"
+        - "(?i)\\bi(?:'ve| have|'m| am)?(?: just| already| now| gone ahead and)? (?:filed|opened|created|submitted) (?:\\S+ ){0,2}?(?:it|this|report|issue|bug|feedback)\\b"
+        - "(?i)\\b(?:your |the |this |a |an )?(?:public |new )?(?:report|issue|bug|feedback)(?: has been| has now been| was| is now| is)? (?:filed|opened|created|submitted)\\b"
+        - "(?i)\\b(?:it|this)(?: has been| has now been| was| is now|'s now) (?:filed|opened|created|submitted)\\b"
+        - "(?i)\\b(?:it's|it is) (?:filed|opened|created|submitted) now\\b"
+        - "(?i)^(?:done\\W+|ok\\W+|all set\\W+)?(?:filed|opened|submitted|created)(?: it| this| the report| your report)?(?: for you)?(?: as a (?:public |new )?issue)?\\.?\\s*$"
+  # The front door composes and asks; the card waits for the yes. No
+  # require_success: an attempted kanban_create is the violation.
+  - name: no-card-before-the-yes
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

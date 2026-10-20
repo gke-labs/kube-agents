@@ -39,6 +39,19 @@ const sessionKindDM = "dm"
 // the right place.
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
+// feedbackCommandNotice answers a bare "/feedback", the gateway's second slash
+// command (docs/designs/chat-feedback-command.md): where a report about
+// kube-agents itself goes, what one needs, and how to have the agent write
+// one up. Deterministic and model-free, like every gateway affordance; the
+// two links are chattext's, shared with the personas. "/feedback <text>" is
+// not answered here: it is the agent's turn, passed through as typed.
+var feedbackCommandNotice = fmt.Sprintf(`📝 To report a problem with kube-agents itself:
+• Open an issue: %s
+• Or use the feedback form, which needs no account: %s
+A report needs a one-line summary, the kind (Bug, Feature request, Question or Other) and what happened. A submission becomes a public issue, so keep cluster names, project ids and anything read from a Secret out of it.
+To have it written up and filed for you, send `+"`/feedback <what happened>`"+` — I'll show you the exact text and ask before anything is filed.`,
+	chattext.FeedbackTrackerURL, chattext.FeedbackFormURL)
+
 // nothingRunningNotice answers a "stop" in a conversation with no active
 // task. nothingRunningCardNotice is the same answer for a conversation that
 // has run a task before: its turn may have filed a kanban card (the gateway
@@ -909,6 +922,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// without the prefix, not a confirmation that drops the ask.
 		msg.Text, sessionCmd = sessionRest, false
 	}
+	// The bare "/feedback" is answered in place whatever the conversation's
+	// route or task state; with text after it the message is the agent's and
+	// nothing here changes (chattext.IsFeedbackCommand).
+	feedbackRest, feedbackCmd := chattext.IsFeedbackCommand(msg.Text)
+	bareFeedback := feedbackCmd && feedbackRest == ""
 	// An explicit cancel from a backend that can express one is read before
 	// the text is read at all: it is not an ask, and a program must never
 	// have to spell "stop" to reach a control path. Read after the strip
@@ -936,6 +954,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		}
 	}
 	switch {
+	case msg.Intent == "" && bareFeedback:
+		// Answered without touching the record's task state: not a steer,
+		// not a stop, not a new task.
+		g.log.Info("feedback notice", "conversation", rec.Key)
+		g.post(rec.Key, feedbackCommandNotice)
 	case msg.Intent == "" && sessionCmd:
 		if !g.sessionCommand(ctx, rec, msg, backend, sessionRest, principal, authority) {
 			return
@@ -1704,7 +1727,8 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 	return true
 }
 
-// sessionCommand resolves the one slash command the gateway owns:
+// sessionCommand resolves the first of the two slash commands the gateway
+// owns (the other, a bare /feedback, is answered inline in routeTurn):
 // "/session" marks the conversation session-routed, "/session <text>" marks
 // it and runs <text> as the first turn, "/session off" releases the
 // incarnation and re-homes to the default addressee. Deterministic, like

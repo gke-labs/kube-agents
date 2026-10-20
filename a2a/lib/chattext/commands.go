@@ -117,13 +117,27 @@ func IsDelegate(text string) (string, bool) {
 	return rest, true
 }
 
-// slashSessionWord and slashOffWord spell the one slash command the gateway
-// resolves itself. Spec-chatops-gateway "Sessions by default": a slash
-// command resolves first, names a route rather than a handle, and is a
+// slashSessionWord and slashOffWord spell the first of the two slash commands
+// the gateway resolves itself. Spec-chatops-gateway "Sessions by default": a
+// slash command resolves first, names a route rather than a handle, and is a
 // debugging/opt-in door for the transition rather than the taught interface.
+// slashFeedbackWord is the second (docs/designs/chat-feedback-command.md):
+// bare, the gateway answers it with the two reporting links below; with text
+// after it, the gateway passes the message through as typed.
 const (
-	slashSessionWord = "session"
-	slashOffWord     = "off"
+	slashSessionWord  = "session"
+	slashOffWord      = "off"
+	slashFeedbackWord = "feedback"
+)
+
+// The two places a report about kube-agents itself goes, as the gateway's
+// bare-/feedback notice hands them out. The same two links are pinned in the
+// personas by tests/test_feedback_reference.py, and the short link is the
+// docs site's redirect to the form (scripts/feedback_form/README.md), never
+// a Google Forms URL, so a recreated form needs no release.
+const (
+	FeedbackTrackerURL = "https://github.com/gke-labs/kube-agents/issues"
+	FeedbackFormURL    = "https://gke-labs.github.io/kube-agents/feedback"
 )
 
 // IsSessionCommand reports whether the turn is "/session": a leading "/"
@@ -136,16 +150,32 @@ const (
 // is refused client-side), so there the form is "@<bot> /session" - the
 // mention is stripped before this reads the text.
 func IsSessionCommand(text string) (string, bool) {
+	return slashWord(text, slashSessionWord)
+}
+
+// IsFeedbackCommand reports whether the turn is "/feedback": the same shape
+// as IsSessionCommand. rest is "" for a bare "/feedback", which the gateway
+// answers itself with FeedbackTrackerURL and FeedbackFormURL; anything else
+// is the report the person wants written up, and the gateway hands the text
+// on as typed, prefix included, for the agent to compose and confirm.
+func IsFeedbackCommand(text string) (string, bool) {
+	return slashWord(text, slashFeedbackWord)
+}
+
+// slashWord resolves one slash command: a leading "/" (after trimming)
+// followed by word, case-insensitively, then the end of the text or
+// whitespace. rest is the ORIGINAL text after the word, trimmed.
+func slashWord(text, word string) (string, bool) {
 	trimmed := strings.TrimSpace(text)
-	if len(trimmed) < 1+len(slashSessionWord) || trimmed[0] != '/' {
+	if len(trimmed) < 1+len(word) || trimmed[0] != '/' {
 		return "", false
 	}
 	body := trimmed[1:]
-	word, rest := body, ""
+	got, rest := body, ""
 	if end := strings.IndexFunc(body, unicode.IsSpace); end >= 0 {
-		word, rest = body[:end], strings.TrimSpace(body[end:])
+		got, rest = body[:end], strings.TrimSpace(body[end:])
 	}
-	if !strings.EqualFold(word, slashSessionWord) {
+	if !strings.EqualFold(got, word) {
 		return "", false
 	}
 	return rest, true
@@ -171,7 +201,7 @@ func IsStop(text string) bool {
 }
 
 // IsCommand reports whether the gateway would act on text as a command on
-// any route and in any task state: the superset of the four matchers, with
+// any route and in any task state: the superset of the five matchers, with
 // the status ask in its wide form. A chat message's choice must not be one
 // (spec-a2a-payloads.md, "Chat messages"), since a click posts its text as
 // the clicker's own message.
@@ -180,6 +210,11 @@ func IsCommand(text string) bool {
 		return true
 	}
 	if _, ok := IsSessionCommand(text); ok {
+		return true
+	}
+	// Only the bare form: "/feedback <text>" is an ordinary turn the agent
+	// answers, and a button may well offer one.
+	if rest, ok := IsFeedbackCommand(text); ok && rest == "" {
 		return true
 	}
 	_, ok := IsDelegate(text)
