@@ -255,6 +255,22 @@
       "deliver": "chat"
     },
     {
+      "id": "sa-role-watch",
+      "name": "Service Account Role Watch",
+      "schedule": {
+        "kind": "cron",
+        "expr": "25 * * * *",
+        "display": "25 * * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "sa_role_watch.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "chat-delivery-watch",
       "name": "Chat Delivery Watch",
       "schedule": {

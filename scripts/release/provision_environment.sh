@@ -284,6 +284,14 @@ INSTALL_ARGS=(
   --gcp-region="${GCP_REGION}"
   --gke-cluster-name="${GKE_CLUSTER_NAME}"
   --image-tag="${IMAGE_TAG}"
+  # Named, not left to install.sh's default: a first install with no
+  # install.env now defaults to next, and a today run must install today (the
+  # E2E readiness check compares the installed mode with this one). A next
+  # run installs next, as the exported PLATFORM_AGENT_MODE already made it,
+  # and the patch and gate at the bottom still run. On a long-lived
+  # environment, where next is refused above, the rendered install.env sets no
+  # mode, which resolves to today, so the flag agrees and is recorded there.
+  --mode="${RELEASE_PLATFORM_AGENT_MODE}"
 )
 
 # Everything below reaches install.sh as a flag rather than as an inherited

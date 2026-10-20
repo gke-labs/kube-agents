@@ -10,9 +10,9 @@ import datetime
 import json
 import pathlib
 import re
+import shlex
 import shutil
 import stat
-import shlex
 import subprocess
 import tempfile
 import unittest
@@ -1675,7 +1675,7 @@ class InstallerCommonTest(unittest.TestCase):
         for args, expect in (
             # Installed today through the installer; the key now asks for next.
             ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
-                                  "renders the NATS bus and the A2A gateway", "Google Chat moves")),
+                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat, or Slack")),
             # Installed next through the installer; the key now asks for today,
             # which renders nothing and so removes the recorded field.
             ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
@@ -5379,6 +5379,18 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                     out,
                 )
                 self.assertNotIn("secretpart", out)
+
+    def test_a_list_of_bot_tokens_through_flags_names_the_mode_flag(self):
+        # A first install is next by default, so the way to keep the list is --mode=today.
+        proc = self._run(token="xoxb-1-secretpart,xoxb-2-secretpart", flags=True)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=1", proc.stdout, out)
+        self.assertIn(
+            "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env or "
+            "--slack-bot-token and run again, or keep this install on PLATFORM_AGENT_MODE=today "
+            "(--mode=today on a first install with no install.env).",
+            out,
+        )
 
     def test_one_bot_token_or_none_passes(self):
         for token in (self._TOKEN, f" {self._TOKEN} ", ""):

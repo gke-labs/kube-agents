@@ -14,8 +14,7 @@ kubectl get all,configmap,pvc,serviceaccount,secret -A \
   -l app.kubernetes.io/part-of=kube-agents
 ```
 
-One deliberate carve-out: controller output rendered under the unsupported `mode: next` dev
-toggle carries `part-of: a2a-next` instead, plus a `kubeagents.x-k8s.io/a2a-component` label,
+One deliberate carve-out: controller output rendered under `mode: next` carries `part-of: a2a-next` instead, plus a `kubeagents.x-k8s.io/a2a-component` label,
 so the A2A stack is one query of its own
 (`-l app.kubernetes.io/part-of=a2a-next`) and the query above keeps meaning "the supported
 install" exactly.
@@ -113,8 +112,9 @@ install:
   kustomization — the only one here with a StatefulSet — therefore sets `includeTemplates: false`
   and patches the two pod templates directly instead.
 
-PersistentVolumeClaims are created once and never updated by the controller, so claims that
-existed before the upgrade stay unlabelled until they are recreated. They will not appear in the
+PersistentVolumeClaims are created once; afterwards the controller only grows the two data
+claims' size and never rewrites their labels, so claims that existed before the upgrade stay
+unlabelled until they are recreated. They will not appear in the
 `-l app.kubernetes.io/part-of=kube-agents` query above. The constraint above means Hindsight's
 claim stays unlabelled permanently, not just until recreation.
 

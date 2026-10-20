@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the switch itself (enum, helper pair, skew path, managed-`.env` pin) is implemented in the operator, and the NATS/gateway render, the agent-side bus surface and session-pod spawning it gates are implemented at playground posture
+- **Status:** merged design of record; the switch itself (enum, helper pair, skew path, managed-`.env` pin) is implemented in the operator, and the NATS/gateway render, the agent-side bus surface and session-pod spawning it gates are implemented; `next` is the default for a first `install.sh` install, and `today` is supported as a rollback for one release
 
 ## Purpose
 
@@ -24,10 +24,13 @@ One optional enum on `PlatformAgentSpec`, next to `Harness` and `Integration`:
 Mode *string `json:"mode,omitempty"`
 ```
 
-`mode: next` is a dev toggle, not a supported configuration. Same shape as the other
-opt-in toggles on this CRD: optional pointer field, nil-safe helper. The install surfaces
-can set it, and each one's default writes no field at all ("Choosing it at install",
-below). Naming note: the CRD already has a `mode` field on the
+`mode: next` is what a first install through `install.sh` runs; `today` is supported as a
+rollback for one release before stage 4 removes it. Same shape as the other opt-in toggles
+on this CRD: optional pointer field, nil-safe helper. The field carries no CRD default and
+absent stays `today`: the API server applies a structural-schema default whenever it reads a
+stored object, not only on create, so a default of `next` would move every existing install
+that never wrote the field. The new-install default lives in the install surfaces instead
+("Choosing it at install", below). Naming note: the CRD already has a `mode` field on the
 Google Chat integration spec (display verbosity, `spec.integration.googleChat.mode`).
 Different path, no schema collision - named here so nobody conflates them.
 
@@ -116,8 +119,9 @@ UIDs and the agent answers on each side, and the next lane runs it after its mat
 
 One thing `next` does not ship: long-term audit. The stream is a 72h ring buffer and
 the audit exporter is stage 2 scope, so `next` has no archive - the NATS spec's audit
-section describes the design, not what this toggle turns on. Dev posture; don't run
-traffic that matters on it and expect audit to exist.
+section describes the design, not what this toggle turns on. A `next` install keeps bus
+traffic for 72 hours and no longer; that is a known limit of the new-install default until
+the exporter lands.
 
 The operator also writes the mode into the managed settings it already renders, as a
 single key: `KUBEAGENTS_MODE`. (Amended 8/26: the draft said
@@ -147,15 +151,28 @@ delivery mechanism can change later without touching call sites.
 
 ## Choosing it at install
 
-Every install surface can set the mode, and every one defaults to rendering no field, so
-an install that never asks renders the CR it did before the surfaces knew the field:
+Every install surface can set the mode. `install.sh` is the one whose first install
+defaults to `next`; the chart and the composition default to rendering no field, so an
+install made through them that never asks renders the CR it did before they knew the field.
+Neither can tell a first install from an upgrade without reading the cluster, and the chart
+rendered without one (`helm template`, Argo CD) would move an existing install:
 
 - The chart's `platformAgent.mode`, `null` by default, which leaves `mode` out of the CR
   (`""` does the same). `today` and `next` render as themselves; the values schema refuses
   anything else.
 - The Terraform composition's `platform_agent_mode`, `"today"` by default, which passes
   the chart nothing; `"next"` passes `platformAgent.mode: next`.
-- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`.
+- `install.sh --mode=today|next`, recorded in `install.env` as `PLATFORM_AGENT_MODE`. When
+  neither the flag nor the file names a mode (`install.env.example` leaves the line commented
+  out), the target cluster decides: a live `PlatformAgent` keeps its mode (absent is `today`),
+  a deleted one whose release is still installed keeps the release's, and only a cluster with
+  neither is a first install, which records `next` (`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`),
+  or `today` when it mirrors its third-party images, since nothing points `next`'s NATS images at the mirror. A
+  cluster that cannot be described or read is never taken for a first install. `upgrade.sh`
+  and the other front doors read a file with no key as `today` (`DEFAULT_PLATFORM_AGENT_MODE`), so
+  `install.sh` records the mode it settled on there; under `-y` it refuses a switch that
+  neither `--mode` nor the file asked for, and a full `upgrade.sh` over a file with no key is
+  refused when the install may run `next`.
 
 A mode switch on a running install is made by editing `PLATFORM_AGENT_MODE`, not by
 passing `--mode`, which is refused when it disagrees with the file, and the run that

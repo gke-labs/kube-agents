@@ -154,6 +154,13 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # review. Delete an entry once its case is registered -- staleness is only
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
+# Why the twelve upgrade-failure scenario cases below wait, in one sentence
+# their KNOWN_UNREGISTERED reasons share.
+SCENARIO_BATCH_WAIT = (
+    "enters hack/eval/nightly-cases.txt in a later batch of five as the main "
+    "part's nights allow, the next after the first batch's nights are measured"
+)
+
 KNOWN_UNREGISTERED = {
     # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
     # as the stack cases below: a `stack:` case runs alone on lock-infra
@@ -211,6 +218,59 @@ KNOWN_UNREGISTERED = {
     "ghes-pdb-remediation-pr": (
         "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
         "run by hand with the recipe in the case header"
+    ),
+    # The upgrade-failure catalogue's scenario cases enter
+    # hack/eval/nightly-cases.txt in batches of five (decided 2026-10-15 on
+    # the registration's review). The nightly's main part ran 370-401 minutes
+    # on its clear nights of 10-15 October against the 480m deadline, the
+    # seventeen measure 770-1,145 serial minutes a night, and the cost-ordered
+    # queue would charge a deadline kill to the existing cases' last
+    # repetition; each entry below carries its measured cost, and
+    # hack/ci-eval-pr.sh's unit_cost_hint prices the seventeen from the same
+    # record. The first batch, entries 1, 3, 5, 12 and 20, is in the roster's
+    # sorted section. These twelve have a fixture the fleet plants and a
+    # task file, and wait for a later batch: the next after the first batch's
+    # first measured week of nights, in the order of measured cost, the five
+    # with no clean pass last. An entry goes when its batch's pull request
+    # moves the case to the roster's sorted section.
+    "upgrades-no-surge-pool-recreate-warned": (
+        f"catalogue entry 2: {SCENARIO_BATCH_WAIT}; median 1065s on three clean "
+        "passes, the record's heaviest run at 3163s"
+    ),
+    "upgrades-node-local-state-named": (
+        f"catalogue entry 4: {SCENARIO_BATCH_WAIT}; median 1226s on two clean passes"
+    ),
+    "upgrades-removed-api-callers-distinguished": (
+        f"catalogue entry 6: {SCENARIO_BATCH_WAIT}; no clean pass on record, an "
+        "agent gap on its complete runs"
+    ),
+    "upgrades-pod-security-latest-pinned-named": (
+        f"catalogue entry 8: {SCENARIO_BATCH_WAIT}; one clean pass, 750s"
+    ),
+    "upgrades-stale-client-skew-named": (
+        f"catalogue entry 10: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-containerd-socket-agent-named": (
+        f"catalogue entry 13: {SCENARIO_BATCH_WAIT}; one clean pass, 540s"
+    ),
+    "upgrades-cgroup-blind-runtime-named": (
+        f"catalogue entry 14: {SCENARIO_BATCH_WAIT}; one clean pass, 360s"
+    ),
+    "upgrades-multi-process-oom-group-named": (
+        f"catalogue entry 15: {SCENARIO_BATCH_WAIT}; no clean pass on record, an "
+        "agent gap on its complete run"
+    ),
+    "upgrades-network-policy-enforcement-stated": (
+        f"catalogue entry 16: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-node-image-coupled-agent-named": (
+        f"catalogue entry 17: {SCENARIO_BATCH_WAIT}; one clean pass, 2180s wall"
+    ),
+    "upgrades-cuda-pinned-gpu-job-named": (
+        f"catalogue entry 18: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-intree-volume-named": (
+        f"catalogue entry 19: {SCENARIO_BATCH_WAIT}; median 1167s on two clean passes"
     ),
 }
 
