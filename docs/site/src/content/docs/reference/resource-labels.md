@@ -113,8 +113,9 @@ install:
   kustomization — the only one here with a StatefulSet — therefore sets `includeTemplates: false`
   and patches the two pod templates directly instead.
 
-PersistentVolumeClaims are created once and never updated by the controller, so claims that
-existed before the upgrade stay unlabelled until they are recreated. They will not appear in the
+PersistentVolumeClaims are created once; afterwards the controller only grows the two data
+claims' size and never rewrites their labels, so claims that existed before the upgrade stay
+unlabelled until they are recreated. They will not appear in the
 `-l app.kubernetes.io/part-of=kube-agents` query above. The constraint above means Hindsight's
 claim stays unlabelled permanently, not just until recreation.
 

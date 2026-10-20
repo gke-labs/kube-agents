@@ -305,8 +305,8 @@ func TestBuildPVC(t *testing.T) {
 		t.Errorf("expected PVC name test-agent-data, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if storageReq.String() != "10Gi" {
-		t.Errorf("expected storage request 10Gi, got %s", storageReq.String())
+	if storageReq.String() != "50Gi" {
+		t.Errorf("expected storage request 50Gi, got %s", storageReq.String())
 	}
 }
 

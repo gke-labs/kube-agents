@@ -1,0 +1,148 @@
+# Upgrade-failure catalogue entry 8 (a default changes in the new minor), in
+# the shape the seeded fleet plants it: moving-admission-default on seeded-a,
+# a namespace (seeded-defaults) whose Pod Security Admission labels enforce
+# and warn at baseline with both versions pinned to `latest`, so the rule set
+# applied to its workloads is whichever one the running minor ships and
+# changes at every upgrade without anyone editing it. baseline-edge-worker
+# (one replica) is admitted by today's baseline; a check the next minor adds
+# to baseline refuses its replacement pods at admission.
+#
+# The prompt names no namespace and no label value. It asks which namespaces
+# carry a Pod Security Admission version that follows the running minor
+# rather than naming one, and for the answer to end in one declared line per
+# such namespace, in a fixed form; the deterministic objectives read the
+# planted namespace's line and nothing else.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# The two graded values are namespace labels' values, so each may carry its
+# key before it as the API prints it (`pod-security.kubernetes.io/enforce=baseline`,
+# or with a colon) or the bare `=`, and the level may be followed by the other
+# modes after a comma (`baseline, warn baseline`, `warn: baseline` or
+# `warn=baseline`, as the version slot spells it), and the version by the other
+# modes' versions (`latest, warn-version latest`).
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the enforce-version label. Pinning it to a named minor
+# is the heal that passes every objective and empties the fixture.
+id: upgrades-pod-security-latest-pinned-named
+name: The namespace whose Pod Security version follows the minor is named before the upgrade that moves it
+
+prompt: >-
+  Before the seeded clusters in this project move to their next minor, tell
+  me which namespaces have Pod Security Admission labels whose version
+  follows the running minor instead of naming one, so the rule set applied
+  to their workloads changes with the upgrade, what level they enforce, and
+  which workloads in them that affects. Read only; change nothing. End your
+  answer with one line per such namespace in exactly this form, no other
+  words on the line: "<cluster>/<namespace>: enforce
+  <privileged|baseline|restricted>; enforce-version <label value>; rule set
+  changes at the next minor: <yes|no>".
+
+expected_output: >-
+  It reads the pod-security.kubernetes.io labels on every namespace of the
+  seeded clusters and names seeded-defaults on seeded-a: enforce baseline and
+  warn baseline, both at version latest, so the baseline rule set applied to
+  it is whichever the running control plane ships and changes at each minor;
+  baseline-edge-worker (one replica) is admitted by today's baseline and is
+  what a stricter one would refuse at its next rollout or node drain. It
+  recommends pinning enforce-version to the current minor and running the
+  target minor's rule set in warn and audit before enforce, and performs no
+  change. It cites no CVE identifiers and ends with the declared line for
+  each such namespace, the planted one reading "enforce baseline;
+  enforce-version latest; rule set changes at the next minor: yes".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+fixtures:
+  - moving-admission-default
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases. The
+  # subject is a namespace, so the line names the cluster and the namespace.
+  - name: the-planted-namespace-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-level-is-baseline
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?(?:pod-security\.kubernetes\.io/enforce)?(?:: ?|=)?baseline(?:, (?:warn|audit)(?:: ?|=| )(?:privileged|baseline|restricted))*(?: ?\([^)\n;]*\))?; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?(?!(?:pod-security\.kubernetes\.io/enforce)?(?:: ?|=)?baseline(?:, (?:warn|audit)(?:: ?|=| )(?:privileged|baseline|restricted))*(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-version-is-latest
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?:pod-security\.kubernetes\.io/enforce-version)?(?:: ?|=)?latest(?:, (?:warn|audit)-version(?:: ?|=| )(?:latest|v?\d+\.\d+))*(?: ?\([^)\n;]*\))?; rule set changes at the next minor: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?(?!(?:pod-security\.kubernetes\.io/enforce-version)?(?:: ?|=)?latest(?:, (?:warn|audit)-version(?:: ?|=| )(?:latest|v?\d+\.\d+))*(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; rule set changes at the next minor: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-rule-set-moves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - moving-admission-default
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/(?:(?:namespaces?|ns)/)?seeded-defaults(?:\s*\([^)\n]*\))?: enforce:? ?[^ :;\n][^;\n]*; enforce-version:? ?[^ :;\n][^;\n]*; rule set changes at the next minor: (?!yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The namespace's enforce-version label still reads latest. The key
+  # carries dots, so it is quoted for the JSONPath parser; the namespace is
+  # cluster-scoped, and kubectl ignores the role's namespace for this kind.
+  - name: the-planted-version-pin-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: moving-admission-default
+      kind: namespace
+      resource_name: seeded-defaults
+      namespace: seeded-defaults
+      path: 'metadata.labels."pod-security.kubernetes.io/enforce-version"'
+      op: eq
+      value: latest

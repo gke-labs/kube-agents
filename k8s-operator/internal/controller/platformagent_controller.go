@@ -1263,8 +1263,9 @@ func (r *PlatformAgentReconciler) reconcileGatewayServiceAccount(ctx context.Con
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	dataClaim := buildPVC(agent)
 	pvcs := []*corev1.PersistentVolumeClaim{
-		buildPVC(agent),
+		dataClaim,
 		buildSystemPVC(agent),
 	}
 	customPVCs, err := buildCustomPVCs(agent)
@@ -1277,6 +1278,11 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 			return err
 		}
 	}
+	// The data claim follows agentDataStorageSize on an existing install too.
+	// reconcilePersistentVolumeClaim is create-only, so without this a size
+	// raised to stop the volume filling would reach new installs only, and
+	// every install that already had the problem would keep it.
+	r.growDataClaim(ctx, client.ObjectKeyFromObject(dataClaim), dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
 	return nil
 }
 
@@ -1284,7 +1290,8 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 	if err := ctrl.SetControllerReference(agent, pvc, r.Scheme); err != nil {
 		return err
 	}
-	// PVCs are created once and never updated, so this labels new claims only;
+	// PVCs are created once and never updated here (growDataClaim widens the
+	// data claims' size and nothing else), so this labels new claims only;
 	// claims from before this change stay unlabelled until they are recreated.
 	withCommonLabels(pvc, agent)
 
@@ -2454,45 +2461,81 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 // growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
 //
 // A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
-// install from before agentDataStorageSize keeps the 5Gi it was given however the
-// template changes — and that claim is the destination sandbox_mirror.py copies
-// the agent's working directories into. Expansion is online; the volume stays
-// mounted and the shell keeps running.
+// install from before the current agentDataStorageSize keeps the size it was
+// given however the template changes — and that claim is the destination
+// sandbox_mirror.py copies the agent's working directories into. The mirror
+// already refuses to fill the volume it is given, so a claim this could not
+// grow means a bounded migration, not a broken one.
+func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	// The StatefulSet's template creates this claim, so no controller reference
+	// points at it; nothing else makes a claim of this name.
+	key := client.ObjectKey{Name: shellSandboxDataClaimName(agent), Namespace: agent.Namespace}
+	r.growDataClaim(ctx, key, resource.MustParse(agentDataStorageSize), nil)
+}
+
+// growDataClaim widens an existing claim to `want`. A claim that is absent is
+// a first install, where whatever creates it sizes it; a claim at or above
+// `want` is left alone, so a size an administrator raised by hand is never
+// undone. With a non-nil owner, a claim the owner does not control is left
+// alone too: reconcilePersistentVolumeClaim adopts a claim of the right name
+// whoever made it, and one an administrator made by hand, smaller on purpose,
+// stays theirs to size. Expansion is online; the volume stays mounted and its
+// pod keeps running.
 //
 // Best-effort and logged rather than returned. A StorageClass without
 // allowVolumeExpansion is how an administrator configured the cluster, and
 // failing the reconcile over it would take the whole agent down to fix a volume
-// that is merely smaller than we would like. The mirror already refuses to fill
-// the volume it is given, so the consequence is a bounded migration, not a broken
-// one.
-func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+// that is merely smaller than we would like.
+func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.ObjectKey, want resource.Quantity, owner metav1.Object) {
 	log := logf.FromContext(ctx)
-	want := resource.MustParse(agentDataStorageSize)
 
-	name := shellSandboxDataClaimName(agent)
 	pvc := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agent.Namespace}, pvc); err != nil {
-		// Not created yet on a first install: the template sizes it correctly.
+	if err := r.Get(ctx, key, pvc); err != nil {
 		if client.IgnoreNotFound(err) != nil {
-			log.Error(err, "could not read the sandbox data claim", "claim", name)
+			log.Error(err, "could not read the data claim", "claim", key.Name)
 		}
+		return
+	}
+	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
+		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
 		return
 	}
 
 	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if have.Cmp(want) >= 0 {
+		// The spec asks for enough. Whether the volume has it is a different
+		// question: the API server admits a resize on the StorageClass alone, and
+		// a failure after that (the project's disk quota, say) leaves the spec at
+		// the new size and status.capacity at the old one, with the reason on the
+		// claim's events rather than on any error this function would see.
+		if capacity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok && capacity.Cmp(want) < 0 {
+			log.Info("the data claim's resize has not landed; the claim's events and status.capacity say why",
+				"claim", key.Name, "spec", have.String(), "capacity", capacity.String())
+		}
 		return
 	}
 
 	patched := pvc.DeepCopy()
 	patched.Spec.Resources.Requests[corev1.ResourceStorage] = want
 	if err := r.Patch(ctx, patched, client.MergeFrom(pvc)); err != nil {
-		log.Error(err, "could not grow the sandbox data claim; migration into it stays bounded by the space that is there",
-			"claim", name, "have", have.String(), "want", want.String())
+		// An admission refusal repeats identically on every reconcile until
+		// someone changes the cluster: a StorageClass without
+		// allowVolumeExpansion or a namespace quota (Forbidden), or a claim not
+		// yet bound (Invalid), which binds and then takes the next pass. State,
+		// not an error of ours; Info with the API's reason, so the line that
+		// recurs every quarter hour is not an Error with a stack trace.
+		if errors.IsForbidden(err) || errors.IsInvalid(err) {
+			log.Info("the API server refused the data claim's growth; the StorageClass, a namespace storage quota, or a claim not yet bound decides this",
+				"claim", key.Name, "have", have.String(), "want", want.String(), "reason", err.Error())
+			return
+		}
+		log.Error(err, "could not grow the data claim",
+			"claim", key.Name, "have", have.String(), "want", want.String())
 		return
 	}
-	log.Info("grew the sandbox data claim to match the agent's",
-		"claim", name, "from", have.String(), "to", want.String())
+	// Acceptance, not growth: the resize itself is the CSI driver's, and it lands
+	// when status.capacity follows the spec.
+	log.Info("requested growth of the data claim", "claim", key.Name, "from", have.String(), "to", want.String())
 }
 
 // applyShellSandboxStatefulSet applies the StatefulSet, recreating it when the
