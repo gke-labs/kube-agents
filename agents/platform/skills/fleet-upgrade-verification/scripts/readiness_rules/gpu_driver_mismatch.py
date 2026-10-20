@@ -11,7 +11,9 @@ table at the target's minor. On Autopilot GKE provisions the node itself, on
 Container-Optimized OS with the driver the template's `gke-gpu-driver-version` selector names
 (`default` when absent), so the same table answers with no pool. A driver below the CUDA
 major's floor is `blocking`; one below the toolkit's own minimum is a `risk` (the build runs
-under minor version compatibility and loses the features newer than the driver); an image
+under minor version compatibility and loses the features newer than the driver); a toolkit
+the minimum table has no row for, above its major's floor, is a note naming the missing row,
+never "serves"; an image
 naming no CUDA version is a `risk`, as is a Standard template whose accelerator no pool
 carries, and so is a target past the driver table's last row (GKE's page has no row for it
 yet, so the finding names the page to verify the floor against, rather than turning every
@@ -55,6 +57,7 @@ REASON_UNKNOWN_CUDA = "CUDA {cuda} is outside the table (majors {majors})"
 BLOCKING_DETAIL = "requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), below the {floor} floor for CUDA {major}.x; the device does not open"
 RISK_DETAIL = "requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), below the {minimum} CUDA {cuda} names; the build runs under minor version compatibility and features newer than the driver fail"
 NOTE_SERVED = "{kind} {object} requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), which serves CUDA {cuda}; forward-compatibility packages inside the image are not readable from the tag"
+NOTE_TOOLKIT_UNLISTED = "{kind} {object} requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), above the {floor} floor for CUDA {major}.x, but the toolkit table has no row for CUDA {cuda}, so whether it meets the toolkit's own minimum is not graded; a row from NVIDIA's release notes settles it"
 MODE_TEXT = "gpuDriverVersion {mode}"
 POOL_TEXT = "pool {pool}"
 AUTOPILOT_POOL_TEXT = "the node Autopilot provisions"
@@ -182,7 +185,9 @@ def _grade_pins(result: dict, obj: dict, pins: list, pool_text: str, driver: int
         if driver < floor:
             detail = BLOCKING_DETAIL.format(floor=DRIVER_FORMAT.format(branch=floor), **fields)
             result["blocking"].append(rules.new_finding(RULE_ID, ENTRY, rules.GRADE_BLOCKING, obj, detail, pool=pool_text, cuda=cuda, driver=driver))
-        elif minimum is not None and driver < minimum:
+        elif minimum is None:
+            result["notes"].append(NOTE_TOOLKIT_UNLISTED.format(kind=obj["kind"], object=obj["object"], floor=DRIVER_FORMAT.format(branch=floor), **fields))
+        elif driver < minimum:
             detail = RISK_DETAIL.format(minimum=DRIVER_FORMAT.format(branch=minimum), **fields)
             result["risks"].append(rules.new_finding(RULE_ID, ENTRY, rules.GRADE_RISK, obj, detail, pool=pool_text, cuda=cuda, driver=driver))
         else:

@@ -546,6 +546,16 @@ class GpuDriverMismatchTest(unittest.TestCase):
         self.assertEqual(out["blocking"], [])
         self.assertIn("driver R580 (gpuDriverVersion LATEST), which serves CUDA 13.0", out["notes"][0])
 
+    def test_a_toolkit_the_minimum_table_has_no_row_for_is_a_note_naming_the_row_never_served(self):
+        # 13.9 clears CUDA 13's R580 floor on a LATEST pool at 1.33, but the toolkit table ends
+        # before it: what the toolkit itself needs is unread, so the note says so.
+        self.assertNotIn((13, 9), tables.CUDA_TOOLKIT_MIN_DRIVER)
+        out = run(gpu_driver_mismatch, [self.trainer("nvidia/cuda:13.9.0-base-ubuntu24.04")], pools=[self.gpu_pool(mode="LATEST")], target=parse_version("1.33.0-gke.1"))
+        self.assertEqual((out["blocking"], out["risks"], out["unknown"]), ([], [], []))
+        self.assertEqual(len(out["notes"]), 1)
+        self.assertIn("ships driver R580 (gpuDriverVersion LATEST), above the R580 floor for CUDA 13.x, but the toolkit table has no row for CUDA 13.9", out["notes"][0])
+        self.assertNotIn("serves", out["notes"][0])
+
     def test_autopilot_reads_the_driver_from_the_cos_table_and_the_selector(self):
         target = parse_version("1.33.0-gke.1")
         out = run(gpu_driver_mismatch, [self.trainer("nvidia/cuda:13.0.0-runtime-ubuntu24.04")], pools=[], target=target, autopilot=True)
