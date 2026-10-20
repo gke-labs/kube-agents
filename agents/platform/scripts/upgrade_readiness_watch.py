@@ -334,7 +334,7 @@ REMEDY_OUTSIDE_UNRESOLVED = (
     "named here again with its remedy; a lookup that keeps failing needs the install's read access on that folder, "
     "organisation or selector"
 )
-REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run): under a declared scope the reporter refuses a number before anything resolves it, so no grant lets it read one"
+REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reporter can resolve the number"
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
 # The unresolved note for a declaration the reconcile did resolve in part: a
 # container or selector lookup did not finish on its last run, so the set it
@@ -615,6 +615,8 @@ class ReportRefused(RuntimeError):
         super().__init__(detail)
         self.cause = cause
         self.signature: str | None = None
+        # The project the refusal names, as the reporter resolved it (``refused_project``).
+        self.project: str | None = None
 
 
 def refused_tick_signature(failed: dict) -> str:
@@ -905,8 +907,9 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     (``ReportRefused``), so the partial line tells it from a sandbox that
     fails. Until a reconcile tick writes a snapshot that answers (the first on
     a new install, the next on one whose snapshot predates the ``boundary``
-    key) the render answers with the management project alone, so another
-    project is refused until that tick. The whole set goes because nothing
+    key) the render answers: the management project is the one project read,
+    and every project the declaration names explicitly goes as unread, so the
+    report refuses another project, with that reason, until that tick. The whole set goes because nothing
     records this argv: it is one line of the loader on the sandbox command's
     stdin, beside both scripts' sources."""
     if scope is None:
@@ -956,7 +959,9 @@ def run_report(
         if envelope.get(ENVELOPE_EXIT_KEY) == REPORT_USAGE_EXIT:
             refusal = refusal_detail(completed.stderr or "", scope, outside_stands=outside_stands)
             if refusal is not None:
-                raise ReportRefused(*refusal)
+                refused = ReportRefused(*refusal)
+                refused.project = refused_project(completed.stderr or "")
+                raise refused
         raise RuntimeError(detail)
     return envelope
 
@@ -1079,6 +1084,18 @@ def refusal_detail(stderr: str, scope: fleet_scope_targets.ScopeTargets | None, 
         if note and kind == REFUSAL_UNREAD and fields.get(REFUSAL_OUTCOME_FIELD) == fleet_scope_targets.OUTCOME_UNRESOLVED:
             reason = f"{reason}; {note}"
         return REFUSED_DETAIL.format(reason=reason, remedy=refusal_remedy(cause, fields, scope)), cause
+    return None
+
+
+def refused_project(stderr: str) -> str | None:
+    """The project a refusal by the report script names, as the script wrote it:
+    the id it resolved a number to when the describe succeeded, the spelling it
+    was handed otherwise; None when the message names none."""
+    text = " ".join(stderr.split())
+    for template, _said, _kind in REFUSAL_REASONS:
+        found = refusal_pattern(template).search(text)
+        if found:
+            return found.groupdict().get(REFUSAL_PROJECT_FIELD) or None
     return None
 
 
@@ -1535,8 +1552,12 @@ def versions_by_project(
             unrun.append(project)
             continue
         timeout = min(VERSION_TABLE_TIMEOUT_SECONDS, remaining)
+        # Under a declared scope a number is asked for by the id already learned for it:
+        # the scope lists ids, so the reporter reads it with no describe, and a describe
+        # that fails that morning is not a refusal the operator is told to fix.
+        asked = keyed(project) if scope is not None else project
         try:
-            envelope = run_report([project], readiness=False, scope=scope, outside_stands=stands_outside(standing, scope, project, keyed(project)), timeout=timeout)
+            envelope = run_report([asked], readiness=False, scope=scope, outside_stands=stands_outside(standing, scope, project, keyed(project)), timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < VERSION_TABLE_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not stamped, so it goes first next time.
@@ -1555,6 +1576,12 @@ def versions_by_project(
             # and the remedy named is the install's, not an agent's.
             last_runs[project] = iso(now)
             failed[project] = exc
+            # A number the reporter resolved before refusing is taught its id, as a
+            # read teaches it: the next tick asks by the id with no describe, so a
+            # describe outage cannot turn an outside refusal into a number refusal,
+            # and the two spellings of one project run once.
+            if exc.project and not is_project_number(exc.project):
+                learn_project_id(ids, project, [exc.project])
             file_refusal(standing, keyed(project), exc.cause, scope)
             merged[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(
                 {MEMBER_ID_KEYS[0]: keyed(project), MEMBER_ID_KEYS[1]: None, ERROR_KIND_KEY: ERROR_KIND_REFUSED.format(cause=exc.cause), MESSAGE_KEY: TABLE_REFUSED_DETAIL.format(project=project, error=str(exc))}
@@ -1666,7 +1693,8 @@ def readiness_by_project(
             unfinished[project] = PROJECT_NOT_RUN_DETAIL.format(project=project, error=BUDGET_EXHAUSTED_DETAIL.format(project=project))
             continue
         timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
-        asked = spelled.get(project, project)
+        # By the id under a declared scope, as the table hop asks; else by the roster's spelling.
+        asked = project if scope is not None else spelled.get(project, project)
         try:
             envelope = run_report([asked], readiness=True, scope=scope, outside_stands=stands_outside(standing, scope, project, asked), timeout=timeout)
         except SandboxTimedOut as exc:

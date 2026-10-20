@@ -120,8 +120,6 @@ class FakeSandbox:
             raise self.readiness_error
         if wanted and any(p in self.failing_projects for p in asked):
             return subprocess.CompletedProcess(argv, 255, stdout="", stderr="ssh: lost connection")
-        if wanted and any(p in self.garbled_projects for p in asked):
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{{\"exit\": 0, \"tables\": \"| cut", stderr="")
         if not wanted and any(p in self.table_failing_projects for p in asked):
             return subprocess.CompletedProcess(argv, 255, stdout="", stderr="ssh: lost connection")
         if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in asked):
@@ -133,11 +131,18 @@ class FakeSandbox:
             # test cannot stage a read or a refusal the reporter would not make.
             scope = fleet_scope_args.DeclaredScope()
             scope.set(flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG), flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG))
-            reason = scope.override_error(asked[0])
+            # On the id the report resolves, as `get_target_projects` checks it: a number
+            # resolves through `projects describe` (the aliases) unless describe is down, when
+            # the digits reach the rule, which refuses them.
+            resolved_id = asked[0] if asked[0] in self.describe_down else self.aliases.get(asked[0], asked[0])
+            reason = scope.override_error(resolved_id)
             if reason is not None:
                 # The script's usage exit, no report, the reason on stderr.
                 body = {"exit": 2, "tables": "", "report": None}
                 return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr=f"(declared scope: fleet_scope): {reason}\n")
+        # A garbled envelope means the reporter ran and printed: staged after its refusal decision.
+        if wanted and any(p in self.garbled_projects for p in asked):
+            return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{{\"exit\": 0, \"tables\": \"| cut", stderr="")
         body = self.readiness if wanted else self.versions
         # Both hops run once per project: answer with that project's slice.
         down = {a for a in asked if a in self.describe_down}
@@ -1495,6 +1500,40 @@ class DeclaredScope(Base):
         self.assertEqual(sandbox.calls[1][1], ["--project", "p1", *scope, "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR])
         self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 1 blocked (a), 0 ready", out)
 
+    def test_under_a_declared_scope_a_number_resolves_before_the_scope_check(self) -> None:
+        """The roster spells the project by number and the scope lists its id: the report
+        resolves the number and reads it, as `get_target_projects` checks the resolved id."""
+        self.declare_scope(["my-proj"])
+        versions = envelope([member("a", "lagging", project="my-proj")])
+        readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "123456"}):
+            code, out = self.run_tick(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}))
+        self.assertEqual(code, 0)
+        self.assertNotIn("refused", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
+
+    def test_under_a_declared_scope_a_learned_number_is_asked_by_its_id_through_a_describe_outage(self) -> None:
+        """Once a tick has learned that the number is my-proj, both hops ask the report for
+        my-proj, which the scope lists, so a morning whose describe fails reads the project
+        instead of refusing it as a number the operator must respell."""
+        self.declare_scope(["my-proj"])
+        versions = envelope([member("a", "lagging", project="my-proj")])
+        readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready")])
+        env = {watch.PROJECTS_ENV: "123456"}
+        with mock.patch.dict(os.environ, env):
+            self.run_tick(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}))
+        self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj"})
+        ledger = self.ledger()
+        ledger["targets"][TARGET]["last_report_at"] = (NOW - timedelta(days=8)).isoformat()
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
+        with mock.patch.dict(os.environ, env):
+            sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}, describe_down={"123456"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertNotIn("refused", out)
+        self.assertEqual([argv[1] for _, argv, _ in sandbox.calls if argv and argv[0] == "--project"], ["my-proj", "my-proj"])
+        self.assertIn("1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
+
     def test_an_install_that_declares_no_scope_keeps_the_bare_project_flag(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]))
         code, _ = self.run_tick(sandbox)
@@ -1643,6 +1682,26 @@ class DeclaredScope(Base):
         self.assertEqual(self.ledger()["standing_outside"], {"p2": []})
         self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["table_runs"]), (None, {}, {}))
 
+    def test_a_refused_number_learns_its_id_so_a_describe_outage_keeps_its_cause(self) -> None:
+        """Roster mgmt and 123456, the number legacy-proj, outside the scope: the first tick's
+        refusal names legacy-proj, which the watch learns, so the next tick asks for legacy-proj
+        with no describe; a describe outage that morning leaves the outside cause, the partial
+        line does not post again, and the standing record stays."""
+        self.declare_scope(["mgmt"])
+        versions = envelope([member("a", "current", project="mgmt")])
+        env = {watch.PROJECTS_ENV: "mgmt,123456"}
+        with mock.patch.dict(os.environ, env):
+            code, first = self.run_tick(FakeSandbox(versions, aliases={"123456": "legacy-proj"}))
+            self.assertEqual(code, 0)
+            self.assertIn("does not list legacy-proj", first)
+            self.assertEqual(self.ledger()["project_ids"].get("123456"), "legacy-proj")
+            sandbox = FakeSandbox(versions, aliases={"123456": "legacy-proj"}, describe_down={"123456"})
+            code, second = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(second, "", "the same refusal under the same cause posts nothing")
+        self.assertIn(["--project", "legacy-proj", "--scope-projects", "mgmt"], [argv for kind, argv, _ in sandbox.calls if kind == "versions"])
+        self.assertIn("legacy-proj", self.ledger()["standing_outside"])
+
     def test_an_all_refused_ticks_failure_line_is_keyed_on_the_refusal_not_its_text(self) -> None:
         """The failure line names the resolved set, which moves with the scope's
         membership; the marker is keyed on what the partial line keys a refusal on,
@@ -1666,10 +1725,10 @@ class DeclaredScope(Base):
     def test_an_all_refused_tick_keeps_the_standing_record_so_its_failure_line_holds_across_a_failed_lookup(self) -> None:
         """A folder-scoped install whose roster holds nothing but p2, in no
         part of the declaration: every run is refused, the tick fails in the
-        install's terms, and the failure line is keyed on the refusal's text.
-        The record the refusal filed is saved though the tick wrote nothing
-        else, so the folder lookup failing on the next tick keeps the cause
-        and the text, and the lookup resolving after that posts nothing more:
+        install's terms, and the failure line is keyed on the refusal's project
+        and cause. The record the refusal filed is saved though the tick wrote
+        nothing else, so the folder lookup failing on the next tick keeps the
+        cause, and the lookup resolving after that posts nothing more:
         one failure line, not three. The record is written once, not on each
         failed tick; declaring p2 reads it, and the recovery line follows."""
         resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
@@ -1690,7 +1749,7 @@ class DeclaredScope(Base):
                 outs[0],
             )
             self.assertEqual(outs[1:], ["", ""], "one failure line, not three")
-            self.assertNotIn("the declaration is not fully resolved", self.marker().read_text())
+            self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p2", watch.REFUSAL_OUTSIDE]]])
             self.declare_scope(["p1", "p2"], containers=[resolved])
             code, out = self.run_tick(FakeSandbox(envelope([])))
         self.assertEqual(code, 0)
@@ -1792,7 +1851,7 @@ class DeclaredScope(Base):
             watch.refusal_detail(label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012"), resolved),
             (
                 "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
-                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run): under a declared scope the reporter refuses a number before anything resolves it, so no grant lets it read one",
+                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reporter can resolve the number",
                 "project number unresolved",
             ),
         )
@@ -2366,7 +2425,7 @@ class Loader(unittest.TestCase):
             decoy = Path(scratch) / "fleet_scope_args.py"
             decoy.write_text("DECLARED_SCOPE_ARGS_MISSING_ERROR = 'the sandbox image copy'\n", encoding="utf-8")
             env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch, "PYTHONPATH": scratch}
-            completed = subprocess.run([sys.executable, "-", "-c", "pass"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            completed = subprocess.run([sys.executable, "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(json.loads(completed.stdout.strip().splitlines()[-1]), [str(watch.scope_args_path()), fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR])
 
