@@ -2457,6 +2457,54 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('openai_compatible_api_key = "oc-key"', content)
             self.assertIn("tfvar=oc-key", proc.stdout)
 
+    # ── the gateway's env Secret, and provider slugs ─────────────────────────
+
+    def test_tfvars_names_the_litellm_env_secret_only_when_set(self):
+        for env, expected in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap", "LITELLM_ENV_SECRET_NAME": "sap-aicore"}, True),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap"}, False),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": ""}, False),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                content = dest.read_text()
+                self.assertEqual('litellm_env_secret_name = "sap-aicore"' in content, expected, content)
+                self.assertIn(f'model_provider     = "{env["MODEL_PROVIDER"]}"', content)
+
+    def test_a_provider_slug_is_accepted_and_needs_a_model(self):
+        proc = self._run(
+            'for p in sap azure bedrock databricks2 a_b; do is_valid_model_provider "$p" && echo "ok $p"; done; '
+            'for p in Azure v-llm 1azure "sap/" "" "azure bedrock" chatgpt; do is_valid_model_provider "$p" || echo "no $p"; done; '
+            'is_table_model_provider sap && echo table-sap; is_table_model_provider azure || echo slug-azure; '
+            'validate_model_provider_inputs azure "" ; echo "slug-no-model=$?"; '
+            'validate_model_provider_inputs azure gpt-5.4; echo "slug-model=$?"; '
+            'validate_model_provider_inputs sap ""; echo "sap-no-model=$?"; '
+            'echo "sap-default=$(default_model_for_provider sap) azure-default=[$(default_model_for_provider azure)]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for line in ("ok sap", "ok azure", "ok bedrock", "ok databricks2", "ok a_b",
+                     "no Azure", "no v-llm", "no 1azure", "no sap/", "no ", "no azure bedrock", "no chatgpt",
+                     "table-sap", "slug-azure", "slug-no-model=1", "slug-model=0", "sap-no-model=0",
+                     "sap-default=anthropic--claude-4.5-sonnet azure-default=[]"):
+            self.assertIn(line, proc.stdout)
+        self.assertIn("MODEL_PROVIDER='azure' is a LiteLLM provider slug", proc.stderr + proc.stdout)
+
+    def test_the_generator_refuses_a_slug_without_a_model_and_a_bad_secret_name(self):
+        for env, message in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "azure", "LITELLM_ENV_SECRET_NAME": "azure-openai"},
+             "set --model-default-name"),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": "Not_A_Secret"},
+             "is not a valid Kubernetes Secret name"),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists(), "the file must be left untouched")
+
     def test_tfvars_writes_a_service_target_port_as_a_number(self):
         env = dict(self._OPENAI_COMPATIBLE_ENV,
                    OPENAI_COMPATIBLE_API_BASE="http://llm.models.svc.cluster.local/v1",
@@ -2951,7 +2999,7 @@ class InstallDefaultsFileTest(unittest.TestCase):
         proc = subprocess.run(
             ["bash", "-c",
              f'set -u; source "{self._INSTALLER_COMMON}"; '
-             'for p in gemini openai anthropic vertex_ai; do '
+             'for p in gemini openai anthropic vertex_ai sap; do '
              'echo "$p=$(default_model_for_provider "$p")"; done'],
             capture_output=True, text=True, cwd=str(_REPO_ROOT),
         )

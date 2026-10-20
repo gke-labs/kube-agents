@@ -6,8 +6,8 @@ run the agent, score, read the log. Most of the mistakes are static. A domain
 slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
 nothing; a fixture role the seeded fleet does not define is a case addressing
 a defect that was never planted; a check with no assertion is a check that
-cannot fail; a case no roster file under `hack/eval/` names never runs; a case with no
-`owner:` has nobody to answer when it flakes; a fixture carrying a real
+cannot fail; a case no roster file under `hack/eval/` names never runs; an
+`owner: maintainers` sends a case's bugs to nobody; a fixture carrying a real
 address or a credential is a leak the moment it merges. None of those needs a
 cluster to find.
 
@@ -47,6 +47,7 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import case_owner  # noqa: E402
 import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -77,15 +78,12 @@ FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # to name a role differently, which fixture_catalog_disagreements() enforces.
 ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
-# The `owner:` field, from bench/CONTRIBUTING.md. A GitHub login, bare, or
-# this literal for a case the OWNERS approvers answer for. Bare because the
-# field is a name to look up, not a mention: a task.yaml is quoted into
-# issues and pull-request comments, where a leading at sign pages someone.
-OWNER_MAINTAINERS = "maintainers"
-# GitHub's own login rule: alphanumerics and single interior hyphens, at most
-# 39 characters, so a stray e-mail address or a display name is rejected
-# before a reviewer has to spot it.
-GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+# The optional `owner:` field, from bench/CONTRIBUTING.md: a GitHub login,
+# written bare because the field is a name to look up, not a mention -- a
+# task.yaml is quoted into issues and pull-request comments, where a leading
+# at sign pages someone. Absent, the case's bugs go to its domain's owner
+# (scripts/case_owner.py, which owns the login rule).
+GITHUB_LOGIN = case_owner.GITHUB_LOGIN
 
 # The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
 # contributed case brings with it lives in one of these trees -- the case
@@ -564,7 +562,20 @@ def platform_job_ids() -> set[str]:
 def known_domains() -> set[str]:
     """Slugs defined in docs/designs/domains.yaml."""
     data = _load_yaml(DOMAINS_FILE) or {}
-    return {d["slug"] for d in data.get("domains") or []}
+    rows = data.get("domains") or []
+    # The filer resolves a case with no owner through case_owner's line scan
+    # of this file, so a row the scan reads differently (slug not first, a
+    # quoted slug, a nested owner:) would route to someone else, or nobody.
+    parsed = {d.get("slug"): d.get("owner") for d in rows if isinstance(d, dict)}
+    scanned = case_owner.parse_domain_owners(DOMAINS_FILE.read_text(encoding="utf-8"))
+    differ = sorted(str(slug) for slug in parsed.keys() | scanned.keys() if parsed.get(slug) != scanned.get(slug))
+    if differ:
+        raise CaseError(
+            f"{DOMAINS_FILE}: scripts/case_owner.py reads the owner of domain(s) "
+            f"{', '.join(differ)} differently from YAML. Start each row with "
+            "'- slug: <slug>' unquoted and give it one plain 'owner: <login>'"
+        )
+    return {d["slug"] for d in rows}
 
 
 # `{cluster:<slot>}` in a report_contains pattern, as bench/kube_agents_bench/
@@ -931,30 +942,56 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "not define"
         )
 
-    # The owner. Demotion (docs/eval-gate-roster.md) files an issue against a
-    # flaking case, and this field is who that issue goes to. devops-bench
-    # discards the key, so like `domain` it is enforced here or nowhere.
+    # The owner, optional. A case's bugs go to it first, and to the domain's
+    # owner in docs/designs/domains.yaml when it is absent (scripts/case_owner.py).
+    # Offline: whether GitHub accepts the login as an assignee is checked when
+    # a bug is filed, not here. devops-bench discards the key, so like `domain`
+    # it is enforced here or nowhere. A bare `owner:` counts as absent.
+    owner_problems = len(problems)
     owner = spec.get("owner")
-    if owner is None:
-        problems.append(
-            "declares no 'owner:'. Name the GitHub login (without the at sign) "
-            f"that answers when this case flakes, or {OWNER_MAINTAINERS!r} for "
-            "a case the OWNERS approvers own -- see bench/CONTRIBUTING.md"
-        )
-    elif not isinstance(owner, str) or not owner:
-        problems.append(f"'owner:' {owner!r} is not a GitHub login string")
-    elif owner.startswith("@"):
-        problems.append(
-            f"owner {owner!r} carries a leading at sign; write the login bare, "
-            "so a task.yaml quoted into an issue names someone rather than "
-            "paging them"
-        )
-    elif owner != OWNER_MAINTAINERS and not GITHUB_LOGIN.fullmatch(owner):
-        problems.append(
-            f"owner {owner!r} is neither a GitHub login (letters, digits and "
-            "single hyphens, at most 39 characters) nor the literal "
-            f"{OWNER_MAINTAINERS!r}"
-        )
+    if owner is not None:
+        if not isinstance(owner, str) or not owner:
+            problems.append(f"'owner:' {owner!r} is not a GitHub login string")
+        elif owner.startswith("@"):
+            problems.append(
+                f"owner {owner!r} carries a leading at sign; write the login bare, "
+                "so a task.yaml quoted into an issue names someone rather than "
+                "paging them"
+            )
+        elif case_owner.is_retired_owner(owner):
+            problems.append(
+                f"'owner: {owner}' is no longer allowed: it names nobody. Delete "
+                "the line and the case's bugs go to its domain's owner in "
+                "docs/designs/domains.yaml, or name the person whose bugs this "
+                "case is -- see bench/CONTRIBUTING.md"
+            )
+        elif not GITHUB_LOGIN.fullmatch(owner):
+            problems.append(
+                f"owner {owner!r} is not a GitHub login (letters, digits and "
+                "single hyphens, at most 39 characters)"
+            )
+
+    # The filer routes a red with case_owner's line scan, not this YAML read.
+    # Where the two read `owner:` or `domain:` differently (`owner: null`, a
+    # block scalar, an anchor, a quoted key), the lint would show one person
+    # and the bug would go to another, so the case is rejected here.
+    if len(problems) == owner_problems:
+        text = path.read_text(encoding="utf-8")
+        for key in ("owner", "domain"):
+            parsed = spec.get(key)
+            if parsed is not None and not isinstance(parsed, str):
+                continue  # already reported above as not a string
+            scanned = case_owner.task_field(text, key)
+            if scanned != parsed:
+                problems.append(
+                    f"'{key}:' reads as {parsed!r} to YAML but as {scanned!r} to "
+                    "scripts/case_owner.py, which routes the case's bugs from the "
+                    f"first line that starts '{key}:' at column 0. Make that line a "
+                    f"plain '{key}: value' (no null, block scalar, anchor or quoted "
+                    "key), and check for such a line inside another field's text or "
+                    "an invisible character such as a byte-order mark before it"
+                    + (", or delete an empty 'owner:' line" if key == "owner" else "")
+                )
 
     # The audit streams a case drives without grading their ledger. The runner
     # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an

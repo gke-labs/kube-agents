@@ -445,6 +445,10 @@ PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
 PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
 PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
 PARAM_OPENAI_COMPATIBLE_API_KEY="${OPENAI_COMPATIBLE_API_KEY:-}"
+# A Secret the operator creates and the gateway reads whole as environment
+# variables: the SAP AI Core service key, another LiteLLM provider's
+# variables, or an openai_compatible gateway's OAuth2 client credentials.
+PARAM_LITELLM_ENV_SECRET_NAME="${LITELLM_ENV_SECRET_NAME:-}"
 PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
 PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
 PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
@@ -686,7 +690,9 @@ Flags for AI Agents & Automation:
                                 namespace, so changing it is for CI and second installs
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
                                 openai_compatible (a server speaking the OpenAI chat
-                                completions API: vLLM, TGI, an internal gateway)
+                                completions API: vLLM, TGI, an internal gateway) |
+                                sap (SAP AI Core) | any other LiteLLM provider slug, with
+                                --model-default-name and --litellm-env-secret
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
@@ -735,6 +741,14 @@ Flags for AI Agents & Automation:
                                 under the key ca.crt; trusted for this server only
   --openai-compatible-api-key=KEY
                                 openai_compatible only: the server's API key (optional)
+  --litellm-env-secret=NAME     Secret in the agent's namespace the gateway reads whole as
+                                environment variables; you create it, the install only
+                                names it. Carries the SAP AI Core service key for
+                                --model-provider=sap (AICORE_SERVICE_KEY,
+                                AICORE_RESOURCE_GROUP), another LiteLLM provider's
+                                variables (any slug with --model-default-name), or the
+                                OAuth2 client credentials of an openai_compatible gateway
+                                (OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID, _CLIENT_SECRET)
   --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
   --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
                                 DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
@@ -1069,6 +1083,7 @@ parse_args() {
       --openai-compatible-egress-cidrs=*) PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${1#*=}"; shift ;;
       --openai-compatible-ca-secret-name=*) PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${1#*=}"; shift ;;
       --openai-compatible-api-key=*) PARAM_OPENAI_COMPATIBLE_API_KEY="${1#*=}"; shift ;;
+      --litellm-env-secret=*) PARAM_LITELLM_ENV_SECRET_NAME="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
@@ -1911,7 +1926,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
-    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
+    LITELLM_ENV_SECRET_NAME PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
@@ -2803,6 +2818,7 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" OPENAI_COMPATIBLE_CA_SECRET_NAME "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
     write_secret_env_var "$tmp" OPENAI_COMPATIBLE_API_KEY "${OPENAI_COMPATIBLE_API_KEY:-}"
   fi
+  write_env_var "$tmp" LITELLM_ENV_SECRET_NAME "${LITELLM_ENV_SECRET_NAME:-}"
   write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
   write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
@@ -4617,13 +4633,82 @@ validate_platform_agent_mode() {
 # environment is this run's own answer.
 # $1 the provider, $2 the model so far, $3 whether --model-default-name was
 # typed, $4 the recorded MODEL_PROVIDER.
+# The same holds for any other provider with no default model (a LiteLLM
+# provider slug outside the table): the recorded model belongs to the old
+# provider, and validate_model_provider_inputs then asks for one.
 openai_compatible_model_for_run() {
   local provider="${1:-}" model="${2:-}" passed="${3:-false}" recorded="${4:-}"
-  if [ "$provider" = "openai_compatible" ] && [ -n "$recorded" ] &&
-    [ "$recorded" != "openai_compatible" ] && [ "$passed" != "true" ]; then
+  # Which providers have no default: openai_compatible always, and a slug
+  # outside the table once installer_common.sh (sourced at step 2) can say so.
+  local no_default=false
+  if [ "$provider" = "openai_compatible" ]; then
+    no_default=true
+  elif declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "$provider"; then
+    no_default=true
+  fi
+  if [ "$no_default" = "true" ] && [ -n "$recorded" ] &&
+    [ "$recorded" != "$provider" ] && [ "$passed" != "true" ]; then
     model=""
   fi
   printf '%s\n' "$model"
+}
+
+# The sixth provider entry: SAP AI Core or any other LiteLLM provider slug,
+# with its credentials in a Secret the operator creates. Asks the slug, the
+# model (prefilled with the slug's default when there is one, or with the
+# model already pinned for that same slug) and the Secret's name. A typo is
+# asked again only while someone can answer: without a controlling tty, or
+# under --non-interactive, prompt_read answers with the default every time,
+# so the function returns 1 instead of waiting for a better answer that
+# cannot come, and the caller stops or goes back to its menu. $1..$3 the
+# names of the caller's provider, model and Secret-name variables.
+prompt_litellm_env_secret_provider() {
+  local provider_var="$1" model_var="$2" secret_name_var="$3"
+  local provider_was="${!provider_var}" model_was="${!model_var}" provider="" model=""
+  local can_retry=true
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] || ! has_controlling_tty; then
+    can_retry=false
+  fi
+  # A table provider other than sap is not this entry's: start at sap.
+  provider="$provider_was"
+  if is_table_model_provider "$provider" && [ "$provider" != "sap" ]; then
+    provider="sap"
+  fi
+  while :; do
+    prompt_read "LiteLLM provider slug (sap, azure, bedrock, databricks, ...)" provider "$provider"
+    if is_valid_model_provider "$provider" && { [ "$provider" = "sap" ] || ! is_table_model_provider "$provider"; }; then
+      break
+    fi
+    # The other table providers have their own entries, with their own
+    # credential prompts; accepting them here would skip those.
+    if is_table_model_provider "$provider"; then
+      print_error "'${provider}' has its own entry in the provider menu; this entry is for sap and any other LiteLLM provider slug."
+    elif [ "$provider" = "chatgpt" ]; then
+      print_error "'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
+    else
+      print_error "'${provider}' is not a LiteLLM provider slug (lowercase letters, digits and underscores)."
+    fi
+    [ "$can_retry" = "true" ] || return 1
+  done
+  model="$(default_model_for_provider "$provider")"
+  if [ "$provider" = "$provider_was" ] && [ -n "$model_was" ]; then
+    model="$model_was"
+  fi
+  while :; do
+    prompt_read "Model name the provider serves" model "$model"
+    [ -z "$model" ] || break
+    print_error "A model name is required: the installer has no default for ${provider}."
+    [ "$can_retry" = "true" ] || return 1
+  done
+  local secret_name="${!secret_name_var}"
+  while :; do
+    prompt_read "Secret in the agent's namespace holding the provider's credentials (you create it)" secret_name "$secret_name"
+    validate_litellm_env_secret_name "$secret_name" && break
+    [ "$can_retry" = "true" ] || return 1
+  done
+  printf -v "$provider_var" '%s' "$provider"
+  printf -v "$model_var" '%s' "$model"
+  printf -v "$secret_name_var" '%s' "$secret_name"
 }
 
 prompt_openai_compatible_settings() {
@@ -5707,6 +5792,7 @@ run_menu_system() {
   local openai_compatible_egress_cidrs="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
   local openai_compatible_ca_secret_name="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
   local openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
+  local litellm_env_secret_name="${LITELLM_ENV_SECRET_NAME:-}"
   local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   local google_chat_home_channel="${GOOGLE_CHAT_HOME_CHANNEL:-}"
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
@@ -5757,7 +5843,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")$([ -n "$litellm_env_secret_name" ] && echo " (credentials Secret: ${litellm_env_secret_name})" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -5818,6 +5904,7 @@ run_menu_system() {
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
           "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
+          "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
           m_opt
         case "$m_opt" in
           1)
@@ -5855,6 +5942,11 @@ run_menu_system() {
             prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
               openai_compatible_target_port openai_compatible_egress_cidrs \
               openai_compatible_api_key openai_compatible_ca_secret_name
+            ;;
+          6)
+            # Back to the menu on an answer nobody can correct; the provider
+            # is unchanged.
+            prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || continue
             ;;
         esac
         ;;
@@ -5907,6 +5999,8 @@ run_menu_system() {
         # the menu on failure.
         validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
           "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || continue
+        validate_model_provider_inputs "$model_provider" "$model_default_name" || continue
+        validate_litellm_env_secret_name "$litellm_env_secret_name" || continue
         # The chat screen's home channel, which the home-channel warning below
         # reads; save_env_var exports it again when it writes install.env.
         export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
@@ -5961,6 +6055,7 @@ run_menu_system() {
           save_env_var OPENAI_COMPATIBLE_CA_SECRET_NAME "$openai_compatible_ca_secret_name"
           save_secret_env_var OPENAI_COMPATIBLE_API_KEY "$openai_compatible_api_key"
         fi
+        save_env_var LITELLM_ENV_SECRET_NAME "$litellm_env_secret_name"
         save_env_var ALLOWED_USERS "$allowed_users"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
@@ -6779,7 +6874,11 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, or openai_compatible."
+    if [ "$model_provider" = "chatgpt" ]; then
+      print_error "Model provider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
+    else
+      print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, openai_compatible, sap, or a LiteLLM provider slug (lowercase letters, digits and underscores) with --model-default-name."
+    fi
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
@@ -6848,6 +6947,7 @@ main() {
   local openai_compatible_egress_cidrs="${PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
   local openai_compatible_ca_secret_name="${PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
   local openai_compatible_api_key="${PARAM_OPENAI_COMPATIBLE_API_KEY:-}"
+  local litellm_env_secret_name="${PARAM_LITELLM_ENV_SECRET_NAME:-}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
@@ -6860,6 +6960,8 @@ main() {
       openai) model_choice="3" ;;
       anthropic) model_choice="4" ;;
       openai_compatible) model_choice="5" ;;
+      # sap, and any other LiteLLM provider slug.
+      *) model_choice="6" ;;
     esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
@@ -6867,6 +6969,7 @@ main() {
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
       "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
+      "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
       model_choice
 
     # A model the install already pins survives a re-run that leaves the
@@ -6920,9 +7023,16 @@ main() {
           openai_compatible_target_port openai_compatible_egress_cidrs \
           openai_compatible_api_key openai_compatible_ca_secret_name
         ;;
+      6)
+        prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || exit 1
+        ;;
     esac
   fi
 
+  # The chart refuses the render without these, so the run stops here, before
+  # anything is built, whatever the provider.
+  validate_model_provider_inputs "$model_provider" "$model_default_name" || exit 1
+  validate_litellm_env_secret_name "$litellm_env_secret_name" || exit 1
   case "$model_provider" in
     gemini)
       [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
@@ -6960,6 +7070,18 @@ main() {
       validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
         "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || exit 1
       print_info "Serving ${model_default_name} from ${openai_compatible_api_base} through the gateway."
+      if [ -n "$litellm_env_secret_name" ]; then
+        print_info "With OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID and _CLIENT_SECRET in the Secret ${litellm_env_secret_name}, the gateway exchanges them for the server's bearer token."
+      fi
+      ;;
+    *)
+      # sap, and any other LiteLLM provider slug: the credentials live in the
+      # Secret, which the install names and never creates.
+      if [ -z "$litellm_env_secret_name" ]; then
+        print_warning "No credentials Secret was named (--litellm-env-secret); the gateway cannot authenticate to ${model_provider} until one exists and a re-run names it."
+      else
+        print_info "Serving ${model_default_name} through ${model_provider}; the gateway reads its credentials from the Secret ${litellm_env_secret_name} in ${NAMESPACE:-$DEFAULT_NAMESPACE}, which must exist before the first model call."
+      fi
       ;;
   esac
 
@@ -7542,6 +7664,7 @@ main() {
   export OPENAI_COMPATIBLE_EGRESS_CIDRS="$openai_compatible_egress_cidrs"
   export OPENAI_COMPATIBLE_CA_SECRET_NAME="$openai_compatible_ca_secret_name"
   export OPENAI_COMPATIBLE_API_KEY="$openai_compatible_api_key"
+  export LITELLM_ENV_SECRET_NAME="$litellm_env_secret_name"
   export ALLOWED_USERS="$allowed_users"
   export CHAT_TOPIC_NAME="$chat_topic_name"
   export CHAT_SUB_NAME="$chat_sub_name"
@@ -7777,6 +7900,9 @@ main() {
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
   elif [ "$model_provider" = "openai_compatible" ]; then
     echo -e "  • ${C_CYAN}OpenAI-compatible Server:${C_RESET} ${openai_compatible_api_base}"
+  fi
+  if [ -n "$litellm_env_secret_name" ]; then
+    echo -e "  • ${C_CYAN}Gateway Credentials Secret:${C_RESET} ${litellm_env_secret_name}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"

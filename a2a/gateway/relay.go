@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -257,6 +258,15 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 		return
 	}
 	rs := g.relayFor(env.TaskID)
+	// The card-stop control is not a turn and renders as none (cardstop.go).
+	if rec.CardStop != nil && rec.CardStop.TaskID == env.TaskID {
+		g.applyCardStopEvent(ctx, rec, rs, item)
+		return
+	}
+	if slices.Contains(rec.RetiredCardStops, env.TaskID) {
+		g.retireTaskRoute(ctx, env.TaskID)
+		return
+	}
 
 	switch env.Kind {
 	case lib.KindStatusUpdate:

@@ -128,6 +128,10 @@ readonly IPV6_GROUP_BITS=16
 readonly IPV4_OCTET_BITS=8
 readonly IPV4_OCTET_MAX=255
 readonly K8S_SECRET_NAME_MAX_LENGTH=253
+# A Kubernetes Secret name (a lowercase DNS subdomain), and a LiteLLM provider
+# slug (azure, bedrock, ...): the chart checks both with the same patterns.
+readonly K8S_SECRET_NAME_PATTERN='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+readonly LITELLM_PROVIDER_SLUG_PATTERN='^[a-z][a-z0-9_]*$'
 # A dotted-quad host, and one in the ranges the gateway's port-443 rule excepts
 # (RFC 1918, link-local, CGNAT), the chart's own patterns: such a host needs
 # CIDRs even on 443.
@@ -453,20 +457,55 @@ normalize_memory_vars() {
 }
 
 # Model provider → the model the install defaults to for that provider. The
-# names live in install.defaults.env; vertex_ai (and anything unrecognised,
-# which the validator rejects separately) takes the Gemini one.
+# names live in install.defaults.env; vertex_ai takes the Gemini one. No
+# default for openai_compatible (the model is whatever the server serves) or
+# for a LiteLLM provider slug outside the table (the install has to name it).
 default_model_for_provider() {
   case "${1:-}" in
+    gemini | vertex_ai) echo "$DEFAULT_MODEL_GEMINI" ;;
     openai) echo "$DEFAULT_MODEL_OPENAI" ;;
     anthropic) echo "$DEFAULT_MODEL_ANTHROPIC" ;;
-    # No default: the model is whatever the server serves.
-    openai_compatible) echo "" ;;
-    *) echo "$DEFAULT_MODEL_GEMINI" ;;
+    sap) echo "$DEFAULT_MODEL_SAP" ;;
+    *) echo "" ;;
   esac
 }
 
+# The providers the installer and the chart know by name: a menu entry, a
+# default model (openai_compatible excepted), and their own credential path.
+is_table_model_provider() {
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible|sap)$ ]]
+}
+
+# Those, or any other LiteLLM provider slug (azure, bedrock, databricks, ...),
+# which the chart accepts when MODEL_DEFAULT_NAME names the model and whose
+# credentials arrive through LITELLM_ENV_SECRET_NAME. chatgpt is a slug the
+# chart refuses by name (a subscription needs an OAuth token store it does
+# not ship), so it is refused here too, before anything is built.
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible)$ ]]
+  [ "${1:-}" != "chatgpt" ] && { is_table_model_provider "${1:-}" || [[ "${1:-}" =~ $LITELLM_PROVIDER_SLUG_PATTERN ]]; }
+}
+
+# A provider outside the table has no default model, so the chart refuses to
+# render it without one; refused here first, for the MODEL_MAX_TOKENS reason.
+# $1 the provider, $2 the model.
+validate_model_provider_inputs() {
+  local provider="${1:-}" model="${2:-}"
+  if ! is_table_model_provider "$provider" && [ -z "$model" ]; then
+    print_error "MODEL_PROVIDER='${provider}' is a LiteLLM provider slug outside the installer's table, which has no default model: set --model-default-name (MODEL_DEFAULT_NAME in install.env) to the model it serves."
+    return 1
+  fi
+}
+
+# LITELLM_ENV_SECRET_NAME: the Secret the gateway reads as environment
+# variables. Empty is allowed (nothing is mounted); anything else must be a
+# name Kubernetes takes, as the chart checks. $1 the name.
+validate_litellm_env_secret_name() {
+  local name="${1:-}"
+  if [ -n "$name" ] &&
+    { [ "${#name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] || [[ ! "$name" =~ $K8S_SECRET_NAME_PATTERN ]]; }; then
+    print_error "LITELLM_ENV_SECRET_NAME='${name}' is not a valid Kubernetes Secret name."
+    return 1
+  fi
 }
 
 # An OpenAI-compatible base URL → "<host> <port>", the host lowercased and an
@@ -755,7 +794,7 @@ validate_openai_compatible_inputs() {
 
   if [ -n "$ca_bundle_name" ] &&
     { [ "${#ca_bundle_name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] ||
-      [[ ! "$ca_bundle_name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+      [[ ! "$ca_bundle_name" =~ $K8S_SECRET_NAME_PATTERN ]]; }; then
     print_error "OPENAI_COMPATIBLE_CA_SECRET_NAME='${ca_bundle_name}' is not a valid Kubernetes Secret name."
     return 1
   fi
@@ -4513,6 +4552,10 @@ write_tfvars_from_state() {
   validate_openai_compatible_inputs "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" "${MODEL_DEFAULT_NAME:-}" \
     "${OPENAI_COMPATIBLE_API_BASE:-}" "${OPENAI_COMPATIBLE_TARGET_PORT:-}" \
     "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}" "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}" || return 1
+  # Same reason: a provider slug with no model, or a Secret name the chart
+  # refuses, stops here with the file untouched.
+  validate_model_provider_inputs "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" "${MODEL_DEFAULT_NAME:-}" || return 1
+  validate_litellm_env_secret_name "${LITELLM_ENV_SECRET_NAME:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
   # regenerate from install.env without install.sh's checks. A misspelt toggle
   # is refused rather than read as off, which would forward requests
@@ -4606,6 +4649,10 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    # Only when set, so an install without one keeps the file it had.
+    if [ -n "${LITELLM_ENV_SECRET_NAME:-}" ]; then
+      echo "litellm_env_secret_name = $(hcl_str "${LITELLM_ENV_SECRET_NAME}")"
+    fi
     # Only for this provider, so every other install's file stays as it was.
     # The target port is 0, the variable's "unset", when empty.
     if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "openai_compatible" ]; then

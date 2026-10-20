@@ -48,7 +48,12 @@ posture findings `finish` held back because the document recorded no complete de
 search (empty everywhere but on a declaring stream that skipped the step; see
 [`declared_intent_searched`](findings-document.md#declared_intent_searched)), and `unaccounted`, the ids of the previous
 findings a clean run was refused its close over (empty on every other outcome; see
-[The clean run](clean-run.md#the-clean-run)). With `--manifest-file` the line also carries
+[The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
+repository in the run also carries `refinish: true`; when that earlier `finish` wrote the report
+store, `new` and `resolved` count against it. When that earlier `finish` reported news or opened a
+pull request, the line also carries `silent_floor: true`: its `silent_ok` stays `false` and its
+sweep opens no automatic pull request, so the findings it would have opened are listed as
+awaiting `/remediate`. Report it as any other line. With `--manifest-file` the line also carries
 `unpublished_candidates`, `wholly_unpublished_checks` and `uncorroborated_findings` — which are
 absent on every other run. The line also carries timing data in seconds, which decides nothing:
 `publish_s`, the time `finish` used to publish; `inspect_s`, the time from `start` to `finish`, when
@@ -105,7 +110,9 @@ and nothing to re-run until that run's `finish`. A `BROKER UNAVAILABLE` line, fr
 on an older build, so check the credential-proxy pod and re-run the same command once it answers.
 From `start`, nothing is in flight. From `finish`, the run is still in flight and its document is
 untouched: re-run `finish`, never `start`. Do not report that nothing reached GitHub: the ledger, a
-label or a pull request may already have landed, and the re-run picks up from them.
+label or a pull request may already have landed, and the re-run picks up from them. On a run `start`
+opened, re-run within two hours of its last step, a re-run after the sweep opened a pull request
+opens no further automatic ones (`silent_floor`, above).
 
 ### Partial coverage
 
