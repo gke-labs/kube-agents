@@ -4,7 +4,7 @@
 
 **Purpose:** Report what the weekend's GKE upgrades did to the workloads on every managed cluster, so the next cluster does not meet the same failure. The other upgrade streams look ahead; this one looks back. For each cluster that is new to it, or that GKE upgraded since its last run, the collector records four things. (A) Which `UPGRADE_MASTER` and `UPGRADE_NODES` operations ran, from which version to which. (B) What stayed down, stuck or restarting afterwards, and which of the catalogue's twenty entries each symptom matches. (C) How to see the failure coming and how to fix it, written for the cluster's own objects. (D) The mitigation it set up. The collector records a guard in `guards.json`, for the readiness watch to read once its reader ships. Where a repository is linked, this stream's one ledger issue carries the finding. The run is **read-only**. It upgrades, rolls back, cordons, deletes and patches nothing, and it opens no pull request on its own.
 
-**Data sources:** the collector `skills/fleet-audit/scripts/upgrade_retrospective.py`, which runs `gcloud container clusters list`, `gcloud container operations list`, `gcloud container get-server-config`, `gcloud container clusters get-credentials` and read-only `kubectl get`. Also the platform_control `fleet_scope` tool for the scope (section 1), `gcloud container clusters list` per project for section 0's recovery step, `gcloud container operations list` for section 7's freshness check, the collector's store and manifest on the shell volume, and the GitOps clone `start` hands you. **Nothing else.** No BigQuery, no Prometheus, no Cloud Logging, no external blueprint, no delegation to Cluster Agents via kanban. The collector classifies and grades. You confirm each candidate against its report and copy its grade (section 3), tailor the fix (section 4), file the ledger (section 5) and write the chat lines (section 6).
+**Data sources:** the collector `/opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py`, which runs `gcloud container clusters list`, `gcloud container operations list`, `gcloud container get-server-config`, `gcloud container clusters get-credentials` and read-only `kubectl get`. Also the platform_control `fleet_scope` tool for the scope (section 1), `gcloud container clusters list` per project for section 0's recovery step, `gcloud container operations list` for section 7's freshness check, the collector's store and manifest on the shell volume, and the GitOps clone `start` hands you. **Nothing else.** No BigQuery, no Prometheus, no Cloud Logging, no external blueprint, no delegation to Cluster Agents via kanban. The collector classifies and grades. You confirm each candidate against its report and copy its grade (section 3), tailor the fix (section 4), file the ledger (section 5) and write the chat lines (section 6).
 
 ---
 
@@ -22,7 +22,7 @@ Two routes reach this SOP. The route decides the scope.
 **Probe the lock before `start`.** The collector holds an exclusive lock on `.lock` under its store for the whole run (section 2). `start` leaves an in-flight note that refuses every run of this stream, a fleet-wide question included, until `finish` releases it or two hours pass. So on a full run probe first, before any note exists:
 
 ```bash
-python3 ./skills/fleet-audit/scripts/upgrade_retrospective.py --probe-lock
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --probe-lock
 ```
 
 The probe tries the lock without blocking, holds it for no time and writes nothing. Exit 0 (`… is free; no retrospective run holds it`) means go on. Either line may end with `; a reset is pending (…/reset-pending.json): the next full run is a baseline the SOP files nothing from, run without start`: an operator ran `--reset-ledger` (section 2) and no full run has written the new baseline yet. Once the lock is free, run the baseline as the no-repository route below: the collector alone, with `--full`, the tool's flags and `--manifest-file`, and no `start`, `draft` or `finish`. Its manifest carries `after_reset: true`, which `draft` and `finish` refuse. Section 6 reports its lines; the ledger issue keeps its findings until the following full run reads the fleet again. Exit 1 prints the holder line (`another retrospective run holds … since …; nothing started`): wait fifteen seconds and probe again, for up to two minutes. Still held after that: on the scheduled route, report the holder line as the run's one line and stop, without `start`; on demand, answer from the latest saved report (section 7) and say which run holds the lock and since when. A scoped run (section 7) runs no probe: it calls neither `start` nor `finish`, and the collector itself waits up to two minutes for the lock and then prints the lock-held line (`another retrospective run holds … since …; waited 2 min for it; nothing written`) and exits 0.
@@ -30,7 +30,7 @@ The probe tries the lock without blocking, holds it for no time and writes nothi
 **Open the audit run before the collector, where a repository is linked.** `finish` refuses a manifest that finished before the run started (`manifest_predates_run`). So on a full run the order is the probe, then `start`, then the collector, then `finish`. Read the managed repository list the way `SOUL.md` §1 says (the `managed_repos` key of `$GITOPS_STATE_CONFIGMAP`). With no GitHub entry, skip the probe, `start` and section 5: the collector still writes its manifest, the report on the volume is the record, and section 6 says so in chat. A scoped run (section 7) never calls `start` or `finish`.
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit upgrade-retrospective [--repo "<owner>/<repo>"]
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py start --audit upgrade-retrospective [--repo "<owner>/<repo>"]
 ```
 
 If `managed_repos` names several repositories, pass `--repo "<owner>/<repo>"`. On a scheduled run, loop over all of them in sequence, with `start` and `finish` for each. On an on-demand full run, do the same unless the question named one. `start` returns `{"issue": <int|null>, "repo": "org/repo", "workspace": "...", "findings_path": "/opt/data/scratch/findings_upgrade-retrospective.json", "carried": [...], "pending_remediation_requests": [...], ...}`. Keep `findings_path` (section 2 drafts the document there), `workspace` (section 4 greps it for a manifest's path) and `carried` (the ids the previous run published). `start` also removes a manifest left at the path section 2 names, so a stale one cannot stand for this run. A `START REFUSED` line means the in-flight note stands: a run of this stream is in flight, a scheduled tick's or another session's, or an earlier run left the note. There is no override. On the scheduled route, report it as the run's one line and stop. On demand, answer from the latest saved report (section 7) and say a run is in flight. A `BROKER UNAVAILABLE` line means the credential proxy did not answer: re-run the same command once it does. `start` creates and resets no branch. The helper owns all git and forge work and renders the ledger body itself. **Never hand-write a ledger body, never run `git commit` or a `vcs.py` verb yourself, and never comment on the ledger.**
@@ -42,7 +42,7 @@ If `managed_repos` names several repositories, pass `--repo "<owner>/<repo>"`. O
 - `scope.skipped` is `[]`.
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit upgrade-retrospective \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit upgrade-retrospective \
   --findings-file /opt/data/scratch/findings_upgrade-retrospective.json \
   --no-collector-manifest "<the collector's exit line>" [--repo "<owner>/<repo>"]
 ```
@@ -58,7 +58,7 @@ Never pass `--project` on a full run: `--full` refuses it, with `--cluster` and 
 ### 2. Run the collector
 
 ```bash
-python3 ./skills/fleet-audit/scripts/upgrade_retrospective.py --full <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --full <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json
 ```
 
 Run it in the foreground with the terminal tool's `timeout: 600`, the foreground maximum, and never in the background: a background run outlives the turn, so you would have to poll for its end before `finish`, and a wake that starts a second run beside it is two writers past the lock. The run reads every fleet cluster on a quiet week too (pods and nodes, one list each), and re-reads every cluster that holds a guard. A second run started beside the first waits up to two minutes for the lock, then exits 0 on the lock-held line without writing. `--full` makes the run full: the collector records the handed scope as the fleet in its ledger, prunes a cluster or project that left it, adds the clusters of a project that joined, writes `reports/<finish-UTC>.md` and points `upgrade-retro-report.md` at it. A run without `--full` is scoped (section 7), whatever its `--project` set. The collector holds its own deadline under that timeout: 480 seconds (`RUN_DEADLINE_S`) from its start, the lock wait included. A read attempted past it fails with `the read budget (480 s) was spent before this read`, a read running past it is cut with `the read budget (480 s) ended this read after <n> s`, and no further cluster is started. What was read is written as a partial run. Each cluster not reached is `gate-failed` in the manifest with `not read this run: the read budget (480 s) was spent; held, read first next run`, so `draft` lists it under `scope.skipped` and `finish` holds its findings; a re-check not started keeps its guards. Info's `Read budget spent: …` line carries the counts, and the next run reads the held clusters first.
@@ -75,7 +75,7 @@ The collector writes two things. **The manifest**, at the path `--manifest-file`
 With a repository, build the findings document from the manifest rather than by hand:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py draft --audit upgrade-retrospective --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json --out /opt/data/scratch/findings_upgrade-retrospective.json
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit upgrade-retrospective --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json --out /opt/data/scratch/findings_upgrade-retrospective.json
 ```
 
 `draft` writes every `collected` target to `scope.clusters`, with the commands at `rc == 0` as its `checks_run` and the collector's `limitations` copied. It writes every other enumerated target to `scope.skipped` with its error. It writes one finding per candidate, with its evidence, impact and severity. It leaves `recommendation` empty and `remediation` at `manual` for you. Sections 3 to 5 say what to verify and what to write. Never retype a `checks_run` entry. `finish` cross-checks each one against the manifest and refuses a check the collector did not run there.
@@ -202,7 +202,7 @@ Before `finish`, self-check the document `draft` wrote and you completed:
 A schema violation publishes nothing: `finish` exits 2 and the ledger is untouched. Validate here rather than discover it there.
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit upgrade-retrospective \
+/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py finish --audit upgrade-retrospective \
   --findings-file /opt/data/scratch/findings_upgrade-retrospective.json \
   --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json \
   [--repo "<owner>/<repo>"]
