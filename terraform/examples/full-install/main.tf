@@ -227,11 +227,9 @@ locals {
   }
 
   # The registry third-party images are pulled from on a mirrored install:
-  # third_party_image_registry, falling back to image_registry, the same
-  # precedence the chart's kube-agents.thirdPartyImageRegistry helper applies.
-  # Empty means the upstream registries.
+  # third_party_image_registry. Empty means the upstream registries.
   third_party_registry = trimsuffix(
-    var.third_party_image_registry != "" ? var.third_party_image_registry : var.image_registry,
+    var.third_party_image_registry,
     "/"
   )
 
@@ -330,6 +328,19 @@ locals {
       try(var.extra_helm_values.platformAgent.harness.driftDetector, "absent") == null
     )
   )
+}
+
+# A warning rather than a precondition: setting image_registry without
+# third_party_image_registry is a valid configuration if the operator only
+# intends to mirror first-party images. But third-party images (cert-manager,
+# LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+# will remain on upstream public registries. On restricted or air-gapped clusters,
+# operators must be informed so deployments do not fail on ImagePullBackOff.
+check "unmirrored_third_party_images" {
+  assert {
+    condition     = trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""
+    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
+  }
 }
 
 # A warning rather than a precondition: an install that enables Slack before
@@ -868,17 +879,17 @@ resource "helm_release" "kube_agents" {
   timeout = 600
 
   values = [yamlencode({
-    # Reaches every image this release pulls, including the three the chart
-    # does not render itself — the agent Deployment, the shell sandbox
-    # StatefulSet, and the fluent-bit sidecar the operator resolves at
-    # reconcile time. See the chart README's "Installing from a mirrored
-    # registry".
+    # Reaches every image this release pulls, including the two the chart
+    # does not render itself — the agent Deployment and the shell sandbox
+    # StatefulSet the operator resolves at reconcile time (the fluent-bit
+    # sidecar follows thirdPartyImageRegistry). See the chart README's
+    # "Installing from a mirrored registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
-    # local.cert_manager_mirror_values carries the same registry to that
-    # release's image repositories, so a mirrored install pulls every image —
-    # cert-manager's included — from the mirror.
+    # When third_party_image_registry is set, local.cert_manager_mirror_values
+    # carries it to that release's image repositories, so a fully mirrored
+    # install pulls cert-manager from the mirror too.
     global = {
       imageRegistry           = var.image_registry
       thirdPartyImageRegistry = var.third_party_image_registry

@@ -428,16 +428,21 @@ Mutation(
         # never sees it: GitHub resolves `uses:` case-insensitively, so this
         # runs the identical action. The test walked straight past it and
         # reported OK until the filter was lowercased. Pins the action SHA
-        # because the flip and the ref are not contiguous otherwise -- a pin
-        # bump reports STALE here, and the fix is to paste the new SHA in.
+        # because the flip and the ref are not contiguous otherwise -- so the
+        # anchor stops just before the pin and the replacement inserts a
+        # case-flipped checkout step ahead of the original. The anchor holds no
+        # SHA, so a Dependabot bump of actions/checkout leaves it intact; the
+        # SHA in the replacement is never matched against the file.
         "B4-pull-request-target-checkout-case",
         ".github/workflows/risk_classify.yml",
-        ("        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+        ("      - name: Checkout the default branch\n"
+         "        uses: actions/checkout@",
+         "      - name: Checkout the default branch\n"
+         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
          "        with:\n"
-         "          ref: ${{ github.event.repository.default_branch }}",
-         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
-         "        with:\n"
-         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}"),
+         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}\n"
+         "      - name: Checkout the default branch, displaced\n"
+         "        uses: actions/checkout@"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "capitalise both the action name and the expression context while "
         "repointing the ref, which is the shape a case-flip evasion takes",
@@ -1012,8 +1017,11 @@ Mutation(
     Mutation(
         "C4-unpinned-action",
         ".github/workflows/prettier.yml",
-        ("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
-         "actions/checkout@v7"),
+        # Anchored on the prefix, not the pin, so a Dependabot bump leaves it
+        # intact: the replacement floats the ref to a tag and turns the old SHA
+        # into a trailing comment.
+        ("uses: actions/checkout@",
+         "uses: actions/checkout@v7 # was "),
         "test_C4_every_third_party_action_is_pinned_to_a_commit",
         "float one action back to a tag, which a Dependabot conflict "
         "resolution can produce by hand",
@@ -1021,7 +1029,9 @@ Mutation(
     Mutation(
         "C4-base-image-digest",
         "tags.env",
-        ("@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294", ""),
+        # Anchored on the separator, not the digest, so a base-image bump
+        # leaves it intact: the digest moves to a comment line below the tag.
+        ("@sha256:", "\n# was @sha256:"),
         "test_C4_the_agent_base_image_is_pinned_by_digest",
         "drop the digest and keep the tag, which reads as equivalent",
     ),
@@ -2379,7 +2389,12 @@ def _run_suite() -> tuple[set[str], set[str]]:
         capture_output=True,
         text=True,
         timeout=300,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        # CONFORMANCE_MUTATION_RUN: the suite's anchor self-check
+        # (test_every_mutation_still_finds_the_text_it_edits) skips itself
+        # here. A mutation removes its own anchor by design, so that check
+        # would fire on every mutated tree and read every verdict as NOISY or
+        # OVERSHOT; this script checks the anchor itself before mutating.
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CONFORMANCE_MUTATION_RUN": "1"},
     )
     output = process.stdout + process.stderr
     failed = set(re.findall(r"^(?:FAIL|ERROR): (\S+)", output, re.MULTILINE))

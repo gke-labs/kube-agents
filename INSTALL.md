@@ -594,11 +594,11 @@ The two flags are separate because the images fall into two groups. `--registry-
 (`image_registry` in tfvars) replaces `ghcr.io/gke-labs/kube-agents` for the images this project
 builds — the operator, the agent, and the credential proxy. `--third-party-registry-prefix`
 (`third_party_image_registry`) covers the ones it does not: the LiteLLM gateway, the fluent-bit
-sidecar, the GitHub token minter, and Hindsight. **Neither implies the other** on the installer
-flags, so an install that mirrors everything passes both, as above. (The chart's own
-`global.thirdPartyImageRegistry` differs here, deliberately: it defaults to
-`global.imageRegistry`.) cert-manager is a separate Helm release the values never reach — see
-the composition README's mirrored-registry section for its recipe.
+sidecar, the GitHub token minter, and Hindsight. **Neither implies the other**, so an install
+that mirrors everything passes both, as above; empty leaves third-party images on their
+upstream registries across the installer, Terraform composition, and Helm chart.
+cert-manager is a separate Helm release the chart values never reach — the composition passes
+`third_party_image_registry` to it when set.
 
 See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
 inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild
@@ -811,6 +811,17 @@ The App and its key belong to one GitHub host, so a switch needs the App on the 
 ```
 
 To switch back to github.com, use `--gitops-host=github.com` with the github.com App and its key (`--github-app-id`, `--github-pem-path` and another new `--kms-key`, or the key that already holds that App's private key). The applied run rewrites `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_CA_SECRET`, `GITOPS_ORG`, `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING`, `KMS_KEY` and `GITHUB_PEM_PATH` (the path that `--github-pem-path` gives; a move does not keep the old App's path, and a switch that gives no `--github-pem-path` removes the line; a `GITHUB_PEM_PATH` exported for the run counts as given when `install.env` records no path) in `install.env`, and a switch to github.com removes the first three. Apply the new `charts/kube-agents/crds/` first when you switch an install of an earlier release: the CRD of an earlier release refuses `caBundleRef` on a `github` forge (`install.sh` applies them on a re-run onto an existing cluster). The install then serves only the new host: repositories registered on the other host are skipped. With Terraform alone, you can instead import the new key into the existing key and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values` (see the next section).
+
+After the switch, the `platform-agent-gitops-state` ConfigMap still lists the repositories of the old host: the operator adds the repositories that the new forge declares, and it never removes an entry. After a switch to an instance, the agent and the token minter skip the old github.com entries, and each `submit-suggestion` call prints a `Skipping managed_repos repository '<url>'` line for each of them. After a switch back to github.com, the token minter cannot read an entry on the instance: it prunes no policy while the entry is listed, and the PlatformAgent reports `Degraded` with the reason `MinterPruningHeld`. In both directions, read the two lists, and write them back without the GitHub entries of the old host:
+
+```bash
+kubectl get configmap platform-agent-gitops-state -n kubeagents-system \
+  -o jsonpath='{.data.managed_repos}{"\n"}{.data.context_repos}{"\n"}'
+kubectl patch configmap platform-agent-gitops-state -n kubeagents-system --type merge \
+  -p '{"data":{"managed_repos":"[{\"type\":\"github\",\"url\":\"https://ghe.example.com/acme/infra\"}]","context_repos":"[]"}}'
+```
+
+Keep the GitOps repository first in `managed_repos`, and keep each context repository on the new host in `context_repos`.
 
 #### Terraform + Helm, without `install.sh`
 

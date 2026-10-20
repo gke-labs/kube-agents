@@ -26,8 +26,8 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # from the repository root, using this same prefix and the same tag as
 # image_tag above — the mirror only holds the tag it was told to copy.
 # image_registry = "us-east4-docker.pkg.dev/my-project/kube-agents"
-# Only if the mirror keeps third-party images (LiteLLM, fluent-bit) elsewhere;
-# defaults to image_registry.
+# Also set this to mirror the third-party images (cert-manager, LiteLLM,
+# fluent-bit, the GitHub token minter, Hindsight); empty leaves them upstream.
 # third_party_image_registry = "us-east4-docker.pkg.dev/my-project/mirror"
 # Only if that mirror needs authenticating to (Harbor, Artifactory rather than
 # an Artifact Registry the nodes can already read). Names Secrets you create
