@@ -45,14 +45,15 @@ global:
   # name only, which is the layout `make mirror-images` writes:
   #   ghcr.io/gke-labs/kube-agents/platform-agent
   #     -> registry.example.com/kube-agents/platform-agent
-  # It also reaches the images the chart does not render itself — the agent
-  # and logging-sidecar references the operator resolves at runtime — so a
+  # It also reaches the first-party images the chart does not render itself —
+  # the agent and shell sandbox references the operator resolves at runtime — so a
   # PlatformAgent created without an explicit spec.deployment.image still
-  # pulls from the mirror.
+  # pulls from the mirror. (The fluent-bit logging sidecar follows
+  # thirdPartyImageRegistry below).
   imageRegistry: ""
   # Registry prefix for images this project does not build (LiteLLM,
-  # fluent-bit). Defaults to imageRegistry; set it only when the mirror keeps
-  # third-party images under a different path.
+  # fluent-bit, GitHub token minter, Hindsight). Empty leaves them on their
+  # upstream registries; set it only when the mirror keeps third-party images.
   thirdPartyImageRegistry: ""
   # Secrets holding credentials for a mirror that has to be authenticated to
   # (Harbor, Artifactory). Leave empty when the nodes can read it themselves —
@@ -90,9 +91,9 @@ global:
 operator:
   enabled: true
   # Extra environment variables for the controller manager. The image
-  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE,
-  # FLUENT_BIT_IMAGE) are
-  # rendered from global.imageRegistry and the image values below, so a
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE)
+  # are rendered from global.imageRegistry (and FLUENT_BIT_IMAGE from
+  # global.thirdPartyImageRegistry) and the image values below, so a
   # mirrored install does not need to hand-write them; anything set here is
   # appended afterwards and therefore still wins.
   extraEnv: []
@@ -367,7 +368,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.104.0
+    tag: v1.106.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -842,6 +843,12 @@ platformAgent:
       pullPolicy: Always
     availability:
       # Number of agent pods. `null` omits the field; the operator defaults to 1.
+      # The operator runs the gateway as a single replica: a value above 1 is
+      # rendered as 1 and the PlatformAgent's ReplicasLimited condition says so.
+      # High availability is not supported yet: a second replica's leader
+      # election has no in-cluster token, and the data volumes are
+      # ReadWriteOnce. The chart's quota preflight still multiplies by this
+      # value, so above 1 it over-counts the agent pod.
       replicas: null
       # RuntimeClass for the agent pod. "gvisor" asks for GKE Sandbox kernel
       # isolation, and is the default because the agent executes model-authored
@@ -882,6 +889,11 @@ platformAgent:
     #
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
+    #
+    # KUBEAGENTS_AUDIT_AUTO_PROMOTE: "false" stops the fleet audits from
+    # opening remediation pull requests on their own; a `/remediate` on a
+    # ledger still opens one. The operator forwards it to the shell sandbox,
+    # where the audits run.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in

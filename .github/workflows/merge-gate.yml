@@ -57,6 +57,7 @@ jobs:
         (github.event_name == 'status' &&
           github.event.context == 'pull-kube-agents-smoke-test'))
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read # check out the default branch: the script
       pull-requests: read # the pull request's labels and files
@@ -103,6 +104,7 @@ jobs:
     # sees this event.
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read # check out the default branch: the script
       pull-requests: read # the queued pull request's head, labels and files

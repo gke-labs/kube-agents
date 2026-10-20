@@ -846,10 +846,16 @@ class BaseTestCase(unittest.TestCase):
                 "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
                 # `sop_path` reads it; an export must not move the SOP path `start` prints.
                 "PLATFORM_AGENT_HOME": "",
+                # The sweep is on unless a test says otherwise: a host with the
+                # switch off would otherwise fail every auto-promotion test.
+                audit_report.AUTO_PROMOTE_ENV: "",
             },
         )
         env.start()
         self.addCleanup(env.stop)
+        switch = patch.object(audit_report, "AUTO_PROMOTE_FILE", str(self.tmp_path / "no-audit-auto-promote"))
+        switch.start()
+        self.addCleanup(switch.stop)
         # Many tests run `start` more than once against one scratch directory
         # and never `finish`; the in-flight note would refuse the second. The
         # tests about the note itself put the real check back.
@@ -1481,6 +1487,211 @@ class TestValidation(unittest.TestCase):
         with self.assertRaises(audit_report.ValidationError) as exc:
             audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[1].evidence.command", str(exc.exception))
+
+    def test_usage_errors_name_the_command_that_makes_the_input(self):
+        for argv, hint in (
+            (["draft", "--audit", AUDIT], "--manifest-file <the manifest the SOP's collector command wrote>"),
+            (["finish", "--audit", AUDIT], "write it with `draft --audit <id> --manifest-file"),
+            (["run", "--audit", AUDIT], "then `finish --audit <id> --findings-file"),
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as exit_:
+                    audit_report.build_parser().parse_args(argv)
+                self.assertEqual(exit_.exception.code, 2)
+                self.assertIn(hint, err.getvalue())
+
+    def test_a_subcommand_typo_gets_no_lifecycle_hint(self):
+        # The root parser reports a subcommand's leftover arguments; telling a
+        # `remediate` caller to go on to `finish` would republish the ledger.
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                audit_report.build_parser().parse_args(
+                    ["remediate", "--audit", AUDIT, "--findings-file", "f", "--finding", "x", "--bogus"]
+                )
+        self.assertIn("unrecognized arguments", err.getvalue())
+        self.assertNotIn(audit_report.LIFECYCLE_HINT, err.getvalue())
+
+    def test_a_missing_findings_file_names_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = str(Path(tmp) / "absent-findings.json")
+            with self.assertRaises(audit_report.ValidationError) as ctx:
+                audit_report.load_findings(absent, "compliance-audit", command="finish")
+            with self.assertRaises(audit_report.ValidationError) as remediate:
+                audit_report.load_findings(absent, "compliance-audit", command="remediate")
+        self.assertIn("does not exist", str(ctx.exception))
+        self.assertIn(
+            "audit_report.py draft --audit compliance-audit --manifest-file "
+            + audit_report.manifest_path_for("compliance-audit"),
+            str(ctx.exception),
+        )
+        self.assertIn(f"--out {absent}", str(ctx.exception))
+        # A run whose collector did not run is pointed at the manual fallback too.
+        self.assertIn("--no-collector-manifest", str(ctx.exception))
+        # `remediate` is not told to run `finish`, which would republish the ledger.
+        self.assertEqual(str(remediate.exception), f"--findings-file: {absent} does not exist")
+
+    def test_one_bad_field_reads_as_before(self):
+        # A single problem must give the same one line as before, with no
+        # second line from a check that read the bad field.
+        def manifest_finding(path):
+            finding = make_finding()
+            finding["remediation"] = {"kind": "manifest", "path": path, "note": "n"}
+            return finding
+
+        cases = {
+            "check null": lambda d: d["findings"][0].__setitem__("check", None),
+            "check empty": lambda d: d["findings"][0].__setitem__("check", ""),
+            "cluster empty": lambda d: d["findings"][0].__setitem__("cluster", ""),
+            "object empty": lambda d: d["findings"][0].__setitem__("object", ""),
+            "title null": lambda d: d["findings"][0].__setitem__("title", None),
+            "path null": lambda d: d["findings"].__setitem__(0, manifest_finding(None)),
+            "path empty": lambda d: d["findings"].__setitem__(0, manifest_finding("")),
+            "checks_run command empty": lambda d: d["scope"]["clusters"][0]["checks_run"][0].__setitem__("command", ""),
+            "cluster name null": lambda d: d["scope"]["clusters"][0].__setitem__("name", None),
+        }
+        for label, spoil in cases.items():
+            with self.subTest(case=label):
+                doc = make_doc()
+                spoil(doc)
+                with self.assertRaises(audit_report.ValidationError) as before:
+                    audit_report._validate_findings_document(copy.deepcopy(doc), AUDIT)
+                with self.assertRaises(audit_report.ValidationError) as now:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertEqual(str(now.exception), str(before.exception))
+
+    def test_every_field_error_is_reported_in_one_call(self):
+        # A worker fixes what the rejection names and runs finish again, so
+        # one field per call costs a run per field (#2856).
+        doc = make_doc(findings=[make_finding(), make_finding(fid="second")])
+        doc["scope"]["clusters"][0]["location"] = None
+        doc["findings"][0]["title"] = None
+        del doc["findings"][1]["evidence"]["command"]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        self.assertIn("3 problems", message)
+        self.assertIn("scope.clusters[0].location", message)
+        self.assertIn("findings[0].title", message)
+        self.assertIn("findings[1].evidence.command", message)
+
+    def test_the_gitlab_rep_errors_come_back_together(self):
+        # #2856's GitLab rep 2 took four rejected finish calls for these.
+        finding = make_finding()
+        finding["evidence"] = "kubectl get rolebinding -A"
+        finding["remediation"] = {"kind": "manifest", "path": None, "note": "n"}
+        del finding["title"]
+        doc = make_doc(findings=[finding])
+        doc["scope"]["clusters"][0]["location"] = None
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        for field in ("scope.clusters[0].location", "findings[0].title", "findings[0].evidence", "findings[0].remediation.path"):
+            self.assertIn(field, message)
+
+    def test_a_bad_identity_field_does_not_stop_later_findings(self):
+        # A missing key used to end collection at the next `finding[key]` read.
+        doc = make_doc(findings=[make_finding(), make_finding(fid="second", obj="Deployment/other")])
+        del doc["findings"][0]["cluster"]
+        doc["findings"][0]["check"] = None
+        del doc["findings"][1]["evidence"]["command"]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        for field in ("findings[0].check", "findings[0].cluster", "findings[1].evidence.command"):
+            self.assertIn(field, message)
+        self.assertNotIn("'None' is not a check", message)
+
+    def test_a_duplicate_identity_is_reported_beside_a_recorded_title(self):
+        # The duplicate is a problem of its own, not a repeat of the title.
+        doc = make_doc(findings=[make_finding(), make_finding()])
+        doc["findings"][1]["title"] = None
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("findings[1].title", str(exc.exception))
+        self.assertIn("findings[1]: same identity as findings[0]", str(exc.exception))
+
+    def test_a_null_limitations_still_shows_the_empty_checks_run(self):
+        doc = make_doc()
+        doc["scope"]["clusters"][0]["checks_run"] = []
+        doc["scope"]["clusters"][0]["limitations"] = None
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("scope.clusters[0].limitations", str(exc.exception))
+        self.assertIn("scope.clusters[0].checks_run: empty", str(exc.exception))
+
+    def test_a_bad_scope_name_keeps_collecting_without_false_scope_errors(self):
+        for label, spoil in {
+            "absent": lambda c: c.pop("name"),
+            "null": lambda c: c.__setitem__("name", None),
+        }.items():
+            with self.subTest(name=label):
+                doc = make_doc(findings=[make_finding()])
+                spoil(doc["scope"]["clusters"][0])
+                doc["resolved_because"] = [resolved_entry()]
+                del doc["findings"][0]["evidence"]["command"]
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                message = str(exc.exception)
+                self.assertIn("scope.clusters[0].name", message)
+                self.assertIn("findings[0].evidence.command", message)
+                self.assertNotIn("is not in scope.clusters", message)
+
+    def test_a_recorded_entry_key_does_not_stop_the_next_entry(self):
+        # A second defect behind the recorded one, in each list round 1's
+        # skip covers: both must come back in one rejection.
+        def checks_run(doc):
+            run = doc["scope"]["clusters"][0]["checks_run"]
+            run[0]["check"] = None
+            run[1]["command"] = ""
+            return "scope.clusters[0].checks_run[0].check", "scope.clusters[0].checks_run[1].command"
+
+        def not_applicable(doc):
+            cluster = doc["scope"]["clusters"][0]
+            first, second = cluster["checks_run"][:2]
+            cluster["checks_run"] = cluster["checks_run"][2:]
+            cluster["checks_not_applicable"] = [
+                {"check": None, "reason": "Autopilot: Google manages the node pools here."},
+                {"check": second["check"], "reason": ""},
+            ]
+            del first
+            return "checks_not_applicable[0].check", "checks_not_applicable[1].reason"
+
+        def skipped(doc):
+            doc["scope"]["skipped"] = [{"reason": "the API refused the call"}, {"cluster": "x", "reason": ""}]
+            return "scope.skipped[0].cluster", "scope.skipped[1].reason"
+
+        def resolved(doc):
+            doc["resolved_because"] = [resolved_entry(reason=None), resolved_entry(object="")]
+            return "resolved_because[0].reason", "resolved_because[1].object"
+
+        for spoil in (checks_run, not_applicable, skipped, resolved):
+            with self.subTest(list=spoil.__name__):
+                doc = make_doc()
+                first, second = spoil(doc)
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn(first, str(exc.exception))
+                self.assertIn(second, str(exc.exception))
+
+    def test_a_recorded_declared_key_does_not_stop_the_next_entry(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(check=None), make_declared(obj="")]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, DECLARING_AUDIT)
+        self.assertIn("declared[0].check", str(exc.exception))
+        self.assertIn("declared[1].object", str(exc.exception))
+
+    def test_reported_field_errors_are_capped(self):
+        findings = [make_finding(fid=f"f{i}") for i in range(25)]
+        doc = make_doc(findings=findings)
+        for finding in doc["findings"]:
+            del finding["evidence"]["command"]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        self.assertIn("findings[19].evidence.command", message)
+        self.assertNotIn("findings[20].evidence.command", message)
+        self.assertIn("5 more", message)
 
     def test_empty_evidence_command_rejected(self):
         doc = make_doc(findings=[make_finding(command="   ")])
@@ -2302,6 +2513,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "chat-delivery-watch",
                 "feedback-prompt",
                 "upgrade-readiness-watch",
+                "sa-role-watch",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
@@ -4103,6 +4315,24 @@ class TestPublishedBodies(HarnessTestCase):
             f'<!-- audit-findings: ["{derived_id()}"] -->', bodies[0]
         )
 
+    def test_the_install_switch_stops_finish_from_opening_a_pull_request(self):
+        """`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, read from the sandbox's root-owned
+        file: the same run that promotes above opens nothing, and the ledger it
+        publishes says the sweep is off and that `/remediate` still works (#3439)."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with tempfile.TemporaryDirectory() as tmp:
+            switch = os.path.join(tmp, "audit-auto-promote")
+            pathlib.Path(switch).write_text("false\n")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch), patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+                self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.harness.bodies_for("proposal-create"), [])
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
+        self.assertTrue(any("## Awaiting `/remediate`" in b and f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), published)
+
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
         # by default rather than by somebody remembering to add a test.
@@ -4197,6 +4427,54 @@ class TestNewMarker(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0, self.err)
         second = self.harness.bodies_for("issue-update")[-1]
         self.assertEqual(self.marked(second), [derived_id(fid="b")])
+
+    def finish_opening_a_pull_request(self, render=None):
+        """Run `finish` over a remembered `a` and a new `b` whose fix the sweep opens.
+
+        `render`, when given, stands in for `render_issue_body` during the run only.
+        """
+        self.remember([make_finding(fid="a", title="Alpha finding")])
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(
+            findings=[
+                make_finding(fid="a", title="Alpha finding"),
+                make_finding(fid="b", title="Bravo finding"),
+            ]
+        )
+        with mock.patch.object(audit_report, "render_issue_body", render or audit_report.render_issue_body):
+            self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+
+    def test_the_body_relinked_to_an_opened_pull_request_keeps_the_marks(self):
+        # The relink edit is the live body when the relay posts, so the card reads its tags from it.
+        self.finish_opening_a_pull_request()
+        first, relinked = self.harness.bodies_for("issue-update")
+        self.assertEqual(self.marked(first), [derived_id(fid="b")])
+        self.assertEqual(self.marked(relinked), [derived_id(fid="b")])
+
+    def test_the_relink_renders_what_the_first_render_did(self):
+        # Only what the opened pull request changes may differ between the two renders.
+        calls = []
+        real = audit_report.render_issue_body
+
+        def recording(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real(*args, **kwargs)
+
+        self.finish_opening_a_pull_request(render=recording)
+        (first_args, first), (relink_args, relink) = calls
+        self.assertEqual(first_args, relink_args)
+        self.assertEqual(set(first), set(relink))
+        relinked = {"states", "pr_urls", "blocked_by"}
+        self.assertEqual(
+            {key: value for key, value in first.items() if key not in relinked},
+            {key: value for key, value in relink.items() if key not in relinked},
+        )
 
     def test_a_first_run_marks_nothing(self):
         # No ledger to measure against: everything would read as new.
@@ -9990,6 +10268,65 @@ class TestPromotion(BaseTestCase):
         self.assertEqual(plan.promote, ["crit", "maj"])
         self.assertEqual(plan.withheld, [])
         self.assertEqual(plan.below_floor, ["min"])
+
+    def test_the_install_switch_turns_the_sweep_off_but_not_a_request(self):
+        """`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` is the inject lane's install: the
+        sweep opens nothing, a `/remediate` still opens what it names, and the
+        ledger says which switch is off and what still works (#3439)."""
+        findings = [
+            manifest_finding("crit", "a.yaml", severity="critical"),
+            manifest_finding("maj", "b.yaml", severity="major"),
+        ]
+        findings.append(manifest_finding("min", "c.yaml", severity="minor"))
+        findings.append(manifest_finding("unb", "d.yaml", severity="critical"))
+        plan = audit_report.promotion_candidates(
+            findings, {}, sweep_off=True, vouched={"crit", "maj", "min"}, uncorroborated={"unb"}
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.switched_off, ["crit", "maj"], "what the sweep would have opened, still classified")
+        self.assertEqual(plan.withheld, [], "the cap never applied, so nothing is over it")
+        self.assertEqual((plan.below_floor, plan.uncorroborated), (["min"], ["unb"]), "the other blocks read as on any install")
+        asked = audit_report.promotion_candidates(
+            findings, {}, ["maj"], sweep_off=True, vouched={"crit", "maj", "min"}, uncorroborated={"unb"}
+        )
+        self.assertEqual(asked.promote, ["maj"], "a request still opens what it names")
+        self.assertEqual(asked.switched_off, ["crit"])
+        body = render_body(make_doc(findings=findings), generated_at=NOW, switched_off=plan.switched_off, below_floor=plan.below_floor)
+        self.assertIn("## Awaiting `/remediate`", body)
+        self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
+        self.assertIn("/remediate <finding-id>", body)
+        section = body[body.index("## Awaiting `/remediate`"):]
+        self.assertLess(section.index("the automatic sweep is off"), section.index("`min`"), "the switch block comes first, the floor block still reads")
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+        on = render_body(make_doc(findings=findings), generated_at=NOW, below_floor=plan.below_floor)
+        self.assertNotIn(audit_report.AUTO_PROMOTE_ENV, on, "an install with the switch on never mentions it")
+        closing = audit_report.render_stale_close_comment("fleet-audit", findings[:1], NOW, pr_number=8, sweep_off=True)
+        self.assertNotIn("re-proposed automatically", closing, "a close on this install promises no automatic re-proposal")
+        self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", closing)
+        self.assertIn("/remediate <finding-id>", closing)
+        self.assertIn("re-proposed automatically", audit_report.render_stale_close_comment("fleet-audit", findings[:1], NOW, pr_number=8))
+
+    def test_the_switch_reads_the_root_owned_file_before_the_variable(self):
+        """A session can export the variable in one word; the sandbox entrypoint's
+        file is root-owned, so it is read first and the variable only without it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "audit-auto-promote")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", path):
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "false"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled())
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "FALSE"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled())
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "0"}):
+                    self.assertTrue(audit_report.auto_promotion_enabled(), "only the word false turns it off")
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(audit_report.AUTO_PROMOTE_ENV, None)
+                    self.assertTrue(audit_report.auto_promotion_enabled())
+                pathlib.Path(path).write_text("false\n")
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+                    self.assertFalse(audit_report.auto_promotion_enabled(), "the file wins over the variable")
+                pathlib.Path(path).write_text("true\n")
+                with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "false"}):
+                    self.assertTrue(audit_report.auto_promotion_enabled(), "the file wins over the variable")
 
     def test_the_floor_is_major(self):
         self.assertEqual(audit_report.AUTO_PROMOTION_FLOOR, "major")
@@ -17583,6 +17920,21 @@ class TestLoadManifest(BaseTestCase):
             audit_report.load_manifest(str(self.tmp_path / "absent.json"))
         self.assertIn("does not exist", str(ctx.exception))
 
+    def test_a_missing_manifest_names_the_next_step_for_the_command(self):
+        absent = str(self.tmp_path / "absent.json")
+        with self.assertRaises(audit_report.ValidationError) as finish:
+            audit_report.load_manifest(absent, "compliance-audit", command="finish")
+        # The next step, for both cases: the collector ran, or it did not.
+        self.assertIn(audit_report.manifest_path_for("compliance-audit"), str(finish.exception))
+        self.assertIn("--no-collector-manifest", str(finish.exception))
+        with self.assertRaises(audit_report.ValidationError) as draft:
+            audit_report.load_manifest(absent, "compliance-audit", command="draft")
+        self.assertIn(audit_report.manifest_path_for("compliance-audit"), str(draft.exception))
+        self.assertNotIn("--no-collector-manifest", str(draft.exception))
+        with self.assertRaises(audit_report.ValidationError) as remediate:
+            audit_report.load_manifest(absent, "compliance-audit", command="remediate")
+        self.assertEqual(str(remediate.exception), f"--manifest-file: {absent} does not exist")
+
     def test_malformed_json_is_a_validation_error(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
             audit_report.load_manifest(self.write("not json"))
@@ -19668,6 +20020,29 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertIn(DECLINE_REASON, "".join(self.harness.bodies_for("issue-*")))
         self.assertIn("published with a manual remediation instead", self.err)
 
+    def test_the_install_switch_keeps_the_refusal_and_lists_the_written_fix_as_awaiting_a_request(self):
+        """On an install whose `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is off a
+        `/remediate` needs the written fix as much as the sweep does, so an
+        unwritten one is refused as on any install; once written it publishes
+        with no pull request, named on the ledger as awaiting a request (#3474)."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        doc = make_doc()
+        with tempfile.TemporaryDirectory() as tmp:
+            switch = os.path.join(tmp, "audit-auto-promote")
+            pathlib.Path(switch).write_text("false\n")
+            with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch):
+                self.assertEqual(self.run_finish(doc), 2)
+                self.assertIn("need their fix written before a `/remediate`", self.err)
+                self.assertNotIn("automatic pull request", self.err, "no sweep opens one on this install")
+                self.touch(doc["findings"][0]["remediation"]["path"])
+                self.assertEqual(self.run_finish(doc), 0, self.err)
+                self.assertFalse(self.harness.forge_calls("proposal-create"))
+                body = "".join(self.harness.bodies_for("issue-*"))
+                self.assertIn("## Awaiting `/remediate`", body)
+                self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
+                self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
+
     def test_finish_publishes_once_the_fix_is_written(self):
         self.harness.replies = {"issue-list": issues_view([])}
         self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
@@ -20304,6 +20679,7 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         self.assertEqual(rc, 2)
         self.assertIn("--manifest-file is required for compliance-audit", self.err)
         self.assertIn("--no-collector-manifest", self.err)
+        self.assertIn(f"--manifest-file {audit_report.manifest_path_for('compliance-audit')}", self.err)
         self.assertFalse(self.harness.matching("issue"))
         self.assertFalse((self.reports_dir / AUDIT).exists())
 

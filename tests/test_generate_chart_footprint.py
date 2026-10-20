@@ -369,7 +369,7 @@ class ExtractFootprintTest(unittest.TestCase):
 
     def test_claims_are_counted(self):
         self.assertEqual(self.op["storage"]["persistentVolumeClaims"], 4)
-        self.assertEqual(self.op["storage"]["storageBytesRequest"], 22 * _GIB)
+        self.assertEqual(self.op["storage"]["storageBytesRequest"], 102 * _GIB)
 
     def test_a_renamed_container_is_an_error_rather_than_a_zero(self):
         """Finding containers by name means a rename must fail loudly, not sum to 0."""
@@ -386,12 +386,12 @@ class ExtractFootprintTest(unittest.TestCase):
         self.assertEqual(shell["pods"], 2)
         self.assertEqual(shell["cpuMillisRequest"], baseline_shell["cpuMillisRequest"] * 2)
         self.assertEqual(shell["memoryBytesRequest"], baseline_shell["memoryBytesRequest"] * 2)
-        # Shell StatefulSet has 2 volumeClaimTemplates (data=10Gi, sshd=1Gi), so scaling from
-        # 1 to 2 replicas adds 2 claims (baseline 4 -> 6) and 11Gi storage (baseline 22Gi -> 33Gi).
+        # Shell StatefulSet has 2 volumeClaimTemplates (data=50Gi, sshd=1Gi), so scaling from
+        # 1 to 2 replicas adds 2 claims (baseline 4 -> 6) and 51Gi storage (baseline 102Gi -> 153Gi).
         self.assertEqual(data["operatorRendered"]["storage"]["persistentVolumeClaims"], 6)
         self.assertEqual(
             data["operatorRendered"]["storage"]["storageBytesRequest"],
-            self.op["storage"]["storageBytesRequest"] + 11 * _GIB,
+            self.op["storage"]["storageBytesRequest"] + 51 * _GIB,
         )
 
     def test_cred_proxy_replicas_multiplies_pods_and_resources(self):

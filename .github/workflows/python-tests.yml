@@ -66,6 +66,7 @@ jobs:
   test:
     name: Run Python Unit Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     # No pull-requests: write here, deliberately. This job runs the pull
     # request's own Makefile and tests, and on a fork PR the token is
@@ -249,6 +250,7 @@ jobs:
   test-agent-python:
     name: Run Python Unit Tests on the agent image's Python
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     permissions:
       contents: read
     env:
@@ -303,6 +305,7 @@ jobs:
   bench-tests:
     name: Run Bench Harness Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code

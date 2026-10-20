@@ -93,6 +93,17 @@ readonly EVAL_NOT_RUN_DIR="not-run"
 readonly EVAL_TIMING_FILE="timing.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
+# Where each unit writes a repetition's log (run_one_unit) and grading reads it
+# back (analyze_eval_phases). CI keeps /tmp. A run that shares the machine with
+# other runs sets a private directory: the tests point it at a mktemp -d. It is
+# made absolute and created here: the write runs in a subshell that cds into
+# BENCH_DIR, so a relative value would write in one place and read in another.
+# CDPATH is cleared for that cd: it would send a relative name to another
+# directory and print the path, which the substitution would capture.
+EVAL_LOG_DIR="${EVAL_LOG_DIR:-/tmp}"
+mkdir -p "${EVAL_LOG_DIR}"
+EVAL_LOG_DIR="$(CDPATH='' cd -- "${EVAL_LOG_DIR}" && pwd)"
+readonly EVAL_LOG_DIR
 
 # EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
 # `spec.mode: next` under, in the same job environment. Under it the matrix
@@ -1972,10 +1983,11 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # case (decided 2026-09-15 on #1546/#1564): it lands there, builds its record
 # in the evidence store (EVAL_BASELINE_STORE below), and earns a presubmit
 # seat on that record; measured cost, presubmit redundancy or grading
-# something outside the core journeys keep a case there for good. The file's
-# header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=8 (6 from #1491 until oss-test-infra#2707, merged
-# 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# something outside the core journeys keep a case there for good. The budget
+# arithmetic its header used to carry (against the periodic's 480m deadline
+# at EVAL_TASK_PARALLELISM=8) is frozen in hack/eval/nightly-budget-history.txt
+# (#3495); a run's matrix is the "Eval matrix: ..." line below, and
+# `python3 scripts/eval_rosters.py --summary` counts the files. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
@@ -2424,10 +2436,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # and the 16.4min fixed term extrapolate honestly, which is what the four
 # estimates before them did not.
 #
-# Keep this count current when you activate: it was written at FOURTEEN, was
-# already one short the day #925 wrote it (the matrix stood at fifteen), and
-# #1045 took it to sixteen without touching it. Recount the entries in
-# hack/eval/presubmit-cases.txt rather than incrementing what is here.
+# The counts above are as of the day each paragraph was written, and they
+# drifted (one was written at FOURTEEN when the matrix stood at fifteen).
+# Don't hand-maintain one here: each run logs its matrix as "Eval matrix: ..."
+# and `python3 scripts/eval_rosters.py --summary` counts the files (#3495).
 #
 # The budget has been raised three times to get here, all merged: oss-test-infra
 # #2667 took it 85m -> 150m off an estimate, #2669 took it 150m -> 240m off a
@@ -2556,6 +2568,12 @@ if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "Zero repetitions would run nothing and report green -- refusing." >&2
   exit 1
 fi
+# The matrix's size, computed (#3495). The roster files don't carry totals any
+# more, so this line is where a run's count is read; for the files themselves,
+# `python3 scripts/eval_rosters.py --summary`.
+# awk reads every value the check above accepts (08, +3, " 3") as the number
+# seq does, so a log line can never stop the job.
+echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(awk -v n="${#TASKS[@]}" -v r="${EVAL_REPETITIONS}" 'BEGIN { print n * r }') unit(s)"
 
 # How far a judged mean may fall below main's before rung 6 fires. 0.5 is
 # arithmetic on the measured spread, not a preference: three repetitions of one
@@ -2634,9 +2652,9 @@ esac
 # eval-crew alias (#1546).
 #
 # Demoting a flaky case is a same-day edit: delete its name from that file
-# and its line from presubmit-cases.txt, add the line to nightly-cases.txt
-# with the issue that names its re-admission condition as the # line above
-# it, and cite what the record says about it.
+# and its line from presubmit-cases.txt, add the line to nightly-cases.txt's
+# sorted section (#3495) with the issue that names its re-admission
+# condition as the # line above it, and cite what the record says about it.
 #
 # A name that is not a presubmit case stops the job here: a misspelled entry
 # would otherwise arm nothing and look like a working roster, and a nightly
@@ -2826,8 +2844,9 @@ unit_cost_hint() {
     # then waits out the human record's card, then an agent turn that is a
     # board read. Priced at the band rather than at the 566-677s its
     # dev-install repetitions measured, because those met a quiet board and the
-    # nightly's is shared. hack/eval/nightly-cases.txt's 2026-10-13 paragraph
-    # carries the measurements and the budget arithmetic.
+    # nightly's is shared. The 2026-10-13 paragraph of
+    # hack/eval/nightly-budget-history.txt carries the measurements and the
+    # budget arithmetic.
     gitops-drift-noise-filtered-triage) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
@@ -2956,6 +2975,53 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # The upgrade-failure catalogue's scenario cases: read-only chat prompts
+    # over the seeded clusters (entries 1 and 2 one Cluster Agent card per
+    # cluster; entries 6 and 16 one declared line per cluster; entry 5 one
+    # maintenance-policy read per cluster; entry 3 and the eleven on the
+    # seeded-a shapes a read of every cluster for one planted object the
+    # prompt does not place). Five are in the nightly from 2026-10-15, the
+    # first batch; the other twelve wait in scripts/validate_bench_cases.py's
+    # KNOWN_UNREGISTERED for their batch. Each measured case is priced at the
+    # median wall clock of its clean passes on a dev install with one user
+    # worker slot
+    # (57 runs, 2026-10-07 to 10-15, re-graded at the head's task files),
+    # rounded up to the next 100s, the way compliance-rbac-overgrant,
+    # capacity-pinned-pool-probe and cluster-agent-delegation-profile-lookup
+    # above are priced at their medians. The clean-pass walls per entry:
+    # entry 1: 514, 782 and 1081s.
+    upgrades-drain-blocking-budget-named) echo 800 ;;
+    # entry 2: 924, 1065 and 3163s, with two more runs lost at the 2400s
+    # delegation ceiling.
+    upgrades-no-surge-pool-recreate-warned) echo 1100 ;;
+    # entry 3: 454, 541, 672 and 983s.
+    upgrades-zonal-skew-replicas-warned) echo 700 ;;
+    # entry 5: 237, 240, 316, 441 and 571s.
+    upgrades-exclusion-end-date-named) echo 400 ;;
+    # entry 4: 1171 and 1280s.
+    upgrades-node-local-state-named) echo 1300 ;;
+    # entry 8: one pass, 750s.
+    upgrades-pod-security-latest-pinned-named) echo 800 ;;
+    # entry 12: 510 and 1161s.
+    upgrades-deprecated-node-label-selector-named) echo 900 ;;
+    # entry 13: one pass, 540s.
+    upgrades-containerd-socket-agent-named) echo 600 ;;
+    # entry 14: one pass, 360s.
+    upgrades-cgroup-blind-runtime-named) echo 400 ;;
+    # entry 17: one pass, 2180s: the agent answered at 264s and the harness
+    # was still waiting on the delegated cards when the sequence stopped it.
+    upgrades-node-image-coupled-agent-named) echo 2200 ;;
+    # entry 19: 1042 and 1291s.
+    upgrades-intree-volume-named) echo 1200 ;;
+    # entry 20: 390 and 1762s.
+    upgrades-retired-registry-image-named) echo 1100 ;;
+    # Entries 6, 10, 15, 16 and 18 have no clean pass on record, so no
+    # measurement: every run was a loss (682-3943s wall, most at the 2400s
+    # delegation ceiling) or an agent gap. They keep the 900 band of their
+    # shape until a clean pass measures them.
+    upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
+    upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
+    upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
     *) echo 200 ;;
   esac
 }
@@ -3225,7 +3291,7 @@ grade_case() { # <task-path> <task-name>
     end_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.end" 2>/dev/null || echo 0)"
     rep_result=""
     [ -n "${run_dir}" ] && rep_result="${run_dir}/results.json"
-    analyze_eval_phases "/tmp/eval_${name}_rep${rep}.log" "${start_ms}" "${end_ms}" "${name} rep ${rep}" "${rep_result}"
+    analyze_eval_phases "${EVAL_LOG_DIR}/eval_${name}_rep${rep}.log" "${start_ms}" "${end_ms}" "${name} rep ${rep}" "${rep_result}"
     if [ -n "${run_dir}" ]; then
       result_args+=(--result "${run_dir}")
       cp "${run_dir}/results.json" "results_${name}_rep${rep}.json" 2>/dev/null || true
@@ -3373,7 +3439,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
 
 run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq> <streams>
   local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6" streams="${7:-}"
-  local log="/tmp/eval_${name}_rep${rep}.log"
+  local log="${EVAL_LOG_DIR}/eval_${name}_rep${rep}.log"
   # A distinct local port per unit: the harness's port-forward is owned by
   # the process that spawned it and its atexit teardown would drop a shared
   # listener under every sibling mid-conversation. On its own port, each

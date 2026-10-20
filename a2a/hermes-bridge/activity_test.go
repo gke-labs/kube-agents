@@ -194,10 +194,11 @@ print("the answer")
 		}
 	}
 
-	// Order on the wire: the trace precedes the result, and the result the
-	// final; the first activity part opens the artifact, the second appends.
+	// Order on the wire: the trace precedes the turn's usage, the usage the
+	// result, and the result the final; the first activity part opens the
+	// artifact, the second appends.
 	trail := eventTrail(t, replayEvents(t, url, "task-activity"))
-	want := []string{"submitted", "working", "activity", "activity", "result", "completed/final"}
+	want := []string{"submitted", "working", "activity", "activity", "usage", "result", "completed/final"}
 	if strings.Join(trail, " ") != strings.Join(want, " ") {
 		t.Fatalf("event trail = %v, want %v", trail, want)
 	}

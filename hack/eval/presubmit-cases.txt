@@ -167,8 +167,7 @@
 # runs both files). scripts/test_eval_rosters.py pins the set as
 # HELD_OUT_IN_PRESUBMIT; roster ⊆ presubmit still holds, presubmit == roster
 # holds less exactly this section. A seat added or withdrawn here moves the
-# case counts in this file's BUDGET line, nightly-cases.txt's header,
-# docs/eval-gate-roster.md, docs/designs/testing-strategy.md and
+# case counts in this file's BUDGET line, docs/eval-gate-roster.md, docs/designs/testing-strategy.md and
 # docs/ci-health.md; SLOW_MIN_TASKS in scripts/eval_dashboard/health.py
 # reads this file.
 

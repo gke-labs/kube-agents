@@ -118,7 +118,9 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
 `FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), and the `KAGE_SLACK_UX` flag —
-but only as literal values; all `valueFrom` sources are rejected. A name earns a
+but only as literal values; all `valueFrom` sources are rejected. One name goes to the shell Pod
+instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
+operator normalises to `true` or `false` before it reaches that Pod. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -223,7 +225,7 @@ process, so a peer that reaches the port cannot spend its threads), and is
 the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
 namespace, where the managed-Prometheus collector runs, and to the operator's own
 pods, which read the counters into the `PlatformAgent`'s `status.usage`
-([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica.
+([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica, a shape the operator does not render today.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per
@@ -257,17 +259,17 @@ than in the Pod's status.
 
 ## Credential Placement
 
-| Data                             | Sandbox                | Credential runtime          |
-| -------------------------------- | ---------------------- | --------------------------- |
-| `spec.deployment.env`            | No                     | Yes                         |
-| Slack tokens                     | No                     | Yes, Secret-backed env      |
-| PlatformAgent external API key   | No                     | Yes, Secret-backed env      |
-| Session KV API key and HMAC salt | Yes, Secret-backed env | Yes, API key only           |
-| Automatic KSA token mount        | Disabled               | Disabled                    |
-| Explicit projected KSA token     | Broker audience only   | Read-only, one-hour token   |
-| gcloud/kubectl configuration     | No                     | Private `emptyDir`          |
-| GitHub installation token/cache  | No                     | Private `emptyDir`          |
-| Agent workspace                  | Yes                    | No, the broker owns its own |
+| Data                             | Sandbox                                                    | Credential runtime          |
+| -------------------------------- | ---------------------------------------------------------- | --------------------------- |
+| `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
+| Slack tokens                     | No                                                         | Yes, Secret-backed env      |
+| PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
+| Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |
+| Automatic KSA token mount        | Disabled                                                   | Disabled                    |
+| Explicit projected KSA token     | Broker audience only                                       | Read-only, one-hour token   |
+| gcloud/kubectl configuration     | No                                                         | Private `emptyDir`          |
+| GitHub installation token/cache  | No                                                         | Private `emptyDir`          |
+| Agent workspace                  | Yes                                                        | No, the broker owns its own |
 
 ### The loopback-only exception
 
@@ -1110,7 +1112,8 @@ needs the same treatment.
 
 CI and deployment tests should assert that:
 
-1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
+1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
+   normalised to `true` or `false`), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

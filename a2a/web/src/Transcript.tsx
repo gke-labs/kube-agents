@@ -14,6 +14,7 @@
  * exchange group gets one correlation chip colored by corrColor.
  */
 import { useEffect, useRef, useState } from "react";
+import { fmtUsage } from "./derive.ts";
 import type { ChatEntry } from "./model.ts";
 import { corrColor } from "./model.ts";
 
@@ -72,6 +73,11 @@ export default function Transcript({ entries, empty }: { entries: ChatEntry[]; e
           {TAGGED.includes(entry.kind) && entry.session && <span className="chat-session">[{entry.session}]</span>}
           <span className="chat-text">{entry.text}</span>
           {entry.note && <span className="chat-note">{entry.note}</span>}
+          {entry.kind === "answer" && entry.usage && (
+            <span className="chat-usage" title="what this turn cost, as its executor reported it">
+              {fmtUsage(entry.usage)}
+            </span>
+          )}
         </div>
       </div>
     );
