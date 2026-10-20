@@ -102,8 +102,7 @@ nothing periodically asked (#656).
 
 ``stuck_in_blocked`` is therefore reported whatever the severity floor says: a
 worker or operator block is sticky, nothing retries it until a human acts, and
-a card nobody is looking at is the one finding this check exists for. The rule
-The rule is stateless and a card still blocked is named (directly, or by task ID
+a card nobody is looking at is the one finding this check exists for. The rule is stateless and a card still blocked is named (directly, or by task ID
 in the omitted list up to the report budget) once a day until someone unblocks,
 comments on, or archives it, which is the intended nag.
 Cards are listed newest first, each with its kind, reason, and age read from the
@@ -160,12 +159,11 @@ AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
 MAX_STUCK_ITEMS = 15
 MAX_STUCK_CHARS = 5500
-MIN_STUCK_CHARS = 2000
 MAX_DIAGNOSTIC_ITEMS = 20
 MAX_DIAGNOSTIC_CHARS = 3500
 MAX_INVARIANT_ITEMS = 20
 MAX_REPORT_CHARS = 8500
-MAX_GROUP_IDS_CHARS = 500
+MAX_GROUP_IDS_CHARS = 1000
 GROUP_EXPAND_MAX = 3
 # Pinned to the board file this run read, the way `diagnostics_lines` pins the
 # engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
@@ -349,11 +347,20 @@ def _card_age_hours(diag: dict) -> float:
 
 def _format_id_list(ids: list, max_chars: int = MAX_GROUP_IDS_CHARS) -> str:
     """Format task IDs comma-separated, truncating with ', and N more' if exceeding max_chars."""
+    text, _ = _format_id_list_with_dropped(ids, max_chars)
+    return text
+
+
+def _format_id_list_with_dropped(ids: list, max_chars: int = MAX_GROUP_IDS_CHARS) -> tuple[str, list]:
+    """Format task IDs comma-separated, truncating with ', and N more' if exceeding max_chars.
+
+    Returns (formatted_str, dropped_ids).
+    """
     if not ids:
-        return ""
+        return "", []
     all_str = ", ".join(ids)
     if len(all_str) <= max_chars:
-        return all_str
+        return all_str, []
     chosen = []
     for i, tid in enumerate(ids):
         remaining_count = len(ids) - (i + 1)
@@ -362,12 +369,13 @@ def _format_id_list(ids: list, max_chars: int = MAX_GROUP_IDS_CHARS) -> str:
         if len(candidate) > max_chars:
             if chosen:
                 break
-            return f"and {len(ids)} more"
+            return f"and {len(ids)} more", list(ids)
         chosen.append(tid)
-    remaining_count = len(ids) - len(chosen)
+    dropped = list(ids[len(chosen):])
+    remaining_count = len(dropped)
     if remaining_count > 0:
-        return ", ".join(chosen) + f", and {remaining_count} more"
-    return ", ".join(chosen)
+        return ", ".join(chosen) + f", and {remaining_count} more", dropped
+    return ", ".join(chosen), []
 
 
 def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=None) -> list:
@@ -395,13 +403,32 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
     if max_chars is None:
         max_chars = MAX_STUCK_CHARS
 
+    tid = str(stuck_items[0][0]) if len(stuck_items) == 1 else "<task_id>"
+    footer_lines = [
+        "  Commands to move a card (run on the agent pod):",
+        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}",
+        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}",
+    ]
+    footer_chars = sum(len(ln) + 1 for ln in footer_lines)
+
+    header = (
+        "Cards blocked with no one looking (a worker or operator block is sticky: "
+        "nothing retries it until a human acts):"
+    )
+    header_chars = len(header) + 1
+
+    budget_for_body = max(0, max_chars - header_chars - footer_chars)
+    min_omission_chars = 120
+    available_for_items = max(0, budget_for_body - min_omission_chars)
+
     parsed = []
     for task_id, diag, entry in stuck_items:
+        task_id = str(task_id)
         info = (context or {}).get(task_id) or {}
-        kind = info.get("kind") or NO_KIND
-        assignee = info.get("assignee") or entry.get("assignee") or "?"
-        title = (info.get("title") or entry.get("title") or "").strip()
-        reason = " ".join((info.get("reason") or "").split())[:REASON_MAX_CHARS]
+        kind = str(info.get("kind") or NO_KIND)
+        assignee = str(info.get("assignee") or entry.get("assignee") or "?")
+        title = str(info.get("title") or entry.get("title") or "").strip()
+        reason = " ".join(str(info.get("reason") or "").split())[:REASON_MAX_CHARS]
         age_hours = _card_age_hours(diag)
         parsed.append({
             "task_id": task_id,
@@ -435,6 +462,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                 "lines": [line],
                 "card_count": 1,
                 "cards": [card],
+                "dropped_ids": [],
             })
         else:
             newest_age = group[0]["age_hours"]
@@ -445,6 +473,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
             kinds_summary = ", ".join(f"{cnt} {k}" for k, cnt in sorted_kinds)
             head = f"  - {title} — {len(group)} cards ({kinds_summary}, oldest {oldest_str})"
             lines_for_group = [head]
+            dropped_ids = []
             if len(group) <= GROUP_EXPAND_MAX:
                 for card in group:
                     age_str = render_age(card["age_hours"] if card["age_hours"] != float("inf") else None)
@@ -460,13 +489,17 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                     latest_sub += f' — "{newest_card["reason"]}"'
                 lines_for_group.append(latest_sub)
                 group_ids = [c["task_id"] for c in group]
-                lines_for_group.append(f"    ids: {_format_id_list(group_ids, MAX_GROUP_IDS_CHARS)}")
+                group_header_chars = len(head) + 1 + len(latest_sub) + 1 + len("    ids: ") + 1
+                group_ids_budget = min(MAX_GROUP_IDS_CHARS, max(0, available_for_items - group_header_chars))
+                formatted_ids, dropped_ids = _format_id_list_with_dropped(group_ids, group_ids_budget)
+                lines_for_group.append(f"    ids: {formatted_ids}")
             renderable_items.append({
                 "age_hours": newest_age,
                 "key": title,
                 "lines": lines_for_group,
-                "card_count": len(group),
+                "card_count": len(group) - len(dropped_ids),
                 "cards": group,
+                "dropped_ids": dropped_ids,
             })
 
     for card in no_title_cards:
@@ -477,27 +510,10 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
             "lines": [line],
             "card_count": 1,
             "cards": [card],
+            "dropped_ids": [],
         })
 
     renderable_items.sort(key=lambda item: (item["age_hours"], item["key"]))
-
-    tid = stuck_items[0][0] if len(stuck_items) == 1 else "<task_id>"
-    footer_lines = [
-        "  Commands to move a card (run on the agent pod):",
-        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}",
-        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}",
-    ]
-    footer_chars = sum(len(ln) + 1 for ln in footer_lines)
-
-    header = (
-        "Cards blocked with no one looking (a worker or operator block is sticky: "
-        "nothing retries it until a human acts):"
-    )
-    header_chars = len(header) + 1
-
-    budget_for_body = max(0, max_chars - header_chars - footer_chars)
-    min_omission_chars = 120
-    available_for_items = max(0, budget_for_body - min_omission_chars)
 
     taken_items = _take_within_budget(
         renderable_items, MAX_STUCK_ITEMS, available_for_items, line_fn=lambda it: it["lines"]
@@ -506,7 +522,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
         next_item = renderable_items[len(taken_items)]
         next_chars = sum(len(ln) + 1 for ln in next_item["lines"])
         current_chars = sum(sum(len(ln) + 1 for ln in it["lines"]) for it in taken_items)
-        if len(taken_items) + 1 == len(renderable_items) and (current_chars + next_chars <= budget_for_body):
+        if len(taken_items) + 1 == len(renderable_items) and not next_item.get("dropped_ids") and (current_chars + next_chars <= budget_for_body):
             taken_items.append(next_item)
 
     lines = [header]
@@ -518,14 +534,21 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
     if omitted_cards > 0:
         current_body_chars = sum(len(ln) + 1 for ln in lines[1:])
         remaining_for_omission = max(0, budget_for_body - current_body_chars)
-        omitted_ids = [c["task_id"] for it in renderable_items[len(taken_items):] for c in it["cards"]]
+        omitted_ids = []
+        for it in taken_items:
+            omitted_ids.extend(it.get("dropped_ids", []))
+        for it in renderable_items[len(taken_items):]:
+            omitted_ids.extend(c["task_id"] for c in it["cards"])
         prefix = f"  ... and {omitted_cards} older stuck card{'s' if omitted_cards != 1 else ''} omitted"
         list_hint = "; run hermes kanban list on the agent pod to view all"
         omission_overhead = len(prefix) + len(" (ids: ") + len(list_hint) + len(")\n")
         max_ids_budget = remaining_for_omission - omission_overhead
         if max_ids_budget >= 15:
             formatted_ids = _format_id_list(omitted_ids, max_chars=max_ids_budget)
-            lines.append(f"{prefix} (ids: {formatted_ids}{list_hint})")
+            if formatted_ids and not formatted_ids.startswith("and "):
+                lines.append(f"{prefix} (ids: {formatted_ids}{list_hint})")
+            else:
+                lines.append(f"{prefix} (run hermes kanban list on the agent pod to view all)")
         else:
             lines.append(f"{prefix} (run hermes kanban list on the agent pod to view all)")
 
@@ -636,13 +659,16 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     if entries is not None and not isinstance(entries, list):
         return [f"  diagnostics unavailable: CLI returned "
                 f"{type(entries).__name__}, expected a JSON list"]
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS
+
     diag_lines = []
     stuck_items = []
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
-        task_id = entry.get("task_id", "?")
-        status = entry.get("status", "?")
+        task_id = str(entry.get("task_id") or "?")
+        status = str(entry.get("status") or "?")
         for diag in entry.get("diagnostics") or []:
             if not isinstance(diag, dict):
                 continue
@@ -659,7 +685,10 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
                 parts.append(f" - {detail}")
             diag_lines.append("".join(parts))
 
-    shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, MAX_DIAGNOSTIC_CHARS)
+    min_stuck_reserve = 500 if stuck_items else 0
+    diag_allowance = max(0, max_chars - min_stuck_reserve)
+    diag_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, diag_allowance) - 120)
+    shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, diag_budget)
     lines = list(shown_diag_lines)
     omitted_diags = len(diag_lines) - len(shown_diag_lines)
     if omitted_diags > 0:
@@ -668,12 +697,9 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
             f"(run hermes kanban diagnostics on the agent pod to view all)"
         )
 
-    if max_chars is None:
-        max_chars = MAX_REPORT_CHARS
-
     if stuck_items:
         current_chars = sum(len(ln) + 1 for ln in lines)
-        remaining = max(MIN_STUCK_CHARS, max_chars - current_chars)
+        remaining = max(0, max_chars - current_chars)
         stuck_budget = min(MAX_STUCK_CHARS, remaining)
         lines.extend(render_stuck_cards(stuck_items, context or {}, home, max_chars=stuck_budget))
     return lines
@@ -710,7 +736,8 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> l
             )
         used_chars += sum(len(ln) + 1 for ln in lines)
 
-    remaining_chars = max(0, max_chars - used_chars)
+    diag_header_reserve = len("Active kanban diagnostics:\n")
+    remaining_chars = max(0, max_chars - used_chars - diag_header_reserve)
     diags = diagnostics_lines(
         home, severity_floor(env), env=env, context=context, always=always_report_kinds(env),
         max_chars=remaining_chars, **kwargs
