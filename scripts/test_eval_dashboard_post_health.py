@@ -1807,14 +1807,14 @@ class BucketState(unittest.TestCase):
 
         def runner(argv, **kwargs):
             calls.append(argv)
-            if argv[:3] == ["gcloud", "storage", "cat"]:
+            if argv[:3] == ["gcloud", "storage", "cat", "--quiet"]:
                 return Result(1)
             return Result(0)
 
         self.assertIsNone(post_health.read_state("gs://bucket/evals/health-state.json", runner))
         post_health.write_state("gs://bucket/evals/health-state.json", {"state": "GREEN"}, runner)
-        self.assertEqual(calls[0], ["gcloud", "storage", "cat", "gs://bucket/evals/health-state.json"])
-        self.assertEqual(calls[1][:5], ["gsutil", "-q", "-h", "Cache-Control: no-cache", "cp"])
+        self.assertEqual(calls[0], ["gcloud", "storage", "cat", "--quiet", "gs://bucket/evals/health-state.json"])
+        self.assertEqual(calls[1][:5], ["gcloud", "storage", "cp", "--quiet", "--cache-control=no-cache"])
         self.assertEqual(calls[1][-1], "gs://bucket/evals/health-state.json")
 
 
