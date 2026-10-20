@@ -32,7 +32,10 @@ the Nodes in one through a jsonpath template, the StorageClasses and PersistentV
 one. A read the credential proxy cut at its output cap is that kind's read error, naming the
 cap. A rule that needs a kind asks `read_error(read, kind)` and files one `unknown` naming the
 reason when the kind was not read, grading what it has; a refused or cut read never costs a
-rule that does not need it.
+rule that does not need it. A rule that grades the PDB read's Deployments and StatefulSets
+and the namespaced read's DaemonSets and CronJobs files `workloads_unread_detail(read, kinds)`
+when one of its reads failed: the text names the kinds not read, the PDB read's included when
+`items` is None, and the kinds graded, or says nothing was.
 
 `context` carries `project`, `location` and `cluster_name` (for a log filter), `run_cmd`
 (the report's runner) with `timeout_seconds` (the per-call cap a rule passes to it), `at`
@@ -119,6 +122,15 @@ READ_KINDS = NAMESPACED_READ_KINDS + (POD_READ_KIND, NODE_READ_KIND) + CLUSTER_R
 # own terms and graded beside these kinds.
 NO_READ_RAN_REASON = "the member's kubeconfig was not written, so no read ran"
 LATER_READS_SKIPPED_REASON = "the PDB read failed, so the reads after the webhook read were skipped"
+# What a rule that grades the PDB read's workloads and some of the namespaced read's kinds says
+# when a read it needs failed: the kinds not read, then the kinds graded. The PDB read's
+# workload kinds are unread exactly when `items` is None, and then nothing was graded.
+PDB_WORKLOAD_KINDS = ("deploy", "statefulset")
+READ_KIND_NAMES = {"deploy": "Deployments", "statefulset": "StatefulSets", "daemonset": "DaemonSets", "cronjob": "CronJobs"}
+WORKLOADS_UNREAD_FORMAT = "{unread} not read ({reason}); {graded}"
+WORKLOADS_GRADED_FORMAT = "{kinds} graded"
+WORKLOADS_NOTHING_GRADED = "nothing graded"
+KIND_LIST_LAST_SEPARATOR = " and "
 
 # The per-member context keys (the module docstring says what each holds).
 CONTEXT_PROJECT = "project"
@@ -365,6 +377,29 @@ def read_error(read, kind: str) -> str | None:
 def unread_kinds(read, kinds) -> dict:
     """{kind: error} for the kinds among `kinds` that were not read."""
     return {kind: error for kind in kinds if (error := read_error(read, kind))}
+
+
+def kind_list(names: list) -> str:
+    """`Deployments, StatefulSets and DaemonSets`."""
+    if len(names) <= 1:
+        return "".join(names)
+    return LIST_SEPARATOR.join(names[:-1]) + KIND_LIST_LAST_SEPARATOR + names[-1]
+
+
+def workloads_unread_detail(read, kinds) -> str | None:
+    """For a rule that grades the PDB read's Deployments and StatefulSets and the namespaced
+    read's `kinds`: None when every one was read, else which kinds were not read, with the
+    first such read's error, and which were graded (`DaemonSets and CronJobs not read (...);
+    Deployments and StatefulSets graded`), or that nothing was, when `items` is None and the
+    PDB read's workloads are unread too."""
+    unread = unread_kinds(read, kinds)
+    if not unread:
+        return None
+    pdb_unread = not read or read.get("items") is None
+    unread_names = [READ_KIND_NAMES.get(kind, kind) for kind in (PDB_WORKLOAD_KINDS if pdb_unread else ()) + tuple(unread)]
+    graded_names = [READ_KIND_NAMES.get(kind, kind) for kind in (() if pdb_unread else PDB_WORKLOAD_KINDS) + tuple(kind for kind in kinds if kind not in unread)]
+    graded = WORKLOADS_GRADED_FORMAT.format(kinds=kind_list(graded_names)) if graded_names else WORKLOADS_NOTHING_GRADED
+    return WORKLOADS_UNREAD_FORMAT.format(unread=kind_list(unread_names), reason=next(iter(unread.values())), graded=graded)
 
 
 def items_of_kind(items, kind: str) -> list[dict]:

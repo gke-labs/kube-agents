@@ -42,7 +42,6 @@ UNKNOWN_TAG_DETAIL = "container {container} runs {image} ({runtime}) on pool {po
 UNKNOWN_POOL_DETAIL = "container {container} runs {image} ({runtime}) on pool {pool}: {reason}"
 NOTE_ALREADY = "{kind} {object} container {container} runs {image} ({runtime}) on pool {pool}, {reason}; not an upgrade risk"
 NOTE_STAYS = "{kind} {object} container {container} runs {image} ({runtime}) on pool {pool}; {reason}; not a risk at this target"
-WORKLOADS_UNREAD_DETAIL = "DaemonSets and CronJobs not read ({reason}); Deployments and StatefulSets graded"
 JDK_MAJOR_8 = 8
 JDK_MAJOR_11 = 11
 
@@ -91,9 +90,9 @@ def _unknown(obj: dict, detail: str, **extra) -> dict:
 def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     result = rules.new_result()
     items = rules.read_items(read)
-    unread = rules.unread_kinds(read, TEMPLATE_READ_KINDS)
-    if unread:
-        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, WORKLOADS_UNREAD_DETAIL.format(reason=next(iter(unread.values())))))
+    unread_detail = rules.workloads_unread_detail(read, TEMPLATE_READ_KINDS)
+    if unread_detail:
+        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, unread_detail))
     for obj, spec, _ in rules.templates(items):
         for container in rules.containers(spec):
             image = container.get("image") or ""

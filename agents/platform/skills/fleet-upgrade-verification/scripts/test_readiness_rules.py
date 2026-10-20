@@ -319,6 +319,33 @@ class SharedHelpersTest(unittest.TestCase):
         self.assertEqual(shared.new_result(), {"blocking": [], "risks": [], "unknown": [], "notes": []})
 
 
+class WorkloadsUnreadDetailTest(unittest.TestCase):
+    """The shared text for a failed workload read names the kinds read and the kinds not."""
+
+    KINDS = ("daemonset", "cronjob")
+
+    def test_every_kind_read_is_none(self):
+        self.assertIsNone(shared.workloads_unread_detail(read(items=[]), self.KINDS))
+
+    def test_the_namespaced_kinds_unread_leaves_the_pdb_reads_workloads_graded(self):
+        detail = shared.workloads_unread_detail(read(items=[], read_errors={"daemonset": "daemonsets is forbidden", "cronjob": "daemonsets is forbidden"}), self.KINDS)
+        self.assertEqual(detail, "DaemonSets and CronJobs not read (daemonsets is forbidden); Deployments and StatefulSets graded")
+        detail = shared.workloads_unread_detail(read(items=[], read_errors={"cronjob": "cronjobs is forbidden"}), self.KINDS)
+        self.assertEqual(detail, "CronJobs not read (cronjobs is forbidden); Deployments, StatefulSets and DaemonSets graded")
+
+    def test_no_read_at_all_says_nothing_was_graded(self):
+        for failed in (read(error="get-credentials failed"), None):
+            detail = shared.workloads_unread_detail(failed, self.KINDS)
+            self.assertTrue(detail.startswith("Deployments, StatefulSets, DaemonSets and CronJobs not read ("), detail)
+            self.assertTrue(detail.endswith("; nothing graded"), detail)
+        self.assertIn("(get-credentials failed)", shared.workloads_unread_detail(read(error="get-credentials failed"), self.KINDS))
+        # Through a rule: the unknown it files says the same, with no object graded.
+        from readiness_rules import retired_registry
+
+        out = retired_registry.evaluate(cluster(), {}, read(error="get-credentials failed"), TARGET, {shared.CONTEXT_POOLS: []})
+        self.assertEqual([u["detail"] for u in out["unknown"]], ["Deployments, StatefulSets, DaemonSets and CronJobs not read (get-credentials failed); nothing graded"])
+
+
 class FindingHelpersTest(unittest.TestCase):
     def test_tiers_notes_and_labels(self):
         result = finding.empty_result()

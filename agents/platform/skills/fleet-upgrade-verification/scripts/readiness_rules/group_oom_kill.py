@@ -45,7 +45,6 @@ NOTE_ALREADY = "{kind} {object} container {container} {shape} on pool {pool}, on
 NOTE_SINGLE_PROCESS = "{kind} {object} container {container} {shape} on pool {pool}, whose node config sets singleProcessOOMKill; not an upgrade risk"
 NOTE_STAYS = "{kind} {object} container {container} {shape} on pool {pool}; {reason}; not a risk at this target"
 NOTE_BELOW_KUBELET = "{kind} {object} container {container} {shape} on pool {pool}; the target {target} is below 1.{minor}, where the kubelet starts the group kill; not a risk at this target"
-WORKLOADS_UNREAD_DETAIL = "DaemonSets and CronJobs not read ({reason}); Deployments and StatefulSets graded"
 
 
 def _program(word: str) -> str:
@@ -109,9 +108,9 @@ def _unknown(obj: dict, detail: str, **extra) -> dict:
 def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     result = rules.new_result()
     items = rules.read_items(read)
-    unread = rules.unread_kinds(read, TEMPLATE_READ_KINDS)
-    if unread:
-        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, WORKLOADS_UNREAD_DETAIL.format(reason=next(iter(unread.values())))))
+    unread_detail = rules.workloads_unread_detail(read, TEMPLATE_READ_KINDS)
+    if unread_detail:
+        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, unread_detail))
     for obj, spec, _ in rules.templates(items):
         for container in rules.containers(spec):
             shape = multi_process_shape(container)

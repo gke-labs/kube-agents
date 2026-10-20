@@ -45,7 +45,6 @@ POOL_LABELS_KEY = "labels"
 DEPRECATED_DETAIL = "selects on {label} ({where}), deprecated since {since} in favour of {replacement}; the kubelet still sets it today, and a node image that stops setting it strands the pods"
 DEPRECATED_PREFIX_DETAIL = "selects on {label} ({where}), a beta-prefixed label Kubernetes has deprecated; a node image that stops setting it strands the pods"
 NODES_UNREAD_DETAIL = "selects on {label} ({where}); the Node read failed ({reason}), so whether a node carries it is unknown"
-WORKLOADS_UNREAD_DETAIL = "DaemonSets and CronJobs not read ({reason}); Deployments and StatefulSets graded"
 EMPTY_SCOPE_NOTE = "{kind} {object} selects on {label} ({where}) and {scope} has no node today{zero}; not graded as stranded"
 SCALES_FROM_ZERO_TEXT = " (the pool scales from zero)"
 SCOPE_POOLS = "pool(s) {pools}"
@@ -99,9 +98,9 @@ def _unknown(obj: dict, detail: str, **extra) -> dict:
 def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     result = rules.new_result()
     items = rules.read_items(read)
-    unread = rules.unread_kinds(read, TEMPLATE_READ_KINDS)
-    if unread:
-        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, WORKLOADS_UNREAD_DETAIL.format(reason=next(iter(unread.values())))))
+    unread_detail = rules.workloads_unread_detail(read, TEMPLATE_READ_KINDS)
+    if unread_detail:
+        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, unread_detail))
     nodes_failed = rules.read_error(read, rules.NODE_READ_KIND)
     autopilot = bool(context.get(rules.CONTEXT_AUTOPILOT))
     all_nodes = rules.items_of_kind(items, rules.KIND_NODE)

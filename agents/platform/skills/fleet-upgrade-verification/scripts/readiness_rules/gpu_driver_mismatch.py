@@ -60,7 +60,6 @@ POOL_TEXT = "pool {pool}"
 AUTOPILOT_POOL_TEXT = "the node Autopilot provisions"
 AUTOPILOT_MODE_TEXT = "{label} {value}"
 AUTOPILOT_MODE_DEFAULT = "default"
-WORKLOADS_UNREAD_DETAIL = "DaemonSets and CronJobs not read ({reason}); Deployments and StatefulSets graded"
 
 
 def cuda_pins(spec: dict) -> list[tuple[tuple[int, int], str]]:
@@ -193,9 +192,9 @@ def _grade_pins(result: dict, obj: dict, pins: list, pool_text: str, driver: int
 def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     result = rules.new_result()
     items = rules.read_items(read)
-    unread = rules.unread_kinds(read, TEMPLATE_READ_KINDS)
-    if unread:
-        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, WORKLOADS_UNREAD_DETAIL.format(reason=next(iter(unread.values())))))
+    unread_detail = rules.workloads_unread_detail(read, TEMPLATE_READ_KINDS)
+    if unread_detail:
+        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, unread_detail))
     autopilot = bool(context.get(rules.CONTEXT_AUTOPILOT))
     for obj, spec, _ in rules.templates(items):
         gpu_containers = requests_gpu(spec)

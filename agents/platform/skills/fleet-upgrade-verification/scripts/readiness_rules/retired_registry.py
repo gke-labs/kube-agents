@@ -29,7 +29,6 @@ DETAIL = "{images}; a rebuilt node pulls it again from a host that stopped publi
 POOLS_BELOW_TEXT = "pool(s) {pools} are below the target and are rebuilt in this upgrade"
 NO_POOL_BELOW_TEXT = "no pool is below the target; the next node upgrade pulls it again"
 NO_TARGET_TEXT = "which pools are rebuilt needs a target"
-WORKLOADS_UNREAD_DETAIL = "DaemonSets and CronJobs not read ({reason}); Deployments and StatefulSets graded"
 
 
 def retired_host(image: str) -> str | None:
@@ -42,9 +41,9 @@ def retired_host(image: str) -> str | None:
 def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     result = rules.new_result()
     items = rules.read_items(read)
-    unread = rules.unread_kinds(read, TEMPLATE_READ_KINDS)
-    if unread:
-        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, WORKLOADS_UNREAD_DETAIL.format(reason=next(iter(unread.values())))))
+    unread_detail = rules.workloads_unread_detail(read, TEMPLATE_READ_KINDS)
+    if unread_detail:
+        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, unread_detail))
     for obj, spec, _ in rules.templates(items):
         images = []
         hosts = []
