@@ -158,8 +158,7 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # their KNOWN_UNREGISTERED reasons share.
 SCENARIO_BATCH_WAIT = (
     "enters hack/eval/nightly-cases.txt in a later batch of five as the main "
-    "part's nights allow, the next after the first batch's nights are measured "
-    "(the roster's 2026-10-14 paragraph)"
+    "part's nights allow, the next after the first batch's nights are measured"
 )
 
 KNOWN_UNREGISTERED = {
@@ -226,13 +225,14 @@ KNOWN_UNREGISTERED = {
     # on its clear nights of 10-15 October against the 480m deadline, the
     # seventeen measure 770-1,145 serial minutes a night, and the cost-ordered
     # queue would charge a deadline kill to the existing cases' last
-    # repetition; the roster's 2026-10-14 paragraph has the measurements, the
-    # queue order and the arithmetic. The first batch, entries 1, 3, 5, 12 and
-    # 20, is in the roster. These twelve have a fixture the fleet plants and a
+    # repetition; each entry below carries its measured cost, and
+    # hack/ci-eval-pr.sh's unit_cost_hint prices the seventeen from the same
+    # record. The first batch, entries 1, 3, 5, 12 and 20, is in the roster's
+    # sorted section. These twelve have a fixture the fleet plants and a
     # task file, and wait for a later batch: the next after the first batch's
     # first measured week of nights, in the order of measured cost, the five
     # with no clean pass last. An entry goes when its batch's pull request
-    # moves the case to the roster and re-prices the paragraph.
+    # moves the case to the roster's sorted section.
     "upgrades-no-surge-pool-recreate-warned": (
         f"catalogue entry 2: {SCENARIO_BATCH_WAIT}; median 1065s on three clean "
         "passes, the record's heaviest run at 3163s"

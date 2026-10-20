@@ -2982,9 +2982,9 @@ unit_cost_hint() {
     # seeded-a shapes a read of every cluster for one planted object the
     # prompt does not place). Five are in the nightly from 2026-10-15, the
     # first batch; the other twelve wait in scripts/validate_bench_cases.py's
-    # KNOWN_UNREGISTERED for their batch (hack/eval/nightly-cases.txt's
-    # 2026-10-14 paragraph). Each measured case is priced at the median wall
-    # clock of its clean passes on a dev install with one user worker slot
+    # KNOWN_UNREGISTERED for their batch. Each measured case is priced at the
+    # median wall clock of its clean passes on a dev install with one user
+    # worker slot
     # (57 runs, 2026-10-07 to 10-15, re-graded at the head's task files),
     # rounded up to the next 100s, the way compliance-rbac-overgrant,
     # capacity-pinned-pool-probe and cluster-agent-delegation-profile-lookup
