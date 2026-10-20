@@ -27265,6 +27265,71 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertIn(f"\n\n{audit_report.CHAT_REPORT_REFINISH_RELATIVE_LABEL}\n", text)
         self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
         self.assertIn(": 0 new, 0 resolved;", self.heads()[-1])
+        # Nor does the second save its mid-run memory for a third to count from.
+        self.assertEqual(self.finish_again(doc), 0)
+        [(_, text)] = self.entries()
+        self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
+
+    def test_a_coverage_gap_on_a_later_finish_withholds_the_runs_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        gapped = make_doc(
+            findings=[make_finding(fid="a", severity="major")],
+            skipped=[{"cluster": "dr-west", "reason": "unreachable"}],
+        )
+        self.assertEqual(self.run_finish(gapped), 0)
+        first, second = self.heads()
+        self.assertIn(": 0 new, 1 resolved;", first)
+        self.assertIn(": 0 new, 0 resolved;", second)
+
+    def test_a_clean_later_finish_over_a_coverage_gap_claims_nothing_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        self.assertEqual(self.run_finish(make_doc(findings=[make_finding(fid="a", severity="major")])), 0)
+        clean = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
+        clean["resolved_because"] = resolved_for(self.stored_ledger_body(AUDIT, "acme/fleet", 42))
+        self.assertEqual(self.run_finish(clean), 0)
+        self.assertEqual(self.stdout_json()["status"], "CLEAN")
+        self.assertIn(": clean, 0 findings, 0 resolved", self.heads()[-1])
+
+    def test_a_run_that_started_on_another_id_scheme_withholds_its_resolved(self):
+        self.start()
+        body = (
+            f"## Findings\n\n<!-- audit-findings: {json.dumps([derived_id(fid='a'), 'gone.under.old.scheme'])} -->\n"
+            f"<!-- audit-id-scheme: {audit_report.ID_SCHEME + 1} -->\n"
+        )
+        self.seed_report(body)
+        self.harness.replies["issue-list"] = self.issue_list()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.run_finish(doc), 0)
+        for head in self.heads():
+            self.assertIn(", 0 resolved;", head)
+
+    def test_a_finding_the_collector_still_flags_is_not_the_runs_resolved(self):
+        self.start()
+        self.on_a_ledger_of("a", "b")
+        candidates = [
+            {
+                "check": "netpol-missing",
+                "cluster": "prod-us-east",
+                "namespace": "payments",
+                "object": f"Namespace/{fid}",
+                "severity": "major",
+                "excerpt": "zero NetworkPolicies in payments",
+                "impact": "x",
+                "needs_triage": None,
+            }
+            for fid in ("a", "b")
+        ]
+        manifest = self.tmp_path / "manifest.json"
+        manifest.write_text(json.dumps(_full_manifest(candidates=candidates)), encoding="utf-8")
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        for _ in range(2):
+            self.assertEqual(self.run_finish(doc, ["--manifest-file", str(manifest)]), 0, self.err)
+        for head in self.heads():
+            self.assertIn(": 0 new, 0 resolved;", head)
 
     def test_a_second_finish_keeps_an_earlier_repositorys_report(self):
         now = datetime.now(timezone.utc)

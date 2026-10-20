@@ -3235,11 +3235,14 @@ def run_baseline(
     Best-effort: never fails the run. Called before the ledger is touched, so a
     `finish` that dies anywhere after it still leaves the baseline for its
     re-run. Never replaced inside a run, so every later `finish` joins the one
-    the first saw.
+    the first saw. Saved only on an entry no `finish` has filled: an earlier
+    one that saved none (an older image, a failed write) leaves this one's
+    memory a mid-run snapshot, which no later `finish` may count from.
     """
     own = RunBaseline(list(previous_ids), bool(delta_known), bool(stale_scheme), False)
     record = _live_chat_record(audit_id, now)
-    part = None if record is None else (_filled_part(record, repo) or _pending_part(record, repo))
+    filled = None if record is None else _filled_part(record, repo)
+    part = filled or (None if record is None else _pending_part(record, repo))
     if part is None:
         return own
     ids = part.get(CHAT_REPORT_BASELINE_IDS_KEY)
@@ -3252,6 +3255,8 @@ def run_baseline(
         and isinstance(stale, bool)
     ):
         return RunBaseline(ids, known, stale, True)
+    if filled is not None:
+        return own
     part[CHAT_REPORT_BASELINE_IDS_KEY] = own.ids
     part[CHAT_REPORT_BASELINE_KNOWN_KEY] = own.known
     part[CHAT_REPORT_BASELINE_STALE_KEY] = own.stale_scheme
@@ -18510,7 +18515,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         )
         # A HELD line prints no counts, so it keeps its own label.
         whole_run = baseline.from_entry and payload["status"] == "CLEAN"
-        run_resolved = 0 if (gaps or unaccounted or held_unread) else len(baseline.ids)
+        run_resolved = 0 if gaps else len(baseline.ids)
         append_chat_report(
             audit_id,
             repo,
