@@ -3,12 +3,15 @@
 the rules share, the `finding` helpers, the shape tables' sources, and the rules registered
 here, on canned cluster records and kubectl objects."""
 
+import copy
+import json
 import os
 import re
 import sys
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import fleet_upgrade_report as report  # noqa: E402
@@ -16,7 +19,7 @@ import readiness_rules as shared  # noqa: E402
 import upgrade_readiness as r  # noqa: E402
 import upgrade_shape_tables as tables  # noqa: E402
 from fleet_upgrade_report import parse_version  # noqa: E402
-from readiness_rules import finding, zonal_control_plane  # noqa: E402
+from readiness_rules import cluster_status_age, control_plane_upgrade_history, finding, known_issues_matrix, lb_connection_draining, orphan_node_objects, target_patch_valid, zonal_control_plane  # noqa: E402
 
 CATALOGUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), *([os.pardir] * 5), "docs", "designs", "upgrade-failure-catalogue.md")
 CATALOGUE_HEADING_RE = re.compile(r"^### (\d+)\. ", re.MULTILINE)
@@ -650,21 +653,11 @@ class ShapeTablesTest(unittest.TestCase):
             self.assertTrue(any(marker in section for marker in ("Source:", "https://", ".com/", ".io/", "kubernetes/kubernetes#", "dotnet/runtime#", ".json")), title)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ------------------------------------------------------------- the incident rules (#3524)
 # Recorded inputs under testdata/: the dev project's backend services, instances, operations
 # and server config as gcloud returned them on 2026-10-20, the seeded-b cluster record and
 # nodes, and the kube-system and gmp-system add-ons, projected to the fields the rules read.
 
-import copy  # noqa: E402
-import json  # noqa: E402
-from datetime import timedelta  # noqa: E402
-from unittest.mock import patch  # noqa: E402
-
-from readiness_rules import cluster_status_age, control_plane_upgrade_history, known_issues_matrix, lb_connection_draining, orphan_node_objects, target_patch_valid  # noqa: E402
 
 TESTDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata")
 # The instant the fixtures were recorded at, so the operations' ages and the table's age read as they did that day.
@@ -1309,3 +1302,7 @@ class RegistryOrderTest(unittest.TestCase):
         self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix", "zonal-control-plane", "lb-connection-draining", "orphan-node-objects"])
         # Every blocking rule says what its mechanism holds; the node-removal rules hold the pool move alone.
         self.assertEqual({m.RULE_ID: m.HOLDS for m in r.EXTRA_RULES if m.CAN_BLOCK}, {"cluster-status-age": shared.HOLDS_BOTH, "target-patch-valid": shared.HOLDS_BOTH, "lb-connection-draining": (shared.HOLDS_NODE_POOL,), "orphan-node-objects": (shared.HOLDS_NODE_POOL,)})
+
+
+if __name__ == "__main__":
+    unittest.main()
