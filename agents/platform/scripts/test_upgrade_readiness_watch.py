@@ -92,7 +92,6 @@ class FakeSandbox:
         table_timeout_projects: set | None = None,
         aliases: dict | None = None,
         describe_down: set | None = None,
-        refused_projects: set | None = None,
     ):
         self.versions = versions
         self.readiness = readiness or versions
@@ -106,8 +105,6 @@ class FakeSandbox:
         self.aliases = aliases or {}
         # Spellings whose `projects describe` is down: the report keys the run by the spelling itself.
         self.describe_down = describe_down or set()
-        # Projects the report script refuses to read, as it does one the handed scope does not list.
-        self.refused_projects = refused_projects or set()
         self.calls: list[tuple[str, list[str], float]] = []
 
     def run(self, argv, *, timeout, check, stdin=None):
@@ -129,22 +126,18 @@ class FakeSandbox:
             return subprocess.CompletedProcess(argv, 255, stdout="", stderr="ssh: lost connection")
         if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in asked):
             raise subprocess.TimeoutExpired(argv, timeout)
-        if any(p in self.refused_projects for p in asked):
-            # The script's usage exit, no report, the reason on stderr, decided as the real
-            # reporter decides it from the handed argv (`DeclaredScope.override_error`): a
-            # project in `--scope-projects` is read, one in `--scope-unread` is refused as
-            # unread, any other as outside. A test that names a project the argv lists as
-            # refused stages a tick the reporter cannot produce, and fails here.
-            flags = {report_argv[i]: report_argv[i + 1] for i, flag in enumerate(report_argv) if flag in (fleet_scope_targets.SCOPE_PROJECTS_FLAG, fleet_scope_targets.SCOPE_UNREAD_FLAG)}
-            listed = [p for p in flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG, "").split(",") if p]
-            unread = dict(fleet_scope_args.parse_scope_unread(flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG)))
-            assert asked[0] not in listed, f"FakeSandbox: {asked[0]} is in refused_projects but the handed argv lists it in {fleet_scope_targets.SCOPE_PROJECTS_FLAG}; the reporter would read it"
-            if asked[0] in unread:
-                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_UNREAD_ERROR.format(project=asked[0], outcome=unread[asked[0]])
-            else:
-                reason = fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=asked[0], projects=", ".join(listed) or "none readable")
-            body = {"exit": 2, "tables": "", "report": None}
-            return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr=f"(declared scope: fleet_scope): {reason}\n")
+        flags = {report_argv[i]: report_argv[i + 1] for i, flag in enumerate(report_argv[:-1]) if flag in (fleet_scope_targets.SCOPE_PROJECTS_FLAG, fleet_scope_targets.SCOPE_UNREAD_FLAG)}
+        if flags:
+            # The reporter's own rule decides, from the handed argv (`DeclaredScope.override_error`):
+            # the fake refuses what the script refuses and reads what it reads, so a scoped tick
+            # test cannot stage a read or a refusal the reporter would not make.
+            scope = fleet_scope_args.DeclaredScope()
+            scope.set(flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG), flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG))
+            reason = scope.override_error(asked[0])
+            if reason is not None:
+                # The script's usage exit, no report, the reason on stderr.
+                body = {"exit": 2, "tables": "", "report": None}
+                return subprocess.CompletedProcess(argv, 0, stdout=f"{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr=f"(declared scope: fleet_scope): {reason}\n")
         body = self.readiness if wanted else self.versions
         # Both hops run once per project: answer with that project's slice.
         down = {a for a in asked if a in self.describe_down}
@@ -1528,11 +1521,27 @@ class DeclaredScope(Base):
         self.declare_scope(["p1"])
         sandbox = FakeSandbox(envelope([member("a", "lagging"), member("b", "lagging", project="p2")]))
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
-            self.run_tick(sandbox)
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
         self.assertCountEqual(
             [argv for kind, argv, _ in sandbox.calls if kind == "versions"],
             [["--project", "p1", "--scope-projects", "p1"], ["--project", "p2", "--scope-projects", "p1"]],
         )
+        # The report refuses p2 from that argv, so only p1's cluster is pending and the line names the refusal.
+        self.assertIn("does not list p2; it lists p1", out)
+        self.assertNotIn("p2/us-central1-a/b", json.dumps(self.ledger()))
+
+    def test_an_all_refused_tick_names_every_refusal_it_is_keyed_on(self) -> None:
+        """Every roster project refused, for two causes: the failure line names each
+        project with its reason and remedy, the key the marker holds, so a change of
+        either cause re-posts a line that says what changed."""
+        self.declare_scope(["mgmt"], unread=["p2"])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            code, out = self.run_tick(FakeSandbox(envelope([])))
+        self.assertEqual(code, 0)
+        self.assertIn("the tick failed: ReportRefused: p1: refused by the report script: the install's declared scope does not list p1", out)
+        self.assertIn("; p2: refused by the report script: the install's declared scope lists p2 but the install could not read it", out)
+        self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, sorted([["p1", watch.REFUSAL_OUTSIDE], ["p2", watch.REFUSAL_UNREAD.format(outcome="denied")]])])
 
     def test_a_refused_project_is_its_own_kind_of_partial_so_a_later_outage_is_still_announced(self) -> None:
         """A roster project the declared scope does not list is refused every
@@ -1543,7 +1552,7 @@ class DeclaredScope(Base):
         versions = envelope([member("a", "lagging"), member("b", "lagging", project="p2"), member("c", "current", project="p3")])
         readiness = envelope([member("a", "lagging", readiness="ready")])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p3"}):
-            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions, readiness))
             self.assertEqual(code, 0)
             self.assertIn("the version table was partial (1 read error(s)", out)
             self.assertIn(
@@ -1557,9 +1566,9 @@ class DeclaredScope(Base):
             self.assertNotIn("fleet_scope", out)
             self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a)", out)
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
-            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions, readiness))
             self.assertEqual((code, out.strip()), (0, ""))
-            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}, table_failing_projects={"p1"}))
+            code, out = self.run_tick(FakeSandbox(versions, readiness, table_failing_projects={"p1"}))
             self.assertEqual(code, 0)
             self.assertIn("the version table was partial (2 read error(s)", out)
             self.assertIn("p1: version table for p1 failed: sandbox exited 255 without a report: ssh: lost connection", out)
@@ -1576,7 +1585,7 @@ class DeclaredScope(Base):
         self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
         versions = envelope([member("a", "current")])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual(code, 0)
             self.assertIn(
                 f"new target version {OLDER_TARGET}, 1 cluster(s) pending (c): none graded (readiness run for p2 refused by the report script: "
@@ -1586,9 +1595,9 @@ class DeclaredScope(Base):
             self.assertNotIn("collector_args", out)
             self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: outside the resolved scope"]])
             self.assertEqual(self.ledger()["targets"][OLDER_TARGET]["pending"], ["p2/us-central1-a/c"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("none graded (readiness run for p2 refused by the report script: the install's declared scope does not list p2; it lists p1;", out)
             self.assertIn("not graded on 3 consecutive attempt(s)", out)
             self.assertIn("next attempt at the weekly refresh", out)
@@ -1599,8 +1608,8 @@ class DeclaredScope(Base):
         self.seed(OLDER_TARGET, None, ["p2/us-central1-a/c"])
         versions = envelope([member("a", "current")])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
-            self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}, failing_projects={"p2"}))
+            self.run_tick(FakeSandbox(versions))
+            code, out = self.run_tick(FakeSandbox(versions, failing_projects={"p2"}))
             self.assertEqual(code, 0)
             self.assertIn("none graded (readiness run for p2 failed: sandbox exited 255 without a report: ssh: lost connection)", out)
             self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run failed"]])
@@ -1610,7 +1619,7 @@ class DeclaredScope(Base):
         failure on the one project the install can read."""
         self.declare_scope(["mgmt-prod"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "alpha-legacy,mgmt-prod"}):
-            code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"alpha-legacy"}, table_failing_projects={"mgmt-prod"}))
+            code, out = self.run_tick(FakeSandbox(envelope([]), table_failing_projects={"mgmt-prod"}))
         self.assertEqual(code, 0)
         self.assertIn("the tick failed: RuntimeError: sandbox exited 255 without a report: ssh: lost connection", out)
         self.assertNotIn("refused", out)
@@ -1618,11 +1627,11 @@ class DeclaredScope(Base):
     def test_a_tick_whose_every_project_is_refused_fails_in_the_install_s_terms(self) -> None:
         self.declare_scope(["p1"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
-            code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}), ["--dry-run"])
+            code, out = self.run_tick(FakeSandbox(envelope([])), ["--dry-run"])
             self.assertEqual(code, 0)
             self.assertIn("the tick failed: ReportRefused:", out)
             self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists(), "a dry run changes nothing")
-            code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(envelope([])))
         self.assertEqual(code, 0)
         self.assertEqual(
             out.strip(),
@@ -1641,15 +1650,15 @@ class DeclaredScope(Base):
         standing refusal re-posts nothing, and a changed cause is a new line."""
         self.declare_scope(["p1"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}):
-            code, first = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            code, first = self.run_tick(FakeSandbox(envelope([])))
             self.assertEqual(code, 0)
             self.assertIn("does not list p2; it lists p1;", first)
             self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p2", watch.REFUSAL_OUTSIDE]]])
             self.declare_scope(["p1", "p3"])
-            code, second = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            code, second = self.run_tick(FakeSandbox(envelope([])))
             self.assertEqual((code, second), (0, ""), "the same refusal with a longer resolved set is not a new line")
             self.declare_scope(["p1"], unread=["p2"])
-            code, third = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+            code, third = self.run_tick(FakeSandbox(envelope([])))
             self.assertEqual(code, 0)
             self.assertIn("lists p2 but the install could not read it", third)
             self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p2", watch.REFUSAL_UNREAD.format(outcome="denied")]]])
@@ -1669,7 +1678,7 @@ class DeclaredScope(Base):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p2"}), mock.patch.object(watch, "save_ledger", wraps=watch.save_ledger) as saves:
             for containers in ([resolved], [failed], [resolved]):
                 self.declare_scope(["p1"], containers=containers)
-                code, out = self.run_tick(FakeSandbox(envelope([]), refused_projects={"p2"}))
+                code, out = self.run_tick(FakeSandbox(envelope([])))
                 self.assertEqual(code, 0)
                 outs.append(out)
                 self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
@@ -1698,11 +1707,11 @@ class DeclaredScope(Base):
         resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], containers=[resolved])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}, table_failing_projects={"p1"}))
+            code, out = self.run_tick(FakeSandbox(versions, table_failing_projects={"p1"}))
             self.assertIn("the tick failed: RuntimeError: sandbox exited 255 without a report", out)
             self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
             self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual(out.splitlines()[0], "upgrade readiness watch: the tick runs again")
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertNotIn("the declaration is not fully resolved", out)
@@ -1730,7 +1739,7 @@ class DeclaredScope(Base):
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], containers=[resolved])
             with mock.patch.object(watch, "decide", side_effect=RuntimeError("boom")):
-                code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}), ["--dry-run"])
+                code, out = self.run_tick(FakeSandbox(versions, readiness), ["--dry-run"])
             self.assertEqual((code, out.strip()), (0, "upgrade readiness watch: the tick failed: RuntimeError: boom"))
             self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists(), "a dry run changes nothing")
             for failure in ("the readiness hop raised", "the report could not be written"):
@@ -1739,22 +1748,22 @@ class DeclaredScope(Base):
                     self.marker().unlink(missing_ok=True)
                     self.declare_scope(["p1"], containers=[resolved])
                     if failure == "the readiness hop raised":
-                        code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}, readiness_error=OSError("sandbox: cannot fork")))
+                        code, out = self.run_tick(FakeSandbox(versions, readiness, readiness_error=OSError("sandbox: cannot fork")))
                         self.assertEqual((code, out.strip()), (0, "upgrade readiness watch: the tick failed: OSError: sandbox: cannot fork"))
                     else:
                         with mock.patch.object(watch, "write_report", side_effect=OSError("disk full")):
-                            code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+                            code, out = self.run_tick(FakeSandbox(versions, readiness))
                         self.assertEqual((code, out.strip()), (watch.WRITE_FAILED_EXIT, "upgrade readiness watch: writing the ledger or the report failed: disk full"))
                     self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]})
                     self.assertEqual((self.ledger()["last_tick"], self.ledger()["targets"], self.ledger()["announced"]), (None, {}, {}), "nothing else of the failed tick is written")
                     self.declare_scope(["p1"], containers=[failed])
-                    code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+                    code, out = self.run_tick(FakeSandbox(versions, readiness))
                     self.assertEqual(code, 0)
                     self.assertIn(held, out)
                     self.assertNotIn("the declaration is not fully resolved", out)
                     self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
                     self.declare_scope(["p1"], containers=[resolved])
-                    code, out = self.run_tick(FakeSandbox(versions, readiness, refused_projects={"p2"}))
+                    code, out = self.run_tick(FakeSandbox(versions, readiness))
                     self.assertEqual((code, out.strip()), (0, ""))
 
     def test_each_refusal_is_re_said_from_the_script_s_own_message_with_the_remedy_and_cause_it_has(self) -> None:
@@ -1921,17 +1930,17 @@ class DeclaredScope(Base):
         versions = envelope([member("a", "current")])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
             self.declare_scope(["p1"], unread=["p2"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn(
                 "p2: version table for p2 refused by the report script: the install's declared scope lists p2 but the install could not read it (denied); "
                 "the remedy is on the install, not this job: give the install read access to the project",
                 out,
             )
             self.assertNotIn("name the project in spec.scope", out)
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
 
     def test_a_declared_project_the_reconcile_cannot_list_is_announced_once_per_outcome_as_its_line_says(self) -> None:
@@ -1944,7 +1953,7 @@ class DeclaredScope(Base):
         versions = envelope([member("a", "current")])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], unread=["p2=unreachable"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual(code, 0)
             self.assertIn(
                 "p2: version table for p2 refused by the report script: the install's declared scope lists p2 but the install could not read it (unreachable); "
@@ -1955,15 +1964,15 @@ class DeclaredScope(Base):
             self.assertNotIn("if it does not", out)
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: listed but unread (unreachable)"])
             for _ in range(3):
-                code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                code, out = self.run_tick(FakeSandbox(versions))
                 self.assertEqual((code, out.strip()), (0, ""))
             self.declare_scope(["p1"], unread=["p2=unresolved"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("could not read it (unresolved); " + watch.REMEDY_UNRESOLVED, out)
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
             self.declare_scope(["p1"], unread=["p2"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("could not read it (denied); the remedy is on the install, not this job: give the install read access to the project", out)
             self.declare_scope(["p1", "p2"])
             code, out = self.run_tick(FakeSandbox(versions))
@@ -1985,7 +1994,7 @@ class DeclaredScope(Base):
         resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], containers=[resolved], retiring=["p2"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual(code, 0)
             self.assertIn(
                 "p2: version table for p2 refused by the report script: the install's declared scope no longer lists p2; the reconcile has it retiring; "
@@ -2004,7 +2013,7 @@ class DeclaredScope(Base):
             self.assertEqual(self.ledger()["standing_outside"], {})
             # An unclean run holds the row at retiring and leaves the scope unresolved: the reconcile's verdict stands.
             self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")], retiring=["p2"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: retiring from the declaration"])
         # The prune lands: the profile is gone, the roster is p1 again, and the table is complete.
@@ -2014,7 +2023,7 @@ class DeclaredScope(Base):
         self.assertIn("the version table reads every project again", out)
         # Onboarded by hand after the prune: no row, so outside the resolved scope, and the line returns with the declaration remedy.
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn(
                 "p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; "
                 "the remedy is on the install, not this job: name the project in spec.scope",
@@ -2034,7 +2043,7 @@ class DeclaredScope(Base):
         versions = envelope([member("a", "current")])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], exclude=["p2"], retiring=["p2"])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual(code, 0)
             self.assertIn(
                 "p2: version table for p2 refused by the report script: the install's declared scope no longer lists p2, and a spec.scope.exclude.projects "
@@ -2063,13 +2072,13 @@ class DeclaredScope(Base):
         versions = envelope([member("a", "current")])
         self.declare_scope(["p1"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("p2: version table for p2 refused", out)
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p4"}):
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2", "p4"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("the version table was partial (2 read error(s)", out)
             self.assertIn("p4: version table for p4 refused", out)
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2", "p4"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
 
     def test_a_standing_outside_refusal_is_not_re_posted_when_a_container_lookup_fails_for_a_tick(self) -> None:
@@ -2084,16 +2093,16 @@ class DeclaredScope(Base):
         failed = dict(resolved, outcome="unreachable")
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], containers=[failed])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the declaration is not fully resolved", out)
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside a scope not yet resolved"])
             self.declare_scope(["p1"], containers=[resolved])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
             for containers in ([failed], [resolved]):
                 self.declare_scope(["p1"], containers=containers)
-                code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                code, out = self.run_tick(FakeSandbox(versions))
                 self.assertEqual((code, out.strip()), (0, ""))
                 self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
 
@@ -2103,11 +2112,11 @@ class DeclaredScope(Base):
         resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], containers=[resolved])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("none graded (readiness run for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: outside the resolved scope"]])
             self.declare_scope(["p1"], containers=[dict(resolved, outcome="unreachable")])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
             self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p2", "readiness run refused: outside the resolved scope"]])
 
@@ -2126,24 +2135,24 @@ class DeclaredScope(Base):
         gained = {"id": "folders/222222222222", "outcome": "denied", "projects": 0}
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
             self.declare_scope(["p1"], containers=[first])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/111111111111"]})
             self.declare_scope(["p1"], containers=[first, gained])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual(code, 0)
             self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the declaration is not fully resolved", out)
             self.assertIn("a lookup that keeps failing needs the install's read access on that folder, organisation or selector", out)
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside a scope not yet resolved"])
             self.assertEqual(self.ledger()["standing_outside"], {})
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
             self.declare_scope(["p1"], containers=[first, dict(gained, outcome="ok")])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertIn("the remedy is on the install, not this job: name the project in spec.scope", out)
             self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/111111111111", "folders/222222222222"]})
             self.declare_scope(["p1"], containers=[dict(first, outcome="unreachable"), dict(gained, outcome="ok")])
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+            code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
 
@@ -2163,26 +2172,26 @@ class DeclaredScope(Base):
             with self.subTest(interruption), mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
                 (self.home / watch.LEDGER_FILE_NAME).unlink(missing_ok=True)
                 self.declare_scope(["p1"], containers=[resolved])
-                code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                code, out = self.run_tick(FakeSandbox(versions))
                 self.assertIn("name the project in spec.scope", out)
                 if interruption == "table failed":
-                    code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}, table_failing_projects={"p2"}))
+                    code, out = self.run_tick(FakeSandbox(versions, table_failing_projects={"p2"}))
                     self.assertIn("p2: version table for p2 failed: sandbox exited 255 without a report", out)
                 else:
                     # started, p1's run, then p2 past the table's share of the budget.
                     with self.monotonic_readings(0.0, 0.0, late, late, late):
-                        code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                        code, out = self.run_tick(FakeSandbox(versions))
                     self.assertIn("tick budget exhausted before the version table read project p2", out)
                 self.assertNotIn("refused", out)
                 self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"]}, "the record outlives a day with no verdict on the scope")
                 self.declare_scope(["p1"], containers=[failed])
-                code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                code, out = self.run_tick(FakeSandbox(versions))
                 self.assertEqual(code, 0)
                 self.assertIn("p2: version table for p2 refused by the report script: the install's declared scope does not list p2; it lists p1; the remedy is on the install, not this job: name the project in spec.scope", out)
                 self.assertNotIn("the declaration is not fully resolved", out)
                 self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: outside the resolved scope"])
                 self.declare_scope(["p1"], containers=[resolved])
-                code, out = self.run_tick(FakeSandbox(versions, refused_projects={"p2"}))
+                code, out = self.run_tick(FakeSandbox(versions))
                 self.assertEqual((code, out.strip()), (0, ""))
 
     def test_the_standing_outside_record_is_kept_by_both_hops(self) -> None:
@@ -2196,13 +2205,13 @@ class DeclaredScope(Base):
         # p5's table run fails in the sandbox, so its clusters are carried forward and its record is the readiness hop's alone.
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2,p5"}):
             self.declare_scope(["p1"], containers=[resolved])
-            self.run_tick(FakeSandbox(versions, refused_projects={"p2", "p5"}, table_failing_projects={"p5"}))
+            self.run_tick(FakeSandbox(versions, table_failing_projects={"p5"}))
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"] if e["project"] == "p5"], ["table failed"])
             self.assertEqual(self.ledger()["standing_outside"], {"p2": ["folders/123456789012"], "p5": ["folders/123456789012"]})
             self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p5", "readiness run refused: outside the resolved scope"]])
             # p2 is declared and read; p5 is refused as excluded: neither stands outside the resolved scope now.
             self.declare_scope(["p1", "p2"], exclude=["p5"], containers=[resolved])
-            self.run_tick(FakeSandbox(versions, refused_projects={"p5"}, table_failing_projects={"p5"}))
+            self.run_tick(FakeSandbox(versions, table_failing_projects={"p5"}))
             self.assertEqual(self.ledger()["standing_outside"], {})
             self.assertEqual(self.ledger()["announced"]["ungraded"][OLDER_TARGET]["signature"], [["p5", "readiness run refused: excluded by spec.scope.exclude"]])
         self.assertEqual(watch.empty_ledger()["standing_outside"], {})
@@ -2228,7 +2237,7 @@ class DeclaredScope(Base):
         versions = envelope([member("a", "current")])
         self.declare_scope(["p1"], exclude=["legacy-*"])
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,legacy-01"}):
-            code, out = self.run_tick(FakeSandbox(versions, refused_projects={"legacy-01"}))
+            code, out = self.run_tick(FakeSandbox(versions))
         self.assertEqual(code, 0)
         self.assertIn(
             "legacy-01: version table for legacy-01 refused by the report script: the install's declared scope does not list legacy-01, "

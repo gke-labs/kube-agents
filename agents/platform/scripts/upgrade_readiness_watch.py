@@ -529,7 +529,8 @@ PARTIAL_LINE = (
     "every project that pends it has been read, or a readiness run has listed every cluster pending it as no longer below it"
 )
 # One reason per project the read errors name, so the line says what went
-# wrong where; the announcement stays keyed on the kinds, so the reasons are the day's.
+# wrong where; the announcement stays keyed on the kinds (and, for a refusal, on
+# the project and its cause), so the other reasons are the day's.
 PARTIAL_REASON = "{project}: {message}"
 REASONS_SEPARATOR = "; "
 PARTIAL_CLEARED_LINE = "{prefix} watch: the version table reads every project again"
@@ -564,9 +565,10 @@ TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 NEXT_REFRESH_PHRASE = "The next scheduled refresh is after {date} while any cluster is still pending"
 NEXT_TOMORROW_PHRASE = "None of the pending clusters was graded, so the job retries tomorrow"
 NEXT_WEEKLY_PHRASE = "None of the pending clusters was graded on {attempts} consecutive attempt(s), so the next attempt is at the weekly refresh"
-# What the partial-table announcement is keyed on: the kinds of read error and
-# how many of each, not their text, so a window of unread projects that turns
-# daily, or a timeout's figure, does not re-post the line.
+# What the partial-table announcement is keyed on: the kinds of read error, not
+# their count or text, and for a refusal the project and its cause
+# (``partial_signature``), so a window of unread projects that turns daily, or a
+# timeout's figure, does not re-post the line.
 ERROR_KIND_UNRUN = "table not run to completion by the budget"
 ERROR_KIND_TABLE_FAILED = "table failed"
 # A refusal's kind carries its cause (``ReportRefused.cause``), so a refusal
@@ -1598,6 +1600,10 @@ def versions_by_project(
             # every run was refused.
             chosen = next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
             if isinstance(chosen, ReportRefused):
+                # Every run was refused: the line names each refusal it is keyed on, the
+                # project before its reason when there is more than one.
+                if len(failed) > 1:
+                    chosen = ReportRefused(REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=project, message=exc) for project, exc in failed.items()), chosen.cause)
                 chosen.signature = refused_tick_signature(failed)
             raise chosen
         if unresolved:
