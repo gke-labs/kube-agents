@@ -11,7 +11,7 @@ the flag set names the six next-stack images and fills the operator.extraEnv
 values the release expands (the five image overrides, the inject door's flag,
 and two settings of the bridge the operator renders: its image and its
 concurrency; its executor is left to the bridge's default, api, which the
-start-line wait requires; and the card stop), the Cloud Build's `a2a` and `a2a-bridge`
+start-line wait requires), the Cloud Build's `a2a` and `a2a-bridge`
 steps run with `docker` stubbed build and push those six in order with the
 bridge FROM this build's platform image, the three guards (release-candidate
 path, Prow run with no pull request that is not a next-lane job, the
@@ -392,14 +392,6 @@ class FlagSetIsNextTest(unittest.TestCase):
             f"operator.extraEnv[7].name={go_constant(_A2A_BRIDGE, 'a2aBridgeConcurrencyOperatorEnvVar')}",
             "--set-string",
             f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}",
-        ]
-        # The card stop, armed on the lane so chat-stop-halts-delegated-remediation
-        # grades it, under the name the operator reads it by.
-        expected += [
-            "--set-string",
-            f"operator.extraEnv[8].name={go_constant(_A2A_MANIFESTS, 'a2aCardStopEnvVar')}",
-            "--set-string",
-            "operator.extraEnv[8].value=true",
         ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,

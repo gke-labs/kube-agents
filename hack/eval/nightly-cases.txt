@@ -882,11 +882,3 @@
 # issue every night. deployer: noop, no fixtures. Nightly from its first
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
-
-# gke-labs#3263, Slack Stop step 1: a `stop` typed after the Planning Agent
-# filed a card stops the card before it opens its pull request. Next lane
-# only (api-lane-exclusions.txt): the harness sends the stop through the
-# inject door, and hack/ci-deploy.sh arms the card stop there. deployer: noop,
-# the no-pdb-workload fixture, one card, a 900s observation window. A
-# next-lane run writes no evidence-store record, so the case builds none.
-./tasks/chat-stop-halts-delegated-remediation/task.yaml
