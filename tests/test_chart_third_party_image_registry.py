@@ -17,6 +17,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -40,14 +41,39 @@ def _render_chart(*args) -> list[dict]:
     return [doc for doc in yaml.safe_load_all(proc.stdout) if doc is not None]
 
 
-def _render_notes(*args) -> str:
-    cmd = [_HELM, "install", "test-release", str(_CHART), "--dry-run", *_REQUIRED, *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return proc.stdout
-
-
 @unittest.skipIf(_HELM is None, "helm is required for chart template rendering tests")
 class ChartThirdPartyImageRegistryTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
+        chart = pathlib.Path(cls._tmp.name) / "kube-agents"
+        shutil.copytree(_CHART, chart)
+        templates = chart / "templates"
+        notes = (templates / "NOTES.txt").read_text()
+        (templates / "NOTES.txt").unlink()
+        (templates / "_notes_under_test.tpl").write_text(
+            '{{- define "notes-under-test" -}}\n' + notes + "\n{{- end -}}\n"
+        )
+        (templates / "notes-under-test.yaml").write_text(
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-under-test\n"
+            'data:\n  notes: {{ include "notes-under-test" . | toJson }}\n'
+        )
+        cls.chart = chart
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def _render_notes(self, *args) -> str:
+        cmd = [
+            _HELM, "template", "test-release", str(self.chart),
+            "--show-only", "templates/notes-under-test.yaml",
+            *_REQUIRED,
+            *args,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        doc = yaml.safe_load(proc.stdout)
+        return doc["data"]["notes"]
     def test_default_render_leaves_images_on_default_registries(self):
         docs = _render_chart()
         rendered_images = self._extract_images(docs)
@@ -133,7 +159,7 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
 
     def test_notes_warns_when_first_party_registry_set_and_third_party_empty(self):
         mirror = "us-east4-docker.pkg.dev/my-proj/kube-agents"
-        notes = _render_notes("--set", f"global.imageRegistry={mirror}")
+        notes = self._render_notes("--set", f"global.imageRegistry={mirror}")
         self.assertIn("WARNING: global.imageRegistry is set", notes)
         self.assertIn("global.thirdPartyImageRegistry is empty", notes)
         self.assertIn("will still be pulled from their upstream public registries", notes)
@@ -141,14 +167,14 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
 
     def test_notes_silent_when_both_registries_set(self):
         mirror = "us-east4-docker.pkg.dev/my-proj/kube-agents"
-        notes = _render_notes(
+        notes = self._render_notes(
             "--set", f"global.imageRegistry={mirror}",
             "--set", f"global.thirdPartyImageRegistry={mirror}",
         )
         self.assertNotIn("WARNING: global.imageRegistry is set", notes)
 
     def test_notes_silent_when_both_registries_empty(self):
-        notes = _render_notes()
+        notes = self._render_notes()
         self.assertNotIn("WARNING: global.imageRegistry is set", notes)
 
     def _extract_images(self, docs: list[dict]) -> list[str]:
