@@ -133,6 +133,7 @@ root does that, driven by `images.json`. Then point the chart at the copy:
 helm install kube-agents ./charts/kube-agents \
   --namespace kubeagents-system --create-namespace \
   --set global.imageRegistry=registry.example.com/kube-agents \
+  --set global.thirdPartyImageRegistry=registry.example.com/kube-agents \
   --set platformAgent.harness.clusterName=my-cluster \
   --set platformAgent.harness.location=us-central1 \
   --set platformAgent.harness.projectId=my-gcp-project \
@@ -147,8 +148,15 @@ published chart, drop them and let `appVersion` pick the release.
 
 `global.imageRegistry` rewrites each image onto the prefix keeping the trailing
 name only, matching the flat layout `mirror-images` writes. Set
-`global.thirdPartyImageRegistry` as well if the mirror keeps LiteLLM and
-fluent-bit under a different path; it defaults to `global.imageRegistry`.
+`global.thirdPartyImageRegistry` to mirror third-party images (LiteLLM,
+fluent-bit, the GitHub token minter, Hindsight); empty leaves them on their
+upstream registries.
+
+> **Breaking:** `global.thirdPartyImageRegistry` previously fell back to
+> `global.imageRegistry`. An empty `global.thirdPartyImageRegistry` now leaves
+> third-party images on their upstream registries. If mirroring all images to a
+> single private registry prefix, pass `--set global.thirdPartyImageRegistry=<prefix>`
+> alongside `--set global.imageRegistry=<prefix>`.
 
 It reaches more than the containers the chart renders. The operator resolves
 three images at reconcile time that appear in no chart template — the agent
@@ -156,22 +164,24 @@ image for a `PlatformAgent` that omits `spec.deployment.image`, the shell
 sandbox StatefulSet it renders beside every agent pod, and the fluent-bit
 logging sidecar it injects into that pod — so the chart passes all three to the
 operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
-`FLUENT_BIT_IMAGE`. Without that a mirrored install reaches `ghcr.io` and Docker
-Hub minutes after `helm install` reported success. `CREDENTIAL_PROXY_IMAGE` is
-deliberately not passed: the operator derives the broker image from the agent
-image by swapping the trailing name, so it follows the mirror on its own. The
-sandbox image cannot be derived that way — it is a separate repository — which
-is why it has to be named.
+`FLUENT_BIT_IMAGE`. `PLATFORM_AGENT_IMAGE` and `AGENT_SANDBOX_IMAGE` follow
+`global.imageRegistry`, while `FLUENT_BIT_IMAGE` follows
+`global.thirdPartyImageRegistry`. Without passing both, a mirrored install reaches
+`ghcr.io` and Docker Hub minutes after `helm install` reported success.
+`CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
+broker image from the agent image by swapping the trailing name, so it follows
+the mirror on its own. The sandbox image cannot be derived that way — it is a
+separate repository — which is why it has to be named.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
 `make mirror-images` writes. Setting `litellm.image.repository` while
-`global.imageRegistry` is set therefore changes only the name the prefix is
+`global.thirdPartyImageRegistry` is set therefore changes only the name the prefix is
 joined to, not where the image is pulled from. To place images individually —
-most on the mirror, one somewhere else — leave `global.imageRegistry` empty and
-give each `*.image.repository` its full mirrored path instead; the operator's
-`PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and `FLUENT_BIT_IMAGE` are
-rendered from those values either way.
+most on the mirror, one somewhere else — leave `global.imageRegistry` and
+`global.thirdPartyImageRegistry` empty and give each `*.image.repository` its full
+mirrored path instead; the operator's `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
+and `FLUENT_BIT_IMAGE` are rendered from those values either way.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
@@ -181,11 +191,10 @@ credentials cannot read — Harbor or Artifactory with token auth, rather than a
 in-project Artifact Registry. An entry is either a bare Secret **name**, so a
 single one is reachable with `--set global.imagePullSecrets[0]=regcred`, or the
 `{name: <secret>}` map a `PodSpec` takes; any other shape fails the render. It
-reaches the same two populations `global.imageRegistry` does: every pod the chart renders
-(operator, LiteLLM, the pre-delete cleanup Job) and the agent pods the operator
-renders, via `IMAGE_PULL_SECRETS` on the manager and `spec.deployment.imagePullSecrets`
-on the `PlatformAgent`. A hand-written `PlatformAgent` that sets that field
-replaces the operator's default rather than adding to it.
+reaches every pod the chart renders (operator, LiteLLM, the pre-delete cleanup Job)
+and the agent pods the operator renders, via `IMAGE_PULL_SECRETS` on the manager and
+`spec.deployment.imagePullSecrets` on the `PlatformAgent`. A hand-written `PlatformAgent`
+that sets that field replaces the operator's default rather than adding to it.
 
 The Secrets are referenced, never created: keeping registry credentials out of
 Helm release data is the point, and the chart has no way to write one that would
@@ -216,9 +225,11 @@ The agent's baked default model endpoint is
 `http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base` and its provider overlays. `litellm.modelProvider`
-(gemini/anthropic/openai/vertex_ai/openai_compatible) picks which provider `model-default` routes to
+(gemini/anthropic/openai/vertex_ai/openai_compatible/sap, or any other LiteLLM provider slug with
+`litellm.modelDefaultName` set) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity, and `openai_compatible`, whose key is optional (both below); `litellm.modelDefaultName`
+uses Workload Identity, `openai_compatible`, whose key is optional, and `sap` and the other slugs,
+whose credentials come from the Secret `litellm.envFromSecret` names (all below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
@@ -350,6 +361,45 @@ including `/v1`) are required, and the render fails without them. Set
 --set litellm.modelDefaultName=<served-model-name> \
 --set litellm.openaiCompatible.apiBase=http://vllm.models.svc.cluster.local:8000/v1 \
 --set litellm.openaiCompatible.targetPort=8000
+```
+
+#### A credentials Secret for the gateway (`litellm.envFromSecret`)
+
+`litellm.envFromSecret` names a Secret in the release namespace that the chart
+mounts whole into the gateway container as environment variables (`envFrom`,
+optional, so the pod starts without it). You create it; the chart only names
+it, and a Helm upgrade never touches it. It carries whatever the LiteLLM
+provider reads from the environment, which is how the providers without a
+key in the credentials Secret get theirs:
+
+- **SAP AI Core (`litellm.modelProvider=sap`).** LiteLLM's `sap/` driver
+  exchanges the service key's client credentials at your tenant's token URL
+  and renews the token itself. Put the service key JSON under
+  `AICORE_SERVICE_KEY` and the resource group under `AICORE_RESOURCE_GROUP`;
+  the default model is `anthropic--claude-4.5-sonnet`, SAP's
+  `<publisher>--<model>` name. A Claude model behind SAP has its sampling keys
+  dropped like any other Claude model; prompt caching stays off.
+- **Any other LiteLLM provider** (`azure`, `bedrock`, `databricks`, ...): set
+  `litellm.modelProvider` to the slug, `litellm.modelDefaultName` to the model
+  (required; the chart has no default for it), and the driver's variables in
+  the Secret.
+- **An OpenAI-compatible gateway behind OAuth2 client credentials.** With
+  `openai_compatible` and `OPENAI_COMPATIBLE_OAUTH_TOKEN_URL`,
+  `OPENAI_COMPATIBLE_OAUTH_CLIENT_ID` and `OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET`
+  in the Secret, the chart ships a pre-call hook that fetches the bearer token,
+  caches it and renews it before expiry
+  ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
+
+A variable the chart also sets from the credentials Secret (`GEMINI_API_KEY`,
+`HOSTED_VLLM_API_KEY`, ...) wins over the same name in this Secret. Rotating
+the Secret does not roll the pods: `kubectl rollout restart deployment/litellm`.
+
+```bash
+kubectl create secret generic sap-aicore -n kubeagents-system \
+  --from-file=AICORE_SERVICE_KEY=./aicore-service-key.json \
+  --from-literal=AICORE_RESOURCE_GROUP=default
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set litellm.modelProvider=sap --set litellm.envFromSecret=sap-aicore
 ```
 
 #### Upgrade notes: inference-gateway Service rename
@@ -1032,7 +1082,6 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
-
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

@@ -935,7 +935,15 @@ main() {
   # provider has no endpoint, so it is reset to the default, which the destroy
   # renders no differently: the release and the gateway go either way.
   export OPENAI_COMPATIBLE_API_BASE="" OPENAI_COMPATIBLE_TARGET_PORT="" OPENAI_COMPATIBLE_EGRESS_CIDRS="" OPENAI_COMPATIBLE_CA_SECRET_NAME=""
-  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ]; then
+  # The gateway's env Secret name, for the same reason: the generator refuses
+  # a malformed one, and the destroy renders no differently without it.
+  export LITELLM_ENV_SECRET_NAME=""
+  # A provider slug outside the installer's table is refused without a model
+  # too, so it is reset with openai_compatible rather than refusing the destroy.
+  # Guarded like the alert ceilings above: an older installer_common.sh has no
+  # is_table_model_provider, and could not have recorded a slug either.
+  if [ "${MODEL_PROVIDER:-}" = "openai_compatible" ] ||
+    { declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"; }; then
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"

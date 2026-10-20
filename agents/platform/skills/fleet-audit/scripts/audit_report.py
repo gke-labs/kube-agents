@@ -57,6 +57,7 @@ import argparse
 import atexit
 import bisect
 import contextlib
+import contextvars
 import copy
 import fcntl
 import hashlib
@@ -502,6 +503,27 @@ COLLECTOR_AUDITS = frozenset(
     }
 )
 
+# How many field errors one rejected findings document reports. A worker
+# fixes what the rejection names and runs `finish` again, so one error per
+# call cost a run per field (#2856); past this many, the rest are counted.
+MAX_REPORTED_FINDINGS_ERRORS = 20
+# What a usage error on `finish`, `draft` or an unknown command adds after
+# argparse's own line, and what a missing input names: the command that
+# produces it, not only the flag (#2856).
+DRAFT_COMMAND = "draft --audit <id> --manifest-file <collector manifest> --out <findings file>"
+LIFECYCLE_HINT = (
+    f"The order is `start`, the SOP's collector command, `{DRAFT_COMMAND}`, then "
+    "`finish --audit <id> --findings-file <findings file> --manifest-file <collector manifest>`."
+)
+FINISH_USAGE_HINT = (
+    f"`finish` takes --audit, --findings-file (write it with `{DRAFT_COMMAND}`) and "
+    '--manifest-file <collector manifest>, or --no-collector-manifest "<why>" when the '
+    "collector did not run."
+)
+DRAFT_USAGE_HINT = (
+    "`draft` takes --audit and --manifest-file <the manifest the SOP's collector command "
+    "wrote>, and writes the findings document for `finish` to --out <findings file>."
+)
 SEVERITIES = ("critical", "major", "minor")
 SEVERITY_RANK = {severity: i for i, severity in enumerate(SEVERITIES)}
 REMEDIATION_KINDS = ("manifest", "gcloud", "manual")
@@ -817,6 +839,23 @@ CHAT_REPORT_UPDATED_KEY = "updated_at"
 CHAT_REPORT_PARTS_KEY = "parts"
 CHAT_REPORT_REPO_KEY = "repo"
 CHAT_REPORT_TEXT_KEY = "text"
+# Saved on the entry `start` opened by the `finish` that fills it, ahead of the
+# store write: its verdict, which a later `finish` of the same repository in
+# the same run must not turn silent, and the ids its ledger body marked new.
+CHAT_REPORT_SILENT_OK_KEY = "silent_ok"
+CHAT_REPORT_NEW_IDS_KEY = "new_ids"
+# Above a later `finish`'s report in the same entry: its counts are measured
+# against the report above it, or against what an earlier `finish` that died
+# before its report published, not against the previous run.
+CHAT_REPORT_REFINISH_LABEL = "Re-run in this audit; counts are against the report above."
+CHAT_REPORT_RERUN_LABEL = (
+    "Re-run in this audit after an earlier finish published and stopped; "
+    "counts are against what it published."
+)
+# On the JSON line of such a later `finish`; `SILENT_FLOOR_KEY` also on its
+# envelope, when the earlier one's news kept this one from being silent.
+REFINISH_KEY = "refinish"
+SILENT_FLOOR_KEY = "silent_floor"
 # The rendered report's last line. `slack_audit_report.ledger_ref` finds the
 # ledger only behind a "ledger:" label, a dash or a markdown link.
 CHAT_REPORT_LEDGER_LINE = "Ledger: {url}"
@@ -2894,6 +2933,7 @@ def report_envelope(
         "prs_still_open": list(payload.get("prs_still_open") or []),
         "prs_closed": list(payload.get("prs_closed") or []),
         "silent_ok": payload.get("silent_ok"),
+        **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
         "ledger_held_open": ledger_held_open,
         "delta_known": delta_known,
         "new_ids": sorted(new_ids),
@@ -3030,11 +3070,29 @@ def _new_chat_record(audit_id: str, now: datetime) -> dict:
     }
 
 
+def _live_chat_record(audit_id: str, now: datetime) -> dict | None:
+    """The record on disk while its last step is within `INFLIGHT_TTL_SECONDS`, else None."""
+    record = _read_chat_record(audit_id)
+    if record is None or now.timestamp() - float(record[CHAT_REPORT_UPDATED_KEY]) >= INFLIGHT_TTL_SECONDS:
+        return None
+    return record
+
+
+def _last_part(record: dict, repo: str, keep: Callable[[dict], bool]) -> dict | None:
+    parts = [p for p in record[CHAT_REPORT_PARTS_KEY] if p.get(CHAT_REPORT_REPO_KEY) == repo and keep(p)]
+    return parts[-1] if parts else None
+
+
+def _pending_part(record: dict, repo: str) -> dict | None:
+    """`repo`'s entry with no report yet, or None."""
+    return _last_part(record, repo, lambda part: not part.get(CHAT_REPORT_TEXT_KEY))
+
+
 def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
     """This run's record: the one on disk when its last step is within
     `INFLIGHT_TTL_SECONDS` and it holds no finished report for `repo`, else a
     new one."""
-    record = _read_chat_record(audit_id)
+    record = _live_chat_record(audit_id, now)
     if record is None:
         return _new_chat_record(audit_id, now)
     finished = {
@@ -3042,7 +3100,7 @@ def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
         for part in record[CHAT_REPORT_PARTS_KEY]
         if part.get(CHAT_REPORT_TEXT_KEY)
     }
-    if now.timestamp() - float(record[CHAT_REPORT_UPDATED_KEY]) >= INFLIGHT_TTL_SECONDS or repo in finished:
+    if repo in finished:
         return _new_chat_record(audit_id, now)
     return record
 
@@ -3062,11 +3120,13 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
     # A record with no finished part that already holds `repo` pending was
     # left by a run that never finished it, and adopting it would carry that
     # run's stamps into this one. One pending only for other repositories is
-    # this run's earlier repository, which the relay must still name.
+    # this run's earlier repository, which the relay must still name. A part
+    # with a saved verdict is a `finish` of this run that died after deciding:
+    # the record and the verdict stay, so the next `finish` is not silent.
     parts = record[CHAT_REPORT_PARTS_KEY]
-    if not any(part.get(CHAT_REPORT_TEXT_KEY) for part in parts) and any(
-        part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts
-    ):
+    if not any(
+        part.get(CHAT_REPORT_TEXT_KEY) or CHAT_REPORT_SILENT_OK_KEY in part for part in parts
+    ) and any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts):
         record = _new_chat_record(audit_id, now)
     if not any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in record[CHAT_REPORT_PARTS_KEY]):
         record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: None})
@@ -3077,22 +3137,95 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
         log(f"WARNING: chat report for {audit_id} not opened: {exc}")
 
 
-def append_chat_report(audit_id: str, repo: str, text: str, now: datetime) -> None:
+def _filled_part(record: dict, repo: str) -> dict | None:
+    """`repo`'s entry that `start` opened and a `finish` has filled, or None."""
+    return _last_part(record, repo, lambda part: CHAT_REPORT_SILENT_OK_KEY in part)
+
+
+def earlier_finish(audit_id: str, repo: str, now: datetime) -> dict | None:
+    """The entry an earlier `finish` of `repo` filled in this run, or None.
+
+    A model can call `finish` again after one `start`. That call reads the
+    envelope the earlier one just stored as the previous run's, so on its own
+    it measures no change and would call a run with news silent. A `finish`
+    with no `start` fills no entry; it is taken for a later `finish` of the
+    same run only while the record of one that did is current.
+    """
+    record = _live_chat_record(audit_id, now)
+    return None if record is None else _filled_part(record, repo)
+
+
+def silent_floor(earlier: dict | None) -> bool:
+    """Whether an earlier `finish` in this run reported news or opened a pull request."""
+    return earlier is not None and earlier.get(CHAT_REPORT_SILENT_OK_KEY) is False
+
+
+def apply_earlier_finish(payload: dict, earlier: dict | None) -> None:
+    """Mark a later `finish` on its JSON line, and keep it loud when the earlier one was."""
+    if earlier is None:
+        return
+    payload[REFINISH_KEY] = True
+    if silent_floor(earlier):
+        payload["silent_ok"] = False
+        payload[SILENT_FLOOR_KEY] = True
+        log(
+            "SILENT FLOOR: an earlier finish in this run reported news or opened a pull "
+            "request, so this one is not silent either and its sweep opens nothing."
+        )
+
+
+def save_chat_verdict(
+    audit_id: str, repo: str, silent_ok: bool, new_ids: Iterable[str], now: datetime
+) -> None:
+    """Save this `finish`'s verdict on `repo`'s entry. Best-effort: never fails the run.
+
+    Called as each sweep pull request opens and before the store write, so a
+    `finish` that dies after either still leaves the verdict for its re-run.
+    """
+    record = _live_chat_record(audit_id, now)
+    if record is None:
+        return
+    part = _filled_part(record, repo) or _pending_part(record, repo)
+    if part is None:
+        return
+    part[CHAT_REPORT_SILENT_OK_KEY] = bool(silent_ok)
+    part[CHAT_REPORT_NEW_IDS_KEY] = sorted(set(part.get(CHAT_REPORT_NEW_IDS_KEY) or []) | set(new_ids))
+    record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
+    try:
+        _write_chat_record(audit_id, record)
+    except OSError as exc:
+        log(f"WARNING: chat report for {audit_id} not saved: {exc}")
+
+
+def append_chat_report(
+    audit_id: str, repo: str, text: str, now: datetime, *, refinish: bool = False
+) -> None:
     """Add `repo`'s report to this run's chat report. Best-effort: never fails the run.
 
-    Fills the entry `start` opened for `repo`. A `finish` with no such entry
-    adds one, and with no current record (see `_current_chat_record`) opens
-    one, so its report still reaches the relay under a run of its own.
+    Fills the entry `start` opened for `repo`. A later `finish` of `repo` in
+    the same run adds its report under the earlier one, so neither that report
+    nor another repository's is lost. A `finish` with no such entry adds one,
+    and with no current record (see `_current_chat_record`) opens one, so its
+    report still reaches the relay under a run of its own.
     """
-    record = _current_chat_record(audit_id, repo, now)
-    pending = [
-        part for part in record[CHAT_REPORT_PARTS_KEY]
-        if part.get(CHAT_REPORT_REPO_KEY) == repo and not part.get(CHAT_REPORT_TEXT_KEY)
-    ]
-    if pending:
-        pending[-1][CHAT_REPORT_TEXT_KEY] = text
+    record = _live_chat_record(audit_id, now)
+    part = None if record is None else _filled_part(record, repo)
+    if part is not None and part.get(CHAT_REPORT_TEXT_KEY):
+        part[CHAT_REPORT_TEXT_KEY] = f"{part[CHAT_REPORT_TEXT_KEY]}\n\n{CHAT_REPORT_REFINISH_LABEL}\n{text}"
+    elif part is not None:
+        part[CHAT_REPORT_TEXT_KEY] = f"{CHAT_REPORT_RERUN_LABEL}\n{text}" if refinish else text
     else:
-        record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: text})
+        record = _current_chat_record(audit_id, repo, now)
+        pending = _pending_part(record, repo)
+        if pending is not None:
+            pending[CHAT_REPORT_TEXT_KEY] = text
+        else:
+            record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: text})
+    if refinish:
+        # A new stamp: the relay posts each stamp once, and the one on the
+        # record may be a run it already posted, or marked posted when an
+        # earlier `finish` died.
+        record[CHAT_REPORT_RUN_KEY] = now.strftime(REPORT_STAMP_FORMAT)
     record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
     try:
         _write_chat_record(audit_id, record)
@@ -3628,14 +3761,36 @@ def assert_pushable(branch: str) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _require_str(value: object, where: str, *, allow_empty: bool = True) -> str:
+# Set while `validate_findings` runs: a missing or empty string field is
+# recorded here and validation goes on, so one rejection names every such
+# field instead of the first.
+_FIELD_ERRORS: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "_FIELD_ERRORS", default=None
+)
+
+
+def _field_error(message: str) -> None:
+    errors = _FIELD_ERRORS.get()
+    if errors is None:
+        raise ValidationError(message)
+    errors.append(message)
+
+
+def _require_str_ok(value: object, where: str, *, allow_empty: bool = True) -> bool:
+    """Whether `value` is a usable string; a failure is raised, or recorded
+    while `validate_findings` collects, and the caller skips what reads it."""
     if not isinstance(value, str):
-        raise ValidationError(
-            f"{where}: expected a string, got {type(value).__name__}"
-        )
+        _field_error(f"{where}: expected a string, got {type(value).__name__}")
+        return False
     if not allow_empty and not value.strip():
-        raise ValidationError(f"{where}: required, must be a non-empty string")
-    return value
+        _field_error(f"{where}: required, must be a non-empty string")
+        return False
+    return True
+
+
+def _require_str(value: object, where: str, *, allow_empty: bool = True) -> str:
+    _require_str_ok(value, where, allow_empty=allow_empty)
+    return value  # type: ignore[return-value]
 
 
 def _sop_pointer(audit_id: str) -> str:
@@ -3702,7 +3857,9 @@ def validate_check_command(value: object, where: str, check: str) -> str:
     A run determined to lie can still lie. The mitigation for that is the
     published record, not this function.
     """
-    command = _require_str(value, where, allow_empty=False)
+    if not _require_str_ok(value, where, allow_empty=False):
+        return value  # type: ignore[return-value]
+    command = str(value)
     text = command.strip()
     if len(text) < MIN_CHECK_COMMAND_CHARS:
         raise ValidationError(
@@ -3755,7 +3912,9 @@ def validate_na_reason(value: object, where: str, check: str) -> str:
     excuses, where the same reader who can re-run a command can read "Autopilot
     — Google manages node pools" and judge it.
     """
-    reason = _require_str(value, where, allow_empty=False)
+    if not _require_str_ok(value, where, allow_empty=False):
+        return value  # type: ignore[return-value]
+    reason = str(value)
     text = reason.strip()
     if len(text) < MIN_NA_REASON_CHARS:
         raise ValidationError(
@@ -4008,7 +4167,57 @@ def _scope_spelling_hint(
 
 
 def validate_findings(data: object, audit_id: str) -> dict:
-    """Validate a findings document. Raises ValidationError naming index + field."""
+    """Validate a findings document. Raises one ValidationError naming every
+    missing or empty string field by index, up to MAX_REPORTED_FINDINGS_ERRORS,
+    plus the first other problem it met; a single problem reads as before."""
+    errors: list[str] = []
+    token = _FIELD_ERRORS.set(errors)
+    try:
+        result = _validate_findings_document(data, audit_id)
+    except ValidationError as exc:
+        # A check that read a field already recorded as wrong repeats that
+        # field ("'None' is not a check"); the recorded error is the real one.
+        if not _repeats_a_recorded_field(str(exc), errors):
+            errors.append(str(exc))
+    except (TypeError, AttributeError, KeyError):
+        # A field already recorded as wrong can break a later check that
+        # assumed its type; the recorded error is the one to report.
+        if not errors:
+            raise
+    finally:
+        _FIELD_ERRORS.reset(token)
+    if not errors:
+        return result
+    if len(errors) == 1:
+        raise ValidationError(errors[0])
+    shown = errors[:MAX_REPORTED_FINDINGS_ERRORS]
+    more = len(errors) - len(shown)
+    lines = [f"{len(errors)} problems in the findings file; fix them all, then run the command again:"]
+    lines += [f"  - {error}" for error in shown]
+    if more:
+        lines.append(f"  ... and {more} more")
+    raise ValidationError("\n".join(lines))
+
+
+def _error_field(message: str) -> str | None:
+    """The field path a validation message leads with (`findings[0].check`)."""
+    head = message.split(":", 1)[0]
+    return head if head and " " not in head else None
+
+
+def _repeats_a_recorded_field(message: str, recorded: list[str]) -> bool:
+    field = _error_field(message)
+    if field is None:
+        return False
+    # Only the same field or one under it: a message about a parent
+    # (`findings[1]: same identity as ...`) is a separate problem.
+    return any(
+        field == other or any(field.startswith(other + sep) for sep in (".", "["))
+        for other in filter(None, map(_error_field, recorded))
+    )
+
+
+def _validate_findings_document(data: object, audit_id: str) -> dict:
     validate_audit_id(audit_id)
 
     if not isinstance(data, dict):
@@ -4043,13 +4252,22 @@ def validate_findings(data: object, audit_id: str) -> dict:
     finding_check_set = audit_finding_checks(audit_id)
     audited_names: set[str] = set()
     qualified_by_leaf: dict[str, list[str]] = {}
+    # Set once a cluster's name is recorded as wrong: that cluster is left out
+    # of `audited_names`, so a later reference to it is not called out of scope.
+    scope_name_recorded = False
     for i, cluster in enumerate(clusters):
         if not isinstance(cluster, dict):
             raise ValidationError(f"scope.clusters[{i}]: expected an object")
-        for field in ("name", "location", "project"):
+        name_ok = _require_str_ok(
+            cluster.get("name"), f"scope.clusters[{i}].name", allow_empty=False
+        )
+        for field in ("location", "project"):
             _require_str(
                 cluster.get(field), f"scope.clusters[{i}].{field}", allow_empty=False
             )
+        if not name_ok:
+            scope_name_recorded = True
+            continue
         # A finding names its cluster by this name, and so does every lookup
         # that resolves one back to this table. Two same-named clusters in two
         # projects make that name ambiguous, and the ambiguity is already
@@ -4082,12 +4300,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # some checks did not run or do not apply" is a different claim from
         # "I could not read this cluster", and conflating the two produces
         # false all-clears.
-        if "limitations" in cluster:
-            _require_str(
-                cluster.get("limitations"),
-                f"scope.clusters[{i}].limitations",
-                allow_empty=False,
-            )
+        # A note recorded as wrong counts as no note in the empty-checks_run test below.
+        limitations_bad = "limitations" in cluster and not _require_str_ok(
+            cluster.get("limitations"),
+            f"scope.clusters[{i}].limitations",
+            allow_empty=False,
+        )
         if CLUSTERS_LISTED_KEY in cluster:
             listed = cluster[CLUSTERS_LISTED_KEY]
             if not name.startswith(PROJECT_TARGET_PREFIX) or isinstance(listed, bool) or listed != 0:
@@ -4140,7 +4358,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
         )
         if (
             not checks_run
-            and not str(cluster.get("limitations", "")).strip()
+            and (limitations_bad or not str(cluster.get("limitations", "")).strip())
             and not every_check_inapplicable
         ):
             raise ValidationError(
@@ -4170,7 +4388,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "nothing, so the claim has to carry the command that backs "
                     f"it. {_sop_pointer(audit_id)}"
                 )
-            _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+            if not _require_str_ok(entry.get("check"), f"{where}.check", allow_empty=False):
+                continue
             name = str(entry["check"])
             if name not in roster_set:
                 # Deliberately no roster in this message. An error that lists
@@ -4212,7 +4431,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     raise ValidationError(
                         f"{where}: expected an object with 'check' and 'reason'"
                     )
-                _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+                if not _require_str_ok(entry.get("check"), f"{where}.check", allow_empty=False):
+                    continue
                 name = str(entry["check"])
                 if name not in roster_set:
                     # No roster here either, for the reason given above: this
@@ -4245,12 +4465,14 @@ def validate_findings(data: object, audit_id: str) -> dict:
     for i, entry in enumerate(skipped):
         if not isinstance(entry, dict):
             raise ValidationError(f"scope.skipped[{i}]: expected an object")
-        _require_str(
+        cluster_ok = _require_str_ok(
             entry.get("cluster"), f"scope.skipped[{i}].cluster", allow_empty=False
         )
         _require_str(
             entry.get("reason"), f"scope.skipped[{i}].reason", allow_empty=False
         )
+        if not cluster_ok:
+            continue
         name = str(entry["cluster"])
         if name in audited_names:
             raise ValidationError(
@@ -4283,9 +4505,11 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # which meant it was only ever as reliable as the id — and the id was
         # prose. Named explicitly it is checkable against the roster, and it
         # becomes the first component of the derived identity below.
-        _require_str(finding.get("check"), f"findings[{i}].check", allow_empty=False)
-        check = str(finding["check"])
-        if check not in finding_check_set:
+        check_ok = _require_str_ok(
+            finding.get("check"), f"findings[{i}].check", allow_empty=False
+        )
+        check = str(finding.get("check"))
+        if check_ok and check not in finding_check_set:
             # No roster in the message, for the same reason `checks_run` gives
             # none: a rejection that enumerates the valid slugs is an answer
             # key for a run that inspected nothing.
@@ -4303,10 +4527,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
             )
 
         _require_str(finding.get("title"), f"findings[{i}].title", allow_empty=False)
-        _require_str(
+        cluster_ok = _require_str_ok(
             finding.get("cluster"), f"findings[{i}].cluster", allow_empty=False
         )
-        if str(finding["cluster"]) in skipped_names:
+        if cluster_ok and str(finding["cluster"]) in skipped_names:
             raise ValidationError(
                 f"findings[{i}].cluster: {finding['cluster']!r} is listed in "
                 "scope.skipped, so this run claims it could not read it — a finding "
@@ -4317,7 +4541,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
         # scope does not list -- the cost stream files unattributable disks
         # under `project/<id>` -- but not a second spelling of one it does,
         # which derives a second id for the same finding.
-        qualified = _qualified_scope_entries(
+        qualified = cluster_ok and _qualified_scope_entries(
             str(finding["cluster"]), audited_names, qualified_by_leaf
         )
         if qualified:
@@ -4330,107 +4554,114 @@ def validate_findings(data: object, audit_id: str) -> dict:
             )
         # namespace may legitimately be empty for cluster-scoped objects.
         _require_str(finding.get("namespace", ""), f"findings[{i}].namespace")
-        _require_str(finding.get("object"), f"findings[{i}].object", allow_empty=False)
+        object_ok = _require_str_ok(
+            finding.get("object"), f"findings[{i}].object", allow_empty=False
+        )
         # `///` is a non-empty string and an empty name. Caught here, against
         # the field the worker wrote, rather than four lines down against a
         # derived string it has never seen.
-        for field in ("cluster", "object"):
-            if _id_segment(str(finding[field])) == ID_EMPTY_SEGMENT:
+        for field, field_ok in (("cluster", cluster_ok), ("object", object_ok)):
+            if field_ok and _id_segment(str(finding[field])) == ID_EMPTY_SEGMENT:
                 raise ValidationError(
                     f"findings[{i}].{field}: {finding[field]!r} has no letter or "
                     "digit in it, so it names nothing and cannot carry the "
                     "finding's identity"
                 )
 
-        # Identity, computed now that its four components are validated. Any
-        # `id` the document arrived with is discarded rather than rejected: a
-        # worker running against a cached SOP would otherwise fail the whole
-        # document, and `exit 2` on an audit publishes nothing at all.
-        fold_unnamespaced_check(finding)
-        full_id = derive_finding_id(finding)
-        fid = _shorten_id(full_id)
-        try:
-            validate_finding_id(fid, f"findings[{i}] (derived id)")
-        except ValidationError as exc:
-            # Unreachable for any object named `Kind/name`, but the operator
-            # must never be sent to fix a string they did not write: say which
-            # fields produced it.
-            raise ValidationError(
-                f"{exc} — the id is derived from check={check!r}, "
-                f"cluster={finding['cluster']!r}, "
-                f"namespace={finding.get('namespace') or ''!r}, "
-                f"object={finding['object']!r}; change one of those"
-            ) from None
-        # Keyed on the *full* derived id, never on the shortened one. Two long
-        # objects in one long-named namespace shorten to the same string
-        # without being the same finding, and rejecting on that refused the
-        # whole document — exit 2, nothing published — while telling the
-        # operator that two different Deployments were one object. Shortening
-        # now carries a digest (`_shorten_id`) so the pair keeps distinct ids;
-        # what stays a hard error is the real modelling mistake this check was
-        # written for, which is two findings agreeing on all four identity
-        # fields.
-        if full_id in seen_ids:
-            first = seen_ids[full_id]
-            raise ValidationError(
-                f"findings[{i}]: same identity as findings[{first}] — check "
-                f"{check!r} against {finding['object']!r} in "
-                f"{finding['cluster']!r}/{finding.get('namespace') or '(cluster)'} "
-                f"derives the id {fid!r} twice. One finding per (check, object): "
-                "three privileged containers in one Deployment are one finding "
-                "listing all three in evidence.excerpt, not three findings. If "
-                "these really are different problems, they are against different "
-                "objects — say which in `object`."
-            )
-        seen_ids[full_id] = i
-        # A residual collision needs two ids over `MAX_FINDING_ID` whose
-        # digests agree in 24 bits, so it is not expected — but it degrades to
-        # two findings sharing one ledger row rather than to an audit that
-        # publishes nothing. The delta will treat them as one; that is a worse
-        # ledger, not an absent one.
-        if fid in short_ids:
-            log(
-                f"WARNING: findings[{i}] and findings[{short_ids[fid]}] both "
-                f"shorten to {fid!r}; they will share one row on the ledger."
-            )
-        else:
-            short_ids[fid] = i
-        finding["id"] = fid
+        if check_ok and cluster_ok and object_ok:
+            # Identity, computed once its components are valid; a run whose check,
+            # cluster or object was recorded as wrong derives no id, and the rest
+            # of the finding is still checked. Any
+            # `id` the document arrived with is discarded rather than rejected: a
+            # worker running against a cached SOP would otherwise fail the whole
+            # document, and `exit 2` on an audit publishes nothing at all.
+            fold_unnamespaced_check(finding)
+            full_id = derive_finding_id(finding)
+            fid = _shorten_id(full_id)
+            try:
+                validate_finding_id(fid, f"findings[{i}] (derived id)")
+            except ValidationError as exc:
+                # Unreachable for any object named `Kind/name`, but the operator
+                # must never be sent to fix a string they did not write: say which
+                # fields produced it.
+                raise ValidationError(
+                    f"{exc} — the id is derived from check={check!r}, "
+                    f"cluster={finding['cluster']!r}, "
+                    f"namespace={finding.get('namespace') or ''!r}, "
+                    f"object={finding['object']!r}; change one of those"
+                ) from None
+            # Keyed on the *full* derived id, never on the shortened one. Two long
+            # objects in one long-named namespace shorten to the same string
+            # without being the same finding, and rejecting on that refused the
+            # whole document — exit 2, nothing published — while telling the
+            # operator that two different Deployments were one object. Shortening
+            # now carries a digest (`_shorten_id`) so the pair keeps distinct ids;
+            # what stays a hard error is the real modelling mistake this check was
+            # written for, which is two findings agreeing on all four identity
+            # fields.
+            if full_id in seen_ids:
+                first = seen_ids[full_id]
+                raise ValidationError(
+                    f"findings[{i}]: same identity as findings[{first}] — check "
+                    f"{check!r} against {finding['object']!r} in "
+                    f"{finding['cluster']!r}/{finding.get('namespace') or '(cluster)'} "
+                    f"derives the id {fid!r} twice. One finding per (check, object): "
+                    "three privileged containers in one Deployment are one finding "
+                    "listing all three in evidence.excerpt, not three findings. If "
+                    "these really are different problems, they are against different "
+                    "objects — say which in `object`."
+                )
+            seen_ids[full_id] = i
+            # A residual collision needs two ids over `MAX_FINDING_ID` whose
+            # digests agree in 24 bits, so it is not expected — but it degrades to
+            # two findings sharing one ledger row rather than to an audit that
+            # publishes nothing. The delta will treat them as one; that is a worse
+            # ledger, not an absent one.
+            if fid in short_ids:
+                log(
+                    f"WARNING: findings[{i}] and findings[{short_ids[fid]}] both "
+                    f"shorten to {fid!r}; they will share one row on the ledger."
+                )
+            else:
+                short_ids[fid] = i
+            finding["id"] = fid
 
         _require_str(finding.get("impact"), f"findings[{i}].impact", allow_empty=False)
 
         evidence = finding.get("evidence")
         if not isinstance(evidence, dict):
-            raise ValidationError(
+            _field_error(
                 f"findings[{i}].evidence: required object with 'command' and 'excerpt'"
             )
-        if not isinstance(evidence.get("command"), str) or not evidence[
-            "command"
-        ].strip():
-            raise ValidationError(
-                f"findings[{i}].evidence.command: required, must be a non-empty "
-                "string — a finding with no reproducible command is dropped, not softened"
+        else:
+            if not isinstance(evidence.get("command"), str) or not evidence[
+                "command"
+            ].strip():
+                _field_error(
+                    f"findings[{i}].evidence.command: required, must be a non-empty "
+                    "string — a finding with no reproducible command is dropped, not softened"
+                )
+            _require_str(
+                evidence.get("excerpt", ""), f"findings[{i}].evidence.excerpt"
             )
-        _require_str(
-            evidence.get("excerpt", ""), f"findings[{i}].evidence.excerpt"
-        )
 
         # Required on EVERY finding, not only the promotable ones. Deferring the
         # reasoning to promotion time means writing it when the evidence is no
         # longer in front of you.
         recommendation = finding.get("recommendation")
         if not isinstance(recommendation, dict):
-            raise ValidationError(
+            _field_error(
                 f"findings[{i}].recommendation: required object with 'action', "
                 "'rationale' and 'risk'"
             )
-        for field, hint in RECOMMENDATION_FIELDS:
-            value = recommendation.get(field)
-            if not isinstance(value, str) or not value.strip():
-                raise ValidationError(
-                    f"findings[{i}].recommendation.{field}: required, must be a "
-                    f"non-empty string — {hint}"
-                )
+        else:
+            for field, hint in RECOMMENDATION_FIELDS:
+                value = recommendation.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    _field_error(
+                        f"findings[{i}].recommendation.{field}: required, must be a "
+                        f"non-empty string — {hint}"
+                    )
 
         remediation = finding.get("remediation")
         if not isinstance(remediation, dict):
@@ -4445,10 +4676,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
             )
         path = remediation.get("path", "")
         if kind == "manifest":
-            _require_str(
+            if not _require_str_ok(
                 path, f"findings[{i}].remediation.path", allow_empty=False
-            )
-            assert isinstance(path, str)
+            ):
+                continue
             # Write the normalised spelling back. Grouping, the branch digest
             # and the `git add` pathspec all key on this string; if `a/b.yaml`
             # and `./a/b.yaml` survive as two spellings they become two groups,
@@ -4496,7 +4727,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"{where}: expected an object with 'check', 'cluster', "
                     "'object' and 'reason' (and 'namespace' unless cluster-scoped)"
                 )
-            _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+            if not _require_str_ok(entry.get("check"), f"{where}.check", allow_empty=False):
+                continue
             check = str(entry["check"])
             if check not in finding_check_set:
                 # No roster, for the reason `findings[].check` gives none.
@@ -4505,25 +4737,29 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "SOP. Name checks by the backticked slug in their `####` "
                     f"heading. {_sop_pointer(audit_id)}"
                 )
-            _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)
+            if not _require_str_ok(entry.get("cluster"), f"{where}.cluster", allow_empty=False):
+                continue
             cluster = str(entry["cluster"])
-            if cluster not in audited_names:
+            if cluster not in audited_names and not scope_name_recorded:
                 raise ValidationError(
                     f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
                     "finding can only be confirmed gone on a cluster this run read."
                     + _scope_spelling_hint(cluster, audited_names, qualified_by_leaf)
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
-            _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
+            if not _require_str_ok(entry.get("object"), f"{where}.object", allow_empty=False):
+                continue
             for field in ("cluster", "object"):
                 if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
                     raise ValidationError(
                         f"{where}.{field}: {entry[field]!r} has no letter or digit "
                         "in it, so it names nothing"
                     )
-            reason = _require_str(
+            if not _require_str_ok(
                 entry.get("reason"), f"{where}.reason", allow_empty=False
-            )
+            ):
+                continue
+            reason = str(entry["reason"])
             if len(reason.strip()) < MIN_RESOLVED_REASON_CHARS:
                 raise ValidationError(
                     f"{where}.reason: {reason!r} is too short to say why the "
@@ -4581,7 +4817,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "no check in it may be moved to `declared` — every candidate "
                     "is a finding. Drop the entry, or omit the key"
                 )
-            _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+            if not _require_str_ok(entry.get("check"), f"{where}.check", allow_empty=False):
+                continue
             check = str(entry["check"])
             if check not in finding_check_set:
                 # No roster, for the reason `findings[].check` gives none.
@@ -4601,9 +4838,10 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "move; write this one under `findings`"
                 )
             _require_str(entry.get("title"), f"{where}.title", allow_empty=False)
-            _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)
+            if not _require_str_ok(entry.get("cluster"), f"{where}.cluster", allow_empty=False):
+                continue
             cluster = str(entry["cluster"])
-            if cluster not in audited_names:
+            if cluster not in audited_names and not scope_name_recorded:
                 raise ValidationError(
                     f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
                     "declaration justifies a posture this run observed, so the "
@@ -4611,7 +4849,8 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     + _scope_spelling_hint(cluster, audited_names, qualified_by_leaf)
                 )
             _require_str(entry.get("namespace", ""), f"{where}.namespace")
-            _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
+            if not _require_str_ok(entry.get("object"), f"{where}.object", allow_empty=False):
+                continue
             if check == NAMESPACE_SHAPE_CHECK and not _is_namespace_object(str(entry["object"])):
                 raise ValidationError(
                     f"{where}.object: {str(entry['object'])!r} — a {check} declaration justifies "
@@ -5395,7 +5634,7 @@ def manifest_predates_run(manifest: dict, audit_id: str) -> tuple[str, str] | No
 FINDINGS_DOCUMENT_KEYS = frozenset({"findings", "scope"})
 
 
-def load_manifest(path: str, audit_id: str | None = None) -> dict:
+def load_manifest(path: str, audit_id: str | None = None, command: str | None = None) -> dict:
     """The collector manifest at `path`, or a ValidationError naming why not.
 
     Only the envelope is checked here — an object, with `clusters` a list when
@@ -5413,7 +5652,18 @@ def load_manifest(path: str, audit_id: str | None = None) -> dict:
     """
     manifest_path = Path(path)
     if not manifest_path.is_file():
-        raise ValidationError(f"--manifest-file: {path} does not exist")
+        hint = ""
+        if command in ("finish", "draft") and audit_id:
+            hint = (
+                " Give the path the SOP's collector command wrote its manifest to "
+                f"({manifest_path_for(audit_id)} in the SOPs)"
+            )
+            hint += (
+                '; if the collector did not run, `finish` takes --no-collector-manifest "<why>" instead.'
+                if command == "finish" else "."
+            )
+        raise ValidationError(f"--manifest-file: {path} does not exist.{hint}" if hint
+                              else f"--manifest-file: {path} does not exist")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -10374,6 +10624,7 @@ def _render_withheld(
     noun: str = DEFAULT_PROPOSAL_NOUN,
     below_floor: list[str] | None = None,
     triage_reasons: dict[str, str] | None = None,
+    swept_earlier: bool = False,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
 
@@ -10420,8 +10671,14 @@ def _render_withheld(
         out += [
             "",
             f"{len(withheld)} finding(s) qualify for an automatic remediation {noun} "
-            f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
-            f"one bad night cannot bury this repository in generated {noun}s. "
+            + (
+                f"but were held back because an earlier finish in this run already "
+                f"ran the automatic sweep. "
+                if swept_earlier
+                else f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
+                f"one bad night cannot bury this repository in generated {noun}s. "
+            )
+            + 
             "Comment `/remediate <finding-id>` to open any of them now — an explicit "
             "request is not capped.",
             "",
@@ -10698,6 +10955,7 @@ def render_issue_body(
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
     unlinked_paths: set[str] | frozenset[str] = frozenset(),
+    swept_earlier: bool = False,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
@@ -10752,6 +11010,7 @@ def render_issue_body(
         noun=noun,
         below_floor=list(below_floor or []),
         triage_reasons=triage_reasons,
+        swept_earlier=swept_earlier,
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -14315,9 +14574,18 @@ def join_harness_declarations(
     return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded, shield_filed_namespaces(declarations)
 
 
-def load_findings(path: str, audit_id: str) -> dict:
+def load_findings(path: str, audit_id: str, command: str | None = None) -> dict:
     findings_file = Path(path)
     if not findings_file.is_file():
+        if command == "finish" and audit_id in COLLECTOR_AUDITS:
+            raise ValidationError(
+                f"--findings-file: {path} does not exist. Write it first with "
+                f"`{Path(__file__).resolve()} draft --audit {audit_id} --manifest-file "
+                f"{manifest_path_for(audit_id)} --out {path}`, fill each recommendation, "
+                "then run `finish` again with that --findings-file and the same --manifest-file. "
+                "If the collector did not run, write the document by hand as the SOP's manual "
+                'fallback says, and pass --no-collector-manifest "<why>" instead of --manifest-file.'
+            )
         raise ValidationError(f"--findings-file: {path} does not exist")
     try:
         data = json.loads(findings_file.read_text(encoding="utf-8"))
@@ -16030,7 +16298,7 @@ def draft_findings(manifest: dict, audit_id: str) -> dict:
 def handle_draft(args: argparse.Namespace) -> None:
     """Write the findings document `draft_findings` builds from a manifest."""
     validate_audit_id(args.audit)
-    manifest = load_manifest(args.manifest_file, args.audit)
+    manifest = load_manifest(args.manifest_file, args.audit, command="draft")
     text = json.dumps(draft_findings(manifest, args.audit), indent=2) + "\n"
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
@@ -16356,8 +16624,11 @@ def _open_promoted_prs(
     issue_number: int | None,
     generated_at: datetime,
     noun: str | None = None,
+    on_open: Callable[[], None] = lambda: None,
 ) -> list[str]:
     """Open (or refresh) one pull request per group holding a promoted finding.
+
+    `on_open` runs after each one, before the next is tried.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
@@ -16428,6 +16699,7 @@ def _open_promoted_prs(
                 raise
             if url:
                 opened.append(url)
+                on_open()
     finally:
         if started_on and started_on != "HEAD":
             git(["checkout", "--force", started_on], check=False)
@@ -16963,6 +17235,7 @@ def _finish_without_forge(
     current_ids = finding_ids(findings)
     previous_ids = previous_no_forge_ids(audit_id)
     delta_known = previous_ids is not None
+    earlier = earlier_finish(audit_id, NO_FORGE_REPO, now)
     # A posture `finish` withheld is in the document, only not published,
     # which is how the ledger branch's `held_exclude` reads it too.
     held = sorted(
@@ -17007,6 +17280,8 @@ def _finish_without_forge(
         "critical": severity_counts(findings)["critical"],
         **timers(),
     }
+    apply_earlier_finish(payload, earlier)
+    save_chat_verdict(audit_id, NO_FORGE_REPO, payload["silent_ok"], [], now)
     stored = write_report(
         audit_id,
         report_envelope(
@@ -17033,7 +17308,9 @@ def _finish_without_forge(
     payload["summary"] = render_no_forge_summary(
         audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
     )
-    append_chat_report(audit_id, NO_FORGE_REPO, payload["summary"], now)
+    append_chat_report(
+        audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
+    )
     print(json.dumps(payload))
 
 
@@ -17092,7 +17369,7 @@ def findings_predate_run(path: str, audit_id: str) -> str | None:
 
 
 def _finish(args: argparse.Namespace, audit_id: str) -> None:
-    data = load_findings(args.findings_file, audit_id)
+    data = load_findings(args.findings_file, audit_id, command="finish")
     stale_since = findings_predate_run(args.findings_file, audit_id)
     if stale_since:
         raise ValidationError(
@@ -17117,7 +17394,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 "--manifest-file: give the path of the manifest the collector "
                 "wrote; an empty path is not the same as running without one."
             )
-        manifest = load_manifest(manifest_file, audit_id)
+        manifest = load_manifest(manifest_file, audit_id, command="finish")
         cross_check_manifest(data, manifest)
         # Before anything reads `evidence` — the dry-run preview and the ledger
         # body both do — so what renders is what the collector observed.
@@ -17173,7 +17450,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         raise ValidationError(
             f"--manifest-file is required for {audit_id}: its SOP runs a collector, "
             "and without the manifest nothing checks this document against what the "
-            "collector actually ran. Pass the manifest the collector wrote, or, on a "
+            "collector actually ran. Pass the manifest the collector wrote "
+            f"(--manifest-file {manifest_path_for(audit_id)} in the SOPs), or, on a "
             "run where it produced none, --no-collector-manifest '<why>' — which "
             "publishes but reports the run as partial."
         )
@@ -17259,6 +17537,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             audit_id, data, now, manifest=manifest, waiver=waiver, timers=timer_payload
         )
         return
+    earlier = earlier_finish(audit_id, repo, now)
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
@@ -18122,6 +18401,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # again past the unaccounted guard.
             stored_issue = opened_issue
             stored_body, stored_ids = opened_body, []
+        apply_earlier_finish(payload, earlier)
+        save_chat_verdict(audit_id, repo, payload["silent_ok"], [], now)
         write_report(
             audit_id,
             report_envelope(
@@ -18143,7 +18424,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             ledger_unchanged=body_untouched,
         )
-        append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
+        append_chat_report(
+        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        refinish=bool(payload.get(REFINISH_KEY)),
+    )
         print(json.dumps(payload))
         return
 
@@ -18203,6 +18487,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         findings,
         pr_by_finding,
         requests.targets,
+        # Everything the sweep would open goes to `withheld` instead, so the
+        # ledger still lists it: the earlier `finish` already opened its share.
+        cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
         requested_at=requests.requested_at,
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
@@ -18253,6 +18540,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         if filed is not None
         else None
     )
+    # This body replaces the earlier `finish`'s, and the Slack card reads its
+    # "new" tags from whichever body is live when the relay posts.
+    carried_new = set((earlier or {}).get(CHAT_REPORT_NEW_IDS_KEY) or []) & set(finding_ids(findings))
+    if carried_new:
+        new_marked = (new_marked or set()) | carried_new
     rendered = render_issue_body(
         data,
         generated_at=now,
@@ -18274,6 +18566,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         file_url=file_url,
         file_ref=file_ref,
         unlinked_paths=unlinked_paths,
+        swept_earlier=silent_floor(earlier),
     )
     if rendered.partial:
         log(
@@ -18402,6 +18695,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         issue_number=number,
         generated_at=now,
         noun=noun,
+        # As each opens, and not only before the store write: a `finish` that
+        # dies after one is re-run, and the re-run must not sweep again.
+        on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now),
     )
 
     # What the live ledger renders once this branch is done, for the store.
@@ -18443,6 +18739,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 file_url=file_url,
                 file_ref=file_ref,
                 unlinked_paths=unlinked_paths,
+                swept_earlier=silent_floor(earlier),
             ).body
             relinked = try_forge("issue-update", repo, {"number": number, "body": relink})
             if relinked is not None:
@@ -18588,6 +18885,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }
+    apply_earlier_finish(payload, earlier)
+    save_chat_verdict(audit_id, repo, payload["silent_ok"], new_marked or [], now)
     write_report(
         audit_id,
         report_envelope(
@@ -18608,7 +18907,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         ),
         now,
     )
-    append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
+    append_chat_report(
+        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        refinish=bool(payload.get(REFINISH_KEY)),
+    )
     print(json.dumps(payload))
 
 
@@ -18648,11 +18950,25 @@ def _nonblank(value: str) -> str:
     return value.strip()
 
 
+class _HintingParser(argparse.ArgumentParser):
+    """An ArgumentParser whose usage errors end with the next step to take."""
+
+    usage_hint = ""
+
+    def error(self, message: str):  # type: ignore[override]
+        # Only the root parser reports leftover arguments, for whichever
+        # subcommand ran; its hint is about choosing one, so it stays off those.
+        if self.usage_hint and not message.startswith("unrecognized arguments"):
+            message = f"{message}\n{self.usage_hint}"
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _HintingParser(
         description="Deterministic audit-reporting harness for the fleet-audit skill."
     )
-    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    parser.usage_hint = LIFECYCLE_HINT
+    subparsers = parser.add_subparsers(dest="subcommand", required=True, parser_class=_HintingParser)
 
     start_parser = subparsers.add_parser(
         "start",
@@ -18670,6 +18986,7 @@ def build_parser() -> argparse.ArgumentParser:
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
     )
+    finish_parser.usage_hint = FINISH_USAGE_HINT
     finish_parser.add_argument("--audit", required=True, help="Audit id.")
     finish_parser.add_argument(
         "--findings-file", required=True, help="Path to the findings.json to publish."
@@ -18749,6 +19066,7 @@ def build_parser() -> argparse.ArgumentParser:
         "recommendation fields are left empty and each remediation `manual`, "
         "for you to fill before `finish`.",
     )
+    draft_parser.usage_hint = DRAFT_USAGE_HINT
     draft_parser.add_argument("--audit", required=True, help="Audit id.")
     draft_parser.add_argument("--manifest-file", required=True, help="The manifest the collector wrote.")
     draft_parser.add_argument("--out", default=None, help="Write the document here rather than to stdout.")

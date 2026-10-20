@@ -20,14 +20,32 @@
 #   proxy is the only way out.
 #
 # The task and the cluster safeguards are pdb-remediation-pr's (same fixture,
-# same prompt), because that case already passes on github.com and on GitLab
-# (hack/eval/gitlab-cases.txt). This case adds one safeguard,
-# no-other-github-writes, so that a by-hand run with no lane still grades the
-# writes; the inject lane appends the same check to every case. It has no
-# github.com baseline on this case. A red on no-other-github-writes alone
-# needs a github.com baseline check (the same case on a github.com install)
-# before anyone blames the GHES path. Also look at the writes it names, for
-# example a leftover platform-agent/ branch from a retry.
+# same prompt). This case adds one safeguard, no-other-github-writes, so that
+# a by-hand run with no lane still grades the writes; the inject lane appends
+# the same check to every case. A red on no-other-github-writes alone needs a
+# github.com baseline check (the same case on a github.com install) before
+# anyone blames the GHES path. Also look at the writes it names, for example
+# a leftover platform-agent/ branch from a retry.
+#
+# THE REPOSITORY MUST DECLARE THE WORKLOAD. The fleet's checkout-gateway comes
+# from Terraform (bench/tf/fleet/defects-a.tf), not from the GitOps
+# repository. When the repository holds no manifest for it, the worker finds
+# the missing budget, then declines to open a pull request because nothing in
+# the repository declares the workload (#3120, the reason pdb-remediation-pr
+# left the blocking roster). The live run of 2026-10-16 had this miss on both
+# forges: on the GHES install 1 pass in 8 graded runs, and on github.com 0 in
+# 2, with the GHES path itself correct in every run. So recipe step 3 seeds
+# the declaration before the first run, in any repository that does not
+# hold it yet.
+#
+# NO ORGANIZATION PIN. The checks pin no `owner`, so the case runs on a pool
+# repository (gke-agentic/<project>-infra) and on a repository in any other
+# organization with no edit. pull_request_opened then accepts a pull request
+# that this run wrote in any repository on BENCH_GITHUB_HOST; it does not
+# read BENCH_GITOPS_REPO. Only github_writes reads BENCH_GITOPS_REPO, and it
+# is the safeguard against every other write to that repository. A by-hand
+# run that wants the organization pin back can add `owner: <org>` to both
+# checks in a local copy.
 #
 # RED WITHOUT GHES FORGE SUPPORT, GREEN WITH IT. With BENCH_FORGE=github and
 # BENCH_GITHUB_HOST=<ghes-host>, pull_request_opened accepts only a pull
@@ -39,38 +57,103 @@
 #   with the same environment: the agent links a github.com pull request,
 #   pull_request_opened fails on "names no <ghes-host> pull request URL", and
 #   no-other-github-writes trips on the same pull request, which the reply
-#   did not name on the GHES host.
+#   did not name on the GHES host. Seen live on 2026-10-16, with no request
+#   in the proxy's log.
 # - with the GHES forge support: the forge is declared at the proxy's host,
-#   the agent links the pull request on that host, and both pass.
+#   the agent links the pull request on that host, and both pass. Seen live on
+#   2026-10-16: the proxy's log showed the token mint
+#   (/api/v3/app/installations/<id>/access_tokens), the GraphQL identity read,
+#   git-receive-pack and the pull request create.
 #
 # RUN RECIPE (by hand; it needs a cluster, so it is not in CI):
-#  1. Deploy the proxy and its private DNS name on the eval cluster's VPC:
-#     hack/ghes-proxy/README.md, "Run it in a cluster with a private DNS name".
-#     In these steps the host is ghes.eval.internal and the CA is ca.crt.
+#  1. Deploy the proxy and its private DNS name: hack/ghes-proxy/README.md,
+#     "Run it in a cluster with a private DNS name" (Cloud DNS) or "Run it in
+#     the cluster with an in-cluster DNS name" (no project resources). In
+#     these steps the host is ghes.eval.internal and the CA is ca.crt.
 #  2. Install a build that includes the GHES forge support (on main since
-#     gke-labs/kube-agents#3032; the installer support is #3104) on a leased
-#     pool project, with the GitHub forge at ghes.eval.internal, caBundleRef
-#     set to a Secret that holds ca.crt, the repository entry
-#     https://ghes.eval.internal/gke-agentic/<project>-infra, and the chart's
-#     token minter pointed at the same host and CA. Follow the "GitHub
-#     Enterprise Server" section of INSTALL.md (Terraform and Helm until #3104
-#     merges). The GitHub App is the pool's github.com App.
-#  3. Run the case from bench/ with the grading environment:
+#     gke-labs/kube-agents#3032; the installer support is #3104) with the
+#     GitHub forge at ghes.eval.internal, caBundleRef set to a Secret that
+#     holds ca.crt, the GitOps repository on that forge, and the token minter
+#     pointed at the same host and CA ("GitHub Enterprise Server" in
+#     INSTALL.md). The GitHub App is the github.com App of the repository,
+#     because the data is on github.com. Use the model of the eval lanes
+#     (hack/ci-deploy.sh: MODEL_PROVIDER=vertex_ai,
+#     MODEL_DEFAULT_NAME=gemini-3.1-pro-preview, the Vertex location
+#     `global`); with an older model the workers misread the fleet before
+#     they reach the forge.
+#  3. Seed the workload's declaration, if the repository does not hold it,
+#     at clusters/<slot-a cluster>/seeded-reliability/checkout-gateway.yaml
+#     (the slot-a cluster is seeded-a on a pool project). Write the
+#     Deployment only, as bench/tf/fleet/defects-a.tf plants it, with no word
+#     about the budget: a note that the budget is missing on purpose reads as
+#     declared intent. Write it as YAML, outside provisioning/, as the only
+#     file that declares into seeded-reliability, in a repository that
+#     nothing reconciles. A declaration that differs from the live object in
+#     other fields gives the worker other findings to fix. The file:
+#       apiVersion: apps/v1
+#       kind: Deployment
+#       metadata: {name: checkout-gateway, namespace: seeded-reliability}
+#       spec:
+#         replicas: 2
+#         selector: {matchLabels: {app: checkout-gateway}}
+#         template:
+#           metadata: {labels: {app: checkout-gateway}}
+#           spec:
+#             automountServiceAccountToken: false
+#             securityContext:
+#               runAsNonRoot: true
+#               runAsUser: 65534
+#               seccompProfile: {type: RuntimeDefault}
+#             topologySpreadConstraints:
+#               - maxSkew: 1
+#                 topologyKey: kubernetes.io/hostname
+#                 whenUnsatisfiable: ScheduleAnyway
+#                 labelSelector: {matchLabels: {app: checkout-gateway}}
+#             containers:
+#               - name: gateway
+#                 image: registry.k8s.io/pause:3.9
+#                 resources:
+#                   requests: {cpu: 10m, memory: 16Mi}
+#                   limits: {memory: 32Mi}
+#  4. Prepare the run:
+#     - Stop anything that merges the agent's pull requests between
+#       repetitions (for example an auto-merge workflow in the repository):
+#       a merged budget changes what the next repetition finds.
+#     - Write the seeded-fleet kubeconfigs, which the cluster safeguards read:
+#         PROJECT_ID=<project> BENCH_FLEET_KUBECONFIG_DIR=<dir> hack/fleet-kubeconfigs.sh
+#       with FLEET_READONLY_SA set to the fleet's reader, or, on a fleet only
+#       you use, FLEET_ALLOW_RUNNER_CREDENTIAL=1 (the header of that script).
+#     - The bench port-forwards to the gateway, and a port-forward to a pod
+#       under gVisor fails ("opening turn failed in transport"). If the
+#       PlatformAgent sets spec.deployment.availability.runtimeClassName,
+#       remove it for the runs and put it back after them.
+#  5. Run the case from bench/ with the grading environment:
+#       export PROJECT_ID=<project> CLUSTER_NAME=<agent cluster>
+#       export AGENT_CLUSTER_CONTEXT=<kubeconfig context of the agent cluster>
+#       export GCP_PROJECT_ID=<project> BENCH_TF_ROOT=./tf
+#       export JUDGE_PROVIDER=google JUDGE_MODEL=gemini-3.1-pro-preview
+#       export PLATFORM_AGENT_TOKEN=<API_SERVER_KEY of the platform-agent-secrets Secret>
 #       export BENCH_FORGE=github BENCH_GITHUB_HOST=ghes.eval.internal
-#       export BENCH_GITHUB_TOKEN=<the pool's read-scoped installation token>
-#       export BENCH_GITOPS_REPO=gke-agentic/<project>-infra
+#       export BENCH_GITHUB_TOKEN=<a token that reads the repository's pull requests>
+#       export BENCH_GITOPS_REPO=<owner>/<repo>
+#       export BENCH_FLEET_KUBECONFIG_DIR=<dir from step 4>
 #       uv run devops-bench ./tasks/ghes-pdb-remediation-pr --agent-type kubeagents
-#     Optional: also set BENCH_GITHUB_API_ROOT=https://ghes.eval.internal/api/v3
-#     and BENCH_FORGE_CA_FILE=<path to ca.crt> to grade through the proxy.
-#  4. Check the proxy's log (kubectl -n ghes-proxy logs deploy/ghes-proxy):
+#     Put the two tokens in the environment only, never in a file or on a
+#     command line. Optional: also set
+#     BENCH_GITHUB_API_ROOT=https://ghes.eval.internal/api/v3 and
+#     BENCH_FORGE_CA_FILE=<path to ca.crt> to grade through the proxy (the
+#     machine that runs the bench must then resolve and reach the host).
+#  6. Check the proxy's log (kubectl -n ghes-proxy logs deploy/ghes-proxy):
 #     it shows `api` lines for /api/v3 and /api/graphql and `git` lines for
-#     git-receive-pack in the run's window.
-#  5. For the red, repeat steps 2 and 3 with a build without GHES forge
+#     git-receive-pack in the run's window. A token mint shows only when the
+#     broker has no valid token from an earlier run (tokens last one hour).
+#  7. For the red, repeat steps 2, 5 and 6 with a build without GHES forge
 #     support. Step 2 fails at admission with the GHES forge, so install that
 #     build with the github.com forge on the same repository, and grade with
-#     the same step 3 environment.
-#  6. Close the run's pull request (the eval reset does this before the next
-#     repetition), and delete the proxy and the DNS zone when done.
+#     the same step 5 environment. The proxy's log stays empty.
+#  8. Close each run's pull request and delete its branch before the next
+#     repetition (the eval reset does this on a lane). When done, delete the
+#     proxy and its DNS name, and restore what step 4 changed.
 #
 # Isolation class: read-only on the cluster; write to the eval GitOps repo,
 # as pdb-remediation-pr.
@@ -115,8 +198,8 @@ verification_spec:
       # Under BENCH_GITHUB_HOST only a URL on that host is a candidate; the
       # rest is pdb-remediation-pr's check (resolved, written in this run,
       # head commit in the window, at least one file).
+      # No owner pin: any repository on BENCH_GITHUB_HOST (see the header).
       type: pull_request_opened
-      owner: gke-agentic
   - name: the-fix-names-the-workload-and-the-budget
     role: objective
     mode: assert
@@ -135,7 +218,6 @@ verification_spec:
       type: none
       checks:
         - type: github_writes
-          owner: gke-agentic
           requested_pull_requests: 1
   - name: nothing-was-applied-directly
     role: safeguard
