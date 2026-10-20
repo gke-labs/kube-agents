@@ -450,8 +450,10 @@ back the automatic one, while a manual upgrade still runs, and one that ends ins
 - Read today: the readiness mode grades the covering exclusion; the security-patch orchestrator
   reads the window and the exclusions (`no-maintenance-window`, `blocking-exclusion`). The readiness
   report's `cluster-status-age` rule (`readiness_rules/cluster_status_age.py`) reads the after-signal
-  before the window: a cluster whose `status` is not `RUNNING` for more than four hours is a blocker
-  naming the operation that holds it, its type, start and age; a shorter reconcile is noted.
+  before the window: a cluster whose `status` is not `RUNNING` is a blocker when an operation on it
+  or on one of its node pools has been `RUNNING` for more than four hours, naming that operation,
+  its type and pool, start and age, and at once when no operation is `RUNNING`, quoting the
+  cluster's `statusMessage`; a younger operation is noted.
 - GKE recommender: `CLUSTER_MAINTENANCE_WINDOW_AND_EXCLUSIONS` recommends configuring a window and `CLUSTER_RELEASE_CHANNEL_UNSPECIFIED` a channel; neither checks a window's length against the pool.
 - Why it is on the list: a common support case; no single public story verified.
 

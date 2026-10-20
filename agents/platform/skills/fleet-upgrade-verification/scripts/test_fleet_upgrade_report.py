@@ -2370,7 +2370,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(a["unknown"], [])
         # Each rule's note on a clean member, prefixed with its id, so the table says the rule ran.
         self.assertIn("orphan-node-objects: 0 orphan Node(s) (0 nodes, 0 instances in the project)", a["note"])
-        self.assertIn("cluster-status-age: status RUNNING; no operation of this cluster is listed", a["note"])
+        self.assertIn("cluster-status-age: status RUNNING; no operation of this cluster or its node pools is listed", a["note"])
         self.assertIn("target-patch-valid: channel REGULAR; target 1.35.1-gke.1000 valid; control plane 1.35.1-gke.1000 listed in validVersions at us-central1-a", a["note"])
         self.assertIn("control-plane-upgrade-history: 0 capacity failure(s) among 0 upgrade or repair operation(s) in the last 90 days; maintenance window none", a["note"])
         self.assertIn("lb-connection-draining: no backend service on this cluster's pools or NEGs drains for more than 600 s (0 matched of 0 in the project)", a["note"])

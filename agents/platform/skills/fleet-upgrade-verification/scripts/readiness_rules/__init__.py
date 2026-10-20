@@ -2,7 +2,8 @@
 readiness_rules — the per-entry rules `upgrade_readiness.EXTRA_RULES` runs after the PDB,
 maintenance and skew rules of `fleet_upgrade_report.py --readiness`.
 
-One module per entry of docs/designs/upgrade-failure-catalogue.md. Each module exposes:
+One or more modules per entry of docs/designs/upgrade-failure-catalogue.md (entry 10 has two,
+the version side and the add-on matrix). Each module exposes:
 
 - `RULE_ID`, the slug the report keys the rule's counts under and stamps on its findings;
   `ENTRY`, the catalogue entry number; `CAN_BLOCK`, whether a finding of the rule can ever
@@ -169,6 +170,22 @@ PROJECT_READ_ERROR_KEY = "error"
 # What a rule reports when the context carries no such read at all (a context built by hand,
 # or a report older than the read): the rule grades what it has and says so.
 PROJECT_READ_NOT_MADE_REASON = "the {read} read was not made, so the rule could not grade it"
+# An operation record as `gcloud container operations list` returns it, and how its
+# `targetLink` names what it works on: `.../zones/<zone>/clusters/<name>` or
+# `.../locations/<location>/clusters/<name>` for the cluster itself, with `/nodePools/<pool>`
+# appended for one of its node pools (an UPGRADE_NODES, a resize, a repair). The segment
+# before `clusters` is the location as the cluster record spells it.
+OPERATION_NAME_KEY = "name"
+OPERATION_TYPE_KEY = "operationType"
+OPERATION_STATUS_KEY = "status"
+OPERATION_START_KEY = "startTime"
+OPERATION_TARGET_KEY = "targetLink"
+OPERATION_STATUS_RUNNING = "RUNNING"
+OPERATION_STATUS_DONE = "DONE"
+TARGET_CLUSTERS_SEGMENT = "clusters"
+TARGET_NODE_POOLS_SEGMENT = "nodePools"
+TARGET_CLUSTER_TAIL_PARTS = 3  # <location>/clusters/<name>
+TARGET_NODE_POOL_TAIL_PARTS = 5  # <location>/clusters/<name>/nodePools/<pool>
 
 # The kinds the reads carry, as `kind` spells them.
 KIND_POD = "Pod"
@@ -448,6 +465,20 @@ def project_read(context, name: str) -> tuple:
     if error:
         return None, str(error)
     return entry.get(PROJECT_READ_DATA_KEY), None
+
+
+def operation_target(operation, name: str, location: str) -> tuple[bool, str | None]:
+    """(whether the operation's `targetLink` names the cluster `name` at `location` or one of
+    its node pools, the pool's name or None for the cluster itself); (False, None) for any
+    other target or a record that is not a dict."""
+    if not isinstance(operation, dict):
+        return False, None
+    parts = str(operation.get(OPERATION_TARGET_KEY) or "").rstrip(PATH_SEPARATOR).split(PATH_SEPARATOR)
+    if len(parts) >= TARGET_NODE_POOL_TAIL_PARTS and parts[-2] == TARGET_NODE_POOLS_SEGMENT and parts[-4] == TARGET_CLUSTERS_SEGMENT and parts[-3] == name and parts[-5] == location and parts[-1]:
+        return True, parts[-1]
+    if len(parts) >= TARGET_CLUSTER_TAIL_PARTS and parts[-2] == TARGET_CLUSTERS_SEGMENT and parts[-1] == name and parts[-3] == location:
+        return True, None
+    return False, None
 
 
 # ------------------------------------------------------------------------- quantities

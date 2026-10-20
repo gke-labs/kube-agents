@@ -741,6 +741,14 @@ class SharedReadHelpersTest(unittest.TestCase):
         self.assertEqual(shared.node_instance(bare), ("us-east4-b", "gke-x-default-pool-abc-1234"))
         self.assertEqual(shared.node_instance(node("n", "p")), ("", "n"))
         self.assertEqual(shared.node_ready({"status": {}}), "")
+        # An operation's target: the cluster itself, one of its node pools, or neither.
+        cluster_link = "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b"
+        self.assertEqual(shared.operation_target({"targetLink": cluster_link}, "seeded-b", "us-central1-a"), (True, None))
+        self.assertEqual(shared.operation_target({"targetLink": cluster_link + "/nodePools/default-pool"}, "seeded-b", "us-central1-a"), (True, "default-pool"))
+        self.assertEqual(shared.operation_target({"targetLink": cluster_link + "/nodePools/default-pool"}, "seeded-a", "us-central1-a"), (False, None))
+        self.assertEqual(shared.operation_target({"targetLink": cluster_link}, "seeded-b", "us-central1"), (False, None))
+        self.assertEqual(shared.operation_target({"targetLink": cluster_link.replace("zones/us-central1-a", "locations/us-central1")}, "seeded-b", "us-central1"), (True, None))
+        self.assertEqual(shared.operation_target("junk", "seeded-b", "us-central1-a"), (False, None))
 
 
 class LbConnectionDrainingRuleTest(unittest.TestCase):
@@ -854,41 +862,77 @@ class OrphanNodeObjectsRuleTest(unittest.TestCase):
 
 
 class ClusterStatusAgeRuleTest(unittest.TestCase):
-    NEWEST_OPERATION = "operation-1791398047406-3b2d8556-49f0-4c69-b3ed-8df036a6352e"  # seeded-b's newest recorded operation (UPDATE_CLUSTER, 2026-10-07T18:34:07Z, right after its UPGRADE_MASTER)
+    # seeded-b's newest recorded operation: the UPGRADE_NODES on default-pool (DONE, 2026-10-07T18:34:18Z), eleven seconds after its UPDATE_CLUSTER.
+    NEWEST_OPERATION = "operation-1791398058861-79f9472d-6079-48fc-838f-2e47f8b578dc"
+    NEWEST_TEXT = f"{NEWEST_OPERATION} (UPGRADE_NODES on default-pool, DONE, started 2026-10-07T18:34:18.86189527Z, 12d 17h ago)"
+    POOL_TARGET = "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b/nodePools/default-pool"
+    CLUSTER_TARGET = "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b"
 
-    def test_a_running_cluster_notes_its_newest_operation(self):
+    def in_flight(self, age, target=POOL_TARGET, kind="UPGRADE_NODES", name="operation-in-flight", status="RUNNING"):
+        """An operation started `age` before the recorded instant, RUNNING unless said otherwise."""
+        return {"name": name, "operationType": kind, "status": status, "startTime": (RECORDED_AT - age).strftime("%Y-%m-%dT%H:%M:%S.000000Z"), "targetLink": target}
+
+    def reads_with(self, *operations):
+        return project_reads(**{shared.PROJECT_READ_OPERATIONS: recorded("project_operations.json") + list(operations)})
+
+    def test_a_running_cluster_notes_its_newest_operation_node_pool_ones_included(self):
         record = seeded_b()
         result = cluster_status_age.evaluate(record, {}, None, None, context_for(record))
         self.assertEqual((result["blocking"], result["unknown"]), ([], []))
-        self.assertEqual(result["notes"], [f"status RUNNING; newest operation {self.NEWEST_OPERATION} (UPDATE_CLUSTER, started 2026-10-07T18:34:07.406867503Z, 12d 17h ago)"])
+        self.assertEqual(result["notes"], [f"status RUNNING; newest operation {self.NEWEST_TEXT}"])
 
-    def test_a_status_other_than_running_blocks_past_the_threshold_and_is_noted_under_it(self):
+    def test_a_running_node_pool_operation_is_a_note_under_the_threshold_and_the_holder_past_it(self):
         record = {**seeded_b(), "status": "RECONCILING"}
+        young = self.reads_with(self.in_flight(timedelta(minutes=10)))
+        result = cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=young))
+        self.assertEqual((result["blocking"], result["unknown"]), ([], []))
+        self.assertEqual(result["notes"], ["status RECONCILING for 10m on operation-in-flight (UPGRADE_NODES on default-pool, RUNNING since 2026-10-20T11:50:00.000000Z); under the 4h threshold a reconcile in progress is not a blocker"])
+        old = self.reads_with(self.in_flight(timedelta(hours=5)))
+        result = cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=old))
+        self.assertEqual(len(result["blocking"]), 1)
+        finding = result["blocking"][0]
+        self.assertEqual((finding["status"], finding["operation"], finding["operation_type"], finding["pool"], finding["age_seconds"], finding["threshold_seconds"]), ("RECONCILING", "operation-in-flight", "UPGRADE_NODES on default-pool", "default-pool", 5 * 3600, 4 * 3600))
+        text = cluster_status_age.describe(finding)
+        self.assertTrue(text.startswith("seeded-b has been RECONCILING for 5h on operation-in-flight (UPGRADE_NODES on default-pool, RUNNING since 2026-10-20T07:00:00.000000Z), past the 4h threshold; freeze changes; past a few hours open a support case quoting the operation id"), text)
+        self.assertIn("Stuck operation section", text)
+        # The holder is the newest RUNNING operation, a cluster one included; a DONE operation
+        # newer than it holds nothing.
+        both = self.reads_with(self.in_flight(timedelta(hours=6), target=self.CLUSTER_TARGET, kind="UPDATE_CLUSTER", name="operation-cluster"), self.in_flight(timedelta(hours=5)))
+        finding = cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=both))["blocking"][0]
+        self.assertEqual((finding["operation"], finding["pool"]), ("operation-in-flight", "default-pool"))
+        cluster_only = self.reads_with(self.in_flight(timedelta(hours=6), target=self.CLUSTER_TARGET, kind="UPDATE_CLUSTER", name="operation-cluster"))
+        finding = cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=cluster_only))["blocking"][0]
+        self.assertEqual((finding["operation"], finding["operation_type"], finding["pool"]), ("operation-cluster", "UPDATE_CLUSTER", None))
+        done_newer = self.reads_with(self.in_flight(timedelta(hours=5)), self.in_flight(timedelta(minutes=1), name="operation-done", status="DONE"))
+        finding = cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=done_newer))["blocking"][0]
+        self.assertEqual((finding["operation"], finding["age_seconds"]), ("operation-in-flight", 5 * 3600))
+        # Another cluster's pool operation is not this cluster's holder.
+        other = self.reads_with(self.in_flight(timedelta(hours=5), target=self.POOL_TARGET.replace("clusters/seeded-b/", "clusters/seeded-a/")))
+        self.assertIsNone(cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=other))["blocking"][0]["operation"])
+
+    def test_a_degraded_cluster_with_only_done_operations_blocks_quoting_its_status_message(self):
+        record = {**seeded_b(), "status": "DEGRADED", "statusMessage": "Cluster certificate authority expired; rotate credentials"}
         result = cluster_status_age.evaluate(record, {}, None, None, context_for(record))
         self.assertEqual(len(result["blocking"]), 1)
         finding = result["blocking"][0]
-        self.assertEqual((finding["status"], finding["operation"], finding["operation_type"], finding["threshold_seconds"]), ("RECONCILING", self.NEWEST_OPERATION, "UPDATE_CLUSTER", 4 * 3600))
-        text = cluster_status_age.describe(finding)
-        self.assertTrue(text.startswith(f"seeded-b has been RECONCILING for 12d 17h on {self.NEWEST_OPERATION} (UPDATE_CLUSTER, started 2026-10-07T18:34:07.406867503Z), past the 4h threshold; freeze changes; past a few hours open a support case quoting the operation id"), text)
-        self.assertIn("Stuck operation section", text)
-        # Two hours into the same operation: a reconcile in progress, noted and not a blocker.
-        soon = datetime(2026, 10, 7, 20, 0, tzinfo=timezone.utc)
-        result = cluster_status_age.evaluate(record, {}, None, None, context_for(record, at=soon))
-        self.assertEqual(result["blocking"], [])
-        self.assertEqual(result["notes"], [f"status RECONCILING for 1h 25m on {self.NEWEST_OPERATION} (UPDATE_CLUSTER, started 2026-10-07T18:34:07.406867503Z); under the 4h threshold a reconcile in progress is not a blocker"])
-        # No operation of the cluster listed at all: the status has stood longer than the list reaches.
+        self.assertEqual((finding["operation"], finding["status_message"], finding["newest"]["operation"], finding["newest"]["status"]), (None, "Cluster certificate authority expired; rotate credentials", self.NEWEST_OPERATION, "DONE"))
+        self.assertEqual(cluster_status_age.describe(finding), f"seeded-b is DEGRADED with no operation RUNNING on it or its node pools (statusMessage: Cluster certificate authority expired; rotate credentials; newest operation: {self.NEWEST_TEXT}); {cluster_status_age.NO_HOLDER_ACTION}")
+        # No statusMessage and no operation listed at all: both said.
+        bare = {**seeded_b(), "status": "RECONCILING"}
         none_listed = project_reads(**{shared.PROJECT_READ_OPERATIONS: []})
-        result = cluster_status_age.evaluate({**record, "status": "DEGRADED"}, {}, None, None, context_for(record, reads=none_listed))
-        self.assertEqual(result["blocking"][0]["operation"], None)
-        self.assertEqual(cluster_status_age.describe(result["blocking"][0]), "seeded-b has been DEGRADED longer than the operations list reaches (no operation of this cluster is listed); " + cluster_status_age.ACTION)
-        self.assertEqual(cluster_status_age.evaluate(seeded_b(), {}, None, None, context_for(record, reads=none_listed))["notes"], ["status RUNNING; no operation of this cluster is listed"])
+        finding = cluster_status_age.evaluate(bare, {}, None, None, context_for(bare, reads=none_listed))["blocking"][0]
+        self.assertEqual(cluster_status_age.describe(finding), "seeded-b is RECONCILING with no operation RUNNING on it or its node pools (statusMessage: none; newest operation: none listed); " + cluster_status_age.NO_HOLDER_ACTION)
+        self.assertEqual(cluster_status_age.evaluate(seeded_b(), {}, None, None, context_for(seeded_b(), reads=none_listed))["notes"], ["status RUNNING; no operation of this cluster or its node pools is listed"])
 
     def test_an_unread_operations_list_is_unknown_only_when_the_status_needs_it(self):
         record = seeded_b()
         failed = project_reads(**{shared.PROJECT_READ_OPERATIONS: failed_read("operations list failed (1): forbidden")})
         self.assertEqual(cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=failed))["notes"], ["status RUNNING; the operations were not read (operations list failed (1): forbidden)"])
         result = cluster_status_age.evaluate({**record, "status": "ERROR"}, {}, None, None, context_for(record, reads=failed))
-        self.assertEqual(result["unknown"], ["status ERROR; the operations were not read (operations list failed (1): forbidden), so how long it has stood is unknown"])
+        self.assertEqual(result["unknown"], ["status ERROR; the operations were not read (operations list failed (1): forbidden), so what holds it and for how long is unknown"])
+        # A RUNNING operation with no readable start: unknown, not a guess.
+        unreadable = self.reads_with({**self.in_flight(timedelta(hours=5)), "startTime": "yesterday"})
+        self.assertEqual(cluster_status_age.evaluate({**record, "status": "RECONCILING"}, {}, None, None, context_for(record, reads=unreadable))["unknown"], ["status RECONCILING; the RUNNING operation operation-in-flight carries no readable startTime ('yesterday'), so its age is unknown"])
         self.assertEqual((cluster_status_age.RULE_ID, cluster_status_age.ENTRY, cluster_status_age.CAN_BLOCK), ("cluster-status-age", 5, True))
 
 

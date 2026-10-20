@@ -273,11 +273,15 @@ Already served (see Scope). The additions:
   check applies, which hides this failure). The action names the newest active patch of the
   minor on the channel.
 - A cluster that is not `RUNNING` accepts no change, and only the provider can end an operation
-  that has wedged. `cluster-status-age` reads the status and the newest operation on the cluster
-  from the project's operations list and files a blocker when the status has stood for more than
-  four hours, naming the operation, its type, its start and its age; a shorter reconcile is noted,
-  not a blocker. The action is the `gke-upgrades` skill's Stuck operation procedure: freeze
-  changes and, past a few hours, open a support case quoting the operation id.
+  that has wedged. `cluster-status-age` reads the status and, from the project's operations list,
+  the operations on the cluster and on its node pools (a node pool upgrade, resize or repair names
+  the pool and holds the cluster as a cluster operation does); the holder is the newest one still
+  `RUNNING`. It files a blocker when the holder has run for more than four hours, naming the
+  operation, its type and pool, its start and its age; a younger holder is a reconcile in
+  progress, noted and not a blocker. A cluster not `RUNNING` with no `RUNNING` operation is a
+  blocker quoting the cluster's `statusMessage`, with the newest finished operation as context.
+  The action is the `gke-upgrades` skill's Stuck operation procedure: freeze changes and, past a
+  few hours, open a support case quoting the operation id, or the status and its message.
 - An automated control-plane upgrade, resize or repair needs compute capacity when it fires, and
   the provider does not check it first. `control-plane-upgrade-history` reads the operations list
   for an `UPGRADE_MASTER`, `UPGRADE_NODES` or `REPAIR_CLUSTER` that failed on capacity in the

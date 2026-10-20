@@ -269,22 +269,29 @@ reads Git only: point at GKE Deprecation Insights for live client usage.
 A cluster whose `status` is not `RUNNING` (`RECONCILING`, `DEGRADED`, `ERROR`) accepts no cluster
 or node pool change, and only the provider can end an operation that has wedged inside it. The
 fleet-upgrade-verification report's `cluster-status-age` rule files such a cluster as a blocker
-once its newest operation has stood for more than four hours, naming that operation, and at once
-when the operations list shows no operation for the cluster at all. What to do with it, in order:
+once an operation on it or on one of its node pools has been `RUNNING` for more than four hours,
+naming that operation, and at once when no operation is `RUNNING` on it at all, quoting the
+cluster's `statusMessage`. What to do with it, in order:
 
-1. **Read the operation, not only the status.** List the cluster's newest operations:
-   `gcloud container operations list --project <project> --filter="targetLink~/clusters/<cluster>$" --sort-by=~startTime --limit=5 --format=json`,
+1. **Read the operation, not only the status.** List the newest operations on the cluster and
+   on its node pools (a node pool upgrade, resize or repair names the pool and holds the cluster as
+   a cluster operation does):
+   `gcloud container operations list --project <project> --filter="targetLink~/clusters/<cluster>($|/nodePools/)" --sort-by=~startTime --limit=5 --format=json`,
    then `gcloud container operations describe <operation id> --location <location> --project <project>`
-   for the newest: its `operationType`, `status`, `startTime`, `statusMessage` and `error`. The
-   age is now minus `startTime`; quote both.
+   for the newest one whose `status` is `RUNNING`: its `operationType`, `status`, `startTime`,
+   `statusMessage` and `error`. The age is now minus `startTime`; quote both. When none is
+   `RUNNING`, what holds the cluster is in its own `statusMessage`
+   (`gcloud container clusters describe <cluster> --location <location> --project <project> --format="value(status,statusMessage)"`);
+   quote it with the newest finished operation.
 2. **Freeze changes on the cluster.** No node pool upgrade, resize, rollback or cluster update
    until the operation ends, and say so in the answer and on any card about the cluster. A pull
    request that changes the cluster's spec waits too: Config Connector would retry against a
    cluster that refuses the change.
 3. **Past a few hours, draft the support-case text** (the rule's threshold is four): the project,
-   the cluster and its location, the operation id, its type, its start time and age, the
-   `statusMessage` and `error` text verbatim, what was being changed when it started, and that the
-   operation needs the provider to abort it. P2 while the workloads run; P1 when the API or the
+   the cluster and its location, the operation id, its type, its start time and age (or, with no
+   operation `RUNNING`, the status and its `statusMessage`), the `statusMessage` and `error` text
+   verbatim, what was being changed when it started, and that the operation needs the provider to
+   abort it. P2 while the workloads run; P1 when the API or the
    nodes are affected.
 4. **File a kanban card for a person to open the case the same day**, titled
    `Support case: <cluster> held by <operation id>`, carrying the drafted text, and block it as
