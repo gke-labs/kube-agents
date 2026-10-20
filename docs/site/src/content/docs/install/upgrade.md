@@ -510,7 +510,24 @@ change of the new release.
   ring and service account. This is what an install whose GitOps came from `install.sh`'s flags looks like when it
   was set up by a release that did not record them in `install.env`. The run prints the lines to
   set, with the live values filled in where it can read them; set them and re-run the same command. To remove GitOps on purpose, re-run with `KUBE_AGENTS_REMOVE_GITOPS=true` in the
-  environment. `--plan` warns instead.
+  environment. `--plan` warns instead. A minter that this install did not make (one made by hand,
+  by `make deploy-github`, or by another Helm release) is not removed by the apply, so the run does
+  not ask for `GITHUB_APP_ID`. It refuses when `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not
+  name the PlatformAgent's GitOps repository, or when it cannot read the PlatformAgent or the
+  repository it names. The run decides that the minter is not this install's only when the
+  `kube-agents` release record has `githubMinter.enabled` false, the minter's Deployment carries no
+  Helm annotations for that release, and the install's Terraform state holds no minter module (its
+  service account and Cloud KMS key); with no release (a first install), or a state it cannot
+  read, it applies the check above.
+
+- **The chart's minter would land on another minter.** This run renders the chart's own token
+  minter, but a minter that this install did not make runs under the same names, and Helm does not
+  take over objects it does not own. Remove all of the other minter's objects first: run
+  `make -C k8s-operator undeploy-github` with the same `GITHUB_MINTER_KSA_NAME` for the kustomize
+  path, or turn the minter off in the Helm release that made it, and delete a
+  `github-app-credentials` Secret that you made by hand. Or keep the other minter: set
+  `GITHUB_APP_ID` empty in `install.env` (and, with `install.sh`, give no `--github-app-id`).
+  `--plan` warns instead.
 
 ## What stops during an upgrade
 

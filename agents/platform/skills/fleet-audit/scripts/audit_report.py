@@ -817,6 +817,23 @@ CHAT_REPORT_UPDATED_KEY = "updated_at"
 CHAT_REPORT_PARTS_KEY = "parts"
 CHAT_REPORT_REPO_KEY = "repo"
 CHAT_REPORT_TEXT_KEY = "text"
+# Saved on the entry `start` opened by the `finish` that fills it, ahead of the
+# store write: its verdict, which a later `finish` of the same repository in
+# the same run must not turn silent, and the ids its ledger body marked new.
+CHAT_REPORT_SILENT_OK_KEY = "silent_ok"
+CHAT_REPORT_NEW_IDS_KEY = "new_ids"
+# Above a later `finish`'s report in the same entry: its counts are measured
+# against the report above it, or against what an earlier `finish` that died
+# before its report published, not against the previous run.
+CHAT_REPORT_REFINISH_LABEL = "Re-run in this audit; counts are against the report above."
+CHAT_REPORT_RERUN_LABEL = (
+    "Re-run in this audit after an earlier finish published and stopped; "
+    "counts are against what it published."
+)
+# On the JSON line of such a later `finish`; `SILENT_FLOOR_KEY` also on its
+# envelope, when the earlier one's news kept this one from being silent.
+REFINISH_KEY = "refinish"
+SILENT_FLOOR_KEY = "silent_floor"
 # The rendered report's last line. `slack_audit_report.ledger_ref` finds the
 # ledger only behind a "ledger:" label, a dash or a markdown link.
 CHAT_REPORT_LEDGER_LINE = "Ledger: {url}"
@@ -2894,6 +2911,7 @@ def report_envelope(
         "prs_still_open": list(payload.get("prs_still_open") or []),
         "prs_closed": list(payload.get("prs_closed") or []),
         "silent_ok": payload.get("silent_ok"),
+        **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
         "ledger_held_open": ledger_held_open,
         "delta_known": delta_known,
         "new_ids": sorted(new_ids),
@@ -3030,11 +3048,29 @@ def _new_chat_record(audit_id: str, now: datetime) -> dict:
     }
 
 
+def _live_chat_record(audit_id: str, now: datetime) -> dict | None:
+    """The record on disk while its last step is within `INFLIGHT_TTL_SECONDS`, else None."""
+    record = _read_chat_record(audit_id)
+    if record is None or now.timestamp() - float(record[CHAT_REPORT_UPDATED_KEY]) >= INFLIGHT_TTL_SECONDS:
+        return None
+    return record
+
+
+def _last_part(record: dict, repo: str, keep: Callable[[dict], bool]) -> dict | None:
+    parts = [p for p in record[CHAT_REPORT_PARTS_KEY] if p.get(CHAT_REPORT_REPO_KEY) == repo and keep(p)]
+    return parts[-1] if parts else None
+
+
+def _pending_part(record: dict, repo: str) -> dict | None:
+    """`repo`'s entry with no report yet, or None."""
+    return _last_part(record, repo, lambda part: not part.get(CHAT_REPORT_TEXT_KEY))
+
+
 def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
     """This run's record: the one on disk when its last step is within
     `INFLIGHT_TTL_SECONDS` and it holds no finished report for `repo`, else a
     new one."""
-    record = _read_chat_record(audit_id)
+    record = _live_chat_record(audit_id, now)
     if record is None:
         return _new_chat_record(audit_id, now)
     finished = {
@@ -3042,7 +3078,7 @@ def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
         for part in record[CHAT_REPORT_PARTS_KEY]
         if part.get(CHAT_REPORT_TEXT_KEY)
     }
-    if now.timestamp() - float(record[CHAT_REPORT_UPDATED_KEY]) >= INFLIGHT_TTL_SECONDS or repo in finished:
+    if repo in finished:
         return _new_chat_record(audit_id, now)
     return record
 
@@ -3062,11 +3098,13 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
     # A record with no finished part that already holds `repo` pending was
     # left by a run that never finished it, and adopting it would carry that
     # run's stamps into this one. One pending only for other repositories is
-    # this run's earlier repository, which the relay must still name.
+    # this run's earlier repository, which the relay must still name. A part
+    # with a saved verdict is a `finish` of this run that died after deciding:
+    # the record and the verdict stay, so the next `finish` is not silent.
     parts = record[CHAT_REPORT_PARTS_KEY]
-    if not any(part.get(CHAT_REPORT_TEXT_KEY) for part in parts) and any(
-        part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts
-    ):
+    if not any(
+        part.get(CHAT_REPORT_TEXT_KEY) or CHAT_REPORT_SILENT_OK_KEY in part for part in parts
+    ) and any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts):
         record = _new_chat_record(audit_id, now)
     if not any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in record[CHAT_REPORT_PARTS_KEY]):
         record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: None})
@@ -3077,22 +3115,95 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
         log(f"WARNING: chat report for {audit_id} not opened: {exc}")
 
 
-def append_chat_report(audit_id: str, repo: str, text: str, now: datetime) -> None:
+def _filled_part(record: dict, repo: str) -> dict | None:
+    """`repo`'s entry that `start` opened and a `finish` has filled, or None."""
+    return _last_part(record, repo, lambda part: CHAT_REPORT_SILENT_OK_KEY in part)
+
+
+def earlier_finish(audit_id: str, repo: str, now: datetime) -> dict | None:
+    """The entry an earlier `finish` of `repo` filled in this run, or None.
+
+    A model can call `finish` again after one `start`. That call reads the
+    envelope the earlier one just stored as the previous run's, so on its own
+    it measures no change and would call a run with news silent. A `finish`
+    with no `start` fills no entry; it is taken for a later `finish` of the
+    same run only while the record of one that did is current.
+    """
+    record = _live_chat_record(audit_id, now)
+    return None if record is None else _filled_part(record, repo)
+
+
+def silent_floor(earlier: dict | None) -> bool:
+    """Whether an earlier `finish` in this run reported news or opened a pull request."""
+    return earlier is not None and earlier.get(CHAT_REPORT_SILENT_OK_KEY) is False
+
+
+def apply_earlier_finish(payload: dict, earlier: dict | None) -> None:
+    """Mark a later `finish` on its JSON line, and keep it loud when the earlier one was."""
+    if earlier is None:
+        return
+    payload[REFINISH_KEY] = True
+    if silent_floor(earlier):
+        payload["silent_ok"] = False
+        payload[SILENT_FLOOR_KEY] = True
+        log(
+            "SILENT FLOOR: an earlier finish in this run reported news or opened a pull "
+            "request, so this one is not silent either and its sweep opens nothing."
+        )
+
+
+def save_chat_verdict(
+    audit_id: str, repo: str, silent_ok: bool, new_ids: Iterable[str], now: datetime
+) -> None:
+    """Save this `finish`'s verdict on `repo`'s entry. Best-effort: never fails the run.
+
+    Called as each sweep pull request opens and before the store write, so a
+    `finish` that dies after either still leaves the verdict for its re-run.
+    """
+    record = _live_chat_record(audit_id, now)
+    if record is None:
+        return
+    part = _filled_part(record, repo) or _pending_part(record, repo)
+    if part is None:
+        return
+    part[CHAT_REPORT_SILENT_OK_KEY] = bool(silent_ok)
+    part[CHAT_REPORT_NEW_IDS_KEY] = sorted(set(part.get(CHAT_REPORT_NEW_IDS_KEY) or []) | set(new_ids))
+    record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
+    try:
+        _write_chat_record(audit_id, record)
+    except OSError as exc:
+        log(f"WARNING: chat report for {audit_id} not saved: {exc}")
+
+
+def append_chat_report(
+    audit_id: str, repo: str, text: str, now: datetime, *, refinish: bool = False
+) -> None:
     """Add `repo`'s report to this run's chat report. Best-effort: never fails the run.
 
-    Fills the entry `start` opened for `repo`. A `finish` with no such entry
-    adds one, and with no current record (see `_current_chat_record`) opens
-    one, so its report still reaches the relay under a run of its own.
+    Fills the entry `start` opened for `repo`. A later `finish` of `repo` in
+    the same run adds its report under the earlier one, so neither that report
+    nor another repository's is lost. A `finish` with no such entry adds one,
+    and with no current record (see `_current_chat_record`) opens one, so its
+    report still reaches the relay under a run of its own.
     """
-    record = _current_chat_record(audit_id, repo, now)
-    pending = [
-        part for part in record[CHAT_REPORT_PARTS_KEY]
-        if part.get(CHAT_REPORT_REPO_KEY) == repo and not part.get(CHAT_REPORT_TEXT_KEY)
-    ]
-    if pending:
-        pending[-1][CHAT_REPORT_TEXT_KEY] = text
+    record = _live_chat_record(audit_id, now)
+    part = None if record is None else _filled_part(record, repo)
+    if part is not None and part.get(CHAT_REPORT_TEXT_KEY):
+        part[CHAT_REPORT_TEXT_KEY] = f"{part[CHAT_REPORT_TEXT_KEY]}\n\n{CHAT_REPORT_REFINISH_LABEL}\n{text}"
+    elif part is not None:
+        part[CHAT_REPORT_TEXT_KEY] = f"{CHAT_REPORT_RERUN_LABEL}\n{text}" if refinish else text
     else:
-        record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: text})
+        record = _current_chat_record(audit_id, repo, now)
+        pending = _pending_part(record, repo)
+        if pending is not None:
+            pending[CHAT_REPORT_TEXT_KEY] = text
+        else:
+            record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: text})
+    if refinish:
+        # A new stamp: the relay posts each stamp once, and the one on the
+        # record may be a run it already posted, or marked posted when an
+        # earlier `finish` died.
+        record[CHAT_REPORT_RUN_KEY] = now.strftime(REPORT_STAMP_FORMAT)
     record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
     try:
         _write_chat_record(audit_id, record)
@@ -10374,6 +10485,7 @@ def _render_withheld(
     noun: str = DEFAULT_PROPOSAL_NOUN,
     below_floor: list[str] | None = None,
     triage_reasons: dict[str, str] | None = None,
+    swept_earlier: bool = False,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
 
@@ -10420,8 +10532,14 @@ def _render_withheld(
         out += [
             "",
             f"{len(withheld)} finding(s) qualify for an automatic remediation {noun} "
-            f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
-            f"one bad night cannot bury this repository in generated {noun}s. "
+            + (
+                f"but were held back because an earlier finish in this run already "
+                f"ran the automatic sweep. "
+                if swept_earlier
+                else f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
+                f"one bad night cannot bury this repository in generated {noun}s. "
+            )
+            + 
             "Comment `/remediate <finding-id>` to open any of them now — an explicit "
             "request is not capped.",
             "",
@@ -10698,6 +10816,7 @@ def render_issue_body(
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
     unlinked_paths: set[str] | frozenset[str] = frozenset(),
+    swept_earlier: bool = False,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
@@ -10752,6 +10871,7 @@ def render_issue_body(
         noun=noun,
         below_floor=list(below_floor or []),
         triage_reasons=triage_reasons,
+        swept_earlier=swept_earlier,
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -16356,8 +16476,11 @@ def _open_promoted_prs(
     issue_number: int | None,
     generated_at: datetime,
     noun: str | None = None,
+    on_open: Callable[[], None] = lambda: None,
 ) -> list[str]:
     """Open (or refresh) one pull request per group holding a promoted finding.
+
+    `on_open` runs after each one, before the next is tried.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
@@ -16428,6 +16551,7 @@ def _open_promoted_prs(
                 raise
             if url:
                 opened.append(url)
+                on_open()
     finally:
         if started_on and started_on != "HEAD":
             git(["checkout", "--force", started_on], check=False)
@@ -16963,6 +17087,7 @@ def _finish_without_forge(
     current_ids = finding_ids(findings)
     previous_ids = previous_no_forge_ids(audit_id)
     delta_known = previous_ids is not None
+    earlier = earlier_finish(audit_id, NO_FORGE_REPO, now)
     # A posture `finish` withheld is in the document, only not published,
     # which is how the ledger branch's `held_exclude` reads it too.
     held = sorted(
@@ -17007,6 +17132,8 @@ def _finish_without_forge(
         "critical": severity_counts(findings)["critical"],
         **timers(),
     }
+    apply_earlier_finish(payload, earlier)
+    save_chat_verdict(audit_id, NO_FORGE_REPO, payload["silent_ok"], [], now)
     stored = write_report(
         audit_id,
         report_envelope(
@@ -17033,7 +17160,9 @@ def _finish_without_forge(
     payload["summary"] = render_no_forge_summary(
         audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
     )
-    append_chat_report(audit_id, NO_FORGE_REPO, payload["summary"], now)
+    append_chat_report(
+        audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
+    )
     print(json.dumps(payload))
 
 
@@ -17259,6 +17388,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             audit_id, data, now, manifest=manifest, waiver=waiver, timers=timer_payload
         )
         return
+    earlier = earlier_finish(audit_id, repo, now)
     noun = _proposal_noun(repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
@@ -18122,6 +18252,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # again past the unaccounted guard.
             stored_issue = opened_issue
             stored_body, stored_ids = opened_body, []
+        apply_earlier_finish(payload, earlier)
+        save_chat_verdict(audit_id, repo, payload["silent_ok"], [], now)
         write_report(
             audit_id,
             report_envelope(
@@ -18143,7 +18275,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             ledger_unchanged=body_untouched,
         )
-        append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
+        append_chat_report(
+        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        refinish=bool(payload.get(REFINISH_KEY)),
+    )
         print(json.dumps(payload))
         return
 
@@ -18203,6 +18338,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         findings,
         pr_by_finding,
         requests.targets,
+        # Everything the sweep would open goes to `withheld` instead, so the
+        # ledger still lists it: the earlier `finish` already opened its share.
+        cap=0 if silent_floor(earlier) else AUTO_PROMOTION_CAP,
         requested_at=requests.requested_at,
         uncorroborated=uncorroborated_findings(findings, manifest),
         triage_marked=set(triage_reasons),
@@ -18253,6 +18391,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         if filed is not None
         else None
     )
+    # This body replaces the earlier `finish`'s, and the Slack card reads its
+    # "new" tags from whichever body is live when the relay posts.
+    carried_new = set((earlier or {}).get(CHAT_REPORT_NEW_IDS_KEY) or []) & set(finding_ids(findings))
+    if carried_new:
+        new_marked = (new_marked or set()) | carried_new
     rendered = render_issue_body(
         data,
         generated_at=now,
@@ -18274,6 +18417,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         file_url=file_url,
         file_ref=file_ref,
         unlinked_paths=unlinked_paths,
+        swept_earlier=silent_floor(earlier),
     )
     if rendered.partial:
         log(
@@ -18402,6 +18546,9 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         issue_number=number,
         generated_at=now,
         noun=noun,
+        # As each opens, and not only before the store write: a `finish` that
+        # dies after one is re-run, and the re-run must not sweep again.
+        on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now),
     )
 
     # What the live ledger renders once this branch is done, for the store.
@@ -18443,6 +18590,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 file_url=file_url,
                 file_ref=file_ref,
                 unlinked_paths=unlinked_paths,
+                swept_earlier=silent_floor(earlier),
             ).body
             relinked = try_forge("issue-update", repo, {"number": number, "body": relink})
             if relinked is not None:
@@ -18588,6 +18736,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         **collector_payload(plan.uncorroborated),
         **timer_payload(),
     }
+    apply_earlier_finish(payload, earlier)
+    save_chat_verdict(audit_id, repo, payload["silent_ok"], new_marked or [], now)
     write_report(
         audit_id,
         report_envelope(
@@ -18608,7 +18758,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         ),
         now,
     )
-    append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
+    append_chat_report(
+        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        refinish=bool(payload.get(REFINISH_KEY)),
+    )
     print(json.dumps(payload))
 
 

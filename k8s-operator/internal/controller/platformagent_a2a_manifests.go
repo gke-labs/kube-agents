@@ -662,14 +662,14 @@ const (
 	a2aProvisionReportOutcomeReported   = "reported"
 	a2aProvisionReportOutcomeClean      = "clean"
 	a2aProvisionReportOutcomeUnreadable = "unreadable"
-	// a2aProvisionReportGrace bounds how long a Complete Job with no
-	// succeeded pod in the cache is read as "the cache has not caught up"
-	// rather than "the pod is gone" (a2aProvisionPodVanished). The pod's
-	// terminated state precedes the Job's Complete condition, and the Job is
-	// read live while the pods come from the cache, so a pass can see the
-	// completion a little before its own cache holds the pod. A minute is
-	// far past any informer lag and far short of the Job's 24h TTL, which is
-	// how long an unbounded wait would re-list and re-log for.
+	// a2aProvisionReportGrace bounds how long a Complete Job whose succeeded
+	// pod a read did not find is treated as "not visible yet" rather than
+	// "the pod is gone" (a2aProvisionPodVanished). Both reads are live — the
+	// Job through a2aReader, the pods through podReader — so the informer lag
+	// this grace was first written for no longer applies; what is left is the
+	// pod deleted in the gap between the two reads. A minute is far past that
+	// and far short of the Job's 24h TTL, which is how long an unbounded wait
+	// would re-list and re-log for.
 	a2aProvisionReportGrace = time.Minute
 	// reasonTasksSubjectCapMissing is the Warning Event's reason when the live
 	// TASKS stream carries no per-subject cap; tasksSubjectCapEventMessage is
@@ -3351,13 +3351,13 @@ func a2aProvisionJobName(agent *agentv1alpha1.PlatformAgent, spec batchv1.JobSpe
 //
 // Best effort throughout, because nothing here changes what the render did
 // or what the phase says. A report the operator cannot deliver is logged; the
-// Job is left unstamped where a retry can still deliver it (a pod the cache
-// has not caught up with, for a2aProvisionReportGrace after the completion)
-// and stamped where it cannot (a message the script did not write, a pod
-// that is gone, a finding the reader cannot trust). The pods come from the
-// cache, which already watches them for the agent pod's status, so a retry
-// costs no API call; the Job itself came through a2aReader, so the stamp is
-// read back live on the next pass.
+// Job is left unstamped where a retry can still deliver it (a pod not visible
+// yet, for a2aProvisionReportGrace after the completion) and stamped where it
+// cannot (a message the script did not write, a pod that is gone, a finding
+// the reader cannot trust). The pods come through podReader and the Job came
+// through a2aReader, so both the report and the stamp are read live: this
+// runs once per Job, and an informer over every Pod in the cluster is not
+// what it costs.
 func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job) {
 	if job.Annotations[a2aProvisionReportAnnotation] != "" {
 		return
@@ -3369,7 +3369,7 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 	// until the garbage collector reaches them, and a report read off one
 	// of those would be the previous run's.
 	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{
+	if err := r.podReader().List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{
 		batchv1.JobNameLabel:       job.Name,
 		batchv1.ControllerUidLabel: string(job.UID),
 	}); err != nil {
@@ -3477,13 +3477,14 @@ func parseA2AProvisionReport(message string) (*tasksSubjectCapFinding, error) {
 	return &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}, nil
 }
 
-// a2aProvisionPodVanished says whether a Complete Job with no succeeded
-// provision pod in the cache has lost that pod rather than not shown it yet.
+// a2aProvisionPodVanished says whether a Complete Job whose succeeded
+// provision pod the read did not return has lost that pod rather than not
+// shown it yet.
 // Gone means the Job controller counted the success (Succeeded is its count,
 // written in the same status as Complete) and the completion is older than
-// a2aProvisionReportGrace: past that, a pod the cache has still not
-// delivered is one the pod garbage collector, a Succeeded-pod cleanup or a
-// hand delete has taken. A counted success with no completion time is not a
+// a2aProvisionReportGrace: past that, a pod a live read still does not return
+// is one the pod garbage collector, a Succeeded-pod cleanup or a hand delete
+// has taken. A counted success with no completion time is not a
 // shape the Job controller writes; with nothing to bound the wait on it is
 // read as gone rather than polled for the rest of the Job's TTL.
 func a2aProvisionPodVanished(job *batchv1.Job, now time.Time) bool {

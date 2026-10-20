@@ -302,7 +302,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai` or `openai_compatible`),
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`, `sap`, or
+   another LiteLLM provider slug),
    where the model credential comes from, and, if the operator wants GitOps pull requests, the
    forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
@@ -335,7 +336,11 @@ An agent given that prompt, or reading this file on its own, follows these steps
    (`--openai-compatible-api-base`), and either the server pod's port for an in-cluster Service
    (`--openai-compatible-target-port`) or the CIDRs of a private address
    (`--openai-compatible-egress-cidrs`), and add those flags to the dry run; its key is optional and
-   goes in `OPENAI_COMPATIBLE_API_KEY`. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#openai-compatible-endpoints-self-hosted-or-private)
+   goes in `OPENAI_COMPATIBLE_API_KEY`. `sap` (SAP AI Core) and any other LiteLLM provider slug take
+   their credentials from a Secret the operator creates in the agent's namespace and names with
+   `--litellm-env-secret` (the SAP service key under `AICORE_SERVICE_KEY`; a slug outside the menu
+   also needs `--model-default-name`); the same flag carries an `openai_compatible` gateway's OAuth2
+   client credentials. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#a-credentials-secret-for-the-gateway)
    has every setting. For a GitOps repository on
    GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
    [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
@@ -1160,8 +1165,9 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 # For MODEL_PROVIDER=vertex_ai also export PROJECT_ID, LITELLM_KSA_NAME,
 # LITELLM_GSA_NAME, VERTEX_PROJECT_ID, and VERTEX_LOCATION — the vertex overlay
 # renders the gateway's Workload Identity ServiceAccount from them.
-# MODEL_PROVIDER=openai_compatible is not available here; install through
-# install.sh, the Terraform example or the Helm chart for it.
+# MODEL_PROVIDER=openai_compatible, sap and the gateway's credentials Secret
+# are not available here; install through install.sh, the Terraform example
+# or the Helm chart for them.
 make deploy-litellm
 
 # Deploy GitHub Integration (requires pre-provisioned Cloud KMS key and pre-created credentials secret)
@@ -1183,6 +1189,13 @@ export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
 export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
 make deploy-github
 ```
+
+This minter is not part of an `install.sh` install. To move this cluster to `install.sh` later,
+remove the minter first: run `make -C k8s-operator undeploy-github` with the same variables
+exported, and delete the `github-app-credentials` Secret. On a first `install.sh` run there is no
+`kube-agents` release yet, so the installer cannot tell this minter from its own: the run refuses
+while the minter runs, or, with `GITHUB_APP_ID` set, the apply fails on the minter's objects
+([When an upgrade is refused](docs/site/src/content/docs/install/upgrade.md#when-an-upgrade-is-refused)).
 
 ### Step 6: Apply Custom Resources
 
@@ -1476,14 +1489,17 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
   ```
 - **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
   ```
+
   - The Slack lines (`dropping message from unverified sender`, `slack: ignoring a message from another workspace's member`, `chat backend stopped; restarting it, the console stays up`, and the empty-allowlist warning) and their fixes are in [Slack app setup → Verify](https://gke-labs.github.io/kube-agents/install/slack-app/#verify). A sender the allowlist refuses was sent the `⛔ I can't verify who you are …` notice once, unless all they did was reply under one of the bot's own posts without a mention, which logs only `dropping unaddressed message from unverified sender` at info level; on Google Chat, add their email to `ALLOWED_USERS` in `install.env` and run `./upgrade.sh`.
   - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map-next-optional)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
   - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).
   - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
   - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply more than 30 minutes after the thread's last task, is not a turn (a reply under one of the bot's own posts, such as an alert, is the exception). Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+
 - **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \

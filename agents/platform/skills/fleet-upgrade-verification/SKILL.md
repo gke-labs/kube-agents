@@ -35,7 +35,7 @@ Neither reads versions against a target.
   <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> \
   [--project <project>]... [--cluster <location>/<name>... | --rollout-in-progress] [--target-version <version>] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
-  --output /opt/data/scratch/fleet_versions.json
+  --output /opt/data/scratch/fleet_versions_$(date +%s)_$$.json
 ```
 
 The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py`).
@@ -76,8 +76,11 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   note where the progress section would be.
   The file is written whole (a temp file, then a rename) when the run finishes and never
   before, so a reader never meets a partial document and a run that dies leaves the path as it found
-  it. `/opt/data/scratch` is shared by every card, so a run that must tell its own file from an
-  earlier one gives it a name of its own (the Delegation bullet in `AGENTS.md` adds a timestamp and the shell's PID, since a timestamp alone is second-resolution).
+  it. `/opt/data/scratch` is shared by every card, so an output name you choose carries this run's
+  own timestamp and the shell's PID, as the block above does (a timestamp alone is
+  second-resolution); the path the script prints on its `Wrote … to` line is the one to read back.
+  The weekly audit's collector is the exception: it moves its own per-run file onto the fixed name
+  described below.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
@@ -379,9 +382,14 @@ error (exit 2).
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/api_deprecation_scan.py \
-  --versions /opt/data/scratch/fleet_versions.json --target-version <version> \
-  [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations.json
+  --versions <the path the version report printed on its Wrote line> --target-version <version> \
+  [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations_$(date +%s)_$$.json
 ```
+
+A scan for a second target names the target as well as the run
+(`api_deprecations_<target>_$(date +%s)_$$.json`): two scans in one shell share `$$` and can
+share the second, and a name without the run's suffix is a file another card can write or has
+already written.
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
@@ -423,7 +431,9 @@ is an apiVersion removed after the floor and no later than the target; a removal
 the floor has already happened on every member and is not reported. A clean section says so
 with the file and document counts it read. Under either, `skipped` lines name the files it did
 not read and why, and a `partial` line means a size cap stopped the scan; a clean section with
-skipped files is clean for what it read, so say that.
+skipped files is clean for what it read, so say that. A section headed `not scanned` means this
+run did not read that repository: report it as not read, with the error the section gives, and
+never answer for it from a scan file this run did not write or from another card's result.
 
 The scan reads what Git declares. Whether a client is still calling a deprecated API on a live
 cluster is a different question, answered by GKE Deprecation Insights from the cluster's audit
