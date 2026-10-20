@@ -227,6 +227,7 @@ class StreakTest(Harness):
         writers = [night(d, [red()], job=WRITERS_JOB, filler=False) for d in (15, 16, 17)]
         gh, _, _ = self.run_once(data(*sorted(nights + writers, key=lambda r: r["build_id"])))
         self.assertEqual(len(self.filed(gh)), 1)
+        self.assertEqual(self.filed(gh, infra=True), [], "graded by writers: not kept from running either")
 
     def test_infra_reps_are_not_failures_and_an_all_infra_night_is_skipped(self):
         all_infra = task("case-red", "infra", "infra", "infra")
@@ -326,9 +327,11 @@ class DedupeTest(Harness):
         closed = {"number": 3996, "title": "t", "body": marker, "closed_at": "2026-10-17T12:00:00Z"}
         gh, out, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[closed]))
         self.assertEqual(gh.writes(), [])
-        self.assertIn("tracked: case-red by #3996 (closed after its newest red night)", out)
+        self.assertIn("tracked: case-red by #3996 (closed, still tracking)", out)
         reads = [p for m, p, _ in gh.calls if m == "GET" and "state=closed" in p]
-        self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&since=2026-10-15T00:00:30Z&per_page=100"])
+        # Every closed one, with no `since` horizon: a hand-off from before
+        # the window still tracks its case.
+        self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&per_page=100"])
         # A newer failing night after the close files again.
         later = data(*(night(d, [red(), green()]) for d in (15, 16, 17, 18)))
         gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
@@ -712,6 +715,13 @@ class InfraCaseTest(Harness):
         doc = data(night(14, [green("case-xfail"), green("case-red")]), *(night(d, []) for d in (15, 16, 17)), inactive=("case-red",))
         gh, _, _ = self.run_once(doc)
         self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_an_open_issue_for_a_case_marked_expected_fail_still_gets_its_recovery(self):
+        issue = {"number": 3976, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-xfail -->", "created_at": "2026-10-15T12:00:00Z"}
+        doc = data(*(night(d, [infra_task("case-xfail")]) for d in (14, 15, 16)), night(17, [green("case-xfail")]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("`case-xfail` was graded on the 2026-10-17 nightly", comment)
 
     def test_recovery_comments_once_when_the_case_is_graded_again(self):
         issue = {"number": 3970, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-16T12:00:00Z"}

@@ -123,13 +123,13 @@ TRIAGE_LABEL = "needs-triage"
 INFRA_LABEL = "Infra"
 DOMAIN_LABEL = "domain:{slug}"
 OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
-# Closed ones too, updated since the window's first night: a bug closed
+# Closed ones too, all of them (the label keeps the list small): a bug closed
 # after the streak's newest night has seen this streak, so it is not filed
 # again until a newer failing night (a fix that merged before the next
-# nightly closes its issue, and the streak on record is still red).
-CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&since={{since}}&per_page=100"
-# `since` in UTC with a Z: a `+00:00` offset would reach GitHub as a space.
-GITHUB_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# nightly closes its issue, and the streak on record is still red); one
+# handed off as not planned tracks the case however long ago it closed, so
+# no `since` horizon may drop it (``still_tracks``).
+CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&per_page=100"
 ISSUES_PATH = "issues"
 COMMENTS_PATH = "issues/{number}/comments"
 COMMENTS_READ_PATH = "issues/{number}/comments?per_page=100"
@@ -548,8 +548,8 @@ class Filer:
     def open_issues(self) -> list[dict] | None:
         return self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
 
-    def closed_issues(self, since: str) -> list[dict] | None:
-        return self.gh.call("GET", self.gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True)
+    def closed_issues(self) -> list[dict] | None:
+        return self.gh.call("GET", self.gh.path(CLOSED_ISSUES_PATH), paginate=True)
 
     def commented(self, number: int, marker: str) -> bool | None:
         comments = self.gh.call("GET", self.gh.path(COMMENTS_READ_PATH.format(number=number)), paginate=True)
@@ -564,10 +564,8 @@ class Filer:
         result = {"filed": [], "recovered": [], "noted": [], "tracked": [], "skipped": [], "failed": []}
         nights = graded_nights(data)
         parts = nightly_infra.part_nights(data, LOOKBACK_NIGHTS)
-        starts = [nightly.parse_iso(n.get("started")) for ns in parts.values() for n in ns]
-        since = min((t for t in starts if t), default=None)
         open_issues = self.open_issues()
-        closed_issues = self.closed_issues(since.strftime(GITHUB_TIME_FORMAT)) if since else []
+        closed_issues = self.closed_issues()
         if open_issues is None or closed_issues is None:
             log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
             return result
@@ -642,9 +640,11 @@ class Filer:
                 tracked[case] = nightly.PART_WRITERS if f"`{nightly.NIGHTLY_WRITERS_JOB}`" in body_text else nightly.PART_MAIN
         for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates, tracked).items()):
             fields = task_fields(case, self.repo_root)
-            if fields is None or fields["expected_fail"]:
+            if fields is None:
                 continue
             issue = tracking_issue(open_issues, case, KIND_INFRA)
+            # An open issue keeps its notes and recovery even once the case
+            # is marked expected_fail, as its footer tells the triager to.
             if issue:
                 # Open: the newest eligible night, kept from running after the
                 # issue opened, gets one comment; a graded one, one recovery.
@@ -654,6 +654,8 @@ class Filer:
                 graded = nightly_infra.first_graded_after_kept(verdicts, lambda v: opened_before(issue, v))
                 if graded:
                     self.recover_infra(KIND_INFRA, KEY_CASE, case, issue, graded, CASE_RECOVERED.format(case=case), result)
+                continue
+            if fields["expected_fail"]:
                 continue
             streak = nightly_infra.kept_streak(verdicts)
             if streak:
@@ -817,7 +819,7 @@ def summary(result: dict, dry_run: bool) -> str:
         lines.extend(f"    {url}" for url in f["runs"] if url)
     lines += [f"  recovered: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["recovered"]]
     lines += [f"  new night: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["noted"]]
-    lines += [f"  tracked: {t['case']} by #{t['issue']}{' (closed after its newest red night)' if t.get('closed') else ''}" for t in result["tracked"]]
+    lines += [f"  tracked: {t['case']} by #{t['issue']}{' (closed, still tracking)' if t.get('closed') else ''}" for t in result["tracked"]]
     lines += [f"  skipped: {s['case']} ({s['why']})" for s in result["skipped"]]
     lines += [f"  failed: {f['case']} ({FAILED_NOTE})" for f in result["failed"]]
     return "\n".join(lines)

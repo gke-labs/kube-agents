@@ -768,7 +768,9 @@ rules). Neither changes the domain streak above.
   would otherwise make every missing case "absent"). A graded night ends the
   streak. A case with an open kept-case issue is still read when no night in
   the window recorded it, so the issue keeps its notes and its recovery.
-  `expected_fail` cases and cases off the matrix are not filed.
+  `expected_fail` cases and cases off the matrix are not filed (an issue
+  already open for a case later marked `expected_fail` keeps its notes and
+  recovery).
 
 An infra issue is deduplicated by its own marker alone: a bot issue of one
 kind never stands in for another, and a human's `nightly-red` issue about a

@@ -249,7 +249,10 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
             usable = [p for p in recorders if day in eligible.get(p, {})]
             if recorders and not usable:
                 continue
-            part = usable[0] if usable else home
+            # A verdict in either part claims the night, as graded_nights
+            # reads it: an ungraded line in one part does not hide the other
+            # part's grade.
+            part = next((p for p in usable if graded(eligible[p][day]["tasks"][case][0])), usable[0]) if usable else home
             night = eligible.get(part, {}).get(day)
             if night is None:
                 continue
