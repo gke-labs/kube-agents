@@ -342,15 +342,16 @@ LATER_READS = (
     (readiness_rules.CLUSTER_READ_KINDS, KUBECTL_CLUSTER_RESOURCES, READ_MODE_CLUSTER_JSON),
 )
 KUBECTL_READS_PER_MEMBER = 2 + len(LATER_READS)  # the PDB read, the webhook read, then LATER_READS
-KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.spec.providerID}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
+KUBECTL_NODE_JSONPATH = '{range .items[*]}{.metadata.name}{"\\t"}{.spec.providerID}{"\\t"}{.metadata.creationTimestamp}{"\\t"}{.metadata.labels}{"\\t"}{.spec.taints}{"\\t"}{.spec.unschedulable}{"\\t"}{.status.nodeInfo}{"\\t"}{.status.allocatable}{"\\t"}{.status.conditions}{"\\n"}{end}'
 JSONPATH_OUTPUT_FORMAT = "jsonpath={template}"
 NODE_FIELD_SEPARATOR = "\t"
 NODE_LINE_SEPARATOR = "\n"  # what the jsonpath template ends each node with; a NEL (U+0085) inside a field is not a line break
-# The name and the providerID (`gce://<project>/<zone>/<instance>`, the instance behind the
-# node, which the orphan-node rule joins to the project's instances) are strings and come
+# The name, the providerID (`gce://<project>/<zone>/<instance>`, the instance behind the
+# node, which the orphan-node rule joins to the project's instances) and the creation
+# timestamp (which that rule reads against the instance list's read time) are strings and come
 # raw; the fields after them are JSON as kubectl's jsonpath renders maps, lists and booleans.
-NODE_FIELD_COUNT = 8
-NODE_RAW_FIELDS = 2
+NODE_FIELD_COUNT = 9
+NODE_RAW_FIELDS = 3
 NODE_KIND = readiness_rules.KIND_NODE
 # The credential proxy caps each stream a brokered command returns; past the cap it writes
 # the cut stdout, prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
@@ -1078,7 +1079,10 @@ def parse_node_lines(stdout: str) -> tuple[list[dict] | None, str | None]:
         spec = {"taints": taints or [], "unschedulable": bool(unschedulable)}
         if fields[1]:  # absent on a node the cloud provider has not registered; left out, as the API leaves it out
             spec[readiness_rules.NODE_PROVIDER_ID_KEY] = fields[1]
-        nodes.append({"kind": NODE_KIND, "metadata": {"name": fields[0], "labels": labels or {}}, "spec": spec, "status": {"nodeInfo": info or {}, "allocatable": allocatable or {}, "conditions": conditions or []}})
+        metadata = {"name": fields[0], "labels": labels or {}}
+        if fields[2]:
+            metadata[readiness_rules.NODE_CREATION_TIMESTAMP_KEY] = fields[2]
+        nodes.append({"kind": NODE_KIND, "metadata": metadata, "spec": spec, "status": {"nodeInfo": info or {}, "allocatable": allocatable or {}, "conditions": conditions or []}})
     return nodes, None
 
 

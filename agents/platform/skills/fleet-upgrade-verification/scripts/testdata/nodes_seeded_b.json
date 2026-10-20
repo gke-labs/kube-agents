@@ -35,7 +35,8 @@
         "topology.kubernetes.io/region": "us-central1",
         "topology.kubernetes.io/zone": "us-central1-a"
       },
-      "name": "gke-seeded-b-default-pool-4176890d-q0q0"
+      "name": "gke-seeded-b-default-pool-4176890d-q0q0",
+      "creationTimestamp": "2026-10-07T18:35:15Z"
     },
     "spec": {
       "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-q0q0",
@@ -103,7 +104,8 @@
         "topology.kubernetes.io/region": "us-central1",
         "topology.kubernetes.io/zone": "us-central1-a"
       },
-      "name": "gke-seeded-b-no-surge-pool-235d7913-2jpr"
+      "name": "gke-seeded-b-no-surge-pool-235d7913-2jpr",
+      "creationTimestamp": "2026-10-01T14:33:03Z"
     },
     "spec": {
       "providerID": "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-no-surge-pool-235d7913-2jpr",

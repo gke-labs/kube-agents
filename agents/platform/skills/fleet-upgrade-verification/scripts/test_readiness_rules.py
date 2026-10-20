@@ -893,6 +893,31 @@ class OrphanNodeObjectsRuleTest(unittest.TestCase):
             self.assertEqual([f["node"] for f in result["blocking"]], ["gke-seeded-b-default-pool-4176890d-new1"])
             self.assertEqual(result["notes"], ["1 orphan Node(s) (3 nodes, 19 instances in the project)"])
 
+    def test_a_node_created_after_the_instance_list_is_a_note_whatever_its_readiness(self):
+        # A surge node registers Ready False for its first seconds: created after the list's read time, it is
+        # a newcomer, not an orphan; the same node created before the list with no instance is the orphan.
+        record = seeded_b()
+        reads = project_reads()
+        reads[shared.PROJECT_READ_INSTANCES][shared.PROJECT_READ_AT_KEY] = "2026-10-20T11:58:00Z"
+        booting = copy.deepcopy(recorded("nodes_seeded_b.json")[0])
+        booting["metadata"]["name"] = "gke-seeded-b-default-pool-4176890d-boot"
+        booting["metadata"]["creationTimestamp"] = "2026-10-20T11:59:30Z"
+        booting["spec"]["providerID"] = "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-boot"
+        booting["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+        result = orphan_node_objects.evaluate(record, {}, seeded_b_read([booting]), None, context_for(record, reads=reads))
+        self.assertEqual(result["blocking"], [])
+        self.assertEqual(result["notes"], ["0 orphan Node(s) (3 nodes, 19 instances in the project)", "1 Node(s) created after the instance list was read at 2026-10-20T11:58:00Z (gke-seeded-b-default-pool-4176890d-boot (created 2026-10-20T11:59:30Z)): a node that registered after the list is not an orphan, whatever its readiness; the next run grades it"])
+        ghost = copy.deepcopy(booting)
+        ghost["metadata"]["creationTimestamp"] = "2026-10-20T11:40:00Z"
+        result = orphan_node_objects.evaluate(record, {}, seeded_b_read([ghost]), None, context_for(record, reads=reads))
+        self.assertEqual([(f["node"], f["ready"]) for f in result["blocking"]], [("gke-seeded-b-default-pool-4176890d-boot", "False")])
+        self.assertEqual(result["notes"], ["1 orphan Node(s) (3 nodes, 19 instances in the project)"])
+        # A context that does not say when the list was read, or a node without the timestamp, falls back to the readiness shape.
+        self.assertEqual(len(orphan_node_objects.evaluate(record, {}, seeded_b_read([booting]), None, context_for(record))["blocking"]), 1)
+        del booting["metadata"]["creationTimestamp"]
+        self.assertEqual(len(orphan_node_objects.evaluate(record, {}, seeded_b_read([booting]), None, context_for(record, reads=reads))["blocking"]), 1)
+        self.assertEqual(shared.node_created_at(recorded("nodes_seeded_b.json")[0]), datetime(2026, 10, 7, 18, 35, 15, tzinfo=timezone.utc))
+
     def test_an_unread_node_list_or_instance_list_is_unknown(self):
         record = seeded_b()
         result = orphan_node_objects.evaluate(record, {}, read(items=[], read_errors={"node": "nodes is forbidden"}), None, context_for(record))

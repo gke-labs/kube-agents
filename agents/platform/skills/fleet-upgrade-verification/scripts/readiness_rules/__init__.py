@@ -249,6 +249,7 @@ NODE_PROVIDER_ID_KEY = "providerID"
 PROVIDER_ID_SEPARATOR = "/"
 PROVIDER_ID_PARTS = 2  # the zone and the instance name, the last two path components
 NODE_ZONE_LABEL = "topology.kubernetes.io/zone"
+NODE_CREATION_TIMESTAMP_KEY = "creationTimestamp"  # `metadata.creationTimestamp`, when the Node object registered
 # Kubernetes resource quantities: a decimal number with an optional SI or binary suffix.
 QUANTITY_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)$")
 BINARY_SUFFIXES = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5, "Ei": 1024**6}
@@ -766,6 +767,12 @@ def node_instance(node: dict) -> tuple[str, str]:
         return parts[-PROVIDER_ID_PARTS], parts[-1]
     meta = node.get("metadata") or {}
     return str((meta.get("labels") or {}).get(NODE_ZONE_LABEL) or ""), str(meta.get("name") or "")
+
+
+def node_created_at(node: dict) -> datetime | None:
+    """When the Node object registered (`metadata.creationTimestamp`), or None when the record
+    does not say or the timestamp does not parse."""
+    return parse_rfc3339((node.get("metadata") or {}).get(NODE_CREATION_TIMESTAMP_KEY))
 
 
 def node_ready(node: dict) -> str:

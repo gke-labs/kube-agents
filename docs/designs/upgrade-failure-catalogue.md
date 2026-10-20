@@ -831,7 +831,7 @@ cordoned, and the next node pool upgrade waits on it.
   shows `NotReady,SchedulingDisabled` or `Unknown` with no instance behind it.
 - Mitigate before: delete the orphan Node object (`kubectl delete node <name>`); nothing runs on it.
 - Mitigate after: the same; the upgrade proceeds.
-- Read today: the readiness report's `orphan-node-objects` rule (`readiness_rules/orphan_node_objects.py`) joins the cluster's Nodes to the project's instances on the providerID's zone and instance name and files a blocker per orphan with the command; a `Ready`, uncordoned Node the instance list does not carry (the list is read once per project at its first graded member, minutes from any member's node read at most) is a note naming the list's read time, not a blocker; its note counts nodes against instances on every member.
+- Read today: the readiness report's `orphan-node-objects` rule (`readiness_rules/orphan_node_objects.py`) joins the cluster's Nodes to the project's instances on the providerID's zone and instance name and files a blocker per orphan with the command; a Node created after the instance list's read time, whatever its readiness, and a `Ready`, uncordoned Node the list does not carry (the list is read once per project at its first graded member, minutes from any member's node read at most) are notes naming the instants, not blockers; its note counts nodes against instances on every member.
 - GKE recommender: none.
 - Why it is on the list: one production fleet's support history: a node pool upgrade hung on
   Nodes that stayed `Ready,SchedulingDisabled` after an earlier interrupted operation had deleted

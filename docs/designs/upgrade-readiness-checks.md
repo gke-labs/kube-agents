@@ -422,8 +422,9 @@ rigid-scheduling and spreading checks already run (see Scope). The additions:
   `kubectl delete node <name>`, and the note counts nodes against instances on every member so a
   clean cluster reads as graded. The list is read once per project, at its first graded member
   (after that member's own node read, before the later members'), so a member's node read and the
-  list are minutes apart at most, and a `Ready`, uncordoned Node the list does not carry joined
-  or left in between (a scale-up, a surge node): a note naming the list's read time, not a blocker.
+  list are minutes apart at most: a Node created after the list's read time registered in between
+  (a surge node, a scale-up; `Ready` `False` for its first seconds), and a `Ready`, uncordoned Node
+  the list does not carry left in between; each is a note naming the instants, not a blocker.
 
 ## Rollout and verification
 

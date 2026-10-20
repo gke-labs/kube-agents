@@ -12,10 +12,14 @@ names nor, for a Node with no providerID, the project at all under the Node's ow
 node is named for its instance) is an orphan: one blocker per Node, naming its Ready condition
 and whether it is cordoned, with the one action, `kubectl delete node <name>`. The instance
 list is read once per project, at its first graded member (after that member's own node read,
-before the later members'), so a member's node read and the list are minutes apart at most, and
-a Node that is `Ready` `True` and not cordoned with no instance in the list joined or left in
-between (a scale-up, a surge node) rather than losing its instance: it is a note naming the
-list's read time, not a blocker, and the next run grades it. The note carries the count either way, so a
+before the later members'), so a member's node read and the list are minutes apart at most. A
+Node whose `metadata.creationTimestamp` is after the list's read time registered after the list
+was made (a surge node, a scale-up), whatever its readiness, since a new node reports `Ready`
+`False` for its first seconds: a note naming both instants, not a blocker. A Node older than
+the list that is `Ready` `True` and not cordoned with no instance in the list has a kubelet
+reporting after the list (a node that left between the two reads): the same note. A Node older
+than the list with no instance and no live kubelet is the orphan. The next run grades a noted
+node. The note carries the count either way, so a
 clean cluster reads as graded rather than silent.
 """
 
@@ -24,14 +28,17 @@ from readiness_rules import (
     HOLDS_NODE_POOL,
     KIND_NODE,
     LIST_SEPARATOR,
+    NODE_CREATION_TIMESTAMP_KEY,
     NODE_READ_KIND,
     PATH_SEPARATOR,
     PROJECT_READ_INSTANCES,
     items_of_kind,
     new_result,
+    node_created_at,
     node_instance,
     node_provider_id,
     node_ready,
+    parse_rfc3339,
     project_read,
     project_read_at,
     read_error,
@@ -54,6 +61,9 @@ FINDING_FORMAT = (
 NO_PROVIDER_ID = "none"
 UNKNOWN_READY = "unknown"
 COUNT_NOTE_FORMAT = "{orphans} orphan Node(s) ({nodes} nodes, {instances} instances in the project)"
+# A Node that registered after the instance list was made: not an orphan, whatever its readiness.
+CREATED_AFTER_LIST_NOTE_FORMAT = "{later} Node(s) created after the instance list was read at {read_at} ({names}): a node that registered after the list is not an orphan, whatever its readiness; the next run grades it"
+CREATED_AT_FORMAT = "{node} (created {created})"
 # A Ready, uncordoned Node the instance list does not carry: the list and the node read are minutes apart at most.
 LATER_NODES_NOTE_FORMAT = "{later} Ready, uncordoned Node(s) not in the instance list read at {read_at} ({names}): a node that joined or left between that list and this node read is not an orphan; the next run grades it"
 NODES_NOT_READ_REASON = "the Nodes were not read ({error}), so no Node could be checked against the instances"
@@ -103,11 +113,17 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         return out
     by_zone, names = instance_index(instances)
     nodes = items_of_kind(read_items(read), KIND_NODE)
-    later = []
+    read_at_text = project_read_at(context, PROJECT_READ_INSTANCES)
+    read_at = parse_rfc3339(read_at_text)
+    later, created_after = [], []
     for node in nodes:
         if is_live(node, by_zone, names):
             continue
         zone, name = node_instance(node)
+        created = node_created_at(node)
+        if created is not None and read_at is not None and created > read_at:
+            created_after.append(CREATED_AT_FORMAT.format(node=name, created=(node.get("metadata") or {}).get(NODE_CREATION_TIMESTAMP_KEY)))
+            continue
         if joined_later(node):
             later.append(name)
             continue
@@ -120,8 +136,10 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
             "action": ACTION_FORMAT.format(node=name),
         })
     out["notes"].append(COUNT_NOTE_FORMAT.format(orphans=len(out["blocking"]), nodes=len(nodes), instances=len(names)))
+    if created_after:
+        out["notes"].append(CREATED_AFTER_LIST_NOTE_FORMAT.format(later=len(created_after), read_at=read_at_text, names=LIST_SEPARATOR.join(created_after)))
     if later:
-        out["notes"].append(LATER_NODES_NOTE_FORMAT.format(later=len(later), read_at=project_read_at(context, PROJECT_READ_INSTANCES), names=LIST_SEPARATOR.join(later)))
+        out["notes"].append(LATER_NODES_NOTE_FORMAT.format(later=len(later), read_at=read_at_text, names=LIST_SEPARATOR.join(later)))
     return out
 
 
