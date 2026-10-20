@@ -404,6 +404,7 @@ class GroupOomKillTest(unittest.TestCase):
         self.assertEqual(shape({"command": ["sh", "-e", "-c", "a & b & wait"]}), "runs a shell script that forks a background job")
         self.assertEqual(shape({"command": ["bash", "--norc", "-c", "a & b & wait"]}), "runs a shell script that forks a background job")
         self.assertEqual(shape({"command": ["bash", "-eo", "pipefail", "-c", "a & b & wait"]}), "runs a shell script that forks a background job")
+        self.assertEqual(shape({"command": ["bash", "-c", "-o", "pipefail", "a & b & wait"]}), "runs a shell script that forks a background job")
         self.assertEqual(shape({"image": "docker.io/phusion/baseimage:jammy-1.0.1"}), "runs phusion/baseimage, whose entrypoint is a supervisor")
         self.assertIsNone(shape({"command": ["sh", "-c", "curl -fsS 'http://svc/health?x=y&z=1'"]}))
         self.assertIsNone(shape({"command": ["sh", "-c", 'echo "Tom & Jerry"']}))
@@ -486,6 +487,11 @@ class NodeImageCoupledAgentTest(unittest.TestCase):
         self.assertEqual(rules.shell_scripts(["bash", "--norc", "-c", "a"]), ["a"])
         self.assertEqual(rules.shell_scripts(["bash", "--rcfile", "/etc/rc", "-c", "a", "arg0"]), ["a"])
         self.assertEqual(rules.shell_scripts(["bash", "-c", "-e", "a"]), ["a"])
+        # An argument-taking option after `-c` is stepped over with its argument, as before it.
+        self.assertEqual(rules.shell_scripts(["bash", "-c", "-o", "pipefail", "a"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["bash", "-co", "pipefail", "a"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["bash", "-c", "--norc", "a"]), ["a"])
+        self.assertEqual(rules.shell_scripts(["sh", "-c", "-O", "extglob", "a", "arg0"]), ["a"])
         self.assertEqual(rules.shell_scripts(["bash", "-e", "script.sh"]), [])
         self.assertEqual(rules.shell_scripts(["bash", "-o", "pipefail", "script.sh"]), [])
 

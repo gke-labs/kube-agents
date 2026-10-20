@@ -795,28 +795,26 @@ def image_repository_and_tag(image: str) -> tuple[str, str]:
 
 def shell_scripts(command: list) -> list[str]:
     """The scripts a command list hands a shell: after every shell program in it (SHELL_PROGRAMS,
-    by last path component) the option words are walked (`-e`, `-o pipefail`, `--norc`, the
-    fused `-ec`), and once a flag group carrying `c` (SHELL_COMMAND_FLAG_RE) is met, the first
-    word after the options is the script. `["tini", "--", "bash", "-o", "pipefail", "-c",
-    "nginx & php-fpm"]` -> `["nginx & php-fpm"]`; a shell with no `c` flag hands back none."""
+    by last path component) the option words are walked, before and after the flag group
+    carrying `c` alike (`-e`, `-o pipefail`, `--norc`, the fused `-ec`, each argument-taking
+    option with its argument), and the first word after them is the script when a group
+    carried `c` (SHELL_COMMAND_FLAG_RE). `["tini", "--", "bash", "-o", "pipefail", "-c",
+    "nginx & php-fpm"]` and `["bash", "-c", "-o", "pipefail", "nginx & php-fpm"]` ->
+    `["nginx & php-fpm"]`; a shell with no `c` flag hands back none."""
     words = [str(w) for w in command or []]
     scripts = []
     for index, word in enumerate(words):
         if word.rsplit(PATH_SEPARATOR, 1)[-1] not in tables.SHELL_PROGRAMS:
             continue
         j, carried = index + 1, False
-        while j < len(words) and words[j].startswith(SHELL_OPTION_PREFIXES) and not carried:
+        while j < len(words) and words[j].startswith(SHELL_OPTION_PREFIXES):
             option = words[j]
             j += 1
             if tables.SHELL_COMMAND_FLAG_RE.match(option):
                 carried = True
-            elif option in SHELL_OPTIONS_WITH_ARGUMENT or SHELL_OPTION_ARGUMENT_GROUP_RE.match(option):
+            if option in SHELL_OPTIONS_WITH_ARGUMENT or SHELL_OPTION_ARGUMENT_GROUP_RE.match(option):
                 j += 1
-        if not carried:
-            continue
-        while j < len(words) and words[j].startswith(SHELL_OPTION_PREFIXES):
-            j += 1
-        if j < len(words):
+        if carried and j < len(words):
             scripts.append(words[j])
     return scripts
 
