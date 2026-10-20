@@ -2696,10 +2696,10 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     assert "rate_limit" in result.errors[0]
 
 
-def test_a_card_unblocked_between_poll_and_final_read_on_inject_is_infrastructure(
+def test_a_card_unblocked_between_poll_and_final_read_on_inject_remains_graded(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A card unblocked between the poll that ended the loop and the final read preserves infra classification."""
+    """A card unblocked between the poll that ended the loop and the final read remains graded and records ceiling."""
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2723,9 +2723,9 @@ def test_a_card_unblocked_between_poll_and_final_read_on_inject_is_infrastructur
 
     result = KubeAgentsHarness().run("check the fleet")
 
-    assert infra(result)
-    assert result.output == ""
-    assert "rate_limit" in result.errors[0]
+    assert not infra(result)
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(CARD_A in e for e in result.errors)
 
 
 def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
@@ -2748,7 +2748,7 @@ def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
         if n == 2:
             # On deliverable read (want_cards), card was unblocked and re-claimed running with fresh run row
             set_card(tmp_path, CARD_A, "running", block_kind="transient")
-            conn = sqlite3.connect(tmp_path / "sessions" / "test-session" / "board.db")
+            conn = sqlite3.connect(tmp_path / board.BOARD_FILE)
             conn.execute(
                 "INSERT INTO task_runs (task_id, profile, status) VALUES (?, 'platform', 'running')",
                 (CARD_A,),
@@ -2762,6 +2762,8 @@ def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
 
     assert not infra(result)
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert any(CARD_A in e for e in result.errors)
+    assert result.metadata.get("final_message") == ACK
 
 
 def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
