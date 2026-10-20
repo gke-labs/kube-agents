@@ -75,9 +75,11 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   note where the progress section would be.
   The file is written whole (a temp file, then a rename) when the run finishes and never
   before, so a reader never meets a partial document and a run that dies leaves the path as it found
-  it. `/opt/data/scratch` is shared by every card, so every output name carries this run's own
-  timestamp and the shell's PID, as the block above does (a timestamp alone is second-resolution);
-  the path the script prints on its `Wrote … to` line is the one to read back.
+  it. `/opt/data/scratch` is shared by every card, so an output name you choose carries this run's
+  own timestamp and the shell's PID, as the block above does (a timestamp alone is
+  second-resolution); the path the script prints on its `Wrote … to` line is the one to read back.
+  The weekly audit's collector is the exception: it moves its own per-run file onto the fixed name
+  described below.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
@@ -360,8 +362,9 @@ error (exit 2).
   [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations_$(date +%s)_$$.json
 ```
 
-A scan for a second target keeps the same suffix (`api_deprecations_<target>_$(date +%s)_$$.json`):
-a name without it is a file another card can write or has already written.
+A scan for a second target carries its own `_$(date +%s)_$$` suffix
+(`api_deprecations_<target>_$(date +%s)_$$.json`): a name without one is a file another card can
+write or has already written.
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
