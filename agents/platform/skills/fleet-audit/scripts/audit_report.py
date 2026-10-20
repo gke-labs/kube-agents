@@ -13622,9 +13622,12 @@ def read_declarations(audit_id: str, repo: str | None = None) -> list[dict]:
 
 
 def unwritten_refusal_message(
-    unwritten: dict[str, "UnwrittenFix"], notes: dict[str, str] | None = None
+    unwritten: dict[str, "UnwrittenFix"], notes: dict[str, str] | None = None, *, sweep_off: bool = False
 ) -> str:
     """What the refusal tells the worker, one list per shape of the shortcut.
+
+    `sweep_off` is the install's switch: the fix is then owed to a `/remediate`,
+    not to a sweep, and the first sentence says so.
 
     The declared list names the object's own file, and says in so many words
     that a new object goes beside it: a worker told only "write the manifest at
@@ -13641,7 +13644,10 @@ def unwritten_refusal_message(
     declared = sorted((fid, fix.path) for fid, fix in unwritten.items() if fix.declared)
     notes = notes or {}
     parts = [
-        f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
+        f"{len(unwritten)} finding(s) need their fix written before a `/remediate` "
+        "can open a pull request for them."
+        if sweep_off
+        else f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
         "their fix is not written."
     ]
     if named:
@@ -17285,7 +17291,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             if fid not in declines and fid not in planned and fid not in answered
         }
         if remaining and has_run_record(audit_id, repo):
-            raise ValidationError(unwritten_refusal_message(remaining, skipped))
+            raise ValidationError(unwritten_refusal_message(remaining, skipped, sweep_off=not sweep_on))
         write_generated_fixes(findings, planned, root)
         unlinked_paths = _unlinked_manifest_paths(findings, manifest, planned, probe)
         file_url = (

@@ -19658,7 +19658,8 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             pathlib.Path(switch).write_text("false\n")
             with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch):
                 self.assertEqual(self.run_finish(doc), 2)
-                self.assertIn("their fix is not written", self.err)
+                self.assertIn("need their fix written before a `/remediate`", self.err)
+                self.assertNotIn("automatic pull request", self.err, "no sweep opens one on this install")
                 self.touch(doc["findings"][0]["remediation"]["path"])
                 self.assertEqual(self.run_finish(doc), 0, self.err)
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
