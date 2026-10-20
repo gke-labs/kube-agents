@@ -98,6 +98,23 @@ class ContainerRuntimeRuleTest(unittest.TestCase):
         record["nodePools"][0]["version"] = "latest"
         self.assertIn("version unparsable", evaluate(record, items_for(), target=TARGET)["unknown"][0])
 
+    def test_a_planted_daemonset_counts_from_its_template_whatever_its_pods_do(self):
+        # The fleet's node-runtime-probe shape: a DaemonSet outside the system namespaces whose
+        # template mounts the socket file. It is a client when its pods run, when none runs on the
+        # cluster, and when only its pods were read; the system DaemonSets beside it count too.
+        probe = template("DaemonSet", "node-runtime-probe", PROBE_SPEC)
+        system = template("DaemonSet", "gke-metadata-server", {"containers": [{"name": "c"}], "volumes": [{"name": "run", "hostPath": {"path": "/var/run/"}}]}, namespace="kube-system")
+        probe_pod = pod("seeded-shapes", "node-runtime-probe-4xvj9", "n1", owner=("DaemonSet", "node-runtime-probe"), volumes=[socket_volume()])
+        expected = [{"owner": "DaemonSet kube-system/gke-metadata-server", "paths": ["/var/run/"]}, {"owner": "DaemonSet seeded-shapes/node-runtime-probe", "paths": ["/run/containerd/containerd.sock"]}]
+        self.assertEqual(container_runtime.socket_clients([probe, system, probe_pod]), expected)
+        self.assertEqual(container_runtime.socket_clients([probe, system]), expected)
+        self.assertEqual(container_runtime.socket_clients([system, probe_pod]), expected)
+        # Through the rule, on a pool whose containerd major does not change at the target.
+        record = cluster(name="seeded-a", pools=[pool_record("default-pool", "1.33.4-gke.1000")])
+        out = evaluate(record, [probe, system, node("n1", "default-pool", runtime="containerd://2.0.4")], target=TARGET)
+        self.assertEqual((out["risks"], out["unknown"]), ([], []))
+        self.assertEqual(out["notes"], ["2 workload(s) mount the container runtime socket (DaemonSet kube-system/gke-metadata-server, DaemonSet seeded-shapes/node-runtime-probe); no pool's containerd major changes at the target"])
+
     def test_socket_clients_dedupe_across_pods_and_templates_and_accept_both_spellings(self):
         items = [
             template("Deployment", "agent", {"containers": [{"name": "c"}], "volumes": [socket_volume("/var/run/docker.sock"), socket_volume("/var/run/containerd/containerd.sock")]}, namespace="ops"),
