@@ -757,6 +757,57 @@ typed answer read back onto the question it answers, which needs the backend's o
 history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
 stands), it posts each notify's text, a later `update` of the same key included.
 
+**Stopping the cards (gke-labs#3263).** A `stop` cancels the conversation's task, and by
+then that task has usually ended. The cards it filed are what still runs, and no carrier
+above reaches them. So the gateway can send the bridge a control, a task of its own whose
+`kind: message` holds one `data` part and no text:
+
+```json
+{ "cardStop": { "v": 1 } }
+```
+
+A message with a text or file part is a question whatever data rides with it, so only a
+data-only message is the control (`lib.CardStopRequested`). The gateway is the only
+publisher on `…in` and builds every other payload from text, so no one can type one. The
+same part on a follow-up is refused `no-text`. The bridge runs the control without a model
+turn: it waits for the conversation's session turn, has session-kv archive every open card
+in the conversation and the cards they spawned, and ends the task `completed`. Its `result`
+artifact holds a short text and the same key in its result form:
+
+```json
+{
+  "cardStop": {
+    "v": 1,
+    "stopped": [{ "id": "t_1", "title": "…", "priorStatus": "running" }],
+    "settled": [{ "id": "t_2", "title": "…" }],
+    "failed": 0,
+    "pending": 0,
+    "unresolved": 0,
+    "truncated": false,
+    "deadline": false,
+    "listsCut": false
+  }
+}
+```
+
+`stopped` is what the stop archived and `settled` the cards that had already finished. The
+counts are what it could not promise: `failed` cards it could not archive, `pending`
+archives still running when it ran out of time, and `unresolved` cards claimed just before
+the stop, for which a worker may still start. `truncated` says more cards were open than one
+stop takes, `deadline` that the stop ran out of time, and `listsCut` only that a list was
+cut to fit the part. A stop that failed carries no part and ends `failed` with
+`reason: card-stop-unavailable` (`card-stop-unsupported` from the `cli` executor). If the
+bus refuses the result with the part, the text goes alone, so a `completed` control can
+arrive with no part. The bridge side is in `a2a/docs/hermes-bridge.md`.
+
+The gateway reads the control as no turn. It is never the conversation's active task and
+never in its task history, so it steers nothing, serializes nothing and is no status ask's
+subject. It words the reply from the result part. Anything else (rejected, failed,
+canceled, completed with no part, or no terminal inside `A2A_CARD_STOP_TIMEOUT`) gets
+"⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working", never a success. A stop that arrives while a control runs marks it, and one quiet
+follow-up control goes out when it ends. The control goes only to the default addressee,
+and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, Stop).
+
 ### Rules
 
 - **The text fallback is the answer.** It stands alone, because a consumer that is not a

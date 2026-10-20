@@ -56,6 +56,30 @@
    "label-ensure"
   ],
   [
+   "git",
+   "--literal-pathspecs",
+   "ls-tree",
+   "-z",
+   "--full-tree",
+   "--name-only",
+   "HEAD",
+   "--",
+   "clusters/prod-us-east/payments-netpol.yaml",
+   "clusters/prod-us-east/kustomization.yaml",
+   "clusters/prod-us-east/kustomization.yml",
+   "clusters/prod-us-east/Kustomization",
+   "clusters/kustomization.yaml",
+   "clusters/kustomization.yml",
+   "clusters/Kustomization",
+   "kustomization.yaml",
+   "kustomization.yml",
+   "Kustomization",
+   "clusters/stage-eu/psp.yaml",
+   "clusters/stage-eu/kustomization.yaml",
+   "clusters/stage-eu/kustomization.yml",
+   "clusters/stage-eu/Kustomization"
+  ],
+  [
    "forge",
    "issue-list"
   ],
@@ -171,6 +195,7 @@
   null,
   null,
   null,
+  "<TMP>/gitops/compliance-audit/acme__fleet",
   null,
   null,
   null,
@@ -239,6 +264,7 @@
    "name": "severity:minor",
    "repository": "acme/fleet"
   },
+  null,
   {
    "labels": [
     "audit:compliance-audit"

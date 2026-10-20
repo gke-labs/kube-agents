@@ -225,9 +225,9 @@ uncovered until the roster line lands; that edit forces the allowlist edit in `d
 the same change. devops-bench
 ignores the extra key (`extra: "ignore"` on its task model), so the field is free to carry.
 
-Every task also carries a top-level `owner:` — a GitHub login without the at sign, or
-`maintainers` — naming who answers when the case flakes. The validator rejects a task without
-one; [CONTRIBUTING.md](CONTRIBUTING.md) says what the owner commits to.
+A task may carry a top-level `owner:`, the GitHub login whose bugs it is first; without one it
+belongs to its domain's owner. [CONTRIBUTING.md](CONTRIBUTING.md#ownership) has the rule and
+what the owner commits to.
 
 A task whose stack starts real audit runs lists them in a top-level `audit_streams:`, so
 the runner holds those streams' locks while it runs; see
@@ -275,7 +275,7 @@ fails if it reported anything, so a case that passes locally passes there too.
 id: my-provisioned-task
 name: Human-readable name
 domain: capacity # required; a slug from docs/designs/domains.yaml
-owner: maintainers # required; a GitHub login without the at sign, or maintainers -- see CONTRIBUTING.md
+owner: some-login # optional; a GitHub login, else the domain's owner -- see CONTRIBUTING.md
 fixtures: [] # required when the spec reads cluster state; seeded-fleet roles, or [] for none
 prompt: >-
   The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.
