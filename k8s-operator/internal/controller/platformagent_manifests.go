@@ -5610,6 +5610,37 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 				Resources: []string{"customresourcedefinitions"},
 				Verbs:     []string{"get", "list", "watch"},
 			},
+			// The GitOps reconcilers' sync objects: which repository and directory
+			// syncs a cluster is often recorded only here, applied once by hand or
+			// by an installer. The gitops-helm-chart skill reads it to decide how to
+			// declare a chart; this grant merges after that skill, so the reader is in
+			// the tree before the read is. Only the kinds that name a sync's source and
+			// destination; HelmReleases, ApplicationSets, AppProjects and
+			// HelmRepositories are not needed for that and stay out, as do Argo
+			// CD's cluster and repository Secrets. An Application can still carry
+			// inline Helm values and a Kustomization substitutions, which this
+			// grant makes readable: the same exposure as the ConfigMap read above,
+			// accepted for now. Inert where the CRDs are absent.
+			{
+				APIGroups: []string{"argoproj.io"},
+				Resources: []string{"applications"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"kustomize.toolkit.fluxcd.io"},
+				Resources: []string{"kustomizations"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"source.toolkit.fluxcd.io"},
+				Resources: []string{"gitrepositories", "ocirepositories"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"configsync.gke.io"},
+				Resources: []string{"rootsyncs", "reposyncs"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
 		},
 	}
 }
