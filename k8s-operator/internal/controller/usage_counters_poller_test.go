@@ -1164,6 +1164,7 @@ func TestUsagePoller_ChatListenerIsReadFromTheLeaderAlone(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))}}
+	uncapUsagePollReplicas(t)
 	a := usageGatewayPod("agent-gateway-aaa", "gw-a", usageTestGatewayIP, created)
 	a.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
 	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
@@ -1276,6 +1277,7 @@ func TestUsagePoller_AnUnreadListenersStreakIsClosed(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))}}
+	uncapUsagePollReplicas(t)
 	a := usageGatewayPod("agent-gateway-aaa", "gw-a", usageTestGatewayIP, created)
 	a.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
 	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
@@ -1326,6 +1328,7 @@ func TestUsagePoller_AnOldProcessOnANeverReadPodIsBaselined(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))}}
+	uncapUsagePollReplicas(t)
 	a := usageGatewayPod("agent-gateway-aaa", "gw-a", usageTestGatewayIP, created)
 	a.Labels[gatewayLeaderLabel] = gatewayLeaderLabelValue
 	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
@@ -2969,4 +2972,37 @@ func TestUsagePoller_DoesNotLogABudgetCutWhenTheParentIsCancelled(t *testing.T) 
 			t.Errorf("a poll cut by a cancelled parent logged a budget line: %q", l)
 		}
 	}
+}
+
+// uncapUsagePollReplicas makes targets read the requested replica count, so a
+// test can still drive the leader rule above one replica. The operator caps
+// the rendered gateway at one (supportedGatewayReplicas), so no install
+// reaches this today; the rule stays for
+// https://github.com/gke-labs/kube-agents/issues/3016.
+func uncapUsagePollReplicas(t *testing.T) {
+	t.Helper()
+	prev := usagePollGatewayReplicas
+	usagePollGatewayReplicas = requestedGatewayReplicas
+	t.Cleanup(func() { usagePollGatewayReplicas = prev })
+}
+
+// With replicas above one requested, the operator still renders one gateway
+// pod and runs no leader_elect.py on it, so that pod never carries the leader
+// label. Its chat listener is read anyway: the leader rule reads the rendered
+// count, not the requested one.
+func TestUsagePoller_ARequestedHAInstallReadsItsOnePodsChatListener(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))}}
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	targets, _, err := h.p.targets(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tg := range targets {
+		if tg.addr == chatAddr() {
+			return
+		}
+	}
+	t.Fatalf("the one gateway pod's chat listener %s is not among the targets: %+v", chatAddr(), targets)
 }

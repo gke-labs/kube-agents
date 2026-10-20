@@ -225,7 +225,7 @@ process, so a peer that reaches the port cannot spend its threads), and is
 the one port the broker's NetworkPolicy opens to the `gke-gmp-system`
 namespace, where the managed-Prometheus collector runs, and to the operator's own
 pods, which read the counters into the `PlatformAgent`'s `status.usage`
-([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica.
+([usage counters](designs/usage-counters-producer.md)); no other peer reaches it by selector, and the site's security reference states the one residual above one replica, a shape the operator does not render today.
 Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
 audience-bound projected ServiceAccount token (one hour; the audience is per

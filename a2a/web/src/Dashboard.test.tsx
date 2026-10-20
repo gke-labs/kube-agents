@@ -112,8 +112,37 @@ describe("Dashboard", () => {
   it("carries the tbd rows with their reasons", () => {
     render(<Dashboard state={state} focus={null} onSession={() => {}} />);
     expect(document.querySelector('[data-panel="capacity"]')!.textContent).toContain("KV buckets");
-    expect(document.querySelector('[data-panel="spend"]')!.textContent).toContain("total_cost_usd");
-    expect(document.querySelector('[data-panel="tasks"]')!.textContent).toContain("tbd");
+  });
+
+  it("says why spend is empty until a turn reports usage, and dashes the cost cell", () => {
+    render(<Dashboard state={state} focus={null} onSession={() => {}} />);
+    expect(document.querySelector('[data-panel="spend"]')!.textContent).toContain("no task has reported usage yet");
+    expect(document.querySelector('[data-panel="tasks"] tbody')!.textContent).toContain("—");
+  });
+
+  it("shows a task's reported usage in its cost cell and sums it in the spend panel", () => {
+    const t1 = state.tasks.get("t1")!;
+    const withUsage: UiState = {
+      ...state,
+      tasks: new Map([
+        ["t1", { ...t1, usage: { model: "claude-opus-5-5", inputTokens: 1500, outputTokens: 80, durationMs: 4000 } }],
+        [
+          "t2",
+          { ...t1, taskId: "t2", usage: { model: "model-default", inputTokens: 500, outputTokens: 20, costUsd: 0.0123, durationMs: 1000 } },
+        ],
+      ]),
+    };
+    render(<Dashboard state={withUsage} focus={null} onSession={() => {}} />);
+    const tasks = document.querySelector('[data-panel="tasks"]')!.textContent!;
+    expect(tasks).toContain("1.5k in / 80 out, 4s, claude-opus-5-5");
+    expect(tasks).toContain("500 in / 20 out, $0.0123, 1s, model-default");
+    const spend = document.querySelector('[data-panel="spend"]')!.textContent!;
+    expect(spend).toContain("tasks reporting2");
+    expect(spend).toContain("tokens2k in / 100 out");
+    expect(spend).toContain("cost$0.0123 over 1 of 2 tasks");
+    // Two tasks, two models: the row names both, not the one the fold saw last.
+    expect(spend).toContain("modelclaude-opus-5-5, model-default");
+    expect(spend).toContain("turn time5s");
   });
 
   it("says an empty panel is empty", () => {

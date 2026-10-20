@@ -305,8 +305,8 @@ func TestBuildPVC(t *testing.T) {
 		t.Errorf("expected PVC name test-agent-data, got %s", pvc.Name)
 	}
 	storageReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if storageReq.String() != "10Gi" {
-		t.Errorf("expected storage request 10Gi, got %s", storageReq.String())
+	if storageReq.String() != "50Gi" {
+		t.Errorf("expected storage request 50Gi, got %s", storageReq.String())
 	}
 }
 
@@ -3347,6 +3347,9 @@ func TestGetConfigMapHash(t *testing.T) {
 	}
 }
 
+// TestBuildDeploymentHA renders replicas: 2, which the operator caps at one
+// replica (supportedGatewayReplicas) because a multi-replica gateway does not
+// start.
 func TestBuildDeploymentHA(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3365,8 +3368,11 @@ func TestBuildDeploymentHA(t *testing.T) {
 	}
 
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *dep.Spec.Replicas != 2 {
-		t.Errorf("expected 2 replicas for HA deployment, got %d", *dep.Spec.Replicas)
+	if *dep.Spec.Replicas != 1 {
+		t.Errorf("expected replicas: 2 to be capped at 1, got %d", *dep.Spec.Replicas)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("expected the single-replica Recreate strategy, got %s", dep.Spec.Strategy.Type)
 	}
 
 	if dep.Spec.Template.Spec.Affinity != nil {
@@ -3464,9 +3470,11 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 		},
 	}
 
+	// Capped at one replica (supportedGatewayReplicas): three renders the
+	// single-replica gateway, with none of the leader-election wiring.
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *dep.Spec.Replicas != 3 {
-		t.Errorf("expected 3 replicas when explicitly set, got %d", *dep.Spec.Replicas)
+	if *dep.Spec.Replicas != 1 {
+		t.Errorf("expected replicas: 3 to be capped at 1, got %d", *dep.Spec.Replicas)
 	}
 
 	// Leadership is the Lease that leader_elect.py holds, not a config key: nothing in
@@ -3484,11 +3492,10 @@ func TestBuildDeploymentReplicasConfig(t *testing.T) {
 	for _, env := range container.Env {
 		envMap[env.Name] = env
 	}
-	if envMap["ENABLE_LEADER_ELECTION"].Value != "true" {
-		t.Errorf("expected ENABLE_LEADER_ELECTION true, got %s", envMap["ENABLE_LEADER_ELECTION"].Value)
-	}
-	if envMap["LEADER_ELECTION_LEASE_NAME"].Value != "custom-replicas-agent-leader" {
-		t.Errorf("expected LEADER_ELECTION_LEASE_NAME custom-replicas-agent-leader, got %s", envMap["LEADER_ELECTION_LEASE_NAME"].Value)
+	for _, name := range []string{"ENABLE_LEADER_ELECTION", "LEADER_ELECTION_LEASE_NAME", "LEADER_ELECTION_NAMESPACE"} {
+		if env, found := envMap[name]; found {
+			t.Errorf("expected no %s on a capped gateway, got %q", name, env.Value)
+		}
 	}
 }
 
@@ -3529,36 +3536,20 @@ func envValue(c corev1.Container, name string) (string, bool) {
 	return value, found
 }
 
-// TestLeaderElectionKeepsTheImageEntrypoint guards the HA path against the regression
-// where nothing built the shared tree.
-//
-// Setting Command on this container replaces the image ENTRYPOINT
-// (/usr/local/bin/agent-entrypoint), so the setup that seeds $HERMES_HOME from
-// /opt/defaults, scaffolds the platform profile, links plugin volumes, merges the config
-// overlays and starts the Session KV server on 8699 never ran at all — leader_elect.py
-// went straight to Hermes. The dashboard was quietly covering for it by running the setup
-// itself; once the dashboard was correctly gated out, an HA pod had no container doing it.
-func TestLeaderElectionKeepsTheImageEntrypoint(t *testing.T) {
-	dep := buildDeployment(haAgent("ha-agent", 2), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	gateway := containerNamed(t, dep, "platform-agent")
-
-	if len(gateway.Command) != 0 {
-		t.Errorf("Command must stay unset so the image ENTRYPOINT runs the shared-state "+
-			"setup before leader_elect.py; got %v", gateway.Command)
-	}
-	want := []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}
-	if !reflect.DeepEqual(gateway.Args, want) {
-		t.Errorf("expected the leader-election wrapper as the entrypoint's exec target %v, got %v", want, gateway.Args)
-	}
-}
-
+// TestSingleReplicaGatewayUsesTheImageCMD covers the counts above one too: the
+// operator caps them at one replica, so none of them runs leader_elect.py,
+// which exits at startup in a container with no in-cluster token (#2995).
 func TestSingleReplicaGatewayUsesTheImageCMD(t *testing.T) {
-	dep := buildDeployment(haAgent("solo-agent", 1), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	gateway := containerNamed(t, dep, "platform-agent")
+	for _, replicas := range []int32{1, 2, 3} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			dep := buildDeployment(haAgent("solo-agent", replicas), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			gateway := containerNamed(t, dep, "platform-agent")
 
-	if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
-		t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
-			gateway.Command, gateway.Args)
+			if len(gateway.Command) != 0 || len(gateway.Args) != 0 {
+				t.Errorf("expected the image CMD (`hermes gateway run`) to stand, got command=%v args=%v",
+					gateway.Command, gateway.Args)
+			}
+		})
 	}
 }
 
@@ -4051,26 +4042,33 @@ func TestRWOStoragePerReplica(t *testing.T) {
 		},
 	}
 
-	if !useStatefulSet(agent) {
-		t.Fatalf("expected useStatefulSet to be true for multi-replica agent with RWO storage")
+	// replicas > 1 over RWO storage used to select the StatefulSet gateway.
+	// The replica cap renders it as the single-replica Deployment, with the
+	// claim as a standalone PVC mounted from the pod spec.
+	if useStatefulSet(agent) {
+		t.Fatalf("expected the replica cap to keep a multi-replica agent with RWO storage on the Deployment")
 	}
 
 	pvcs, err := buildCustomPVCs(agent)
 	if err != nil {
 		t.Fatalf("unexpected error from buildCustomPVCs: %v", err)
 	}
-	if len(pvcs) != 0 {
-		t.Errorf("expected 0 standalone PVCs when using StatefulSet, got %d", len(pvcs))
+	if len(pvcs) != 1 {
+		t.Errorf("expected 1 standalone PVC on the capped Deployment, got %d", len(pvcs))
 	}
 
 	vols := buildCustomStorageVolumes(agent)
-	if len(vols) != 0 {
-		t.Errorf("expected 0 custom storage volumes in pod spec when using StatefulSet RWO, got %d", len(vols))
+	if len(vols) != 1 {
+		t.Errorf("expected 1 custom storage volume in the capped pod spec, got %d", len(vols))
 	}
 
+	// buildStatefulSet itself is unreachable from the spec under the cap and
+	// is called directly here so its claim-template shape stays pinned. Its
+	// replica count comes through the same capped resolver.
+
 	sts := buildStatefulSet(agent, "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	if *sts.Spec.Replicas != 2 {
-		t.Errorf("expected 2 replicas in StatefulSet, got %d", *sts.Spec.Replicas)
+	if *sts.Spec.Replicas != 1 {
+		t.Errorf("expected the capped 1 replica in StatefulSet, got %d", *sts.Spec.Replicas)
 	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("expected 1 VolumeClaimTemplate in StatefulSet, got %d", len(sts.Spec.VolumeClaimTemplates))
@@ -6369,8 +6367,9 @@ func TestPlatformFrontDoorArgsSelectTheProfile(t *testing.T) {
 	}{
 		{"off at one replica keeps the image CMD", 1, false, nil},
 		{"on at one replica names the profile", 1, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
-		{"off above one replica keeps the wrapper", 2, false, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
-		{"on above one replica keeps the wrapper", 2, true, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
+		// Two is capped at one replica, so the argv is the single-replica one.
+		{"off above one replica is capped to the image CMD", 2, false, nil},
+		{"on above one replica is capped and names the profile", 2, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dep := buildDeployment(frontDoorAgent("fd-agent", tc.replicas, tc.on), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
@@ -7332,6 +7331,11 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 // carries namespace-wide pods:patch on the identity that also holds the agent's
 // Workload Identity annotation. Nothing breaks, nothing logs, and the grant is
 // only found by someone auditing RBAC.
+//
+// Under the replica cap (supportedGatewayReplicas) every row renders one replica,
+// so the pods rule and the arming are both off on every row; the agreement still
+// holds and is still checked. TestLeaderRolePodsRuleVerbsAboveOneReplica keeps
+// the verbs of the multi-replica rule pinned meanwhile.
 func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -7642,5 +7646,34 @@ func TestDeploymentEnvCannotMoveTheWatcherMetricsPort(t *testing.T) {
 	}
 	if found[0] != "9095" {
 		t.Errorf("spec.deployment.env moved the watcher's metrics port to %q", found[0])
+	}
+}
+
+// TestLeaderRolePodsRuleVerbsAboveOneReplica pins the verbs of the leader Role's
+// pods rule at a multi-replica count, read from leaderRoleRules directly because
+// the replica cap keeps every spec-driven render at one replica and so renders
+// the rule nowhere. It is the agent identity's only write grant on workloads, so
+// a verb added to it is worth a red test before the cap lifts (#3016).
+func TestLeaderRolePodsRuleVerbsAboveOneReplica(t *testing.T) {
+	var found bool
+	for _, r := range leaderRoleRules(3) {
+		if !slices.Contains(r.Resources, "pods") {
+			continue
+		}
+		found = true
+		if !slices.Equal(r.Verbs, []string{"get", "patch"}) {
+			t.Errorf("leader Role pods rule grants %v, want [get patch]", r.Verbs)
+		}
+		if !slices.Equal(r.Resources, []string{"pods"}) {
+			t.Errorf("leader Role pods rule reaches %v, want [pods]", r.Resources)
+		}
+	}
+	if !found {
+		t.Error("no pods rule at three replicas")
+	}
+	for _, r := range leaderRoleRules(1) {
+		if slices.Contains(r.Resources, "pods") {
+			t.Errorf("a pods rule at one replica: %v", r)
+		}
 	}
 }

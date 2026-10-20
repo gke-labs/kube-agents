@@ -1454,7 +1454,8 @@ Sizing the two volumes together has an upgrade cost, because `volumeClaimTemplat
 immutable and the template sizes only the claims it creates. An install that predates it
 therefore needs both halves done to it: the operator widens the existing claim in place
 (online, with the volume still mounted) and recreates the StatefulSet with Orphan
-propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`,
+propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`;
+the widening is `growDataClaim`, which `reconcilePVC` also runs on the agent's own claim,
 and both are best-effort in the direction that matters — a StorageClass without
 `allowVolumeExpansion` leaves a smaller volume and a bounded migration rather than a failed
 reconcile that would take the agent down with it.

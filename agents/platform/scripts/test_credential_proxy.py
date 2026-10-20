@@ -9690,6 +9690,7 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     a store recording every git call it makes."""
 
     TOKEN = "glpat-SENTINEL-must-never-appear"
+    READ_TOKEN = "glpat-READ-SENTINEL-must-never-appear"
 
     def setUp(self):
         import content_workspace
@@ -9734,6 +9735,33 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     def _config_of(self, subcommand):
         return [config for argv, config in self.calls if argv[1] == subcommand]
 
+    def _forges_with_read_token(self):
+        """The forges file the operator renders when the forge has credentialsRef:
+        `readTokenPath` set, and the file there only if the Secret has the key."""
+        path = self.base / "forges-read.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(self.base / "token"),
+             "readTokenPath": str(self.base / "read-token"), "allowedPaths": ["acme"]},
+        ]}))
+        return path
+
+    def _with_read_token_path(self):
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            self.registry = credential_proxy.providers.Registry()
+        patcher = mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _store_read_token(self):
+        read = self.base / "read-token"
+        read.write_text(self.READ_TOKEN)
+        return str(read)
+
+    def _helper_file(self, config):
+        """The token file the forge's git helper reads, from one git call's config."""
+        return dict(config)["credential.https://gitlab.com.helper"].split()[1]
+
     def _commit(self, handle):
         self.store.commit(
             handle, "platform-agent/change", "feat: a change",
@@ -9756,6 +9784,87 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
         self.assertEqual([()], self._config_of("clone"))
         self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
         self.assertIn("presents none", "\n".join(logs.output))
+        # This forges file names no readTokenPath, so the warning blames the
+        # operator that rendered it, not the Secret.
+        self.assertIn("names no readTokenPath", "\n".join(logs.output))
+
+    def test_a_context_gitlab_repository_clones_with_the_stored_read_token(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            workspace = self.store.open("gitlab.com/acme/notes")
+        [config] = self._config_of("clone")
+        self.assertEqual("", dict(config)["credential.helper"])
+        self.assertEqual(read, self._helper_file(config))
+        self.assertTrue(workspace.credential.stored_token)
+        dumped = json.dumps(self.calls)
+        self.assertNotIn(self.READ_TOKEN, dumped)
+        self.assertNotIn(self.TOKEN, dumped)
+
+    def test_a_secret_without_the_read_token_key_clones_a_context_repository_with_none(self):
+        # The path is configured, but the Secret lacks the key, so the
+        # operator's optional projection mounts no file: today's behaviour.
+        self._with_read_token_path()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            workspace = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual([()], self._config_of("clone"))
+        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
+        self.assertIn("presents none", "\n".join(logs.output))
+        self.assertIn(credential_proxy.FORGE_READ_TOKEN_KEY, "\n".join(logs.output))
+        # A key added later is presented on the next open, with no restart.
+        read = self._store_read_token()
+        self.calls.clear()
+        self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[0]))
+
+    def test_the_read_token_never_reaches_a_write_route(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        token = str(self.base / "token")
+        # The content workspace: a managed repository's clone, fetch and push
+        # present the write token's helper, never the read token's.
+        managed = self.store.open("gitlab.com/acme/infra")
+        self._commit(managed.handle)
+        self.store.push(managed.handle, "platform-agent/change")
+        for subcommand in ("clone", "fetch", "push"):
+            with self.subTest(subcommand=subcommand):
+                configs = self._config_of(subcommand)
+                self.assertTrue(configs)
+                for config in configs:
+                    self.assertEqual(token, self._helper_file(config))
+        # A context repository clones with the read token and is never
+        # pushable: the write gate refuses it before any push.
+        context = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[-1]))
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(self.store, context.handle)
+        # The API routes and `/v1/vcs/publish`: the broker's transport and git
+        # runner present `forge.credential`, the write token.
+        git_configs = []
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            broker = vcs_broker.VcsBroker(
+                self.base / "vcs",
+                git_runner=lambda argv, cwd, check=True, config=(): git_configs.append(config),
+            )
+        forge, repo = broker.registry.resolve("gitlab.com/acme/infra")
+        self.assertEqual({"PRIVATE-TOKEN": self.TOKEN}, broker._transport(forge, repo)._headers())
+        broker._git_for(forge, repo)(self.base, "push")
+        self.assertEqual(token, self._helper_file(git_configs[0]))
+        # `/v1/forge/refresh` has nothing to make current for a stored token,
+        # read-only or not, and presents neither.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a stored token")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler._handle_forge_refresh()
+        self.assertEqual([(HTTPStatus.OK, {"status": "nothing to refresh", "forge": "gitlab"})], replies)
+        self.assertNotIn(self.READ_TOKEN, json.dumps(self.calls + replies))
 
     def test_a_path_outside_allowed_paths_is_refused_at_open_and_at_the_gate(self):
         with self.assertRaises(self.cw.ContentWorkspaceError):

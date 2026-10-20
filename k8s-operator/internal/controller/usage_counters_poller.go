@@ -618,8 +618,18 @@ func (p *UsageCounterPoller) reader() client.Reader {
 // its streak closed, since a count left open behind a leadership change or
 // a restart would meet the next cold start's one failed read and make it a
 // Warning.
+// usagePollGatewayReplicas is the gateway replica count targets reads the leader
+// rule against: the rendered count, which the operator caps at one
+// (supportedGatewayReplicas). It is a variable so the multi-replica tests can
+// still exercise the leader rule for the redesign in
+// https://github.com/gke-labs/kube-agents/issues/3016.
+var usagePollGatewayReplicas = func(deployment *agentv1alpha1.DeploymentSpec) int32 {
+	replicas, _ := resolveDeploymentReplicasAndStrategy(deployment)
+	return replicas
+}
+
 func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]usageTarget, map[string]bool, error) {
-	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	replicas := usagePollGatewayReplicas(agent.Spec.Deployment)
 	runsGateway := func(pod *corev1.Pod) bool {
 		leads := replicas <= 1 || pod.Labels[gatewayLeaderLabel] == gatewayLeaderLabelValue
 		return leads && usageContainerReady(pod, platformAgentContainerName)
