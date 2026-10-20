@@ -3893,6 +3893,13 @@ def test_extract_infra_failure_reason_classifier() -> None:
         )
         == "rate_limit"
     )
+    # failure_reason=context_length (non-infra reason under prefix) -> None
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=context_length): max context"
+        )
+        is None
+    )
 
 
 def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
@@ -4004,7 +4011,7 @@ def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
 def test_a_429_blocked_card_unblocked_and_ready_at_settle_remains_graded(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """A card 429-blocked and retired, then unblocked to ready at settle, records ceiling and remains graded."""
+    """A card 429-blocked and retired, then unblocked to ready at settle, records the status discrepancy and remains graded."""
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4239,11 +4246,51 @@ def test_a_triage_card_at_deadline_on_api_lane_records_ceiling_once(
 
     result = KubeAgentsHarness().run("Check cards.")
 
-    ceiling_errors = [e for e in result.errors if harness.DELEGATION_CEILING_MARKER in e]
-    assert len(ceiling_errors) == 1
-    assert ceiling_errors == [
+    assert result.errors == [
         f"{harness.DELEGATION_CEILING_MARKER}: delegated tasks did not finish within 0s: {t1} (triage)"
     ]
+
+
+def test_a_triage_card_on_mute_agent_exit_does_not_record_unsettled_status_discrepancy(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card still in triage on a mute agent exit does not record a spurious unsettled status discrepancy."""
+    t1 = _TASK_ID
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and show t1 in triage
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_show", {"task_id": t1}, {"task": {"id": t1, "status": "triage"}, "runs": []}, "s1"),
+            _text("Delegated, currently in triage."),
+        ),
+        _turn(_text("still investigating")),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx < 3:
+                return ""
+            payload = {
+                "statuses": {t1: "triage"},
+                "summaries": {},
+                "errors": {},
+                "block_kinds": {t1: "transient"},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert any("reported no status for 3 turns running" in e for e in result.errors)
+    assert not any("but triage at settle" in e for e in result.errors)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
 
 
 def test_a_429_blocked_card_unblocked_and_re_failed_for_own_fault_remains_graded(

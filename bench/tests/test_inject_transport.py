@@ -2699,7 +2699,7 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
 def test_a_card_unblocked_between_poll_and_final_read_on_inject_remains_graded(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A card unblocked between the poll that ended the loop and the final read remains graded and records ceiling."""
+    """A card unblocked between the poll that ended the loop and the final read remains graded and records the status discrepancy."""
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
