@@ -7,9 +7,6 @@
 # where traces landing shows.
 # Tier: nightly (new case; presubmit admission is earned on record).
 #
-# Domain: none (KNOWN_NO_DOMAIN in scripts/validate_bench_cases.py) — this
-# case grades the agent's own observability skill, not a fleet domain.
-#
 # The kube-agents-observability skill's trace latency analyzer reads Cloud
 # Trace. In the sandbox the only route to a Google API is the credential
 # broker: `gcloud` is the broker's shim, whose allowlist prints no access
@@ -83,6 +80,7 @@
 # Isolation class: read-only (nothing created or applied).
 id: observability-trace-latency-brokered
 name: Trace latency analysis completes through the broker, with no token in any command
+domain: observability
 prompt: >-
   Use the kube-agents-observability skill's trace latency analyzer
   (scripts/analyze_trace_latency.py) against this install's own Google Cloud
@@ -101,9 +99,6 @@ expected_output: >-
 infrastructure:
   deployer: noop
 validated: false
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
 
 verification_spec:
   - name: the-analyzer-ran-to-a-trace-breakdown

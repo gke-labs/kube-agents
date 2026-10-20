@@ -1,0 +1,88 @@
+# NIGHTLY — an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: security (Cluster Agent). Journey: a user asks for one cluster's
+# security audit; the Platform Agent hands it to that cluster's Cluster
+# Agent, which runs the audit script its gke-workload-security skill names
+# and reports what the script printed.
+#
+# What it catches. A Cluster Agent's terminal runs in the shell sandbox,
+# which stages none of the Cluster Agent's skill trees; the scripts its
+# skills run are under /opt/data/scripts (deploy/sandbox/Dockerfile). A skill
+# command that names its script relative to the skill folder
+# (`./scripts/audit_cluster.sh`) resolves to nothing from the card's working
+# directory. Observed on main: the worker searched for the script
+# (`find / -name audit_cluster.sh`) and ran the first copy it found, or a
+# call by the profile's skill path printed `No such file or directory`. The
+# answer can still read right, so the checks grade the route: a Cluster Agent
+# did the work, ran /opt/data/scripts/audit_cluster.sh against seeded-a, and
+# no call's result shows the script missing. A copy found by a search runs
+# from its own path, so the required pattern fails it. The residual: once
+# the script is staged, a worker that searches first and then runs the staged
+# copy passes, so a skill command that drifts off the staged path is caught
+# only when the worker tries that command and the missing-file result lands
+# in the window below. bench/tests/test_cluster_agent_security_audit_patterns.py
+# pins the command and result shapes.
+#
+# The run is read as a text pattern rather than `required_runs`: the worker
+# types `bash <path>/audit_cluster.sh`, as SOUL.md dictates for preflight,
+# and a run through `bash <file>` is not credited there.
+#
+# The result check opens its window at the first result any worker call in
+# the card's lineage returns, and grades only calls issued in a later turn.
+# A Cluster Agent runs cluster_preflight.sh before any diagnostics
+# (agents/cluster/SOUL.md), so a missing script shows in the window unless
+# the worker skips preflight, or chains or parallelizes the audit with it in
+# that same first turn.
+#
+# No planted defect: the script reads the cluster's own configuration, and
+# any seeded cluster has one. Isolation class: read-only. Eligible tier:
+# nightly.
+id: cluster-agent-security-audit-script
+name: A Cluster Agent runs its security audit script from the card's workspace
+prompt: >-
+  Have the Cluster Agent for the seeded-a cluster run the security audit
+  script from its gke-workload-security skill against seeded-a, and report
+  each check the script prints with its PASS, FAIL or WARN result.
+expected_output: >-
+  The Platform Agent delegates the audit to seeded-a's Cluster Agent, which
+  runs audit_cluster.sh for seeded-a and reports each check the script
+  printed (Workload Identity, Network Policy, Shielded Nodes, Binary
+  Authorization, Private Cluster) with its PASS, FAIL or WARN result. No change is
+  made to the cluster.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: security
+
+owner: toshiowang
+
+# No fixtures: the seeded fleet's standing clusters are the target, and every
+# check reads the run's transcript.
+fixtures: []
+
+verification_spec:
+  - name: a-cluster-agent-did-the-work
+    role: objective
+    check:
+      type: worker_agents
+      required_agents: ["cluster-.+"]
+  - name: the-audit-script-ran-from-the-skill-path
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      after_result_pattern: '[\s\S]'
+      required_patterns:
+        # The path the skill names, so a copy found some other way does not count.
+        - '(?:/opt/data/scripts/|\bcd\s+/opt/data/scripts/?\s*(?:&&|;|\n)\s*(?:(?:bash|sh)\s+)?(?:\./)?)audit_cluster\.sh[''"]?\s+[''"]?seeded-a\b'
+      forbidden_result_patterns:
+        - 'audit_cluster\.sh[''"]?: (?:[Nn]o such file or directory|(?:command )?not found|[Pp]ermission denied)'
+  - name: report-carries-the-script-results
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["Workload Identity", "Shielded Nodes"]
+      # Word-bounded so "password" does not count; the result words do.
+      any_of_patterns: ['(?i)\b(?:pass|fail|warn)(?:e[ds]|s|ings?|ure)?\b']

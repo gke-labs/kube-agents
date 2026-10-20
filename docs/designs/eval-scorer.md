@@ -1076,8 +1076,8 @@ periodic's timeout comment; the fixed provision-and-deploy term is inside that f
 why it sits far below the unit-loop speed-ups measured under [Open items](#open-items)), at which
 that night projected to ~470–490 minutes — `360m` would truncate most nights, and the job gates
 nothing, so a long night costs a lease and nothing else. The thirty-nine-task matrix since
-2026-09-16 prices at ~775–795 serial minutes (the budget paragraph in
-`hack/eval/nightly-cases.txt`), which at 1.15× is ~675–690 — over `480m` — and fits only if the
+2026-09-16 prices at ~775–795 serial minutes (the budget paragraph, now
+frozen in `hack/eval/nightly-budget-history.txt`), which at 1.15× is ~675–690 — over `480m` — and fits only if the
 nightly, alone on the quota and two lanes wider, realises ~1.65×; the first nights measure it
 (#1491). The fan-out is
 `EVAL_TASK_PARALLELISM=6`, wider than the presubmit's 4, because the nightly is alone on the model
@@ -1288,7 +1288,9 @@ is sayable.
 
 **Step 1 — this run's number.** `judged_means(reps)` averages each judged metric over the
 repetitions that were actually **scored** (outcome pass or fail). Blocked and infra repetitions are
-excluded: a judge that scored a run the harness never completed is scoring an artefact.
+excluded: a judge that scored a run the harness never completed is scoring an artefact. Each metric's
+`n` counts only the repetitions that carry it, so a score the judge failed to return shrinks `n`; the
+eval script (presubmit and nightly) asks for a missing `OutcomeValidity` once more before grading (`kube_agents_bench/rejudge.py`).
 
 **Step 2 — main's number.** `_pool_judged()` combines the `judged` blocks of the pooled baseline
 records into one mean per metric, **weighted by each block's own `n`** so 20 runs of evidence

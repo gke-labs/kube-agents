@@ -273,6 +273,48 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.
 
+## `sa-role-watch` says when the agent's account holds more than `read-only`
+
+The install grants the agent's Google service account the `read-only`
+permission set, and the installer warns about an admin role in a `custom` set,
+but only when the set is chosen. A role granted afterwards, by hand or by
+another tool, is what the Google-hosted GKE MCP server acts with when the agent
+container calls it on that account's credentials, and nothing in the product
+said so. `sa_role_watch.py` is that check.
+
+Each tick reads, through the shell sandbox and so through the credential
+broker, the `PlatformAgent` in the agent's namespace and the ServiceAccount it
+runs the agent and broker pods as. The ServiceAccount's
+`iam.gke.io/gcp-service-account` annotation is the account the agent
+container's own credentials resolve to; the CR's
+`spec.security.workloadIdentityFederation`, when both its fields are set, is the
+one the broker impersonates instead, and both are checked. With federation
+armed, an absent annotation is said once, since the agent container then has no
+Google credential of its own; with neither, there is no account to check and the
+job reports a check failure, once. A role bound to the ServiceAccount's own
+Workload Identity principal is not checked (#3450). Then `gcloud projects get-iam-policy` runs for the management project and
+each project in the resolved `spec.scope` (`fleet_scope_targets`), four at a
+time, and every role bound to one of those accounts that is not in the script's
+`READ_ONLY_ROLES` is a finding. `tests/test_agent_iam_ceiling.py` holds that
+list equal to `read_only_roles` in the full-install composition.
+
+It keeps a ledger at `profiles/platform/cron/sa_role_watch.json`, the way
+`stall-watch` does, so chat hears a role on the tick it first appears and again
+when it goes. A role still held is said again once a day, on the first tick from
+12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats: a
+grant said once in a busy channel can be missed, and nothing else would raise it
+again. Any other tick on an unchanged account prints nothing. That is why it can run
+hourly: a fresh install or a new grant is named within the hour, and a quiet
+hour costs one `kubectl` pair and one policy read per project, no model turn. A
+project whose policy cannot be read keeps its last answer and its failure is
+said once. So does a project missing from a scope the tick could read only in part (the
+render unreadable, or members the reconcile has not resolved), and the partial
+scope is said once. Losing the shell sandbox mid-tick is one failure line, not
+one per project. It reads project-level bindings only: a role granted on a folder,
+the organisation or a group is not in that answer, and reading those needs
+verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
+is reported like any other grant, and repeated daily like one.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is

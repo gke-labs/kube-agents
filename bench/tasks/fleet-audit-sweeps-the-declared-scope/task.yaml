@@ -53,9 +53,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: fleet-audits
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # No fixture role exists for the out-of-scope project yet (see the header and #1865).
 fixtures: []
 

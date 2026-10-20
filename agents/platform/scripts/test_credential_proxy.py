@@ -29,6 +29,7 @@ from unittest import mock
 
 import credential_proxy
 import credential_proxy_client
+import feedback_broker
 import gke_endpoint
 import providers
 import vcs_broker
@@ -9689,6 +9690,7 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     a store recording every git call it makes."""
 
     TOKEN = "glpat-SENTINEL-must-never-appear"
+    READ_TOKEN = "glpat-READ-SENTINEL-must-never-appear"
 
     def setUp(self):
         import content_workspace
@@ -9733,6 +9735,33 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
     def _config_of(self, subcommand):
         return [config for argv, config in self.calls if argv[1] == subcommand]
 
+    def _forges_with_read_token(self):
+        """The forges file the operator renders when the forge has credentialsRef:
+        `readTokenPath` set, and the file there only if the Secret has the key."""
+        path = self.base / "forges-read.json"
+        path.write_text(json.dumps({"forges": [
+            {"provider": "github", "host": "github.com"},
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": str(self.base / "token"),
+             "readTokenPath": str(self.base / "read-token"), "allowedPaths": ["acme"]},
+        ]}))
+        return path
+
+    def _with_read_token_path(self):
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            self.registry = credential_proxy.providers.Registry()
+        patcher = mock.patch.object(credential_proxy, "forge_registry", return_value=self.registry)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _store_read_token(self):
+        read = self.base / "read-token"
+        read.write_text(self.READ_TOKEN)
+        return str(read)
+
+    def _helper_file(self, config):
+        """The token file the forge's git helper reads, from one git call's config."""
+        return dict(config)["credential.https://gitlab.com.helper"].split()[1]
+
     def _commit(self, handle):
         self.store.commit(
             handle, "platform-agent/change", "feat: a change",
@@ -9755,6 +9784,87 @@ class ContentWorkspaceOnGitLabTest(unittest.TestCase):
         self.assertEqual([()], self._config_of("clone"))
         self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
         self.assertIn("presents none", "\n".join(logs.output))
+        # This forges file names no readTokenPath, so the warning blames the
+        # operator that rendered it, not the Secret.
+        self.assertIn("names no readTokenPath", "\n".join(logs.output))
+
+    def test_a_context_gitlab_repository_clones_with_the_stored_read_token(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            workspace = self.store.open("gitlab.com/acme/notes")
+        [config] = self._config_of("clone")
+        self.assertEqual("", dict(config)["credential.helper"])
+        self.assertEqual(read, self._helper_file(config))
+        self.assertTrue(workspace.credential.stored_token)
+        dumped = json.dumps(self.calls)
+        self.assertNotIn(self.READ_TOKEN, dumped)
+        self.assertNotIn(self.TOKEN, dumped)
+
+    def test_a_secret_without_the_read_token_key_clones_a_context_repository_with_none(self):
+        # The path is configured, but the Secret lacks the key, so the
+        # operator's optional projection mounts no file: today's behaviour.
+        self._with_read_token_path()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            workspace = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual([()], self._config_of("clone"))
+        self.assertIsInstance(workspace.credential, credential_proxy.providers.NoCredential)
+        self.assertIn("presents none", "\n".join(logs.output))
+        self.assertIn(credential_proxy.FORGE_READ_TOKEN_KEY, "\n".join(logs.output))
+        # A key added later is presented on the next open, with no restart.
+        read = self._store_read_token()
+        self.calls.clear()
+        self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[0]))
+
+    def test_the_read_token_never_reaches_a_write_route(self):
+        self._with_read_token_path()
+        read = self._store_read_token()
+        token = str(self.base / "token")
+        # The content workspace: a managed repository's clone, fetch and push
+        # present the write token's helper, never the read token's.
+        managed = self.store.open("gitlab.com/acme/infra")
+        self._commit(managed.handle)
+        self.store.push(managed.handle, "platform-agent/change")
+        for subcommand in ("clone", "fetch", "push"):
+            with self.subTest(subcommand=subcommand):
+                configs = self._config_of(subcommand)
+                self.assertTrue(configs)
+                for config in configs:
+                    self.assertEqual(token, self._helper_file(config))
+        # A context repository clones with the read token and is never
+        # pushable: the write gate refuses it before any push.
+        context = self.store.open("gitlab.com/acme/notes")
+        self.assertEqual(read, self._helper_file(self._config_of("clone")[-1]))
+        with self.assertRaises(self.cw.RepositoryNotManaged):
+            credential_proxy.require_managed_workspace(self.store, context.handle)
+        # The API routes and `/v1/vcs/publish`: the broker's transport and git
+        # runner present `forge.credential`, the write token.
+        git_configs = []
+        with mock.patch.dict(os.environ, {"VCS_FORGES_CONFIG": str(self._forges_with_read_token())}):
+            broker = vcs_broker.VcsBroker(
+                self.base / "vcs",
+                git_runner=lambda argv, cwd, check=True, config=(): git_configs.append(config),
+            )
+        forge, repo = broker.registry.resolve("gitlab.com/acme/infra")
+        self.assertEqual({"PRIVATE-TOKEN": self.TOKEN}, broker._transport(forge, repo)._headers())
+        broker._git_for(forge, repo)(self.base, "push")
+        self.assertEqual(token, self._helper_file(git_configs[0]))
+        # `/v1/forge/refresh` has nothing to make current for a stored token,
+        # read-only or not, and presents neither.
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 1 << 20
+        body = json.dumps({"provider": "gitlab", "repository": "https://gitlab.com/acme/infra"}).encode()
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.executor = types.SimpleNamespace(
+            refresh_forge_credential=lambda *a: self.fail("no refresh for a stored token")
+        )
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler._handle_forge_refresh()
+        self.assertEqual([(HTTPStatus.OK, {"status": "nothing to refresh", "forge": "gitlab"})], replies)
+        self.assertNotIn(self.READ_TOKEN, json.dumps(self.calls + replies))
 
     def test_a_path_outside_allowed_paths_is_refused_at_open_and_at_the_gate(self):
         with self.assertRaises(self.cw.ContentWorkspaceError):
@@ -14127,6 +14237,117 @@ class ApiRelayQueryStrippingTest(unittest.TestCase):
             "keyed=1&my_access_token=2&oauth_token_x=3",
             credential_proxy.strip_credential_query_keys("keyed=1&my_access_token=2&oauth_token_x=3"),
         )
+
+
+class FeedbackRouteTest(_ExecRouteServer):
+    """`POST /v1/feedback/submit`: the sandbox's one way to file a kube-agents report.
+
+    The verb lives on the broker because the shell sandbox's NetworkPolicy
+    reaches DNS and the broker only; feedback_broker.py owns the wire path and
+    test_feedback_broker.py its behaviour. These tests hold the route: who may
+    call it, how a refusal and an answer travel, and that a malformed body is a
+    400 rather than a traceback.
+    """
+
+    GOOD_PAYLOAD = {
+        "title": "credential proxy dies silently",
+        "kind": "Bug",
+        "happened": "the sidecar crash-loops and nothing surfaces it",
+        "user_confirmed": True,
+    }
+
+    def post_as(self, role, body, raw=False):
+        principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:platform-agent-shell", uid="u", groups=(), role=role
+        )
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{feedback_broker.ROUTE}",
+            data=body if raw else json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # The authenticator rather than _authenticated: the route-role gate
+        # (403) runs inside _authenticated, and this class tests that gate.
+        authenticator = mock.Mock()
+        authenticator.authenticate.return_value = principal
+        with mock.patch.object(CredentialProxyHandler, "authenticator", authenticator):
+            try:
+                with urllib.request.urlopen(request) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.loads(error.read())
+
+    def test_only_the_shell_role_reaches_the_route(self):
+        with mock.patch.object(feedback_broker, "submit") as submit:
+            for role in (credential_proxy.CALLER_ROLE_SESSION, credential_proxy.CALLER_ROLE_CHAT):
+                status, _ = self.post_as(role, self.GOOD_PAYLOAD)
+                self.assertEqual(status, 403, role)
+            submit.assert_not_called()
+
+    def test_a_blocked_payload_is_400_with_the_reason_and_links(self):
+        status, body = self.post_as(
+            credential_proxy.CALLER_ROLE_SHELL, {**self.GOOD_PAYLOAD, "user_confirmed": False}
+        )
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertIn("user_confirmed", body["reason"])
+        self.assertEqual(body["fallback"]["form"], feedback_broker.SHORT_LINK)
+
+    def test_a_submission_answers_200_with_the_brokers_object(self):
+        answer = {
+            "status": "SUBMITTED",
+            "issue_url": "https://github.com/gke-labs/kube-agents/issues/1",
+            "fallback": feedback_broker.FALLBACK,
+        }
+        with mock.patch.object(feedback_broker, "submit", return_value=answer) as submit:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body), (200, answer))
+        self.assertEqual(submit.call_args.args[0]["title"], self.GOOD_PAYLOAD["title"])
+
+    def test_an_unreachable_form_is_400_blocked_not_a_traceback(self):
+        with mock.patch.object(
+            feedback_broker, "submit", side_effect=feedback_broker.Blocked("could not reach the feedback form (x)")
+        ):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertIn("could not reach", body["reason"])
+
+    def test_a_full_broker_answers_503_busy_not_a_dropped_connection(self):
+        busy = credential_proxy.CommandSlotUnavailable("every slot is taken")
+        with mock.patch.object(CredentialProxyHandler, "_request_slot", side_effect=busy):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual(status, 503)
+        self.assertIn("error", body)
+
+    def test_an_unexpected_broker_error_is_400_blocked(self):
+        with mock.patch.object(feedback_broker, "submit", side_effect=IndexError("list index out of range")):
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, self.GOOD_PAYLOAD)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertEqual(body["fallback"], feedback_broker.FALLBACK)
+
+    def test_the_title_is_redacted_before_it_is_logged(self):
+        token = "ghp_" + "a" * 36
+        payload = {**self.GOOD_PAYLOAD, "title": token + " leaked in the relay log"}
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, payload)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
+        self.assertTrue(any("feedback submit" in line for line in logs.output))
+
+    def test_a_refusal_reason_is_redacted_before_it_is_logged(self):
+        token = "ghp_" + "b" * 36
+        payload = {**self.GOOD_PAYLOAD, "kind": token}
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, payload)
+        self.assertEqual((status, body["status"]), (400, "BLOCKED"))
+        self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
+        self.assertNotIn(token, body["reason"])
+
+    def test_a_non_json_body_is_400(self):
+        status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, b"not json", raw=True)
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+
 
 
 if __name__ == "__main__":

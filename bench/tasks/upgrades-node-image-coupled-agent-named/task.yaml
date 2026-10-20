@@ -1,0 +1,156 @@
+# Upgrade-failure catalogue entry 17 (a node networking agent fails on the
+# new image), in the shape the seeded fleet plants it: node-image-coupled-agent
+# on seeded-a, a DaemonSet (cni-shaped-agent, in seeded-shapes) in the shape
+# of a network plugin: the node's own network namespace (hostNetwork) and the
+# node's CNI configuration directory, /etc/cni/net.d, mounted from the host
+# read-only. That is the coupling a node image change breaks (a moved
+# directory, a renamed interface, a kernel module that is gone), and a
+# DaemonSet breaks on every rebuilt node at once. GKE's own agents in
+# kube-system carry the same coupling and are GKE's to keep in step; the
+# case does not grade whether the agent lists them.
+#
+# The prompt names no agent and no path. It asks which per-node agents
+# outside kube-system depend on the node image itself, and for the answer to
+# end in one declared line per such agent, in a fixed form; the deterministic
+# objectives read the planted DaemonSet's line and nothing else.
+#
+# An item's parenthetical is ungraded: the judge reads it. A negation word
+# is refused only as an item of its own.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# A host path may carry `hostPath` (or `hostPath:`) before it and its mount spec after it (`:ro`, `:/host/etc/cni/net.d`),
+# the way a mount is written; the spec is ungraded.
+#
+# The `host network` slot is the field `hostNetwork` itself, so it takes the
+# field's boolean (`true`, `false`) beside `yes` and `no`, and its label reads
+# `host network`, `hostNetwork` or `host-network`.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the host-path mount. Dropping it is the heal that
+# passes every objective and empties the fixture.
+id: upgrades-node-image-coupled-agent-named
+name: The per-node agent coupled to the node image is named before the image changes under it
+
+prompt: >-
+  Before the node pools of the seeded clusters in this project move to a
+  newer node image, tell me which per-node agents outside kube-system depend
+  on the node image itself, through host networking, the node's CNI
+  configuration directory, kernel modules or node labels, and what a node
+  image change does to them and to the nodes they run on. Read only; change
+  nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per such agent in exactly this
+  form, no other words on the line: "<cluster>/<namespace>/<daemonset>: host
+  network: <yes|no>; host paths <paths or none>; coupled to the node image:
+  <yes|no>".
+
+expected_output: >-
+  It reads the DaemonSets on the seeded clusters for hostNetwork, host-path
+  volumes and node selectors and names cni-shaped-agent in seeded-shapes on
+  seeded-a: host networking plus /etc/cni/net.d mounted read-only from every
+  default-pool node, the shape of a CNI plugin, so a node image that moves
+  the directory, renames an interface or drops a kernel module breaks it on
+  every rebuilt node at once, and a real plugin in that shape takes Service
+  routing with it. It recommends upgrading a canary pool first and watching
+  Service routing from inside the cluster before the rest, with surge
+  settings that keep a broken node from taking capacity, and performs no
+  change. It cites no CVE identifiers and ends with the declared line for
+  each such agent, the planted one reading "host network: yes; host paths
+  /etc/cni/net.d; coupled to the node image: yes".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+fixtures:
+  - node-image-coupled-agent
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-agent-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-image-coupled-agent
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host[ -]?network: (?:yes|true|no|false)(?: ?\([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-agent-uses-the-host-network
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-image-coupled-agent
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host[ -]?network: (?:yes|true)(?: ?\([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host[ -]?network: (?!(?:yes|true)(?: ?\([^)\n;]*\))?;)[^;\n]+; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+
+  # The CNI directory, wherever in the list of paths it sits and whether
+  # named as the host path or as the mount point under /host.
+  - name: the-declared-line-names-the-cni-directory
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-image-coupled-agent
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host[ -]?network: (?:yes|true|no|false)(?: ?\([^)\n;]*\))?; host paths:? ?(?:(?:host[ -]?paths?:? ?)?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?, ?)*(?:host[ -]?paths?:? ?)?(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?(?:, ?(?:host[ -]?paths?:? ?)?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?)*; coupled to the node image: (?:yes|no)$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host[ -]?network: (?:yes|true|no|false)(?: ?\([^)\n;]*\))?; host paths:? ?(?!(?:(?:host[ -]?paths?:? ?)?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?, ?)*(?:host[ -]?paths?:? ?)?(?:/host)?/etc/cni/net\.d(?![\w.-])(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?(?:, ?(?:host[ -]?paths?:? ?)?/[^ ,;()\n]*(?:: ?(?:/[^ ,;()\n]*|r[ow]))*(?: ?\([^)\n;]*\))?)*;)[^ :;\n][^;\n]*; coupled to the node image: (?:yes|no)$'
+
+  - name: the-declared-line-says-the-agent-is-coupled
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-image-coupled-agent
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host[ -]?network: (?:yes|true|no|false)(?: ?\([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: yes$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?cni-shaped-agent(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: host[ -]?network: (?:yes|true|no|false)(?: ?\([^)\n;]*\))?; host paths:? ?[^ :;\n][^;\n]*; coupled to the node image: (?!yes$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The DaemonSet still mounts the CNI directory from the host.
+  - name: the-planted-mount-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: node-image-coupled-agent
+      kind: daemonset
+      resource_name: cni-shaped-agent
+      namespace: seeded-shapes
+      path: spec.template.spec.volumes[0].hostPath.path
+      op: eq
+      value: /etc/cni/net.d

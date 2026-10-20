@@ -45,14 +45,15 @@ global:
   # name only, which is the layout `make mirror-images` writes:
   #   ghcr.io/gke-labs/kube-agents/platform-agent
   #     -> registry.example.com/kube-agents/platform-agent
-  # It also reaches the images the chart does not render itself — the agent
-  # and logging-sidecar references the operator resolves at runtime — so a
+  # It also reaches the first-party images the chart does not render itself —
+  # the agent and shell sandbox references the operator resolves at runtime — so a
   # PlatformAgent created without an explicit spec.deployment.image still
-  # pulls from the mirror.
+  # pulls from the mirror. (The fluent-bit logging sidecar follows
+  # thirdPartyImageRegistry below).
   imageRegistry: ""
   # Registry prefix for images this project does not build (LiteLLM,
-  # fluent-bit). Defaults to imageRegistry; set it only when the mirror keeps
-  # third-party images under a different path.
+  # fluent-bit, GitHub token minter, Hindsight). Empty leaves them on their
+  # upstream registries; set it only when the mirror keeps third-party images.
   thirdPartyImageRegistry: ""
   # Secrets holding credentials for a mirror that has to be authenticated to
   # (Harbor, Artifactory). Leave empty when the nodes can read it themselves —
@@ -90,9 +91,9 @@ global:
 operator:
   enabled: true
   # Extra environment variables for the controller manager. The image
-  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE,
-  # FLUENT_BIT_IMAGE) are
-  # rendered from global.imageRegistry and the image values below, so a
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE)
+  # are rendered from global.imageRegistry (and FLUENT_BIT_IMAGE from
+  # global.thirdPartyImageRegistry) and the image values below, so a
   # mirrored install does not need to hand-write them; anything set here is
   # appended afterwards and therefore still wins.
   extraEnv: []
@@ -193,13 +194,32 @@ operator:
     # not also create the CR (platformAgent.enabled=false), and after the first
     # install once the operator is serving.
     failurePolicy: Ignore
+  # Memory here is the manager's cache, and the cache holds one entry per
+  # object in the cluster, not per install: every informer it starts is
+  # cluster-wide, Owns() included (it filters events by owner, it does not
+  # scope the watch). Pods are read live instead, because they outnumber
+  # every other kind, as Secrets and the A2A bookkeeping objects already
+  # were. What stays: Deployments, StatefulSets,
+  # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
+  # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
+  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
+  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # where their CRDs are installed). Deployments, StatefulSets, Services and
+  # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
+  # carrying a whole pod template, so a cluster with thousands of them is the
+  # case to raise this for; the rest grow with its namespaces, and the
+  # operator is one pod per install.
+  #
+  # Sized from a measurement rather than the Kubebuilder scaffold it replaces:
+  # on a 3-node install the store holds 675 objects in 3.7 MiB of live heap,
+  # in a process of 22 MiB RSS. Kept in step with k8s-operator/config/manager.
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 512Mi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 128Mi
 
 telemetry:
   # Where OpenTelemetry signals go. One setting, three consumers: the PlatformAgent CR,
@@ -241,14 +261,31 @@ litellm:
   # the otel callback's DNS failure aborts every LLM request. Enable it once
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
-  # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai, openai_compatible. The provider's API
-  # key must exist in the credentials Secret — except vertex_ai, which
-  # authenticates with Workload Identity instead, and openai_compatible, whose
-  # key (OPENAI_COMPATIBLE_API_KEY) is optional; see openaiCompatible below.
+  # model-default routes to <modelProvider>/<modelDefaultName>. Providers with
+  # a default model: gemini, anthropic, openai, vertex_ai, sap (SAP AI Core).
+  # The provider's API key must exist in the credentials Secret — except
+  # vertex_ai, which authenticates with Workload Identity instead;
+  # openai_compatible, whose key (OPENAI_COMPATIBLE_API_KEY) is optional (see
+  # openaiCompatible below); and sap, whose credentials arrive through
+  # envFromSecret. Any other LiteLLM provider slug (azure, bedrock, ...) is
+  # accepted when modelDefaultName names the model; its credentials arrive
+  # through envFromSecret too.
   modelProvider: gemini
+  # A Secret in the release namespace mounted whole into the gateway container
+  # as environment variables (envFrom, optional: a missing Secret does not stop
+  # the pod). Create it yourself; the chart only names it. It carries whatever
+  # the LiteLLM provider reads from the environment: AICORE_SERVICE_KEY and
+  # AICORE_RESOURCE_GROUP for sap, AZURE_API_KEY and AZURE_API_BASE for azure,
+  # and for openai_compatible the OAuth2 client-credentials trio
+  # OPENAI_COMPATIBLE_OAUTH_TOKEN_URL / _CLIENT_ID / _CLIENT_SECRET, which turns
+  # on the gateway's token-exchange hook. A key the chart also sets from the
+  # credentials Secret (GEMINI_API_KEY, HOSTED_VLLM_API_KEY, ...) wins over the
+  # same name here. envFrom does not roll the pods on a Secret change:
+  # `kubectl rollout restart deployment/litellm` after rotating it.
+  envFromSecret: ""
   # Empty selects the per-provider default (mirrors common.sh).
-  # A Claude model (anthropic, or vertex_ai with a claude-* name) gets
+  # A Claude model (anthropic, vertex_ai with a claude-* name, or sap with an
+  # anthropic--* name) gets
   # additional_drop_params: temperature, top_p and top_k under every alias,
   # because Claude Opus 5 refuses them and a caller may send them anyway.
   # Chart-only; the kustomize dev base carries no such key.
@@ -331,7 +368,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.104.0
+    tag: v1.106.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -806,6 +843,12 @@ platformAgent:
       pullPolicy: Always
     availability:
       # Number of agent pods. `null` omits the field; the operator defaults to 1.
+      # The operator runs the gateway as a single replica: a value above 1 is
+      # rendered as 1 and the PlatformAgent's ReplicasLimited condition says so.
+      # High availability is not supported yet: a second replica's leader
+      # election has no in-cluster token, and the data volumes are
+      # ReadWriteOnce. The chart's quota preflight still multiplies by this
+      # value, so above 1 it over-counts the agent pod.
       replicas: null
       # RuntimeClass for the agent pod. "gvisor" asks for GKE Sandbox kernel
       # isolation, and is the default because the agent executes model-authored
@@ -846,6 +889,11 @@ platformAgent:
     #
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
+    #
+    # KUBEAGENTS_AUDIT_AUTO_PROMOTE: "false" stops the fleet audits from
+    # opening remediation pull requests on their own; a `/remediate` on a
+    # ledger still opens one. The operator forwards it to the shell sandbox,
+    # where the audits run.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in

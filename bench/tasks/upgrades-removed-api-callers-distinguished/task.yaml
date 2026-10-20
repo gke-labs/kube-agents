@@ -1,0 +1,144 @@
+# Upgrade-failure catalogue entry 6 (a served API version is removed), read
+# against the fleet the way the catalogue separates it from entry 9: the
+# seeded clusters call no API their next minor stops serving, and seeded-a's
+# deprecated-api-caller writes Endpoints v1, which is deprecated and stays
+# served. An answer that files the Endpoints writer under "removed" would
+# send an operator to fix a break that is not coming; one that misses it
+# under "deprecated" loses the count the later removal turns into an outage.
+#
+# The prompt names no API and no cluster. It asks, per seeded cluster, which
+# APIs the next minor removes are still called and, separately, which APIs in
+# use are deprecated but still served, and for the answer to end in one
+# declared line per cluster, in a fixed form; the deterministic objectives
+# read those lines and nothing else. The next minor itself is whatever the
+# cluster's channel offers above it; the patterns accept any MAJOR.MINOR, with
+# or without a v or a patch, and "none" for a cluster at its channel's top.
+#
+# An item's parenthetical is ungraded: the judge reads it. A bare word is
+# not an item: a second API carries its version (before the kind, after it,
+# or opening its parenthetical) or is one (a bare `group/version`), or it is
+# an API path or a dotted group, so a negation standing as an item is refused
+# whatever the word; only the graded token stands bare.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`.
+#
+# The token's version and the word `api` compose in either order
+# (`endpoints v1 api`, `endpoints api v1`, `endpoints (core/v1) api`). The
+# removed-API slot's `none` may stand in parentheses or read `none found`.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the writer's suspend flag.
+id: upgrades-removed-api-callers-distinguished
+name: Removed APIs still called are told apart from deprecated APIs still served before the next minor
+
+prompt: >-
+  We are about to move the seeded clusters in this project to their next
+  minor version. For each cluster, tell me which API versions that next minor
+  stops serving are still being called, and separately which APIs in use are
+  deprecated but will still be served after the upgrade. Read only; change
+  and upgrade nothing. End your answer with one line per seeded cluster in
+  exactly this form, no other words on the line: "<cluster>: next minor
+  <MAJOR.MINOR, or none if the channel offers nothing above the current
+  minor>; removed apis still called: <comma-separated list, or none>;
+  deprecated but still served: <comma-separated list, or none>".
+
+expected_output: >-
+  It works out each seeded cluster's next minor from its version and channel,
+  checks the audit log (k8s.io/removed-release and k8s.io/deprecated labels)
+  or GKE's deprecation insights, and reports that no seeded cluster calls an
+  API its next minor removes, while seeded-a's
+  seeded-deprecation/legacy-endpoints-writer calls Endpoints v1, deprecated
+  since 1.33 and still served. It says the two differ: the first would break
+  on upgrade day, the second needs a migration to EndpointSlice before a
+  removal is scheduled. It performs no change and cites no CVE identifiers.
+  It ends with the declared line for every seeded cluster, seeded-a's reading
+  "removed apis still called: none; deprecated but still served: v1
+  endpoints" and the others "removed apis still called: none" with whatever
+  deprecated callers they find (GKE's own kube-system endpoint controller
+  writes Endpoints on every cluster, so "v1 endpoints" there is right too).
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# The four roles are one per seeded slot, the way the zonal case names them:
+# the runner's per-slot credential is how a declared-line objective tells a
+# cluster the agent missed from a cluster the project does not have
+# (`fixture_roles`), and the role whose defect this case reads is the first.
+fixtures:
+  - deprecated-api-caller
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:b}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:c}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)(?=.*^^{cluster:d}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n?!]+; deprecated but still served: [^\n]+$)'
+
+  # The fleet plants no caller of a removed API. The Endpoints writer
+  # filed here is the misclassification the case exists for.
+  - name: no-seeded-cluster-is-said-to-call-a-removed-api
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: \(?none\)?(?: (?:found|detected))?(?: ?\([^)\n;]*\))?; deprecated but still served: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: (?!\(?none\)?(?: (?:found|detected))?(?: ?\([^)\n;]*\))?;)[^;\n]+; deprecated but still served: [^\n]+$'
+
+  - name: seeded-a-keeps-the-endpoints-writer-under-deprecated
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-api-caller
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?:(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|(?:/apis?/)?[a-z0-9.-]+/v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= ?\((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: ?\([^)\n;]*(?:\)|$))?(?:, ?|,? and ))*(?:/?api/)?(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1(?: api)?|\.v1(?: api)?| api(?: v1)?| ?\(core/v1(?:\)(?: api)?|$)| ?\(v1(?:\)(?: api)?|$))?(?: ?\([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|(?:/apis?/)?[a-z0-9.-]+/v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= ?\((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: ?\([^)\n;]*(?:\)|$))?)*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: next minor:? ?(?:v?\d+\.\d+[^;\n]*|none[^;\n]*); removed apis still called: [^;\n]+; deprecated but still served: (?!(?:(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|(?:/apis?/)?[a-z0-9.-]+/v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= ?\((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: ?\([^)\n;]*(?:\)|$))?(?:, ?|,? and ))*(?:/?api/)?(?:(?:core/)?v1[ /])?endpoints?(?:[ /]v1(?: api)?|\.v1(?: api)?| api(?: v1)?| ?\(core/v1(?:\)(?: api)?|$)| ?\(v1(?:\)(?: api)?|$))?(?: ?\([^)\n;]*(?:\)|$))?(?:(?:, ?|,? and )(?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])(?:(?:/apis?/)?(?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?[ /](?!(?:none|nothing|no|n[/.]?a|nil|null|zero|0|not|nope|nah|never|neither|false|nowhere|and)\b|[-\u2014\u2013])[a-z][a-z0-9.]*|[a-z][a-z0-9]* (?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|(?:/apis?/)?[a-z0-9.-]+/v\d+(?:(?:alpha|beta)\d+)?(?![\w./-])|[a-z][a-z0-9-]+(?:\.[a-z0-9-]+)+|[a-z][a-z0-9]*(?= ?\((?:[a-z0-9.-]+/)?v\d+(?:(?:alpha|beta)\d+)?\b))(?: ?\([^)\n;]*(?:\)|$))?)*$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  - name: the-planted-writer-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: deprecated-api-caller
+      kind: cronjob
+      resource_name: legacy-endpoints-writer
+      namespace: seeded-deprecation
+      path: spec.suspend
+      op: eq
+      value: false

@@ -69,9 +69,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: consistency
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster; roles are defined in bench/tf/fleet/fixtures.json and the rule
 # is docs/designs/bench-fleet-catalog.md. The unlabelled host cluster is not

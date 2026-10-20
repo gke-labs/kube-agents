@@ -12,6 +12,7 @@ from command_policy import (
     _IMPERSONATION_FLAGS,
     _KUBECTL_FILE_WRITE_FLAGS,
     _KUBECTL_IDENTITY_FLAGS,
+    _GOVERNED_TOOLS,
     _gcloud_asks_for_help,
     _gcloud_words_and_flag,
 )
@@ -29,6 +30,16 @@ GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # Fewer fenced commands than this means the parser or the path went stale
 # and the allowed-commands test would pass by finding nothing.
 MIN_FENCED_COMMANDS = 8
+# The gitops-helm-chart skill declares a chart for a reconciler to install and
+# never runs helm, which the policy does not govern. Its reads are checked the
+# same way, and every shipped skill (gke-basics' reference among them, whose
+# helm lines it replaced) is checked for a helm command.
+HELM_CHART_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "gitops-helm-chart"
+HELM_INVOCATION = re.compile(
+    r"(?im)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)\s*helm\s"
+)
+SHIPPED_SKILL_DIRS = sorted(Path(__file__).resolve().parents[2].glob("*/skills/*/"))
+MIN_HELM_CHART_FENCED_COMMANDS = 6
 
 
 def _gcloud_words(argv):
@@ -40,6 +51,22 @@ def _gcloud_words(argv):
     """
     words, _ = _gcloud_words_and_flag(argv)
     return words
+
+
+def _fenced_shell_commands(skill_dir):
+    """Every command line in the fenced shell blocks of a skill's Markdown."""
+    commands = []
+    for path in sorted(skill_dir.rglob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        for block in FENCED_SHELL_BLOCK.findall(text):
+            for line in block.replace("\\\n", " ").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                argv = shlex.split(line)
+                if argv:
+                    commands.append((path.name, argv))
+    return commands
 
 
 class KubectlReadOnlyTest(unittest.TestCase):
@@ -1794,18 +1821,11 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
 
     @staticmethod
     def _fenced_commands():
-        commands = []
-        for path in sorted(CONFIG_CONNECTOR_SKILL_DIR.rglob("*.md")):
-            text = path.read_text(encoding="utf-8")
-            for block in FENCED_SHELL_BLOCK.findall(text):
-                for line in block.replace("\\\n", " ").splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    argv = shlex.split(line)
-                    if argv and argv[0] in GOVERNED_TOOLS:
-                        commands.append((path.name, argv))
-        return commands
+        return [
+            (name, argv)
+            for name, argv in _fenced_shell_commands(CONFIG_CONNECTOR_SKILL_DIR)
+            if argv[0] in GOVERNED_TOOLS
+        ]
 
     def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
         commands = self._fenced_commands()
@@ -1837,6 +1857,62 @@ class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
               "--cluster=c", "--location=us-central1"], "node-pools update"),
             (["gcloud", "compute", "firewall-rules", "update", "allow-ssh",
               "--project=p"], "firewall-rules update"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class TheHelmChartSkillStaysInsideThePolicy(unittest.TestCase):
+    """agents/platform/skills/gitops-helm-chart declares a third-party chart in
+    the GitOps repository for the customer's reconciler to install. Every
+    kubectl and gcloud command its fenced blocks spell must be one the policy
+    allows; none may be helm, which the policy does not govern and the shell
+    cannot run against a cluster; and the writes and the token it leaves alone
+    must be refused.
+    """
+
+    def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
+        commands = [
+            (name, argv)
+            for name, argv in _fenced_shell_commands(HELM_CHART_SKILL_DIR)
+            if argv[0] in GOVERNED_TOOLS
+        ]
+        self.assertGreaterEqual(
+            len(commands), MIN_HELM_CHART_FENCED_COMMANDS,
+            f"found {len(commands)} governed commands under "
+            f"{HELM_CHART_SKILL_DIR}; the skill moved or the fence parser is stale",
+        )
+        for name, argv in commands:
+            with self.subTest(file=name, command=" ".join(argv)):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{decision.rule_id}: {decision.message}")
+
+    def test_helm_is_ungoverned_so_no_skill_tells_the_model_to_run_it(self):
+        # A broker shim for helm would be a write path no allowlist checks,
+        # which is why the skill declares charts instead. If helm ever becomes
+        # governed, this skill's premise changed and needs rereading.
+        self.assertNotIn("helm", _GOVERNED_TOOLS)
+        self.assertIn(HELM_CHART_SKILL_DIR, SHIPPED_SKILL_DIRS)
+        # Matched by pattern rather than shlex: some skills' blocks carry
+        # quoting that spans lines, and a helm after `&&` or `|` counts too.
+        for skill_dir in SHIPPED_SKILL_DIRS:
+            for path in sorted(skill_dir.rglob("*.md")):
+                for block in FENCED_SHELL_BLOCK.findall(path.read_text(encoding="utf-8")):
+                    for line in block.splitlines():
+                        with self.subTest(skill=skill_dir.name, file=path.name, line=line):
+                            self.assertIsNone(HELM_INVOCATION.search(line))
+
+    def test_what_the_skill_leaves_to_the_reconciler_is_refused(self):
+        # The Red Lines name the apply, the create and the token for helm as
+        # things the agent never does; each is asserted refused so the skill
+        # cannot describe a boundary the policy does not hold.
+        for argv, desc in (
+            (["kubectl", "apply", "-f", "helmrelease.yaml"], "apply"),
+            (["kubectl", "apply", "--dry-run=server", "-f", "application.yaml"],
+             "server-side dry-run"),
+            (["kubectl", "create", "-f", "rootsync.yaml"], "create"),
+            (["kubectl", "create", "namespace", "cert-manager"], "create namespace"),
+            (["gcloud", "auth", "print-access-token"], "access token"),
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
@@ -1991,6 +2067,50 @@ class LocalRenderTests(unittest.TestCase):
             ["kubectl", "scale", "deploy/x", "--replicas=3", "--dry-run=client", "--dry-run=none"],
         ):
             self.assertFalse(command_policy.local_render(argv), argv)
+
+
+class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
+    """submit-suggestion's "Deleting a resource" (#3077) answers a delete
+    request with a stated stop. It must run no cluster or cloud command, and
+    the direct delete it rules out must be one the policy refuses, or the
+    section would rest on a refusal that is not there. Its fences sit inside
+    a numbered list, so they are indented.
+    """
+
+    SKILL = Path(__file__).resolve().parents[1] / "skills" / "submit-suggestion" / "SKILL.md"
+    INDENTED_FENCE = re.compile(r"^( *)```(?:bash|sh|shell)\n(.*?)^\1```", re.MULTILINE | re.DOTALL)
+
+    def _section(self):
+        text = self.SKILL.read_text(encoding="utf-8")
+        start = text.index("### Deleting a resource")
+        return text[start:text.index("\n### ", start + 1)]
+
+    def test_the_section_runs_no_cluster_or_cloud_command(self):
+        # Every case in the section ends in a stated stop: its fences are the
+        # preflight and a search of the working copy, and none runs kubectl
+        # or gcloud, so nothing in it can coach a write the policy refuses.
+        lines = []
+        for _, block in self.INDENTED_FENCE.findall(self._section()):
+            lines += [line.strip() for line in block.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(lines), 3, "the section's fences moved or the parser is stale")
+        for line in lines:
+            with self.subTest(command=line):
+                argv = shlex.split(line)
+                self.assertNotIn(argv[0], GOVERNED_TOOLS)
+
+    def test_the_direct_delete_is_refused(self):
+        for argv in (
+            ["kubectl", "delete", "namespace", "scratch-ns"],
+            ["kubectl", "delete", "ns", "scratch-ns", "--wait=false"],
+            ["kubectl", "annotate", "namespace", "scratch-ns", "kube-agents.x-k8s.io/state=deleted"],
+        ):
+            with self.subTest(command=" ".join(argv)):
+                self.assertFalse(evaluate(argv).allowed)
+
+    def test_the_section_writes_no_marker_manifest(self):
+        # The #3077 failure was a manifest carrying an invented annotation.
+        # The section names no annotation or label of its own to write.
+        self.assertNotRegex(self._section(), r"kube-agents\.x-k8s\.io/|state: deleted")
 
 
 if __name__ == "__main__":

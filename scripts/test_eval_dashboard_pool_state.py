@@ -205,9 +205,11 @@ class OneProject(ScanHarness):
         # health.py words the pool-drift advice from this: a finding here
         # reds no leased run, so a 403 on the project is the change's.
         self.assertTrue(pool_state.passes_leases("gke/host-otel-scope"))
+        self.assertTrue(pool_state.passes_leases(verifier.FINDING_COMPUTE_SWEEPER_MISSING))
         self.assertFalse(pool_state.passes_leases(FINDING))
         self.assertFalse(pool_state.passes_leases("gke/cluster/seeded-b"))
-        self.assertEqual(frozenset(f for f in (FINDING, "gke/host-otel-scope", "gke/cluster/seeded-b") if pool_state.passes_leases(f)), verifier.LEASE_SILENT_FINDINGS)
+        candidates = (FINDING, "gke/host-otel-scope", verifier.FINDING_COMPUTE_SWEEPER_MISSING, "gke/cluster/seeded-b")
+        self.assertEqual(frozenset(f for f in candidates if pool_state.passes_leases(f)), verifier.LEASE_SILENT_FINDINGS)
 
     def test_the_stub_exits_the_way_the_verifier_does(self):
         # The fixtures' exit codes sit on the check records; the stub must

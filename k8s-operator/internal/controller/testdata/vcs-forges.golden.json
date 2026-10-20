@@ -1,1 +1,1 @@
-{"forges":[{"provider":"github","host":"github.com"},{"provider":"gitlab","host":"gitlab.com","tokenPath":"/var/run/kube-agents/forge-credentials/gitlab/token","allowedPaths":["acme","platform"]}]}
+{"forges":[{"provider":"github","host":"github.com"},{"provider":"gitlab","host":"gitlab.com","tokenPath":"/var/run/kube-agents/forge-credentials/gitlab/token","readTokenPath":"/var/run/kube-agents/forge-credentials/gitlab/read-token","allowedPaths":["acme","platform"]}]}

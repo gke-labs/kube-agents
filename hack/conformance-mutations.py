@@ -428,16 +428,21 @@ Mutation(
         # never sees it: GitHub resolves `uses:` case-insensitively, so this
         # runs the identical action. The test walked straight past it and
         # reported OK until the filter was lowercased. Pins the action SHA
-        # because the flip and the ref are not contiguous otherwise -- a pin
-        # bump reports STALE here, and the fix is to paste the new SHA in.
+        # because the flip and the ref are not contiguous otherwise -- so the
+        # anchor stops just before the pin and the replacement inserts a
+        # case-flipped checkout step ahead of the original. The anchor holds no
+        # SHA, so a Dependabot bump of actions/checkout leaves it intact; the
+        # SHA in the replacement is never matched against the file.
         "B4-pull-request-target-checkout-case",
         ".github/workflows/risk_classify.yml",
-        ("        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
+        ("      - name: Checkout the default branch\n"
+         "        uses: actions/checkout@",
+         "      - name: Checkout the default branch\n"
+         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\n"
          "        with:\n"
-         "          ref: ${{ github.event.repository.default_branch }}",
-         "        uses: Actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1\n"
-         "        with:\n"
-         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}"),
+         "          ref: ${{ github.event.Pull_Request.HEAD.sha }}\n"
+         "      - name: Checkout the default branch, displaced\n"
+         "        uses: actions/checkout@"),
         "test_B4_no_pull_request_target_workflow_checks_out_the_pull_request",
         "capitalise both the action name and the expression context while "
         "repointing the ref, which is the shape a case-flip evasion takes",
@@ -1012,8 +1017,11 @@ Mutation(
     Mutation(
         "C4-unpinned-action",
         ".github/workflows/prettier.yml",
-        ("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
-         "actions/checkout@v7"),
+        # Anchored on the prefix, not the pin, so a Dependabot bump leaves it
+        # intact: the replacement floats the ref to a tag and turns the old SHA
+        # into a trailing comment.
+        ("uses: actions/checkout@",
+         "uses: actions/checkout@v7 # was "),
         "test_C4_every_third_party_action_is_pinned_to_a_commit",
         "float one action back to a tag, which a Dependabot conflict "
         "resolution can produce by hand",
@@ -1021,7 +1029,9 @@ Mutation(
     Mutation(
         "C4-base-image-digest",
         "tags.env",
-        ("@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294", ""),
+        # Anchored on the separator, not the digest, so a base-image bump
+        # leaves it intact: the digest moves to a comment line below the tag.
+        ("@sha256:", "\n# was @sha256:"),
         "test_C4_the_agent_base_image_is_pinned_by_digest",
         "drop the digest and keep the tag, which reads as equivalent",
     ),
@@ -1247,12 +1257,13 @@ Mutation(
     ),
     Mutation(
         "C5-leader-reaches-configmaps",
-        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
-        # rule renders only above one replica, and the HA fixture is the only
-        # golden that sets it.
+        # platformagent-ha.yaml: the fixture that asks for more than one
+        # replica. Since the operator caps the gateway at one replica (#3027),
+        # its leader Role renders the leases rule only, so the mutation widens
+        # that rule.
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
-        ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
-         "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
+        ("    resources:\n      - leases\n    verbs:\n",
+         "    resources:\n      - configmaps\n      - leases\n    verbs:\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",
         "add the ConfigMap lock client-go's configmapsleases mode still "
         "supports, which turns a coordination role into a namespace read-write "
@@ -2111,12 +2122,33 @@ Mutation(
     Mutation(
         "A3-session-sends-a-notify",
         "a2a/authcallout/session.go",
-        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t},',
-         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(pod, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.NotifySubjectGchat,\n\t\t},'),
         "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
-        "derive a session pod a publish grant on the notify subject, so a "
-        "session can post its result to the home channel itself. The gateway "
-        "then posts as the install's bot for whatever runs in a session pod",
+        "derive a session pod (and, through the shared executorGrants, an "
+        "AgentProfile pod) a publish grant on the notify subject, so a session "
+        "can post its result to the home channel itself. The gateway then "
+        "posts as the install's bot for whatever runs in that pod",
+    ),
+    Mutation(
+        "A3-agent-answers-the-board",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack)\n",
+         "\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aBoardReplySubjects)\n"),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "give the agent publish on the board reply namespace, so the agent "
+        "container can answer the gateway's board request itself. What it "
+        "answers is drawn on the Slack Home tab of every admitted member",
+    ),
+    Mutation(
+        "A3-session-asks-the-board",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, "*"),\n\t\t\tlib.BoardSubject,\n\t\t},'),
+        "test_A3_a_board_request_has_one_writer_and_its_answer_has_one",
+        "derive a session pod a publish grant on the board request, so "
+        "whatever runs in a session pod can make the bridge read session-kv "
+        "on its behalf",
     ),
     Mutation(
         "A3-session-per-task-wildcard",
@@ -2358,7 +2390,12 @@ def _run_suite() -> tuple[set[str], set[str]]:
         capture_output=True,
         text=True,
         timeout=300,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        # CONFORMANCE_MUTATION_RUN: the suite's anchor self-check
+        # (test_every_mutation_still_finds_the_text_it_edits) skips itself
+        # here. A mutation removes its own anchor by design, so that check
+        # would fire on every mutated tree and read every verdict as NOISY or
+        # OVERSHOT; this script checks the anchor itself before mutating.
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CONFORMANCE_MUTATION_RUN": "1"},
     )
     output = process.stdout + process.stderr
     failed = set(re.findall(r"^(?:FAIL|ERROR): (\S+)", output, re.MULTILINE))

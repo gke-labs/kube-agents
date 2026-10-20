@@ -215,6 +215,16 @@ const (
 	a2aNotifySubjectSlack  = "chat.notify.slack"
 	a2aNotifyReplySubjects = "chat.notify.reply.agent.>"
 
+	// The board route (a2a/gateway/board.go, a2a/hermes-bridge/board.go,
+	// a2a/lib/board.go): the Slack Home tab's read of the agent pod's board.
+	// The gateway publishes the first and reads the second; the bridge reads
+	// the first and publishes the second; no other principal holds either.
+	// The reply has a namespace of its own for the notify reply's reason: a
+	// bridge grant reaching the gateway's _INBOX could forge its JetStream
+	// replies.
+	a2aBoardSubject       = "chat.board"
+	a2aBoardReplySubjects = "chat.board.reply.gateway.>"
+
 	// a2aBridgeUser is the Hermes bridge sidecar's principal. Static, not
 	// callout — see bridgeIdentity for why a token cannot separate it from
 	// the container above.
@@ -419,6 +429,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// never binds the bucket, precisely so this grant does not have to
 		// include a STREAM.INFO read.
 		"$KV.cap.root.*",
+		// The Home tab's board request (a2aBoardSubject): an empty body,
+		// answered by the bridge on a2aBoardReplySubjects.
+		a2aBoardSubject,
 	}
 	publish = append(publish, a2aGatewayJetStreamGrants()...)
 	publish = append(publish,
@@ -473,6 +486,8 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 			// card's report back to its conversation, one subject per backend.
 			a2aNotifySubjectGchat,
 			a2aNotifySubjectSlack,
+			// The bridge's answer to a board request.
+			a2aBoardReplySubjects,
 			"_INBOX.gateway.>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was
@@ -824,6 +839,13 @@ func bridgeIdentity() a2aIdentity {
 	// granted it: `$KV.cap.hop.<...>.*`. This executor never attenuates,
 	// because it never delegates onward.
 	publish = append(publish, "a2a.cap.verify."+a2aBridgeAddressee)
+	// The answer to the gateway's board request (a2aBoardSubject), relayed
+	// from session-kv's GET /v1/board. Read-only data, and the bridge
+	// answers rather than the agent container because it already holds
+	// session-kv's bearer. The trust boundary is the pod's, as for every
+	// grant here: the agent's terminal can reach this password, so a board
+	// it forged would show on the Home tab to the members the gateway admits.
+	publish = append(publish, a2aBoardReplySubjects)
 
 	return a2aIdentity{
 		user:     a2aBridgeUser,
@@ -844,6 +866,8 @@ func bridgeIdentity() a2aIdentity {
 			"a2a.tasks." + a2aBridgeAddressee + ".*.in",
 			"$KV.runtime-state.>",
 			"a2a.cap.reply." + a2aBridgeAddressee + ".>",
+			// The gateway's board request.
+			a2aBoardSubject,
 			"_INBOX." + a2aBridgeUser + ".>",
 		},
 		// Defence in depth rather than a live subtraction. This deny was

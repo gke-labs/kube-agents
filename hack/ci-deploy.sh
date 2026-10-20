@@ -278,19 +278,21 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The next lane's Prow jobs: its on-demand presubmit, its six-hourly periodic
-# on main, and its daily full-catalog nightly on main (the agent on Claude,
-# compared with a today-mode nightly on the same model). Section 2b admits
+# on main, its daily full-catalog nightly on main (the agent on Claude,
+# compared with a today-mode nightly on the same model), and the GitLab
+# lane's nightly under next (EVAL_FORGE=gitlab, hack/eval/gitlab-cases.txt,
+# beside the today-mode GitLab nightly). Section 2b admits
 # the flag on a run whose JOB_NAME is one of these (space-separated, matched
 # whole) or that carries a PULL_NUMBER -- the presubmit is admitted by the
 # second on a pull request and by the first on a Tide batch, the periodic and
-# the nightly only by the first -- and refuses it on any other Prow run, so
+# the nightlies only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today nightly's or a postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. hack/ci-eval-pr.sh keeps such a run out of the baseline
 # recorder on the flag alone, so admitting a job here never lets it write
 # main's window.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The first change: the mode, and the maxSessions section 2b sizes for the
@@ -609,6 +611,20 @@ export IMAGE_TAG="${TAG}"
 # exist; step 5 expands it into the Helm install, where an empty array
 # contributes nothing and the release is byte-for-byte the today one.
 A2A_OPERATOR_ENV_ARGS=()
+# The next lane's audits open no remediation pull request on their own: the
+# inject lane's write safeguard charges any pull request in a repetition's
+# window to the case in flight, and the fleet audits' automatic sweep (the
+# first-run chain included) writes one whenever a pool repository declares a
+# workload with a major finding (#3439). spec.deployment.env carries the
+# switch; the operator forwards it to the shell sandbox, where finish runs.
+# Empty on the today lane, so that release stays byte-for-byte the same.
+MODE_NEXT_ENV_ARGS=()
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  MODE_NEXT_ENV_ARGS=(
+    --set-string "platformAgent.deployment.env[2].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[2].value=false"
+  )
+fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
 # RC_COMMIT_SHA unset is the presubmit and everything this script did before the
@@ -885,7 +901,7 @@ else
 fi
 
 # The mode flip exists for the next lane's runs: a pull request's, or one of
-# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightly on main).
+# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightlies on main).
 # A flagged run appends nothing to main's baseline and publishes no dashboard
 # (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
 # separately refuses a pull request's sample, bench/baselines/README.md), so
@@ -1622,6 +1638,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
+    ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e

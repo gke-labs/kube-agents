@@ -32,11 +32,13 @@ Federation for GKE** cannot authenticate to Google Cloud APIs. Typical symptoms:
 ## Read-only boundary
 
 This skill is **diagnostic and non-interactive**. It only **reads** cluster,
-IAM, and logging state and **proposes** fixes as commands or GitOps manifest
-changes for a human to apply. It must **never** create or modify IAM bindings,
+IAM, and logging state and **proposes** fixes as a pull request to the GitOps
+repository for a human to review. It must **never** create or modify IAM bindings,
 KSA annotations, node pools, or clusters automatically. When evidence is missing
 or the fix requires a privileged change, summarize findings and hand off to a
 human (see Step 7).
+
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
 
 ## Output discipline (apply to every conclusion)
 
@@ -49,9 +51,9 @@ When you report a diagnosis, always:
     state plainly that it is **not** a KSA annotation or IAM binding problem;
     when the cause is a missing role on a target resource, state that Workload
     Identity itself is **not** misconfigured.
-3.  **Give the exact remediation as a proposed change for a human** — a concrete
-    `gcloud` command (or GitOps manifest edit) with the real identifiers filled
-    in — and never apply it automatically.
+3.  **Give the exact remediation as a proposed change for a human** — a pull
+    request with the real identifiers filled in — and never apply it
+    automatically.
 
 --------------------------------------------------------------------------------
 
@@ -143,19 +145,16 @@ gcloud container node-pools describe "{node_pool}" --cluster "{cluster}" \
 -   Empty workload pool → Workload Identity is **not enabled on the cluster**.
 -   Node-pool mode is `GCE_METADATA` (or empty) → the node pool is **not** using
     the GKE metadata server; this is the usual cause of "runs as the node
-    default service account". Remediation: enable
-    `--workload-metadata=GKE_METADATA` on the node pool (propose to a human;
-    recreates nodes). This is a **node-pool configuration** problem — not a KSA
+    default service account". Remediation: run the pool's workloads on the GKE
+    metadata server through `spec.nodeConfig.workloadMetadataConfig.mode` on the
+    pool's `ContainerNodePool`, proposed as a pull request through
+    `gcp-config-connector` (a mutable field, so an edit to the existing pool; GKE re-creates the pool's nodes to apply it, restarting its workloads). This is a **node-pool configuration** problem — not a KSA
     annotation or IAM binding problem — so do not change KSA annotations or IAM
     bindings to fix it. When the symptom is "runs as the node default service
     account", say so explicitly: the root cause is the node pool's
     `workloadMetadataConfig.mode`, and the KSA annotation and IAM bindings are
-    **ruled out** as the cause. Propose the exact fix, e.g.:
-
-```bash
-gcloud container node-pools update "{node_pool}" --cluster "{cluster}" \
-  --location "{location}" --workload-metadata=GKE_METADATA
-```
+    **ruled out** as the cause. Propose that exact fix for node pool
+    `{node_pool}`.
 
 --------------------------------------------------------------------------------
 
@@ -224,15 +223,11 @@ gcloud asset search-all-iam-policies \
 If no binding grants the required role on the target resource, **that missing
 role is the root cause** (and Workload Identity itself is **not**
 misconfigured). Present the fix as a **proposed change for a human to apply** —
-the exact `add-iam-policy-binding` with the real principal and role — never
-applying it automatically. For example, for direct binding on a project-level
-resource:
-
-```bash
-gcloud projects add-iam-policy-binding "{TARGET_PROJECT_ID}" \
-  --member="principal://iam.googleapis.com/projects/{PROJECT_NUMBER}/locations/global/workloadIdentityPools/{PROJECT_ID}.svc.id.goog/subject/ns/{NAMESPACE}/sa/{KSA_NAME}" \
-  --role="{REQUIRED_ROLE}"   # e.g. roles/storage.objectViewer
-```
+the IAM binding with the real principal and role, as Config Connector YAML
+through `gcp-config-connector` — never applying it automatically. For example,
+for direct binding on a project-level resource, grant `{REQUIRED_ROLE}` (e.g.
+`roles/storage.objectViewer`) on project `{TARGET_PROJECT_ID}` to
+`principal://iam.googleapis.com/projects/{PROJECT_NUMBER}/locations/global/workloadIdentityPools/{PROJECT_ID}.svc.id.goog/subject/ns/{NAMESPACE}/sa/{KSA_NAME}`.
 
 --------------------------------------------------------------------------------
 
@@ -314,13 +309,15 @@ default returns `SERVICEACCOUNT_NAME.svc.id.goog` as the identifier, which is
 not a valid IAM service account email. This is **not** a missing IAM binding and
 does **not** require reverting the setup.
 
-Fix (propose to a human): add the
-`iam.gke.io/return-principal-id-as-email="true"` annotation to the Pod's KSA so
-the metadata server returns the identity in the expected form:
+Fix (propose as a pull request): add the
+`iam.gke.io/return-principal-id-as-email="true"` annotation to the Pod's KSA
+(`{ksa_name}` in `{namespace}`) in its manifest, so the metadata server returns
+the identity in the expected form:
 
-```bash
-kubectl annotate serviceaccount "{ksa_name}" --namespace "{namespace}" \
-  iam.gke.io/return-principal-id-as-email="true"
+```yaml
+metadata:
+  annotations:
+    iam.gke.io/return-principal-id-as-email: "true"
 ```
 
 --------------------------------------------------------------------------------
@@ -330,8 +327,8 @@ kubectl annotate serviceaccount "{ksa_name}" --namespace "{namespace}" \
 -   Present the **root cause + evidence** (the exact error, the missing binding
     / annotation / node-pool mode, or the metadata-server state). Include a
     **Cloud Logging deep link** (see Step 1) to the supporting entries.
--   Propose the fix as a **command or GitOps manifest change** for a human to
-    apply — never modify IAM, KSAs, or node pools automatically.
+-   Propose the fix as a **pull request** for a human to review — never modify
+    IAM, KSAs, or node pools automatically.
 
 **Escalate** (instead of proposing more self-service diagnostics) when either:
 
