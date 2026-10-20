@@ -240,7 +240,8 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		Answer: slackUnescaper.Replace(p.Message.Text)}
 	s.goSession(func() {
 		// Kept first, so the note the modal sends and a 👍 that follows find
-		// the 👎 already there; one KV write, inside the three seconds the
+		// the 👎 already there: a session read and a merge (a read and a
+		// write, again on a race), which must finish inside the three seconds the
 		// modal's trigger lasts.
 		if err := recorder.Rate(rating); err != nil {
 			// The modal says the answer is kept; with nothing kept it
