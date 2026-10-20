@@ -6775,7 +6775,8 @@ main() {
   # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
   # the warning before the apply and the closing summary say it then.
   _confirm_no_home_channel() {
-    local home="${2//[[:space:]]/}" keep=""
+    local home keep=""
+    home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
     print_warning "$(next_home_channel_unset_message "$1")"
     prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
@@ -8275,9 +8276,23 @@ main() {
     echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
   fi
 
+  # The checklists and the closing summary follow the mode the CR is left
+  # on, which a mode set outside this installer can keep from the key.
+  local mode_after_apply="${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
+  # shellcheck disable=SC2034  # read by print_next_home_channel_unset_summary
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode_after_apply" "${slack_enabled:-false}" \
+    "${google_chat_enabled:-false}" "$slack_home_channel" "$google_chat_home_channel")"
   if [ "${google_chat_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
+    # As for Slack below.
+    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
+      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
+      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="$google_chat_enabled" \
+      GCHAT_STEPS_HOME_CHANNEL="$google_chat_home_channel" \
+      GCHAT_STEPS_ALLOWED_USERS="$allowed_users" \
+      GCHAT_STEPS_TOPIC_NAME="$chat_topic_name" \
+      GCHAT_STEPS_SUB_NAME="$chat_sub_name" \
+      bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
   fi
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
@@ -8285,7 +8300,7 @@ main() {
     # what the run applied, which an interview answer install.env does not
     # record makes differ from the file.
     IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
-      SLACK_STEPS_PLATFORM_AGENT_MODE="$platform_agent_mode" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
       SLACK_STEPS_SLACK_ENABLED="$slack_enabled" \
       SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}" \
       SLACK_STEPS_HOME_CHANNEL="$slack_home_channel" \
