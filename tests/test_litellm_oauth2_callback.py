@@ -106,6 +106,11 @@ class _TokenEndpoint:
                 pass
 
             def do_POST(self):
+                if self.path == "/redirect":
+                    self.send_response(302)
+                    self.send_header("Location", "/oauth/token")
+                    self.end_headers()
+                    return
                 length = int(self.headers.get("Content-Length", "0"))
                 form = urllib.parse.parse_qs(self.rfile.read(length).decode())
                 auth = self.headers.get("Authorization", "")
@@ -331,6 +336,39 @@ class TestHook(unittest.TestCase):
             # cert_store_stats counts every loaded certificate; get_ca_certs
             # would skip a throwaway certificate minted without the CA flag.
             self.assertEqual(contexts[0].cert_store_stats()["x509"], real().cert_store_stats()["x509"] + 1)
+
+    def test_a_redirecting_token_url_is_refused_with_the_redirect_status(self):
+        # urllib would follow a 302 with a GET, dropping the form and carrying
+        # the Basic header to the new location; the hook refuses instead and
+        # the credentials never reach the redirect target.
+        env = dict(self.env, **{self.hook.TOKEN_URL_ENV: self.endpoint.url.replace("/oauth/token", "/redirect")})
+        with self.assertRaises(RuntimeError) as refused:
+            self._run({"model": "model-default"}, env=env)
+        self.assertIn("302", str(refused.exception))
+        self.assertEqual(self.endpoint.requests, [], "the credentials must not reach the redirect target")
+
+    def test_a_401_from_the_server_drops_the_cached_token(self):
+        # A token the server stops honouring early (revoked, signing key
+        # rotated) must not be sent until its stated expiry: the failure hook
+        # forgets it, and the next request fetches a new one.
+        instance = self.hook.proxy_handler_instance
+        self.assertEqual(self._run({"model": "model-default"})["api_key"], "tok-1")
+
+        class _Unauthorized(Exception):
+            status_code = 401
+
+        class _Throttled(Exception):
+            status_code = 429
+
+        with mock.patch.object(self.hook, "_router", return_value=_ROUTER):
+            asyncio.run(instance.async_post_call_failure_hook({"model": "model-default"}, _Throttled(), None))
+            self.assertTrue(self.hook._cache.usable(), "a 429 is not a verdict on the token")
+            asyncio.run(instance.async_post_call_failure_hook({"model": "gemini"}, _Unauthorized(), None))
+            self.assertTrue(self.hook._cache.usable(), "another provider's 401 is not about this token")
+            with self.assertLogs(self.hook.logger, level="WARNING"):
+                asyncio.run(instance.async_post_call_failure_hook({"model": "model-default"}, _Unauthorized(), None))
+        self.assertFalse(self.hook._cache.usable())
+        self.assertEqual(self._run({"model": "model-default"})["api_key"], "tok-2")
 
     def test_a_token_url_without_client_credentials_is_a_configuration_error(self):
         with self.assertRaises(ValueError) as err:

@@ -31,7 +31,11 @@ so a gateway on a private CA can still use a public identity provider. A
 response without expires_in is kept for
 DEFAULT_TOKEN_LIFETIME_SECONDS. A failed exchange raises, so the request that
 needed the token fails with that error rather than leaving without a
-credential, and the next request tries again.
+credential, and the next request tries again. A token endpoint that redirects
+is refused with the redirect's status: the request is a credential-bearing
+POST and must not be replayed elsewhere. A server that answers 401 to a
+cached token drops it, so the next request fetches a new one instead of
+waiting out the stated lifetime.
 
 The chart renders this file into the litellm-config ConfigMap only for
 openai_compatible with litellm.envFromSecret set;
@@ -101,6 +105,10 @@ logger = logging.getLogger("litellm_oauth2_callback")
 _blind_warned = False
 
 
+# The status a server answers with for a token it no longer honours.
+UNAUTHORIZED_STATUS = 401
+
+
 class TokenCache:
     """One bearer token and when it stops being safe to send."""
 
@@ -111,6 +119,16 @@ class TokenCache:
 
     def usable(self) -> bool:
         return bool(self.token) and time.monotonic() < self.expires_at - REFRESH_MARGIN_SECONDS
+
+    def drop(self) -> None:
+        self.token, self.expires_at = "", 0.0
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib would turn the POST into a GET and carry the Basic header to the new host; refuse instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 _cache = TokenCache()
@@ -166,7 +184,8 @@ def fetch_token(settings: dict[str, str], ca_bundle: str = "") -> tuple[str, flo
         if ca_bundle:
             context = ssl.create_default_context()
             context.load_verify_locations(cafile=ca_bundle)
-        with urllib.request.urlopen(request, timeout=TOKEN_REQUEST_TIMEOUT_SECONDS, context=context) as response:
+        opener = urllib.request.build_opener(_RefuseRedirects(), urllib.request.HTTPSHandler(context=context))
+        with opener.open(request, timeout=TOKEN_REQUEST_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read().decode())
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"oauth2: the token endpoint answered {exc.code} {exc.reason}") from None
@@ -278,6 +297,21 @@ class OAuth2ClientCredentials(CustomLogger):
             return data
         data[REQUEST_CREDENTIAL_KEY] = await bearer_for(settings, _cache, ca_bundle_of(deployments))
         return data
+
+    async def async_post_call_failure_hook(
+        self, request_data: dict, original_exception: Exception, user_api_key_dict: Any, traceback_str: Any = None
+    ) -> None:
+        # The server no longer honours the token it was sent (revoked, a
+        # rotated signing key, a restarted token store): forget it, so the next
+        # request exchanges for a new one instead of waiting out the stated
+        # lifetime. Only for an alias this hook supplies the token to.
+        if getattr(original_exception, "status_code", None) != UNAUTHORIZED_STATUS or not _cache.token:
+            return None
+        if not hosted_vllm_deployments((request_data or {}).get(MODEL_KEY, ""), _router()):
+            return None
+        _cache.drop()
+        logger.warning("oauth2: the server answered %d to the cached bearer token; dropped it, the next request fetches a new one", UNAUTHORIZED_STATUS)
+        return None
 
 
 _configure_logger()
