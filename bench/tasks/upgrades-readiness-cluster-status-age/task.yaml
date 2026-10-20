@@ -1,0 +1,119 @@
+# A cluster whose status is not RUNNING is held by an operation (catalogue entry 5's after-signal, read before the window).
+#
+# The rule reads a condition that cannot be planted on a healthy seeded cluster
+# (a status other than RUNNING needs a real operation in flight or wedged), so this case does not grade a detection: it grades the
+# rule's declared report line for every seeded cluster in its "no finding" form,
+# which is red on `main` (no rule prints such a line, and an agent cannot
+# invent the numbers it carries) and green once the rule prints it; the rule's
+# unit tests (scripts/test_readiness_rules.py) carry the positive detection on
+# recorded inputs. The prompt asks for one declared line per seeded cluster in
+# a fixed vocabulary copied from the rule's note in the report's note column
+# (`<rule id>: <the rule's text>`) and its JSON (`readiness.notes`); the
+# deterministic objectives read those lines and nothing else, the prose is the
+# judge's.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container, gcloud compute and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: nothing is planted for this
+# case; the four roles below stand for their slots, so the declared-line
+# objectives can tell a cluster the agent missed from a cluster the project
+# does not have. No `worker_commands` objective either: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead.
+id: upgrades-readiness-cluster-status-age
+name: Upgrade readiness names the operation that holds a cluster, and its age, on every cluster
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against each cluster's release channel default and include, per cluster, its status, the newest GKE operation the report found on it (its id, type and start time) and how long ago that operation started, as the cluster-status-age rule's note in the report's note column or its JSON states them; a cluster not RUNNING for more than four hours is that rule's blocker, with the operation that holds it. Read only; change and upgrade nothing. A member may be blocked or carry
+  risks from other rules on the same report; the slots are about this rule
+  only. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: cluster-status-age: status <STATUS>; newest operation <operation id|none>; type <operation type|none>; started <RFC 3339 time|none>; age <age|none>".
+
+expected_output: >-
+  The version table and the readiness table read during this run, with every seeded cluster RUNNING and its newest operation named from the report: the operation id, its type (an UPGRADE_MASTER, UPDATE_CLUSTER or similar), its start time and its age. The answer says what a status other than RUNNING for hours would mean (no change can be applied; freeze changes and, past a few hours, open a support case quoting the operation id) and that no cluster is in that state. It ends with the declared lines, each reading "cluster-status-age: status RUNNING; newest operation <id>; type <type>; started <time>; age <age>" copied from the report. It cites no CVE identifiers and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# No planted defect is read: the four roles are one per slot, and they are how the
+# declared-line objectives tell a cluster the agent missed from a cluster the
+# project does not have.
+fixtures:
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  # The frame every cluster must satisfy, all five slots included.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$)'
+  # RUNNING on every seeded cluster: the fleet's reconcile keeps them so, and a status
+  # other than RUNNING is a finding the judge reads, not this case's premise.
+  - name: the-declared-lines-say-every-cluster-is-running
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status running; newest operation [^;\n]+; type [^;\n]+; started [^;\n]+; age [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status (?!running;)[^;\n]+; newest operation [^\n]+$'
+  # The operation slot is an operation id as GKE spells one, or `none` for a cluster whose
+  # operations the list no longer reaches; an invented value fails here.
+  - name: the-declared-lines-name-an-operation-the-report-listed
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation (?:operation-\d+-[0-9a-f-]+|none); type [^;\n]+; started (?:\d{4}-\d{2}-\d{2}t[0-9:.]+z|none); age [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: cluster-status-age: status [^;\n]+; newest operation (?!(?:operation-\d+-[0-9a-f-]+|none);)[^\n]*$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]

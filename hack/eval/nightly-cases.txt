@@ -936,6 +936,14 @@
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
+# Catalogue entry 2 through the readiness report's control-plane-upgrade-history
+# rule: the capacity failures among each seeded cluster's upgrade and repair
+# operations, against its maintenance window (#3524). Read-only; no planted
+# fixture. Priced at 600s in unit_cost_hint as the first of the five
+# readiness-line cases of that change to launch; every one of the five makes
+# the same reads, and the figure is a ceiling until the nightly record prices them.
+./tasks/upgrades-audit-control-plane-capacity/task.yaml
+
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
@@ -979,6 +987,26 @@
 # median of five clean passes, 237-571s). Nightly from its first merge; a
 # presubmit seat is a later pull request that cites its record.
 ./tasks/upgrades-exclusion-end-date-named/task.yaml
+
+# A cluster held by an operation: the cluster-status-age rule's status, newest
+# operation and age on every seeded cluster (#3524). Read-only; no planted
+# fixture; three units at the 200s default.
+./tasks/upgrades-readiness-cluster-status-age/task.yaml
+
+# The add-on inventory and the known-issues-matrix rule's table over it, one
+# declared line per seeded cluster (#3524). Read-only; no planted fixture;
+# three units at the 200s default.
+./tasks/upgrades-readiness-known-issues/task.yaml
+
+# Catalogue entry 22 through the readiness report's orphan-node-objects rule:
+# the Nodes without an instance behind them, counted on every seeded cluster
+# (#3524). Read-only; no planted fixture; three units at the 200s default.
+./tasks/upgrades-readiness-orphan-node/task.yaml
+
+# The target-patch-valid rule's re-read of the target and the running patch
+# against the channel's valid versions, on every seeded cluster (#3524).
+# Read-only; no planted fixture; three units at the 200s default.
+./tasks/upgrades-readiness-target-patch-valid/task.yaml
 
 # Catalogue entry 20 (images on a retired registry): seeded-a's
 # seeded-shapes/legacy-registry-pull (retired-registry-image),

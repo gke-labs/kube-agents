@@ -3098,6 +3098,11 @@ unit_cost_hint() {
     upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
     upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
     upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
+    # Nightly-only since #3524. A read-only readiness run whose declared line
+    # needs the project's operations list read for every member; unmeasured,
+    # priced at the knowledge probe's band rather than the 200s default so the
+    # other four readiness-line cases of the same change pack after it.
+    upgrades-audit-control-plane-capacity) echo 600 ;;
     *) echo 200 ;;
   esac
 }

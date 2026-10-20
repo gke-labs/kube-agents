@@ -1,0 +1,142 @@
+# Upgrade-failure catalogue entry 21: the load balancer's connection drain outlasts the node's deregistration wait.
+#
+# The rule reads a condition that cannot be planted on a healthy seeded cluster
+# (on the three slots without the fixture), so this case does not grade a detection: it grades the
+# rule's declared report line for every seeded cluster in its "no finding" form,
+# which is red on `main` (no rule prints such a line, and an agent cannot
+# invent the numbers it carries) and green once the rule prints it; the rule's
+# unit tests (scripts/test_readiness_rules.py) carry the positive detection on
+# recorded inputs. The prompt asks for one declared line per seeded cluster in
+# a fixed vocabulary copied from the rule's note in the report's note column
+# (`<rule id>: <the rule's text>`) and its JSON (`readiness.notes`); the
+# deterministic objectives read those lines and nothing else, the prose is the
+# judge's.
+#
+# The patterns name the slots through `{cluster:<slot>}`, which the verifier
+# expands to the cluster the runner recorded for the slot, so a fleet applied
+# with another prefix is graded on its own names.
+#
+# Isolation class: read-only (chat prompt; the script reads with gcloud
+# container, gcloud compute and kubectl get and writes only its own record and
+# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+#
+# No deterministic mutation safeguard, documented: nothing is planted for this
+# case; the four roles below stand for their slots, so the declared-line
+# objectives can tell a cluster the agent missed from a cluster the project
+# does not have. No `worker_commands` objective either: it reads delegated
+# workers' terminals only and errors on a run the router answered itself, so
+# the report's own output is graded through the declared lines instead.
+#
+# Unlike its siblings this case reads a planted fixture: the readiness-lb-drain-timeout
+# role on slot b, a backend service on the default pool's instance group with a
+# 3600-second connection draining timeout, six times GKE's 600-second per-node
+# deregistration wait, behind a TCP health check and no forwarding rule. The
+# slot-b line must name it with its timeout and pool; the other slots read
+# `none`. The backend service is a Compute Engine object no probe or state
+# assertion can address, so the role probes the pool's node and asserts the
+# pool's status; the case is parked in FIXTURE_NOT_READY until the fixture is
+# applied to the pool projects (#3524).
+id: upgrades-readiness-lb-drain-timeout
+name: Upgrade readiness blocks a cluster whose load balancer drains longer than GKE waits per node
+
+prompt: >-
+  For every cluster in this project, run the upgrade readiness check against each cluster's release channel default and include, per cluster, every backend service the report found on the cluster's node pools or NEGs whose connection draining timeout is above the 600 seconds GKE waits per node during a pool upgrade (the lb-connection-draining rule's blocker), with the backend service's name, its draining timeout in seconds and the pool it fronts, and the gcloud command the report gives to fix it; a cluster with none reads none in every slot. Read only; change and upgrade nothing. A member may be blocked or carry
+  risks from other rules on the same report; the slots are about this rule
+  only. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: lb-connection-draining: backend service <name|none>; draining timeout <seconds> s|none; pool <pool|none>".
+
+expected_output: >-
+  The version table and the readiness table read during this run, with the slot-b cluster blocked by the lb-connection-draining rule: its backend service drain-timeout-<prefix>-b drains for 3600 s on pool default-pool, GKE waits 600 s per node during an upgrade, so each surge node's drain times out, and the fix is `gcloud compute backend-services update <name> --global --connection-draining-timeout=600`. The other seeded clusters carry no such backend service. It ends with the declared lines: the slot-b cluster's reading "lb-connection-draining: backend service drain-timeout-<prefix>-b; draining timeout 3600 s; pool default-pool" and the others "lb-connection-draining: backend service none; draining timeout none; pool none". It cites no CVE identifiers, changes no backend service and performs no upgrade.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: haoxuw
+
+# The planted role first, then one role per slot, which is how the declared-line
+# objectives tell a cluster the agent missed from a cluster the project does not
+# have.
+fixtures:
+  - readiness-lb-drain-timeout
+  - crashloop-workload
+  - version-laggard
+  - drift-outlier
+  - zonal-skew-scheduling
+
+verification_spec:
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame, anchored
+  # at both ends, with the line's decoration folded first.
+  # The frame every cluster must satisfy, all three slots included.
+  - name: every-seeded-cluster-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-lb-drain-timeout
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: lb-connection-draining: backend service [^;\n]+; draining timeout [^;\n]+; pool [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: backend service [^;\n]+; draining timeout [^;\n]+; pool [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: lb-connection-draining: backend service [^;\n]+; draining timeout [^;\n]+; pool [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: lb-connection-draining: backend service [^;\n]+; draining timeout [^;\n]+; pool [^\n]+$)'
+  # Slot b carries the fixture: the backend service by name (the fleet's prefix varies per
+  # project), its 3600-second timeout and the default pool.
+  - name: the-planted-backend-service-is-named-with-its-timeout-and-pool
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-lb-drain-timeout
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: backend service drain-timeout-[a-z0-9-]+; draining timeout 3600 s; pool default-pool$'
+      forbidden_patterns:
+        - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: lb-connection-draining: (?!backend service drain-timeout-[a-z0-9-]+; draining timeout 3600 s; pool default-pool$)[^\n]*$'
+  # No backend service above the wait on the slots without the fixture: a line naming one
+  # there is a wrong read.
+  - name: the-other-clusters-read-none
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - readiness-lb-drain-timeout
+        - crashloop-workload
+        - version-laggard
+        - drift-outlier
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: lb-connection-draining: backend service none; draining timeout none; pool none$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: lb-connection-draining: (?!backend service none; draining timeout none; pool none$)[^\n]*$'
+        - '(?m)^{cluster:c}(?:\s*\([^)\n]*\))?: lb-connection-draining: (?!backend service none; draining timeout none; pool none$)[^\n]*$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?: lb-connection-draining: (?!backend service none; draining timeout none; pool none$)[^\n]*$'
+  - name: the-reply-names-the-fix
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The command the finding carries, copied rather than paraphrased.
+      any_of_phrases: ["--connection-draining-timeout=600"]
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a readiness report is an invention.
+      forbidden_phrases: ["CVE-"]
