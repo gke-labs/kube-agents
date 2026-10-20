@@ -1284,7 +1284,9 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 
 `.bootstrap_scan_filed` means the scan's task has been filed. `.bootstrap_completed` means a
 delivery run has claimed the report; it is written before the chat post, so it does not prove the
-post arrived, and the report is not sent again. `ls` reports the one that does not exist yet.
+post arrived, and the report is not sent again. Under `spec.mode: next` a claim can be released and tried
+again later, five attempts in all (the plugin README's Rule 5 says when);
+`/opt/data/.bootstrap_conversation_attempts.json` says why the report has not gone yet. `ls` reports the one that does not exist yet.
 The site's [first-run onboarding](docs/site/src/content/docs/concepts/chatops.md#first-run-onboarding)
 section describes each stage.
 
