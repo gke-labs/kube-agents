@@ -447,7 +447,10 @@ the suite reports green around it — which is how `agent-kanban-smoke`, a case 
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
 
-A new case lands in the nightly file (decided 2026-09-15,
+A new case lands in the nightly file's sorted section, the last one, at its place in
+case-id order with its reason as the `#` lines directly above its entry (#3495; the roster
+test checks both, so two case pull requests don't edit the same lines). It lands there by
+decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
 the night it merges, its record accrues in the evidence store, and a presubmit seat is a
