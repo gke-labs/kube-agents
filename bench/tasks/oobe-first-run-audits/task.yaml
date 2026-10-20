@@ -62,9 +62,6 @@ validated: false
 # Slug per docs/designs/domains.yaml: what starts is four of the fleet audits.
 domain: fleet-audits
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The turn below makes no tool call on purpose, so bench-gate's liveness rung
 # takes its reply as the sign of a real run instead of a tool call.
 tool_calls_optional: true

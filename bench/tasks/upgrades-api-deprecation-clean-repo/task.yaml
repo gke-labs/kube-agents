@@ -57,9 +57,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # report_contains: a chat prompt, so the sections are the reply. Three
 # objectives, one for each thing the report must do: name its source, give a
 # verdict, invent nothing; and two for the route it must take: delegate, and

@@ -50,8 +50,6 @@ validated: false
 
 domain: reliability
 
-owner: maintainers
-
 fixtures:
   - no-pdb-workload
 
