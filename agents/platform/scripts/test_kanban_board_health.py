@@ -929,7 +929,47 @@ class DiagnosticsTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("Small Card", text)
         self.assertIn("t_small_1", text)
-        self.assertIn("... and 3 older stuck cards omitted", text)
+        self.assertIn("... and 3 other stuck cards omitted", text)
+
+    def test_promoted_item_rendered_newest_first_after_skipping(self):
+        # When an oversized newest item is skipped during budget allocation but
+        # later promoted into budget_for_body, taken_items is re-sorted so the
+        # promoted newest item renders first rather than last.
+        cards = [
+            ("t_a", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 5}},
+             {"task_id": "t_a", "status": "blocked", "title": "Card A"}),
+            ("t_b", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 15}},
+             {"task_id": "t_b", "status": "blocked", "title": "Card B"}),
+            ("t_c", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 25}},
+             {"task_id": "t_c", "status": "blocked", "title": "Card C"}),
+        ]
+        context = {
+            "t_a": {"reason": "a" * 200},
+        }
+        lines = kbh.render_stuck_cards(cards, context, Path("/opt/data"), max_chars=744)
+        text = "\n".join(lines)
+        pos_a = text.find("Card A")
+        pos_b = text.find("Card B")
+        pos_c = text.find("Card C")
+        self.assertNotEqual(pos_a, -1)
+        self.assertNotEqual(pos_b, -1)
+        self.assertNotEqual(pos_c, -1)
+        self.assertLess(pos_a, pos_b, "Promoted newest card A must render before card B")
+        self.assertLess(pos_b, pos_c, "Card B must render before card C")
+
+    def test_null_task_ids_in_group_not_suppressed_when_ids_budget_starved(self):
+        # When cards with null task_id (coerced to '?') share a title and group_ids_budget
+        # cannot fit IDs, position-based dropped_ids filtering removes only the shown card
+        # so remaining cards are correctly counted and emitted in the omission summary.
+        cards = [
+            (None, {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 10 + i}},
+             {"task_id": None, "status": "blocked", "title": "Shared Title"})
+            for i in range(5)
+        ]
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=600)
+        text = "\n".join(lines)
+        self.assertIn("Shared Title", text)
+        self.assertIn("... and 4 older stuck cards omitted", text)
 
     def test_task_id_prefixed_with_and_not_misidentified_as_formatter_sentinel(self):
         # A task ID starting with 'and ' (e.g. 'and 01') should not trigger an in-band
@@ -1062,10 +1102,29 @@ class ReportTests(unittest.TestCase):
         cards = [(f"t_stuck_{i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24 + i}},
                   {"task_id": f"t_stuck_{i:02d}", "status": "blocked", "title": f"Stuck {i:02d}"})
                  for i in range(20)]
-        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=350)
+        # At max_chars=500 (above the 486-char floor for /opt/data), output strictly respects max_chars
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=500)
         text = "\n".join(lines)
+        self.assertLessEqual(len(text), 500)
         self.assertIn("older stuck cards omitted (run hermes kanban list", text)
         self.assertNotIn("(ids:", text)
+
+        # Under extreme starvation below irreducible floor (~486 chars for /opt/data),
+        # render_stuck_cards emits the floor rather than truncating operator commands.
+        lines_floor = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=350)
+        text_floor = "\n".join(lines_floor)
+        self.assertEqual(len(text_floor), 486)
+        self.assertIn("older stuck cards omitted (run hermes kanban list", text_floor)
+
+    def test_min_stuck_floor_derived_from_actual_home_path(self):
+        cards = [(f"t_stuck_{i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24 + i}},
+                  {"task_id": f"t_stuck_{i:02d}", "status": "blocked", "title": f"Stuck {i:02d}"})
+                 for i in range(10)]
+        floor_short = kbh._min_stuck_floor(cards, Path("/opt/data"))
+        floor_long = kbh._min_stuck_floor(cards, Path("/var/run/kube-agents/long/home/path"))
+        # Floor scales with 4 * len(home)
+        diff_len = len("/var/run/kube-agents/long/home/path") - len("/opt/data")
+        self.assertEqual(floor_long - floor_short, 4 * diff_len)
 
 
 class MainOutputContractTests(unittest.TestCase):

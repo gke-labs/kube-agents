@@ -361,7 +361,7 @@ title, they are grouped to keep the report readable, with task IDs and reasons
 retained. The `hermes kanban unblock` and `archive` commands appear once in a
 footer (using `<task_id>` when multiple cards are stuck) rather than repeated
 under every card, so the room knows how to move a card while long reports stay
-bounded within chat limits, summarizing any omitted older cards by task ID up to
+bounded within chat limits, summarizing any omitted cards by task ID up to
 the character budget (and falling back to a count and list command when omitted IDs
 exceed the limit).
 

@@ -111,7 +111,7 @@ they are grouped: small groups list each card's task ID, kind, age, and reason,
 while larger groups summarize the count, kind breakdown, and oldest age,
 followed by the newest card's details and task IDs. Long reports are bounded
 to keep recent outage cards and the footer commands within chat limits,
-summarizing any omitted older cards by task ID up to the character budget (and
+summarizing any omitted cards by task ID up to the character budget (and
 falling back to a count and list command when omitted IDs exceed the limit). The
 operator unblock and archive commands appear once in a footer (noting they run
 on the agent pod) rather than repeated under every card.
@@ -398,8 +398,36 @@ def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=Non
     return taken
 
 
+def _min_stuck_floor(stuck_items: list, home: Path) -> int:
+    """Minimum characters render_stuck_cards emits: header + footer + count-only omission line."""
+    if not stuck_items:
+        return 0
+    tid = str(stuck_items[0][0]) if len(stuck_items) == 1 else "<task_id>"
+    footer_lines = [
+        "  Commands to move a card (run on the agent pod):",
+        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}",
+        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}",
+    ]
+    footer_chars = sum(len(ln) + 1 for ln in footer_lines)
+    header = (
+        "Cards blocked with no one looking (a worker or operator block is sticky: "
+        "nothing retries it until a human acts):"
+    )
+    header_chars = len(header) + 1
+    omission_sample = (
+        f"  ... and {len(stuck_items)} older stuck cards omitted "
+        f"(run hermes kanban list on the agent pod to view all)\n"
+    )
+    return header_chars + footer_chars + len(omission_sample)
+
+
 def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_chars: int | None = None) -> list:
-    """Render stuck cards: grouped by title when duplicated, newest first, commands once."""
+    """Render stuck cards: grouped by title when duplicated, newest first, commands once.
+
+    Has an irreducible minimum output floor of header + footer + count-only omission line
+    (451 + 4*len(str(home)) characters), below which it returns this floor rather than
+    truncating operator footer commands or suppressing the omission notice.
+    """
     if not stuck_items:
         return []
     if max_chars is None:
@@ -497,7 +525,8 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                 formatted_ids, dropped_ids = _format_id_list_with_dropped(group_ids, group_ids_budget)
                 if len(dropped_ids) < len(group_ids):
                     lines_for_group.append(f"    ids: {formatted_ids}")
-                dropped_ids = [i for i in dropped_ids if i != newest_card["task_id"]]
+                if dropped_ids and len(dropped_ids) == len(group_ids):
+                    dropped_ids = dropped_ids[1:]
             renderable_items.append({
                 "age_hours": newest_age,
                 "key": title,
@@ -537,6 +566,8 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
             taken_items.append(next_item)
             untaken_items = []
 
+    taken_items.sort(key=lambda item: (item["age_hours"], item["key"]))
+
     lines = [header]
     for it in taken_items:
         lines.extend(it["lines"])
@@ -551,7 +582,20 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
             omitted_ids.extend(it.get("dropped_ids", []))
         for it in untaken_items:
             omitted_ids.extend(c["task_id"] for c in it["cards"])
-        prefix = f"  ... and {omitted_cards} older stuck card{'s' if omitted_cards != 1 else ''} omitted"
+        shown_cards = []
+        omitted_cards_list = []
+        for it in taken_items:
+            shown_cards.extend(it["cards"][:it["card_count"]])
+            omitted_cards_list.extend(it["cards"][it["card_count"]:])
+        for it in untaken_items:
+            omitted_cards_list.extend(it["cards"])
+
+        all_omitted_older = (
+            not shown_cards
+            or all(o["age_hours"] >= s["age_hours"] for o in omitted_cards_list for s in shown_cards)
+        )
+        qualifier = "older " if all_omitted_older else "other "
+        prefix = f"  ... and {omitted_cards} {qualifier}stuck card{'s' if omitted_cards != 1 else ''} omitted"
         list_hint = "; run hermes kanban list on the agent pod to view all"
         omission_overhead = len(prefix) + len(" (ids: ") + len(list_hint) + len(")\n")
         max_ids_budget = remaining_for_omission - omission_overhead
@@ -697,7 +741,7 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
                 parts.append(f" - {detail}")
             diag_lines.append("".join(parts))
 
-    min_stuck_reserve = 500 if stuck_items else 0
+    min_stuck_reserve = _min_stuck_floor(stuck_items, home)
     diag_allowance = max(0, max_chars - min_stuck_reserve)
     diag_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, diag_allowance) - 120)
     shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, diag_budget)
