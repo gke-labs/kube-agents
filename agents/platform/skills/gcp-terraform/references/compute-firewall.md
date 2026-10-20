@@ -8,7 +8,7 @@ From the `google` provider's source at 8.x (September 2026).
   `target_service_accounts`, `priority`, `disabled`, `log_config`,
   `description`. `network` is not marked as forcing replacement in the
   provider, but changing a rule's network is not a change the Compute API is
-  documented to accept: treat it as a replacement and stop for the user.
+  documented to accept: treat it as a replacement (Step 3).
 - **Disabling a rule** is `disabled = true`, never deleting the block.
 - **Narrowing** a `source_ranges` list is the edit; never widen one to
   `0.0.0.0/0` unless the request says so in those words, and call it out in

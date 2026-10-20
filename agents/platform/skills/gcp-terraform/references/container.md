@@ -70,8 +70,8 @@ decides.
   `min_master_version`, `enable_private_nodes`, `enable_private_endpoint`,
   addons, logging and monitoring config.
 - **`remove_default_node_pool`** updates in place, and setting it `true`
-  deletes `default-pool` and its nodes. Treat it as a replacement: stop for
-  the user.
+  deletes `default-pool` and its nodes. Treat it as a replacement (Step 3):
+  write it only when the user asked for it, and call it out.
 - **`deletion_protection` defaults to `true` (5.0.0 and later).** It is
   checked when Terraform deletes, against the value in state: a destroy or
   replacement plans cleanly and then fails at apply until a separate apply

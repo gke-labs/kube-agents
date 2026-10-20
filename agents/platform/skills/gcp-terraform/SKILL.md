@@ -110,7 +110,7 @@ From the files that own the target, take:
 
 **Stopping before Step 5 leaves nothing to clean up.** The copy is on this
 filesystem. Stop where you need to (a question from Step 2's table, a
-replacement in Step 3, a syntax error you cannot resolve) and run `prepare`
+an unasked replacement in Step 3, a syntax error you cannot resolve) and run `prepare`
 again when the work resumes.
 
 ### Step 2: Decide edit, import or create, read-only
@@ -143,10 +143,19 @@ which reads decided the edit.
 - **Edit in place.** Change the arguments the request needs, add the ones
   it requires, and nothing else. An argument you copy from the live resource
   becomes one someone has to own.
-- **Replacement is the line.** If the change touches an argument that
-  forces replacement (`references/` lists them per family; the provider's
-  page for the pinned version decides), say so, name the argument, and stop
-  for the user's decision. Never write a replacement unasked.
+- **A replacement is written only when it is what the user asked for.**
+  An argument that forces replacement (`references/` lists them per family;
+  the provider's page for the pinned version decides) destroys and recreates
+  the resource when the pull request is applied. When the requested change
+  is itself that argument ("switch the pool to Spot VMs" is `spot`), write
+  it and lead with it: the PR body's **Replacement** line names the argument
+  and what is destroyed and recreated (the pool's nodes and their workloads,
+  or the whole cluster), and so does your reply. Name a route that avoids
+  the replacement if one exists (a new pool beside the old one) as an
+  alternative in the body, without writing it. When the request does not
+  need the replacement, and only your way of writing it would cause one,
+  never write it: say so, name the argument, and stop for the user's
+  decision.
 - **Deletion protection.** Never set `deletion_protection = false`, remove
   it, remove a `lifecycle { prevent_destroy = true }`, or change a
   `deletion_policy` (`ABANDON` gets past `deletion_protection`). A change
@@ -191,7 +200,7 @@ header:
 ### Terraform change
 - **Decision:** edit | import | create, and the reads that decided it.
 - **Resource:** `<address>` (<type> `<name>` in project `<project>`, location `<location>`).
-- **Replacement:** none | <argument> forces replacement (this PR proposes it; see below).
+- **Replacement:** none | REPLACES <address>: `<argument>` forces it; applying this PR destroys and recreates <what>.
 - **Deletion protection:** unchanged.
 - **Import:** none | `import { to = <address>, id = "<id>" }`; plan must show an import, not a create.
 - **Checked:** `tofu fmt -check` on <path>. Not run here: `terraform init`, `validate` and
