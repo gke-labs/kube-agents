@@ -1081,6 +1081,19 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("T" * kbh.TITLE_MAX_CHARS, text)
         self.assertNotIn("T" * (kbh.TITLE_MAX_CHARS + 1), text)
 
+    def test_oversized_title_in_repeated_title_group_clipped_to_title_max_chars(self):
+        cards = [
+            ("t_huge_1", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24}},
+             {"task_id": "t_huge_1", "status": "blocked", "title": "T" * 1000}),
+            ("t_huge_2", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 25}},
+             {"task_id": "t_huge_2", "status": "blocked", "title": "T" * 1000}),
+        ]
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"))
+        text = "\n".join(lines)
+        # Head line carries exactly TITLE_MAX_CHARS 'T's and no more
+        self.assertIn(f"  - {'T' * kbh.TITLE_MAX_CHARS} — 2 cards", text)
+        self.assertNotIn("T" * (kbh.TITLE_MAX_CHARS + 1), text)
+
     def test_min_stuck_floor_derived_from_actual_home_path(self):
         cards = [(f"t_stuck_{i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24 + i}},
                   {"task_id": f"t_stuck_{i:02d}", "status": "blocked", "title": f"Stuck {i:02d}"})
