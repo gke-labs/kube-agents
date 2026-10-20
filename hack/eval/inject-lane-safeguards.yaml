@@ -18,7 +18,10 @@
 # item 3, and this list is what grades that). The cluster safeguards
 # every case carries say nothing about GitHub. One entry here reaches every
 # case the lane runs; fifty per-case edits would change what the api lane
-# grades too.
+# grades too. The fleet audits' own remediation sweep is the other source of
+# pull requests nobody asked for; it is turned off on this lane's install
+# (KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, hack/ci-deploy.sh, #3439), so a pull
+# request inside a window is the case's.
 #
 # Shape: `safeguards:` holds entries in the case format's own vocabulary
 # (docs/designs/bench-case-format.md), each a `role: safeguard` with a name no

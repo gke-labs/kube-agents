@@ -444,7 +444,7 @@ Rules for the agent:
 - Do not give `--gitops-ca-file` when a public CA signed the certificate. Do not use `/dev/stdin` or a process substitution for it.
 - The organization check asks the instance with the CA and sends no credential. On an instance in private mode it warns that it cannot verify the organization and goes on.
 - To upgrade, run `upgrade.sh`. To remove, run `uninstall.sh`. Both read the forge from `install.env` (`GITOPS_FORGE=github`, `GITOPS_HOST`, `GITOPS_CA_SECRET`).
-- A switch between github.com and an instance needs the App on the new host and a new `--kms-key`, because `install.sh` imports a key only into a key with no `ENABLED` version. The installer refuses a change of host that keeps the recorded App or key. INSTALL.md, "Switch between github.com and a GitHub Enterprise Server", gives the command. `--gitops-host=github.com` switches back.
+- A switch between github.com and an instance needs the App on the new host and a new `--kms-key`, because `install.sh` imports a key only into a key with no `ENABLED` version. The installer refuses a change of host that keeps the recorded App or key. INSTALL.md, "Switch between github.com and a GitHub Enterprise Server", gives the command. `--gitops-host=github.com` switches back. After a switch, `platform-agent-gitops-state` still lists the old host's repositories (the operator never removes an entry). Remove them as INSTALL.md says in the same section; after a switch back to github.com this is required, because an entry on the instance holds the minter's policy pruning (`Degraded`, `MinterPruningHeld`).
 - With `--generate-only`, the operator creates the CA Secret and restarts the minter after `lifecycle.sh apply`; INSTALL.md gives the commands. Over an existing `install.env`, generate-only does not record the forge keys: have the operator set `GITOPS_FORGE=github`, `GITOPS_HOST` and, for a private CA, `GITOPS_CA_SECRET` there before `lifecycle.sh apply`, or the next `upgrade.sh` renders github.com.
 - When `install.env` records `GITOPS_FORGE=gitlab`, also pass `--gitops-forge=github` to switch to an instance.
 
@@ -466,8 +466,8 @@ Rules for the agent:
   its `https://` URL on that host. Put the host in `--gitops-host`, not in the path. Leave
   `--gitops-host` out for gitlab.com.
 - The broker uses the token only for the declared repositories. Another project in the
-  same group gets no token; `inspect-repository` reads it without one, so only a public project
-  is readable. A project outside those groups is refused. Tell the operator to use the token with the smallest reach. That is a project access
+  same group gets no write token. `inspect-repository` reads a public project with no token, and a
+  private one only when it is a context repository and a read-only token is stored. A project outside those groups is refused. Tell the operator to use the token with the smallest reach. That is a project access
   token on the GitOps project, or a group access token on the project's own group. For
   `platform/infra/gitops`, that group is `platform/infra`, not `platform`. Tell the operator to
   record the token's expiry date, and to check the token before the install, as the GitLab page
@@ -483,6 +483,12 @@ Rules for the agent:
     lines, use `<(pass show gitlab/agent-token | head -n1)`. The operator unlocks `gpg-agent`
     before the run. Do not use `/dev/stdin` under `curl … | bash`, because standard input is the
     script there.
+- Only when the operator wants the agent to read a private GitLab context repository, also set
+  `GITLAB_READ_TOKEN_FILE` to a source that holds a read-only token (Reporter role,
+  `read_repository` scope only), with the same rules as the token source above. It must not be
+  the same source as `--gitlab-token-file`. Use a release whose `install.env.example` lists
+  `GITLAB_READ_TOKEN_FILE`; an older release ignores it. The GitLab page's "Private context
+  repositories" section has the setup.
 - Only when a private CA signed the instance's certificate, add `--gitops-ca-file` to the dry run
   and to the stage 3 run. Do not give it for gitlab.com or for a public CA. Ask the operator
   for the CA certificates (public; never a private key) as a regular PEM file: the root CA, and the
@@ -511,7 +517,8 @@ The command below is a stage 2 dry run. Apply through stage 3 once the operator 
   --gitlab-token-file=<(pass show gitlab/agent-token | head -n1)
 ```
 
-Pass the same `--gitlab-token-file` source to the stage 3 run. The dry run only checks it.
+Pass the same `--gitlab-token-file` source, and the same `GITLAB_READ_TOKEN_FILE` if you set one, to
+the stage 3 run. The dry run only checks them.
 
 ## Supported Command-Line Flags
 

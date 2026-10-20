@@ -104,6 +104,16 @@ INSTALL_ENV_FLAGS_TYPED=""
 INSTALL_ENV_KEYS_TO_RECORD=""
 # Those keys with their companions, toggles last (resolve_install_env_record_keys).
 INSTALL_ENV_RECORD_KEYS=""
+# The keys of the GitLab token Secret, and the server-side-apply field manager
+# that writes each one. The write token is "token" (ForgeCredentialsTokenKey
+# in gitspec.go). The optional read-only token, for context repositories, is
+# "read-token". Each key has its own manager: an apply that leaves out a field
+# its manager applied before deletes that field. So a run without
+# GITLAB_READ_TOKEN_FILE never deletes the read token.
+readonly GITLAB_TOKEN_SECRET_KEY="token"
+readonly GITLAB_READ_TOKEN_SECRET_KEY="read-token"
+readonly GITLAB_TOKEN_FIELD_MANAGER="kube-agents-installer"
+readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -462,6 +472,9 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# An optional FILE with a read-only GitLab token. The broker presents it only
+# to clone context repositories. Like the token file, it is never recorded.
+PARAM_GITLAB_READ_TOKEN_FILE="${GITLAB_READ_TOKEN_FILE:-}"
 # A self-managed GitLab behind a private CA: a FILE the CA is read from, and
 # the Secret it goes into, which install.env records. The file's path is
 # never recorded. GITOPS_CA_FILE in the environment counts as an interview
@@ -4936,23 +4949,25 @@ validate_gitops_forge_flags() {
     case "$PARAM_GITLAB_TOKEN_FILE" in
       \~/*) PARAM_GITLAB_TOKEN_FILE="${HOME}/${PARAM_GITLAB_TOKEN_FILE#\~/}" ;;
     esac
-    if [ ! -r "$PARAM_GITLAB_TOKEN_FILE" ] || [ -d "$PARAM_GITLAB_TOKEN_FILE" ]; then
-      print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
+    check_gitlab_token_source "--gitlab-token-file" "$PARAM_GITLAB_TOKEN_FILE" || return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    case "$PARAM_GITLAB_READ_TOKEN_FILE" in
+      \~/*) PARAM_GITLAB_READ_TOKEN_FILE="${HOME}/${PARAM_GITLAB_READ_TOKEN_FILE#\~/}" ;;
+    esac
+    check_gitlab_token_source "GITLAB_READ_TOKEN_FILE" "$PARAM_GITLAB_READ_TOKEN_FILE" || return 1
+    # One source for both tokens is refused. A stream such as /dev/stdin
+    # cannot carry two tokens, and one file would store the write token as the
+    # read token. -ef also catches a second name for the same file or stream.
+    if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] && {
+      [ "$PARAM_GITLAB_TOKEN_FILE" = "$PARAM_GITLAB_READ_TOKEN_FILE" ] ||
+        [ "$PARAM_GITLAB_TOKEN_FILE" -ef "$PARAM_GITLAB_READ_TOKEN_FILE" ] || {
+        gitlab_token_source_is_stdin "$PARAM_GITLAB_TOKEN_FILE" &&
+          gitlab_token_source_is_stdin "$PARAM_GITLAB_READ_TOKEN_FILE"
+      }
+    }; then
+      print_error "--gitlab-token-file ('${PARAM_GITLAB_TOKEN_FILE}') and GITLAB_READ_TOKEN_FILE ('${PARAM_GITLAB_READ_TOKEN_FILE}') name the same source. Give each token its own file or stream."
       return 1
-    fi
-    # A regular file can be read now and again after the apply, so an empty
-    # one stops the run here, before anything is built. A one-shot source
-    # (/dev/stdin, /dev/fd/N, a process substitution) is not read here: a read
-    # can use it up, so create_gitlab_token_secret checks it after the apply.
-    if gitops_source_is_rereadable "$PARAM_GITLAB_TOKEN_FILE"; then
-      local early_token=""
-      IFS= read -r -d '' early_token <"$PARAM_GITLAB_TOKEN_FILE" || true
-      early_token="$(gitlab_token_strip "$early_token")"
-      if [ -z "$early_token" ]; then
-        print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is empty."
-        return 1
-      fi
-      early_token=""
     fi
   fi
   # A private CA is for a self-managed host only: gitlab.com presents a
@@ -4975,6 +4990,38 @@ validate_gitops_forge_flags() {
     fi
   fi
   validate_gitops_ca_inputs "${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}"
+}
+
+# True when PATH is one of the literal names of this process's standard input.
+# Two such names are one stream even where -ef cannot tell (a pipe on stdin).
+gitlab_token_source_is_stdin() {
+  case "$1" in
+    /dev/stdin | /dev/fd/0 | /proc/self/fd/0) return 0 ;;
+  esac
+  return 1
+}
+
+# Checks the GitLab token source PATH, which messages call LABEL: it must be
+# readable and not a directory. A regular file can be read now and again after
+# the apply, so an empty one stops the run here, before anything is built. A
+# one-shot source (/dev/stdin, /dev/fd/N, a process substitution) is not read
+# here: a read can use it up, so the Secret's writer checks it after the apply.
+check_gitlab_token_source() {
+  local label="$1" path="$2"
+  if [ ! -r "$path" ] || [ -d "$path" ]; then
+    print_error "${label} '${path}' is not readable."
+    return 1
+  fi
+  if gitops_source_is_rereadable "$path"; then
+    local early_token=""
+    IFS= read -r -d '' early_token <"$path" || true
+    early_token="$(gitlab_token_strip "$early_token")"
+    if [ -z "$early_token" ]; then
+      print_error "${label} '${path}' is empty."
+      return 1
+    fi
+    early_token=""
+  fi
 }
 
 # The checks a private CA's inputs get on either forge: the CA file is
@@ -5033,6 +5080,10 @@ GITHUB_RESERVED_HOST_RE='(^|\.)(github\.com|githubusercontent\.com|githubassets\
 validate_github_forge_flags() {
   if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
     print_error "--gitlab-token-file applies only with --gitops-forge=gitlab."
+    return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    print_error "GITLAB_READ_TOKEN_FILE applies only with --gitops-forge=gitlab."
     return 1
   fi
   case "${PARAM_GITOPS_HOST:-}" in
@@ -5134,7 +5185,9 @@ gitops_ca_pem_problem() {
   fi
 }
 
-# Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
+# Writes the token on stdin into Secret NAME, under KEY, as field manager
+# MANAGER. The object sent holds KEY alone, so the apply leaves the other key
+# as it is (see GITLAB_TOKEN_FIELD_MANAGER). Server-side apply,
 # because a client-side apply copies the whole object, token included, into
 # the kubectl.kubernetes.io/last-applied-configuration annotation, where
 # anyone who can read the Secret's metadata reads it again. Both kubectl
@@ -5142,14 +5195,14 @@ gitops_ca_pem_problem() {
 # was sent, and that object carries the token. A failure prints a fixed
 # message and kubectl's exit codes, never kubectl's text.
 apply_gitlab_token_secret() {
-  local name="$1" namespace="$2" context="$3"
+  local name="$1" namespace="$2" context="$3" key="$4" manager="$5"
   kubectl create secret generic "$name" -n "$namespace" --context "$context" \
-    --from-file=token=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
-    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+    --from-file="${key}=/dev/stdin" --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager="$manager" \
       -n "$namespace" --context "$context" -f - >/dev/null 2>&1
   local rcs=("${PIPESTATUS[@]}")
   if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
-    print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
+    print_error "Could not write key '${key}' of the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
   fi
 }
@@ -5335,7 +5388,8 @@ restart_github_minter_for_ca() {
   fi
 }
 
-# Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
+# Writes the `token` key of the Secret the GitLab forge's credentialsRef names
+# (field manager GITLAB_TOKEN_FIELD_MANAGER, so a read-token key stays), in
 # the agent's namespace, after the apply has made the namespace. The token
 # reaches kubectl through a pipe -- read from the named source, or from a
 # no-echo prompt, into a local that is cleared at once -- so it is never in
@@ -5346,7 +5400,10 @@ create_gitlab_token_secret() {
   local namespace="$1" context="$2"
   local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
   local exists="false" token="" rc=0
-  if kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+  # The write token's key, not the Secret: a Secret that holds only the
+  # read-token key has no write token to keep.
+  if [ -n "$(kubectl get secret "$name" -n "$namespace" --context "$context" \
+    -o "jsonpath={.data.${GITLAB_TOKEN_SECRET_KEY}}" 2>/dev/null)" ]; then
     exists="true"
   fi
   if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
@@ -5358,7 +5415,7 @@ create_gitlab_token_secret() {
       print_error "The GitLab token source '${PARAM_GITLAB_TOKEN_FILE}' is empty; nothing was stored."
       return 1
     fi
-    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
     token=""
     unset token
     [ "$rc" -eq 0 ] || return 1
@@ -5394,11 +5451,34 @@ create_gitlab_token_secret() {
     print_warning "No token entered; nothing was stored. Create Secret '${name}' later (see the install guide)."
     return 0
   fi
-  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
   token=""
   unset token
   [ "$rc" -eq 0 ] || return 1
   print_success "GitLab token stored in Secret '${name}' (namespace ${namespace})."
+}
+
+# Writes the read-only token from GITLAB_READ_TOKEN_FILE into the key
+# "read-token" of the same Secret. The broker presents it only to clone
+# context repositories, never on a write. The token travels as in
+# create_gitlab_token_secret. Without a file, nothing is applied, so an
+# existing read token stays in place.
+create_gitlab_read_token_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+  local token="" rc=0
+  [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ] || return 0
+  IFS= read -r -d '' token <"$PARAM_GITLAB_READ_TOKEN_FILE" || true
+  token="$(gitlab_token_strip "$token")"
+  if [ -z "$token" ]; then
+    print_error "The GitLab read token source '${PARAM_GITLAB_READ_TOKEN_FILE}' is empty; nothing was stored."
+    return 1
+  fi
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_READ_TOKEN_SECRET_KEY" "$GITLAB_READ_TOKEN_FIELD_MANAGER" || rc=$?
+  token=""
+  unset token
+  [ "$rc" -eq 0 ] || return 1
+  print_success "GitLab read token stored in Secret '${name}', key ${GITLAB_READ_TOKEN_SECRET_KEY} (namespace ${namespace})."
 }
 
 # Validates that non-interactive minter configuration has either an ENABLED KMS key
@@ -6775,7 +6855,8 @@ main() {
   # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
   # the warning before the apply and the closing summary say it then.
   _confirm_no_home_channel() {
-    local home="${2//[[:space:]]/}" keep=""
+    local home keep=""
+    home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
     print_warning "$(next_home_channel_unset_message "$1")"
     prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
@@ -8198,6 +8279,7 @@ main() {
     # Secret must exist by then.
     create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitlab_read_token_secret "$namespace" "$expected_ctx" || exit 1
   elif [ -n "${GITOPS_HOST:-}" ]; then
     # A GitHub Enterprise Server: the CA before the minter restart, which is
     # how the minter reads it. The broker reads it on each call.
@@ -8275,9 +8357,23 @@ main() {
     echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
   fi
 
+  # The checklists and the closing summary follow the mode the CR is left
+  # on, which a mode set outside this installer can keep from the key.
+  local mode_after_apply="${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
+  # shellcheck disable=SC2034  # read by print_next_home_channel_unset_summary
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode_after_apply" "${slack_enabled:-false}" \
+    "${google_chat_enabled:-false}" "$slack_home_channel" "$google_chat_home_channel")"
   if [ "${google_chat_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
+    # As for Slack below.
+    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
+      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
+      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="$google_chat_enabled" \
+      GCHAT_STEPS_HOME_CHANNEL="$google_chat_home_channel" \
+      GCHAT_STEPS_ALLOWED_USERS="$allowed_users" \
+      GCHAT_STEPS_TOPIC_NAME="$chat_topic_name" \
+      GCHAT_STEPS_SUB_NAME="$chat_sub_name" \
+      bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
   fi
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
@@ -8285,7 +8381,7 @@ main() {
     # what the run applied, which an interview answer install.env does not
     # record makes differ from the file.
     IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
-      SLACK_STEPS_PLATFORM_AGENT_MODE="$platform_agent_mode" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
       SLACK_STEPS_SLACK_ENABLED="$slack_enabled" \
       SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}" \
       SLACK_STEPS_HOME_CHANNEL="$slack_home_channel" \

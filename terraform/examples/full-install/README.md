@@ -514,11 +514,13 @@ For production, always pin a validated numeric SemVer release tag or full commit
 For a cluster that may only pull from an approved registry, copy the images
 there first — `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>` from
 the repository root, driven by `images.json` — then set `image_registry` to the
-same prefix. It reaches the two images the chart never renders as well (the
-agent Deployment and the fluent-bit sidecar the operator resolves at reconcile
-time); the [chart README](../../../charts/kube-agents/README.md) explains how.
-Add `third_party_image_registry` only if the mirror keeps LiteLLM and
-fluent-bit under a different path.
+same prefix. It reaches the runtime images the chart never renders as well (the
+agent Deployment and shell sandbox StatefulSet the operator resolves at reconcile
+time; the fluent-bit logging sidecar follows `third_party_image_registry`); the
+[chart README](../../../charts/kube-agents/README.md) explains how.
+Add `third_party_image_registry` to mirror third-party images (cert-manager,
+LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
+their upstream registries.
 
 `IMAGE_TAG` is not optional here. The four first-party images take whatever tag
 the mirror step was given (`latest` if it was given none), while Terraform asks
@@ -548,15 +550,15 @@ chart renders and, through `IMAGE_PULL_SECRETS` on the operator and
 `spec.deployment.imagePullSecrets` on the `PlatformAgent`, the agent pods the
 operator renders too.
 
-**cert-manager images follow the same prefix, but not the same credentials.**
+**cert-manager images follow `third_party_image_registry`, not `image_registry`.**
 `helm_release.cert_manager` is a separate release of an upstream chart and
 never sees the `helm_release.kube_agents` values, but the composition passes
-it the same registry through its own image overrides
-(`local.cert_manager_mirror_values`), so its five images
+`var.third_party_image_registry` through its own image overrides
+(`local.cert_manager_mirror_values`), so when set, its five images
 (`cert-manager-controller`, `-cainjector`, `-webhook`, `-acmesolver`,
 `-startupapicheck`) are pulled as `<prefix>/<name>:<tag>` — the layout
 `make mirror-images` writes from `images.json`, which carries all five
-entries. `image_pull_secrets` does **not** reach it, so a mirror that needs
+entries. Empty leaves them on `quay.io`. `image_pull_secrets` does **not** reach it, so a mirror that needs
 credentials means installing cert-manager yourself (below). Also not covered
 is the chart itself: it is fetched over the network from
 `https://charts.jetstack.io`, which an air-gapped runner cannot

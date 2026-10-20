@@ -133,6 +133,7 @@ root does that, driven by `images.json`. Then point the chart at the copy:
 helm install kube-agents ./charts/kube-agents \
   --namespace kubeagents-system --create-namespace \
   --set global.imageRegistry=registry.example.com/kube-agents \
+  --set global.thirdPartyImageRegistry=registry.example.com/kube-agents \
   --set platformAgent.harness.clusterName=my-cluster \
   --set platformAgent.harness.location=us-central1 \
   --set platformAgent.harness.projectId=my-gcp-project \
@@ -147,8 +148,15 @@ published chart, drop them and let `appVersion` pick the release.
 
 `global.imageRegistry` rewrites each image onto the prefix keeping the trailing
 name only, matching the flat layout `mirror-images` writes. Set
-`global.thirdPartyImageRegistry` as well if the mirror keeps LiteLLM and
-fluent-bit under a different path; it defaults to `global.imageRegistry`.
+`global.thirdPartyImageRegistry` to mirror third-party images (LiteLLM,
+fluent-bit, the GitHub token minter, Hindsight); empty leaves them on their
+upstream registries.
+
+> **Breaking:** `global.thirdPartyImageRegistry` previously fell back to
+> `global.imageRegistry`. An empty `global.thirdPartyImageRegistry` now leaves
+> third-party images on their upstream registries. If mirroring all images to a
+> single private registry prefix, pass `--set global.thirdPartyImageRegistry=<prefix>`
+> alongside `--set global.imageRegistry=<prefix>`.
 
 It reaches more than the containers the chart renders. The operator resolves
 three images at reconcile time that appear in no chart template — the agent
@@ -156,22 +164,24 @@ image for a `PlatformAgent` that omits `spec.deployment.image`, the shell
 sandbox StatefulSet it renders beside every agent pod, and the fluent-bit
 logging sidecar it injects into that pod — so the chart passes all three to the
 operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
-`FLUENT_BIT_IMAGE`. Without that a mirrored install reaches `ghcr.io` and Docker
-Hub minutes after `helm install` reported success. `CREDENTIAL_PROXY_IMAGE` is
-deliberately not passed: the operator derives the broker image from the agent
-image by swapping the trailing name, so it follows the mirror on its own. The
-sandbox image cannot be derived that way — it is a separate repository — which
-is why it has to be named.
+`FLUENT_BIT_IMAGE`. `PLATFORM_AGENT_IMAGE` and `AGENT_SANDBOX_IMAGE` follow
+`global.imageRegistry`, while `FLUENT_BIT_IMAGE` follows
+`global.thirdPartyImageRegistry`. Without passing both, a mirrored install reaches
+`ghcr.io` and Docker Hub minutes after `helm install` reported success.
+`CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
+broker image from the agent image by swapping the trailing name, so it follows
+the mirror on its own. The sandbox image cannot be derived that way — it is a
+separate repository — which is why it has to be named.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
 `make mirror-images` writes. Setting `litellm.image.repository` while
-`global.imageRegistry` is set therefore changes only the name the prefix is
+`global.thirdPartyImageRegistry` is set therefore changes only the name the prefix is
 joined to, not where the image is pulled from. To place images individually —
-most on the mirror, one somewhere else — leave `global.imageRegistry` empty and
-give each `*.image.repository` its full mirrored path instead; the operator's
-`PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and `FLUENT_BIT_IMAGE` are
-rendered from those values either way.
+most on the mirror, one somewhere else — leave `global.imageRegistry` and
+`global.thirdPartyImageRegistry` empty and give each `*.image.repository` its full
+mirrored path instead; the operator's `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`,
+and `FLUENT_BIT_IMAGE` are rendered from those values either way.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
@@ -181,11 +191,10 @@ credentials cannot read — Harbor or Artifactory with token auth, rather than a
 in-project Artifact Registry. An entry is either a bare Secret **name**, so a
 single one is reachable with `--set global.imagePullSecrets[0]=regcred`, or the
 `{name: <secret>}` map a `PodSpec` takes; any other shape fails the render. It
-reaches the same two populations `global.imageRegistry` does: every pod the chart renders
-(operator, LiteLLM, the pre-delete cleanup Job) and the agent pods the operator
-renders, via `IMAGE_PULL_SECRETS` on the manager and `spec.deployment.imagePullSecrets`
-on the `PlatformAgent`. A hand-written `PlatformAgent` that sets that field
-replaces the operator's default rather than adding to it.
+reaches every pod the chart renders (operator, LiteLLM, the pre-delete cleanup Job)
+and the agent pods the operator renders, via `IMAGE_PULL_SECRETS` on the manager and
+`spec.deployment.imagePullSecrets` on the `PlatformAgent`. A hand-written `PlatformAgent`
+that sets that field replaces the operator's default rather than adding to it.
 
 The Secrets are referenced, never created: keeping registry credentials out of
 Helm release data is the point, and the chart has no way to write one that would
@@ -914,7 +923,8 @@ the GitHub minter, each multiplied by its `replicaCount`, Hindsight's two pods, 
 have no replica count to multiply, and the pre-delete cleanup hook Job (one pod, when
 `platformAgent.cleanupHook.enabled` is true) — plus the pods the operator renders, whose
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
-pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
+pod is multiplied by `platformAgent.deployment.availability.replicas` (an over-count above one,
+since the operator runs the gateway as a single replica whatever the value); the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
@@ -965,8 +975,9 @@ sizes for is the largest one in the release that a rollout actually creates: rol
 per-workload, so room for one at a time is enough. The shell sandbox's StatefulSet and the
 pre-delete cleanup Job never surge, and neither does the agent pod at the default
 `platformAgent.deployment.availability.replicas` of one, where the operator rolls the
-gateway Deployment with `strategy: Recreate` — it counts only from two replicas up, where
-the strategy becomes `RollingUpdate`.
+gateway Deployment with `strategy: Recreate`. The check counts an agent-pod surge from two
+replicas up, which the operator no longer renders: it runs the gateway as a single replica
+under `Recreate` at any value, so that surge is an over-count.
 
 **Where it is silent, and where it is not.** The check needs a cluster to query, so it
 does nothing under `helm template` and nothing in a namespace with no ResourceQuota — a

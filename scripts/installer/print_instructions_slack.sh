@@ -39,11 +39,11 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh" "$@"
 
-# A standalone run takes these from install.env alone, as install.sh's own
-# bootstrap does: an exported value the file does not assign would otherwise
-# decide which checklist prints.
+# A standalone run takes the mode from install.env alone, as install.sh's own
+# bootstrap does. An exported GOOGLE_CHAT_ENABLED or SLACK_HOME_CHANNEL the
+# file does not assign is kept: install.sh applies those too.
 if [ -z "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ] && [ -f "$(install_env_file_for_state)" ]; then
-  unset PLATFORM_AGENT_MODE GOOGLE_CHAT_ENABLED SLACK_HOME_CHANNEL
+  unset PLATFORM_AGENT_MODE
 fi
 load_state
 
@@ -60,9 +60,8 @@ fi
 # that only SLACK_HOME_CHANNEL sets.
 print_a2a_gateway_steps() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
-  local home="${SLACK_HOME_CHANNEL:-}" not_an_id
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home not_an_id
+  home="$(trim_go_space "${SLACK_HOME_CHANNEL:-}")"
   not_an_id="$(slack_home_channel_not_an_id "$home")"
   echo -e "[ ] 1. Check the Slack app against the spec.mode next manifest:"
   echo -e "       ${SLACK_NEXT_APP_DOC}"

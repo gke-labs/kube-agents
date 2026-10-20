@@ -1,0 +1,146 @@
+# Upgrade-failure catalogue entry 3 (every replica in one zone or on one
+# node), in the shape the seeded fleet plants it: zone-pinned-api on
+# seeded-d runs two replicas under a topology spread that is only
+# ScheduleAnyway beside a required nodeAffinity only the first zone
+# satisfies, so both replicas sit in one zone and a node recreate there takes
+# the whole Deployment at once.
+#
+# The prompt names no workload, no zone and no constraint. It asks which
+# workloads would lose every replica when one zone's nodes are recreated,
+# and for the answer to end in one declared line per multi-replica workload
+# on the multi-zone cluster, in a fixed form; the deterministic objectives
+# read those lines and nothing else.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it (the
+# cause's first component included; its last component ends the line, where
+# the line-end rule holds). It
+# may not carry the line's own separator, `;`.
+#
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# A cause component may carry its qualifier before it (`required`,
+# `preferred`, `ScheduleAnyway`, `DoNotSchedule`), and `plus` joins two
+# components as `and` does, as does `&`, and `both` may open the pair.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the spread's whenUnsatisfiable. Flipping it to
+# DoNotSchedule is one heal; adding the second zone to the affinity's values,
+# a second term or a changed operator are others the safeguard does not see,
+# and the prompt's "change nothing" is what guards those.
+id: upgrades-zonal-skew-replicas-warned
+name: A workload whose replicas all sit in one zone is named before the zone's nodes are recreated
+
+prompt: >-
+  Before we roll node upgrades across the multi-zone seeded cluster in this
+  project, tell me which workloads with more than one replica would lose
+  every replica at once when one zone's nodes are recreated, and why they
+  are placed the way they are. Read only; change and upgrade nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End
+  your answer with one line per multi-replica workload on that cluster in
+  exactly this form, no other words on the line:
+  "<cluster>/<namespace>/<workload>: replicas <count>; zones in use <count>;
+  all replicas in one zone: <yes|no>; cause: <node affinity|spread
+  constraint|storage class|capacity|none>".
+
+expected_output: >-
+  It identifies the multi-zone seeded cluster and reads where each
+  multi-replica workload's pods run. It names zone-pinned-api in
+  seeded-topology: both replicas in the first zone, because its required
+  nodeAffinity admits only that zone and its topology spread is
+  ScheduleAnyway, so the spread yields and never separates them; a node
+  recreate in that zone takes both replicas. It may also name
+  zone-bound-store, whose claims bind it to the same zone through its
+  StorageClass, and capacity-starved-worker, whose running replicas share the
+  second zone for want of room elsewhere, and first-zone-sponge, six replicas
+  pinned to the first zone's pool by a nodeSelector and Pending for want of
+  room. It recommends the manifest change
+  (a DoNotSchedule spread, or an affinity that admits both zones) and
+  performs no change. It ends with the declared line for every multi-replica
+  workload on the cluster, zone-pinned-api's reading "replicas 2; zones in
+  use 1; all replicas in one zone: yes; cause: node affinity" (or "spread
+  constraint", either names the mechanism). It cites no CVE identifiers.
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+fixtures:
+  - zonal-skew-scheduling
+
+verification_spec:
+  # The declared lines are what the deterministic objectives read; each
+  # pattern matches a whole line that starts with the planted workload's
+  # cluster, namespace and name.
+  - name: the-workload-has-a-declared-line
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: ?\([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: ?\([^)\n;]*\))?; cause: [^\n]+$'
+
+  - name: the-declared-line-says-all-replicas-share-a-zone
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?1(?: ?\([^)\n;]*\))?; all replicas in one zone: yes(?: ?\([^)\n;]*\))?; cause: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: ?\([^)\n;]*\))?; all replicas in one zone: (?!yes(?: ?\([^)\n;]*\))?;)[^;\n]+; cause: [^\n]+$'
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?(?!1(?: ?\([^)\n;]*\))?;)\d+(?: ?\([^)\n;]*\))?; all replicas in one zone: [^;\n]+; cause: [^\n]+$'
+
+  # The cause: the required affinity, the spread that only prefers, or the
+  # two named together, which is the reading the fixture's own description
+  # gives (the affinity is what makes ScheduleAnyway bite); the API field
+  # spellings (nodeAffinity, topologySpreadConstraints) name the same two.
+  - name: the-declared-line-names-the-scheduling-cause
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - zonal-skew-scheduling
+      any_of_patterns:
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: ?\([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: ?\([^)\n;]*\))?; cause: (?:both )?(?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: ?\([^)\n;]*\))?(?:(?:,| and| \+|/| with| under| plus| ?&) ?(?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$'
+      forbidden_patterns:
+        - '(?m)^{cluster:d}(?:\s*\([^)\n]*\))?/seeded-topology/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?zone-pinned-api(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: replicas:? ?\d+[^;\n]*; zones in use:? ?\d+(?: ?\([^)\n;]*\))?; all replicas in one zone: (?:yes|no)(?: ?\([^)\n;]*\))?; cause: (?!(?:both )?(?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?)(?: ?\([^)\n;]*\))?(?:(?:,| and| \+|/| with| under| plus| ?&) ?(?:(?:required|preferred|hard|soft|scheduleanyway|donotschedule) )?(?:node[ -]?affinity|(?:topology[ -]?)?spread[ -]?constraints?))?$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The constraint is still only a preference. DoNotSchedule is the heal
+  # that spreads the pods and empties the fixture for every later case.
+  - name: the-planted-spread-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-scheduling
+      kind: deployment
+      resource_name: zone-pinned-api
+      namespace: seeded-topology
+      path: spec.template.spec.topologySpreadConstraints[0].whenUnsatisfiable
+      op: eq
+      value: ScheduleAnyway
