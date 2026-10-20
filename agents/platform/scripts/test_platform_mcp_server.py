@@ -76,6 +76,7 @@ sandbox_exec.MANAGED_CONFIG_PATH = "/nonexistent/kube-agents-test/config.yaml"
 # file or off the environment depends on where it runs. Pinned to nothing, the
 # file sources are closed and the cases that are about them point these at a
 # tmpdir.
+import chat_notify  # noqa: E402
 import chat_platforms  # noqa: E402
 chat_platforms.MANAGED_CONFIG_PATH = "/nonexistent/kube-agents-test/managed.yaml"
 chat_platforms.CONFIG_PATH = "/nonexistent/kube-agents-test/profile.yaml"
@@ -89,9 +90,16 @@ chat_platforms.CONFIG_PATH = "/nonexistent/kube-agents-test/profile.yaml"
 # reason. Derived from `_ENV_SIGNALS` rather than listed out, so a signal added
 # there cannot escape the blanking; a case states the ones it wants by merging
 # them over this.
+#
+# `_ENV_SIGNALS` is not the whole of the third source any more. Since the gateway
+# took the backend under `next`, `A2A_NOTIFY_PLATFORM` decides two things these
+# cases assert on: `enabled_chat_platforms` counts the routed platform as enabled
+# whatever the files say, and `chat_notify.command` turns a `hermes send` argv into
+# an `a2a notify` one. An operator renders it, so it is on a maintainer's shell for
+# the same reason the relay URLs are. Named from `chat_notify`'s own constants.
 BLANK_CHAT_ENV = {
     var: "" for signals in chat_platforms._ENV_SIGNALS.values() for var in signals
-}
+} | {chat_notify.NOTIFY_PLATFORM_ENV: "", chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}
 
 from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification, report_to_chat, _sanitize_log_text, _sanitize_audit_value, _strip_audit_log_noise
 
@@ -716,6 +724,7 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('urllib.request.urlopen')
     @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV})
     def test_send_notification_with_session_success(self, mock_run, mock_urlopen, mock_env):
         mock_env.return_value = {}
         
@@ -1020,6 +1029,29 @@ class TestSendNotificationDeliveryFallback(unittest.TestCase):
         send_notification("rca report", session_id="k8s-evt-abc")
 
         self.assertEqual([self.THREAD_TARGET], self._targets(mock_run))
+
+    @patch('platform_mcp_server._run_env')
+    @patch('urllib.request.urlopen')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV, 'GOOGLE_CHAT_HOME_CHANNEL': 'spaces/HOME'})
+    def test_a_thread_send_of_unknown_outcome_is_not_broadcast_again(self, mock_run, mock_urlopen, mock_env):
+        # `a2a notify` exits NOTIFY_OUTCOME_UNKNOWN when the gateway did not
+        # answer in time: the post may have landed, and `chat_notify` says not
+        # to resend it. The fallback keys on delivery, so it has to read that
+        # exit as delivered rather than as the failure its non-zero code looks
+        # like, or a report that did post gets a second copy in the home
+        # channel -- the duplicate this fallback is built not to create.
+        mock_env.return_value = {}
+        mock_urlopen.return_value.__enter__.return_value = self._metadata()
+        mock_run.side_effect = subprocess.CalledProcessError(
+            chat_notify.NOTIFY_OUTCOME_UNKNOWN, ["a2a"], stderr="the gateway did not answer",
+        )
+
+        result = send_notification("rca report", session_id="k8s-evt-abc")
+
+        self.assertEqual([self.THREAD_TARGET], self._targets(mock_run))
+        self.assertNotIn("NOTE: thread delivery failed", result)
+        self.assertIn("do not resend it", result)
 
 
 class TestSendNotificationPlatformResolution(unittest.TestCase):
