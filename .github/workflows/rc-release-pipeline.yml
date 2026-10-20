@@ -174,8 +174,12 @@ jobs:
   # dispatch until step 8 ends, roughly doubling a run. It goes when today is
   # removed (#2007).
   #
-  # `mode: "today"` is written out rather than left to the inputs' default, so
-  # the leg keeps installing today whatever that default becomes.
+  # `mode: "today"` is written out rather than left to the inputs' default. On
+  # its own that does not pin the install: platform_agent_mode.sh resolves an
+  # explicit `today` to "no key", so the pin holds only while
+  # provision_environment.sh hands install.sh `--mode` explicitly rather than
+  # leaving the mode to install.sh's default. Drop that and this leg installs
+  # whatever new installs get.
   #
   # Hung off step 5 and inheriting its success() gate, so the leg runs only for
   # a candidate that passed on next, and only once the next cluster is gone.

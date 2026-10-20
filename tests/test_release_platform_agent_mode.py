@@ -461,6 +461,11 @@ class WorkflowsCarryTheModeTest(unittest.TestCase):
                 self.assertIn("github.repository == 'gke-labs/kube-agents'", job["if"])
                 # Any status function replaces the implicit success() gate.
                 self.assertIsNone(re.search(r"\b(always|cancelled|failure|success)\s*\(", job["if"]))
+        # The tag step fails closed on a red next E2E, and the gating teardown keeps a
+        # failed next install standing, only through the same implicit success().
+        for job_id in ("step-4-tag-validated", "step-5-teardown-env"):
+            with self.subTest(job=job_id):
+                self.assertIsNone(re.search(r"\b(always|cancelled|failure|success)\s*\(", jobs[job_id]["if"]))
         # The same suites as the today leg, so the two results read side by side.
         for key in ("blocking_suite", "optional_suites"):
             self.assertEqual(jobs["step-7-run-e2e-today"]["with"][key], jobs["step-3-run-e2e-tests"]["with"][key])
