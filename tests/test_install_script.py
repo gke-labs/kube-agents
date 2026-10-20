@@ -6821,11 +6821,12 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
 
     # ── the interview re-asks rather than refusing after it ──
 
-    def _interview(self, flags, content, answers, choice="2"):
+    def _interview(self, flags, content, answers, choice="2", locale=None):
         """Step 6 on an interactive run: prompt_menu picks `choice`, and
         prompt_read answers from `answers` in order, echoing each prompt."""
         stubs = (
-            "has_controlling_tty() { return 0; }\n"
+            (f"export LC_ALL={locale}\n" if locale else "")
+            + "has_controlling_tty() { return 0; }\n"
             "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
             "tf_state_chat_subscription_name() { :; }\n"
             f'prompt_menu() {{ local v="${{!#}}"; printf -v "$v" "%s" "{choice}"; }}\n'
@@ -6918,6 +6919,22 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # A home channel given at once is not questioned.
         proc = self._interview("--mode=next", "", lead + ["C0123ABCD", "#ops"])
         self.assertNotIn("Continue without a home channel", proc.stdout + proc.stderr)
+
+    def test_a_home_channel_of_unicode_space_under_next_is_confirmed(self):
+        # The operator trims with strings.TrimSpace, so such an answer is no
+        # home channel at all; [[:space:]] misses it in the C locale.
+        for locale in ("C", "en_US.UTF-8"):
+            with self.subTest(locale=locale, platform="slack"):
+                lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
+                proc = self._interview("--mode=next", "", lead + ["\u00a0", "n", "C0123ABCD", "#ops"], locale=locale)
+                out = proc.stdout + proc.stderr
+                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
+            with self.subTest(locale=locale, platform="google_chat"):
+                proc = self._interview("--mode=next", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
+                out = proc.stdout + proc.stderr
+                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("went on ASKED=5", proc.stdout, out)
 
     def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
         # #3320 on Chat, which holds the gateway whenever it is enabled under
