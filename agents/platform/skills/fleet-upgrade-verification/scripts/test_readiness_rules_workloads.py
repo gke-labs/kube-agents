@@ -173,6 +173,14 @@ class NodeLocalStateTest(unittest.TestCase):
         self.assertIn("the pvc read failed", out["unknown"][0]["detail"])
         self.assertEqual(run(node_local_state, items, read_errors=WORKLOADS_UNREAD)["unknown"], [])
 
+    def test_no_workload_read_is_one_unknown_not_a_clean_record(self):
+        # The PDB read carries the Deployments and StatefulSets this rule grades: when it did not
+        # run, the rule says so instead of reading as a cluster with no node-local state.
+        failed = {"kubeconfig": "k", "items": None, "error": "get-credentials failed", "read_errors": {kind: rules.NO_READ_RAN_REASON for kind in rules.READ_KINDS}}
+        out = node_local_state.evaluate({}, {}, failed, TARGET, context([pool()]))
+        self.assertEqual((out["risks"], out["notes"]), ([], []))
+        self.assertEqual([(u["object"], u["detail"]) for u in out["unknown"]], [(None, "Deployments and StatefulSets not read (get-credentials failed); nothing graded")])
+
     def test_clean_daemonsets_cronjobs_and_system_namespaces_are_not_read(self):
         items = [
             template("Deployment", "stateless", {"containers": [busybox()], "volumes": [{"name": "cfg", "configMap": {"name": "c"}}]}),

@@ -11,7 +11,8 @@ with the volume. A Deployment's `emptyDir`, which every reschedule empties and t
 rebuilds, a memory-backed `emptyDir`, a `hostPath` mounted read-only and a `hostPath` declared
 but mounted by no container are notes. DaemonSets
 (per-node agents by design) and CronJobs (transient pods) are not read. When the StorageClass
-or claim read failed and a template mounts a claim, the claim's class is `unknown`. Nothing
+or claim read failed and a template mounts a claim, the claim's class is `unknown`; when the
+PDB read's workloads were not read at all, the rule is one `unknown` and grades nothing. Nothing
 here blocks: a rebuild loses the data and GKE does not stop for it, so `CAN_BLOCK` is False.
 
 Sources: docs.cloud.google.com/kubernetes-engine/docs/concepts/local-ssd (data on Local SSD
@@ -45,6 +46,7 @@ DETAIL = "keeps data on the node in {volumes}; a node rebuild loses it{statefuls
 STATEFULSET_TEXT = ", and a StatefulSet's identity survives the rebuild while its node-local data does not"
 NOTE_SCRATCH = "{kind} {object} keeps scratch on the node in {volumes}; not a risk: a Deployment's emptyDir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload's"
 STORAGE_UNREAD_DETAIL = "mounts claim(s) {claims}; the {kind} read failed ({reason}), so whether a claim is on a local class is unknown"
+WORKLOADS_NOT_READ = "Deployments and StatefulSets not read ({reason}); nothing graded"
 
 
 def _local_storage_classes(items: list) -> set[str]:
@@ -131,6 +133,10 @@ def node_local_volumes(obj: dict, spec: dict, workload: dict, local_classes: set
 
 def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
     result = rules.new_result()
+    workloads_error = rules.read_error(read, rules.PDB_WORKLOAD_KINDS[0])
+    if workloads_error:
+        result["unknown"].append(rules.rule_unknown(RULE_ID, ENTRY, WORKLOADS_NOT_READ.format(reason=workloads_error)))
+        return result
     items = rules.read_items(read)
     unread = rules.unread_kinds(read, (STORAGE_CLASS_READ_KIND, CLAIM_READ_KIND))
     local_classes = _local_storage_classes(items)
