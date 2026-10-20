@@ -216,10 +216,6 @@ type CardStopResult struct {
 	// order, cut at CardStopListMax (ListsCut covers it too). Absent from an
 	// older executor's result, which reads as none named.
 	NotStopped []CardStopCard `json:"notStopped,omitempty"`
-	// PullRequests are the URLs of the pull or merge requests the stopped
-	// conversation's cards had opened, finished cards included, cut at
-	// CardStopListMax. Absent when the executor does not report them.
-	PullRequests []string `json:"pullRequests,omitempty"`
 }
 
 // CardStopCard is one card a result names. PriorStatus is set on a stopped

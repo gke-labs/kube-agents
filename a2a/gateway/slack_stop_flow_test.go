@@ -24,13 +24,8 @@ func TestSlackStopReplyWording(t *testing.T) {
 		{"only the turn", lib.CardStopResult{}, true, "Stopped."},
 		{"nothing", lib.CardStopResult{}, false, "Nothing was running."},
 		{"only finished cards", lib.CardStopResult{Settled: stopped}, false, "Nothing was running."},
-		{"a pull request", lib.CardStopResult{Stopped: stopped, PullRequests: []string{"https://github.com/o/r/pull/412"}}, false,
-			"Stopped. I'd already opened a pull request before you stopped me: [#412](https://github.com/o/r/pull/412)."},
-		{"a merge request", lib.CardStopResult{Stopped: stopped, PullRequests: []string{"https://gitlab.com/g/p/-/merge_requests/7"}}, false,
-			"Stopped. I'd already opened a pull request before you stopped me: [#7](https://gitlab.com/g/p/-/merge_requests/7)."},
-		{"an unlinkable pull request", lib.CardStopResult{Stopped: stopped, PullRequests: []string{
-			"javascript:alert(1)", "http://x/pull/1", "https://x/pull/1?a=b", "https://u:p@x/pull/2", "https://x/a(b)/pull/3", "https://x/issues/4"}}, false, "Stopped."},
-		{"a pull request but nothing ran", lib.CardStopResult{PullRequests: []string{"https://github.com/o/r/pull/412"}}, false, "Nothing was running."},
+		{"the only card did not stop", lib.CardStopResult{Failed: 1, NotStopped: []lib.CardStopCard{{ID: "t_2", Title: "audit prod"}}}, false,
+			slackStopCouldntReply},
 		{"one card did not stop", lib.CardStopResult{Stopped: stopped, Failed: 1, NotStopped: []lib.CardStopCard{{ID: "t_2", Title: "audit prod"}}}, false,
 			"Stopped, except one task that didn't respond: audit prod."},
 		{"one unnamed card did not stop", lib.CardStopResult{Stopped: stopped, Pending: 1}, false, slackStopCouldntReply},
@@ -154,6 +149,62 @@ func TestSlackStopButtonCancelsTheTurnQuietly(t *testing.T) {
 	for _, p := range slackPostsIn(d, "100.1") {
 		if strings.Contains(p, "cancel sent") || strings.Contains(p, "canceled") {
 			t.Fatalf("the Stop button's cancel posted %q", p)
+		}
+	}
+}
+
+func TestSlackStopButtonDuringACardStopCancelsANewTurnAndFollowsUp(t *testing.T) {
+	d := slackStopRig(t)
+	ctx := context.Background()
+	askAndAnswer(t, d)
+	conv := "slack:dm/D1/100.1"
+
+	pressStop(d, "U1", "100.1", "200.1")
+	control := awaitSubmission(t, d.r, "platform", 1)
+	// A new ask while the first control runs, and a second press on it.
+	d.adapter.events <- slackMsg("im", "D1", "U1", "and the nodes", "300.1", "100.1")
+	second := awaitSubmission(t, d.r, "platform", 2)
+	exec := d.r.execFor(t, second, "platform")
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitForRecord(t, d.r, conv, "the new turn to run", func(rec *SessionRecord) bool {
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == second.TaskID
+	})
+	pressStop(d, "U1", "100.1", "400.1")
+	waitFor(t, "the new turn's cancel on the bus", func() bool {
+		for _, e := range inSubjectEnvelopes(t, d.r.url, "platform") {
+			if e.Kind == lib.KindCancel && e.TaskID == second.TaskID {
+				return true
+			}
+		}
+		return false
+	})
+	rec := waitForRecord(t, d.r, conv, "the follow-up marked in the Slack voice", func(rec *SessionRecord) bool {
+		return rec.CardStop != nil && rec.CardStop.Again != nil && rec.CardStop.AgainSlackStop && rec.CardStop.Promised
+	})
+	if rec.CardStop.TaskID != control.TaskID {
+		t.Fatalf("the second press replaced the control in flight: %+v", rec.CardStop)
+	}
+
+	if err := exec.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	answerControl(t, d.r, control, &lib.CardStopResult{Stopped: []lib.CardStopCard{{ID: "t_1", Title: "check pods"}}})
+	followUp := awaitSubmission(t, d.r, "platform", 3)
+	answerControl(t, d.r, followUp, &lib.CardStopResult{})
+	waitFor(t, "a Slack Stop reply for each press", func() bool {
+		n := 0
+		for _, p := range slackPostsIn(d, "100.1") {
+			if p == slackStopStoppedReply {
+				n++
+			}
+		}
+		return n == 2
+	})
+	for _, p := range slackPostsIn(d, "100.1") {
+		if strings.Contains(p, "🛑") || strings.Contains(p, "⚠️") {
+			t.Fatalf("a Slack Stop posted the typed stop's line %q", p)
 		}
 	}
 }

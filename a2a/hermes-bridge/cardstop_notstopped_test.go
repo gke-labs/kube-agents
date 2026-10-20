@@ -5,16 +5,14 @@ import (
 	"testing"
 )
 
-// The result names the cards that did not stop and the pull requests the
-// conversation's cards opened, for the Slack Stop's replies.
-func TestCardStopResultNamesWhatDidNotStopAndThePullRequests(t *testing.T) {
+// The result names the cards that did not stop, for the Slack Stop's reply.
+func TestCardStopResultNamesWhatDidNotStop(t *testing.T) {
 	var r cardStopResponse
 	if err := json.Unmarshal([]byte(`{
 		"stopped": [{"id": "t_1", "title": "check pods", "prior_status": "running"}],
 		"failed": [{"id": "t_2", "title": "audit prod", "error": "boom"}],
 		"pending": [{"id": "t_3", "title": "drain node"}],
-		"unresolved": [{"id": "t_4", "title": "late worker"}],
-		"pull_requests": ["https://github.com/o/r/pull/412"]
+		"unresolved": [{"id": "t_4", "title": "late worker"}]
 	}`), &r); err != nil {
 		t.Fatal(err)
 	}
@@ -34,14 +32,10 @@ func TestCardStopResultNamesWhatDidNotStopAndThePullRequests(t *testing.T) {
 	if out.NotStopped[0].Title != "audit prod" {
 		t.Fatalf("a not-stopped card lost its title: %+v", out.NotStopped[0])
 	}
-	if len(out.PullRequests) != 1 || out.PullRequests[0] != "https://github.com/o/r/pull/412" {
-		t.Fatalf("pullRequests = %v", out.PullRequests)
-	}
 }
 
-func TestCardStopResultWithoutThemNamesNone(t *testing.T) {
-	out := cardStopResult(&cardStopResponse{})
-	if out.NotStopped != nil || out.PullRequests != nil {
-		t.Fatalf("an answer with neither named some: %+v %+v", out.NotStopped, out.PullRequests)
+func TestCardStopResultWithNothingUnstoppedNamesNone(t *testing.T) {
+	if out := cardStopResult(&cardStopResponse{}); out.NotStopped != nil {
+		t.Fatalf("an answer with every card stopped named some: %+v", out.NotStopped)
 	}
 }

@@ -58,7 +58,12 @@ A first line of `[bench:card-failure-wake]` or `[bench:slack-question-wake]` mak
 replay of a card's wake rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
 runs only over the api transport and errors under any other `AGENT_TRANSPORT`, so the case also
-needs an entry in `hack/eval/inject-lane-exclusions.txt`.
+needs an entry in `hack/eval/inject-lane-exclusions.txt`. A first line of
+`[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the
+prompt an ask the harness stops once it has filed a card
+([`bench/kube_agents_bench/stop_hook.py`](../../bench/kube_agents_bench/stop_hook.py)); it runs
+only over the inject transport, so the case needs an entry in
+`hack/eval/api-lane-exclusions.txt`.
 
 `expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
 case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that

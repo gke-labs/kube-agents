@@ -1849,7 +1849,7 @@ otherwise leaves the old process's Working… on it; the thread is renamed once 
 verified ask that is not a gateway command, with today's title rules: the ask up to its first
 question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
-three suggested prompts. `agent_session_stopped` is not handled: Stop stays deferred.
+three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
 **One backend per gateway process.** The relay binds one durable, and two gateways on
 one durable split event deliveries - so config counts the armed backends and refuses

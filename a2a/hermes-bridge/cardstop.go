@@ -127,9 +127,6 @@ type cardStopResponse struct {
 	Errors     []string          `json:"errors"`
 	Truncated  bool              `json:"truncated"`
 	Deadline   bool              `json:"deadline"`
-	// PullRequests are the pull or merge request URLs the conversation's
-	// cards opened, when session-kv reports them.
-	PullRequests []string `json:"pull_requests"`
 }
 
 // cardStopCardRef is a card session-kv names by id and title alone.
@@ -322,13 +319,6 @@ func cardStopResult(r *cardStopResponse) *lib.CardStopResult {
 			break
 		}
 		out.NotStopped = append(out.NotStopped, lib.CardStopCard{ID: c.ID, Title: cardStopTitle(c.Title)})
-	}
-	for _, u := range r.PullRequests {
-		if len(out.PullRequests) == cardStopListMax {
-			out.ListsCut = true
-			break
-		}
-		out.PullRequests = append(out.PullRequests, u)
 	}
 	return out
 }

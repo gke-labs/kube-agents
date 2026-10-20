@@ -130,6 +130,9 @@ type CardStopRun struct {
 	// TurnCancelled records that the Slack Stop also cancelled a running
 	// turn, so a result naming no card still says "Stopped.".
 	TurnCancelled bool `json:"turnCancelled,omitempty"`
+	// AgainSlackStop marks an Again the Slack Stop button set: its follow-up
+	// speaks with the Slack Stop's replies (followUpCardStop).
+	AgainSlackStop bool `json:"againSlackStop,omitempty"`
 	// Promised is set when a stop told "the answer comes"
 	// (cardStopAlreadyNotice) marked this control, so it answers in full
 	// even when Quiet.
@@ -397,7 +400,7 @@ func (g *Gateway) endCardStop(ctx context.Context, rec *SessionRecord) {
 	g.stopCardStopTimer(run.TaskID)
 	g.retireTaskRoute(ctx, run.TaskID)
 	if run.Again != nil {
-		g.followUpCardStop(ctx, rec, *run.Again)
+		g.followUpCardStop(ctx, rec, *run.Again, CardStopRun{SlackStop: run.AgainSlackStop, TurnCancelled: run.AgainSlackStop})
 	}
 }
 
@@ -409,7 +412,10 @@ func (g *Gateway) endCardStop(ctx context.Context, rec *SessionRecord) {
 // on (/session, or a delegate's re-home), or when a turn is running: that
 // turn started after the stop, and a control would wait for it and archive
 // its cards too, which nobody asked for.
-func (g *Gateway) followUpCardStop(ctx context.Context, rec *SessionRecord, authority Authority) {
+//
+// voice is the Slack Stop's when the button asked for the follow-up: it then
+// speaks with the button's replies, a skip included (slackStopCouldntReply).
+func (g *Gateway) followUpCardStop(ctx context.Context, rec *SessionRecord, authority Authority, voice CardStopRun) {
 	var why, notice string
 	switch active := rec.ActiveTask; {
 	case !g.cfg.CardStop:
@@ -421,10 +427,13 @@ func (g *Gateway) followUpCardStop(ctx context.Context, rec *SessionRecord, auth
 	}
 	if notice != "" {
 		g.log.Info("card stop follow-up not sent", "conversation", rec.Key, "why", why)
+		if voice.SlackStop {
+			notice = slackStopCouldntReply
+		}
 		g.post(rec.Key, notice)
 		return
 	}
-	g.stopCards(ctx, rec, authority, "", true)
+	g.stopCardsAs(ctx, rec, authority, "", true, voice)
 }
 
 // cardStopResultOf finds the result form of the cardStop part among parts.

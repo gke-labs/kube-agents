@@ -3,8 +3,6 @@ package gateway
 import (
 	"context"
 	"fmt"
-	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/slack-go/slack/slackevents"
@@ -36,27 +34,15 @@ const (
 )
 
 // The Slack Stop's replies, the maintainer's approved wording, one per stop.
+// The approved pull request line ("Stopped. I'd already opened a pull request
+// before you stopped me: #412.") waits for a card-stop result that names the
+// pull requests the stopped cards opened; none does yet.
 const (
 	slackStopStoppedReply = "Stopped."
-	// slackStopPRReplyFormat takes the pull request as a markdown link,
-	// written "#<number>".
-	slackStopPRReplyFormat = "Stopped. I'd already opened a pull request before you stopped me: %s."
 	// slackStopExceptReplyFormat takes the one card that did not stop.
 	slackStopExceptReplyFormat = "Stopped, except one task that didn't respond: %s."
 	slackStopNothingReply      = "Nothing was running."
 	slackStopCouldntReply      = "I couldn't stop the work in this thread. Press Stop again."
-)
-
-// slackStopPRPathRE is the path of a pull request (GitHub) or a merge request
-// (GitLab), with its number. A URL of any other shape is not linked.
-var slackStopPRPathRE = regexp.MustCompile(`/(?:pull|-/merge_requests|merge_requests)/([0-9]+)/?$`)
-
-const (
-	// slackStopPRScheme is the only scheme a reported pull request may have.
-	slackStopPRScheme = "https"
-	// slackStopLinkBreakers are the characters that would end or reopen the
-	// markdown link, or a Slack link, early; a URL holding one is not linked.
-	slackStopLinkBreakers = "()[]<>| \t\n"
 )
 
 // isSlackStop reports a stop from the Slack Stop button rather than the word:
@@ -66,15 +52,13 @@ func isSlackStop(msg InboundMessage, backend string) bool {
 }
 
 // slackStop is the Stop button's stop with the card stop armed and on its
-// route (cardStopWanted): the running turn is cancelled quietly, then the
+// route (cardStopWanted): a running turn is cancelled quietly, then the
 // thread's cards are stopped by a control that speaks with the Slack Stop's
-// replies. A second press while that control runs adds nothing: the first
-// one's reply is still coming.
+// replies. With a control already in flight, a press that cancelled a newer
+// turn marks it for one follow-up, which answers in the Slack Stop's voice,
+// since that turn may have filed cards the control has passed; a press that
+// cancelled nothing adds nothing, because the first press's reply is coming.
 func (g *Gateway) slackStop(ctx context.Context, rec *SessionRecord, authority Authority, backend string) {
-	if rec.CardStop != nil {
-		g.log.Info("slack stop: a card stop is already running; nothing added", "conversation", rec.Key)
-		return
-	}
 	turn := false
 	if active := rec.ActiveTask; active != nil && !active.Detached {
 		if !g.cancelTaskVoiced(ctx, rec, authority, true) {
@@ -82,6 +66,16 @@ func (g *Gateway) slackStop(ctx context.Context, rec *SessionRecord, authority A
 			return
 		}
 		turn = true
+	}
+	if rec.CardStop != nil {
+		if !turn {
+			g.log.Info("slack stop: a card stop is already running; nothing added", "conversation", rec.Key)
+			return
+		}
+		markCardStopAgain(rec, authority)
+		rec.CardStop.AgainSlackStop = true
+		rec.CardStop.Promised = true
+		return
 	}
 	g.stopCardsAs(ctx, rec, authority, backend, false, CardStopRun{SlackStop: true, TurnCancelled: turn})
 }
@@ -97,45 +91,24 @@ func (run CardStopRun) unconfirmed() string {
 }
 
 // slackStopReply words a completed control's result as the Slack Stop's one
-// reply. Anything the stop could not promise is the couldn't-stop reply,
-// except exactly one card that did not stop, which is named; a stop that
-// cancelled no turn and stopped no card says nothing was running; a stop that
-// stopped something names the first pull request the thread's cards opened,
-// when the executor reports one. Titles are cleaned as the card stop's are
-// (cardStopTitle), so a title can mention no one and link nowhere.
+// reply. A stop that cancelled no turn and stopped no card says nothing was
+// running, unless something it found would not stop; anything the stop
+// could not promise is the couldn't-stop reply, except exactly one card that
+// did not stop beside work that did, which is named. Titles are cleaned as
+// the card stop's are (cardStopTitle), so a title can mention no one and link
+// nowhere.
 func slackStopReply(r *lib.CardStopResult, turnCancelled bool) string {
 	unpromised := r.Failed + r.Pending + r.Unresolved
+	stoppedSome := turnCancelled || len(r.Stopped) > 0
 	switch {
-	case unpromised == 1 && len(r.NotStopped) == 1 && !r.Deadline && !r.Truncated:
+	case unpromised == 1 && len(r.NotStopped) == 1 && stoppedSome && !r.Deadline && !r.Truncated:
 		return fmt.Sprintf(slackStopExceptReplyFormat, cardStopTitle(r.NotStopped[0].Title))
 	case unpromised > 0 || r.Deadline || r.Truncated:
 		return slackStopCouldntReply
-	case !turnCancelled && len(r.Stopped) == 0:
+	case !stoppedSome:
 		return slackStopNothingReply
 	}
-	for _, u := range r.PullRequests {
-		if link, ok := slackStopPRLink(u); ok {
-			return fmt.Sprintf(slackStopPRReplyFormat, link)
-		}
-	}
 	return slackStopStoppedReply
-}
-
-// slackStopPRLink is raw as a markdown link "[#<number>](<url>)", when it is
-// an https pull or merge request URL with no user info, query or fragment,
-// which toMrkdwn turns into a Slack link; anything else is not linked.
-func slackStopPRLink(raw string) (string, bool) {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != slackStopPRScheme || u.Host == "" || u.User != nil ||
-		u.RawQuery != "" || u.Fragment != "" {
-		return "", false
-	}
-	m := slackStopPRPathRE.FindStringSubmatch(u.EscapedPath())
-	s := u.String()
-	if m == nil || strings.ContainsAny(s, slackStopLinkBreakers) {
-		return "", false
-	}
-	return "[#" + m[1] + "](" + s + ")", true
 }
 
 // inboundStop normalizes one agent_session_stopped event into a stop, or

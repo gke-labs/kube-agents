@@ -11,7 +11,7 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
 alias with `no_parent_owners`, so a root approver does not count for either. Nothing else
 carries the rule: `hack/eval/nightly-cases.txt`, `hack/eval/inject-lane-exclusions.txt`,
-`hack/eval/inject-lane-safeguards.yaml`, a new
+`hack/eval/api-lane-exclusions.txt`, `hack/eval/inject-lane-safeguards.yaml`, a new
 case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats

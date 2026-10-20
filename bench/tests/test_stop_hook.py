@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 import pytest
 from devops_bench.agents import AgentResult
 from kube_agents_bench import board, harness, stop_hook
@@ -126,5 +125,3 @@ def test_the_case_carries_the_directive_on_its_own_line():
     case = harness.Path(__file__).resolve().parents[1] / "tasks" / "chat-stop-halts-delegated-remediation" / "task.yaml"
     stop = stop_hook.parse(yaml.safe_load(case.read_text(encoding="utf-8"))["prompt"])
     assert stop is not None and "checkout-gateway" in stop.prompt
-
-
