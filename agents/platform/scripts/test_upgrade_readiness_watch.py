@@ -2103,11 +2103,12 @@ class DeclaredScope(Base):
             code, out = self.run_tick(FakeSandbox(versions))
             self.assertEqual((code, out.strip()), (0, ""))
 
-    def test_a_declared_project_the_reconcile_cannot_list_is_announced_once_per_outcome_as_its_line_says(self) -> None:
+    def test_a_declared_project_the_reconcile_cannot_list_is_announced_once_per_outcome(self) -> None:
         """The reconcile's listing of p2 times out every run, so the snapshot
         records it unreachable on every tick. The partial line posts once,
         with the listing remedy, and does not return while that outcome
-        stands, which is what the remedy now says; the reconcile recording
+        stands, since its key holds the project and the cause (the remedy
+        itself states no cadence); the reconcile recording
         another outcome (unresolved, then a denial) is a new cause, named with
         its remedy, and the project being read clears the table."""
         versions = envelope([member("a", "current")])
