@@ -28,6 +28,17 @@ configuration drift: the fleet-consistency audit compares a cluster's configurat
 live peers, and the drift-detection design (not yet shipped) means live state diverging from Git.
 Neither reads versions against a target.
 
+## Before you run anything: is this the brief?
+
+A request for **the upgrade readiness brief**, for **which findings need a decision**, or for
+**this week's upgrade readiness report** is not answered by this skill's table. Stop here, load the
+`upgrade-readiness-brief` skill (`skill_view upgrade-readiness-brief`) and follow it: it reads the
+Saturday review's copy under `/opt/data/upgrade-readiness/weekly/` and the findings queue, and
+answers in the brief's shape, which opens with **Decide now** and the undecided critical findings'
+queue ids. Run this skill's report only when that skill tells you to (no weekly review exists yet),
+or when the question is the readiness table itself ("is every cluster ready", "what would stop the
+upgrade", "which clusters lag").
+
 ## Run the report
 
 ```bash
@@ -377,6 +388,26 @@ while the member's maintenance and skew rules, and a per-entry rule that reads t
 record alone, are still graded, and the other members are unaffected. `--at` with a
 value that is not RFC 3339, or `--at` or `--kubeconfig-dir` without `--readiness`, is a usage
 error (exit 2).
+
+## Scheduled runs of the readiness report
+
+Besides the Monday upgrade audit, whose `upgrade-blocked` check runs `--readiness` for each cluster
+found behind, two cron jobs on the Platform Agent's roster run the whole report without a request
+(`cron/README.md` in the platform profile says how):
+
+- `upgrade-readiness-watch`, daily: for a cluster below a version its release channel offers; the
+  report lands under `upgrade-readiness/reports/<version>/` on the agent's volume with one chat line.
+- `upgrade-readiness-weekly-review`, Saturdays: every cluster in scope, every blocker and risk
+  registered on the findings queue; the technical report is `upgrade-readiness/weekly/latest.md`
+  on the agent's volume, with a copy at `/opt/data/upgrade-readiness/weekly/latest.md` in the
+  sandbox; the review job writes both, so never create, copy over or edit them from this skill
+  (the brief reads them as the review's record). `upgrade-readiness-weekly-brief` follows it with
+  the week's brief in chat. A user who
+  asks for "this week's upgrade readiness report" gets that copy printed; one who asks for the brief,
+  or for what needs their decision, gets the brief's shape composed from the copy and the findings
+  queue by the `upgrade-readiness-brief` skill (the SOP's "On request" route as the agent loads
+  it), never this skill's table or a summary of it: the brief leads with **Decide now** and the
+  undecided critical findings' queue ids.
 
 ## Scan the GitOps manifests
 

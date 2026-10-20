@@ -439,6 +439,134 @@ class TestRegistration(QueueTestCase):
 
         self.assertEqual(fq.get_finding(self.conn, elsewhere_id)["rubric"]["C"], 1.0)
 
+    def test_a_check_prefix_scopes_absence_to_its_own_family(self):
+        # The weekly upgrade readiness review is complete for the `upgrade-`
+        # family on a cluster and for nothing else: an inventory row it never
+        # looked at keeps its confidence, the upgrade row it no longer reports
+        # loses it.
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        self.register(sample(), upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        inventory_id = fq.validate_finding(sample())["id"]
+
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})  # empty batch, prefixed claim
+
+        self.assertEqual(result, {"results": [], "downgraded": 1})
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 0.6)
+        self.assertIsNotNone(fq.get_finding(self.conn, upgrade_id)["absent_since"])
+        self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
+        self.assertIsNone(fq.get_finding(self.conn, inventory_id)["absent_since"])
+
+    def test_a_complete_claim_without_a_prefix_reaches_its_own_source_only(self):
+        # The onboarding sweep re-run by hand sends no prefix; its claim is
+        # complete for the inventory's rows and must not touch the weekly
+        # review's rows on the same cluster.
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        stale = sample(object="Deployment/ledger")
+        self.register(sample(), stale, upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        stale_id = fq.validate_finding(stale)["id"]
+
+        result = self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+
+    def test_a_prefixed_claim_reaches_the_family_whatever_wrote_it(self):
+        # The review's ordinary batch: its own rows plus the `upgrade-` prefix.
+        # The claim is the family, so an `upgrade-` row another source wrote and
+        # the review no longer reports loses confidence too, while the inventory
+        # row outside the family keeps it.
+        foreign = sample(source="inventory", check="upgrade-pool-skew", namespace="", object="old-pool")
+        self.register(sample(), foreign)
+        foreign_id = fq.validate_finding(foreign)["id"]
+        inventory_id = fq.validate_finding(sample())["id"]
+        mine = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+
+        result = self.register(mine, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, foreign_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
+
+    def test_a_prefixed_claim_must_name_the_batchs_own_family(self):
+        upgrade = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+        self.register(upgrade)
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        crash = sample(source="event-watcher", check="crashloop", object="Deployment/ledger")
+        # A crashloop batch cannot claim the review's family.
+        with self.assertRaises(fq.FindingError):
+            self.register(crash, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+        # A prefix that is not a family (no trailing separator) reaches too much.
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade"})
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": ["upgrade-"]})
+        # One segment and its separator: neither a sub-family nor the bare separator.
+        for prefix in ("upgrade-pool-", "-", "upgrade_"):
+            with self.assertRaises(fq.FindingError):
+                self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": prefix})
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+        # Folded like the stored check: a capitalised prefix reaches the row.
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "Upgrade-"})
+        self.assertEqual(result["downgraded"], 1)
+        # A check that is only its family's name (stored without the separator) belongs to the family.
+        bare = sample(source="upgrade-readiness", check="upgrade-", namespace="", object="bare-pool")
+        self.register(bare)
+        bare_id = fq.validate_finding(bare)["id"]
+        self.assertEqual(fq.get_finding(self.conn, bare_id)["check"], "upgrade")
+        self.assertEqual(self.register(bare, scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})["results"][0]["outcome"], "updated")
+        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})["downgraded"], 1)
+
+    def test_a_check_is_stored_lower_case_so_the_prefix_reaches_it(self):
+        odd = sample(source="upgrade-readiness", check="Upgrade_Pool Skew", namespace="", object="old-pool")
+        self.register(odd)
+        odd_id = fq.validate_finding(odd)["id"]
+        self.assertEqual(fq.get_finding(self.conn, odd_id)["check"], "upgrade-pool-skew")
+        self.assertTrue(odd_id.startswith("upgrade-pool-skew."))
+        result = self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-"})
+        self.assertEqual(result["downgraded"], 1)
+
+    def test_scope_source_must_be_known_and_one_the_batch_wrote(self):
+        stale = sample(object="Deployment/stale")
+        self.register(stale)
+        stale_id = fq.validate_finding(stale)["id"]
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "audits"})
+        # A batch of inventory rows cannot claim the event watcher's rows.
+        with self.assertRaises(fq.FindingError):
+            self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "event-watcher"})
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 1.0)
+        self.assertEqual(self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "inventory"})["downgraded"], 1)
+
+    def test_an_empty_batch_needs_a_complete_scope(self):
+        with self.assertRaises(fq.FindingError):
+            self.register()
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu"})
+        # Complete and empty, but naming neither a prefix nor a source: it would
+        # reach every row on the cluster, which no caller means.
+        with self.assertRaises(fq.FindingError):
+            self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+        self.assertEqual(self.register(scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True, "source": "inventory"}), {"results": [], "downgraded": 0})
+
+    def test_a_mixed_batch_claims_completeness_for_its_sources_only(self):
+        upgrade = sample(source="audit", check="upgrade-pool-skew", namespace="", object="default-pool")
+        other = sample(source="event-watcher", check="crashloop", object="Deployment/ledger")
+        self.register(sample(), upgrade, other)
+        other_id = fq.validate_finding(other)["id"]
+        upgrade_id = fq.validate_finding(upgrade)["id"]
+        stale = sample(object="Deployment/stale")
+        self.register(stale)
+        stale_id = fq.validate_finding(stale)["id"]
+
+        self.register(sample(), sample(source="event-watcher", check="crashloop", object="Deployment/other"), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
+
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, other_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
+
     def test_absence_does_not_reach_a_state_the_user_set(self):
         accepted = sample(object="Deployment/ledger")
         self.register(sample(), accepted)

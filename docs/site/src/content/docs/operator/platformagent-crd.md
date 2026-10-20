@@ -713,7 +713,7 @@ spec:
   `RECONCILE_EXCLUDE` environment variable, which matched bare names across every project and keeps
   working for one release alongside it. An excluded cluster gets no Cluster Agent, and fleet answers,
   the onboarding sweep and the fleet-audit collectors that list clusters leave it out. Still covering
-  it: the daily upgrade-readiness watch, whose report enumerates by project; the networking audit's
+  it: the daily upgrade-readiness watch and the Saturday `upgrade-readiness-weekly-review`, whose reports enumerate by project (the review's findings on such a cluster reach the findings queue and the weekly brief); the networking audit's
   subnet usage, since its pods still hold their IPs; the GCE audit's instance listing; and the
   third-party `gke` MCP server's `list_clusters`.
 
@@ -1089,7 +1089,7 @@ absent key is a key the agent may write, and it is read back by exactly one modu
 The fourth is `KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json`, where the reconcile finds the
 [`spec.scope`](#specscope) declaration. The container env carries it too, for the same reason as
 `HERMES_HOME_MODE`: a line the agent writes into the PVC `.env` would otherwise outrank it and hand
-the reconcile a declaration the agent authored. Its readers are `agents/platform/scripts/cluster_agent_reconcile.py`, which resolves it every hour, and `fleet_scope_targets.py`, which reads it when no reconcile snapshot answers, or when the last snapshot recorded no boundary, for the platform MCP server's `fleet_scope` tool and for the Platform Agent's `upgrade-readiness-watch` job, which learns from it whether the install declares a scope before handing the readiness report script the resolved scope beside each project it reads.
+the reconcile a declaration the agent authored. Its readers are `agents/platform/scripts/cluster_agent_reconcile.py`, which resolves it every hour, and `fleet_scope_targets.py`, which reads it when no reconcile snapshot answers, or when the last snapshot recorded no boundary, for the platform MCP server's `fleet_scope` tool and for the Platform Agent's `upgrade-readiness-watch` and `upgrade-readiness-weekly-review` jobs, which learn from it whether the install declares a scope before handing the readiness report script the resolved scope beside each project it reads.
 
 The fifth is `RECONCILE_PROJECT=`, pinned empty. The reconcile reads that variable as the management
 project ahead of the metadata server, and a management project that changes identity retires the
