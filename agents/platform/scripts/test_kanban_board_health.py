@@ -309,6 +309,136 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(kbh.severity_floor(env={"KANBAN_HEALTH_SEVERITY": "nonsense"}),
                          "error")
 
+    def test_commands_appear_once_in_footer_with_multiple_cards(self):
+        payload = json.dumps([
+            {"task_id": "t_1", "status": "blocked", "title": "Card 1",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 10}}]},
+            {"task_id": "t_2", "status": "blocked", "title": "Card 2",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 20}}]},
+        ])
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context={})
+        text = "\n".join(lines)
+        self.assertIn("Commands to move a card (run on the agent pod):", text)
+        self.assertIn("<task_id>", text)
+        self.assertEqual(text.count("re-run it:"), 1)
+        self.assertEqual(text.count("drop it:"), 1)
+
+    def test_stuck_cards_sorted_newest_first(self):
+        payload = json.dumps([
+            {"task_id": "t_old", "status": "blocked", "title": "Old card",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 216}}]},
+            {"task_id": "t_new", "status": "blocked", "title": "New card",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 2}}]},
+            {"task_id": "t_mid", "status": "blocked", "title": "Mid card",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 48}}]},
+        ])
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context={})
+        text = "\n".join(lines)
+        pos_new = text.find("t_new")
+        pos_mid = text.find("t_mid")
+        pos_old = text.find("t_old")
+        self.assertTrue(0 <= pos_new < pos_mid < pos_old,
+                        f"Expected newest first order: pos_new={pos_new}, pos_mid={pos_mid}, pos_old={pos_old}")
+
+    def test_cards_sharing_title_are_grouped(self):
+        payload = json.dumps([
+            {"task_id": "t_1", "status": "blocked", "title": "Scale kube-dns on platform-agent-host",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 216}}]},
+            {"task_id": "t_2", "status": "blocked", "title": "Scale kube-dns on platform-agent-host",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 120}}]},
+            {"task_id": "t_3", "status": "blocked", "title": "Scale kube-dns on platform-agent-host",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 120}}]},
+            {"task_id": "t_4", "status": "blocked", "title": "Scale kube-dns on platform-agent-host",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 48}}]},
+        ])
+        context = {
+            "t_1": {"kind": "capability"},
+            "t_2": {"kind": "needs_input"},
+            "t_3": {"kind": "needs_input"},
+            "t_4": {"kind": "transient"},
+        }
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context=context)
+        text = "\n".join(lines)
+        self.assertIn("Scale kube-dns on platform-agent-host — 4 cards (2 needs_input, 1 capability, 1 transient, oldest 9d)", text)
+        self.assertEqual(text.count("Scale kube-dns on platform-agent-host"), 1)
+
+    def test_thirty_four_cards_scenario_fits_within_chat_limit(self):
+        # Reproduce Hang's 34-card bug bash scenario (#3470)
+        # 24 cards on "Scale kube-dns on platform-agent-host to 3 replicas" / near-copies
+        # 6 triage cards for an outage from 2d ago
+        # 4 miscellaneous cards
+        cards = []
+        context = {}
+        for i in range(23):
+            tid = f"t_dns_{i}"
+            kind = "needs_input" if i < 17 else ("transient" if i < 21 else "capability")
+            age = 216 if i < 2 else (120 if i < 22 else 96)
+            cards.append({
+                "task_id": tid, "status": "blocked",
+                "title": "Scale kube-dns on platform-agent-host to 3 replicas",
+                "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                                 "title": "x", "detail": "y", "data": {"age_hours": age}}],
+            })
+            context[tid] = {
+                "kind": kind,
+                "reason": "Direct mutation of GKE resources is blocked by command policy: 'Agents hold read-only access to Kubernetes. Propose this change as a pull request instead...'",
+            }
+
+        # 6 outage triage cards from 2 days ago (48h)
+        for i in range(6):
+            tid = f"t_triage_{i}"
+            pod = f"platform-agent-gateway-pod-{i}"
+            cards.append({
+                "task_id": tid, "status": "blocked",
+                "title": f"Triage {pod} (Failed) on platform-agent-host",
+                "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                                 "title": "x", "detail": "y", "data": {"age_hours": 48}}],
+            })
+            context[tid] = {
+                "kind": "needs_input",
+                "reason": "The pinned kubeconfig is for a different cluster than this agent is scoped to.",
+            }
+
+        payload = json.dumps(cards)
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context=context)
+        text = "\n".join(lines)
+
+        # 1. Output length must be well below 12,000 characters
+        self.assertLess(len(text), 3000, f"Expected compact report under 3000 chars, got {len(text)}")
+
+        # 2. The 23 kube-dns cards collapsed into one group line
+        self.assertIn("Scale kube-dns on platform-agent-host to 3 replicas — 23 cards (17 needs_input, 4 transient, 2 capability, oldest 9d)", text)
+
+        # 3. The 6 recent outage triage cards (48h) appear BEFORE the kube-dns cards whose newest is 96h (4d)
+        pos_triage = text.find("t_triage_0")
+        pos_dns_group = text.find("Scale kube-dns on platform-agent-host to 3 replicas — 23 cards")
+        self.assertTrue(0 <= pos_triage < pos_dns_group,
+                        f"Expected outage triage cards (2d) before kube-dns group (4d): pos_triage={pos_triage}, pos_dns_group={pos_dns_group}")
+
+        # 4. Commands footer appears once with <task_id> placeholder
+        self.assertEqual(text.count("re-run it:"), 1)
+        self.assertEqual(text.count("drop it:"), 1)
+        self.assertIn("<task_id>", text)
+
+
+
 
 class ReportTests(unittest.TestCase):
     @staticmethod

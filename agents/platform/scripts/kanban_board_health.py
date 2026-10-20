@@ -105,14 +105,17 @@ worker or operator block is sticky, nothing retries it until a human acts, and
 a card nobody is looking at is the one finding this check exists for. The rule
 is stateless and a card still blocked is named once a day until someone
 unblocks, comments on, or archives it, which is the intended nag. Each such
-line carries the card's kind, reason and age, read here from the board, and the
-two operator commands, because the CLI's JSON has neither the kind nor the
-reason and a line that names a stuck card without saying how to move it is a
-line the room learns to skip.
+Each such line carries the card's kind, reason and age, read here from the board.
+Cards are listed newest first so recent outages appear at the top. Where multiple
+cards share a title, they are grouped into a single summary line with their
+breakdown of block kinds and oldest age. The operator commands appear once in a
+footer (noting they run on the agent pod) rather than repeated under every card,
+keeping reports readable and within chat limits.
 
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 """
 
+import collections
 import json
 import os
 import shutil
@@ -295,9 +298,9 @@ def render_age(age_hours) -> str:
     return f"{int(hours // HOURS_PER_DAY)}d"
 
 
-def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home: Path) -> list:
+def stuck_card_line(task_id: str, diag: dict, context: dict, entry: dict) -> str:
     """One stuck card: the board's kind and reason, the CLI's title and assignee as fallback."""
-    info = context.get(task_id) or {}
+    info = (context or {}).get(task_id) or {}
     kind = info.get("kind") or NO_KIND
     assignee = info.get("assignee") or entry.get("assignee") or "?"
     title = info.get("title") or entry.get("title") or ""
@@ -308,11 +311,96 @@ def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home:
         head += f": {title}"
     if reason:
         head += f' — "{reason}"'
+    return head
+
+
+def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home: Path) -> list:
+    """One stuck card with its own operator commands (legacy / standalone format)."""
     return [
-        head,
+        stuck_card_line(task_id, diag, context, entry),
         f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=task_id)}",
         f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=task_id)}",
     ]
+
+
+def _card_age_hours(diag: dict) -> float:
+    try:
+        val = (diag.get("data") or {}).get("age_hours")
+        if val is not None:
+            return float(val)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return float("inf")
+
+
+def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
+    """Render stuck cards: grouped by title when duplicated, newest first, commands once."""
+    if not stuck_items:
+        return []
+
+    parsed = []
+    for task_id, diag, entry in stuck_items:
+        info = (context or {}).get(task_id) or {}
+        kind = info.get("kind") or NO_KIND
+        assignee = info.get("assignee") or entry.get("assignee") or "?"
+        title = (info.get("title") or entry.get("title") or "").strip()
+        reason = " ".join((info.get("reason") or "").split())[:REASON_MAX_CHARS]
+        age_hours = _card_age_hours(diag)
+        parsed.append({
+            "task_id": task_id,
+            "diag": diag,
+            "entry": entry,
+            "kind": kind,
+            "assignee": assignee,
+            "title": title,
+            "reason": reason,
+            "age_hours": age_hours,
+        })
+
+    by_title = collections.defaultdict(list)
+    no_title_cards = []
+    for card in parsed:
+        if card["title"]:
+            by_title[card["title"]].append(card)
+        else:
+            no_title_cards.append(card)
+
+    renderable_items = []
+
+    for title, group in by_title.items():
+        if len(group) == 1:
+            card = group[0]
+            line = stuck_card_line(card["task_id"], card["diag"], context, card["entry"])
+            renderable_items.append((card["age_hours"], card["task_id"], line))
+        else:
+            newest_age = min(c["age_hours"] for c in group)
+            oldest_age_hours = max(c["age_hours"] for c in group)
+            oldest_str = render_age(oldest_age_hours if oldest_age_hours != float("inf") else None)
+            kind_counts = collections.Counter(c["kind"] for c in group)
+            sorted_kinds = sorted(kind_counts.items(), key=lambda x: (-x[1], x[0]))
+            kinds_summary = ", ".join(f"{cnt} {k}" for k, cnt in sorted_kinds)
+            line = f"  - {title} — {len(group)} cards ({kinds_summary}, oldest {oldest_str})"
+            renderable_items.append((newest_age, title, line))
+
+    for card in no_title_cards:
+        line = stuck_card_line(card["task_id"], card["diag"], context, card["entry"])
+        renderable_items.append((card["age_hours"], card["task_id"], line))
+
+    renderable_items.sort(key=lambda item: (item[0], item[1]))
+
+    lines = [
+        "Cards blocked with no one looking (a worker or operator block is sticky: "
+        "nothing retries it until a human acts):"
+    ]
+    for _, _, line in renderable_items:
+        lines.append(line)
+
+    lines.append("  Commands to move a card (run on the agent pod):")
+    tid = stuck_items[0][0] if len(stuck_items) == 1 else "<task_id>"
+    lines.append(f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}")
+    lines.append(f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}")
+
+    return lines
 
 
 def invariant_violations(conn: sqlite3.Connection) -> list:
@@ -418,7 +506,7 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
         return [f"  diagnostics unavailable: CLI returned "
                 f"{type(entries).__name__}, expected a JSON list"]
     lines = []
-    stuck = []
+    stuck_items = []
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
@@ -429,7 +517,7 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
                 continue
             kind = diag.get("kind")
             if kind == STUCK_IN_BLOCKED and kind in always:
-                stuck.extend(stuck_card_lines(task_id, diag, context or {}, entry, home))
+                stuck_items.append((task_id, diag, entry))
                 continue
             if not clears_floor(str(diag.get("severity", "")), severity) and kind not in always:
                 continue
@@ -439,12 +527,8 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
             if detail:
                 parts.append(f" - {detail}")
             lines.append("".join(parts))
-    if stuck:
-        lines.append(
-            "Cards blocked with no one looking (a worker or operator block is sticky: "
-            "nothing retries it until a human acts):"
-        )
-        lines.extend(stuck)
+    if stuck_items:
+        lines.extend(render_stuck_cards(stuck_items, context or {}, home))
     return lines
 
 
