@@ -70,7 +70,7 @@ The install grants the agent GSA one of two permission sets. Both entry points c
 The default **read-only** set binds read roles, with one qualification under the Trace role:
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
-- `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice.
+- `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice; the readiness report's `lb-connection-draining` and `orphan-node-objects` rules list a project's backend services and instances with it, and say `unknown` in a project that lacks it.
 - `roles/monitoring.viewer`, `roles/logging.viewer` — read-only metrics and logs.
 - `roles/cloudtrace.user` — trace reads (`cloudtrace.traces.get` and `.list`), for the observability skill's trace helpers through the credential broker's relay. Google's Trace User role also carries create, delete and update on Trace-console objects — analysis-report tasks and trace scopes — and no predefined Trace role grants the two reads without them, so a narrower grant is a custom role of your own. The sandbox's route to Google is the broker, which forwards relayed reads as `GET` only and whose `gcloud` allowlist carries no `trace` command, so nothing the model's code sends through it uses those permissions. A token minted on the annotated ServiceAccount itself — from the gateway Pod, which shares it with the broker, or from an `AgentPlugin`, which executes with it — carries every role bound to the identity, these permissions included; the sandbox boundary and `AgentPlugin` notes below say what bounds those paths.
 - `roles/iam.serviceAccountUser` — act as service accounts when running jobs.

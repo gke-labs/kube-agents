@@ -31,3 +31,8 @@ need it say `unknown`; a rule that can block then leaves the member `unknown`, o
 is reported in the note. The three list reads are projected to the fields the rules use, so a
 project of a few thousand instances stays under the credential proxy's output cap; a list the
 proxy cut is the same error, naming the cap.
+
+The three list reads need `roles/compute.viewer` (backend services, instances) and
+`roles/container.viewer` (operations) in each project the report reads; the default role list
+carries both. A custom list without them leaves the rules that need the read `unknown`, the member
+`unknown` where the rule can block, and the run at exit 1.
