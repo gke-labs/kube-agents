@@ -26309,6 +26309,56 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.finish_again(doc), 0)
         self.assertFalse(self.stdout_json()["silent_ok"])
 
+    def test_a_rerun_after_a_lost_broker_opens_no_second_batch(self):
+        self.start()
+        findings = []
+        for i in range(audit_report.AUTO_PROMOTION_CAP + 2):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    remediation={"kind": "manifest", "path": path, "note": "n"},
+                )
+            )
+            self.touch(path)
+        doc = make_doc(findings=findings)
+        listing = audit_report.list_remediation_prs
+        calls = []
+
+        def broker_drops_after_the_sweep(repo, audit_id):
+            calls.append(repo)
+            if len(calls) == 2:
+                raise audit_report.BrokerUnavailable("the broker did not answer")
+            return listing(repo, audit_id)
+
+        with patch.object(audit_report, "list_remediation_prs", broker_drops_after_the_sweep):
+            self.assertEqual(self.run_finish(doc), 2)
+        opened = len(self.harness.forge_calls("proposal-create"))
+        self.assertEqual(opened, audit_report.AUTO_PROMOTION_CAP)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [
+                pr(100 + i, audit_report.group_branch_for(AUDIT, [finding]))
+                for i, finding in enumerate(findings[: audit_report.AUTO_PROMOTION_CAP])
+            ]
+        )
+
+        self.assertEqual(self.finish_again(doc), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
+
+    def test_a_start_after_a_finish_that_died_opens_a_new_run(self):
+        now = datetime.now(timezone.utc)
+        audit_report.open_chat_report(AUDIT, "acme/a", now)
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", now)
+        self.start()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        with patch.object(audit_report, "append_chat_report", side_effect=RuntimeError("killed")):
+            self.assertNotEqual(self.run_finish(doc), 0)
+        run = self.chat_record()["run"]
+
+        self.start()
+        self.assertNotEqual(self.chat_record()["run"], run)
+        self.assertEqual(self.entries(), [("acme/fleet", None)])
+
     def test_a_finish_with_no_start_stays_a_run_of_its_own(self):
         doc = make_doc(findings=[make_finding(fid="a", severity="major")])
         self.assertEqual(self.run_finish(doc), 0)

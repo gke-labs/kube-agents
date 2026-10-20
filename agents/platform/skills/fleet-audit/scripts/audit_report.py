@@ -3030,15 +3030,14 @@ def _live_chat_record(audit_id: str, now: datetime) -> dict | None:
     return record
 
 
+def _last_part(record: dict, repo: str, keep: Callable[[dict], bool]) -> dict | None:
+    parts = [p for p in record[CHAT_REPORT_PARTS_KEY] if p.get(CHAT_REPORT_REPO_KEY) == repo and keep(p)]
+    return parts[-1] if parts else None
+
+
 def _pending_part(record: dict, repo: str) -> dict | None:
-    """`repo`'s entry that no `finish` has filled yet, or None."""
-    pending = [
-        part for part in record[CHAT_REPORT_PARTS_KEY]
-        if part.get(CHAT_REPORT_REPO_KEY) == repo
-        and not part.get(CHAT_REPORT_TEXT_KEY)
-        and CHAT_REPORT_SILENT_OK_KEY not in part
-    ]
-    return pending[-1] if pending else None
+    """`repo`'s entry with no report yet, or None."""
+    return _last_part(record, repo, lambda part: not part.get(CHAT_REPORT_TEXT_KEY))
 
 
 def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
@@ -3090,11 +3089,7 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
 
 def _filled_part(record: dict, repo: str) -> dict | None:
     """`repo`'s entry that `start` opened and a `finish` has filled, or None."""
-    filled = [
-        part for part in record[CHAT_REPORT_PARTS_KEY]
-        if part.get(CHAT_REPORT_REPO_KEY) == repo and CHAT_REPORT_SILENT_OK_KEY in part
-    ]
-    return filled[-1] if filled else None
+    return _last_part(record, repo, lambda part: CHAT_REPORT_SILENT_OK_KEY in part)
 
 
 def earlier_finish(audit_id: str, repo: str, now: datetime) -> dict | None:
@@ -3103,7 +3098,8 @@ def earlier_finish(audit_id: str, repo: str, now: datetime) -> dict | None:
     A model can call `finish` again after one `start`. That call reads the
     envelope the earlier one just stored as the previous run's, so on its own
     it measures no change and would call a run with news silent. A `finish`
-    with no `start` fills no entry, and stays a run of its own.
+    with no `start` fills no entry; it is taken for a later `finish` of the
+    same run only within the age limit of one that did.
     """
     record = _live_chat_record(audit_id, now)
     return None if record is None else _filled_part(record, repo)
@@ -18080,6 +18076,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         generated_at=now,
         noun=noun,
     )
+    # Now as well as before the store write: a `finish` that dies after this
+    # sweep keeps its lease, and the re-run must not sweep again.
+    if prs_opened:
+        save_chat_verdict(audit_id, repo, False, new_marked or [], now)
 
     # What the live ledger renders once this branch is done, for the store.
     ledger_body = rendered.body

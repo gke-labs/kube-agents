@@ -23,7 +23,7 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, `unpublished_candidates`,
 `wholly_unpublished_checks`, `uncorroborated_findings`, `prs_opened`, `prs_still_open`, `prs_closed`, `silent_ok`,
 `ledger_held_open`, `delta_known`, `new_ids`, `resolved_ids`, `current_ids`, `id_scheme`, `ledger_body`,
-`document`, and sometimes `ledger_document`, `inspect_s`, `publish_s` and `collect_s`.
+`document`, and sometimes `ledger_document`, `silent_floor`, `inspect_s`, `publish_s` and `collect_s`.
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.

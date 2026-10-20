@@ -224,10 +224,14 @@ record, and so does a `start` that finds no finished part, which a run that
 never reached `finish` left. A `finish` applies the age and repository rule, with one
 exception: a later `finish` of a repository whose entry `start` opened and an earlier
 `finish` filled, within the two hours, is the same run. It adds its report under the
-earlier one, below a label line, and gives the record a new `run` stamp. The earlier
-`finish` saves its `silent_ok` on the entry before it writes the report store, and when
-that was `false` the later one is not silent either and its automatic sweep opens no pull request
-(`earlier_finish`). A `finish` with no `start` fills no entry and stays a run of its own. The relay
+earlier one's, below a label line, and gives the record a new `run` stamp; when the earlier
+`finish` died before it wrote its report, the later one fills the entry in its place. The
+earlier `finish` saves its `silent_ok` on the entry before it writes the report store, and
+again as soon as its sweep opens a pull request. When that was `false` the later one is not
+silent either and its automatic sweep opens no pull request (`earlier_finish`). A `finish`
+with no `start` fills no entry, but within two hours of a `start` and `finish` of the same
+repository it is taken for a later `finish` of that run, and the relay posts that run's
+report again with its own under it. The relay
 reads the record, over the gateway's sandbox login where the shell runs in the
 shell sandbox (`sandbox_exec.read_bytes`).
 
