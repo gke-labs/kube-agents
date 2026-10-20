@@ -39,11 +39,11 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh" "$@"
 
-# A standalone run takes these from install.env alone, as install.sh's own
-# bootstrap does: an exported value the file does not assign would otherwise
-# decide which checklist prints.
+# A standalone run takes the mode from install.env alone, as install.sh's own
+# bootstrap does. An exported GOOGLE_CHAT_ENABLED or SLACK_HOME_CHANNEL the
+# file does not assign is kept: install.sh applies those too.
 if [ -z "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ] && [ -f "$(install_env_file_for_state)" ]; then
-  unset PLATFORM_AGENT_MODE GOOGLE_CHAT_ENABLED SLACK_HOME_CHANNEL
+  unset PLATFORM_AGENT_MODE
 fi
 load_state
 

@@ -235,6 +235,9 @@ readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/
 # the same rule. Keep the three in step (docs/README.md lists them; a test
 # checks all three agree).
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
+# The prefix of a Google Chat space's resource name, the only home channel
+# form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
+readonly GCHAT_SPACE_PREFIX="spaces/"
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -1064,6 +1067,14 @@ slack_moves_to_a2a_gateway() {
   [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
 }
 
+# Whether Google Chat is consumed by the A2A gateway after this apply: the
+# operator's a2aChatArmed (k8s-operator platformagent_a2a_manifests.go),
+# spec.mode next with Google Chat enabled. $1 the mode the apply renders, $2
+# GOOGLE_CHAT_ENABLED.
+google_chat_moves_to_a2a_gateway() {
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
+}
+
 # The three checks behind refuse_next_slack_gateway_settings, one per
 # setting, which the install.sh interview also uses to re-ask. Each prints
 # nothing for a setting that passes.
@@ -1090,6 +1101,33 @@ slack_home_channel_not_an_id() {
   if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
     printf '%s' "$home"
   fi
+}
+
+# A Google Chat home channel ($1), trimmed, when it is set and is not a bare
+# space name: "spaces/" and an id with no further "/". The gateway's
+# gchatIsSpaceName (a2a/gateway/gchat.go) refuses anything else and leaves
+# its notify route unarmed; the operator's a2aGchatHomeSpace holds the same
+# rule.
+gchat_home_channel_not_a_space_name() {
+  local home="${1:-}" id
+  home="${home#"${home%%[![:space:]]*}"}"
+  home="${home%"${home##*[![:space:]]}"}"
+  [ -n "$home" ] || return 0
+  id="${home#"$GCHAT_SPACE_PREFIX"}"
+  if [ "$id" = "$home" ] || [ -z "$id" ] || [[ "$id" == */* ]]; then
+    printf '%s' "$home"
+  fi
+}
+
+# Whether a Google Chat allowlist ($1) holds no address once split the way
+# hcl_csv_list renders it, which drops blank items: the operator then renders
+# allow-all for the gateway.
+gchat_allowlist_is_empty() {
+  local item
+  while IFS= read -r item; do
+    [ -z "$item" ] || return 1
+  done <<< "$(csv_list_items "${1:-}")"
+  return 0
 }
 
 # The number of tokens a Slack bot token ($1) holds, when it is more than
@@ -1280,6 +1318,13 @@ _platform_agent_mode_unread() {
   print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
 }
 
+# The spec.mode the CR carries after this apply, for the chat checklists that
+# follow it: the key, unless the reads below show a CR the apply leaves on
+# another mode (platform_agent_mode_after_apply). A platformAgent.mode in the
+# composition's extra_helm_values is not followed: the installer cannot read
+# it (platform_agent_mode_extra_values_caveat).
+PLATFORM_AGENT_MODE_AFTER_APPLY=""
+
 # The front door's call, after the scope check beside it: $1 namespace, $2
 # the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
 # confirmation after the notice. Quiet where there is nothing to switch (a cluster the tfvars
@@ -1291,8 +1336,10 @@ _platform_agent_mode_unread() {
 # absent, or a get-credentials that did not land on the --dry-run and
 # --generate-only routes the scope check skips) is a read that did not
 # happen, and is said with the scope check's remedy.
+# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$key")"
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
     PLATFORM_AGENT_READS_HELD_FOR=""
     return 0
@@ -1322,6 +1369,7 @@ announce_platform_agent_mode_for_apply() {
   else
     record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
   fi
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
   announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
 }
 

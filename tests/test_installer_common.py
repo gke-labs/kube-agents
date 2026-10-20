@@ -1733,6 +1733,26 @@ class InstallerCommonTest(unittest.TestCase):
                     proc.stdout,
                 )
 
+    def test_the_mode_after_the_apply_is_kept_for_the_chat_checklists(self):
+        # The chat checklists follow the mode the CR is left on: the key,
+        # unless the CR carries a mode set by hand that the apply leaves there.
+        # Every early return, a first install's included, leaves the key.
+        echo = '; echo "AFTER=$PLATFORM_AGENT_MODE_AFTER_APPLY"'
+        for listing, latest, key, after in (
+            (self._cr_list("next"), "{}", "today", "next"),
+            (self._cr_list(), '{"platformAgent":{"mode":"next"}}', "next", "today"),
+            (self._cr_list(), "{}", "next", "next"),
+            (self._cr_list("next"), '{"platformAgent":{"mode":"next"}}', "next", "next"),
+            (self._cr_list(), "norelease", "next", "next"),
+        ):
+            with self.subTest(listing=listing, latest=latest, key=key):
+                proc = self._announce(self._cr_kubectl(listing), self._helm(self._HEALTHY, {}, latest=latest),
+                                      call=f"announce_platform_agent_mode_for_apply kubeagents-system {key}{echo}")
+                self.assertIn(f"AFTER={after}\n", proc.stdout, proc.stderr)
+        first = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE_AFTER_APPLY=stale; TFVARS_CLUSTER_EXISTS=false "
+                          f"announce_platform_agent_mode_for_apply kubeagents-system today{echo}", kubectl_script=None)
+        self.assertIn("AFTER=today\n", first.stdout, first.stderr)
+
     def test_a_retag_says_what_a_full_upgrade_would_do(self):
         proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
         self.assertIn("WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run", proc.stdout)
