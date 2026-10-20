@@ -109,9 +109,9 @@ From the files that own the target, take:
   or `module.<name>.google_container_node_pool.<name>`), for the PR body.
 
 **Stopping before Step 5 leaves nothing to clean up.** The copy is on this
-filesystem. Stop where you need to (a question from Step 2's table, a
-an unasked replacement in Step 3, a syntax error you cannot resolve) and run `prepare`
-again when the work resumes.
+filesystem. Stop where you need to (a question from Step 2's table, an
+unasked replacement in Step 3, a syntax error you cannot resolve) and run
+`prepare` again when the work resumes.
 
 ### Step 2: Decide edit, import or create, read-only
 
@@ -143,23 +143,27 @@ which reads decided the edit.
 - **Edit in place.** Change the arguments the request needs, add the ones
   it requires, and nothing else. An argument you copy from the live resource
   becomes one someone has to own.
-- **A replacement is written only when it is what the user asked for.**
-  An argument that forces replacement (`references/` lists them per family;
+- **A replacement is written only when the request names it.** An
+  argument that forces replacement (`references/` lists them per family;
   the provider's page for the pinned version decides) destroys and recreates
-  the resource when the pull request is applied. When the requested change
-  is itself that argument ("switch the pool to Spot VMs" is `spot`), write
-  it and lead with it: the PR body's **Replacement** line names the argument
-  and what is destroyed and recreated (the pool's nodes and their workloads,
-  or the whole cluster), and so does your reply. Name a route that avoids
-  the replacement if one exists (a new pool beside the old one) as an
-  alternative in the body, without writing it. When the request does not
-  need the replacement, and only your way of writing it would cause one,
-  never write it: say so, name the argument, and stop for the user's
-  decision.
+  the resource when the pull request is applied. Write one only when the
+  request names that argument or its direct effect ("switch the pool to
+  Spot VMs" names `spot`), and lead with it: the PR body's **Replacement**
+  line names the argument and what is destroyed and recreated (the pool's
+  nodes and their workloads, or the whole cluster), and so does your reply.
+  Name a route that avoids the replacement if one exists (a new pool beside
+  the old one) as an alternative in the body, without writing it. When the
+  request states a goal and only a replace-forcing argument would meet it
+  ("more pod IPs" is `cluster_ipv4_cidr`), or only your way of writing it
+  would cause one, never write it: say so, name the argument, and stop for
+  the user's decision.
 - **Deletion protection.** Never set `deletion_protection = false`, remove
   it, remove a `lifecycle { prevent_destroy = true }`, or change a
-  `deletion_policy` (`ABANDON` gets past `deletion_protection`). A change
-  that needs any of them is a human's pull request.
+  `deletion_policy` (`ABANDON` gets past `deletion_protection`). A
+  requested cluster replacement is still written, with the **Deletion
+  protection** line saying that applying it fails until a human sets
+  `deletion_protection = false` in a separate change. Anything else that
+  needs one of them is a human's pull request: stop and say so.
 - **New resources** go where the repository keeps their siblings, in a file
   named the way the siblings are, using the same module or resource shape.
 - **No secrets in HCL.** A password, key or token never goes into a `.tf`
@@ -200,8 +204,8 @@ header:
 ### Terraform change
 - **Decision:** edit | import | create, and the reads that decided it.
 - **Resource:** `<address>` (<type> `<name>` in project `<project>`, location `<location>`).
-- **Replacement:** none | REPLACES <address>: `<argument>` forces it; applying this PR destroys and recreates <what>.
-- **Deletion protection:** unchanged.
+- **Replacement:** none | REPLACES <address>: `<argument>` forces it; applying this PR destroys and recreates <what> (or deletes <what>).
+- **Deletion protection:** unchanged | unchanged; applying this PR fails until a human sets `deletion_protection = false` in a separate change.
 - **Import:** none | `import { to = <address>, id = "<id>" }`; plan must show an import, not a create.
 - **Checked:** `tofu fmt -check` on <path>. Not run here: `terraform init`, `validate` and
   `plan`. Run `plan` in CI before merging; it must show only the changes above.
@@ -219,8 +223,8 @@ ends in `kanban_block(kind="needs_input")` with the reason, never in
   prompt.
 - Never set `deletion_protection = false`, remove it, remove
   `prevent_destroy`, or change a `deletion_policy`.
-- Never write a replacement, a removed resource or a `removed` block
-  unasked.
+- Never write a replacement the request did not name, a removed resource
+  or a `removed` block unasked.
 - Never fill in a project, region, network or name you did not read from
   the repository, the cloud or the user.
 - Never write a secret into HCL or a `.tfvars` file.
