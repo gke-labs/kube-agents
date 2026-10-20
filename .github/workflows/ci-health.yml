@@ -91,7 +91,7 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # health-history.jsonl beside it (download, append, upload: GCS has no
 # append); a failure there is a warning.
 #
-# Two things write to GitHub with this workflow's own token, which is why
+# Three things write to GitHub with this workflow's own token, which is why
 # the job asks for pull-requests: write and issues: write and nothing else
 # does: the poster files the tracking issue a new OUTAGE lacks (label
 # presubmit-gate; it adopts a human's if one names the same cases, and
@@ -104,6 +104,15 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # killed at the job deadline -- since the last tick, edited in place on
 # later runs. Both are best-effort: a
 # GitHub failure is a warning, retried next tick, never a failed run.
+# A third, scripts/eval_dashboard/nightly_bugs.py, files a `nightly-red`
+# issue for a case the nightly failed on every graded repetition three
+# graded nights in a row, and comments once when it passes again; and an
+# `Infra` one for the infra owner when a part of the nightly lost 2 of its
+# last 3 nights or a case graded nothing 3 nights running. It runs
+# every tick in dry run -- it reads the open issues and prints what it would
+# file, comment and assign -- and writes only when the repository variable
+# NIGHTLY_BUGS_LIVE is `true` (a maintainer arms it after reading a few dry
+# runs) and CI_HEALTH_MUTE is not.
 #
 # A second job, on its own hourly cron: the seeded-fleet scan (#1550). It
 # runs hack/fleet-kubeconfigs.sh and hack/fleet-fixture-state.py against
@@ -169,6 +178,9 @@ env:
   CI_HEALTH_SA: ${{ vars.CI_HEALTH_SA || 'eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com' }}
   CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
   CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
+  # The nightly bug filer's arming switch (header): anything but `true` is a
+  # dry run.
+  NIGHTLY_BUGS_LIVE: ${{ vars.NIGHTLY_BUGS_LIVE || 'false' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
   # the smoke-test presubmit's archive, the nightly periodic's log prefix
   # (its own bucket, gs://kube-agents-evals-nightly-logs, since the nightly's
@@ -247,10 +259,10 @@ jobs:
     concurrency:
       group: ci-health
       cancel-in-progress: false
-    # The workflow-level grant plus the two writes the header explains: the
+    # The workflow-level grant plus the writes the header explains: the
     # gate comment on a pull request (a red run, a lost build node, or a
-    # deadline kill) and the tracking issue (an OUTAGE, or a lost_pods
-    # condition).
+    # deadline kill), the tracking issue (an OUTAGE, or a lost_pods
+    # condition) and, once armed, the nightly bug.
     permissions:
       contents: read
       id-token: write
@@ -685,6 +697,18 @@ jobs:
             --data work/data.json \
             --health work/health.json \
             --state "$DASHBOARD_BUCKET/gate-comment-state.json"
+
+      # Dry run unless armed (header). Reads data.json as the digest does, so
+      # after a failed collect it judges the bucket's copy, which holds the
+      # same nights. Best-effort like the comment step: never reds the run.
+      - name: File bugs for persistent nightly failures (dry run unless armed)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mode=--dry-run
+          if [ "$NIGHTLY_BUGS_LIVE" = "true" ] && [ "$CI_HEALTH_MUTE" != "true" ]; then mode=--live; fi
+          python3 scripts/eval_dashboard/nightly_bugs.py --data work/data.json "$mode"
 
       - name: Fail the run if the collect or the post failed
         if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'
