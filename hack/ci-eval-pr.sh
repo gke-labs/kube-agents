@@ -2975,6 +2975,53 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # The upgrade-failure catalogue's scenario cases: read-only chat prompts
+    # over the seeded clusters (entries 1 and 2 one Cluster Agent card per
+    # cluster; entries 6 and 16 one declared line per cluster; entry 5 one
+    # maintenance-policy read per cluster; entry 3 and the eleven on the
+    # seeded-a shapes a read of every cluster for one planted object the
+    # prompt does not place). Five are in the nightly from 2026-10-15, the
+    # first batch; the other twelve wait in scripts/validate_bench_cases.py's
+    # KNOWN_UNREGISTERED for their batch. Each measured case is priced at the
+    # median wall clock of its clean passes on a dev install with one user
+    # worker slot
+    # (57 runs, 2026-10-07 to 10-15, re-graded at the head's task files),
+    # rounded up to the next 100s, the way compliance-rbac-overgrant,
+    # capacity-pinned-pool-probe and cluster-agent-delegation-profile-lookup
+    # above are priced at their medians. The clean-pass walls per entry:
+    # entry 1: 514, 782 and 1081s.
+    upgrades-drain-blocking-budget-named) echo 800 ;;
+    # entry 2: 924, 1065 and 3163s, with two more runs lost at the 2400s
+    # delegation ceiling.
+    upgrades-no-surge-pool-recreate-warned) echo 1100 ;;
+    # entry 3: 454, 541, 672 and 983s.
+    upgrades-zonal-skew-replicas-warned) echo 700 ;;
+    # entry 5: 237, 240, 316, 441 and 571s.
+    upgrades-exclusion-end-date-named) echo 400 ;;
+    # entry 4: 1171 and 1280s.
+    upgrades-node-local-state-named) echo 1300 ;;
+    # entry 8: one pass, 750s.
+    upgrades-pod-security-latest-pinned-named) echo 800 ;;
+    # entry 12: 510 and 1161s.
+    upgrades-deprecated-node-label-selector-named) echo 900 ;;
+    # entry 13: one pass, 540s.
+    upgrades-containerd-socket-agent-named) echo 600 ;;
+    # entry 14: one pass, 360s.
+    upgrades-cgroup-blind-runtime-named) echo 400 ;;
+    # entry 17: one pass, 2180s: the agent answered at 264s and the harness
+    # was still waiting on the delegated cards when the sequence stopped it.
+    upgrades-node-image-coupled-agent-named) echo 2200 ;;
+    # entry 19: 1042 and 1291s.
+    upgrades-intree-volume-named) echo 1200 ;;
+    # entry 20: 390 and 1762s.
+    upgrades-retired-registry-image-named) echo 1100 ;;
+    # Entries 6, 10, 15, 16 and 18 have no clean pass on record, so no
+    # measurement: every run was a loss (682-3943s wall, most at the 2400s
+    # delegation ceiling) or an agent gap. They keep the 900 band of their
+    # shape until a clean pass measures them.
+    upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
+    upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
+    upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
     *) echo 200 ;;
   esac
 }

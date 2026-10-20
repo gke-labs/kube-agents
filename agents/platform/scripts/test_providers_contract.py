@@ -23,13 +23,19 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from providers import AVAILABLE, COLLABORATION_VERBS, ForgeUnsupported
-from providers.credentials import BrokeredCredential, MintedReadCredential, NoCredential
+from providers.credentials import (
+    BrokeredCredential,
+    MintedReadCredential,
+    NoCredential,
+    StaticFileCredential,
+)
 from workspace_paths import WorkspaceError
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -665,6 +671,36 @@ class ReadCredentialTest(unittest.TestCase):
         for forge in (*registry.forges, *registry.stubs):
             with self.subTest(forge=forge.name):
                 self.assertIsInstance(forge.read_credential("acme/infra"), NoCredential)
+
+    def test_a_forge_with_a_stored_token_defaults_to_no_read_credential(self):
+        # GitLab with no read-only token configured, or with its path
+        # configured and the Secret lacking the key, reads as before.
+        from providers import Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for extra in ({}, {"read_token_path": f"{tmp}/read-token"}):
+                with self.subTest(extra=extra):
+                    registry = Registry({"forges": [
+                        {"provider": "gitlab", "host": "gitlab.com", "token_path": f"{tmp}/token",
+                         "allowed_paths": (), **extra},
+                    ]})
+                    self.assertIsInstance(registry.default.read_credential("acme/infra"), NoCredential)
+
+    def test_a_forge_with_a_stored_read_token_answers_it_per_call(self):
+        from providers import Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "read-token").write_text("glpat-read\n")
+            registry = Registry({"forges": [
+                {"provider": "gitlab", "host": "gitlab.com", "token_path": f"{tmp}/token",
+                 "read_token_path": f"{tmp}/read-token", "allowed_paths": ()},
+            ]})
+            forge = registry.default
+            first = forge.read_credential("acme/infra")
+            self.assertIsInstance(first, StaticFileCredential)
+            self.assertIsNot(first, forge.read_credential("acme/infra"))
+            self.assertEqual({"PRIVATE-TOKEN": "glpat-read"}, first.headers("acme/infra"))
+            self.assertIsNot(forge.credential, first)
 
     def test_a_forge_built_with_a_mint_answers_a_fresh_credential_per_call(self):
         from providers import Registry

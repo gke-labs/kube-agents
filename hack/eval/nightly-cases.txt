@@ -882,3 +882,75 @@
 # issue every night. deployer: noop, no fixtures. Nightly from its first
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
+
+# Catalogue entry 12 (a node label is removed): seeded-a's
+# seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
+# nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
+# Read-only chat prompt graded on the workload's declared line (the label,
+# that it is deprecated, the replacement), with a catastrophic safeguard on
+# the selector. deployer: noop, no lock; a read of every seeded cluster,
+# 900s hint (the median of two clean passes, 510 and 1161s). The role is
+# one #2916 plants; #3042's postsubmit reconcile
+# (post-kube-agents-fleet-reconcile job 2110720877149556736 on its merge
+# commit 2d3d4399f) finished clean at 16:10:30 UTC on 2026-10-15 with all
+# 40 pool projects applied, and the fixture scan of 17:08:57 UTC that day
+# reads the role healthy on 40 of 40: the citation the Registration rule
+# asks for per role (docs/designs/bench-case-format.md). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-deprecated-node-label-selector-named/task.yaml
+
+# Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
+# eviction), one of the first batch of five of the catalogue's seventeen
+# scenario cases (entries 1, 3, 5, 12 and 20, in this section); the twelve
+# that wait, each with its measured cost, are in
+# scripts/validate_bench_cases.py's KNOWN_UNREGISTERED. A read-only chat
+# case whose prompt names no fixture; it grades, on a declared line per
+# budget, the reading of the one the seeded fleet plants:
+# pinned-batch-runner's maxUnavailable 0 budget in seeded-upgrade on
+# seeded-b (readiness-drain-blocked, readiness-pinned-workload), with a
+# catastrophic safeguard on that field. deployer: noop, no lock; one
+# Cluster Agent card per seeded cluster, 800s hint (the median of three
+# clean passes, 514-1081s). Nightly from its first merge; a presubmit seat
+# is a later pull request that cites its record.
+./tasks/upgrades-drain-blocking-budget-named/task.yaml
+
+# Catalogue entry 5 (maintenance window too short, or an exclusion ends
+# mid-roll), the scheduling half: seeded-b's hold-the-minor-lag exclusion
+# with its scope and end time (version-laggard), where
+# upgrades-fleet-readiness-exclusion grades the readiness report's verdict.
+# Read-only chat prompt graded on a declared line per cluster; the
+# exclusion is a GKE API setting, not an object in a cluster, so the case
+# carries no cluster safeguard and the fleet's reconcile owns it. deployer:
+# noop, no lock; one maintenance-policy read per cluster, 400s hint (the
+# median of five clean passes, 237-571s). Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-exclusion-end-date-named/task.yaml
+
+# Catalogue entry 20 (images on a retired registry): seeded-a's
+# seeded-shapes/legacy-registry-pull (retired-registry-image),
+# k8s.gcr.io/pause:3.9 with imagePullPolicy Always, a retired hostname
+# served by redirect. Read-only chat prompt graded on the workload's
+# declared line (the retired host, that it is retired), with a catastrophic
+# safeguard on the image. deployer: noop, no lock; a read of every seeded
+# cluster, 1100s hint (the median of two clean passes, 390 and 1762s). The
+# role is one #2916 plants; #3042's postsubmit reconcile
+# (post-kube-agents-fleet-reconcile job 2110720877149556736 on its merge
+# commit 2d3d4399f) finished clean at 16:10:30 UTC on 2026-10-15 with all
+# 40 pool projects applied, and the fixture scan of 17:08:57 UTC that day
+# reads the role healthy on 40 of 40: the citation the Registration rule
+# asks for per role (docs/designs/bench-case-format.md). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-retired-registry-image-named/task.yaml
+
+# Catalogue entry 3 (every replica in one zone or on one node), in the shape
+# the seeded fleet plants it: zone-pinned-api in seeded-topology on
+# seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only
+# chat prompt graded on a declared line per multi-replica workload, with a
+# catastrophic safeguard on the spread's whenUnsatisfiable. deployer: noop,
+# no lock; the prompt names the multi-zone cluster without saying which, so
+# the agent reads every cluster to find it, 700s hint (the median of four
+# clean passes, 454-983s). Nightly from its first merge; a presubmit seat
+# is a later pull request that cites its record.
+./tasks/upgrades-zonal-skew-replicas-warned/task.yaml
