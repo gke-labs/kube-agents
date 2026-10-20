@@ -2903,7 +2903,7 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
 
     # Branch 2: final read succeeds, card is still blocked but has empty summaries and errors
     def _shell_empty_failures(script: str, timeout: float) -> str:
-        payload = {"statuses": {t: "blocked"}, "summaries": {}, "errors": {}}
+        payload = {"statuses": {t: "blocked"}, "summaries": {}, "errors": {}, "block_kinds": {t: "transient"}}
         return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_empty_failures)
@@ -3954,6 +3954,17 @@ def test_a_429_blocked_card_unblocked_and_running_at_settle_is_infrastructure(
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             elif idx == 3:
+                # Poll 2: t2 has finished. A terminal reading is what ends the
+                # poll-and-continue loop and spends status turn 2.
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 4:
                 # Settle read: failure_cards is [t1]. Board shows t1 was unblocked and is running.
                 payload = {
                     "statuses": {t1: "running"},
