@@ -2011,8 +2011,10 @@ plan (so one per ask; a fan-out's children fold into their rows and post nothing
 creator's), naming that plan's `update` key. The notify route marks it under the ask the key is
 bound to (`notifyChainIndex`, bound by the plan's first mark), laid out or, for a report that
 posts as text (an actionable one), on its last chunk; a key no ask holds is not marked rather than
-guessed at. Some asks go unrated rather than rated wrongly: the notifier keeps the plan in
-memory, so a card that settles an ask after the agent restarted is not flagged (one that sent a progress note since the restart opened a new plan and is, under the conversation's latest ask); a last card that
+guessed at; so is a key bound to a chain that did not hand its ask to cards, and a second card
+answer for an ask that already has a rated one (an ask's follow-up cards can settle a second plan),
+which the gateway remembers per process. Some asks go unrated rather than rated wrongly: the notifier keeps the plan in
+memory, so a card that settles an ask after the agent restarted is not flagged (one that sent a progress note since the restart opened a new plan, whose key binds to the conversation's latest ask, and is rated only if that ask was handed to cards too); a last card that
 gives up without a hard-wall reason posts no answer to flag; a plan records one answer, at the settle that first finished it, so a card unblocked after it gave up adds no second rated report; the flag is read once, so a report
 whose send is retried goes out unflagged; and a plan's key binds to the conversation's latest ask
 at the plan's first mark, so a follow-up asked before that mark takes the card's answer. Plan rows, progress, a question waiting on the

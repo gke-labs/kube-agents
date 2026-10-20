@@ -953,11 +953,13 @@ func blocksMention(v any) string {
 
 // notifyInteractiveTypes are the block and element types a click or an
 // entry arrives from. The gateway answers clicks only on the choice buttons
-// it draws itself from a chat message, so a click on one of these would do
-// nothing for the user; validate refuses them rather than trusting the
+// and rating controls it draws itself, so a click on one of these would do
+// nothing for the user, or, on a rating block a sender wrote, rate under a
+// task id the sender chose; validate refuses them rather than trusting the
 // sender to strip them.
 var notifyInteractiveTypes = []string{
 	"actions", "input", "button", "overflow", "checkboxes", "radio_buttons",
+	slackContextActionsBlock, slackFeedbackButtons, "icon_button",
 	"datepicker", "timepicker", "datetimepicker", "plain_text_input",
 	"static_select", "external_select", "users_select", "conversations_select", "channels_select",
 	"multi_static_select", "multi_external_select", "multi_users_select",
@@ -1053,10 +1055,14 @@ func (c gatewayConversations) ConversationContext(ctx context.Context, key strin
 // AnswerFeedbackTarget is the root task of the ask the plan key answerTo is
 // bound to, when answer feedback is on (notifyFeedbackTarget). A key no ask
 // holds (a plan that never carried a mark, or one evicted) rates nothing
-// rather than guessing at the conversation's latest ask.
+// rather than guessing at the conversation's latest ask. So does a chain
+// that did not hand its ask to cards (TaskRef.CardsAnswer), which a key
+// bound after a restart can name, and a chain whose card answer was
+// already rated: an ask's follow-up cards can settle a second plan.
 func (c gatewayConversations) AnswerFeedbackTarget(conversation, answerTo string) string {
 	g := c.g
-	if g.feedback.Load() == nil {
+	desk := g.feedback.Load()
+	if desk == nil {
 		return ""
 	}
 	// The notify worker's lookup bound, as post's own read of the record.
@@ -1070,10 +1076,18 @@ func (c gatewayConversations) AnswerFeedbackTarget(conversation, answerTo string
 	if rec == nil {
 		return ""
 	}
-	if i := rec.notifyChainIndex(answerTo); i >= 0 {
-		return rec.Tasks[i].rootID()
+	i := rec.notifyChainIndex(answerTo)
+	if i < 0 {
+		return ""
 	}
-	return ""
+	root := rec.Tasks[i].rootID()
+	if ref, ok := rec.TaskRefFor(root); !ok || !ref.CardsAnswer {
+		return ""
+	}
+	if !desk.claimCardAnswer(root) {
+		return ""
+	}
+	return root
 }
 
 func (c gatewayConversations) Post(conversation, text string) (string, error) {

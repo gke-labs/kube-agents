@@ -65,6 +65,9 @@ const (
 	// feedbackLockStripes is how many locks the ratings are serialised on
 	// (feedbackDesk.lockKey).
 	feedbackLockStripes = 64
+	// feedbackCardAnswersMax is how many asks the desk remembers having
+	// rated a card answer for (claimCardAnswer), oldest forgotten first.
+	feedbackCardAnswersMax = 1024
 
 	// feedbackRetryInterval is how often the gateway looks again for a
 	// feedback bucket it did not find at start: on an upgrade the provision
@@ -158,6 +161,34 @@ type feedbackDesk struct {
 	// fixed however many answers are rated; two unrelated ratings sharing
 	// a stripe only wait for each other.
 	stripes [feedbackLockStripes]sync.Mutex
+
+	// cardAnswers are the chain roots a card answer was rated for, in
+	// this process, oldest first (claimCardAnswer).
+	cardMu      sync.Mutex
+	cardAnswers map[string]bool
+	cardOrder   []string
+}
+
+// claimCardAnswer reports whether root's card answer may be rated, and
+// records it so the next is not: one rated card answer per ask. The record
+// is this process's, so a card answer after a gateway restart can be rated
+// a second time.
+func (d *feedbackDesk) claimCardAnswer(root string) bool {
+	d.cardMu.Lock()
+	defer d.cardMu.Unlock()
+	if d.cardAnswers[root] {
+		return false
+	}
+	if d.cardAnswers == nil {
+		d.cardAnswers = map[string]bool{}
+	}
+	d.cardAnswers[root] = true
+	d.cardOrder = append(d.cardOrder, root)
+	if len(d.cardOrder) > feedbackCardAnswersMax {
+		delete(d.cardAnswers, d.cardOrder[0])
+		d.cardOrder = d.cardOrder[1:]
+	}
+	return true
 }
 
 // lockKey takes the rating lock for key and returns its release.

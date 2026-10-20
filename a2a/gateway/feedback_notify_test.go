@@ -99,8 +99,26 @@ func TestAnswerFeedbackTargetIsTheAskItsPlanNames(t *testing.T) {
 	c := gatewayConversations{g: r.g}
 	// The plan's first mark binds its key to the ask.
 	c.MarkConversation("discord:g1/fb12", "plan-1", MarkState{Ask: "diagnose"})
+	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-1"); got != "" {
+		t.Errorf("a chain that answered itself has card target %q, want none", got)
+	}
+	// The chain handed its ask to cards, as the relay records it.
+	ctx := context.Background()
+	rec, err := r.g.reg.Get(ctx, "discord:g1/fb12")
+	if err != nil || rec == nil {
+		t.Fatalf("session = %v, %v", rec, err)
+	}
+	rec.markCardsAnswer(origin.TaskID)
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
 	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-1"); got != origin.TaskID {
 		t.Errorf("target = %q, want the ask's root %q", got, origin.TaskID)
+	}
+	// A second plan of the same ask (its follow-up cards) rates nothing more.
+	c.MarkConversation("discord:g1/fb12", "plan-2", MarkState{Ask: "diagnose"})
+	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-2"); got != "" {
+		t.Errorf("a second card answer for one ask has target %q, want none", got)
 	}
 	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-never-marked"); got != "" {
 		t.Errorf("a key no ask holds has target %q, want none", got)

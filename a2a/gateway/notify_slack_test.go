@@ -312,6 +312,8 @@ func TestSlackNotifyRefusesInteractiveBlocks(t *testing.T) {
 		"accessory":     `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"button","text":{"type":"plain_text","text":"Go"},"action_id":"b"}}]`,
 		"select":        `[{"type":"section","text":{"type":"mrkdwn","text":"x"},"accessory":{"type":"static_select","action_id":"c","options":[]}}]`,
 		"input":         `[{"type":"input","label":{"type":"plain_text","text":"y"},"element":{"type":"plain_text_input","action_id":"d"}}]`,
+		// A rating block a sender wrote would rate under a task id it chose.
+		"rating block": `[{"type":"context_actions","block_id":"kage.feedback.t-1","elements":[{"type":"feedback_buttons","action_id":"kage.feedback","positive_button":{"text":{"type":"plain_text","text":"Good"},"value":"up"},"negative_button":{"text":{"type":"plain_text","text":"Bad"},"value":"down"}}]}]`,
 	} {
 		if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Blocks: json.RawMessage(blocks)}); !strings.Contains(got.Error, "interactive") {
 			t.Errorf("%s: reply = %+v, want an interactive refusal", name, got)
