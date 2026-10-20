@@ -2884,7 +2884,9 @@ class KubeAgentsHarness(AgentHarness):
             if _status(t) not in _TERMINAL_STATUSES and t not in outstanding
         ]
         if unsettled:
-            has_delivery = any(_status(t) == "done" for t in awaited)
+            has_delivery = bool(
+                delivered_results(observed, [t for t in awaited if t not in unsettled])
+            )
             _record_unsettled(
                 result,
                 unsettled,
@@ -3024,7 +3026,9 @@ class KubeAgentsHarness(AgentHarness):
                 live_statuses=live_statuses,
             )
             if unsettled:
-                has_delivery = any(statuses.get(t) == "done" or live_statuses.get(t) == "done" for t in awaited)
+                has_delivery = bool(
+                    delivered_results(observed, [t for t in awaited if t not in unsettled])
+                )
                 _record_unsettled(
                     result,
                     unsettled,
@@ -3256,7 +3260,9 @@ class KubeAgentsHarness(AgentHarness):
         if outstanding:
             unsettled = [t for t in unsettled if t not in outstanding]
         if unsettled:
-            has_delivery = any(latest.get(t) == "done" or live_statuses.get(t) == "done" for t in awaited)
+            has_delivery = bool(
+                delivered_results(observed, [t for t in awaited if t not in unsettled])
+            )
             _record_unsettled(
                 result,
                 unsettled,
