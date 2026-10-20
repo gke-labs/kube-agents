@@ -768,9 +768,9 @@ class LbConnectionDrainingRuleTest(unittest.TestCase):
         result = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=reads))
         self.assertEqual(len(result["blocking"]), 1)
         finding = result["blocking"][0]
-        self.assertEqual((finding["backend_service"], finding["timeout_seconds"], finding["pool"], finding["scope"]), ("drain-timeout-seeded-b", 3600, "default-pool", "--global"))
+        self.assertEqual((finding["backend_service"], finding["timeout_seconds"], finding["pools"], finding["negs"], finding["scope"]), ("drain-timeout-seeded-b", 3600, ["default-pool"], [], "--global"))
         text = lb_connection_draining.describe(finding)
-        self.assertTrue(text.startswith("BackendService drain-timeout-seeded-b drains for 3600 s on pool default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out"), text)
+        self.assertTrue(text.startswith("BackendService drain-timeout-seeded-b drains for 3600 s on pool(s) default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out"), text)
         self.assertIn("`gcloud compute backend-services update drain-timeout-seeded-b --global --connection-draining-timeout=600`", text)
         self.assertEqual(result["notes"], [])
         # A regional service names its region in the command; one at the wait is clean.
@@ -797,8 +797,8 @@ class LbConnectionDrainingRuleTest(unittest.TestCase):
         with_services = seeded_b_read()
         with_services["webhook_items"] = [neg_service]
         result = lb_connection_draining.evaluate(record, {}, with_services, None, context_for(record, reads=reads))
-        self.assertEqual((result["blocking"][0]["service"], result["blocking"][0]["pool"]), ("shop/web", None))
-        self.assertIn("on NEG k8s1-abc-shop-web-80-def of Service shop/web", lb_connection_draining.describe(result["blocking"][0]))
+        self.assertEqual((result["blocking"][0]["negs"], result["blocking"][0]["pools"]), ([{"group": "k8s1-abc-shop-web-80-def", "service": "shop/web"}], []))
+        self.assertIn("drains for 3600 s on NEG k8s1-abc-shop-web-80-def of Service shop/web; GKE waits", lb_connection_draining.describe(result["blocking"][0]))
         # Services not read: the NEG half is unknown only when a NEG backend was seen.
         unread = seeded_b_read()
         unread["webhook_items"], unread["webhook_error"] = None, "timed out"
@@ -806,6 +806,26 @@ class LbConnectionDrainingRuleTest(unittest.TestCase):
         self.assertEqual(result["blocking"], [])
         self.assertEqual(result["unknown"], ["the Services were not read (timed out), so a NEG-backed backend service was not matched"])
         self.assertEqual(lb_connection_draining.evaluate(record, {}, unread, None, context_for(record))["unknown"], [])
+
+    def test_one_blocker_per_backend_service_names_every_matched_pool_once(self):
+        # One service with two backends on two pools: one blocker naming both pools, one service counted.
+        record = seeded_b()
+        default_group, surge_group = (pool["instanceGroupUrls"][0].replace("instanceGroupManagers", "instanceGroups") for pool in record["nodePools"])
+        service = self.planted()
+        service["backends"] = [{"balancingMode": "UTILIZATION", "group": default_group}, {"balancingMode": "UTILIZATION", "group": surge_group}]
+        reads = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: [service]})
+        result = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=reads))
+        self.assertEqual([(f["backend_service"], f["pools"]) for f in result["blocking"]], [("drain-timeout-seeded-b", ["default-pool", "no-surge-pool"])])
+        self.assertIn("drains for 3600 s on pool(s) default-pool, no-surge-pool; GKE waits 600 s", lb_connection_draining.describe(result["blocking"][0]))
+        # A multi-zone pool: one instance group per zone, both backends of the service, the pool named once; at the wait, one service matched of one.
+        regional = copy.deepcopy(record)
+        regional["nodePools"][0]["instanceGroupUrls"].append(regional["nodePools"][0]["instanceGroupUrls"][0].replace("us-central1-a", "us-central1-b"))
+        service["backends"] = [{"balancingMode": "UTILIZATION", "group": default_group}, {"balancingMode": "UTILIZATION", "group": default_group.replace("us-central1-a", "us-central1-b")}]
+        result = lb_connection_draining.evaluate(regional, {}, seeded_b_read(), None, context_for(regional, reads=reads))
+        self.assertEqual([f["pools"] for f in result["blocking"]], [["default-pool"]])
+        service["connectionDraining"]["drainingTimeoutSec"] = 600
+        result = lb_connection_draining.evaluate(regional, {}, seeded_b_read(), None, context_for(regional, reads=reads))
+        self.assertEqual((result["blocking"], result["notes"]), ([], ["no backend service on this cluster's pools or NEGs drains for more than 600 s (1 matched of 1 in the project)"]))
 
     def test_a_failed_or_missing_read_is_unknown(self):
         record = seeded_b()

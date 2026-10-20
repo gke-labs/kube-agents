@@ -9,7 +9,8 @@ service whose `connectionDraining.drainingTimeoutSec` is above that wait holds e
 removal for the whole wait and then times out: the upgrade spends the wait on each surge
 node, and the node leaves the pool with its drain unfinished. The rule reads the project's
 backend services (the report's `backend_services` read) and files one blocker per backend
-service whose backends include one of the cluster's node-pool instance groups
+service, naming every matched pool and NEG once (a multi-zone pool has one instance group per
+zone, and a NEG one per zone), whose backends include one of the cluster's node-pool instance groups
 (`nodePools[].instanceGroupUrls`, compared by zone and name, which is how a backend's
 `group` URL and a pool's instance-group-manager URL spell one group) or a network endpoint
 group the cluster's Services carry in their `cloud.google.com/neg-status` annotation (the
@@ -27,6 +28,7 @@ import json
 
 from readiness_rules import (
     HOLDS_NODE_POOL,
+    LIST_SEPARATOR,
     PATH_SEPARATOR,
     PROJECT_READ_BACKEND_SERVICES,
     new_result,
@@ -69,14 +71,15 @@ SERVICE_LABEL_FORMAT = "{namespace}/{name}"
 GLOBAL_SCOPE_FLAG = "--global"
 REGION_SCOPE_FLAG_FORMAT = "--region {region}"
 ACTION_FORMAT = "gcloud compute backend-services update {name} {scope} --connection-draining-timeout={wait}"
-FINDING_POOL_FORMAT = (
-    "BackendService {name} drains for {timeout} s on pool {pool}; GKE waits {wait} s per node during an upgrade, "
+FINDING_FORMAT = (
+    "BackendService {name} drains for {timeout} s on {targets}; GKE waits {wait} s per node during an upgrade, "
     "so each surge node's drain times out; set the timeout at or under the wait: `{action}`"
 )
-FINDING_NEG_FORMAT = (
-    "BackendService {name} drains for {timeout} s on NEG {group} of Service {service}; GKE waits {wait} s per node during an upgrade, "
-    "so each surge node's drain times out; set the timeout at or under the wait: `{action}`"
-)
+# What one service's finding names: its matched pools once each, its matched NEGs once each.
+POOLS_TARGET_FORMAT = "pool(s) {pools}"
+NEG_TARGET_FORMAT = "NEG {group} of Service {service}"
+TARGETS_JOIN = " and "
+# Both counts are backend services: the ones with a backend on this cluster, of the project's.
 CLEAN_NOTE_FORMAT = "no backend service on this cluster's pools or NEGs drains for more than {wait} s ({matched} matched of {total} in the project)"
 SERVICES_NOT_READ_REASON = "the Services were not read ({error}), so a NEG-backed backend service was not matched"
 BACKEND_SERVICES_NOT_A_LIST = "the backend-services read returned {type}, not a list"
@@ -157,30 +160,37 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         if not isinstance(backend_service, dict):
             continue
         timeout = _timeout(backend_service)
+        pools: list[str] = []
+        neg_matches: list[tuple[str, str]] = []
         for backend in backend_service.get(BACKENDS_KEY) or []:
             if not isinstance(backend, dict):
                 continue
             zone, kind, name = _url_parts(backend.get(GROUP_KEY, ""))
-            pool = groups.get((zone, name)) if kind in (INSTANCE_GROUPS_SEGMENT, INSTANCE_GROUP_MANAGERS_SEGMENT) else None
-            service = negs.get(name) if kind == NEG_SEGMENT else None
-            saw_neg_backend = saw_neg_backend or kind == NEG_SEGMENT
-            if pool is None and service is None:
-                continue
-            matched += 1
-            if timeout <= DEREGISTRATION_WAIT_SECONDS:
-                continue
-            bs_name = str(backend_service.get(BACKEND_SERVICE_NAME_KEY) or "")
-            scope = _scope(backend_service)
-            out["blocking"].append({
-                "backend_service": bs_name,
-                "scope": scope,
-                "timeout_seconds": timeout,
-                "wait_seconds": DEREGISTRATION_WAIT_SECONDS,
-                "group": name,
-                "pool": pool,
-                "service": service,
-                "action": ACTION_FORMAT.format(name=bs_name, scope=scope, wait=DEREGISTRATION_WAIT_SECONDS),
-            })
+            if kind in (INSTANCE_GROUPS_SEGMENT, INSTANCE_GROUP_MANAGERS_SEGMENT):
+                pool = groups.get((zone, name))
+                if pool is not None and pool not in pools:
+                    pools.append(pool)
+            elif kind == NEG_SEGMENT:
+                saw_neg_backend = True
+                service = negs.get(name)
+                if service is not None and (name, service) not in neg_matches:
+                    neg_matches.append((name, service))
+        if not pools and not neg_matches:
+            continue
+        matched += 1  # one service, however many of its backends (one per zone) are the cluster's
+        if timeout <= DEREGISTRATION_WAIT_SECONDS:
+            continue
+        bs_name = str(backend_service.get(BACKEND_SERVICE_NAME_KEY) or "")
+        scope = _scope(backend_service)
+        out["blocking"].append({
+            "backend_service": bs_name,
+            "scope": scope,
+            "timeout_seconds": timeout,
+            "wait_seconds": DEREGISTRATION_WAIT_SECONDS,
+            "pools": pools,
+            "negs": [{"group": group, "service": service} for group, service in neg_matches],
+            "action": ACTION_FORMAT.format(name=bs_name, scope=scope, wait=DEREGISTRATION_WAIT_SECONDS),
+        })
     if services is None and saw_neg_backend:
         out["unknown"].append(SERVICES_NOT_READ_REASON.format(error=(read or {}).get("webhook_error") or "no Service list"))
     if not out["blocking"]:
@@ -188,7 +198,14 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     return out
 
 
+def _targets_text(finding: dict) -> str:
+    parts = []
+    if finding.get("pools"):
+        parts.append(POOLS_TARGET_FORMAT.format(pools=LIST_SEPARATOR.join(finding["pools"])))
+    if finding.get("negs"):
+        parts.append(LIST_SEPARATOR.join(NEG_TARGET_FORMAT.format(group=neg["group"], service=neg["service"]) for neg in finding["negs"]))
+    return TARGETS_JOIN.join(parts)
+
+
 def describe(finding: dict) -> str:
-    if finding.get("pool") is not None:
-        return FINDING_POOL_FORMAT.format(name=finding["backend_service"], timeout=finding["timeout_seconds"], pool=finding["pool"], wait=finding["wait_seconds"], action=finding["action"])
-    return FINDING_NEG_FORMAT.format(name=finding["backend_service"], timeout=finding["timeout_seconds"], group=finding["group"], service=finding["service"], wait=finding["wait_seconds"], action=finding["action"])
+    return FINDING_FORMAT.format(name=finding["backend_service"], timeout=finding["timeout_seconds"], targets=_targets_text(finding), wait=finding["wait_seconds"], action=finding["action"])
