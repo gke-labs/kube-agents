@@ -67,6 +67,7 @@ type fakeDaemon struct {
 	backlogStatus   int
 	backlogPayloads []DriftInjectPayload
 	backlogAttempts int
+	backlogHeaders  []http.Header
 }
 
 // newFakeDaemon starts a server and returns it with its base URL.
@@ -101,6 +102,7 @@ func newFakeDaemon(t *testing.T) (*fakeDaemon, string) {
 
 		if r.URL.Path == driftBacklogPath {
 			d.backlogAttempts++
+			d.backlogHeaders = append(d.backlogHeaders, r.Header.Clone())
 			if d.backlogStatus != 0 && d.backlogStatus != http.StatusOK {
 				w.WriteHeader(d.backlogStatus)
 				_, _ = w.Write([]byte("the daemon said no"))
@@ -1170,6 +1172,12 @@ func TestInjectPostsABacklogRecordToTheDigestRoute(t *testing.T) {
 	daemon.mu.Unlock()
 	if len(payloads) != 1 {
 		t.Fatalf("backlog posts = %d, want 1", len(payloads))
+	}
+	daemon.mu.Lock()
+	headers := daemon.backlogHeaders
+	daemon.mu.Unlock()
+	if len(headers) != 1 || headers[0].Get(authorizationHeader) != bearerPrefix+"token-value" {
+		t.Errorf("the digest route was not called with the bearer token: %v", headers)
 	}
 	got := payloads[0]
 	if !got.Backlog || got.PublishTime != "2026-09-21T10:30:05Z" || got.InsertID != "insert-1" || got.Kind != injectKindDrift {

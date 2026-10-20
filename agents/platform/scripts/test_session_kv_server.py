@@ -6578,6 +6578,38 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertIn("ada@example.com (1)", run.call_args.args[0][-1])
         self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
         self.trigger.assert_not_called()
+        drift = self.client.get("/v1/alert-quota").json()["severities"][session_kv_server.DRIFT_QUOTA_KEY]
+        self.assertEqual(drift["sent"], 0, "the unit claimed for a card that was never sent was kept")
+
+    def test_the_worker_waits_the_retry_interval_after_a_failed_post(self):
+        self._burst()
+        self.arm_patch.stop()
+        self._chat()
+        calls = []
+
+        def refuse(*_args, **_kwargs):
+            calls.append(time.monotonic())
+            raise subprocess_error(1)
+
+        retry = 0.5
+        with patch.object(session_kv_server, "DRIFT_BACKLOG_QUIET_SECONDS", 0), patch.object(
+            session_kv_server, "DRIFT_BACKLOG_RETRY_SECONDS", retry
+        ), patch.object(session_kv_server.subprocess, "run", side_effect=refuse):
+            session_kv_server._arm_drift_backlog_digest()
+            deadline = time.monotonic() + 5
+            while len(calls) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(len(calls), 2, "the worker did not retry a failed post")
+            self.assertGreaterEqual(calls[1] - calls[0], retry * 0.9, "the worker retried before the retry interval")
+            with patch.object(session_kv_server.subprocess, "run"):
+                session_kv_server._arm_drift_backlog_digest()
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    with session_kv_server._drift_backlog_lock:
+                        if session_kv_server._drift_backlog_thread is None:
+                            break
+                    time.sleep(0.01)
+        self.assertIsNone(session_kv_server._drift_backlog_thread)
 
     def test_a_lone_row_that_cannot_be_carded_is_digested_not_spun_on(self):
         self._chat()

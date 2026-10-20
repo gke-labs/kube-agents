@@ -372,9 +372,12 @@
 # the one worth testing before anyone treats removing a case as the lever
 # that bought this headroom.
 #
-# The two drift cases now spend six injects a night between them, below the
-# default ALERT_DAILY_LIMIT_DRIFT that the sibling's paragraph below reasons
-# from. Other runs against the same install on the same UTC day spend from the
+# The three drift cases spend twenty-one injects a night between them: six for
+# the first two, and fifteen for gitops-drift-backlog-digest (five cards a
+# repetition). That is over the default ALERT_DAILY_LIMIT_DRIFT of 20 that the
+# sibling's paragraph below reasons from, so on a dev install carrying the
+# default, the last repetition can lose a card to the ceiling and red as
+# late-edit-not-carded. Other runs against the same install on the same UTC day spend from the
 # same bucket. The eval install runs uncapped (EVAL_ALERT_DAILY_LIMIT_DRIFT=0
 # in hack/ci-deploy.sh), so this is a dev-install note, not a CI one.
 #
@@ -1071,8 +1074,11 @@
 # fixture stops the detector process, publishes, and kills it, so the
 # relaunched process marks them; a live record after that still gets its card.
 # Graded on the fixture's read of the ledger and the board. Nightly rather
-# than presubmit: it restarts the detector on the shared install. Priced at
-# the drift band (900s) until the nightly record measures it.
+# than presubmit: it restarts the detector on the shared install. Each
+# repetition spends five drift alerts (three kubectl cards, one lone-principal
+# card, the live card), so three do not fit a defaulted dev install beside the
+# other drift cases; see the budget paragraph above. Priced at the drift band
+# (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
 # Asked for options to choose from, the card pauses on the question:

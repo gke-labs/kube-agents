@@ -4385,6 +4385,22 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     )
 
 
+def _refund_alert_quota(severity: str) -> None:
+    """Give back one of today's alerts for `severity`, claimed for a post that
+    never happened. Best-effort: a failed refund costs one unit of the day's
+    budget, which is what it cost before the refund existed."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE alert_quota SET sent = sent - 1 WHERE day = ? AND severity = ? AND sent > 0",
+                    (day, severity),
+                )
+    except sqlite3.Error as exc:
+        logger.error(f"Could not refund a {severity} alert claimed for a post that did not happen: {exc}")
+
+
 def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
     """Card the rows of every principal with fewer than DRIFT_BACKLOG_CARD_BELOW
     rows, and return the rest for the digest.
@@ -4431,6 +4447,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
                     )
         except sqlite3.Error as exc:
             logger.error(f"Late record {row['id']} could not be carded and goes to the digest: {exc}")
+            _refund_alert_quota(DRIFT_QUOTA_KEY)
             digest.append(row)
             continue
         logger.info(f"Drift backlog: carding late record {row['id']} (its principal has {counts[row['principal']]} late row(s))")
