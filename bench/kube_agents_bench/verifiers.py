@@ -2643,17 +2643,14 @@ class WorkerCommandsVerifier(BaseVerifier):
             typed = logged_commands + children
             windowed = typed
             traj_calls = calls
+            no_traj_for_succeeded = False
             if has_succeeded_runs and not traj_calls:
                 tagged = any(isinstance(e, dict) and e.get("agent") and e.get("name") not in _CODE_TOOLS for e in (snap.trajectory or ()))
                 dropped = any(isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS for e in (snap.trajectory or ()))
                 if not tagged or dropped or snap.worker_commands:
-                    return VerificationResult(
-                        success=False,
-                        status="error",
-                        elapsed_time=time.monotonic() - start,
-                        reason=_NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON,
-                    )
+                    no_traj_for_succeeded = True
         else:
+            no_traj_for_succeeded = False
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
                 # Tagged MCP calls beside an empty card log mean the worker typed nothing.
@@ -2733,6 +2730,9 @@ class WorkerCommandsVerifier(BaseVerifier):
             else:
                 # Grade succeeded: true from worker trajectory only.
                 # A required run with succeeded: true and no trajectory to read is not credited.
+                if no_traj_for_succeeded:
+                    traj_missing.append(run)
+                    continue
                 matched_any = False
                 succeeded = False
                 for argv, call_succeeded in traj_argv_entries:
@@ -2769,16 +2769,20 @@ class WorkerCommandsVerifier(BaseVerifier):
 
         if failed:
             parts = []
-            if missing and (not partial or self.after_result_pattern is None):
+            if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s){exempted}{sources}"
                 )
-            unrun_missing_reported = unrun_missing if not partial else [r for r in unrun_missing if not r.succeeded]
+            if self.after_result_pattern is None and partial:
+                unrun_missing_reported = [r for r in unrun_missing if not r.succeeded]
+                unrun_failed_reported = []
+            else:
+                unrun_missing_reported = unrun_missing
+                unrun_failed_reported = unrun_failed
             if unrun_missing_reported:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
                 parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
-            unrun_failed_reported = unrun_failed if not partial else []
             if unrun_failed_reported:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
                 parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
@@ -2820,15 +2824,19 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason=reason,
             )
         if traj_missing:
-            named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
+            if no_traj_for_succeeded:
+                reason = _NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON
+            else:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
+                reason = (
+                    f"the worker card log shows {named} ran, but the worker trajectory did not "
+                    f"capture the call, so success could not be verified"
+                )
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=(
-                    f"the worker card log shows {named} ran, but the worker trajectory did not "
-                    f"capture the call, so success could not be verified"
-                ),
+                reason=reason,
             )
         return VerificationResult(
             success=True,

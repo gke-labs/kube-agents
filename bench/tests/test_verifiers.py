@@ -8571,6 +8571,20 @@ def test_worker_commands_required_run_succeeded_flag():
     assert res_gap_missing.status == "error" and "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_missing.reason
     assert "fleet_upgrade_report.py --readiness" in res_gap_missing.reason
 
+    # Absent/uncredited succeeded: true run from both sources beside capture gaps lands in unrun_missing
+    # and yields status="error" via partial (not conclusive fail).
+    transcript.set(
+        "ok",
+        traj_other,
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_unrun_missing = v.verify(5.0)
+    assert res_gap_unrun_missing.status == "error"
+    assert "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_unrun_missing.reason
+    assert "could not be verified" in res_gap_unrun_missing.reason
+    assert "fleet_upgrade_report.py --readiness" in res_gap_unrun_missing.reason
+
     # Card-log required pattern miss beside capture gaps yields conclusive failure (status="fail").
     v_with_pattern = WorkerCommandsVerifier(
         type="worker_commands",
@@ -8663,6 +8677,52 @@ def test_worker_commands_succeeded_tagged_mcp_beside_card_log_is_error():
     res = v.verify(5.0)
     assert res.status == "error"
     assert "the card log shows commands the trajectory did not carry" in res.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_with_conclusive_card_log_failure_fails():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        forbidden_patterns=[r"kubectl delete"],
+        required_runs=[run],
+    )
+    # No tagged worker terminal calls in trajectory, but card log has forbidden pattern.
+    # Conclusive card log evidence must fail conclusively rather than returning error.
+    transcript.set(
+        "ok",
+        [],
+        worker_commands=[
+            {"task": "t_1", "command": "kubectl delete pod x"},
+            {"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"},
+        ],
+    )
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "forbidden pattern(s) matched worker commands" in res.reason
+
+
+def test_worker_commands_after_result_partial_capture_preserves_missing_in_fail_reason():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        after_result_pattern=r"START",
+        required_patterns=[r"must_run_this"],
+        forbidden_patterns=[r"forbidden_cmd"],
+        required_runs=[WorkerRun(script="worker.py", flags=[], succeeded=False)],
+    )
+    calls = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo START"}, "result": "START", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "forbidden_cmd"}, "result": "ok", "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", calls, worker_commands=[], worker_capture_gaps=["card t_9: locked"])
+    res = v.verify(5.0)
+    assert res.status == "fail"
+    assert "no worker command matched required pattern(s) ['must_run_this']" in res.reason
+    assert "no worker command ran worker.py across 2 command(s)" in res.reason
+    assert "forbidden pattern(s) matched worker commands" in res.reason
 
 
 def test_worker_commands_required_run_succeeded_with_after_result_pattern():
