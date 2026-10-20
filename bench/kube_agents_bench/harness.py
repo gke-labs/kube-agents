@@ -2640,18 +2640,24 @@ class KubeAgentsHarness(AgentHarness):
         awaited: Sequence[str],
         statuses: Mapping[str, str],
         fallback_messages: Mapping[str, Sequence[str]] | None = None,
+        poll_interval: float = 0.1,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
 
-        When the board read fails or the card is no longer in a failure status (for instance,
-        if it was unblocked after being reported blocked), falls back to the most recent
-        failure summary/error seen during polling.
+        When the board read fails after retries, falls back to the most recent failure
+        summary/error seen during polling.
         """
         failure_cards = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
         if not failure_cards:
             return []
         board_messages: list[str] = []
-        final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
+        final_bstate = None
+        for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
+            final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
+            if final_bstate is not None:
+                break
+            if attempt < _MAX_TRANSPORT_FAILURES:
+                time.sleep(max(0.0, poll_interval))
         if final_bstate is None:
             _log.warning("kanban board could not be read for failure cards: %s", ", ".join(failure_cards))
             if fallback_messages:
@@ -2664,12 +2670,6 @@ class KubeAgentsHarness(AgentHarness):
             card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
             if card_msgs:
                 board_messages.extend(card_msgs)
-            elif (
-                fallback_messages
-                and t in fallback_messages
-                and (t not in final_bstate[0] or final_bstate[0].get(t) not in _FAILURE_STATUSES)
-            ):
-                board_messages.extend(fallback_messages[t])
         return board_messages
 
     def _await_delegated_cards(
@@ -2818,6 +2818,7 @@ class KubeAgentsHarness(AgentHarness):
         # that text and hide the ceiling from the scorer.
         settled = [t for t in awaited if _status(t) in _TERMINAL_STATUSES]
         want_cards = list(dict.fromkeys(settled + [t for t in awaited if _status(t) in _FAILURE_STATUSES]))
+        poll_failure_statuses = {t: _status(t) for t in awaited if _status(t) in _FAILURE_STATUSES}
         if want_cards:
             final = _read(want_cards)
             if final is None:
@@ -2851,7 +2852,14 @@ class KubeAgentsHarness(AgentHarness):
         # checks that could read them are set aside on inject records anyway.
         shown = any(e.get("name") == inject.EVENT_ENTRY_ACTIVITY for e in result.trajectory)
         before = len(result.trajectory)
-        bstatuses = {t: _status(t) for t in awaited}
+        bstatuses = {
+            t: (
+                poll_failure_statuses[t]
+                if t in poll_failure_statuses and _status(t) not in _FAILURE_STATUSES
+                else _status(t)
+            )
+            for t in awaited
+        }
         bsummaries = {
             t: str(read.cards[t]["summary"])
             for t in awaited
@@ -2962,7 +2970,9 @@ class KubeAgentsHarness(AgentHarness):
                 self._extract_trajectory_failure_summaries(result.trajectory, failure_awaited)
             )
         if not outstanding:
-            board_messages = self._final_board_failures(awaited, statuses, poll_failure_messages)
+            board_messages = self._final_board_failures(
+                awaited, statuses, poll_failure_messages, poll_interval=poll_interval
+            )
             self._settle(
                 result,
                 observed,
@@ -3111,6 +3121,14 @@ class KubeAgentsHarness(AgentHarness):
             # every turn after the first terminal card as settled.
             turn_new_calls = new_calls(status_turn, seen_calls)
             fresh_reported = reported_statuses(turn_new_calls)
+            statuses.update(reported_statuses(status_turn.trajectory))
+            # dict.fromkeys: order-preserving dedupe, so a card the agent
+            # re-filed under the same id is awaited once. The overflow is
+            # reported only the first time, since the replayed trajectory
+            # re-offers the dropped ids on every poll.
+            merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
+            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
+            capped = capped or len(merged) > _MAX_AWAITED_TASKS
             latest.update(fresh_reported)
             for t, s in fresh_reported.items():
                 if s not in _FAILURE_STATUSES:
@@ -3158,14 +3176,6 @@ class KubeAgentsHarness(AgentHarness):
                     )
                     timed_out = False
                     break
-            statuses.update(reported_statuses(status_turn.trajectory))
-            # dict.fromkeys: order-preserving dedupe, so a card the agent
-            # re-filed under the same id is awaited once. The overflow is
-            # reported only the first time, since the replayed trajectory
-            # re-offers the dropped ids on every poll.
-            merged = list(dict.fromkeys(awaited + delegated_task_ids(status_turn.trajectory)))
-            awaited = self._capped(_pending_first(merged, statuses), None if capped else result)
-            capped = capped or len(merged) > _MAX_AWAITED_TASKS
             outstanding = [t for t in awaited if statuses.get(t) not in _TERMINAL_STATUSES]
 
         # Only on the deadline path: after a transport failure or a mute agent
@@ -3173,7 +3183,9 @@ class KubeAgentsHarness(AgentHarness):
         # the run stopped.
         if outstanding and timed_out:
             _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
-        board_messages = self._final_board_failures(awaited, latest, poll_failure_messages)
+        board_messages = self._final_board_failures(
+            awaited, latest, poll_failure_messages, poll_interval=poll_interval
+        )
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.

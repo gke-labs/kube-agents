@@ -2892,25 +2892,37 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
     t = "task-1"
     fallback = {t: ["provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"]}
 
-    # Branch 1: final read succeeds but card was unblocked (status is running)
+    # Branch 1: final read fails after retries, falls back to fallback store
+    read_attempts: list[str] = []
+
+    def _shell_failed(script: str, timeout: float) -> str:
+        read_attempts.append(script)
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell_failed)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
+    assert len(read_attempts) == harness._MAX_TRANSPORT_FAILURES
+    assert msgs == fallback[t]
+
+    # Branch 2: final read succeeds but card was unblocked (status is running) -> cleared, empty msgs
     def _shell_running(script: str, timeout: float) -> str:
         payload = {"statuses": {t: "running"}, "summaries": {}, "errors": {}}
         return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_running)
-    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
-    assert msgs == fallback[t]
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
+    assert msgs == []
 
-    # Branch 2: final read succeeds, card is still blocked but has empty summaries and errors
+    # Branch 3: final read succeeds, card is still blocked but has empty summaries and errors
     def _shell_empty_failures(script: str, timeout: float) -> str:
         payload = {"statuses": {t: "blocked"}, "summaries": {}, "errors": {}, "block_kinds": {t: "transient"}}
         return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_empty_failures)
-    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
     assert msgs == []
 
-    # Branch 3: final read succeeds and has summaries/errors, does not use fallback
+    # Branch 4: final read succeeds and has summaries/errors, does not use fallback
     def _shell_with_summary(script: str, timeout: float) -> str:
         payload = {
             "statuses": {t: "blocked"},
@@ -2921,7 +2933,7 @@ def test_final_board_failures_fallback_branches(monkeypatch: pytest.MonkeyPatch)
         return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}"
 
     monkeypatch.setattr(harness, "_agent_shell", _shell_with_summary)
-    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback)
+    msgs = KubeAgentsHarness._final_board_failures([t], {t: "blocked"}, fallback, poll_interval=0.0)
     assert msgs == ["new summary"]
 
 
@@ -3883,10 +3895,10 @@ def test_extract_infra_failure_reason_classifier() -> None:
     )
 
 
-def test_a_429_blocked_card_unblocked_and_running_at_settle_is_infrastructure(
+def test_a_429_blocked_card_unblocked_and_running_at_settle_remains_graded(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
-    """A card 429-blocked and retired, then unblocked and still running at settle, falls back to infra."""
+    """A card 429-blocked and retired, then unblocked and still running at settle, is cleared and remains graded."""
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -3980,6 +3992,138 @@ def test_a_429_blocked_card_unblocked_and_running_at_settle_is_infrastructure(
     monkeypatch.setattr(harness, "_agent_shell", _shell)
 
     result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert "Finished." in result.output
+
+
+def test_a_429_blocked_card_unblocked_and_re_failed_for_own_fault_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card 429-blocked and retired, then unblocked and re-failed for its own fault, remains graded."""
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked on 429 -> t1 retires
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": "t2 finished"}, "runs": []},
+                "s2",
+            ),
+            _text("Finished."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                return ""
+            elif idx == 2:
+                payload = {
+                    "statuses": {t2: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 3:
+                payload = {
+                    "statuses": {t2: "done"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx >= 4:
+                # Settle read: t1 re-failed for its own worker fault (not transient, not 429)
+                payload = {
+                    "statuses": {t1: "failed"},
+                    "summaries": {},
+                    "errors": {t1: "worker exit code 1: internal assertion error"},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+    assert "Finished." in result.output
+
+
+def test_status_turn_filed_and_blocked_card_seeds_fallback_store_and_marks_infra(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A card filed and shown blocked in the same status turn joins awaited and seeds fallback store."""
+    t1 = _TASK_ID
+    t_new = _TASK_ID + "-new"
+    stub_agent.turns = [
+        # Turn 0: delegate t1
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            _text("Delegated initial task."),
+        ),
+        # Turn 1: status turn shows t1 done, but files t_new and shows t_new blocked on 429
+        _turn(
+            *_call("kanban_show", {"task_id": t1}, {"task": {"id": t1, "status": "done", "result": "done"}, "runs": []}, "s1"),
+            *_call("kanban_create", {"title": "followup task"}, {"ok": True, "task_id": t_new, "status": "ready"}, "c2"),
+            *_call(
+                "kanban_show",
+                {"task_id": t_new},
+                {
+                    "task": {"id": t_new, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429 quota exhausted"}],
+                },
+                "s2",
+            ),
+            _text("t1 finished, but followup t_new blocked."),
+        ),
+    ]
+
+    # Every BOARD_PRESENT read fails (returns empty string), forcing settle to rely on fallback store
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: "")
+
+    result = KubeAgentsHarness().run("Run pipeline.")
 
     assert any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
     assert "rate_limit" in result.errors[0]

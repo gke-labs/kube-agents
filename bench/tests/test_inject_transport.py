@@ -2696,6 +2696,36 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     assert "rate_limit" in result.errors[0]
 
 
+def test_a_card_unblocked_between_poll_and_final_read_on_inject_is_infrastructure(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card unblocked between the poll that ended the loop and the final read preserves infra classification."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "blocked",
+        summary=(
+            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+            'HTTP 429 ... "TPM quota exhausted"'
+        ),
+        block_kind="transient",
+    )
+
+    def _on_read(n: int) -> None:
+        if n == 2:
+            # On the deliverable read (want_cards), card has unblocked and is running
+            set_card(tmp_path, CARD_A, "running", block_kind="transient")
+
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch, on_read=_on_read))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert infra(result)
+    assert result.output == ""
+    assert "rate_limit" in result.errors[0]
+
+
 def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
