@@ -26298,6 +26298,8 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         for finding in findings[audit_report.AUTO_PROMOTION_CAP :]:
             self.assertIn(f"`{derived_id(fid=finding['id'])}`", body)
         self.assertIn("/remediate", body)
+        self.assertIn("an earlier finish in this run already ran the automatic sweep", body)
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
 
     def test_a_finish_that_dies_after_the_store_write_still_leaves_its_verdict(self):
         self.start()
@@ -26308,6 +26310,28 @@ class TestSecondFinishInOneRun(HarnessTestCase):
 
         self.assertEqual(self.finish_again(doc), 0)
         self.assertFalse(self.stdout_json()["silent_ok"])
+        [(_, text)] = self.entries()
+        self.assertTrue(text.startswith(audit_report.CHAT_REPORT_RERUN_LABEL + "\n"))
+
+    def test_a_clean_second_finish_after_a_clean_one_with_news_is_not_silent(self):
+        self.start()
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+
+        self.assertEqual(self.run_finish(doc), 0)
+        second = self.stdout_json()
+        self.assertFalse(second["silent_ok"])
+        self.assertTrue(second[audit_report.SILENT_FLOOR_KEY])
+        self.assertTrue(second[audit_report.REFINISH_KEY])
 
     def test_a_rerun_after_a_lost_broker_opens_no_second_batch(self):
         self.start()
@@ -26378,7 +26402,7 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.finish_again(doc), 0, self.err)
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
 
-    def test_a_start_after_a_finish_that_died_opens_a_new_run(self):
+    def test_a_start_after_a_finish_that_died_keeps_the_run_and_its_verdict(self):
         now = datetime.now(timezone.utc)
         audit_report.open_chat_report(AUDIT, "acme/a", now)
         audit_report.append_chat_report(AUDIT, "acme/a", "report A", now)
@@ -26389,8 +26413,20 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         run = self.chat_record()["run"]
 
         self.start()
-        self.assertNotEqual(self.chat_record()["run"], run)
-        self.assertEqual(self.entries(), [("acme/fleet", None)])
+        self.assertEqual(self.chat_record()["run"], run)
+        self.assertEqual(self.entries(), [("acme/a", "report A"), ("acme/fleet", None)])
+        self.assertEqual(self.finish_again(doc), 0)
+        self.assertTrue(self.stdout_json()[audit_report.SILENT_FLOOR_KEY])
+
+    def test_a_start_after_the_only_finish_died_keeps_its_verdict(self):
+        self.start()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        with patch.object(audit_report, "append_chat_report", side_effect=RuntimeError("killed")):
+            self.assertNotEqual(self.run_finish(doc), 0)
+
+        self.start()
+        self.assertEqual(self.finish_again(doc), 0)
+        self.assertFalse(self.stdout_json()["silent_ok"])
 
     def test_a_finish_with_no_start_stays_a_run_of_its_own(self):
         doc = make_doc(findings=[make_finding(fid="a", severity="major")])

@@ -221,8 +221,7 @@ it renders from its own line and the findings document (`render_chat_report`;
 hours (the stream lease, which covers one step) and that holds no finished
 report for this repository is the same run; any other `start` opens a new
 record, and so does a `start` that finds no finished part, which a run that
-never reached `finish` left. An entry whose `finish` saved its verdict counts as finished
-here, so a `start` after a `finish` that died after saving it opens a new record. A `finish` applies the
+never reached `finish` left. A `start` after a `finish` that died after saving its verdict keeps the record and the verdict, so the next `finish` of that repository is not silent. A `finish` applies the
 age and repository rule, with one exception: a later `finish` of a repository whose entry
 `start` opened and an earlier `finish` filled, while the record's last step is within the
 two hours, is the same run. It adds its report under the earlier one's, below a label line,

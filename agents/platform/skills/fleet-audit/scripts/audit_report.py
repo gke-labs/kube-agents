@@ -823,8 +823,13 @@ CHAT_REPORT_TEXT_KEY = "text"
 CHAT_REPORT_SILENT_OK_KEY = "silent_ok"
 CHAT_REPORT_NEW_IDS_KEY = "new_ids"
 # Above a later `finish`'s report in the same entry: its counts are measured
-# against the report above it, not against the previous run.
+# against the report above it, or against what an earlier `finish` that died
+# before its report published, not against the previous run.
 CHAT_REPORT_REFINISH_LABEL = "Re-run in this audit; counts are against the report above."
+CHAT_REPORT_RERUN_LABEL = (
+    "Re-run in this audit after an earlier finish published and stopped; "
+    "counts are against what it published."
+)
 # On the JSON line of such a later `finish`; `SILENT_FLOOR_KEY` also on its
 # envelope, when the earlier one's news kept this one from being silent.
 REFINISH_KEY = "refinish"
@@ -3050,7 +3055,7 @@ def _current_chat_record(audit_id: str, repo: str, now: datetime) -> dict:
     finished = {
         str(part.get(CHAT_REPORT_REPO_KEY))
         for part in record[CHAT_REPORT_PARTS_KEY]
-        if part.get(CHAT_REPORT_TEXT_KEY) or CHAT_REPORT_SILENT_OK_KEY in part
+        if part.get(CHAT_REPORT_TEXT_KEY)
     }
     if repo in finished:
         return _new_chat_record(audit_id, now)
@@ -3072,11 +3077,13 @@ def open_chat_report(audit_id: str, repo: str, now: datetime) -> None:
     # A record with no finished part that already holds `repo` pending was
     # left by a run that never finished it, and adopting it would carry that
     # run's stamps into this one. One pending only for other repositories is
-    # this run's earlier repository, which the relay must still name.
+    # this run's earlier repository, which the relay must still name. A part
+    # with a saved verdict is a `finish` of this run that died after deciding:
+    # the record and the verdict stay, so the next `finish` is not silent.
     parts = record[CHAT_REPORT_PARTS_KEY]
-    if not any(part.get(CHAT_REPORT_TEXT_KEY) for part in parts) and any(
-        part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts
-    ):
+    if not any(
+        part.get(CHAT_REPORT_TEXT_KEY) or CHAT_REPORT_SILENT_OK_KEY in part for part in parts
+    ) and any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in parts):
         record = _new_chat_record(audit_id, now)
     if not any(part.get(CHAT_REPORT_REPO_KEY) == repo for part in record[CHAT_REPORT_PARTS_KEY]):
         record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: None})
@@ -3147,7 +3154,9 @@ def save_chat_verdict(
         log(f"WARNING: chat report for {audit_id} not saved: {exc}")
 
 
-def append_chat_report(audit_id: str, repo: str, text: str, now: datetime) -> None:
+def append_chat_report(
+    audit_id: str, repo: str, text: str, now: datetime, *, refinish: bool = False
+) -> None:
     """Add `repo`'s report to this run's chat report. Best-effort: never fails the run.
 
     Fills the entry `start` opened for `repo`. A later `finish` of `repo` in
@@ -3164,7 +3173,7 @@ def append_chat_report(audit_id: str, repo: str, text: str, now: datetime) -> No
         # with no `start` after a posted run lands here too.
         record[CHAT_REPORT_RUN_KEY] = now.strftime(REPORT_STAMP_FORMAT)
     elif part is not None:
-        part[CHAT_REPORT_TEXT_KEY] = text
+        part[CHAT_REPORT_TEXT_KEY] = f"{CHAT_REPORT_RERUN_LABEL}\n{text}" if refinish else text
     else:
         record = _current_chat_record(audit_id, repo, now)
         pending = _pending_part(record, repo)
@@ -10453,6 +10462,7 @@ def _render_withheld(
     noun: str = DEFAULT_PROPOSAL_NOUN,
     below_floor: list[str] | None = None,
     triage_reasons: dict[str, str] | None = None,
+    swept_earlier: bool = False,
 ) -> list[str]:
     """Name the manifest fixes the automatic sweep opened no pull request for.
 
@@ -10499,8 +10509,14 @@ def _render_withheld(
         out += [
             "",
             f"{len(withheld)} finding(s) qualify for an automatic remediation {noun} "
-            f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
-            f"one bad night cannot bury this repository in generated {noun}s. "
+            + (
+                f"but were held back because an earlier finish in this run already "
+                f"ran the automatic sweep. "
+                if swept_earlier
+                else f"but were held back by the cap of {AUTO_PROMOTION_CAP} per run, so "
+                f"one bad night cannot bury this repository in generated {noun}s. "
+            )
+            + 
             "Comment `/remediate <finding-id>` to open any of them now — an explicit "
             "request is not capped.",
             "",
@@ -10777,6 +10793,7 @@ def render_issue_body(
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
     unlinked_paths: set[str] | frozenset[str] = frozenset(),
+    swept_earlier: bool = False,
 ) -> RenderedIssue:
     """Render the complete ledger issue body. The model never hand-writes this.
 
@@ -10831,6 +10848,7 @@ def render_issue_body(
         noun=noun,
         below_floor=list(below_floor or []),
         triage_reasons=triage_reasons,
+        swept_earlier=swept_earlier,
     )
     # Measured with the fixed sections, not against what the findings leave:
     # the table is row-capped and says what it saw, and a declaration that
@@ -16715,7 +16733,9 @@ def _finish_without_forge(
     payload["summary"] = render_no_forge_summary(
         audit_id, data, gaps, new_ids, resolved_ids, delta_known, held, note, len(unpublished)
     )
-    append_chat_report(audit_id, NO_FORGE_REPO, payload["summary"], now)
+    append_chat_report(
+        audit_id, NO_FORGE_REPO, payload["summary"], now, refinish=bool(payload.get(REFINISH_KEY))
+    )
     print(json.dumps(payload))
 
 
@@ -17812,7 +17832,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             now,
             ledger_unchanged=body_untouched,
         )
-        append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
+        append_chat_report(
+        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        refinish=bool(payload.get(REFINISH_KEY)),
+    )
         print(json.dumps(payload))
         return
 
@@ -17951,6 +17974,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         file_url=file_url,
         file_ref=file_ref,
         unlinked_paths=unlinked_paths,
+        swept_earlier=silent_floor(earlier),
     )
     if rendered.partial:
         log(
@@ -18123,6 +18147,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 file_url=file_url,
                 file_ref=file_ref,
                 unlinked_paths=unlinked_paths,
+                swept_earlier=silent_floor(earlier),
             ).body
             relinked = try_forge("issue-update", repo, {"number": number, "body": relink})
             if relinked is not None:
@@ -18290,7 +18315,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         ),
         now,
     )
-    append_chat_report(audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now)
+    append_chat_report(
+        audit_id, repo, render_chat_report(audit_id, payload, data, delta_known), now,
+        refinish=bool(payload.get(REFINISH_KEY)),
+    )
     print(json.dumps(payload))
 
 
