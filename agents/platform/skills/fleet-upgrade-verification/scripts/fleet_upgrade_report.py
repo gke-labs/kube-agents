@@ -204,6 +204,11 @@ OUTPUT_TMP_PREFIX = ".fleet-upgrade-output-"
 # graded, from one the API server never answered.
 ERROR_READ_KEY = "read"
 WEBHOOK_READ = "webhooks"
+# The `read` a project-keyed error row names: the project's `clusters list`, or one of the
+# per-project reads the rules take (readiness_rules.PROJECT_READS, under their own names).
+# The rollout record carries a missing member forward only when its project's `clusters
+# list` failed: a failed instances or backend-services list left the clusters listed and graded.
+CLUSTERS_LIST_READ = "clusters"
 # Bumped when the record's shape changes; a file with another version is reported and
 # treated as no prior run rather than compared field by field.
 STATE_FORMAT_VERSION = 1
@@ -797,7 +802,7 @@ class ProjectReads:
                 if error is None and not isinstance(data, list):
                     data, error = None, PROJECT_READ_NOT_A_LIST.format(cmd=" ".join(cmd))
                 if error is not None:
-                    self.errors.append({"project": project, "location": None, "message": error})
+                    self.errors.append({"project": project, "location": None, ERROR_READ_KEY: name, "message": error})
                 reads[name] = {readiness_rules.PROJECT_READ_DATA_KEY: data, readiness_rules.PROJECT_READ_ERROR_KEY: error, readiness_rules.PROJECT_READ_AT_KEY: format_timestamp(utc_now())}
             self._by_project[project] = reads
         return self._by_project[project]
@@ -1366,7 +1371,7 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
                 if ours:
                     continue
                 error = f"{error} ({why_not})"
-            errors.append({"project": project, "location": None, "message": error or f"{' '.join(cmd)} returned no list"})
+            errors.append({"project": project, "location": None, ERROR_READ_KEY: CLUSTERS_LIST_READ, "message": error or f"{' '.join(cmd)} returned no list"})
             unlisted.append(project)
             continue
         # Narrowed by --scope-exclude-clusters, which the agent passes with the
@@ -1755,7 +1760,10 @@ def compute_progress(report: dict, previous: dict | None, now: datetime, rollout
     """
     now_text = format_timestamp(now)
     prior_members = previous["members"] if previous else {}
-    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None and e.get("project")}
+    # The projects whose `clusters list` failed, by the row's `read`: a project read that failed
+    # (instances, backend services, operations) leaves the clusters listed and graded, so a
+    # member missing there is gone, not unread.
+    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None and e.get("project") and e.get(ERROR_READ_KEY) == CLUSTERS_LIST_READ}
     read_projects = set(report["projects"]) - failed_projects
 
     record: dict[str, dict] = {}

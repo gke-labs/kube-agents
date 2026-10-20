@@ -1073,6 +1073,23 @@ class RolloutTrackingTest(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.state_dir, other + ".json")))
         self.assertEqual(self._state()["recorded_at"], "2026-09-11T10:00:00Z", "the first target's record is untouched")
 
+    def test_a_failed_project_read_does_not_carry_a_deleted_cluster_forward(self):
+        # The carry-forward is for a project whose `clusters list` failed. A failed `compute
+        # instances list` (one of the rules' project reads) in a project that listed cleanly
+        # leaves a deleted cluster dropped from the record, as a clean read does.
+        previous = {"recorded_at": "2026-09-11T10:00:00Z", "members": {"p2/europe-west1/far": {"status": "lagging", "control_plane_version": self.OLD, "unchanged_since": "2026-09-11T10:00:00Z"}}}
+        now = self.T0 + timedelta(hours=1)
+
+        def missing(errors):
+            run = {"projects": ["p2"], "members": [], "errors": errors, "target_version": self.TARGET}
+            report.compute_progress(run, previous, now, False, os.path.join(self.state_dir, self.TARGET + ".json"))
+            return run["rollout"]["missing_members"]
+
+        instances_failed = [{"project": "p2", "location": None, report.ERROR_READ_KEY: readiness_rules.PROJECT_READ_INSTANCES, "message": "gcloud compute instances list --project=p2 --format=json(name,zone,status) failed (1): forbidden"}]
+        self.assertEqual(missing(instances_failed), [{"member": "p2/europe-west1/far", "reason": report.GONE_REASON_ABSENT, "carried_forward": False}])
+        listing_failed = [{"project": "p2", "location": None, report.ERROR_READ_KEY: report.CLUSTERS_LIST_READ, "message": "gcloud container clusters list --project=p2 --format=json failed (1): forbidden"}]
+        self.assertEqual(missing(listing_failed), [{"member": "p2/europe-west1/far", "reason": report.GONE_REASON_NOT_READ.format(why=report.NOT_READ_FAILED.format(project="p2")), "carried_forward": True}])
+
     def test_member_missing_after_a_failed_read_is_carried_forward_then_dropped(self):
         fleet = self._fleet()
         fleet["p2"] = [cluster("far", "europe-west1", self.OLD, [("p", self.OLD)])]
