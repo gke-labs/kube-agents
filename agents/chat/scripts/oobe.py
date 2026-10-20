@@ -594,18 +594,23 @@ def first_run_audits(data_dir: Path, now: float) -> None:
             skip(data_dir, SKIP_NOT_NEW if scan_finished(data_dir, filed[0]) else SKIP_UNSETTLED, now)
             return
         # No repository check: with none registered each audit keeps its report in the report store
-        # and posts a summary (the fleet-audit skill's "No forge configured").
+        # (the fleet-audit skill's "No forge configured").
         if not scan_settled(data_dir, now):
             return
     advance_chain(data_dir, state, now, since=filed[1] if filed is not None else None)
 
 
 def finished(data_dir: Path, now: float) -> bool:
-    """Every stage is done, and the report was claimed long enough ago that no run still posts it."""
+    """Every stage is done, and the report was claimed long enough ago that no run still posts it,
+    and on the conversation path its post recorded an outcome."""
     if not read_state(data_dir).get(STATE_DONE):
         return False
     claimed = bootstrap_delivery._completed_at(data_dir)
-    return claimed is not None and now - claimed >= bootstrap_delivery.RETIRE_AFTER_SECONDS
+    return (
+        claimed is not None
+        and now - claimed >= bootstrap_delivery.RETIRE_AFTER_SECONDS
+        and bootstrap_delivery.delivery_settled(data_dir)
+    )
 
 
 def main(data_dir: Path | None = None, now: float | None = None) -> int:

@@ -76,9 +76,6 @@ validated: false
 # half of the fleet-wide audit onboarding runs once.
 domain: fleet-audits
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # A board read that leaves the card alone. The session this prompt reaches is
 # the Platform Agent's API session, not the card's worker, and it must not
 # start, retry or complete the card: the verifiers read what the worker wrote,

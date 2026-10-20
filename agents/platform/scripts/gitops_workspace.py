@@ -804,6 +804,14 @@ def qualify(repo: str, managed: list[str] | None = None) -> str:
     spelling the list uses, so every gate can compare it with the list as
     written. A repository on another forge is returned unchanged.
 
+    On a GitHub Enterprise Server install the list names each GitHub
+    repository `<host>/owner/name`. A bare `owner/name` then resolves to the
+    entry on the install's GitHub host, as the install has one GitHub forge.
+    The name stays bare when an entry of another forge has the same path,
+    because the name does not tell which forge it is on: the caller's gate
+    then refuses it, and the caller must name the host. A
+    `github.com/owner/name` is never moved to the install's host.
+
     `managed` is the list when the caller has read it already; otherwise it is
     read here, and a list that cannot be read leaves the name as it was for the
     caller's own read to fail on.
@@ -822,10 +830,35 @@ def qualify(repo: str, managed: list[str] | None = None) -> str:
             managed = get_managed_repos()
         except Exception:
             return repo
+    if not host:
+        install_host = github_host()
+        if install_host != repo_ref.GITHUB_CANONICAL_HOST:
+            return _qualify_on_enterprise_host(bare, managed, install_host)
     qualified = f"{repo_ref.GITHUB_CANONICAL_HOST}/{bare}"
     if any(isinstance(name, str) and name.lower() == qualified.lower() for name in managed):
         return qualified
     return bare
+
+
+def _qualify_on_enterprise_host(bare: str, managed: list[str], install_host: str) -> str:
+    """The managed entry that a bare `owner/name` names on a GitHub Enterprise Server install.
+
+    The entry as the list spells it, so the caller's gate finds it. `bare`
+    when the list has no such entry, or when an entry on another host has the
+    same path.
+    """
+    want = bare.lower()
+    match = None
+    for name in managed:
+        if not isinstance(name, str):
+            continue
+        host, path = split_host(name)
+        if path.lower() != want:
+            continue
+        if host.lower() != install_host:
+            return bare
+        match = name
+    return match or bare
 
 
 def split_host(repo: str) -> tuple[str, str]:
@@ -1015,7 +1048,11 @@ def github_enterprise_ref(entry: str, host: str | None = None) -> tuple[str, str
     return host, ref.path
 
 
-DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
+# The operator's read-only projection of the gitops-state ConfigMap
+# (`gitopsStateDir` in `platformagent_manifests.go`). The agent container, the
+# shell sandbox and the credential proxy all mount it here.
+GITOPS_STATE_DIR = "/etc/gitops"
+DEFAULT_GITOPS_STATE_PATH = GITOPS_STATE_DIR + "/managed_repos"
 # How long `_read_state_key`'s ConfigMap fallback read waits on the API server
 # before giving up.
 # One namespaced GET against an in-cluster endpoint, so this is not a budget so
@@ -1107,6 +1144,19 @@ def _context_ref(item: dict, url: str, key: str) -> tuple[str | None, str | None
     return None, refused
 
 
+_IGNORED_STATE_PATHS: set[str] = set()
+
+
+def in_operator_pod() -> bool:
+    """Whether this runs in a pod the operator built, which mounts the state dir.
+
+    The mount rather than an environment variable, because the shell sandbox
+    forwards only an allowlist of the pod's environment into sessions, and the
+    mount is there in every container that reads the list.
+    """
+    return Path(GITOPS_STATE_DIR).is_dir()
+
+
 def _state_key_path(key: str) -> Path:
     """Where ConfigMap key `key` lands on disk.
 
@@ -1116,6 +1166,19 @@ def _state_key_path(key: str) -> Path:
     the same parent — `/etc/gitops/context_repos` beside
     `/etc/gitops/managed_repos` — and one environment variable locates both.
     """
+    if in_operator_pod():
+        # gke-labs/kube-agents#2989: in the pod the variable can come from the
+        # model's own shell, so it is not read at all. Honouring it even under
+        # the mount would let it name a sibling key (context_repos as the
+        # managed list) or a path that does not exist, which falls through to
+        # a kubectl read whose ConfigMap, namespace and context are all
+        # environment too. The operator only ever sets the default.
+        configured = os.environ.get("GITOPS_STATE_PATH")
+        if configured and configured != DEFAULT_GITOPS_STATE_PATH and configured not in _IGNORED_STATE_PATHS:
+            # Once per value: one list read asks for the path several times.
+            _IGNORED_STATE_PATHS.add(configured)
+            LOGGER.warning("ignoring GITOPS_STATE_PATH=%s in the pod; reading %s", configured, GITOPS_STATE_DIR)
+        return Path(GITOPS_STATE_DIR) / key
     state_file = Path(os.environ.get("GITOPS_STATE_PATH", DEFAULT_GITOPS_STATE_PATH))
     if key == MANAGED_REPOS_KEY:
         return state_file
@@ -1133,8 +1196,12 @@ def _read_state_text(key: str) -> str:
     if state_file.is_file():
         try:
             return state_file.read_text(encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as err:
+            if in_operator_pod():
+                # The mount is the only source in the pod: the kubectl read
+                # below takes its ConfigMap, namespace and context from an
+                # environment the model can set (gke-labs/kube-agents#2989).
+                raise RuntimeError(f"Could not read the repository list from {state_file}: {err}") from err
     elif state_file.parent.is_dir():
         # The mount is there and the key is not, which is what kubelet projects
         # for a ConfigMap with no data: an install with nothing registered. That
@@ -1144,7 +1211,6 @@ def _read_state_text(key: str) -> str:
         # pod has no context of its own to pass, so the fallback fails and every
         # gated call answers 503 instead of refusing the repository.
         return ""
-
     cfg_name = os.environ.get("GITOPS_STATE_CONFIGMAP", "platform-agent-gitops-state")
     ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
     cmd = ["kubectl", "get", "configmap", cfg_name, "-n", ns, "-o", "json"]
@@ -1638,7 +1704,9 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
     2. Workspace lease record (fallback if workspace is the lease holder directory).
     3. Git remote origin of workspace (if workspace is provided).
     4. ConfigMap state ($GITOPS_STATE_CONFIGMAP).
-    5. Local git remote origin fallback (for local development/inside clone).
+    5. Local git remote origin fallback, for local development only. In the
+       pod the cwd is wherever the model put it, so its origin says nothing
+       about what the install manages (gke-labs/kube-agents#2989).
     """
     if workspace is not None:
         try:
@@ -1679,6 +1747,22 @@ def resolve_repo(workspace: str | Path | None = None) -> str:
         raise RuntimeError(
             f"Multiple repositories configured in ConfigMap ({', '.join(managed)}): "
             "please specify the target repository explicitly (e.g. via --repo <owner/repo>)."
+        )
+
+    if in_operator_pod():
+        if managed_repos_registered():
+            raise RuntimeError(
+                "Could not resolve the target repository as owner/name: managed_repos in "
+                "the GitOps state ConfigMap ($GITOPS_STATE_CONFIGMAP) holds a value this "
+                "image cannot use: it does not parse as a list of {type, url} entries, or "
+                "an entry names a forge type this image does not serve or a URL that is not "
+                "a repository. Fixing the entry is the user's call; report that."
+            )
+        raise RuntimeError(
+            "Could not resolve the target repository as owner/name: no repository "
+            "is registered in the GitOps state ConfigMap ($GITOPS_STATE_CONFIGMAP). "
+            "Registering one is the user's call; report that, or pass --repo <owner/repo> "
+            "for a repository that is registered."
         )
 
     from github_token_refresh import get_current_git_repo

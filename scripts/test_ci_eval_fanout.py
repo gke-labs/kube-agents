@@ -300,6 +300,10 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # task lock, and the unwinding its skip paths share.
             lifted("finished_rep_count"),
             lifted("skip_unit"),
+            # What the unit does when the install is gone (#3129): the code
+            # wait_platform_runs returns for it and the marker that latches it.
+            lifted_constant("EVAL_GATEWAY_GONE_RC"),
+            lifted_constant("EVAL_INSTALL_GONE_MARKER"),
             lifted("run_one_unit"),
             self.UNIT_STUBS,
             extra,
@@ -342,6 +346,52 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         self.assertNotIn("FINISH_CASE", result.stdout)
         self.assertIn("case-x rep 2 gave up on its task lock", result.stderr)
         self.assertNotIn("case-x.rep2.end", result.stdout)
+
+    def test_a_gateway_that_is_gone_records_every_repetition_as_infrastructure_and_never_launches(self):
+        """#3129: when wait_platform_runs reports the gateway Deployment gone,
+        the unit records its repetition as infrastructure instead of running
+        the bench against a missing install, and latches the state for the
+        run, so later units, streams or none, skip the exec and record the
+        same way; the last one grades the case."""
+        gone = "\n".join(
+            [
+                lifted_constant("EVAL_INFRA_FAILURE_MARKER"),
+                lifted_constant("EVAL_NOT_RUN_DIR"),
+                lifted_constant("EVAL_NOT_RUN_STATUS"),
+                lifted("record_unit_not_run"),
+                'wait_platform_runs() { echo "WAIT ${rep}"; return "${EVAL_GATEWAY_GONE_RC}"; }',
+            ]
+        )
+        result = self.run_reps(gone)
+        out = result.stdout + result.stderr
+        self.assertEqual(result.stdout.count("WAIT"), 1, out)
+        self.assertEqual(result.stderr.count("recorded as infrastructure"), 3, out)
+        self.assertNotIn("ran 1 task(s)", result.stdout, "the bench must not launch against a missing install")
+        self.assertIn("FINISH_CASE case-x after rep 3", result.stdout, out)
+        self.assertIn("install-gone", result.stdout, out)
+
+    def test_a_gone_gateway_leaves_a_state_lock_another_unit_holds(self):
+        """The gone-gateway exit comes before this unit takes its state lock,
+        so it must not release that lock: another unit sharing it may hold it
+        at that moment, and skip_unit's release would take it from under it."""
+        gone = "\n".join(
+            [
+                lifted_constant("EVAL_INFRA_FAILURE_MARKER"),
+                lifted_constant("EVAL_NOT_RUN_DIR"),
+                lifted_constant("EVAL_NOT_RUN_STATUS"),
+                lifted("record_unit_not_run"),
+                lifted("release_state_lock"),
+                'unit_state_lock() { echo shared-state; }',
+                'state_lock_deadline() { echo 1; }',
+                'mkdir "${STATE_DIR}/lock-state-shared-state"',
+                'wait_platform_runs() { return "${EVAL_GATEWAY_GONE_RC}"; }',
+            ]
+        )
+        after = '[ -d "${STATE_DIR}/lock-state-shared-state" ] && echo "STATE LOCK KEPT" || echo "STATE LOCK RELEASED"'
+        result = self.run_reps(gone, after)
+        out = result.stdout + result.stderr
+        self.assertEqual(result.stderr.count("recorded as infrastructure"), 3, out)
+        self.assertIn("STATE LOCK KEPT", result.stdout, out)
 
     def test_every_repetition_gets_its_own_tunnels(self):
         """The harness owns one port-forward per process and its atexit
@@ -426,7 +476,9 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
         released = unit.rindex('lock_release "${STATE_DIR}/lock-task-${name}"')
         self.assertLess(written, counted)
         self.assertLess(counted, released)
-        self.assertLess(released, unit.index('finish_case "${task}" "${name}"'))
+        # The last finish_case: the main path's (the gone-gateway exit grades
+        # earlier, under the same rule).
+        self.assertLess(released, unit.rindex('finish_case "${task}" "${name}"'))
         # A repetition the launcher could not start writes its record and is
         # counted the same way, under the lock, before it lets go.
         skip = lifted("skip_unit")
@@ -636,6 +688,8 @@ class StateLockTest(unittest.TestCase):
         body = "\n".join(
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
@@ -677,6 +731,8 @@ class StateLockTest(unittest.TestCase):
         body = "\n".join(
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
@@ -695,6 +751,60 @@ class StateLockTest(unittest.TestCase):
         out = run_bash(body).stdout
         self.assertIn("HELD", out)
         self.assertIn("RELEASED", out)
+
+    def test_the_hold_covers_the_exempt_stacks_waits(self):
+        # STATE_LOCK_HOLD_SECONDS stands for the time an exempt stack's apply
+        # can wait: its own_wait plus its chain_wait. The turn and teardown on
+        # top fit in the INFRA_LOCK_DEADLINE term state_lock_deadline adds.
+        hold = int(lifted_constant("STATE_LOCK_HOLD_SECONDS").split("=")[1])
+        exempt = [t.parent.name for t in sorted(TASKS_DIR.glob("*/task.yaml")) if self.exempt(t.parent.name)]
+        self.assertIn("oobe-first-run-audits", exempt)
+        for case in exempt:
+            with self.subTest(case=case):
+                main = (TF_ROOT / task_stack(case) / "main.tf").read_text(encoding="utf-8")
+                waits = []
+                for name in ("own_wait", "chain_wait"):
+                    match = re.search(rf"^\s*{name}\s*=\s*(\d+)\s*$", main, re.M)
+                    self.assertIsNotNone(match, f"{case}: no {name} local in its stack's main.tf")
+                    waits.append(int(match.group(1)))
+                self.assertLessEqual(sum(waits), hold)
+
+    def give_up_on_busy_state_lock(self, has_stack: str) -> str:
+        body = "\n".join(
+            [
+                lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
+                lifted_constant("EVAL_TIMING_FILE"),
+                lifted("unit_task_path"),
+                lifted("finished_rep_count"),
+                lifted("skip_unit"),
+                lifted("run_one_unit"),
+                PerCaseGradingTest.UNIT_STUBS,
+                lifted("release_state_lock"),
+                lifted("release_streams"),
+                'ACQ_LOG="$(mktemp)"; rm -f /tmp/eval_case-x_rep1.log',
+                'lock_acquire() { mkdir "$1" 2>/dev/null && echo "$(basename "$1")" >> "${ACQ_LOG}"; }',
+                "unit_state_lock() { echo onboarding; }",
+                "state_lock_deadline() { echo 0; }",
+                "INFRA_LOCK_DEADLINE=3; STATE_LOCK_RETRY_SECONDS=1",
+                'mkdir "${STATE_DIR}/lock-state-onboarding"',
+                f'run_one_unit ./tasks/x/task.yaml case-x 1 "" "{has_stack}" 1 "s-one s-two" 2>&1 | tail -1',
+                'echo "HELD=$(grep -c "^lock-stream-" "${ACQ_LOG}")"',
+                'ls "${STATE_DIR}" | grep "^lock-" | tr "\\n" " "; echo',
+            ]
+        )
+        return run_bash(body).stdout
+
+    def test_a_unit_that_gives_up_on_the_state_lock_keeps_no_stream(self):
+        # Both give-up paths hand back the streams the unit already holds;
+        # without that, every later unit on them waits out its own deadline.
+        for has_stack, said in (("true", "gave up on the infra lock with the onboarding state lock"), ("", "gave up on the onboarding state lock")):
+            with self.subTest(has_stack=has_stack):
+                out = self.give_up_on_busy_state_lock(has_stack)
+                self.assertIn(said, out)
+                self.assertIn("HELD=2", out)
+                self.assertEqual(out.splitlines()[-1].split(), ["lock-state-onboarding"])
 
     def test_the_state_lock_deadline_outlasts_every_holder(self):
         # Each case on the lock keeps its stack applied while it holds it, and a
@@ -723,6 +833,8 @@ class StateLockTest(unittest.TestCase):
         body_for = lambda exempt: "\n".join(  # noqa: E731
             [
                 lifted_constant("EVAL_INJECT_LOCAL_PORT_BASE"),
+                lifted_constant("EVAL_GATEWAY_GONE_RC"),
+                lifted_constant("EVAL_INSTALL_GONE_MARKER"),
                 lifted_constant("EVAL_TIMING_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),

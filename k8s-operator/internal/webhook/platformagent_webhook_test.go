@@ -541,6 +541,44 @@ func TestPlatformAgentValidation(t *testing.T) {
 		}
 	})
 
+	// The watchers' broker token is reserved in either mode: any container but
+	// agent-api-auth that holds it holds the broker's watcher role. The render
+	// strips it (TestNoCRSurfaceHandsAContainerTheWatcherToken); this tells the
+	// author why.
+	t.Run("fails if a user-authored surface names the watcher token volume", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+		mount := corev1.VolumeMount{Name: "watcher-credential-proxy-token", MountPath: "/w"}
+		for _, tc := range []struct {
+			name string
+			dep  *agentv1alpha1.DeploymentSpec
+			path string
+		}{
+			{"sidecar", &agentv1alpha1.DeploymentSpec{
+				Sidecars: []corev1.Container{{Name: "helper", VolumeMounts: []corev1.VolumeMount{mount}}},
+			}, "spec.deployment.sidecars[0].volumeMounts[0].name"},
+			{"init container", &agentv1alpha1.DeploymentSpec{
+				InitContainers: []corev1.Container{{Name: "prep", VolumeMounts: []corev1.VolumeMount{mount}}},
+			}, "spec.deployment.initContainers[0].volumeMounts[0].name"},
+			{"extra volume mount", &agentv1alpha1.DeploymentSpec{
+				ExtraVolumeMounts: []corev1.VolumeMount{mount},
+			}, "spec.deployment.extraVolumeMounts[0].name"},
+			{"sidecar volume shadowing the name", &agentv1alpha1.DeploymentSpec{
+				SidecarVolumes: []corev1.Volume{{Name: "watcher-credential-proxy-token"}},
+			}, "spec.deployment.sidecarVolumes[0].name"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				agent := &agentv1alpha1.PlatformAgent{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+					Spec: agentv1alpha1.PlatformAgentSpec{
+						AgentSpec: agentv1alpha1.AgentSpec{Deployment: tc.dep},
+					},
+				}
+				_, err := val.ValidateCreate(ctx, agent)
+				assertFieldError(t, err, tc.path)
+			})
+		}
+	})
+
 	t.Run("fails if privileged service account is specified", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
 
@@ -560,6 +598,22 @@ func TestPlatformAgentValidation(t *testing.T) {
 
 		_, err := val.ValidateCreate(ctx, agent)
 		assertFieldError(t, err, "spec.security.serviceAccountName")
+	})
+
+	t.Run("fails if the broker's service account is one the operator mints for another workload", func(t *testing.T) {
+		val := &PlatformAgentCustomValidator{}
+		for _, name := range []string{"test-agent-gateway-agent", "test-agent-a2a-session", "test-agent-shell"} {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					AgentSpec: agentv1alpha1.AgentSpec{
+						Security: &agentv1alpha1.SecuritySpec{ServiceAccountName: name},
+					},
+				},
+			}
+			_, err := val.ValidateCreate(ctx, agent)
+			assertFieldError(t, err, "spec.security.serviceAccountName")
+		}
 	})
 
 	t.Run("fails if system:admin service account is specified", func(t *testing.T) {

@@ -28,8 +28,8 @@
 # the run and restores them,
 # files two archived cards, and adds and removes the `oobe` job. The four audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
-# repository (with none, its report in the report store) and posts its summary
-# wherever the install sends audit reports. The
+# repository (with none, its report in the report store) and, when it changed
+# something, posts its summary wherever the install sends audit reports. The
 # runner holds their four streams' locks for the unit (`audit_streams` below), and
 # every unit on one of those streams first waits up to two hours for a run the
 # install started there, so no audit case runs beside them and the next repetition
@@ -61,9 +61,6 @@ validated: false
 
 # Slug per docs/designs/domains.yaml: what starts is four of the fleet audits.
 domain: fleet-audits
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
 
 # The turn below makes no tool call on purpose, so bench-gate's liveness rung
 # takes its reply as the sign of a real run instead of a tool call.

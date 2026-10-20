@@ -27,7 +27,9 @@ import (
 //     a clause past the cap, and the rest as the detail, or under "why" when
 //     the rest is longer than a detail holds (split_answer); an answer that
 //     ends by asking which of its options to take offers them as choices
-//     (answer_choices, chat_choices.go);
+//     (answer_choices, chat_choices.go), and one that declares its next step
+//     on a last line of its own offers that step as its one choice
+//     (next_step);
 //   - mark.ask, the kind of ask the prompt is, chosen by keyword
 //     (arrival_reaction), on each heartbeat while the turn runs;
 //   - when the turn filed kanban cards, the terminal's mark-only message
@@ -197,8 +199,13 @@ func askIsQuestion(text string) bool {
 
 // answerChat is the result's chat message, or false when the answer posts as
 // text: no headline (one opening on a code fence) or a rest past the fold's
-// cap.
+// cap. An answer is laid out without any step-shaped line at its end
+// (visibleText), and the step it declares (nextStep) is its one choice,
+// unless it offers options, which win, or the gateway would act on the step
+// as a command, which makes it no choice.
 func answerChat(answer string) (chatmsg.Message, bool) {
+	_, step := nextStep(answer)
+	answer = visibleText(answer)
 	headline, body := splitAnswer(answer)
 	if headline == "" {
 		return chatmsg.Message{}, false
@@ -209,6 +216,10 @@ func answerChat(answer string) (chatmsg.Message, bool) {
 		if offered, ok := offerChat(msg, rest); ok {
 			return offered, true
 		}
+	}
+	// A step the gateway would act on as a command is no button.
+	if step != "" && !chattext.IsCommand(step) {
+		msg.Choices = []chatmsg.Choice{{Text: step, Next: true}}
 	}
 	switch n := runeLen(rest); {
 	case n > chatFoldTextMax:

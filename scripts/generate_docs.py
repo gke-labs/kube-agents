@@ -135,6 +135,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-tpu-metrics-monitoring",
     ],
     "Observability": [
+        "gke-alert-configuration",
         "gke-basics",
         "gke-observability",
         "kube-agents-observability",
@@ -146,6 +147,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     ],
     "Manifests and remediation": [
         "gcp-config-connector",
+        "gitops-helm-chart",
         "gke-manifest-generation",
         "submit-suggestion",
     ],

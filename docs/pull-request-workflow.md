@@ -162,8 +162,9 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`
-against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
+nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
@@ -625,12 +626,14 @@ Those contexts are not the whole required set either. Tide also requires every P
 (GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
 date. The command below therefore answers part of the question, and the two lists together still do
 not answer all of it: they say which contexts must be _present_ and green, but Tide also refuses any
-posted context that is not green, required or not, unless Prow marks it `optional`: Tide always
-reads a cancelled or failed check run as a failing context, and with no Tide context policy for this
-repository an unknown context is not optional. A `classify` run cancelled
-by a superseding event held #1364 unmerged with `lgtm` and `approved` on it, though `classify` is in
-neither list. `tide`'s own status names the offending context; `gh run rerun <run-id> --job <job-id>`
-clears it — by job ID, since `--failed` (below) re-runs failed jobs and a cancelled one is not failed.
+posted context that is not green, required or not, unless Prow marks it `optional`: Tide reads a
+check name whose every check run is cancelled or failed as a failing context (one success under the
+same name clears it; one still running holds it as pending), and with no Tide context policy for this repository
+an unknown context is not optional. A `classify` run cancelled by a superseding event held #1364
+unmerged with `lgtm` and `approved` on it, though `classify` is in neither list. `tide`'s own status
+names the offending context; `/retest` ([below](#re-running-a-check-that-failed)) re-runs such a
+run whole, and with Write access `gh run rerun <run-id> --job <job-id>` clears it by job ID, since
+`--failed` re-runs failed jobs and a cancelled one is not failed.
 
 ```bash
 gh api repos/gke-labs/kube-agents/branches/main/protection \
@@ -726,7 +729,23 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 ## Re-running a check that failed
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
-re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
+re-run. Comment `/retest` on the pull request, as the first thing in the comment: Prow re-runs its
+failed jobs, and [`retest-actions.yml`](../.github/workflows/retest-actions.yml) re-runs the GitHub
+Actions runs behind the red checks at the head commit (a cancelled or timed-out run whole, since
+Tide blocks on it the same way) for any owner, member or collaborator. Prow also reads the command
+at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
+comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
+only the pull request's own runs: a head commit that is also a commit on `main` or a release line
+carries that line's push runs too, and a red one of those is named and left alone. It reads the checks as Tide does, the best
+state per check name, so a run a newer success superseded or one cancelled while still queued is
+not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
+collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
+was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
+red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot
+re-run looks like). A run already on its third attempt is left alone (the
+second attempt is for a run that a lost runner or a superseding event cancelled on the way to the
+one re-run the flake is worth); someone with Write access reads its log and decides, re-running from
+the run's page or with `gh run rerun <run-id> --failed`. Either re-run is also a report.
 [`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) sweeps the recent runs
 of the checks it watches every fifteen minutes, and when a run's latest attempt passed on the same
 commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class

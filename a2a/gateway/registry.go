@@ -122,6 +122,19 @@ type SessionRecord struct {
 	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
 	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
 	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+	// CardStop is the card-stop control in flight on this conversation, nil
+	// when there is none (cardstop.go). Not ActiveTask and not in Tasks: the
+	// control is the gateway's own errand for a stop, not a turn, so it
+	// serializes nothing, steers nothing, is no status ask's subject, and
+	// never counts as a task the conversation ran.
+	CardStop *CardStopRun `json:"cardStop,omitempty"`
+	// RetiredCardStops are the last controls that ended, newest last, at most
+	// cardStopRetiredKept, kept so a late event for one is dropped even when
+	// its task index outlived the route's retirement (a failed DropTask):
+	// read as an ordinary task, its terminal would post the executor's raw
+	// text. More than one, because a follow-up ends seconds after the control
+	// it follows.
+	RetiredCardStops []string `json:"retiredCardStops,omitempty"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,
@@ -252,6 +265,11 @@ type TaskRef struct {
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	Canceled bool `json:"canceled,omitempty"`
+	// TerminalObserved marks that observeTaskTerminal has already been called
+	// for this task (e.g. by healActiveTask when recovering a stale terminal
+	// from the stream), so a queued or redelivered relayTerminal does not
+	// double-count in task_terminals_total.
+	TerminalObserved bool `json:"terminalObserved,omitempty"`
 	// Requester, Attribution and StartedAt are what a child task minted on
 	// this turn's behalf, or the wake-up turn after it, inherits: the
 	// allowlist is checked against Requester, the child's authority block is
@@ -441,6 +459,17 @@ func (rec *SessionRecord) MarkCanceled(taskID string) {
 	for i := range rec.Tasks {
 		if rec.Tasks[i].ID == taskID {
 			rec.Tasks[i].Canceled = true
+			return
+		}
+	}
+}
+
+// MarkTerminalObserved records that observeTaskTerminal has been called
+// for the task, preventing double-counting if a queued relay terminal follows.
+func (rec *SessionRecord) MarkTerminalObserved(taskID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].TerminalObserved = true
 			return
 		}
 	}

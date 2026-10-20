@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import hashlib
 import re
@@ -26,6 +27,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import board_snapshot
 import chat_notify
 import findings_queue
 import gitops_workspace
@@ -196,6 +198,51 @@ MANAGED_DOTENV_PATH = os.path.join(
 MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
 )
+
+
+# The report a fleet-audit run's `finish` leaves for the relay, in the
+# directory the run's shell writes to (`audit_report.SCRATCH_DIR`, in the shell
+# sandbox when there is one). The relay posts it in place of the job's final
+# message, which holds whatever else the model wrote in its last turn.
+FLEET_AUDIT_SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
+CHAT_REPORT_FILE = "chat_report_{audit}.json"
+# `audit_report.CHAT_REPORT_*_KEY`.
+CHAT_REPORT_RUN_KEY = "run"
+CHAT_REPORT_UPDATED_KEY = "updated_at"
+CHAT_REPORT_PARTS_KEY = "parts"
+CHAT_REPORT_REPO_KEY = "repo"
+CHAT_REPORT_TEXT_KEY = "text"
+# The scheduler's run ledger under a profile home, and the status its row holds
+# from the run's start until after its delivery.
+RUN_LEDGER = ("cron", "executions.db")
+RUN_LEDGER_RUNNING = "running"
+# Above the relay's own report ceiling, so a long report is clipped with its
+# notice by `_truncate_report`; a record past it posts the unreadable notice.
+CHAT_REPORT_MAX_BYTES = 1024 * 1024
+# The roster the image ships for the Platform Agent. Only a job in it runs under
+# its audit stream's id, which is the name `finish` gives the record; a job
+# created at runtime keeps posting its final message.
+IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
+# The field the relay plugin (deploy/docker/plugins/chat/adapter.py) sends on
+# every scheduled delivery and `report_to_chat` never does.
+SCHEDULER_LEG_KEY = "also_delivered_to"
+# deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
+# delivery is the scheduler's failure line for the run.
+SCHEDULER_FAILURE_KEY = "scheduler_failure"
+AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
+# `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
+AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
+CHAT_REPORT_READ_TIMEOUT_S = 20
+# `audit_report.INFLIGHT_TTL_SECONDS`: no step of a run outlives its stream's
+# lease, so a record whose last step is older than that is an earlier run's.
+CHAT_REPORT_MAX_AGE_S = 2 * 60 * 60
+CHAT_REPORT_PARTS_SEPARATOR = "\n\n"
+AUDIT_NOT_FINISHED_NOTICE = "{label} did not finish, so it has no report. See the run log for job `{job}`."
+AUDIT_UNREADABLE_NOTICE = "{label}: the relay could not read the run's report ({why}). See the run log for job `{job}`."
+AUDIT_UNFINISHED_REPOS_LINE = "{label} did not finish for {repos}. See the run log for job `{job}`."
+# Busy timeout for the audit-run bookkeeping below, as for every other
+# connection this server opens.
+AUDIT_RUNS_DB_TIMEOUT_S = 5.0
 
 
 def _dotenv_value(path: str, name: str) -> str:
@@ -572,6 +619,22 @@ DRIFT_ALERT_EMOJI = "🔀"
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
 
+# What a drift card says when the install has no usable GitOps repository
+# registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
+# that are all unusable). The object may well be synced from a repository by a
+# GitOps tool; what the install lacks is a repository it can open a pull
+# request against. So the card asks for an explanation only: no options, no
+# "To authorize:" line, and so no buttons a reader could click for an action
+# that can only block (gke-labs#3313). The registration paths are
+# gitops_preflight.REGISTRATION_STEPS'; test_session_kv_server holds the two
+# to the same field and flag.
+DRIFT_NO_GITOPS_LINE = (
+    "No usable GitOps repository is registered with this install, so the agent cannot open a pull request to "
+    "revert or codify this change. Register one, or fix the existing entry, in the PlatformAgent's "
+    "spec.integration.repositories (or re-run the installer with --gitops-repo) to get those options on later "
+    "drift alerts."
+)
+
 # The `join` value the detector sends when it actually read the live object's
 # `managedFields` (`joinEnriched` in k8s-operator/cmd/drift-detector/join.go).
 # Any other value means ownership is absent because the lookup did not happen,
@@ -803,6 +866,20 @@ def init_db() -> None:
                     sent       INTEGER NOT NULL DEFAULT 0,
                     suppressed INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (day, severity)
+                )
+                """
+            )
+            # The fleet-audit run whose report each audit job last posted, so a
+            # run's report is posted once and a later run that never reached
+            # `finish` gets the not-finished notice instead of it.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_report_runs (
+                    profile   TEXT NOT NULL,
+                    job_id    TEXT NOT NULL,
+                    run       TEXT NOT NULL,
+                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (profile, job_id)
                 )
                 """
             )
@@ -1117,6 +1194,17 @@ _CHAT_ENV_SIGNALS: Dict[str, tuple[str, ...]] = {
 # worse off than it was and no send is addressed to the empty string.
 DEFAULT_CHAT_PLATFORM = "google_chat"
 
+# Where each platform's home channel is set, named in the relay's refusal when
+# the gateway holds that platform's backend with no home channel: the CR field,
+# then the install.env key the installer turns into it.
+HOME_CHANNEL_SETTINGS: Dict[str, str] = {
+    "google_chat": "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
+    "slack": "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",
+}
+# The refusal when no platform can be named: no chat at all, a malformed home
+# channel the gateway refuses, or a backend this file has no route for.
+NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
+
 
 def _mapping(value: object) -> dict:
     """`value` if it is a mapping, else an empty one.
@@ -1320,6 +1408,23 @@ def _chat_platforms_disabled() -> bool:
     """
     resolved, explicit = _resolve_chat_platforms()
     return not resolved and bool(explicit) and not any(explicit.values())
+
+
+def _no_chat_route_error() -> str:
+    """Why a report was not sent on an install with no chat route.
+
+    It reaches `last_delivery_error` through the relay adapter and the 502, and
+    from there the dashboard, `hermes cron list`, the cronjob tool's reply in
+    chat and the `chat_delivery_watch` ledger issue. The gateway names its
+    backend whether or not a home channel is set, so with one named the cause is
+    the missing home channel; without one this cannot tell no chat from a
+    misconfigured one, so it guesses at neither.
+    """
+    platform = chat_notify.gateway_platform()
+    setting = HOME_CHANNEL_SETTINGS.get(platform)
+    if setting:
+        return f"composed but not delivered to {platform} (no home channel: set {setting})"
+    return NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -2004,28 +2109,8 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _drift_task_body(payload: Dict[str, Any]) -> str:
-    """The kanban card body for an out-of-band change to a live object.
-
-    The event path's equivalent is `_triage_task_body`, and its docstring is the
-    canonical explanation of the parts these two share: the `kanban_complete`
-    delivery, the three `##` sections SOUL.md §7 permits, the **Done when**
-    line, and the `To authorize:` bullet that `kanban_notifier.actionable_report`
-    keys on to decide which completions earn an `incidents` row — which is what
-    makes the offer to reply `apply` honourable. Those literals are load-bearing
-    in both bodies for the same reasons; read that docstring before rewording
-    either. This body has its own third reader as well —
-    bench/tasks/gitops-drift-out-of-band-triage/task.yaml's delivery objective
-    keys on the same literals — and bench/tests/test_triage_delivery_contract.py
-    holds this template against both that case and the notifier gate.
-
-    What is not shared is the question. An event says Kubernetes is unhappy and
-    asks for a root cause. This says a person or a tool changed a live object
-    outside git, and asks whether the declared state or the live state is the
-    one that should win. That is a decision the reader makes, not a defect the
-    agent diagnoses, so the report's job is to establish what changed, whether
-    it still stands, and what each answer would cost.
-    """
+def _drift_audit_facts(payload: Dict[str, Any]) -> str:
+    """The audit record a drift card opens with, and whether it was reconciled since."""
     resource_path = _drift_resource_path(payload)
     cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
     principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
@@ -2051,8 +2136,6 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         )
 
     return (
-        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
-        f"through git, and the audit log is how we know about it.\n\n"
         f"**What the audit log recorded:**\n"
         f"- **Object:** {resource_path}\n"
         f"- **Cluster / project:** {cluster_name} / {project}\n"
@@ -2063,17 +2146,132 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"- **When:** {timestamp}\n"
         f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
         f"{_drift_ownership_block(payload)}\n"
-        f"{reconcile_line}\n\n"
+        f"{reconcile_line}"
+    )
+
+
+def _gitops_repo_registered() -> Optional[bool]:
+    """Whether the install has a usable GitOps repository: True, False, or None when unknown.
+
+    Asks gitops_preflight, the check a PR-writing worker runs first, so the
+    drift card and the worker that would act on it cannot disagree about
+    whether there is a repository. A registry that cannot be read is None,
+    and the card then keeps its options: the worker's own preflight still
+    stops an action that cannot be carried out.
+    """
+    try:
+        import gitops_preflight
+
+        code, _ = gitops_preflight.preflight()
+    except Exception:  # noqa: BLE001 - an unknown answer keeps upstream's card
+        return None
+    if code == gitops_preflight.EXIT_REGISTERED:
+        return True
+    if code == gitops_preflight.EXIT_NO_REGISTERED_REPO:
+        return False
+    return None
+
+
+def _drift_task_body_without_gitops(payload: Dict[str, Any]) -> str:
+    """The drift card for an install with no GitOps repository: explain, offer nothing.
+
+    The same audit facts and the same delivery as :func:`_drift_task_body`,
+    but the report's 'What to do' is :data:`DRIFT_NO_GITOPS_LINE` and nothing
+    else. Without a 'To authorize:' line kanban_notifier.actionable_report
+    files no incidents row, and the Slack presenter draws no option buttons.
+    """
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}', and the audit log "
+        f"recorded it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
         f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
         f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
         f"use it.\n\n"
+        f"**{DRIFT_NO_GITOPS_LINE}** So this report explains the change and proposes nothing: no revert, no "
+        f"codify, no other fix, and no call to action.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
+        f"the alert was raised, and `result` is what gets posted there.\n\n"
+        f"**Done when:** the report says who changed what, what the live object looks like now, whether the change "
+        f"still stands, and what it affects. Nothing else is a condition of finishing.\n\n"
+        f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it.** "
+        f"**Do not judge the change by who made it**, and change nothing in the cluster.\n\n"
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
+        f"these three `##` sections are the only ones:\n\n"
+        f"## What's wrong\n\n"
+        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"## Why\n\n"
+        f"- <What the live object shows now, with the evidence>\n"
+        f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
+        f"## What to do\n\n"
+        f"- {DRIFT_NO_GITOPS_LINE}\n\n"
+        f"Every <...> above is a placeholder: fill each one in. Write the 'What to do' bullet exactly as given."
+    )
+
+
+def _drift_task_body(payload: Dict[str, Any]) -> str:
+    """The kanban card body for an out-of-band change to a live object.
+
+    The event path's equivalent is `_triage_task_body`, and its docstring is the
+    canonical explanation of the parts these two share: the `kanban_complete`
+    delivery, the three `##` sections SOUL.md §7 permits, the **Done when**
+    line, and the `To authorize:` bullet that `kanban_notifier.actionable_report`
+    keys on to decide which completions earn an `incidents` row — which is what
+    makes the offer to reply `apply` honourable. Those literals are load-bearing
+    in both bodies for the same reasons; read that docstring before rewording
+    either. This body has its own further readers as well — every
+    bench/tasks/gitops-drift-*/task.yaml delivery objective keys on the same
+    literals — and bench/tests/test_triage_delivery_contract.py holds this
+    template against each of those cases and against the notifier gate. The
+    count is deliberately not written out here: the list that decides it is
+    CONTRACTS in that test, which is where a new case is added.
+
+    What is not shared is the question. An event says Kubernetes is unhappy and
+    asks for a root cause. This says a person or a tool changed a live object
+    outside git, and asks whether the declared state or the live state is the
+    one that should win. That is a decision the reader makes, not a defect the
+    agent diagnoses, so the report's job is to establish what changed, whether
+    it still stands, and what each answer would cost.
+
+    The body names `gke-load-bearing-change` outright for the reason
+    `_stall_task_body` names its skill: the Cluster Agent reaches this text as a
+    verbatim presentation template and follows its format faithfully, and a
+    skill is not picked up by ambient relevance while it is doing that. What the
+    skill carries is the step a report can skip while looking complete —
+    establishing whether the state git declares still runs before proposing that
+    the change be undone.
+
+    On an install with no usable GitOps repository the card is
+    :func:`_drift_task_body_without_gitops` instead: an explanation with no
+    options. The bench contract above binds only this, the registered path.
+    """
+    if _gitops_repo_registered() is False:
+        return _drift_task_body_without_gitops(payload)
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
+        f"through git, and the audit log is how we know about it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
+        f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
+        f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
+        f"use it.\n\n"
+        f"**Run the `gke-load-bearing-change` skill before you propose undoing the change.** Reading the live "
+        f"object tells you whether the change still stands. It does not tell you whether the state git declares "
+        f"would run if you put it back — and a change that is the only reason this object's workload is up is "
+        f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
+        f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
+        f"whichever way it comes out belongs in the report.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
         f"delivers one line to the person waiting for it.\n\n"
         f"**Done when:** the report says what the live object looks like now compared with what the change did; "
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
-        f"either reverting it to the declared state or codifying it in git, with the consequence of each. "
+        f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
+        f"revert's consequence being whether the state git declares would still run, read off this cluster or "
+        f"reported as not established. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -2638,7 +2836,7 @@ def _sanitize_label(value: str) -> str:
     return neutralised
 
 
-def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
+def _truncate_report(report: str, profile: str, job_id: str, audit_record: bool = False) -> tuple[str, str]:
     """Cut an oversized report to the cap. Returns `(report, notice)`.
 
     `notice` is `""` for a report that fits, and otherwise the line that says so,
@@ -2654,8 +2852,9 @@ def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
     cap.
 
     A cut report is worse than a whole one and much better than none. The head
-    survives, and the notice names the directory the scheduler saved the full
-    text to, so nothing is only in the truncated copy.
+    survives, and the notice names where the full text is: the directory the
+    scheduler saved it to, or for a fleet-audit record (`audit_record`) the
+    record and the ledger issues the report links.
 
     Not a link: the file lives on the agent's PVC under
     `$HERMES_HOME/cron/output/<job_id>/<timestamp>.md` and the run's own
@@ -2665,11 +2864,24 @@ def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
     if len(report) <= CRON_REPORT_MAX_CHARS:
         return report, ""
 
+    # A fleet-audit report is the record `finish` left, not the final message
+    # the scheduler saved, so the notice names the record.
+    # The ledger lines are what a reader can open; the cut keeps the head and
+    # drops each report's last line, which is where `finish` puts them.
+    ledgers = sorted(set(AUDIT_LEDGER_LINE_RE.findall(report))) if audit_record else []
+    saved = (
+        f"The whole report is in `{CHAT_REPORT_FILE.format(audit=job_id)}` in the "
+        f"shell's scratch directory, and its findings are on the ledger issue"
+        + (": " + ", ".join(ledgers) if ledgers else "")
+        + "."
+        if audit_record
+        else f"The whole report was saved by the scheduler under "
+        f"`cron/output/{job_id}/` in the {profile} profile's home."
+    )
     notice = (
         f"[truncated] This report was {len(report)} characters, over the "
         f"{CRON_REPORT_MAX_CHARS}-character chat limit, so what follows is the "
-        f"beginning of it. The whole report was saved by the scheduler under "
-        f"`cron/output/{job_id}/` in the {profile} profile's home.\n\n"
+        f"beginning of it. {saved}\n\n"
     )
     logger.warning(
         f"Relay for {profile}/{job_id}: report is {len(report)} chars, truncating to "
@@ -2943,6 +3155,11 @@ def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
         return False
+    return _roster_runs_fleet_audit(store, job_id)
+
+
+def _roster_runs_fleet_audit(store: Any, job_id: str) -> bool:
+    """Whether `job_id` in a cron roster's parsed JSON runs the fleet-audit skill."""
     jobs = store.get("jobs") if isinstance(store, dict) else store
     for job in jobs if isinstance(jobs, list) else []:
         if isinstance(job, dict) and str(job.get("id") or "") == job_id:
@@ -3166,6 +3383,203 @@ def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, j
     return line
 
 
+class ChatReportUnreadable(Exception):
+    """The record may exist, but the read did not return it."""
+
+
+def _read_chat_report_record(job_id: str) -> dict | None:
+    """The chat report record `finish` left for `job_id`, or None when there is none.
+
+    Raises ChatReportUnreadable when the read itself failed, which says
+    nothing about whether the run finished.
+    """
+    path = os.path.join(FLEET_AUDIT_SCRATCH_DIR, CHAT_REPORT_FILE.format(audit=job_id))
+    try:
+        import sandbox_exec
+
+        # One byte past the cap, so a record over it is told from one at it.
+        if sandbox_exec.sandbox_enabled():
+            raw = sandbox_exec.read_bytes(
+                path, max_bytes=CHAT_REPORT_MAX_BYTES + 1, timeout=CHAT_REPORT_READ_TIMEOUT_S
+            )
+        else:
+            with open(path, "rb") as handle:
+                raw = handle.read(CHAT_REPORT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning(f"Relay for {job_id}: chat report unreadable: {exc!r}")
+        raise ChatReportUnreadable(type(exc).__name__) from exc
+    if raw is None:
+        return None
+    if len(raw) > CHAT_REPORT_MAX_BYTES:
+        logger.warning(f"Relay for {job_id}: chat report is over {CHAT_REPORT_MAX_BYTES} bytes")
+        raise ChatReportUnreadable(f"over {CHAT_REPORT_MAX_BYTES} bytes")
+    try:
+        record = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        logger.warning(f"Relay for {job_id}: chat report is not JSON")
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _last_posted_run(profile: str, job_id: str) -> str:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT run FROM audit_report_runs WHERE profile = ? AND job_id = ?",
+                (profile, job_id),
+            ).fetchone()
+        return str(row[0]) if row else ""
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: last posted run unreadable: {exc!r}")
+        return ""
+
+
+def _mark_run_posted(profile: str, job_id: str, run: str) -> None:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO audit_report_runs (profile, job_id, run) VALUES (?, ?, ?)",
+                    (profile, job_id, run),
+                )
+    except Exception as exc:
+        logger.error(f"Relay for {profile}/{job_id}: run {run} not marked posted: {exc!r}")
+
+
+def _is_shipped_audit_job(job_id: str) -> bool:
+    """Whether the image's Platform Agent roster ships `job_id` as a fleet-audit job."""
+    try:
+        with open(IMAGE_PLATFORM_ROSTER, encoding="utf-8") as handle:
+            store = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Relay for {job_id}: image roster unreadable: {exc}")
+        return False
+    return _roster_runs_fleet_audit(store, job_id)
+
+
+def _delivering_run_start(profile: str, job_id: str) -> float | None:
+    """When the run now delivering `job_id` started, from the scheduler's ledger; None when unknown.
+
+    The scheduler keeps the run's row `running` until after its delivery and
+    allows one live run per job. `claimed` rows are left out: a tick writes one
+    at submit and may lose the claim. Read-only, and any failure is None.
+    """
+    from gitops_workspace import agent_home
+
+    base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+    path = os.path.join(base, *RUN_LEDGER)
+    if not os.path.exists(path):
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT started_at FROM executions WHERE job_id = ? AND status = ?",
+                (job_id, RUN_LEDGER_RUNNING),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: run ledger unreadable: {exc}")
+        return None
+    starts = []
+    for (started,) in rows:
+        try:
+            stamp = datetime.fromisoformat(str(started)).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(stamp):
+            starts.append(stamp)
+    return max(starts) if starts else None
+
+
+def _record_written_by_this_run(profile: str, job_id: str) -> bool:
+    """Whether the delivering run finished a repository into the record on disk.
+
+    True when the record holds a finished part and its last step is at or after
+    the run's start in the scheduler's ledger. Unknown (no ledger row, no
+    record) is False, and the failure line is posted as on main.
+    """
+    started = _delivering_run_start(profile, job_id)
+    if started is None:
+        return False
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return False
+    if not record:
+        return False
+    try:
+        updated = float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        return False
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    finished = any(
+        isinstance(part, dict) and str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip()
+        for part in (parts if isinstance(parts, list) else [])
+    )
+    return finished and math.isfinite(updated) and updated >= started
+
+
+def _record_run(job_id: str) -> str:
+    """The run id of the chat record on disk for `job_id`, or "" when there is none to read."""
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return ""
+    return str((record or {}).get(CHAT_REPORT_RUN_KEY) or "")
+
+
+def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
+    """What a fleet-audit job posts, and the run it is for: `(report, run)`.
+
+    The reports `finish` left for each repository of this job's latest run,
+    followed by a line naming any repository the run started and did not
+    finish, when that run has not been posted and its last step is within
+    `CHAT_REPORT_MAX_AGE_S`. A run with no finished repository posts
+    `AUDIT_NOT_FINISHED_NOTICE`, as does one already posted or too old, with no
+    run. The final message is never posted: it is what the model wrote, and
+    posting it is how a channel got working notes in place of a report.
+    """
+    label = title or job_id
+    notice = AUDIT_NOT_FINISHED_NOTICE.format(label=label, job=job_id)
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable as exc:
+        return AUDIT_UNREADABLE_NOTICE.format(label=label, why=exc, job=job_id), ""
+    if record is None:
+        return notice, ""
+    run = str(record.get(CHAT_REPORT_RUN_KEY) or "")
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    parts = [part for part in (parts if isinstance(parts, list) else []) if isinstance(part, dict)]
+    texts = [str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip() for part in parts]
+    finished = [text for text in texts if text]
+    unfinished = [
+        str(part.get(CHAT_REPORT_REPO_KEY) or "")
+        for part, text in zip(parts, texts)
+        if not text
+    ]
+    try:
+        age = time.time() - float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        age = None
+    if age is not None and not math.isfinite(age):
+        age = None
+    if not run or not finished or age is None or age > CHAT_REPORT_MAX_AGE_S:
+        return notice, ""
+    if run == _last_posted_run(profile, job_id):
+        return notice, ""
+    # A closing line after several reports, or after the unfinished line, so
+    # the message does not end with a ledger link and Slack posts it whole: a
+    # headline card shows one repository's ledger and drops the rest.
+    if unfinished:
+        finished.append(
+            AUDIT_UNFINISHED_REPOS_LINE.format(label=label, repos=", ".join(unfinished), job=job_id)
+        )
+    elif len(finished) > 1:
+        finished.append(AUDIT_REPOS_SUMMARY_LINE.format(label=label, count=len(finished)))
+    return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
+
+
 def relay_cron_report(
     session_id: str,
     profile: str,
@@ -3221,6 +3635,13 @@ def relay_cron_report(
     `also_delivered_to` are not in it: the scheduler is posting there itself, so
     they are skipped rather than missed.
 
+    An install with no chat route gets no send at all, where the fallback to
+    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): a
+    `next` install whose gateway holds Slack with no home channel. The error
+    names the platform and the setting that arms it, in the wording
+    `chat_delivery_watch` reads the platform from; see
+    :func:`_no_chat_route_error`.
+
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line
     about a kanban card it had filed) that were then posted and recorded as
@@ -3228,6 +3649,11 @@ def relay_cron_report(
     in its thread: that comes from the incident row stored below, which
     `incident_context` replays, not from a session the turn left behind.
     """
+    if _chat_platforms_disabled():
+        error = _no_chat_route_error()
+        logger.error(f"Relay for {profile}/{job_id}: report not sent: {error}")
+        return error, []
+
     posts_deadline = time.monotonic() + CRON_RELAY_POSTS_BUDGET_S
     blocks_deadline = posts_deadline - AUDIT_TEXT_SEND_RESERVE_S
     # Floored at the full set, so a wrong sibling list cannot silence the report:
@@ -3452,7 +3878,24 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=400, detail="job_id field is required")
     if not report:
         raise HTTPException(status_code=400, detail="report field is required")
-    report, truncation_notice = _truncate_report(report, profile, job_id)
+    audit_run = ""
+    # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
+    # `report_to_chat` does not, and its text is posted as written.
+    from_scheduler = SCHEDULER_LEG_KEY in request_data
+    failure_run = ""
+    if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
+        if request_data.get(SCHEDULER_FAILURE_KEY) is True and not _record_written_by_this_run(profile, job_id):
+            # The scheduler's line for a failed run, posted as written, as on
+            # main: it says why the run failed, and the record on disk is an
+            # earlier run's. Marking that record posted keeps a later run that
+            # never reached `start` from posting it as its own.
+            failure_run = _record_run(job_id)
+        else:
+            # The flag is read off the text, which the model can also write:
+            # a run that wrote its own record reached `finish`, so its report
+            # is posted whatever its last message says.
+            report, audit_run = audit_chat_report(profile, job_id, title)
+    report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     session_id = _cron_report_session_id(profile, job_id, day)
@@ -3466,6 +3909,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {type(exc).__name__}") from exc
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
+    if audit_run or failure_run:
+        _mark_run_posted(profile, job_id, audit_run or failure_run)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they
@@ -4403,6 +4848,24 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     fleet that got healthier.
     """
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
+
+
+@app.get("/v1/board", dependencies=[Depends(verify_api_key)])
+def get_board() -> Dict[str, Any]:
+    """The Slack Home tab's snapshot (`board_snapshot.py`), relayed by the Hermes bridge.
+
+    A source that cannot be read is a 503, never an empty board: the gateway
+    then says it could not read the board rather than drawing a clean fleet.
+    """
+    board = _kanban_db_path()
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as session_db:
+            if not os.path.isfile(board):
+                return board_snapshot.snapshot(session_db, None, datetime.now(timezone.utc))
+            with closing(_read_only(board)) as kanban:
+                return board_snapshot.snapshot(session_db, kanban, datetime.now(timezone.utc))
+    except Exception as exc:  # noqa: BLE001 — a source that cannot be read is a 503, whatever raised
+        raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
 
 
 @app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])

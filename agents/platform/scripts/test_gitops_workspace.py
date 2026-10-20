@@ -30,6 +30,19 @@ import vcs_client  # noqa: E402
 LEASE = "compliance-audit"
 
 
+def setUpModule():
+    # in_operator_pod() keys on the real /etc/gitops, and in the pod a test's
+    # own GITOPS_STATE_PATH is then ignored. Keep every test off the host's
+    # mount; TestReadersIgnoreWorkerSources points it at a temp dir of its own.
+    global _NO_MOUNT
+    _NO_MOUNT = patch("gitops_workspace.GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
+    _NO_MOUNT.start()
+
+
+def tearDownModule():
+    _NO_MOUNT.stop()
+
+
 class WorkspaceTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -996,6 +1009,134 @@ class TestResolveRepo(WorkspaceTestCase):
                 mock_run.call_args.kwargs["timeout"],
                 gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
             )
+
+
+class TestReadersIgnoreWorkerSources(WorkspaceTestCase):
+    """gke-labs/kube-agents#2989: in the pod, the registered list is the
+    operator's mount and nothing a worker can write.
+
+    The shape from the issue: an install with no repository registered, a
+    worker that wrote its own state file under the agent home and pointed
+    GITOPS_STATE_PATH at it, and a `git init` with an origin in its cwd.
+    """
+
+    DUMMY = "https://github.com/gke-labs/kube-agents-gitops-dummy"
+
+    def setUp(self):
+        super().setUp()
+        self.mount = self.tmp_path / "etc-gitops"
+        self.mount.mkdir()
+        mount = patch("gitops_workspace.GITOPS_STATE_DIR", str(self.mount))
+        mount.start()
+        self.addCleanup(mount.stop)
+        home = self.tmp_path / "opt-data" / "profiles" / "platform"
+        home.mkdir(parents=True)
+        self.planted = home / "dummy-gitops-state"
+        self.planted.write_text(json.dumps([{"type": "github", "url": self.DUMMY}]), encoding="utf-8")
+        self.cwd_origin = type(sys)("github_token_refresh")
+        self.cwd_origin.get_current_git_repo = lambda cwd=None: "gke-labs/kube-agents-gitops-dummy"
+
+    def register(self, url):
+        (self.mount / "managed_repos").write_text(json.dumps([{"type": "github", "url": url}]), encoding="utf-8")
+
+    def test_a_state_file_under_the_agent_home_is_not_the_list(self):
+        self.register("https://github.com/acme/fleet")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.planted)}), patch("subprocess.run") as run:
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/fleet"])
+            run.assert_not_called()
+
+    def test_dot_dot_out_of_the_mount_is_not_the_list(self):
+        self.register("https://github.com/acme/fleet")
+        escape = self.mount / ".." / "opt-data" / "profiles" / "platform" / "dummy-gitops-state"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(escape)}), patch("subprocess.run") as run:
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/fleet"])
+            run.assert_not_called()
+
+    def test_a_path_under_the_mount_that_does_not_exist_never_reaches_kubectl(self):
+        # Otherwise the fallback reads a ConfigMap, namespace and context the
+        # worker's environment names.
+        self.register("https://github.com/acme/fleet")
+        env = {"GITOPS_STATE_PATH": str(self.mount / "x" / "managed_repos"),
+               "GITOPS_STATE_CONFIGMAP": "planted", "KUBE_DEFAULT_NAMESPACE": "elsewhere"}
+        with patch.dict(os.environ, env), patch("subprocess.run") as run:
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/fleet"])
+            run.assert_not_called()
+
+    def test_a_sibling_key_is_not_the_managed_list(self):
+        self.register("https://github.com/acme/fleet")
+        (self.mount / "context_repos").write_text(
+            json.dumps([{"type": "github", "url": "https://github.com/acme/docs"}]), encoding="utf-8")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.mount / "context_repos")}):
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/fleet"])
+
+    def test_an_unreadable_mounted_list_is_unreadable_not_a_kubectl_read(self):
+        self.register("https://github.com/acme/fleet")
+        with patch.object(Path, "read_text", side_effect=PermissionError("denied")), \
+                patch("subprocess.run") as run:
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_repo_entries()
+            run.assert_not_called()
+        self.assertIsInstance(caught.exception.__cause__, PermissionError)
+
+    def test_a_registered_entry_this_image_cannot_use_is_not_called_unregistered(self):
+        (self.mount / "managed_repos").write_text(
+            json.dumps([{"type": "bitbucket", "url": "https://bitbucket.org/acme/fleet"}]), encoding="utf-8")
+        with patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.resolve_repo()
+        self.assertIn("cannot use", str(caught.exception))
+        self.assertNotIn("no repository is registered", str(caught.exception))
+        # Self-contained: an entry with no type is skipped with no warning at all.
+        self.assertNotIn("warning above", str(caught.exception))
+        (self.mount / "managed_repos").write_text(
+            json.dumps([{"url": "https://github.com/acme/fleet"}]), encoding="utf-8")
+        with patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.resolve_repo()
+        self.assertIn("{type, url}", str(caught.exception))
+
+    def test_the_ignored_variable_is_logged_once(self):
+        self.register("https://github.com/acme/fleet")
+        gitops_workspace._IGNORED_STATE_PATHS.clear()
+        self.addCleanup(gitops_workspace._IGNORED_STATE_PATHS.clear)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.planted)}), \
+                self.assertLogs("gitops_workspace", level="WARNING") as logs:
+            gitops_workspace.get_managed_github_repos()
+            gitops_workspace.resolve_repo()
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn(str(self.planted), logs.output[0])
+
+    def test_the_operators_path_and_its_sibling_keys_still_read(self):
+        self.register("https://github.com/acme/fleet")
+        (self.mount / "context_repos").write_text(
+            json.dumps([{"type": "github", "url": "https://github.com/acme/docs"}]), encoding="utf-8")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.mount / "managed_repos")}):
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["acme/fleet"])
+            self.assertEqual(
+                [e["url"] for e in gitops_workspace.get_context_repo_entries()],
+                ["https://github.com/acme/docs"],
+            )
+
+    def test_an_empty_install_stays_empty_whatever_the_worker_wrote(self):
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.planted)}), \
+                patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}), \
+                patch("subprocess.run") as run:
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.resolve_repo()
+            run.assert_not_called()
+        message = str(caught.exception)
+        self.assertNotIn("dummy", message)
+        self.assertNotIn("origin", message)
+        self.assertIn("--repo", message)
+
+    def test_outside_a_pod_the_variable_and_the_cwd_origin_still_work(self):
+        shutil.rmtree(self.mount)
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.planted)}):
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), ["gke-labs/kube-agents-gitops-dummy"])
+        with patch("gitops_workspace.get_managed_repos", return_value=[]), \
+                patch.dict(sys.modules, {"github_token_refresh": self.cwd_origin}):
+            self.assertEqual(gitops_workspace.resolve_repo(), "gke-labs/kube-agents-gitops-dummy")
 
 
 # --------------------------------------------------------------------------- #

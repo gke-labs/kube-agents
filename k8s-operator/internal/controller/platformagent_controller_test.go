@@ -1629,8 +1629,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		scrape.From[0].PodSelector != nil {
 		t.Errorf("expected the collector ingress rule to admit every pod in gke-gmp-system, got %v", scrape.From)
 	}
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules (DNS, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -1663,19 +1663,15 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		t.Error("the DNS rule does not name 169.254.169.254, so a Cloud DNS for GKE cluster " +
 			"cannot resolve and every named destination below becomes unreachable")
 	}
-	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
-		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
-	})
-	if ruleMeta80 == nil || len(ruleMeta80.To) != 1 {
-		t.Errorf("expected 1 peer in GCP Workload Identity egress rule (port 80)")
-	}
-	// Port 988 is the post-DNAT destination, so it carries the metadata daemon's own
-	// address as well as the link-local one even when the cluster has no nodes.
-	ruleMeta988 := findEgressRule(988, func(p networkingv1.NetworkPolicyPeer) bool {
-		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.252/32"
-	})
-	if ruleMeta988 == nil || len(ruleMeta988.To) != 2 {
-		t.Errorf("expected 2 peers in GCP Workload Identity egress rule (port 988)")
+	// The gateway pod holds no Google identity, so the metadata server's token
+	// paths are closed: nothing admits 169.254.169.254 on 80 (pre-NAT) or the WI
+	// daemon on 988 (post-NAT). Only the DNS rule above may name the address.
+	for _, port := range []int32{80, 988} {
+		if rule := findEgressRule(port, func(p networkingv1.NetworkPolicyPeer) bool {
+			return p.IPBlock != nil && (p.IPBlock.CIDR == "169.254.169.254/32" || p.IPBlock.CIDR == "169.254.169.252/32")
+		}); rule != nil {
+			t.Errorf("the gateway policy admits the metadata server on port %d, a Workload Identity token path", port)
+		}
 	}
 	ruleLiteLLM := findEgressRule(4000, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.PodSelector != nil && p.PodSelector.MatchLabels["app"] == "litellm"
@@ -1756,20 +1752,19 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
-	// Expected 11 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
+	// Expected 9 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is
+	// omitted, and the gateway policy carries no metadata-server rule):
 	// 1. Cluster DNS (53)
-	// 2. GCP WI / Metadata server (80)
-	// 3. GKE WI Host Network Daemon (988)
-	// 4. LiteLLM Gateway (80, 4000, 8080)
-	// 5. vLLM Gemma Server (80, 8000)
-	// 6. Kubernetes API Server (443, 6443, 8443)
-	// 7. GKE Managed OpenTelemetry Collector (4317, 4318)
-	// 8. GitHub Token Minter (8080)
-	// 9. Hindsight memory API (8888)
-	// 10. The shell sandbox's sshd (2222)
-	// 11. The credential broker, which hosts the chat relay (8765)
-	if len(netpol.Spec.Egress) != 11 {
-		t.Errorf("expected 11 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	// 2. LiteLLM Gateway (80, 4000, 8080)
+	// 3. vLLM Gemma Server (80, 8000)
+	// 4. Kubernetes API Server (443, 6443, 8443)
+	// 5. GKE Managed OpenTelemetry Collector (4317, 4318)
+	// 6. GitHub Token Minter (8080)
+	// 7. Hindsight memory API (8888)
+	// 8. The shell sandbox's sshd (2222)
+	// 9. The credential broker, which hosts the chat relay (8765)
+	if len(netpol.Spec.Egress) != 9 {
+		t.Errorf("expected 9 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
 	}
 	for _, egress := range netpol.Spec.Egress {
 		for _, peer := range egress.To {
@@ -2090,39 +2085,17 @@ func TestBuildNetworkPolicy_ProfileDrivenRules(t *testing.T) {
 		}
 	})
 
-	t.Run("EmptyMetadataDaemonIPSuppressesRule3", func(t *testing.T) {
-		profile := defaultTestNetpolProfile()
-		profile.MetadataDaemonIP = ""
-		profile.MetadataDaemonSource = netpolSourceSuppressed
+	t.Run("TheMetadataDaemonSettingOpensNothing", func(t *testing.T) {
+		// The gateway policy carries no metadata-server rule, so the daemon
+		// address the profile discovers or suppresses changes nothing in it.
+		suppressed := defaultTestNetpolProfile()
+		suppressed.MetadataDaemonIP = ""
+		suppressed.MetadataDaemonSource = netpolSourceSuppressed
 
-		netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
-		for _, rule := range netpol.Spec.Egress {
-			for _, p := range rule.Ports {
-				if p.Port != nil && p.Port.IntValue() == 988 {
-					t.Fatalf("rule 3 (port 988) survived metadataDaemon.endpoint suppression")
-				}
-			}
-		}
-
-		// The pre-DNAT rule 2 is a separate rule and must NOT go with it.
-		withDaemon := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
-		if len(netpol.Spec.Egress) != len(withDaemon.Spec.Egress)-1 {
-			t.Errorf("suppression removed %d rules, want exactly 1", len(withDaemon.Spec.Egress)-len(netpol.Spec.Egress))
-		}
-		found80 := false
-		for _, rule := range netpol.Spec.Egress {
-			for _, p := range rule.Ports {
-				if p.Port != nil && p.Port.IntValue() == 80 {
-					for _, peer := range rule.To {
-						if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
-							found80 = true
-						}
-					}
-				}
-			}
-		}
-		if !found80 {
-			t.Errorf("rule 2 (link-local metadata on port 80) was removed along with rule 3")
+		without := buildNetworkPolicy(agent, nil, suppressed, false, "", false)
+		with := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+		if !reflect.DeepEqual(without.Spec.Egress, with.Spec.Egress) {
+			t.Errorf("the metadata daemon setting changed the gateway policy; it should open nothing")
 		}
 	})
 }
@@ -2137,37 +2110,22 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 
-	// The pre-NAT target belongs on port 80.
-	got80 := egressCIDRsForPort(netpol, 80)
-	want80 := []string{"169.254.169.254/32"}
-	if !reflect.DeepEqual(got80, want80) {
-		t.Errorf("expected port 80 metadata peers %v, got %v", want80, got80)
+	// The gateway pod holds no Google identity, so neither token path is open: not
+	// the pre-NAT link-local address on 80, not the WI daemon on 988.
+	for _, port := range []int32{80, 988} {
+		for _, cidr := range egressCIDRsForPort(netpol, port) {
+			if cidr == "169.254.169.254/32" || cidr == "169.254.169.252/32" {
+				t.Errorf("the gateway policy admits the metadata server at %s on port %d", cidr, port)
+			}
+		}
 	}
 
-	// Port 988 is the post-DNAT destination on Dataplane V1, carrying the metadata
-	// daemon's link-local address (169.254.169.252) and the link-local alias.
-	got988 := egressCIDRsForPort(netpol, 988)
-	want988 := []string{
-		"169.254.169.252/32",
-		"169.254.169.254/32",
-	}
-	if !reflect.DeepEqual(got988, want988) {
-		t.Errorf("expected metadata daemon peers %v, got %v", want988, got988)
-	}
-
-	// Every port the metadata server is reachable on, across all egress rules. 8080 —
-	// the pre-NAT ALTS handshaker port — must not be among them: Dataplane V2 evaluates
-	// policy pre-NAT at the socket layer, so pairing 8080 with the link-local address
-	// reopens the DirectPath route the sandbox refuses. Asserted here rather than left
-	// to the platform goldens, which are snapshots that `go test -update` re-blesses
-	// from whatever the code emits.
-	//
-	// 53 is on the list and is not a credential port: under Cloud DNS for GKE the node
-	// answers DNS at this address, and the DNS rule names it for that and nothing else.
-	// This assertion is the guard on that — a change that widened the DNS rule to carry
-	// 80, or the port-80 rule to carry 53, fails here rather than in review.
+	// Every port the metadata address is reachable on, across all egress rules: 53
+	// only. Under Cloud DNS for GKE the node answers DNS at this address, and the DNS
+	// rule names it for that and nothing else; a change that adds any other port
+	// here reopens a token path and fails rather than passing review.
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{53, 80, 988}
+	wantPorts := []int32{53}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
 	}
@@ -2184,20 +2142,12 @@ func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
 	profile.MetadataDaemonPort = 1988
 
 	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
-
-	got1988 := egressCIDRsForPort(netpol, 1988)
-	want1988 := []string{
-		"169.254.169.252/32",
-		"169.254.169.254/32",
+	if got := egressCIDRsForPort(netpol, 1988); len(got) != 0 {
+		t.Errorf("a custom metadata daemon port opened %v in the gateway policy", got)
 	}
-	if !reflect.DeepEqual(got1988, want1988) {
-		t.Errorf("expected custom metadata daemon peers %v, got %v", want1988, got1988)
-	}
-
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{53, 80, 1988}
-	if !reflect.DeepEqual(gotPorts, wantPorts) {
-		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
+	if !reflect.DeepEqual(gotPorts, []int32{53}) {
+		t.Errorf("expected the metadata server reachable on port 53 only, got %v", gotPorts)
 	}
 }
 
@@ -2252,6 +2202,11 @@ func egressPortsForCIDR(netpol *networkingv1.NetworkPolicy, cidr string) []int32
 		for _, p := range netpol.Spec.Egress[i].Ports {
 			if p.Port != nil {
 				seen[p.Port.IntVal] = true
+			}
+			// A range's upper end too: {Port: 53, EndPort: 988} opens the
+			// post-NAT token port while Port still reads 53 (see ruleIsDNSOnly).
+			if p.EndPort != nil {
+				seen[*p.EndPort] = true
 			}
 		}
 	}
@@ -3738,6 +3693,22 @@ func TestReconcileGitopsStateGitHubHost(t *testing.T) {
 		t.Errorf("a refused declaration wrote events: %v", got)
 	}
 	agent.Spec.Integration.Forges[0].CABundleRef = nil
+	// A refusal the schema admits, with a later GitHub forge at github.com:
+	// the first forge still holds the host, so the key stays.
+	agent.Spec.Integration.Forges[0].Namespace = "acme.ops"
+	agent.Spec.Integration.Forges = append(agent.Spec.Integration.Forges,
+		agentv1alpha1.ForgeSpec{Name: "upstream", Namespace: "kubernetes"})
+	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if host, _ := read(); host != "ghe.example.com" {
+		t.Errorf("github_host = %q with a refused first forge and a github.com forge after it, expected ghe.example.com", host)
+	}
+	if got := events(); len(got) != 0 {
+		t.Errorf("a refused first forge wrote events: %v", got)
+	}
+	agent.Spec.Integration.Forges = agent.Spec.Integration.Forges[:1]
+	agent.Spec.Integration.Forges[0].Namespace = "acme"
 	declare("")
 	if err := r.reconcileGitopsStateConfigMap(ctx, agent); err != nil {
 		t.Fatal(err)
@@ -4554,8 +4525,8 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 	foundBlanketHTTPS := false
 	for _, egress := range netpol.Spec.Egress {
@@ -4617,8 +4588,8 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 12 {
-		t.Errorf("expected 12 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 10 {
+		t.Errorf("expected 10 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 }
 

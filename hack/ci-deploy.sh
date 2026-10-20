@@ -278,19 +278,21 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # The next lane's Prow jobs: its on-demand presubmit, its six-hourly periodic
-# on main, and its daily full-catalog nightly on main (the agent on Claude,
-# compared with a today-mode nightly on the same model). Section 2b admits
+# on main, its daily full-catalog nightly on main (the agent on Claude,
+# compared with a today-mode nightly on the same model), and the GitLab
+# lane's nightly under next (EVAL_FORGE=gitlab, hack/eval/gitlab-cases.txt,
+# beside the today-mode GitLab nightly). Section 2b admits
 # the flag on a run whose JOB_NAME is one of these (space-separated, matched
 # whole) or that carries a PULL_NUMBER -- the presubmit is admitted by the
 # second on a pull request and by the first on a Tide batch, the periodic and
-# the nightly only by the first -- and refuses it on any other Prow run, so
+# the nightlies only by the first -- and refuses it on any other Prow run, so
 # the flag leaking into the today nightly's or a postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. hack/ci-eval-pr.sh keeps such a run out of the baseline
 # recorder on the flag alone, so admitting a job here never lets it write
 # main's window.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The first change: the mode, and the maxSessions section 2b sizes for the
@@ -493,6 +495,36 @@ readonly CI_IMAGE_TAG_NO_PULL="local"
 readonly CI_IMAGE_TAG_NO_COMMIT="latest"
 readonly CI_IMAGE_TAG_SHA_CHARS=7
 
+# Boskos, for the lease heartbeat below: the in-cluster endpoint the Prow
+# wrapper leases from, with the owner convention BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}"
+# (oss-test-infra prow/prowjobs/gke-labs/kube-agents/*.yaml); the same pair
+# ci-teardown.sh and ci-eval-pr.sh derive.
+readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
+
+# The image build's wait (section 4, #3129). Submitted with --async and polled
+# rather than streamed: on 2026-10-14 four runs' log tails stalled mid-push on
+# two build nodes after Cloud Build had finished, and each sat six hours in
+# the submit's log tail. The cap is cloudbuild-ci.yaml's 3600s build timeout
+# plus margin for queueing; the submit (a source upload, the same long storage
+# write) and every poll and log read carry their own deadline. `readonly
+# VAR="${VAR:-default}"`: env still overrides, which is how the unit tests
+# shrink the cap to seconds.
+readonly BUILD_SUBMIT_TIMEOUT_SECONDS="${CI_BUILD_SUBMIT_TIMEOUT_SECONDS:-900}"
+readonly BUILD_WAIT_CAP_SECONDS="${CI_BUILD_WAIT_CAP_SECONDS:-4200}"
+readonly BUILD_POLL_INTERVAL_SECONDS="${CI_BUILD_POLL_INTERVAL_SECONDS:-15}"
+readonly BUILD_CALL_TIMEOUT_SECONDS="${CI_BUILD_CALL_TIMEOUT_SECONDS:-60}"
+# A `describe` that fails is polled again, but not for the whole cap: this
+# many in a row (five minutes of polls, at most 25 with every call timing
+# out) is a bad region, a revoked permission or an API outage, not a blip.
+readonly BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS="${CI_BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS:-20}"
+# Cloud Build's terminal states (Build.Status): the one that continues the
+# deploy, and the ones that end it with the build's log.
+readonly BUILD_SUCCESS_STATUS="SUCCESS"
+readonly BUILD_FAILED_STATUSES="FAILURE INTERNAL_ERROR TIMEOUT CANCELLED EXPIRED"
+# What a build id looks like (a UUID), so a submit whose stdout is not one is
+# refused before it is polled.
+readonly BUILD_ID_RE='^[0-9a-fA-F-]+$'
+
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 # Still required with the agent path on vertex_ai below: the judge reads it
 # (JUDGE_API_KEY in ci-eval-pr.sh) and the chart's credentials secret carries it.
@@ -515,7 +547,33 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 source "${SCRIPT_DIR}/../tags.env"
-trap dump_prow_artifacts_on_failure EXIT
+# The failure dump first, because it reads the exit status; then the lease
+# heartbeat started below is stopped (a no-op until it starts).
+DEPLOY_HEARTBEAT_PID=""
+stop_deploy_heartbeat() { kill "${DEPLOY_HEARTBEAT_PID:-}" 2>/dev/null || true; }
+deploy_exit() {
+  dump_prow_artifacts_on_failure
+  stop_deploy_heartbeat
+}
+trap deploy_exit EXIT
+
+# Boskos lease heartbeat for the deploy's own lifetime (#3129). The Prow
+# wrapper's `boskosctl heartbeat` covers this step too, but it stops at its
+# own --timeout (5h by default), and a deploy held past that point -- the four
+# image-build hangs of 2026-10-14 -- lost its lease, was re-leased to another
+# run, and at the ceiling tore that run's install down. The daemon
+# ci-teardown.sh and ci-eval-pr.sh already run beats here as well, for exactly
+# this script's lifetime, so the lease stays this run's however long the deploy
+# takes and whatever a job definition does. Same endpoint and owner convention
+# as the wrapper; outside Prow nothing is derived and the daemon disables
+# itself with one line.
+if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
+  export BOSKOS_HOST="${BOSKOS_HOST:-${PROW_BOSKOS_DEFAULT_HOST}}"
+  export BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"
+  export BOSKOS_OWNER_NAME="${BOSKOS_OWNER_NAME:-${JOB_NAME}-${BUILD_ID}}"
+fi
+"${SCRIPT_DIR}/boskos_heartbeat.sh" &
+DEPLOY_HEARTBEAT_PID=$!
 ensure_helm
 
 # The image tag, carried by every image this run builds and installs. It has
@@ -829,7 +887,7 @@ else
 fi
 
 # The mode flip exists for the next lane's runs: a pull request's, or one of
-# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightly on main).
+# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightlies on main).
 # A flagged run appends nothing to main's baseline and publishes no dashboard
 # (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
 # separately refuses a pull request's sample, bench/baselines/README.md), so
@@ -1130,11 +1188,15 @@ if [ -n "${CLOUD_BUILD_WORKER_POOL:-}" ]; then
       exit 1
       ;;
   esac
+  # On its own as well: `builds describe` and `builds log` in section 4 need
+  # the same region, and only the submit takes the pool.
+  BUILD_REGION_ARGS=(--region="$(echo "$CLOUD_BUILD_WORKER_POOL" | cut -d'/' -f4)")
   BUILD_WORKER_ARGS=(
     --worker-pool="$CLOUD_BUILD_WORKER_POOL"
-    --region="$(echo "$CLOUD_BUILD_WORKER_POOL" | cut -d'/' -f4)"
+    "${BUILD_REGION_ARGS[@]}"
   )
 else
+  BUILD_REGION_ARGS=()
   # The default pool's unspecified machine is two vCPUs, which is most of why
   # the image builds are the single largest phase of this job. The build also
   # runs the operator step alongside the agent build (see
@@ -1319,9 +1381,88 @@ else
     )
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
   fi
-  gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
+  # Submitted asynchronously and polled, never streamed (#3129). Without
+  # --async, `gcloud builds submit` tails the build log from storage and
+  # returns when the tail ends; a tail that stalls after the build has
+  # finished never ends, and the harness gave it six hours. The id and the
+  # Console URL go out before the first poll, so a run killed while polling
+  # still names its build. Each call runs under its own deadline where
+  # `timeout` exists (the Prow image; not every developer machine).
+  with_deadline() { # <seconds> <command...>
+    local seconds="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+      timeout --foreground "${seconds}" "$@"
+    else
+      "$@"
+    fi
+  }
+  CLOUD_BUILD_ID=""
+  CLOUD_BUILD_LOG_URL=""
+  CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
     --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
-    --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
+    --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
+    echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
+    exit 1
+  }
+  IFS=$'\t' read -r CLOUD_BUILD_ID CLOUD_BUILD_LOG_URL <<<"${CLOUD_BUILD_SUBMIT_OUT}"
+  if ! [[ "${CLOUD_BUILD_ID}" =~ ${BUILD_ID_RE} ]]; then
+    echo "ERROR: gcloud builds submit printed no build id: ${CLOUD_BUILD_SUBMIT_OUT}" >&2
+    exit 1
+  fi
+  echo "Cloud Build ${CLOUD_BUILD_ID} submitted: ${CLOUD_BUILD_LOG_URL:-no log URL returned}"
+  echo "Polling its status every ${BUILD_POLL_INTERVAL_SECONDS}s, for at most ${BUILD_WAIT_CAP_SECONDS}s"
+  CLOUD_BUILD_DEADLINE=$((SECONDS + BUILD_WAIT_CAP_SECONDS))
+  CLOUD_BUILD_STATUS=""
+  CLOUD_BUILD_OUTCOME=""
+  CLOUD_BUILD_DESCRIBE_ERR="$(mktemp)"
+  CLOUD_BUILD_DESCRIBE_ERRORS=0
+  while :; do
+    if CLOUD_BUILD_STATUS="$(with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds describe "${CLOUD_BUILD_ID}" \
+      --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} --format="value(status)" 2>"${CLOUD_BUILD_DESCRIBE_ERR}")"; then
+      CLOUD_BUILD_DESCRIBE_ERRORS=0
+    else
+      CLOUD_BUILD_DESCRIBE_RC=$?
+      CLOUD_BUILD_DESCRIBE_ERRORS=$((CLOUD_BUILD_DESCRIBE_ERRORS + 1))
+      echo "WARNING: gcloud builds describe ${CLOUD_BUILD_ID} exited ${CLOUD_BUILD_DESCRIBE_RC} ($(tr '\n' ' ' <"${CLOUD_BUILD_DESCRIBE_ERR}")); polling again (${CLOUD_BUILD_DESCRIBE_ERRORS}/${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS} in a row)"
+      CLOUD_BUILD_STATUS=""
+      if [ "${CLOUD_BUILD_DESCRIBE_ERRORS}" -ge "${BUILD_DESCRIBE_MAX_CONSECUTIVE_ERRORS}" ]; then
+        CLOUD_BUILD_OUTCOME="could not be described ${CLOUD_BUILD_DESCRIBE_ERRORS} times in a row"
+        break
+      fi
+    fi
+    if [ "${CLOUD_BUILD_STATUS}" = "${BUILD_SUCCESS_STATUS}" ]; then
+      CLOUD_BUILD_OUTCOME="${BUILD_SUCCESS_STATUS}"
+      break
+    fi
+    case " ${BUILD_FAILED_STATUSES} " in
+      *" ${CLOUD_BUILD_STATUS} "*)
+        CLOUD_BUILD_OUTCOME="ended ${CLOUD_BUILD_STATUS}"
+        break ;;
+    esac
+    if [ "${SECONDS}" -ge "${CLOUD_BUILD_DEADLINE}" ]; then
+      CLOUD_BUILD_OUTCOME="did not reach a terminal state within the ${BUILD_WAIT_CAP_SECONDS}s cap (last status: ${CLOUD_BUILD_STATUS:-unknown})"
+      break
+    fi
+    sleep "${BUILD_POLL_INTERVAL_SECONDS}"
+  done
+  rm -f "${CLOUD_BUILD_DESCRIBE_ERR}"
+  if [ "${CLOUD_BUILD_OUTCOME}" != "${BUILD_SUCCESS_STATUS}" ]; then
+    echo "ERROR: Cloud Build ${CLOUD_BUILD_ID} ${CLOUD_BUILD_OUTCOME}; its log follows (${CLOUD_BUILD_LOG_URL:-no log URL})" >&2
+    # A build this loop gave up on (the cap, or describe failing) may still be
+    # running; cancel it so it stops pushing into a project this run is about
+    # to hand back. A build that ended on its own needs nothing.
+    case "${CLOUD_BUILD_OUTCOME}" in
+      ended\ *) ;;
+      *) with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds cancel "${CLOUD_BUILD_ID}" \
+           --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} >/dev/null \
+           || echo "WARNING: gcloud builds cancel ${CLOUD_BUILD_ID} exited $?; it runs until its own timeout" >&2 ;;
+    esac
+    with_deadline "${BUILD_CALL_TIMEOUT_SECONDS}" gcloud builds log "${CLOUD_BUILD_ID}" \
+      --project="${PROJECT_ID}" ${BUILD_REGION_ARGS[@]+"${BUILD_REGION_ARGS[@]}"} \
+      || echo "WARNING: gcloud builds log ${CLOUD_BUILD_ID} exited $?; read it at ${CLOUD_BUILD_LOG_URL:-the Cloud Build console}" >&2
+    exit 1
+  fi
   echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 fi
 
@@ -2123,6 +2264,7 @@ PF_PID=""
 cleanup_pf_and_dump() {
   kill "${PF_PID:-}" 2>/dev/null || true
   dump_prow_artifacts_on_failure
+  stop_deploy_heartbeat
 }
 trap cleanup_pf_and_dump EXIT
 
@@ -2170,7 +2312,7 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
 done
 
 kill "${PF_PID:-}" 2>/dev/null || true
-trap dump_prow_artifacts_on_failure EXIT
+trap deploy_exit EXIT
 
 if [ "${CONNECTIVITY_OK}" = "true" ]; then
   echo "✓ Agent API Server responded successfully in $((SECONDS - STEP_START))s!"
