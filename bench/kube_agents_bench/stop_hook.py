@@ -44,6 +44,11 @@ MAX_OBSERVE_SECONDS = 3600.0
 STOP_WORD = "stop"
 #: The trajectory entry the harness records for the stop.
 STOP_ENTRY = "harness_stop_sent"
+#: The trajectory entry for what the stop did: ``completed`` only when every
+#: card the session filed ended ``archived`` inside the window.
+CARDS_STOPPED_ENTRY = "harness_cards_stopped"
+#: The board status a stopped card ends in.
+STOPPED_STATUS = "archived"
 
 
 @dataclass(frozen=True)

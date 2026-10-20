@@ -82,6 +82,22 @@ def test_a_filed_card_is_stopped_and_recorded(monkeypatch):
     assert entry["args"]["cards"] == ["t_1"]
     assert result.metadata["stop_card_statuses"] == {"t_1": "archived"}
     assert archived == []
+    assert _stopped(result)["status"] == "completed"
+
+
+def _stopped(result):
+    return next(e for e in result.trajectory if e["name"] == stop_hook.CARDS_STOPPED_ENTRY)
+
+
+def test_a_card_that_finished_instead_of_stopping_fails_the_stop(monkeypatch):
+    # A card that reached done wrote whatever it wrote; the stop did not stop it.
+    result, _, _, _ = _run(monkeypatch, [_cards({"t_1": "running"}), _cards({"t_1": "done"})])
+    assert _stopped(result)["status"] == "error"
+
+
+def test_a_stop_the_gateway_refused_fails_the_stop_even_if_the_card_ended(monkeypatch):
+    result, _, _, _ = _run(monkeypatch, [_cards({"t_1": "running"}), _cards({"t_1": "archived"})], send=(False, "no"))
+    assert _stopped(result)["status"] == "error"
 
 
 def test_no_card_sends_no_stop_and_fails_the_entry(monkeypatch):
@@ -102,6 +118,7 @@ def test_a_card_still_running_after_the_window_is_archived(monkeypatch):
     result, _, _, archived = _run(monkeypatch, [_cards({"t_1": "running"}), _cards({"t_1": "running"})])
     assert archived == ["t_1"]
     assert any("not terminal" in e for e in result.errors)
+    assert _stopped(result)["status"] == "error"
 
 
 def test_an_unreadable_session_sends_no_stop(monkeypatch):

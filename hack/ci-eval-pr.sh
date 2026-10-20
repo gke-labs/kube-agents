@@ -2998,6 +2998,12 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # Next-lane nightly only (api-lane-exclusions.txt). The opening turn files
+    # a card, then the harness sends `stop` and waits out the prompt's
+    # observe=900 window (stop_hook.py), so a repetition is never under 900s;
+    # priced in that band so a deadline cut does not take it first.
+    # Unmeasured until its first nights.
+    chat-stop-halts-delegated-remediation) echo 1100 ;;
     *) echo 200 ;;
   esac
 }

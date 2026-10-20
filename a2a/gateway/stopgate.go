@@ -14,10 +14,12 @@ const stopGatedBackend = slackBackend
 // requester the record holds: a recorded task's requester or one of its steer
 // authors, or one of the session's authors. The record prunes old tasks and
 // clears a requester past AskTTL, so an early requester of a long thread can
-// age out of it. A conversation that has run nothing has nothing to protect,
-// so its stop passes and gets the nothing-is-running answer.
+// age out of it while later ones are held. A record that holds no requester
+// at all, because the conversation has run nothing or every copy has aged
+// out, gates nobody: there is no one to tell the requester from, and refusing
+// everyone would lock the requester out of their own long-running thread.
 func mayStop(rec *SessionRecord, backend string, author TaskRequester) bool {
-	if backend != stopGatedBackend || (len(rec.Tasks) == 0 && len(rec.SessionAuthors) == 0) {
+	if backend != stopGatedBackend || !holdsARequester(rec) {
 		return true
 	}
 	if author.Subject == "" {
@@ -35,6 +37,20 @@ func mayStop(rec *SessionRecord, backend string, author TaskRequester) bool {
 	}
 	for _, a := range rec.SessionAuthors {
 		if a == author {
+			return true
+		}
+	}
+	return false
+}
+
+// holdsARequester reports whether rec still holds any requester copy: a
+// task's requester or steer author, or a session author.
+func holdsARequester(rec *SessionRecord) bool {
+	if len(rec.SessionAuthors) > 0 {
+		return true
+	}
+	for _, ref := range rec.Tasks {
+		if ref.Requester != nil || len(ref.SteerAuthors) > 0 {
 			return true
 		}
 	}

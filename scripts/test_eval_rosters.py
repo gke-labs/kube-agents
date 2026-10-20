@@ -783,9 +783,6 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
 ]
-# The first line that makes a prompt a stopped ask (bench/kube_agents_bench/stop_hook.py,
-# STOP_DIRECTIVE); spelled here because this suite imports nothing from bench/.
-STOP_DIRECTIVE = "[bench:stop-after-first-card]"
 
 
 class ApiLaneExclusionsTest(unittest.TestCase):
@@ -815,8 +812,12 @@ class ApiLaneExclusionsTest(unittest.TestCase):
 
     def test_every_registered_stopped_ask_is_excluded(self):
         # A stopped ask errors on the api transport, so an unlisted one would
-        # error there every repetition.
+        # error there every repetition. The directive is read from the module
+        # the harness reads it from, so the two cannot disagree.
         import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.stop_hook import STOP_DIRECTIVE
 
         excluded = eval_rosters.api_lane_exclusions()
         for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):

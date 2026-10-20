@@ -164,6 +164,8 @@ func (g *Gateway) cardStopRoute(rec *SessionRecord) bool {
 func markCardStopAgain(rec *SessionRecord, authority Authority) {
 	a := authority
 	rec.CardStop.Again = &a
+	// The latest mark's voice too: a Slack Stop sets it after this call.
+	rec.CardStop.AgainSlackStop = false
 }
 
 // cardStopPayload is the control's message: the cardStop part in its request
@@ -417,7 +419,7 @@ func (g *Gateway) endCardStop(ctx context.Context, rec *SessionRecord) {
 // its cards too, which nobody asked for.
 //
 // voice is the Slack Stop's when the button asked for the follow-up: it then
-// speaks with the button's replies, a skip included (slackStopCouldntReply).
+// speaks with the button's replies, and a skip posts nothing.
 func (g *Gateway) followUpCardStop(ctx context.Context, rec *SessionRecord, authority Authority, voice CardStopRun) {
 	var why, notice string
 	switch active := rec.ActiveTask; {
@@ -430,10 +432,12 @@ func (g *Gateway) followUpCardStop(ctx context.Context, rec *SessionRecord, auth
 	}
 	if notice != "" {
 		g.log.Info("card stop follow-up not sent", "conversation", rec.Key, "why", why)
-		if voice.SlackStop {
-			notice = slackStopCouldntReply
+		// A Slack Stop has no approved line for a skip, and "Press Stop
+		// again" would promise what a press cannot do here, so it posts
+		// nothing; the log line above says why.
+		if !voice.SlackStop {
+			g.post(rec.Key, notice)
 		}
-		g.post(rec.Key, notice)
 		return
 	}
 	g.stopCardsAs(ctx, rec, authority, "", true, voice)

@@ -241,6 +241,20 @@ func TestSlackStopButtonFromSomeoneElseStopsNothing(t *testing.T) {
 	}
 }
 
+func TestSlackStopButtonFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
+	d := slackStopRig(t)
+	askAndAnswer(t, d)
+	conv := "slack:dm/D1/100.1"
+	before := len(slackPostsIn(d, "100.1"))
+	done := d.adapter.turnsFinished(conv)
+
+	pressStop(d, "U2", "100.1", "200.1")
+	waitFor(t, "the press to be handled", func() bool { return d.adapter.turnsFinished(conv) > done })
+	if got := slackPostsIn(d, "100.1"); len(got) != before {
+		t.Fatalf("an unlisted member's press posted %q", got[before:])
+	}
+}
+
 func TestTypedStopFromSomeoneElseKeepsTheCardStop(t *testing.T) {
 	d := slackStopRig(t)
 	askAndAnswer(t, d)

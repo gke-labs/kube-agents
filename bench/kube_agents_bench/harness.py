@@ -2616,6 +2616,15 @@ class KubeAgentsHarness(AgentHarness):
                 break
             time.sleep(min(left, max(poll_interval, 1.0)))
         result.metadata["stop_card_statuses"] = statuses
+        # What the stop did, read before the harness archives any leftover:
+        # every card it filed archived, or the stop did not reach them all.
+        stopped = bool(cards) and all(statuses.get(t) == stop_hook.STOPPED_STATUS for t in cards)
+        result.trajectory.append({
+            "name": stop_hook.CARDS_STOPPED_ENTRY,
+            "args": {"statuses": statuses},
+            "status": "completed" if sent and stopped else "error",
+            "result": "every card archived" if stopped else "not every card was archived by the stop",
+        })
         still = [t for t in cards if statuses.get(t) not in _TERMINAL_STATUSES]
         if still:
             result.errors.append(

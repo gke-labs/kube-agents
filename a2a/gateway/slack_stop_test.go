@@ -106,4 +106,9 @@ func TestMayStopOffSlackAndOnAnEmptyConversation(t *testing.T) {
 	if !mayStop(&SessionRecord{}, slackBackend, TaskRequester{Backend: slackBackend, Subject: "h-other"}) {
 		t.Error("a conversation that ran nothing refused a stop, which would hide its nothing-running answer")
 	}
+	// Every requester copy aged out (AskTTL): the tasks remain, nobody is held.
+	aged := &SessionRecord{Tasks: []TaskRef{{ID: "task-1"}, {ID: "task-2"}}}
+	if !mayStop(aged, slackBackend, TaskRequester{Backend: slackBackend, Subject: "h-alice"}) {
+		t.Error("a thread whose requesters all aged out locked everyone out")
+	}
 }

@@ -458,7 +458,9 @@ test checks both, so two case pull requests don't edit the same lines). It lands
 decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
-the night it merges, its record accrues in the evidence store, and a presubmit seat is a
+the night it merges, its record accrues in the evidence store (except for a case in
+`hack/eval/api-lane-exclusions.txt`, which runs only on the next lane, whose runs write no
+record), and a presubmit seat is a
 later pull request that moves its line to the presubmit file, adds its name to
 `hack/eval/blocking-roster.txt` in the same edit (since 2026-09-22 the presubmit runs the
 blocking roster and nothing else, and `scripts/test_eval_rosters.py` pins the two files as

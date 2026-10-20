@@ -779,7 +779,9 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// the list talking to a colleague under an alert would otherwise get
 		// a public refusal in a thread the channel is reading. Nor is it
 		// counted as notified, so their first real ask still gets the notice.
-		notified := msg.Unaddressed
+		// Nor for a press of Slack's Stop button: it asked the bot for
+		// nothing, and the notice would land in a thread the channel reads.
+		notified := msg.Unaddressed || isSlackStop(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
