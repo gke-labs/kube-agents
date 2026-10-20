@@ -27,7 +27,19 @@ CONFIG_CONNECTOR_SKILL_DIR = (
 )
 # A fence may be indented, as one inside a numbered list is. The languages
 # are deploy/docker/check_skill_commands.py's SHELL_LANGUAGES.
-FENCED_SHELL_BLOCK = re.compile(r"^[ \t]*```(?:bash|sh|shell|zsh)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
+FENCED_SHELL_BLOCK = re.compile(
+    r"^(?P<indent>[ \t]*)```(?:bash|sh|shell|zsh)[ \t]*\n(?P<body>.*?)^(?P=indent)```[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+
+def _shell_blocks(text):
+    """The body of each shell fence. A fence closes at a ``` with its opener's
+    indentation, so an indented fence quoted inside a heredoc does not end the
+    block around it."""
+    return [m.group("body") for m in FENCED_SHELL_BLOCK.finditer(text)]
+
+
 GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # Fewer fenced commands than this means the parser or the path went stale
 # and the allowed-commands test would pass by finding nothing.
@@ -74,7 +86,7 @@ def _fenced_shell_commands(skill_dir):
     commands = []
     for path in sorted(skill_dir.rglob("*.md")):
         text = path.read_text(encoding="utf-8")
-        for block in FENCED_SHELL_BLOCK.findall(text):
+        for block in _shell_blocks(text):
             for line in block.replace("\\\n", " ").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
@@ -1890,7 +1902,7 @@ class TheTerraformSkillStaysInsideThePolicy(unittest.TestCase):
     @staticmethod
     def _fenced_lines(skill_dir):
         for path in sorted(skill_dir.rglob("*.md")):
-            for block in FENCED_SHELL_BLOCK.findall(path.read_text(encoding="utf-8")):
+            for block in _shell_blocks(path.read_text(encoding="utf-8")):
                 for line in block.replace("\\\n", " ").splitlines():
                     line = line.strip()
                     if line and not line.startswith("#"):
@@ -1988,7 +2000,7 @@ class TheHelmChartSkillStaysInsideThePolicy(unittest.TestCase):
         # quoting that spans lines, and a helm after `&&` or `|` counts too.
         for skill_dir in SHIPPED_SKILL_DIRS:
             for path in sorted(skill_dir.rglob("*.md")):
-                for block in FENCED_SHELL_BLOCK.findall(path.read_text(encoding="utf-8")):
+                for block in _shell_blocks(path.read_text(encoding="utf-8")):
                     for line in block.splitlines():
                         with self.subTest(skill=skill_dir.name, file=path.name, line=line):
                             self.assertIsNone(HELM_INVOCATION.search(line))

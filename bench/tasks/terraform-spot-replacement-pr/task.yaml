@@ -72,20 +72,23 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # Underscores are deleted with emphasis, so resource names are written
-      # without them (google_container_node_pool reads googlecontainernodepool).
-      # A negated form ("will not replace", "is not replaced") satisfies none.
+      # The skill's own callout forms, positively worded: "forces replacement",
+      # "destroys and recreates", "REPLACES <address>", "will be replaced".
+      # Underscores are deleted with emphasis, so google_container_node_pool
+      # reads googlecontainernodepool. A regex cannot decide negation in
+      # general; these avoid bare participles, which a denial also uses, and
+      # the judge reads expected_output for the rest.
       any_of_patterns:
-        - '(?<!not )(?<!n''t )(?<!never )\b(?:forces?|forcing|requires?|triggers?|causes?|means?)\s+(?:a\s+|the\s+)?(?:(?!not\b|no\b)\w+\s+){0,4}(?:replacement|recreat\w*|replac\w+|destroy\w*)'
-        - '(?<!not )(?<!n''t )(?<!never )(?<!not be )(?<!n''t be )(?<!never be )\b(?:replaced|recreated|recreates)\b'
+        - '(?<!not )(?<!n''t )(?<!never )\b(?:forces?|forcing|triggers?|causes?|requires?)\s+(?:a\s+|the\s+)?(?:(?:node\s+)?pool\s+|resource\s+)?(?:replacement|recreation)\b'
         - '(?<!not )(?<!n''t )(?<!never )\b(?:destroys|deletes)\s+and\s+recreates?\b'
-        - '(?<!not )(?<!n''t )(?<!never )\breplaces\s+(?:the\s+)?(?:googlecontainernodepool|main.?pool|node\s+pool|pool)'
-        - '\b(?:will|would)\s+(?:(?!not\b|never\b)\w+\s+){0,3}(?:recreate|replace|destroy)\b'
-        - '\bnot\s+(?:updatable|changeable)\s+in\s+place\b'
+        - '(?<!not )(?<!n''t )(?<!never )\breplaces\s+(?:the\s+)?(?:googlecontainernodepool|main.?pool|node\s+pool)'
+        - '\b(?:will|would)\s+be\s+(?:destroyed\s+and\s+recreated|replaced|recreated)\b(?!\s+in\s+place)'
   # Command patterns: a command position (line start, a separator, `!`, a
   # `-c` string) behind any wrappers, VAR=value or a path, with OpenTofu's
   # global options skipped. Not a backtick: the PR body, written through a
   # heredoc, names `terraform init` as prose.
+  # A regex cannot parse shell: wrapper flags (`sudo -u`), `then`/`do` and the
+  # like are not covered. A shell-aware matcher is #3592.
   - name: the-syntax-was-checked-with-tofu-fmt
     role: objective
     mode: assert

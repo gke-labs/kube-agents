@@ -33,7 +33,6 @@ def test_replacement_callouts_pass():
         "- **Replacement:** REPLACES `google_container_node_pool.main_pool`: `node_config.spot` forces it; "
         "applying this PR destroys and recreates the pool's nodes and their workloads.",
         "this replaces the main_pool node pool",
-        "applying it recreates the pool",
         "merging this deletes and recreates main-pool",
         "Heads up: `spot = true` forces replacement of the node pool.",
         "The pool will be destroyed and recreated when this is applied.",
@@ -58,6 +57,11 @@ def test_a_reply_that_denies_the_replacement_fails():
         "The node pool is not replaced; spot is updated in place.",
         "Switching to Spot does not force a replacement.",
         "It won't be recreated.",
+        "No nodes are recreated; spot is applied in place.",
+        "Nothing is destroyed or recreated.",
+        "The pool is updated without being replaced.",
+        "The pool is not going to be replaced.",
+        "It does not need to be replaced.",
     ):
         assert not _names_replacement(report), report
 

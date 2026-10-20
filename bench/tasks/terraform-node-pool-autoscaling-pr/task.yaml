@@ -76,6 +76,8 @@ verification_spec:
   # `-c` string) behind any wrappers, VAR=value or a path, with OpenTofu's
   # global options skipped. Not a backtick: the PR body, written through a
   # heredoc, names `terraform init` as prose.
+  # A regex cannot parse shell: wrapper flags (`sudo -u`), `then`/`do` and the
+  # like are not covered. A shell-aware matcher is #3592.
   - name: the-syntax-was-checked-with-tofu-fmt
     role: objective
     mode: assert

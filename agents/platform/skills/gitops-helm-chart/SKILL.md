@@ -11,7 +11,7 @@ description: >-
   add, deploy, or upgrade a chart or a packaged third-party component. Don't
   use for kube-agents itself (an operator upgrades it with the installer), plain
   workload YAML (use gke-manifest-generation), or Google Cloud resources (use
-  gcp-config-connector).
+  gcp-config-connector, or gcp-terraform on a Terraform repository).
 ---
 
 # Third-Party Helm Charts Through GitOps
