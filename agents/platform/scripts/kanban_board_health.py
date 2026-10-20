@@ -492,7 +492,8 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                 group_header_chars = len(head) + 1 + len(latest_sub) + 1 + len("    ids: ") + 1
                 group_ids_budget = min(MAX_GROUP_IDS_CHARS, max(0, available_for_items - group_header_chars))
                 formatted_ids, dropped_ids = _format_id_list_with_dropped(group_ids, group_ids_budget)
-                lines_for_group.append(f"    ids: {formatted_ids}")
+                if formatted_ids and not formatted_ids.startswith("and "):
+                    lines_for_group.append(f"    ids: {formatted_ids}")
             renderable_items.append({
                 "age_hours": newest_age,
                 "key": title,
@@ -522,7 +523,11 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
         next_item = renderable_items[len(taken_items)]
         next_chars = sum(len(ln) + 1 for ln in next_item["lines"])
         current_chars = sum(sum(len(ln) + 1 for ln in it["lines"]) for it in taken_items)
-        if len(taken_items) + 1 == len(renderable_items) and not next_item.get("dropped_ids") and (current_chars + next_chars <= budget_for_body):
+        if (
+            len(taken_items) + 1 == len(renderable_items)
+            and not any(it.get("dropped_ids") for it in [*taken_items, next_item])
+            and (current_chars + next_chars <= budget_for_body)
+        ):
             taken_items.append(next_item)
 
     lines = [header]
