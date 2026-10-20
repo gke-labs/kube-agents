@@ -4,9 +4,10 @@ automated control-plane upgrade, a node upgrade or a repair needs compute capaci
 location when it fires, the provider does not check capacity first, and the agent cannot
 read zone capacity. It can read the cluster's recent operations. The rule reads the project's
 operations (the report's `operations` read) and files one risk per `DONE` operation of type
-UPGRADE_MASTER, UPGRADE_NODES or REPAIR_CLUSTER on this cluster in the last LOOKBACK_DAYS
-whose `error` or `statusMessage` names capacity (CAPACITY_MARKERS), with the operation's
-date and the cluster's maintenance window, which is where the odds are moved: a window in an
+UPGRADE_MASTER, UPGRADE_NODES or REPAIR_CLUSTER on this cluster or on one of its node pools
+(an UPGRADE_NODES names the pool, `.../clusters/<name>/nodePools/<pool>`) in the last
+LOOKBACK_DAYS whose `error` or `statusMessage` names capacity (CAPACITY_MARKERS), with the
+operation's date and the cluster's maintenance window, which is where the odds are moved: a window in an
 off-peak hour for the region, and the upgrade retried in it. A lagging signal by nature: the
 finding explains the last failure and lowers the odds of the next. Never a blocker, so
 `CAN_BLOCK` is False and a failed operations read is reported in the note.
@@ -16,11 +17,16 @@ from readiness_rules import (
     CONTEXT_AT,
     CONTEXT_LOCATION,
     NOTE_EXCERPT_CHARS,
-    PATH_SEPARATOR,
+    OPERATION_NAME_KEY,
+    OPERATION_START_KEY,
+    OPERATION_STATUS_DONE,
+    OPERATION_STATUS_KEY,
+    OPERATION_TYPE_KEY,
     PROJECT_READ_OPERATIONS,
     SECONDS_PER_DAY,
     new_result,
     one_line,
+    operation_target,
     parse_rfc3339,
     project_read,
 )
@@ -34,21 +40,14 @@ CAN_BLOCK = False
 LOOKBACK_DAYS = 90
 LOOKBACK_SECONDS = LOOKBACK_DAYS * SECONDS_PER_DAY
 OPERATION_TYPES = ("UPGRADE_MASTER", "UPGRADE_NODES", "REPAIR_CLUSTER")
-STATUS_DONE = "DONE"
 # What a capacity failure's message carries, matched without case: the Compute Engine
 # phrasing, the stockout error codes, and the quota and resource shortfalls.
 CAPACITY_MARKERS = ("does not have enough resources", "resource_pool_exhausted", "stockout", "insufficient")
-# The operation record's fields.
-OPERATION_NAME_KEY = "name"
-OPERATION_TYPE_KEY = "operationType"
-OPERATION_STATUS_KEY = "status"
-OPERATION_START_KEY = "startTime"
-OPERATION_TARGET_KEY = "targetLink"
+# The operation record's error fields; the rest are the shared OPERATION_* keys.
 OPERATION_ERROR_KEY = "error"
 OPERATION_ERROR_MESSAGE_KEY = "message"
 OPERATION_STATUS_MESSAGE_KEY = "statusMessage"
-CLUSTERS_SEGMENT = "clusters"
-TARGET_TAIL_PARTS = 4
+TYPE_ON_POOL_FORMAT = "{type} on {pool}"
 # The cluster's maintenance window, as the record spells it.
 MAINTENANCE_POLICY_KEY = "maintenancePolicy"
 WINDOW_KEY = "window"
@@ -90,11 +89,6 @@ def names_capacity(message: str) -> bool:
     return any(marker in lowered for marker in CAPACITY_MARKERS)
 
 
-def _targets_cluster(operation: dict, name: str, location: str) -> bool:
-    parts = str(operation.get(OPERATION_TARGET_KEY) or "").rstrip(PATH_SEPARATOR).split(PATH_SEPARATOR)
-    return len(parts) >= TARGET_TAIL_PARTS and parts[-1] == name and parts[-2] == CLUSTERS_SEGMENT and parts[-3] == location
-
-
 def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     out = new_result()
     operations, error = project_read(context, PROJECT_READ_OPERATIONS)
@@ -110,9 +104,10 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     at = context[CONTEXT_AT]
     considered = 0
     for operation in operations:
-        if not isinstance(operation, dict) or operation.get(OPERATION_TYPE_KEY) not in OPERATION_TYPES or operation.get(OPERATION_STATUS_KEY) != STATUS_DONE:
+        if not isinstance(operation, dict) or operation.get(OPERATION_TYPE_KEY) not in OPERATION_TYPES or operation.get(OPERATION_STATUS_KEY) != OPERATION_STATUS_DONE:
             continue
-        if not _targets_cluster(operation, name, location):
+        mine, pool = operation_target(operation, name, location)
+        if not mine:
             continue
         started = parse_rfc3339(operation.get(OPERATION_START_KEY))
         if started is None or (at - started).total_seconds() > LOOKBACK_SECONDS:
@@ -123,6 +118,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
             out["risks"].append({
                 "operation": operation.get(OPERATION_NAME_KEY),
                 "operation_type": operation.get(OPERATION_TYPE_KEY),
+                "pool": pool,
                 "date": str(operation.get(OPERATION_START_KEY))[:DATE_CHARS],
                 "location": location,
                 "message": one_line(message, NOTE_EXCERPT_CHARS),
@@ -134,4 +130,5 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
 
 
 def describe(finding: dict) -> str:
-    return FINDING_FORMAT.format(type=finding["operation_type"], date=finding["date"], location=finding["location"], message=finding["message"], window=finding["window"], action=finding["action"])
+    kind = TYPE_ON_POOL_FORMAT.format(type=finding["operation_type"], pool=finding["pool"]) if finding.get("pool") else finding["operation_type"]
+    return FINDING_FORMAT.format(type=kind, date=finding["date"], location=finding["location"], message=finding["message"], window=finding["window"], action=finding["action"])

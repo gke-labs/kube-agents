@@ -995,7 +995,8 @@ class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
         finding = result["risks"][0]
         self.assertEqual((finding["operation_type"], finding["date"], finding["window"], finding["location"]), ("UPGRADE_MASTER", "2026-10-09", "none", "us-central1"))
         self.assertEqual(control_plane_upgrade_history.describe(finding), "UPGRADE_MASTER on 2026-10-09 failed on compute capacity in us-central1 (Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1.); maintenance window: none; set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep upgrade notifications consumed so a failed attempt is a message the same day")
-        self.assertEqual(result["notes"], ["1 capacity failure(s) among 3 upgrade or repair operation(s) in the last 90 days; maintenance window none"])
+        # Nine operations: the host's control-plane upgrades and the UPGRADE_NODES on its pools, which name the pool.
+        self.assertEqual(result["notes"], ["1 capacity failure(s) among 9 upgrade or repair operation(s) in the last 90 days; maintenance window none"])
         self.assertEqual(result["blocking"], [])
         # A window set: named. Outside the lookback: not counted.
         windowed = {**record, "maintenancePolicy": {"window": {"recurringWindow": {"window": {"startTime": "2026-01-03T01:00:00Z", "endTime": "2026-01-03T05:00:00Z"}, "recurrence": "FREQ=WEEKLY;BYDAY=SA,SU"}}}}
@@ -1007,7 +1008,15 @@ class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
         record = seeded_b()
         result = control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record))
         self.assertEqual(result["risks"], [])
-        self.assertEqual(result["notes"], ["0 capacity failure(s) among 1 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S"])
+        # Two operations: the UPGRADE_MASTER on the cluster and the UPGRADE_NODES on default-pool.
+        self.assertEqual(result["notes"], ["0 capacity failure(s) among 2 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S"])
+        # The recorded capacity message on a node-pool upgrade: a surge node needs the capacity too, and the finding names the pool.
+        stockout = {"name": "operation-pool-stockout", "operationType": "UPGRADE_NODES", "status": "DONE", "startTime": (RECORDED_AT - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%S.000000Z"), "targetLink": "https://container.googleapis.com/v1/projects/196584622296/zones/us-central1-a/clusters/seeded-b/nodePools/default-pool", "error": {"message": "Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1-a."}}
+        reads = project_reads(**{shared.PROJECT_READ_OPERATIONS: recorded("project_operations.json") + [stockout]})
+        result = control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record, reads=reads))
+        self.assertEqual([(f["operation"], f["operation_type"], f["pool"], f["date"]) for f in result["risks"]], [("operation-pool-stockout", "UPGRADE_NODES", "default-pool", "2026-10-17")])
+        self.assertTrue(control_plane_upgrade_history.describe(result["risks"][0]).startswith("UPGRADE_NODES on default-pool on 2026-10-17 failed on compute capacity in us-central1-a (Try a different location"))
+        self.assertEqual(result["notes"], ["1 capacity failure(s) among 3 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S"])
         for message in ("ZONE_RESOURCE_POOL_EXHAUSTED", "Stockout in zone", "Insufficient quota"):
             self.assertTrue(control_plane_upgrade_history.names_capacity(message), message)
         self.assertFalse(control_plane_upgrade_history.names_capacity("operation aborted by the user"))
