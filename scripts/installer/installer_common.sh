@@ -1298,8 +1298,9 @@ next_home_channel_unset_remedy() {
   esac
 }
 
-# Set by warn_next_home_channel_unset so the front door's closing summary can
-# say it again where the reader of a non-interactive run's log will see it.
+# Set by warn_next_home_channel_unset, and again by install.sh from the mode
+# after the apply, so the front door's closing summary can say it again where
+# the reader of a non-interactive run's log will see it.
 NEXT_HOME_CHANNEL_UNSET_KEY=""
 
 # Warns when the apply leaves the gateway's chat backend without a home

@@ -84,7 +84,8 @@ print_a2a_gateway_steps() {
     echo -e "[ ] ${step}. ALLOWED_USERS is empty, so the A2A gateway answers everyone the app is visible to (step 1's Visibility)."
     echo -e "       To answer only some people, set ${C_WHITE}ALLOWED_USERS${C_RESET} in install.env to their email addresses and re-run the installer."
   else
-    echo -e "[ ] ${step}. The A2A gateway answers only ${C_WHITE}${ALLOWED_USERS}${C_RESET}; a message from anyone else gets no reply."
+    echo -e "[ ] ${step}. The A2A gateway answers only ${C_WHITE}${ALLOWED_USERS}${C_RESET}. Anyone else gets one notice"
+    echo -e "       that asks an admin to add them to the allowed users, and no answers after it."
     echo -e "       To add a person, add the email address to ${C_WHITE}ALLOWED_USERS${C_RESET} in install.env and re-run the installer."
   fi
   echo -e ""

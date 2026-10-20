@@ -317,7 +317,10 @@ class GchatStepsFollowTheModeTest(unittest.TestCase):
                 out = self._run(self._env(mode="next", allowed=allowed))
                 self.assertIn("ALLOWED_USERS is empty, so the A2A gateway answers everyone the app is visible to", out)
         out = self._run(self._env(mode="next", allowed='"a@example.com, b@example.com"'))
-        self.assertIn("The A2A gateway answers only a@example.com, b@example.com; a message from anyone else gets no reply", out)
+        # The gateway posts one refusal notice per unlisted sender
+        # (a2a/gateway/gateway.go, verifySender), then stays silent.
+        self.assertIn("The A2A gateway answers only a@example.com, b@example.com. Anyone else gets one notice", out)
+        self.assertIn("asks an admin to add them to the allowed users, and no answers after it", out)
 
     def test_the_steps_are_numbered_without_a_gap(self):
         without, with_number = self._both(self._env(mode="next"))
