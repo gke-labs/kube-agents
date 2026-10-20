@@ -13,13 +13,14 @@ every repetition classified as infrastructure (``classify.rep_kind``: an
 ``infra`` verdict, a never-ran phrasing, the delegation ceiling), or no line
 for the case at all. INFRA_STREAK_NIGHTS such nights in a row file one issue
 for the case. A night is not counted, either way, when the case's part did
-not run or was lost (the job itself did not run), when the night predates
-the case's first recorded night in the window (a case new to the matrix,
-or back on it, is not "never graded" on the nights it was not on it), when
-infrastructure took at least INFRA_EVENT_FRACTION of the part's cases (a
-pool-wide outage, which is not one case's problem), or when the part
-recorded under THIN_NIGHT_FRACTION of the cases its fullest night in the
-window did. A graded night ends the streak.
+not run or was lost (the job itself did not run, or one job of the part
+lost its build and no clean build of that job followed), when the night
+predates the case's first recorded night in the window (a case new to the
+matrix, or back on it, is not "never graded" on the nights it was not on
+it), when infrastructure took at least INFRA_EVENT_FRACTION of the part's
+cases (a pool-wide outage, which is not one case's problem), or when the
+part recorded under THIN_NIGHT_FRACTION of the cases its fullest night in
+the window did. A graded night ends the streak.
 
 Neither shape touches the domain streak: ``nightly_bugs.graded_nights``
 still drops every infrastructure repetition before it calls a night failing.
@@ -97,16 +98,22 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
     run_url, lost, how, run, tasks}``; ``tasks`` is ``{case: (task, run)}``
     over every clean build of the part that date (the newest line wins), so
     two builds with different case sets, such as two halves of one part,
-    both count; a lost night's are its own build's."""
+    both count; a lost night's are its own build's. ``unrescued`` is true
+    when a job of the part lost its build that date and no clean build of
+    the same job followed: a clean sibling job does not vouch for the cases
+    the lost one was running, so the kept-case rule skips the night."""
     window = window_dates(data, lookback)
     by_part: dict[str, dict[datetime.date, dict]] = {}
     clean_tasks: dict[tuple[str, datetime.date], dict[str, tuple[dict, dict]]] = {}
+    jobs_lost: dict[tuple[str, datetime.date], set[str]] = {}
+    jobs_clean: dict[tuple[str, datetime.date], set[str]] = {}
     for run in nightly.sorted_nightly_runs(data):
         day = nightly.night_date(run)
         if day not in window:
             continue
         lost, how = stopped(run)
         part = nightly.night_part(run)
+        (jobs_lost if lost else jobs_clean).setdefault((part, day), set()).add(run.get("job") or nightly.DEFAULT_NIGHTLY_JOB)
         if not lost:
             held_tasks = clean_tasks.setdefault((part, day), {})
             for task in classify.run_tasks(run):
@@ -131,6 +138,7 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
         for day, n in nights.items():
             own = {t["name"]: (t, n["run"]) for t in classify.run_tasks(n["run"]) if isinstance(t.get("name"), str)}
             n["tasks"] = own if n["lost"] else clean_tasks.get((part, day), {})
+            n["unrescued"] = bool(jobs_lost.get((part, day), set()) - jobs_clean.get((part, day), set()))
     return {part: [nights[d] for d in sorted(nights)] for part, nights in by_part.items()}
 
 
@@ -197,7 +205,7 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str]) -> dict[str, l
     eligible = {}
     for part, nights in parts.items():
         fullest = max((len(n["tasks"]) for n in nights), default=0)
-        eligible[part] = [n for n in nights if not n["lost"] and not infra_event([t for t, _ in n["tasks"].values()])
+        eligible[part] = [n for n in nights if not n["lost"] and not n["unrescued"] and not infra_event([t for t, _ in n["tasks"].values()])
                           and not thin_night(list(n["tasks"]), fullest)]
     out: dict[str, list[dict]] = {}
     for case in cases:
@@ -218,8 +226,8 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str]) -> dict[str, l
                 state, reason = STATE_GRADED, None
             out.setdefault(case, []).append({
                 "date": night["date"],
-                "started": night["started"],
-                "finished": night["finished"],
+                "started": run.get("started"),
+                "finished": run.get("finished"),
                 "build": run.get("build_id"),
                 "job": run.get("job") or nightly.DEFAULT_NIGHTLY_JOB,
                 "run_url": nightly.build_url(run),

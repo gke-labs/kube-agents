@@ -754,12 +754,14 @@ rules). Neither changes the domain streak above.
   nothing: every repetition classified as infrastructure, or no line for it. 3
   such nights in a row file one issue naming the case and the classifier's
   reason. A night is skipped, not counted, when the part did not run or was
-  lost, when it predates the case's first recorded night in the last 14 (a case
-  new to the matrix, or back on it), when infrastructure took half or more of
-  the part's cases (a pool-wide outage, which is not one case's problem), or
-  when the part recorded under half the cases of its fullest night in the
-  window (a short run would otherwise make every missing case "absent"). A
-  graded night ends the streak.
+  lost (or any job of the part lost its build that date and was not re-run
+  clean: another job's clean build does not vouch for its cases), when it
+  predates the case's first recorded night in the last 14 (a case new to the
+  matrix, or back on it), when infrastructure took half or more of the part's
+  cases (a pool-wide outage, which is not one case's problem), or when the part
+  recorded under half the cases of its fullest night in the window (a short run
+  would otherwise make every missing case "absent"). A graded night ends the
+  streak.
   `expected_fail` cases and cases off the matrix are not filed.
 
 An infra issue is deduplicated by its own marker alone: a bot issue of one

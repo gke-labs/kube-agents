@@ -754,6 +754,29 @@ class InfraCaseTest(Harness):
         [issue] = self.filed(gh, infra=True)
         self.assertIn(f"/logs/{JOB}/30000000000000170001/artifacts/eval_case-red_rep1.log", issue["body"])
 
+    def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
+        # Two jobs of the main part each date: the first runs clean, the
+        # second (which runs case-red) is cut off. case-red's job did not run
+        # to its verdict, so the night is skipped, not counted as "absent".
+        half = JOB + "-b"
+        both_clean = [night(14, []), night(14, [green("case-red")], job=half, hour="09")]
+        runs = [r for d in (15, 16, 17) for r in (night(d, []), night(d, [green("case-red")], job=half, hour="09", truncated=True))]
+        gh, _, _ = self.run_once(data(*both_clean, *runs))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # A lost build re-run clean by the same job still counts.
+        runs = [r for d in (15, 16, 17) for r in (night(d, [], lost=True), night(d, [infra_task("case-red")], hour="09"))]
+        gh, _, _ = self.run_once(data(*runs))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+
+    def test_a_verdict_carries_the_clock_of_the_build_that_recorded_it(self):
+        # case-red is kept on the 00:00 build (finished 00:59); the 09:00
+        # build has no line for it. An issue opened at 05:00 already saw the
+        # 17th's verdict, so the night is not news to it.
+        issue = {"number": 3974, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-17T05:00:00Z"}
+        runs = [r for d in (15, 16, 17) for r in (night(d, [infra_task("case-red")], filler=False), night(d, [], hour="09"))]
+        gh, _, _ = self.run_once(data(*runs), FakeGh(open_issues=[issue]))
+        self.assertEqual(self.comments(gh), [])
+
     def test_a_case_recorded_only_before_the_window_is_new_again(self):
         # Recorded on the 1st, then off the matrix for the 14 nights on
         # record and re-listed: not kept from running on nights it was not
