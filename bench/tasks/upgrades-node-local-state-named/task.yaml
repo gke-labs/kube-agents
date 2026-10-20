@@ -67,9 +67,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The role is the planted workload's; it also stands for slot a in
 # `fixture_roles`, so a project without the slot is an environment error.
 fixtures:

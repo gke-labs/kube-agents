@@ -89,9 +89,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The four roles are one per seeded slot, the way the zonal case names them:
 # the runner's per-slot credential is how a declared-line objective tells a
 # cluster the agent missed from a cluster the project does not have
