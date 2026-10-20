@@ -589,7 +589,7 @@ class Workflow(unittest.TestCase):
     def test_the_tick_reads_the_published_scan(self):
         steps = self.jobs["refresh-and-adjudicate"]["steps"]
         fetch = next(step for step in steps if "pool-state.json" in step.get("run", "") and "health-prev.json" in step["run"])
-        self.assertIn('gsutil -q cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true', fetch["run"])
+        self.assertIn('gcloud storage cp "$DASHBOARD_BUCKET/pool-state.json" work/pool-state.json || true', fetch["run"])
         adjudicate = next(step for step in steps if step.get("name") == "Adjudicate")
         self.assertIn("--pool-state work/pool-state.json", adjudicate["run"])
 

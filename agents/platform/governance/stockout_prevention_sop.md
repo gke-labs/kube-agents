@@ -63,7 +63,7 @@ A project whose own Kubernetes Engine API is disabled holds no cluster; its `clu
     "command": "kubectl --context prod-usc1 get computeclasses -A -o yaml"
   }
   ```
-  `check` is the backticked slug from the §3 heading that defines it — `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`, and so on. `command` is the literal invocation you issued on that cluster for that check. It must name one of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm`, or `curl`; anything under eight characters is rejected.
+  `check` is the backticked slug from the §3 heading that defines it — `ccc-missing-fallbacks`, `ccc-no-ondemand-floor`, and so on. `command` is the literal invocation you issued on that cluster for that check. It must name one of `kubectl`, `gcloud`, `gcloud storage`, `bq`, `helm`, or `curl`; anything under eight characters is rejected.
 - **A check the cluster's shape rules out is declared in `checks_not_applicable`** with a specific reason:
   ```json
   {

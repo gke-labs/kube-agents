@@ -317,7 +317,7 @@ class PromotionPipelineWiringTest(unittest.TestCase):
         )
 
     def test_the_eval_wait_activates_its_credential_for_gsutil(self):
-        """gsutil ignores GOOGLE_GHA_CREDS_PATH; the poller would see an empty bucket.
+        """gcloud storage ignores GOOGLE_GHA_CREDS_PATH; the poller would see an empty bucket.
 
         Without the explicit `gcloud auth login --cred-file`, every listing the
         poller makes fails on anonymous credentials, no build is ever found, and
