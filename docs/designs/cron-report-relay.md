@@ -221,7 +221,13 @@ it renders from its own line and the findings document (`render_chat_report`;
 hours (the stream lease, which covers one step) and that holds no finished
 report for this repository is the same run; any other `start` opens a new
 record, and so does a `start` that finds no finished part, which a run that
-never reached `finish` left. A `finish` applies the age and repository rule. The relay
+never reached `finish` left. A `finish` applies the age and repository rule, with one
+exception: a later `finish` of a repository whose entry `start` opened and an earlier
+`finish` filled, within the two hours, is the same run. It adds its report under the
+earlier one, below a label line, and gives the record a new `run` stamp. The earlier
+`finish` saves its `silent_ok` on the entry before it writes the report store, and when
+that was `false` the later one is not silent either and its automatic sweep opens no pull request
+(`earlier_finish`). A `finish` with no `start` fills no entry and stays a run of its own. The relay
 reads the record, over the gateway's sandbox login where the shell runs in the
 shell sandbox (`sandbox_exec.read_bytes`).
 
