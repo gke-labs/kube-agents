@@ -636,7 +636,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 }
 
 # ─── The cut-off report ──────────────────────────────────────────────────────
-# A Prow deadline (the nightly's 480m, the presubmit's 360m) arrives as
+# A Prow deadline (the nightly's, the presubmit's 360m) arrives as
 # SIGTERM, which the trap below turns into an exit before the suite step ever
 # runs. The nights of 2026-09-18 and 09-21 (builds 2101099042170736640 and
 # 2102186223282950144) had finished 105 and 122 units when it arrived and
@@ -2923,6 +2923,12 @@ unit_cost_hint() {
     # The same shape again, plus a detector stop and relaunch before the live
     # card wait. Unmeasured; priced with its siblings.
     gitops-drift-backlog-digest) echo 900 ;;
+    # The two CUJ 1 halves (#2889), registered 2026-10-20. Same shape as
+    # the two above -- infra lock, a plant, an inject and a card wait --
+    # and measured 7-11 minutes a repetition on a dev install, so the
+    # drift band is the ceiling rather than the expectation.
+    gitops-drift-deleted-policy-triage) echo 900 ;;
+    gitops-drift-load-bearing-change-triage) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev

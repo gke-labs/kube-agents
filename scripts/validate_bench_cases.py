@@ -162,18 +162,6 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
-    # as the stack cases below: a `stack:` case runs alone on lock-infra
-    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
-    # chain is already at or past the 480m deadline on cost hints alone.
-    "gitops-drift-deleted-policy-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
-    "gitops-drift-load-bearing-change-triage": (
-        "#2889: stack case held out of the nightly until the infra-lock "
-        "chain has room"
-    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record

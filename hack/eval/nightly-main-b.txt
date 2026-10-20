@@ -31,3 +31,11 @@ obtainability-planted-orphan-service
 fleet-audit-unchanged-finding-keeps-wording
 first-install-hello-running
 first-install-hello-done
+# One of the two CUJ 1 halves registered on 2026-10-20 (#2889). Both landed
+# in main-a and took its chain 1950s past main-b's, so one moves here: 7950s
+# against 7800s. This one rather than its sibling because its plant is the
+# longer of the two -- three observed rollouts, two of them waiting out a
+# failure -- and because it leaves main-a with three drift cases rather than
+# four, which spends less of that install's ALERT_DAILY_LIMIT_DRIFT bucket
+# on one project.
+gitops-drift-load-bearing-change-triage

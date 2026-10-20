@@ -905,6 +905,25 @@
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
+# The revert half of CUJ 1: a GitOps-owned NetworkPolicy deleted out of band,
+# where the live state is the accident and restoring what git declares is the
+# right answer. Its stack plants the policy under the GitOps field manager,
+# deletes it, and asserts the namespace holds none; the record carries
+# `join: no_object` and no `owners` key, which is what the detector emits for
+# a delete (#2889). Holds the infra lock; 900s, the drift band its two
+# siblings carry.
+./tasks/gitops-drift-deleted-policy-triage/task.yaml
+
+# The codify half of CUJ 1, and the discriminating one: a hardening setting
+# loosened by hand that turns out to be the only reason the workload runs, so
+# the correct answer is to write the live state into git. Without it an agent
+# that answers "revert" to every security drift scores full marks on the
+# suite, which is the failure CUJ 1 exists to beat. The stack plants three
+# rollout revisions -- declared (never started), non-root uid (crash-looped),
+# root (healthy) -- so the load-bearing property is observable (#2889).
+# Holds the infra lock; 900s, the drift band.
+./tasks/gitops-drift-load-bearing-change-triage/task.yaml
+
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
