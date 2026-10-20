@@ -123,6 +123,13 @@ type CardStopRun struct {
 	// Quiet marks a follow-up (followUpCardStop): it posts only a stop that
 	// stopped something, and a failure.
 	Quiet bool `json:"quiet,omitempty"`
+	// SlackStop marks a control the Slack Stop button started
+	// (slack_stop.go): no placeholder, and its answer and fallback are the
+	// Slack Stop's own replies (slackStopReply), never this file's notices.
+	SlackStop bool `json:"slackStop,omitempty"`
+	// TurnCancelled records that the Slack Stop also cancelled a running
+	// turn, so a result naming no card still says "Stopped.".
+	TurnCancelled bool `json:"turnCancelled,omitempty"`
 	// Promised is set when a stop told "the answer comes"
 	// (cardStopAlreadyNotice) marked this control, so it answers in full
 	// even when Quiet.
@@ -186,6 +193,14 @@ func cardStopPlaceholderOn(backend string) bool {
 // bus (CancelPublished), which is what a program asking to cancel waits on.
 // A control that cannot be started answers the fallback at once.
 func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority Authority, backend string, quiet bool) {
+	g.stopCardsAs(ctx, rec, authority, backend, quiet, CardStopRun{})
+}
+
+// stopCardsAs is stopCards with the Slack Stop button's voice taken from
+// voice (its SlackStop and TurnCancelled): such a control posts no
+// placeholder, and every line it posts is a Slack Stop reply.
+func (g *Gateway) stopCardsAs(ctx context.Context, rec *SessionRecord, authority Authority, backend string, quiet bool, voice CardStopRun) {
+	unconfirmed := voice.unconfirmed()
 	taskID := "task-" + randHex(taskIDHexWidth)
 	correlationID := "corr-" + randHex(correlationIDHexWidth)
 	addressee := rec.Addressee
@@ -200,7 +215,7 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 	if err != nil {
 		if !g.cfg.CapabilityOptional {
 			notStarted("capability mint failed", err)
-			g.post(rec.Key, cardStopUnconfirmedNotice)
+			g.post(rec.Key, unconfirmed)
 			return
 		}
 		g.log.Warn("A2A_CAPABILITY_REQUIRED=false; sending the card stop with no capability", "taskId", taskID, "err", err)
@@ -209,7 +224,7 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 	payload, err := cardStopPayload(taskID, rec.ContextID)
 	if err != nil {
 		notStarted("payload build failed", err)
-		g.post(rec.Key, cardStopUnconfirmedNotice)
+		g.post(rec.Key, unconfirmed)
 		return
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
@@ -217,7 +232,7 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 		lib.WithAuthority(authority.Render(capRef)))
 	if err != nil {
 		notStarted("envelope build failed", err)
-		g.post(rec.Key, cardStopUnconfirmedNotice)
+		g.post(rec.Key, unconfirmed)
 		return
 	}
 
@@ -226,7 +241,7 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 	// the stop is under way while the executor works.
 	statusMsgID := ""
 	switch {
-	case quiet:
+	case quiet, voice.SlackStop:
 	case cardStopPlaceholderOn(backend):
 		if statusMsgID, err = g.adapter.Post(rec.Key, cardStopPlaceholder); err != nil {
 			g.log.Error("card stop placeholder post failed", "conversation", rec.Key, "err", err)
@@ -236,7 +251,8 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 		g.post(rec.Key, cardStopDoorNotice)
 	}
 	rec.CardStop = &CardStopRun{TaskID: taskID, CorrelationID: correlationID, Addressee: addressee,
-		Capability: capRef, StatusMsgID: statusMsgID, StartedAt: time.Now().UTC(), Quiet: quiet}
+		Capability: capRef, StatusMsgID: statusMsgID, StartedAt: time.Now().UTC(), Quiet: quiet,
+		SlackStop: voice.SlackStop, TurnCancelled: voice.TurnCancelled}
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
 	g.relays[taskID] = &relayState{local: true}
@@ -251,7 +267,7 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 		notStarted("publish failed", err)
 		rec.CardStop = nil
 		g.retireTaskRoute(ctx, taskID)
-		g.answerCardStop(rec.Key, statusMsgID, cardStopUnconfirmedNotice)
+		g.answerCardStop(rec.Key, statusMsgID, unconfirmed)
 		return
 	}
 	// Only a stop's own turn tells a door its cancel went out. A quiet
@@ -329,7 +345,7 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
 	}
-	answer, post, outcome, stopped := cardStopUnconfirmedNotice, true, cardStopOutcomeExecutor, 0
+	answer, post, outcome, stopped := run.unconfirmed(), true, cardStopOutcomeExecutor, 0
 	if s.Status.State == lib.StateCompleted {
 		outcome = cardStopOutcomeNoResult
 		result, ok := cardStopResultOf(rs.result)
@@ -345,7 +361,11 @@ func (g *Gateway) finishCardStop(ctx context.Context, rec *SessionRecord, rs *re
 		}
 		if ok {
 			outcome, stopped = cardStopOutcomeAnswered, len(result.Stopped)
-			answer = cardStopReply(result, rec.ActiveTask != nil && !rec.ActiveTask.Detached)
+			if run.SlackStop {
+				answer = slackStopReply(result, run.TurnCancelled)
+			} else {
+				answer = cardStopReply(result, rec.ActiveTask != nil && !rec.ActiveTask.Detached)
+			}
 			// A follow-up that found nothing more says nothing: the first
 			// control already answered the stop.
 			post = !run.Quiet || run.Promised || cardStopNews(result)
@@ -518,7 +538,7 @@ func (g *Gateway) abandonCardStop(ctx context.Context, rec *SessionRecord, autho
 	if err != nil {
 		g.log.Warn("card stop cancel not sent", "taskId", run.TaskID, "err", err)
 	}
-	g.answerCardStop(rec.Key, run.StatusMsgID, cardStopUnconfirmedNotice)
+	g.answerCardStop(rec.Key, run.StatusMsgID, run.unconfirmed())
 	g.logCardStopEnded(rec.Key, run.TaskID, "", "", outcome, "followUp", run.Quiet)
 	g.endCardStop(ctx, rec)
 }
