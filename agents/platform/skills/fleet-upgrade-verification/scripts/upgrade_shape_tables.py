@@ -406,6 +406,9 @@ JDK_FIRST_MAJOR_WITH_CGROUP_V2 = 15
 # milestone 5.0.0) and its runtime change dotnet/runtime#34334; .NET Core 3.1 and 2.1 read
 # cgroup v1 only.
 DOTNET_IMAGE_REPO_MARKERS = ("mcr.microsoft.com/dotnet/", "microsoft/dotnet")
+# .NET Framework (4.x) ships in Windows containers only, which run on Windows pools where
+# cgroups do not exist; its images are outside the rule, on either registry path.
+DOTNET_FRAMEWORK_IMAGE_MARKERS = ("mcr.microsoft.com/dotnet/framework/", "microsoft/dotnet-framework")
 DOTNET_TAG_RE = re.compile(r"^(\d+)\.(\d+)")
 DOTNET_CGROUP_V2_VERSION = (5, 0)
 # From Kubernetes 1.28 the kubelet sets memory.oom.group on every container on a cgroup v2

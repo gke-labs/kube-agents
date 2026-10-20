@@ -4,7 +4,8 @@ read it: a JDK below 8u372, 11.0.16 or 15, or a .NET below 5.0, reads its memory
 cgroup v1 paths; on a cgroup v2 node it sizes its heap from the machine and is OOM-killed.
 
 The grade needs two reads: the image tag for the runtime version (`upgrade_shape_tables`,
-pinned tags only) and the pool for whether the upgrade to the target moves it to cgroup v2
+pinned tags only; a .NET Framework image is outside the rule, since it runs in Windows
+containers only, on pools with no cgroup) and the pool for whether the upgrade to the target moves it to cgroup v2
 (`effectiveCgroupMode` and the pin, against GKE's 1.33 migration and 1.35 removal). A runtime
 below the floor on a pool that moves is a `risk`; a known runtime whose tag names no version
 on such a pool is `unknown`; a pool whose mode the record does not carry is `unknown`; a pool
@@ -71,6 +72,8 @@ def runtime_verdict(image: str) -> tuple[str, str] | None:
             return RUNTIME_BELOW, JDK_OLD_MAJOR_TEXT.format(major=major, first=tables.JDK_FIRST_MAJOR_WITH_CGROUP_V2)
         return RUNTIME_UNVERSIONED, JAVA_UNVERSIONED_TEXT
     if any(marker in image for marker in tables.DOTNET_IMAGE_REPO_MARKERS):
+        if any(marker in image for marker in tables.DOTNET_FRAMEWORK_IMAGE_MARKERS):
+            return None
         m = tables.DOTNET_TAG_RE.match(tag)
         if not m:
             return RUNTIME_UNVERSIONED, DOTNET_UNVERSIONED_TEXT

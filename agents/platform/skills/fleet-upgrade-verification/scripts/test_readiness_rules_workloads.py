@@ -356,6 +356,9 @@ class CgroupV2RuntimeTest(unittest.TestCase):
         self.assertEqual(cgroup_v2_runtime.runtime_verdict("mcr.microsoft.com/dotnet/aspnet:3.1"), (below, ".NET 3.1, below 5.0"))
         self.assertEqual(cgroup_v2_runtime.runtime_verdict("mcr.microsoft.com/dotnet/aspnet:8.0")[0], ok)
         self.assertEqual(cgroup_v2_runtime.runtime_verdict("mcr.microsoft.com/dotnet/runtime:latest")[0], unversioned)
+        # .NET Framework runs in Windows containers only, where there is no cgroup to read.
+        self.assertIsNone(cgroup_v2_runtime.runtime_verdict("mcr.microsoft.com/dotnet/framework/aspnet:4.8-windowsservercore-ltsc2022"))
+        self.assertIsNone(cgroup_v2_runtime.runtime_verdict("microsoft/dotnet-framework:4.8"))
         self.assertIsNone(cgroup_v2_runtime.runtime_verdict("busybox:1.36"))
         self.assertIsNone(cgroup_v2_runtime.runtime_verdict("registry.k8s.io/pause:3.10"))
 

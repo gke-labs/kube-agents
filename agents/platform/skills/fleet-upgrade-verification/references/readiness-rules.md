@@ -155,13 +155,14 @@ new rule adds its entry in that order.
   changes under it; a completed pool can be downgraded in place while GKE still offers the previous
   version.
 - `cgroup-v2-runtime` (cgroup v2 under an old runtime), entry 14, risk. Reads: A Java image tag
-  below JDK 8u372, 11.0.16 or 15, or a .NET image tag below 5.0, on a pool the target moves to
-  cgroup v2 (`effectiveCgroupMode` v1 and a target at or past GKE's 1.33 migration, or a pool pinned
-  to v1 and a target at or past the 1.35 removal) is a `risk`; a known runtime whose tag names no
-  version on such a pool, or a pool whose mode the record does not carry, is `unknown`; a pool
-  already on cgroup v2, or staying on v1 at the target, is a note. Action: Move to a runtime that
-  reads cgroup v2 (JDK 8u372, 11.0.16 or 15 and later; .NET 5 and later) or set the heap explicitly;
-  until 1.35 a pool can be pinned to cgroup v1 to buy time.
+  below JDK 8u372, 11.0.16 or 15, or a .NET image tag below 5.0 (a .NET Framework image is outside
+  the rule: Windows containers only, on pools with no cgroup), on a pool the target moves to cgroup
+  v2 (`effectiveCgroupMode` v1 and a target at or past GKE's 1.33 migration, or a pool pinned to v1
+  and a target at or past the 1.35 removal) is a `risk`; a known runtime whose tag names no version
+  on such a pool, or a pool whose mode the record does not carry, is `unknown`; a pool already on
+  cgroup v2, or staying on v1 at the target, is a note. Action: Move to a runtime that reads cgroup
+  v2 (JDK 8u372, 11.0.16 or 15 and later; .NET 5 and later) or set the heap explicitly; until 1.35 a
+  pool can be pinned to cgroup v1 to buy time.
 - `group-oom-kill` (Group OOM kill), entry 15, risk, a heuristic. Reads: A heuristic, marked as one
   in every finding, because the process count is not readable from the API: a container whose
   command or args run `supervisord`, `s6-svscan` or `runsvdir`, whose shell `-c` script forks a
