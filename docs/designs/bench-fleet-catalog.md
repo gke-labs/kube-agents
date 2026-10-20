@@ -94,7 +94,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-four fixtures: thirty-one across the four cluster slots and three project-scoped. Most in-cluster
+Thirty-five fixtures: thirty-two across the four cluster slots and three project-scoped. Most in-cluster
 fixtures are on slot `a`, across the eleven seeded namespaces `seeded-debug`,
 `seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
@@ -263,8 +263,8 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Twenty-nine of the thirty-one are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
-`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
+Thirty of the thirty-two are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+`declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the five
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,

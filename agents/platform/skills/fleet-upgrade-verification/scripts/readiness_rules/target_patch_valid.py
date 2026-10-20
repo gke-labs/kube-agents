@@ -68,23 +68,30 @@ NODE_LIST_CLAUSE = " (validNodeVersions lists it, which serves a pool move alone
 # The action names an active version to move to: the newest patch of the version's own minor at
 # or above it (a channel can still list an older patch of the minor it has moved past, which is
 # no target), else the lowest active version above it, else nothing the channel lists.
-ACTION_NEWEST_FORMAT = "target the newest active patch of the minor on {channel}: {newest}"
-ACTION_NEXT_FORMAT = "no active patch of {minor} at or above it on {channel}; the next active version is {next}"
-ACTION_NONE_FORMAT = "no active version at or above it on {channel}"
+ACTION_NEWEST_FORMAT = "target the newest active patch of the minor on {where}: {newest}"
+ACTION_NEXT_FORMAT = "no active patch of {minor} at or above it on {where}; the next active version is {next}"
+ACTION_NONE_FORMAT = "no active version at or above it on {where}"
+# The list a finding was graded against, and where its action looks: the channel's validVersions
+# on a channel, validMasterVersions on none (a static cluster takes versions from that list).
+ROSTER_CHANNEL_FORMAT = "the {channel} channel's {field}"
+ROSTER_NO_CHANNEL_FORMAT = "{field} (no channel)"
+WHERE_CHANNEL_FORMAT = "the {channel} channel"
+PAST_CHANNEL = "the channel has moved past it, whatever another channel still lists"
+PAST_NO_CHANNEL = "the list no longer serves it"
 MINOR_FORMAT = "{major}.{minor}"
 TARGET_FINDING_FORMAT = (
-    "target {version} is in neither the {channel} channel's validVersions nor validNodeVersions at {location}: "
+    "target {version} is in neither {roster} nor validNodeVersions at {location}: "
     "a withdrawn patch stays selectable and a node pool upgrade to it fails on an image the provider no longer serves; {action}"
 )
 TARGET_CONTROL_PLANE_FINDING_FORMAT = (
-    "target {version} is not in the {channel} channel's validVersions at {location}, which the control plane's move to it needs{node_clause}: "
+    "target {version} is not in {roster} at {location}, which the control plane's move to it needs{node_clause}: "
     "the channel refuses the move, and a withdrawn patch stays selectable; {action}"
 )
 CONTROL_PLANE_FINDING_FORMAT = (
-    "control plane {version} is not among the {channel} channel's validVersions at {location} "
-    "(the channel has moved past it, whatever another channel still lists); {action}"
+    "control plane {version} is not among {roster} at {location} "
+    "({past}); {action}"
 )
-NOTE_FORMAT = "channel {channel}; target {target} {target_verdict}; control plane {master} {master_verdict} in validVersions at {location}; the target's move: {move}"
+NOTE_FORMAT = "channel {channel}; target {target} {target_verdict}; control plane {master} {master_verdict} in {field} at {location}; the target's move: {move}"
 TARGET_VALID = "valid"
 TARGET_WITHDRAWN = "withdrawn"
 TARGET_NONE = "none"
@@ -162,15 +169,31 @@ def active_versions_above(version_text: str, roster: list[str]) -> tuple[str | N
     return newest_text, lowest_text
 
 
+def _on_channel(finding: dict) -> bool:
+    return finding.get("channel") != NO_CHANNEL_LABEL
+
+
+def _roster_text(finding: dict) -> str:
+    """The list the finding was graded against, as the text names it."""
+    field = finding.get("field") or (VALID_VERSIONS_KEY if _on_channel(finding) else VALID_MASTER_VERSIONS_KEY)
+    return ROSTER_CHANNEL_FORMAT.format(channel=finding["channel"], field=field) if _on_channel(finding) else ROSTER_NO_CHANNEL_FORMAT.format(field=field)
+
+
+def _where_text(finding: dict) -> str:
+    """Where the action looks for an active version."""
+    return WHERE_CHANNEL_FORMAT.format(channel=finding["channel"]) if _on_channel(finding) else _roster_text(finding)
+
+
 def action_text(finding: dict) -> str:
     """The move the finding recommends, from its `newest` and `next_version`."""
+    where = _where_text(finding)
     if finding.get("newest"):
-        return ACTION_NEWEST_FORMAT.format(channel=finding["channel"], newest=finding["newest"])
+        return ACTION_NEWEST_FORMAT.format(where=where, newest=finding["newest"])
     version = parse_version(finding.get("version")) or (0, 0)
     minor = MINOR_FORMAT.format(major=version[0], minor=version[1])
     if finding.get("next_version"):
-        return ACTION_NEXT_FORMAT.format(minor=minor, channel=finding["channel"], next=finding["next_version"])
-    return ACTION_NONE_FORMAT.format(channel=finding["channel"])
+        return ACTION_NEXT_FORMAT.format(minor=minor, where=where, next=finding["next_version"])
+    return ACTION_NONE_FORMAT.format(where=where)
 
 
 def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
@@ -206,7 +229,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         else:
             target_verdict = TARGET_WITHDRAWN
             newest, next_version = active_versions_above(target_text, roster)
-            out["blocking"].append({"kind": KIND_TARGET, "version": target_text, "channel": channel_label, "location": location, "newest": newest, "next_version": next_version, "move": move, "in_node_list": in_node_list})
+            out["blocking"].append({"kind": KIND_TARGET, "version": target_text, "channel": channel_label, "field": field, "location": location, "newest": newest, "next_version": next_version, "move": move, "in_node_list": in_node_list})
     master_verdict = MASTER_NONE
     if master_text:
         if master_text in roster:
@@ -214,14 +237,16 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         else:
             master_verdict = MASTER_NOT_LISTED
             newest, next_version = active_versions_above(master_text, roster)
-            out["risks"].append({"kind": KIND_CONTROL_PLANE, "version": master_text, "channel": channel_label, "location": location, "newest": newest, "next_version": next_version})
-    out["notes"].append(NOTE_FORMAT.format(channel=channel_label, target=target_text or TARGET_NONE, target_verdict=target_verdict, master=master_text or MASTER_NONE, master_verdict=master_verdict, location=location, move=move))
+            out["risks"].append({"kind": KIND_CONTROL_PLANE, "version": master_text, "channel": channel_label, "field": field, "location": location, "newest": newest, "next_version": next_version})
+    out["notes"].append(NOTE_FORMAT.format(channel=channel_label, target=target_text or TARGET_NONE, target_verdict=target_verdict, master=master_text or MASTER_NONE, master_verdict=master_verdict, field=field, location=location, move=move))
     return out
 
 
 def describe(finding: dict) -> str:
     action = action_text(finding)
+    roster = _roster_text(finding)
     if finding.get("kind") == KIND_TARGET and finding.get("move") == MOVE_CONTROL_PLANE:
-        return TARGET_CONTROL_PLANE_FINDING_FORMAT.format(version=finding["version"], channel=finding["channel"], location=finding["location"], node_clause=NODE_LIST_CLAUSE if finding.get("in_node_list") else "", action=action)
-    template = TARGET_FINDING_FORMAT if finding.get("kind") == KIND_TARGET else CONTROL_PLANE_FINDING_FORMAT
-    return template.format(version=finding["version"], channel=finding["channel"], location=finding["location"], action=action)
+        return TARGET_CONTROL_PLANE_FINDING_FORMAT.format(version=finding["version"], roster=roster, location=finding["location"], node_clause=NODE_LIST_CLAUSE if finding.get("in_node_list") else "", action=action)
+    if finding.get("kind") == KIND_TARGET:
+        return TARGET_FINDING_FORMAT.format(version=finding["version"], roster=roster, location=finding["location"], action=action)
+    return CONTROL_PLANE_FINDING_FORMAT.format(version=finding["version"], roster=roster, location=finding["location"], past=PAST_CHANNEL if _on_channel(finding) else PAST_NO_CHANNEL, action=action)

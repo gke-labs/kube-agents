@@ -28,6 +28,10 @@ the control plane alone is due, as a budget does not; `cluster-status-age` and
 `holds` too, and the check records the member unevaluated for it on the move due, never clean; a
 block on the row still wins.
 
+Once per project is once per reporter process: the skill's fleet run and the daily watch grade a
+project in one process and make the lists once; the Monday audit runs the reporter once per behind
+cluster and makes them per cluster.
+
 A failed project or location read is an error row under the table (exit 1), and the rules that
 need it say `unknown`; a rule that can block then leaves the member `unknown`, one that cannot
 is reported in the note. The three list reads are projected to the fields the rules use, so a

@@ -40,8 +40,9 @@ Read-only against GCP: the gcloud commands it runs are `container clusters list`
 describe` (to tie an API-disabled refusal to its project or resolve a numeric project
 number to its projectId) and, with
 `--readiness`, `container clusters get-credentials`, `compute backend-services list`,
-`compute instances list` and `container operations list` once per project, `container
-clusters describe` and a `container operations list` for one cluster for a member the list
+`compute instances list` and `container operations list` once per project (per reporter
+process: once per behind cluster under the Monday audit, which runs the reporter per cluster),
+`container clusters describe` and a `container operations list` for one cluster for a member the list
 showed not RUNNING with no RUNNING operation on it (the status-age rule confirming a status and
 a holder the project's lists may predate), and, for a rule that reads the audit log,
 `logging read`. The only things it writes are its own state file,

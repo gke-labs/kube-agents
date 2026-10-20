@@ -18,14 +18,16 @@
 #
 # Isolation class: read-only (chat prompt; the script reads with gcloud
 # container, gcloud compute and kubectl get and writes only its own record and
-# per-member kubeconfig files). Eligible tier: nightly from its first merge.
+# per-member kubeconfig files). Eligible tier: nightly once its fixture is applied
+# to the pool projects; parked in FIXTURE_NOT_READY until then.
 #
-# No deterministic mutation safeguard, documented: nothing is planted for this
-# case; the four roles below stand for their slots, so the declared-line
-# objectives can tell a cluster the agent missed from a cluster the project
-# does not have. No `worker_commands` objective either: it reads delegated
-# workers' terminals only and errors on a run the router answered itself, so
-# the report's own output is graded through the declared lines instead.
+# No deterministic mutation safeguard, documented: the planted backend service is
+# read by the report and changed by nothing in the run; the five roles below (the
+# planted one and one per slot) are how the declared-line objectives tell a cluster
+# the agent missed from a cluster the project does not have. No `worker_commands`
+# objective either: it reads delegated workers' terminals only and errors on a run
+# the router answered itself, so the report's own output is graded through the
+# declared lines instead.
 #
 # Unlike its siblings this case reads a planted fixture: the readiness-lb-drain-timeout
 # role on slot b, a backend service on the default pool's instance group with a
