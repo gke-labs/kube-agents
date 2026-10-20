@@ -1771,6 +1771,24 @@ class DeclaredScope(Base):
         self.assertEqual(self.ledger()["standing_outside"], {})
         self.assertFalse(self.marker().exists())
 
+    def test_an_all_refused_number_keeps_its_learned_id_so_the_hold_survives_a_failed_lookup(self) -> None:
+        """Roster 123456 alone, the number legacy-proj, outside a folder-scoped declaration:
+        the failed tick saves the id it learned beside the record filed under it, so the next
+        tick, the folder lookup failing, still finds the record and posts nothing."""
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        failed = dict(resolved, outcome="unreachable")
+        outs = []
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "123456"}):
+            for containers in ([resolved], [failed]):
+                self.declare_scope(["p1"], containers=containers)
+                code, out = self.run_tick(FakeSandbox(envelope([]), aliases={"123456": "legacy-proj"}))
+                self.assertEqual(code, 0)
+                outs.append(out)
+                self.assertEqual(self.ledger()["project_ids"], {"123456": "legacy-proj"})
+                self.assertEqual(self.ledger()["standing_outside"], {"legacy-proj": ["folders/123456789012"]})
+        self.assertIn("does not list legacy-proj", outs[0])
+        self.assertEqual(outs[1], "", "the hold holds through the failed lookup: no second line")
+
     def test_an_all_failed_tick_keeps_the_record_of_the_project_it_refused_beside_the_failure_it_names(self) -> None:
         """p1's sandbox run fails beside p2's refusal: the tick fails with the
         sandbox's failure, and p2's record is saved all the same, so the

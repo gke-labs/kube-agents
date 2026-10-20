@@ -52,7 +52,7 @@ scope on this pod, where the reconcile's snapshot is
 render until a reconcile tick writes a snapshot that answers), and hands the report the resolved
 scope beside each ``--project``, the ``collector_args`` the platform_control
 ``fleet_scope`` tool hands the SOPs less ``--scope-exclude-clusters``, which the
-report does not take beside ``--project`` (``--scope-projects``, ``--scope-unread``):
+watch omits beside ``--project`` (``--scope-projects``, ``--scope-unread``):
 the report reads a project inside the scope and refuses one outside it with
 the reason, which the table carries as that project's failure; an install
 that declares none keeps the bare flag, and a render this pod cannot read
@@ -183,8 +183,8 @@ PROJECT_FLAG = "--project"
 # script, a fleet-audit collector, refuses a bare ``--project`` there
 # (``fleet_scope_args.DeclaredScope``): without the scope a collector cannot
 # tell a project inside it from one outside. The scope is read on this pod
-# (``scope_flags``) and handed on as the fleet_scope tool spells it, so the
-# flags cannot drift from the collectors'. A render the operator wrote that
+# (``scope_flags``) and handed on as the fleet_scope tool spells it, less the
+# cluster exclusion, so the flags cannot drift from the collectors'. A render the operator wrote that
 # this pod cannot read is a fault, not an undeclared install.
 SCOPE_UNREADABLE_DETAIL = (
     "the operator's scope render could not be read, so whether the install declares a scope is unknown; "
@@ -623,7 +623,7 @@ class ReportRefused(RuntimeError):
 def refused_tick_signature(failed: dict) -> str:
     """The failure marker's key for a tick whose every run was refused: the
     refused projects and their causes, sorted, under ``FAILURE_KEY_REFUSED``."""
-    return json.dumps([FAILURE_KEY_REFUSED, sorted([project, exc.cause] for project, exc in failed.items() if isinstance(exc, ReportRefused))])
+    return json.dumps([FAILURE_KEY_REFUSED, signature_pairs({project: exc.cause for project, exc in failed.items() if isinstance(exc, ReportRefused)})])
 
 
 class SandboxTimedOut(RuntimeError):
@@ -1811,7 +1811,7 @@ def file_refusal(standing: dict[str, list[str]], project: str, cause: str, scope
         standing.pop(project, None)
 
 
-def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, list[str]]) -> None:
+def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, list[str]], ids: dict[str, str] | None = None, loaded_ids: dict[str, str] | None = None) -> None:
     """Save the standing-outside record (``STANDING_OUTSIDE_KEY``) of a tick
     that failed, at whichever step: a table that read nothing, a hop whose
     sandbox call raised, a report that could not be written. Such a tick
@@ -1824,16 +1824,25 @@ def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, 
     change cause, and post again, on each lookup that fails for a tick, and a
     project filed on a tick whose report could not be written would be posted
     under the lookup's remedy and then the declaration's.
-    Written under that key alone into the ledger as it is on disk, and only
-    when the record moved from ``loaded``, the one the tick read, so a failed
+    The ids the tick learned (``PROJECT_IDS_KEY``, ``ids`` against
+    ``loaded_ids``) are saved beside it: the record is filed under the id a
+    refusal named, and a roster that spells the project by number finds the
+    record only through the id.
+    Written under those keys alone into the ledger as it is on disk, and only
+    when the record or the ids moved from what the tick read, so a failed
     tick that filed nothing still leaves no ledger and a standing failure
     rewrites nothing; a record that cannot be written is the hold not
     carried, which the next refusal re-files."""
-    if standing == loaded:
+    # Only a number that learned another id moves the ids: an id spelling maps to itself.
+    learned = {spelling: key for spelling, key in (ids or {}).items() if spelling != key}
+    ids_moved = ids is not None and learned != {s: k for s, k in (loaded_ids or {}).items() if s != k}
+    if standing == loaded and not ids_moved:
         return
     try:
         ledger = load_ledger(path)
         ledger[STANDING_OUTSIDE_KEY] = standing
+        if ids_moved:
+            ledger[PROJECT_IDS_KEY] = ids
         save_ledger(path, ledger)
     except OSError:
         pass
@@ -1964,11 +1973,12 @@ def tick(dry_run: bool = False) -> list[str]:
     ledger = load_ledger(ledger_path)
     standing = ledger[STANDING_OUTSIDE_KEY]
     loaded_standing = {project: list(containers) for project, containers in standing.items()}
+    loaded_ids = dict(ledger[PROJECT_IDS_KEY])
     try:
         return sweep(started, home, ledger, dry_run)
     except Exception:
         if not dry_run:
-            keep_standing(ledger_path, standing, loaded_standing)
+            keep_standing(ledger_path, standing, loaded_standing, ledger[PROJECT_IDS_KEY], loaded_ids)
         raise
 
 

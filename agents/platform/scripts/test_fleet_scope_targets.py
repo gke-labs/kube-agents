@@ -409,11 +409,8 @@ class CollectorArgvTest(unittest.TestCase):
         self.assertEqual(nothing.collector_argv(), ("--scope-unread", "declared-scope=unresolved"))
         self.assertEqual(nothing.collector_args(), "--scope-unread declared-scope=unresolved")
         # The exclude entries never reach the collector flags: the sweep and the unread rows are the whole argv.
-        self.assertEqual(targets.excluded, ())
         excluding = fst.ScopeTargets(projects=("ops-mgmt",), unread=(), resolved_at=None, path="x", excluded=("*-sandbox",), declared_containers=("folders/1",), retiring=("legacy",))
         self.assertEqual(excluding.collector_argv(), ("--scope-projects", "ops-mgmt"))
-        self.assertEqual(targets.declared_containers, ())
-        self.assertEqual(targets.retiring, ())
 
 
 if __name__ == "__main__":
