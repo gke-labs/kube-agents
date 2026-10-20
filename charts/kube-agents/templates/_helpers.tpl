@@ -841,8 +841,8 @@ model_list:
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching, for Anthropic-family models only: the same $claude gate as
-  additional_drop_params above. On Gemini, LiteLLM turns these markers into
+  Prompt caching, for Anthropic-family models only: the $claude gate, which
+  leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
   Vertex explicit context caching: a cachedContents list before every call,
   and a create whenever the cached prefix is new. A create that Vertex holds
   past its request credential's life fails the whole turn (a 401 after a

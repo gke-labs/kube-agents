@@ -361,12 +361,14 @@ class TestHook(unittest.TestCase):
             status_code = 429
 
         with mock.patch.object(self.hook, "_router", return_value=_ROUTER):
-            asyncio.run(instance.async_post_call_failure_hook({"model": "model-default"}, _Throttled(), None))
+            asyncio.run(instance.async_post_call_failure_hook({"model": "model-default", "api_key": "tok-1"}, _Throttled(), None))
             self.assertTrue(self.hook._cache.usable(), "a 429 is not a verdict on the token")
-            asyncio.run(instance.async_post_call_failure_hook({"model": "gemini"}, _Unauthorized(), None))
+            asyncio.run(instance.async_post_call_failure_hook({"model": "gemini", "api_key": "tok-1"}, _Unauthorized(), None))
             self.assertTrue(self.hook._cache.usable(), "another provider's 401 is not about this token")
+            asyncio.run(instance.async_post_call_failure_hook({"model": "model-default", "api_key": "tok-0"}, _Unauthorized(), None))
+            self.assertTrue(self.hook._cache.usable(), "a late 401 for a token already replaced must not drop its successor")
             with self.assertLogs(self.hook.logger, level="WARNING"):
-                asyncio.run(instance.async_post_call_failure_hook({"model": "model-default"}, _Unauthorized(), None))
+                asyncio.run(instance.async_post_call_failure_hook({"model": "model-default", "api_key": "tok-1"}, _Unauthorized(), None))
         self.assertFalse(self.hook._cache.usable())
         self.assertEqual(self._run({"model": "model-default"})["api_key"], "tok-2")
 

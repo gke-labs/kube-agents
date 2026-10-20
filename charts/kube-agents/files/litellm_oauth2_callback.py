@@ -304,10 +304,15 @@ class OAuth2ClientCredentials(CustomLogger):
         # The server no longer honours the token it was sent (revoked, a
         # rotated signing key, a restarted token store): forget it, so the next
         # request exchanges for a new one instead of waiting out the stated
-        # lifetime. Only for an alias this hook supplies the token to.
+        # lifetime. Only for an alias this hook supplies the token to, and
+        # only when the refused token is the one still cached: a late 401 for
+        # a token already replaced must not drop its successor.
+        request_data = request_data or {}
         if getattr(original_exception, "status_code", None) != UNAUTHORIZED_STATUS or not _cache.token:
             return None
-        if not hosted_vllm_deployments((request_data or {}).get(MODEL_KEY, ""), _router()):
+        if request_data.get(REQUEST_CREDENTIAL_KEY) != _cache.token:
+            return None
+        if not hosted_vllm_deployments(request_data.get(MODEL_KEY, ""), _router()):
             return None
         _cache.drop()
         logger.warning("oauth2: the server answered %d to the cached bearer token; dropped it, the next request fetches a new one", UNAUTHORIZED_STATUS)
