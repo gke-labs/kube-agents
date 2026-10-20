@@ -1228,6 +1228,9 @@ BODY_BUDGET = 60_000
 # bounded to a slice of the budget: past this a fleet keeps its findings and
 # loses the complete list.
 ALL_FINDINGS_BLOCK_CAP = 12_000
+# Reads that block back: `_finish` uses it as the last run's filed ids when the
+# report store holds no document to say what the body cut.
+ALL_FINDINGS_RE = re.compile(r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M)
 # What an id costs the hidden delta block beyond its own length: its two
 # quotes and the comma joining it to the next.
 DELTA_SLOT_CHARS = 3
@@ -18699,6 +18702,15 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # run that has room.
     if filed is not None:
         new_ids = [fid for fid in new_ids if fid not in filed[0]]
+    else:
+        # A seeded memory has no document, but a body that cut findings named
+        # every one it filed in its complete block.
+        complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
+        try:
+            cut = set(json.loads(complete[-1])) if complete else set()
+        except (json.JSONDecodeError, TypeError):
+            cut = set()
+        new_ids = [fid for fid in new_ids if fid not in cut]
     # Held back again for the collector, on the same principle as the coverage
     # rule one source further out: a candidate the collector still emits is the
     # condition still holding, whatever this run's document did or did not say

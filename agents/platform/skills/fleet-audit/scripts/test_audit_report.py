@@ -25177,6 +25177,30 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(self.stdout_json()["status"], "HELD")
         self.assertNotIn("could not be read to seed one", self.err)
 
+    def test_a_seeded_memory_does_not_announce_findings_the_old_body_cut_as_new(self):
+        # A body from before cut findings were listed names only its full rows
+        # in the delta block and every filed id in the complete block; with no
+        # stored document to read, the complete block is what says they were
+        # filed.
+        findings = [
+            {**f, "remediation": {"kind": "manual", "note": "Fix it by hand."}}
+            for f in bulk_findings(150)
+        ]
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        named = audit_report.parse_delta_block(body)
+        full = sorted(audit_report.parse_finding_titles(body))
+        self.assertTrue(audit_report.all_findings_block(named), "ids must fit the block's cap")
+        self.assertLess(len(full), len(named), "fixture must list findings")
+        old = body.replace(audit_report.delta_block(named), audit_report.delta_block(full))
+        old = old.replace(
+            audit_report.delta_block(full),
+            audit_report.delta_block(full) + "\n" + audit_report.all_findings_block(named),
+        )
+        self.harness.replies = {"issue-list": self.listing(old)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=findings)), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
+
     def test_start_seeds_from_the_listing_without_a_second_read(self):
         previous = published_body(make_doc(), generated_at=NOW)
         self.harness.replies = {"issue-list": self.listing(previous)}
