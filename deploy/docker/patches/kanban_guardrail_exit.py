@@ -347,6 +347,7 @@ LAST_API_FAILURE_ATTR = "_kube_last_api_failure"
 TASK_ENV = "HERMES_KANBAN_TASK"
 RUN_ID_ENV = "HERMES_KANBAN_RUN_ID"
 GOAL_MODE_ENV = "HERMES_KANBAN_GOAL_MODE"
+DB_ENV = "HERMES_KANBAN_DB"
 
 #: The value ``_default_spawn`` sets ``HERMES_KANBAN_GOAL_MODE`` to for a
 #: goal-mode card; anything else, including unset, is a normal worker.
@@ -857,7 +858,7 @@ def record_rate_limit_block(
             pass
 
 
-def _default_connect():
+def _default_connect(db_path=None):
     """The board opener: ``hermes_cli.kanban_db_connect.connect`` since the
     v2026.9.14 split of ``kanban_db``, else the pre-split
     ``hermes_cli.kanban_db.connect`` (the split module only forwards that name
@@ -866,6 +867,8 @@ def _default_connect():
         from hermes_cli.kanban_db_connect import connect
     except ImportError:
         from hermes_cli.kanban_db import connect
+    if db_path is not None:
+        return lambda: connect(db_path)
     return connect
 
 
@@ -907,7 +910,7 @@ def block_rate_limited_worker(
     ):
         return False
     if connect is None:
-        connect = _default_connect()
+        connect = _default_connect(env.get(DB_ENV))
     if block_task is None:
         from hermes_cli import kanban_db as _kb
 
@@ -1089,7 +1092,7 @@ def close_failed_chat_turn(
     run_id = worker_run_id(env)
     try:
         if connect is None:
-            connect = _default_connect()
+            connect = _default_connect(env.get(DB_ENV))
         if add_comment is None:
             from hermes_cli import kanban_db as _kb
 
@@ -1194,7 +1197,7 @@ def close_no_turn_chat(
     run_id = worker_run_id(env)
     try:
         if connect is None:
-            connect = _default_connect()
+            connect = _default_connect(env.get(DB_ENV))
         if add_comment is None:
             from hermes_cli import kanban_db as _kb
 

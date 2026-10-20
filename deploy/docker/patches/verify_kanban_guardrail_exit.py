@@ -1630,7 +1630,7 @@ no_turn_card, no_turn_run = claimed_card("Bootstrap agent profile (no turn ran)"
 conn = board()
 worker = spawn_worker(conn, no_turn_card)
 close_no_turn = getattr(GUARD, "close_no_turn_chat", None)
-code = close_no_turn(environ=env_for(no_turn_card, no_turn_run)) if close_no_turn else None
+code = close_no_turn(connect=board, environ=env_for(no_turn_card, no_turn_run)) if close_no_turn else None
 exit_worker(worker, code)
 check(
     "a kanban worker on the chat path with no turn exits 1, as -Q does",
@@ -1691,7 +1691,7 @@ nt_workers = []
 conn = board()
 for tid, run_id in no_turn_burst:
     nt_workers.append(spawn_worker(conn, tid))
-nt_codes = [close_no_turn(environ=env_for(tid, run_id)) for tid, run_id in no_turn_burst] if close_no_turn else []
+nt_codes = [close_no_turn(connect=board, environ=env_for(tid, run_id)) for tid, run_id in no_turn_burst] if close_no_turn else []
 for worker, c in zip(nt_workers, nt_codes):
     exit_worker(worker, c)
 crashed = KD.detect_crashed_workers(board())

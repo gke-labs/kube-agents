@@ -1347,6 +1347,38 @@ class CloseFailedChatTurnTest(unittest.TestCase):
         self.assertEqual(com.calls[0][1], kge.FAILED_TURN_COMMENT_AUTHOR)
 
 
+class CloseNoTurnChatTest(unittest.TestCase):
+    """The single-query exit site when no turn ran: comment, charge, exit 1."""
+
+    def _close(self, rows=(("t_80ff98c9", "running", 28),), recorder=None, record=None, **over):
+        conn = ClosableConn(board(list(rows)))
+        com = recorder or CommentRecorder()
+        rec = record or Recorder()
+        kwargs = dict(
+            connect=lambda: conn, add_comment=com, record_failure=rec, environ=WORKER_ENV,
+            cron_run=False, delegated_child=False,
+        )
+        kwargs.update(over)
+        return kge.close_no_turn_chat(**kwargs), com, rec
+
+    def test_no_turn_worker_charges_crashed_and_comments_before_exit_1(self):
+        code, com, rec = self._close()
+        self.assertEqual(code, 1)
+        task_id, author, body = com.calls[0]
+        self.assertEqual((task_id, author), ("t_80ff98c9", "platform"))
+        self.assertIn("ended before any turn ran", body)
+        self.assertIn("Run 28 ", body)
+        self.assertEqual(rec.calls[0][1]["error"], kge.NO_TURN_ERROR)
+        self.assertEqual(rec.calls[0][1]["outcome"], kge.NO_TURN_OUTCOME)
+
+    def test_default_connect_binds_hermes_kanban_db(self):
+        opened = []
+        with mock.patch.dict(sys.modules, {"hermes_cli.kanban_db_connect": types.SimpleNamespace(connect=lambda path: opened.append(path))}):
+            fn = kge._default_connect("/custom/path.db")
+            fn()
+            self.assertEqual(opened, ["/custom/path.db"])
+
+
 # The applier is exercised against a miniature of the five real files, in the
 # shape v2026.9.14 gives them: the turn loop's phases are helpers that return a
 # verdict, and the loop copies the verdict's fields back into its locals. The
