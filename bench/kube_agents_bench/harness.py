@@ -649,7 +649,7 @@ def _extract_infra_failure_reason(text: str | None) -> str | None:
     if text.startswith(_RATE_LIMIT_REASON_PREFIX):
         match = _FAILURE_REASON_PATTERN.search(text)
         if match:
-            return match.group(1) if match.group(1) in _INFRA_FAILURE_REASONS else None
+            return match.group(1) if match.group(1) == "rate_limit" else None
         return "rate_limit"
     return None
 
@@ -2590,8 +2590,10 @@ class KubeAgentsHarness(AgentHarness):
         if status in _FAILURE_STATUSES:
             # A card a block landed in ``blocked`` (or, on the loop breaker's second
             # block, ``triage``) must carry block_kind == "transient" to be recognized
-            # as infra; stops non-transient blocks (e.g. needs_input) from admitting
-            # summaries as infra failure reasons.
+            # as infra. ``transient`` is the signature stamped by Hermes's patched
+            # 429 exit (deploy/docker/patches/kanban_guardrail_exit.py: RATE_LIMIT_BLOCK_KIND);
+            # non-transient blocks (e.g. worker-authored needs_input or capability per
+            # SOUL.md §0) are refused from admitting summaries into infra failure reasons.
             if status in ("blocked", "triage") and bblock_kinds.get(task_id) != "transient":
                 return []
             if task_id in bsummaries:
@@ -2673,26 +2675,19 @@ class KubeAgentsHarness(AgentHarness):
         awaited: Sequence[str],
         statuses: Mapping[str, str],
         fallback_messages: Mapping[str, Sequence[str]] | None = None,
-        poll_interval: float = 0.1,
         unsettled: list[str] | None = None,
         live_statuses: dict[str, str] | None = None,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
 
-        When the board read fails after retries, falls back to the most recent failure
-        summary/error seen during polling.
+        When the board read fails, falls back immediately to the most recent failure
+        summary/error seen during polling without retrying.
         """
         failure_cards = [t for t in awaited if statuses.get(t) in _FAILURE_STATUSES]
         if not failure_cards:
             return []
         board_messages: list[str] = []
-        final_bstate = None
-        for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
-            final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
-            if final_bstate is not None:
-                break
-            if attempt < _MAX_TRANSPORT_FAILURES:
-                time.sleep(max(0.0, poll_interval))
+        final_bstate = board.read_board_state(_agent_shell, failure_cards, _EXEC_TIMEOUT)
         if final_bstate is None:
             _log.warning("kanban board could not be read for failure cards: %s", ", ".join(failure_cards))
             if fallback_messages:
@@ -3028,7 +3023,6 @@ class KubeAgentsHarness(AgentHarness):
                 awaited,
                 statuses,
                 poll_failure_messages,
-                poll_interval=poll_interval,
                 unsettled=unsettled,
                 live_statuses=live_statuses,
             )
@@ -3260,7 +3254,6 @@ class KubeAgentsHarness(AgentHarness):
             awaited,
             latest,
             poll_failure_messages,
-            poll_interval=poll_interval,
             unsettled=unsettled,
             live_statuses=live_statuses,
         )
