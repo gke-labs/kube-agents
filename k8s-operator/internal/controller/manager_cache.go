@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // ManagerCacheOptions is the cache the manager is built with. It is a
@@ -42,8 +44,9 @@ import (
 //     on it.
 //
 // What is left is to keep the kinds that grow with the cluster out of the
-// cache entirely — Pods through podReader, Secrets and the A2A bookkeeping
-// objects through APIReader — and to hold less of what remains, below.
+// cache entirely — Pods through ManagerClientOptions below, Secrets and the
+// A2A bookkeeping objects through APIReader — and to hold less of what
+// remains, below.
 func ManagerCacheOptions() cache.Options {
 	return cache.Options{
 		// managedFields is the largest part of most cached objects and
@@ -62,5 +65,28 @@ func ManagerCacheOptions() cache.Options {
 		// field, but an Update built from a cached copy without it would
 		// delete it from the live object.
 		DefaultTransform: cache.TransformStripManagedFields(),
+	}
+}
+
+// ManagerClientOptions is the client the manager hands its reconcilers, and
+// it is where "this operator does not cache Pods" stops being a convention.
+//
+// Nothing watches Pods, so the informer exists only if something reads one
+// through the cache, and the four reads that do are written to go live
+// (podReader, UsageCounterPoller.reader) with a test apiece. That pins the
+// four; it does not pin the fifth. DisableFor makes the delegating client
+// answer every Pod read from the API server whoever writes it, so a reader
+// added later cannot start a cluster-wide Pod informer by accident, and
+// podReader's fallback to the cached client — the shape tests supply — is
+// live in this process too.
+//
+// It does not make the informer impossible: a Watches() or Owns() on Pods
+// bypasses the client entirely and would start one. Nothing here does that,
+// and the reason not to is in podReader's comment.
+func ManagerClientOptions() client.Options {
+	return client.Options{
+		Cache: &client.CacheOptions{
+			DisableFor: []client.Object{&corev1.Pod{}},
+		},
 	}
 }

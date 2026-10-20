@@ -207,7 +207,8 @@ func main() {
 		LeaderElectionID:       "c5a0294c.kubeagents.x-k8s.io",
 		// What this process holds in memory; controller.ManagerCacheOptions
 		// says what is in the cache, what is kept out of it, and why.
-		Cache: controller.ManagerCacheOptions(),
+		Cache:  controller.ManagerCacheOptions(),
+		Client: controller.ManagerClientOptions(),
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")

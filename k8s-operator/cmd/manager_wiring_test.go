@@ -22,18 +22,26 @@ import (
 //     is true with the field still there. Every other test in the repository
 //     passes either way -- manager_cache_test.go exercises
 //     ManagerCacheOptions() directly and never reaches main.go.
+//   - Client. controller.ManagerClientOptions is what makes "no Pod informer"
+//     a property of the client rather than a convention the four known call
+//     sites keep; drop it and the next cached Pod read anyone writes starts
+//     one again.
 //   - APIReader. SetupWithManager backfills it from the manager when it is
 //     nil, so deleting the line is caught there rather than here; what the
 //     backfill cannot catch is the line pointing somewhere else, because a
 //     non-nil APIReader is left alone. mgr.GetClient() would put every Pod
-//     read back on the cache with the field set and the reconciler running.
-//     The deletion is asserted too, so the two lines are read the same way.
+//     read back on the cache with the field set and the reconciler running —
+//     or it would, without the Client option above, which is why the two are
+//     asserted together. The deletion is asserted too, so all three lines are
+//     read the same way.
 
 const (
 	mainSourceFile           = "main.go"
 	managerOptionsType       = "ctrl.Options"
 	managerCacheField        = "Cache"
 	managerCacheValue        = "controller.ManagerCacheOptions()"
+	managerClientField       = "Client"
+	managerClientValue       = "controller.ManagerClientOptions()"
 	reconcilerType           = "controller.PlatformAgentReconciler"
 	reconcilerAPIReaderField = "APIReader"
 	reconcilerAPIReaderValue = "mgr.GetAPIReader()"
@@ -54,6 +62,8 @@ func TestMainHandsTheManagerItsCacheAndTheReconcilerALiveReader(t *testing.T) {
 	}{
 		{managerOptionsType, managerCacheField, managerCacheValue,
 			"the manager is built with a cache that keeps the managedFields of every cached object"},
+		{managerOptionsType, managerClientField, managerClientValue,
+			"any Pod read through the manager's client is served from the cache, which starts a cluster-wide Pod informer"},
 		{reconcilerType, reconcilerAPIReaderField, reconcilerAPIReaderValue,
 			"podReader serves Pod reads from the cache unless SetupWithManager's nil-backfill catches it, and a non-nil wrong value it cannot"},
 	} {

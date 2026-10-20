@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -51,4 +52,21 @@ func TestTheManagerCacheKeepsNoManagedFields(t *testing.T) {
 	if cached.Name != deployment.Name || cached.Namespace != deployment.Namespace {
 		t.Errorf("the transform changed the object's identity: %s/%s", cached.Namespace, cached.Name)
 	}
+}
+
+// Pods are out of the cache by configuration, not by every reader
+// remembering to ask for a live one. The four readers that exist are tested
+// individually (pod_reads_are_live_test.go); this is what covers the fifth,
+// written by someone who never read those tests.
+func TestTheManagerClientNeverServesAPodFromTheCache(t *testing.T) {
+	opts := ManagerClientOptions()
+	if opts.Cache == nil {
+		t.Fatal("the manager's client has no CacheOptions, so every kind is served from the cache")
+	}
+	for _, obj := range opts.Cache.DisableFor {
+		if _, ok := obj.(*corev1.Pod); ok {
+			return
+		}
+	}
+	t.Errorf("Pods are not in the client's DisableFor (%T), so a cached Pod read starts a cluster-wide Pod informer", opts.Cache.DisableFor)
 }
