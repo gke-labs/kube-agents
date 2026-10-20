@@ -31,6 +31,7 @@ AT = datetime(2026, 9, 14, 15, 0, tzinfo=timezone.utc)
 LAGGING = "1.34.11-gke.1000"
 CURRENT = "1.35.1-gke.1000"
 POOL_LABEL = "cloud.google.com/gke-nodepool"
+POD_RANGE = "10.0.0.0/14"  # every GKE record carries one; the surge-capacity rule counts its free blocks
 
 
 def pool(name="default-pool", version="1.33.4-gke.1000", autoscaling=None, **config):
@@ -38,7 +39,7 @@ def pool(name="default-pool", version="1.33.4-gke.1000", autoscaling=None, **con
 
 
 def cluster(name="seeded-b", location="us-central1-a", pools=(), **extra):
-    record = {"name": name, "location": location, "status": "RUNNING", "currentMasterVersion": LAGGING, "nodePools": list(pools), "locations": [location]}
+    record = {"name": name, "location": location, "status": "RUNNING", "currentMasterVersion": LAGGING, "nodePools": list(pools), "locations": [location], "clusterIpv4Cidr": POD_RANGE}
     record.update(extra)
     return record
 

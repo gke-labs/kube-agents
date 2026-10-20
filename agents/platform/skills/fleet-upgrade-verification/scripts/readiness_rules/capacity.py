@@ -31,9 +31,35 @@ exists. The rule reads the Nodes and the Pods; a pool that removes a node first 
 `unknown` when either was not read. Autopilot members are not graded: GKE owns their
 pools and their surge settings.
 
+The same pool list is read for the other side of the entry, the surge node that must
+exist before a drain: a pool on the surge strategy with `maxSurge` above 0 (GKE's default
+is 1) creates that many nodes beyond its size while it upgrades. Each surge node needs a
+Pod CIDR block of the pool's per-node size (the prefix its nodes' `spec.podCIDR` carries,
+else the block GKE sizes for the pool's pod limit) in the pool's Pod range
+(`networkConfig.podIpv4CidrBlock`, else the cluster's `clusterIpv4Cidr`). The free aligned
+blocks of that range, those no node's block touches, against the surge nodes the pools
+below the target need (the sum of their `maxSurge`, counted per pool, not per zone; a
+blue-green pool creates its green pool instead and is not counted) is a blocker when the
+free blocks are fewer: a node without a block never registers, and the pool upgrade stalls
+between versions. Where the pools' blocks differ in size the largest is the unit, so the
+count is the conservative one. And a pool carrying accelerators (`config.accelerators`)
+that surges with no reservation affinity (`config.reservationAffinity` consuming neither
+ANY_RESERVATION nor SPECIFIC_RESERVATION) is a blocker: a surge node needs accelerator
+capacity the zone may not have, the shape in which a GPU pool upgrade stalled halfway on
+capacity and left the pool on two versions; one under a reservation is a note. The surge
+halves need the target (which pools upgrade) and the Nodes (the blocks held): without the
+target they are one `unknown`, and the Pod range half is `unknown` when the Nodes were not
+read or the record carries no Pod range. Quota is not read here: the stockout-prevention
+audit reads it.
+
 Source for the settings and the strategies:
 https://docs.cloud.google.com/kubernetes-engine/docs/concepts/node-pool-upgrade-strategies
+Source for the per-node block GKE sizes from the pod limit:
+https://docs.cloud.google.com/kubernetes-engine/docs/how-to/flexible-pod-cidr
 """
+
+import ipaddress
+import math
 
 from readiness_rules import (
     CONTEXT_AUTOPILOT,
@@ -132,6 +158,55 @@ UNKNOWN_QUANTITY = "{summary}: {what} did not parse, so its headroom was not mea
 QUANTITY_POD = "the requests of pod {namespace}/{name}"
 QUANTITY_NODE = "the allocatable of node {name}"
 
+# The surge halves. A pool's Pod range is its own secondary range when it has one, else the
+# cluster's, under either spelling of the record; each node's block is its `spec.podCIDR`,
+# which the report's projected node read carries. GKE sizes a node's block at twice its pod
+# limit rounded up to a power of two (110 pods is a /24, 32 pods a /26), the fallback for a
+# pool with no node yet, from the pool's limit, else the cluster's default, else a /24.
+POOL_NETWORK_CONFIG_KEY = "networkConfig"
+POOL_POD_RANGE_KEY = "podIpv4CidrBlock"
+CLUSTER_POD_RANGE_KEY = "clusterIpv4Cidr"
+IP_ALLOCATION_POLICY_KEY = "ipAllocationPolicy"
+IP_ALLOCATION_POD_RANGE_KEY = "clusterIpv4CidrBlock"
+MAX_PODS_CONSTRAINT_KEY = "maxPodsConstraint"
+CLUSTER_DEFAULT_MAX_PODS_KEY = "defaultMaxPodsConstraint"
+MAX_PODS_PER_NODE_KEY = "maxPodsPerNode"
+POD_CIDR_KEY = "podCIDR"
+POD_BLOCK_ADDRESSES_PER_POD = 2
+DEFAULT_POD_BLOCK_PREFIX = 24
+IPV4_BITS = 32
+IPV4_VERSION = 4
+# Accelerators and the reservation a pool consumes, as `nodePools[].config` spells them; a
+# pool with no `reservationAffinity`, or one that consumes NO_RESERVATION, holds none.
+ACCELERATORS_KEY = "accelerators"
+ACCELERATOR_TYPE_KEY = "acceleratorType"
+ACCELERATOR_COUNT_KEY = "acceleratorCount"
+DEFAULT_ACCELERATOR_COUNT = 1
+RESERVATION_AFFINITY_KEY = "reservationAffinity"
+RESERVATION_TYPE_KEY = "consumeReservationType"
+RESERVATIONS_HELD = ("ANY_RESERVATION", "SPECIFIC_RESERVATION")
+# What a finding of this rule is about: the placement half above, or one of the surge halves.
+FINDING_KEY = "finding"
+FINDING_PLACEMENT = "placement"
+FINDING_POD_RANGE = "pod-range"
+FINDING_ACCELERATOR = "accelerator"
+ACCELERATOR_TEXT = "{count} x {type}"
+SURGE_POOL_TEXT = "{pool} (maxSurge {max_surge})"
+POD_RANGE_FINDING_TEXT = (
+    "pod range {range} has {free} free /{prefix} block(s) ({used} of {total} hold a node) and the {need} surge node(s) of pool(s) {pools} "
+    "each need one: a surge node with no block never registers and the pool upgrade stalls between versions; lower max-surge or add a secondary Pod range"
+)
+ACCELERATOR_FINDING_TEXT = (
+    "pool {pool} ({accelerators}) surges (maxSurge {max_surge}) with no reservation affinity: each surge node needs accelerator capacity the zone may not have, "
+    "and a pool upgrade that cannot create one stalls between versions; set the in-place strategy (max-surge 0, max-unavailable 1) or hold a reservation"
+)
+NOTE_ACCELERATOR_RESERVED = "pool {pool} ({accelerators}) surges (maxSurge {max_surge}) under reservation affinity {reservation}"
+UNKNOWN_SURGE_NO_TARGET = "surge pool(s) {pools}: no target, so whether their surge nodes are needed in this upgrade is unknown"
+UNKNOWN_SURGE_VERSION = "surge pool {pool}: version unparsable, so whether its surge nodes are needed in this upgrade is unknown"
+UNKNOWN_POD_RANGE_UNREAD = "pod range headroom for the surge node(s) of pool(s) {pools}: {kind} not read ({error}), so the free blocks were not counted"
+UNKNOWN_POD_RANGE_MISSING = "pod range headroom for the surge node(s) of pool(s) {pools}: the cluster record carries no Pod range, so the free blocks were not counted"
+UNKNOWN_POD_RANGE_UNPARSABLE = "pod range headroom for the surge node(s) of pool(s) {pools}: the Pod range {range!r} did not parse, so the free blocks were not counted"
+
 
 def _int(value, default: int) -> int:
     if isinstance(value, bool):
@@ -176,6 +251,93 @@ def autoscaler_ceiling(pool: dict, cluster: dict) -> tuple[bool, int | None]:
         return True, total
     zones = len(pool.get(POOL_LOCATIONS_KEY) or cluster.get(CLUSTER_LOCATIONS_KEY) or []) or SINGLE_ZONE
     return True, _int(autoscaling.get(MAX_NODES_PER_ZONE_KEY), 0) * zones
+
+
+def surges(settings: dict) -> bool:
+    """Whether the pool's upgrade creates surge nodes: the surge strategy with maxSurge above 0."""
+    return settings["strategy"] == STRATEGY_SURGE and settings["max_surge"] > 0
+
+
+def _config(pool: dict) -> dict:
+    config = pool.get("config")
+    return config if isinstance(config, dict) else {}
+
+
+def pool_accelerators(pool: dict) -> list[dict]:
+    """The accelerators the pool's nodes carry, each with a type."""
+    return [a for a in _config(pool).get(ACCELERATORS_KEY) or [] if isinstance(a, dict) and a.get(ACCELERATOR_TYPE_KEY)]
+
+
+def accelerators_text(accelerators: list[dict]) -> str:
+    return LIST_SEPARATOR.join(ACCELERATOR_TEXT.format(count=_int(a.get(ACCELERATOR_COUNT_KEY), DEFAULT_ACCELERATOR_COUNT), type=a.get(ACCELERATOR_TYPE_KEY)) for a in accelerators)
+
+
+def pool_reservation(pool: dict) -> str | None:
+    """The reservation type the pool's nodes consume, or None when they hold none."""
+    affinity = _config(pool).get(RESERVATION_AFFINITY_KEY)
+    kind = affinity.get(RESERVATION_TYPE_KEY) if isinstance(affinity, dict) else None
+    return kind if kind in RESERVATIONS_HELD else None
+
+
+def pool_pod_range(pool: dict, cluster: dict) -> str | None:
+    """The Pod range the pool's nodes draw their blocks from: its own, else the cluster's."""
+    network = pool.get(POOL_NETWORK_CONFIG_KEY)
+    own = network.get(POOL_POD_RANGE_KEY) if isinstance(network, dict) else None
+    policy = cluster.get(IP_ALLOCATION_POLICY_KEY)
+    shared = cluster.get(CLUSTER_POD_RANGE_KEY) or (policy.get(IP_ALLOCATION_POD_RANGE_KEY) if isinstance(policy, dict) else None)
+    return own or shared or None
+
+
+def pod_network(text):
+    """The IPv4 network a Pod range or a node's block names, or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        network = ipaddress.ip_network(text.strip(), strict=False)
+    except ValueError:
+        return None
+    return network if network.version == IPV4_VERSION else None
+
+
+def block_prefix_for_pods(max_pods) -> int | None:
+    """The prefix of the block GKE sizes for a pod limit: twice the limit, rounded up to a power of two."""
+    pods = _int(max_pods, 0)
+    if pods <= 0:
+        return None
+    return IPV4_BITS - math.ceil(math.log2(pods * POD_BLOCK_ADDRESSES_PER_POD))
+
+
+def pool_block_prefix(pool: dict, cluster: dict, pool_nodes: list[dict]) -> int:
+    """The per-node block prefix of the pool: the largest block among its nodes' `spec.podCIDR`,
+    else the block GKE sizes for its pod limit (the pool's, else the cluster's default), else a /24."""
+    prefixes = [network.prefixlen for network in (pod_network((n.get("spec") or {}).get(POD_CIDR_KEY)) for n in pool_nodes) if network is not None]
+    if prefixes:
+        return min(prefixes)
+    for holder, key in ((pool, MAX_PODS_CONSTRAINT_KEY), (cluster, CLUSTER_DEFAULT_MAX_PODS_KEY)):
+        constraint = holder.get(key)
+        prefix = block_prefix_for_pods(constraint.get(MAX_PODS_PER_NODE_KEY)) if isinstance(constraint, dict) else None
+        if prefix is not None:
+            return prefix
+    return DEFAULT_POD_BLOCK_PREFIX
+
+
+def free_blocks(pod_range, prefix: int, nodes: list[dict]) -> tuple[int, int, int]:
+    """(free, held, total): the aligned /`prefix` blocks of `pod_range` no node's block touches,
+    the blocks the nodes hold, and the range's count of them. A node block larger than the unit
+    holds every unit in it, a smaller one the unit it sits in, and a node outside the range
+    holds none of it; a unit larger than the range is the range itself."""
+    unit = max(prefix, pod_range.prefixlen)
+    total = 1 << (unit - pod_range.prefixlen)
+    shift = IPV4_BITS - unit
+    held: set[int] = set()
+    for node in nodes:
+        network = pod_network((node.get("spec") or {}).get(POD_CIDR_KEY))
+        if network is None or not network.subnet_of(pod_range):
+            continue
+        first = (int(network.network_address) - int(pod_range.network_address)) >> shift
+        last = (int(network.broadcast_address) - int(pod_range.network_address)) >> shift
+        held.update(range(first, last + 1))
+    return total - len(held), len(held), total
 
 
 def _term_matches(term: dict, labels: dict) -> bool:
@@ -387,6 +549,66 @@ def _is_autopilot(cluster: dict, context) -> bool:
     return bool((cluster.get(AUTOPILOT_KEY) or {}).get(AUTOPILOT_ENABLED_KEY))
 
 
+def _grade_surge(out: dict, cluster: dict, surge_pools: list[tuple[dict, dict]], pools_parsed: dict, target, nodes, nodes_error) -> None:
+    """The surge halves over the pools whose upgrade creates surge nodes: each pool below the
+    target with accelerators is graded on its reservation, and each Pod range on its free
+    blocks against the surge nodes the pools drawing on it need."""
+    if not surge_pools:
+        return
+    if target is None:
+        out["unknown"].append(UNKNOWN_SURGE_NO_TARGET.format(pools=LIST_SEPARATOR.join(p.get("name", "") for p, _ in surge_pools)))
+        return
+    pending = []
+    for pool, settings in surge_pools:
+        version = pools_parsed.get(pool.get("name"))
+        if version is None:
+            out["unknown"].append(UNKNOWN_SURGE_VERSION.format(pool=pool.get("name", "")))
+        elif version < target:
+            pending.append((pool, settings))
+    if not pending:
+        return
+    for pool, settings in pending:
+        accelerators = pool_accelerators(pool)
+        if not accelerators:
+            continue
+        name, text, reservation = pool.get("name", ""), accelerators_text(accelerators), pool_reservation(pool)
+        if reservation:
+            out["notes"].append(NOTE_ACCELERATOR_RESERVED.format(pool=name, accelerators=text, max_surge=settings["max_surge"], reservation=reservation))
+        else:
+            out["blocking"].append({FINDING_KEY: FINDING_ACCELERATOR, "pool": name, "accelerators": text, "max_surge": settings["max_surge"], "reservation": None})
+    by_range: dict = {}
+    for pool, settings in pending:
+        by_range.setdefault(pool_pod_range(pool, cluster), []).append((pool, settings))
+    for range_text, members in by_range.items():
+        pools_text = LIST_SEPARATOR.join(SURGE_POOL_TEXT.format(pool=p.get("name", ""), max_surge=s["max_surge"]) for p, s in members)
+        if nodes_error:
+            out["unknown"].append(UNKNOWN_POD_RANGE_UNREAD.format(pools=pools_text, kind=NODE_READ_KIND, error=nodes_error))
+            continue
+        if not range_text:
+            out["unknown"].append(UNKNOWN_POD_RANGE_MISSING.format(pools=pools_text))
+            continue
+        pod_range = pod_network(range_text)
+        if pod_range is None:
+            out["unknown"].append(UNKNOWN_POD_RANGE_UNPARSABLE.format(pools=pools_text, range=range_text))
+            continue
+        prefix = min(pool_block_prefix(p, cluster, [n for n in nodes if node_pool(n) == p.get("name", "")]) for p, _ in members)
+        need = sum(s["max_surge"] for _, s in members)
+        free, held, total = free_blocks(pod_range, prefix, nodes)
+        if free < need:
+            out["blocking"].append(
+                {
+                    FINDING_KEY: FINDING_POD_RANGE,
+                    "range": range_text,
+                    "prefix": prefix,
+                    "free": free,
+                    "held": held,
+                    "total": total,
+                    "need": need,
+                    "pools": [{"pool": p.get("name", ""), "max_surge": s["max_surge"]} for p, s in members],
+                }
+            )
+
+
 def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     out = new_result()
     if _is_autopilot(cluster, context):
@@ -397,10 +619,13 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     pods_error = read_error(read, POD_READ_KIND)
     nodes = None if nodes_error else items_of_kind(items, KIND_NODE)
     pods = active_pods(items)
+    surge_pools = []
     for pool in cluster.get("nodePools") or []:
         if not isinstance(pool, dict):
             continue
         settings = pool_settings(pool)
+        if surges(settings):
+            surge_pools.append((pool, settings))
         if not removes_node_first(settings):
             continue
         name = pool.get("name", "")
@@ -435,6 +660,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
             out["notes"].append(NOTE_HEADROOM.format(summary=summary))
             continue
         finding = {
+            FINDING_KEY: FINDING_PLACEMENT,
             "pool": name,
             "strategy": settings["strategy"],
             "max_surge": settings["max_surge"],
@@ -448,10 +674,17 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         }
         blocks = settings["strategy"] == STRATEGY_SURGE and settings["max_surge"] == 0 and settings["max_unavailable"] > 0 and at_ceiling
         (out["blocking"] if blocks else out["risks"]).append(finding)
+    _grade_surge(out, cluster, surge_pools, pools_parsed, target, nodes, nodes_error)
     return out
 
 
 def describe(finding: dict) -> str:
+    kind = finding.get(FINDING_KEY, FINDING_PLACEMENT)
+    if kind == FINDING_POD_RANGE:
+        pools = LIST_SEPARATOR.join(SURGE_POOL_TEXT.format(pool=p["pool"], max_surge=p["max_surge"]) for p in finding["pools"])
+        return POD_RANGE_FINDING_TEXT.format(range=finding["range"], free=finding["free"], prefix=finding["prefix"], used=finding["held"], total=finding["total"], need=finding["need"], pools=pools)
+    if kind == FINDING_ACCELERATOR:
+        return ACCELERATOR_FINDING_TEXT.format(pool=finding["pool"], accelerators=finding["accelerators"], max_surge=finding["max_surge"])
     workloads = LIST_SEPARATOR.join(
         WORKLOAD_TEXT.format(owner=w["owner"], cpu=format_cpu(w["cpu_m"]), memory=format_memory(w["memory_bytes"]), pinned=WORKLOAD_PINNED_SUFFIX if w["pinned"] else "")
         for w in finding["workloads"]

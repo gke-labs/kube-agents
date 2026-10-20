@@ -368,7 +368,24 @@ note column does. The rules registered today, with the catalogue entry each read
   strands pods. Autopilot members are not graded. A pool at or above the target is not graded; no
   target, an unparsable pool version or quantity, or Nodes or Pods not read is unknown, and the
   rule can block, so that unknown moves the verdict. GKE's defaults (`maxSurge` 1,
-  `maxUnavailable` 0) never trigger it.
+  `maxUnavailable` 0) never trigger the placement half. The same pools are read for the surge
+  node that must exist before a drain: every pool below the target on the surge strategy with
+  `maxSurge` above 0 (the default is 1; a blue-green pool creates its green pool instead and is
+  not counted). A pool carrying accelerators (`config.accelerators`) that surges with no
+  reservation affinity (`config.reservationAffinity` consuming neither `ANY_RESERVATION` nor
+  `SPECIFIC_RESERVATION`) blocks, since a surge node needs accelerator capacity the zone may
+  not have and a pool upgrade that cannot create one stalls between versions; one under a
+  reservation is a note. Per Pod range (the pool's `networkConfig.podIpv4CidrBlock`, else the
+  cluster's `clusterIpv4Cidr`), the free aligned blocks of the pools' per-node size (each
+  node's `spec.podCIDR`, which the projected node read carries, else the block GKE sizes for
+  the pool's pod limit; the largest block among the pools is the unit) are counted against the
+  sum of the pools' `maxSurge`, and fewer free blocks than surge nodes blocks: a surge node with
+  no block never registers. The cell names the range with its free, held and total blocks, the
+  surge need and the pools, or the pool with its accelerators and `maxSurge`, and the action:
+  lower `max-surge` or add a secondary Pod range; set the in-place strategy (`max-surge` 0,
+  `max-unavailable` 1) or hold a reservation. No target is one unknown for the surge pools;
+  Nodes not read, or a record with no Pod range, is unknown for the range half while the
+  accelerator half still grades. Quota is not read here: the stockout-prevention audit reads it.
 - **Data on the node** (`data-on-the-node`, entry 4). Deployments and StatefulSets are read for
   state, not scratch: a StatefulSet's `emptyDir` (its identity survives the rebuild, its
   node-local data does not), a `hostPath` a container mounts writable, a `hostPath` under a
