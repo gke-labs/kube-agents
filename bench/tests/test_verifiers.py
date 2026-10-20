@@ -9768,6 +9768,9 @@ _INTREE_CELL = (
 # fleet's; the case's pattern stops before them.
 _DEFAULTS_NOTE_CELL = "changed-defaults: 1 namespace follows latest with no enforced check changing between 1.35 and 1.36 per the table"
 _DEFAULTS_LOOSENS_CELL = "changed-defaults: seeded-defaults follows latest; 1.37 only widens the baseline allowlist, which rejects nothing new"
+# The note the rule files first once the channel default passes the table's last minor; the prompt
+# asks for the first of the rule's entries, so the case admits it.
+_DEFAULTS_PAST_TABLE_CELL = "changed-defaults: the defaults table ends at 1.36 (read 2026-10-13); minors after it up to the target 1.37 are not graded, and a row per minor from its release notes refreshes the table"
 _DEFAULTS_RISK_CELL = (
     "changed-defaults: namespace seeded-defaults: pod-security.kubernetes.io/enforce=baseline, pod-security.kubernetes.io/enforce-version=latest: "
     "follows the running minor, so the enforced baseline rule set changes at 1.34; 1.34: the host field of probes and lifecycle hooks must be unset "
@@ -9902,7 +9905,7 @@ def test_rule_cases_accept_the_bare_json_text_without_the_rule_prefix(case, obje
     assert _case_grades(case, objective, text)
 
 
-@pytest.mark.parametrize("cell,grade", [(_DEFAULTS_LOOSENS_CELL, "note"), (_DEFAULTS_RISK_CELL, "risk")])
+@pytest.mark.parametrize("cell,grade", [(_DEFAULTS_LOOSENS_CELL, "note"), (_DEFAULTS_RISK_CELL, "risk"), (_DEFAULTS_PAST_TABLE_CELL, "note")])
 @pytest.mark.parametrize("wrap", _CELL_WRAPS)
 def test_defaults_case_accepts_the_rules_other_forms_on_a_fleet_that_crosses_a_baseline_change(cell, grade, wrap):
     report = _defaults_report(wrap.format(cell=cell), grade=grade)
