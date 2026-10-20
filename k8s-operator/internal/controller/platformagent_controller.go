@@ -513,6 +513,13 @@ type PlatformAgentReconciler struct {
 // where this grant is trimmed, block WaitForCacheSync forever behind a forbidden LIST.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
+// The GitOps reconcilers' objects, read-only, for the same escalation-prevention reason
+// as `nodes` above: buildMinimalPlatformRole grants them to the agent, so the operator
+// must hold them to apply that role. The operator itself never reads them.
+// +kubebuilder:rbac:groups=argoproj.io,resources=applications,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kustomize.toolkit.fluxcd.io,resources=kustomizations,verbs=get;list;watch
+// +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=gitrepositories;ocirepositories,verbs=get;list;watch
+// +kubebuilder:rbac:groups=configsync.gke.io,resources=rootsyncs;reposyncs,verbs=get;list;watch
 
 // isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
 // (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io,
