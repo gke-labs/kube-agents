@@ -45,7 +45,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest. A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does, and one the ceiling refuses stays in the digest.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -123,7 +123,8 @@ What the drift branch does differently:
   row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). A
   principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
   claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
-  `4`. The post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
+  `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
+  carded from its own columns (summary and cluster). The post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
   route as `features: ["drift-backlog"]` on `/healthz`; the detector's README has the rule that
   marks a record late and what it costs.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of

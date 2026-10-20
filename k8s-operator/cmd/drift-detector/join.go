@@ -104,8 +104,8 @@ const (
 	// record from kubectl is carded rather than digested: an install's own
 	// writes come from Helm's Go client, so a late kubectl write is far more
 	// likely a person's edit made just before a restart. The user agent is
-	// self-declared, which is acceptable here because it can only add a card,
-	// never hide one.
+	// self-declared; the rule only routes such a record the way a live one
+	// goes.
 	kubectlUserAgentPrefix = "kubectl/"
 )
 

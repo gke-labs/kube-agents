@@ -1,7 +1,8 @@
 # Domain: incident triage. Journey: changes queue while the drift detector is
-# not pulling (an install, a pod roll), and they are recorded and
-# summarised in one digest rather than triaged one card each; a change made
-# after the detector is pulling again still gets its card.
+# not pulling (an install, a pod roll), and a burst of them is recorded and
+# summarised in one digest rather than triaged one card each; a lone late
+# change, a late kubectl write and a change made after the detector is pulling
+# again still get their cards.
 #
 # Issue #3387: an install's own Helm apply runs under the installer's account,
 # reaches the detector as a burst of human-tier records when it first pulls,

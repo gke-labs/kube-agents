@@ -117,9 +117,9 @@ FEED_STATUS_INJECTED = "injected"
 FEED_STATUS_FILTERED = "filtered"
 FEED_STATUS_SUPPRESSED = "suppressed"
 FEED_STATUS_UNDELIVERED = "undelivered"
-# A drift backlog row (`backlog` non-zero): recorded and owed, or given, one
-# digest line instead of a card. Checked before the others, because its
-# `notified` is 0 and would otherwise read as suppressed.
+# A drift backlog row that is digested or owed a digest. Checked before the
+# others, because its `notified` is 0 and would otherwise read as suppressed. A
+# carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
 FEED_STATUS_BACKLOG = "backlog"
 # The severity the inject route filters out of chat (see `inject_message`).
 FEED_FILTERED_SEVERITY = "Info"
@@ -723,8 +723,9 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # The drift backlog: records the detector marks as having reached it late
 # (published before its process first pulled, or after waiting longer than its
 # max wait; `subscriber.backlog` in the detector). They arrive on
-# `POST /v1/drift-backlog`, write a ledger row with `backlog` set, spend no
-# quota, start no turn, and are posted as one digest. An install queues such a
+# `POST /v1/drift-backlog` and write a ledger row with `backlog` set. Most spend
+# no quota, start no turn, and are posted as one digest; the late rows of a
+# principal with few of them are carded instead (DRIFT_BACKLOG_CARD_BELOW). An install queues such a
 # burst under the installer's own account, and triaging it one card at a time
 # spent the day's drift budget on kube-agents' own objects. A pod roll queues
 # whatever was published while it restarted.
@@ -735,7 +736,7 @@ DRIFT_BACKLOG_FEATURE = "drift-backlog"
 DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE]
 # `intercepted_events.backlog`. Zero for every row that is not backlog, which
 # includes every row written before the column existed. A pending row is owed a
-# digest; the other two are terminal.
+# digest or a card; the other three are terminal.
 DRIFT_BACKLOG_NONE = 0
 DRIFT_BACKLOG_PENDING = 1
 DRIFT_BACKLOG_DIGESTED = 2
@@ -4161,7 +4162,7 @@ def _drift_alert_message(summary: str) -> str:
 
 @app.post("/v1/drift-backlog", dependencies=[Depends(verify_api_key)])
 def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
-    """Record one drift backlog record and owe it a line in the next digest.
+    """Record one drift backlog record and owe it the next digest or a card.
 
     The detector posts here, with no session, a record it marked as having
     reached it late (DRIFT_BACKLOG_FEATURE). Nothing here spends quota or starts
@@ -4291,7 +4292,14 @@ def _drift_backlog_digest_loop() -> None:
         if wait > 0:
             _drift_backlog_wake.wait(timeout=wait)
             continue
-        if _post_drift_backlog_digest():
+        try:
+            posted = _post_drift_backlog_digest()
+        except Exception as exc:
+            # The worker is the only thing that digests; an error it does not
+            # survive leaves every pending row until the next backlog record.
+            logger.error(f"Drift backlog digest failed; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s: {exc}")
+            posted = False
+        if posted:
             retry_at = 0.0
         else:
             retry_at = time.monotonic() + DRIFT_BACKLOG_RETRY_SECONDS
@@ -4381,12 +4389,14 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
     """Card the rows of every principal with fewer than DRIFT_BACKLOG_CARD_BELOW
     rows, and return the rest for the digest.
 
-    Each carded row takes the path a live drift record takes: a session, a
-    quota claim, and on admission the alert and the triage turn. The row is
-    marked DRIFT_BACKLOG_CARDED with that outcome before the turn starts, so a
+    A carded row gets what a live drift record gets, less field ownership (its
+    join was skipped): a quota claim, a session, the alert and the triage turn.
+    A row the ceiling refuses stays in the digest, so the change is still named
+    in chat. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
     crash after it cannot card it twice; a turn that fails after that is lost as
-    a live one would be. The turn runs on a thread of its own, so a slow gateway
-    does not hold the digest's lease.
+    a live one would be. A row whose session or mark cannot be written stays
+    pending for the next digest. The turn runs on a thread of its own, so a slow
+    gateway does not hold the digest's lease.
     """
     counts: Dict[str, int] = {}
     for row in rows:
@@ -4402,19 +4412,24 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
             payload = {}
         if not isinstance(payload, dict) or payload.get("kind") != INJECT_KIND_DRIFT:
             payload = {"kind": INJECT_KIND_DRIFT, "summary": row["message"], "cluster": row["cluster"]}
-        session_id = create_session()["sessionID"]
         allowed, suppressed_today = _claim_alert_quota(DRIFT_QUOTA_KEY)
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
-            with conn:
-                conn.execute(
-                    "UPDATE intercepted_events SET backlog = ?, notified = ?, session_id = ? WHERE id = ?",
-                    (DRIFT_BACKLOG_CARDED, 1 if allowed else 0, session_id, row["id"]),
-                )
         if not allowed:
             logger.warning(
-                f"Suppressed drift alert for late record {row['message'][:120]}: daily limit of "
+                f"Late record {row['id']} stays in the digest: daily limit of "
                 f"{ALERT_DAILY_LIMITS[DRIFT_QUOTA_KEY]} drift alerts reached, {suppressed_today} suppressed today"
             )
+            digest.append(row)
+            continue
+        try:
+            session_id = create_session()["sessionID"]
+            with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+                with conn:
+                    conn.execute(
+                        "UPDATE intercepted_events SET backlog = ?, notified = 1, session_id = ? WHERE id = ?",
+                        (DRIFT_BACKLOG_CARDED, session_id, row["id"]),
+                    )
+        except sqlite3.Error as exc:
+            logger.error(f"Late record {row['id']} could not be carded and stays pending: {exc}")
             continue
         logger.info(f"Drift backlog: carding late record {row['id']} (its principal has {counts[row['principal']]} late row(s))")
         threading.Thread(
@@ -5100,7 +5115,7 @@ def _feed_status(notified: int, severity: str, delivery_error: str, backlog: int
     skips chat delivery) only for an alert admitted past the severity gate and
     daily quota, an Info row is the one the severity gate filters, and
     `delivery_error` is written only when a chat post was attempted and failed.
-    A backlog row is `backlog` whatever the other three say.
+    A backlog row that is not carded is `backlog` whatever the other three say.
     """
     if backlog and backlog != DRIFT_BACKLOG_CARDED:
         return FEED_STATUS_BACKLOG

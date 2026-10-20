@@ -25,7 +25,7 @@ The inject is off unless `--daemon-url` is set, and off is the default. With it 
 does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
 local run against a real subscription wants. With it on, each surviving record opens a session and
 posts one payload into it — except one from a cluster outside the install's scope, which is held (the
-rule is a few paragraphs below), and one that arrived late, which goes to the daemon's digest route
+rule is a few paragraphs below), and most that arrived late, which go to the daemon's digest route
 with no session when the daemon advertises one ([The backlog](#the-backlog)); `logDriftEvent` still runs first either way, so the `DRIFT` line is
 emitted whether or not a daemon is configured and whether or not the inject lands.
 
@@ -38,8 +38,9 @@ the last few thousand `insertId`s it has injected and suppresses a repeat before
 session, so one redelivered batch does not page a human twice for one change. That set is in memory
 and per-process, which leaves one case uncovered: a non-graceful exit leaves its batch unacked, and
 the next instance starts with an empty set. Those records were published before its first pull, so
-they come back as backlog, and the daemon drops each one that already has a drift row. Against a
-daemon without the digest route, the next instance injects them again. A climbing `duplicate=`
+they come back as backlog, and the daemon drops each one that already has a drift row. A late
+`kubectl` write is the exception: it is carded, not digested, so it is injected again, as every
+record is against a daemon without the digest route. A climbing `duplicate=`
 count in the shutdown tally is a sign the ack deadline is too tight, not that the cluster is busy.
 Climbing alongside `failed=` means something else — a record is marked seen before its send, so a
 failed inject is not retried on redelivery either.
@@ -54,7 +55,7 @@ chat line names no severity — but billed to a daily ceiling
 of its own rather than to the event watcher's, because one `kubectl apply` over a directory is one
 human action and several audit entries: sharing the bucket let routine use of this signal cap-drop
 the watcher's for the rest of the day. The two ceilings therefore add up, which is the cost of the
-split; what it does not fix is the fan-out itself, since the detector coalesces nothing live. Records
+split; what it does not fix is the fan-out itself, since the detector coalesces nothing live. Most records
 that arrive late are the exception: they are digested instead ([The backlog](#the-backlog)). A record
 the ceiling refuses is lost rather than deferred: the daemon answers
 `suppressed`, the detector has already marked the `insertId` as seen, and the intercepted-events
@@ -678,15 +679,16 @@ the topic after the first pull is live. The second catches a process that starte
 pull.
 
 Against a daemon whose `/healthz` lists the `drift-backlog` feature, a backlog record skips the
-live-object join and is posted to `POST /v1/drift-backlog` with no session — unless its user agent
-starts with `kubectl/`. A late kubectl write is carded as a live one is, join included: an install's
-own writes come from Helm's Go client, so a late kubectl write is more likely a person's edit made
-just before a restart. The user agent is self-declared, which is acceptable because the rule can only
-add a card. The daemon records it,
+live-object join and is posted to `POST /v1/drift-backlog` with no session. The daemon records it,
 spends no alert quota, starts no triage turn, and posts one digest per burst that counts the records
-by principal. The `DRIFT` line carries `backlog=true` and the publish time, and the shutdown tally
-counts `skipped_backlog=` (join) and `backlog=` (inject). Against an older daemon, the startup line
-says so and every record is sent as a card, as before.
+by principal. The `DRIFT` line of such a record carries `backlog=true` and the publish time, and the
+shutdown tally counts `skipped_backlog=` (join) and `backlog=` (inject). Against an older daemon, the
+startup line says so and every record is sent as a card, as before.
+
+A backlog record whose user agent starts with `kubectl/` is not sent to the digest: it is joined and
+injected as a live record is, with no `backlog=true` marker. An install's own writes come from Helm's
+Go client, so a late kubectl write is more likely a person's edit made just before a restart. The
+user agent is self-declared; the rule only routes such a record the way a live one goes.
 
 An install's own Helm apply is the burst this exists for. It runs under the installer's account,
 so the classifier sees a person, and before this route each object it wrote became a triage card

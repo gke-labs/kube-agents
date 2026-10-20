@@ -127,12 +127,12 @@ variable "card_wait_seconds" {
 }
 
 variable "backlog_record_count" {
-  description = "How many records are published while the detector is stopped."
+  description = "How many records backlog_principal publishes, with Helm's user agent, while the detector is stopped: the burst to be digested."
   type        = number
   default     = 6
   validation {
-    condition     = var.backlog_record_count >= 1 && floor(var.backlog_record_count) == var.backlog_record_count
-    error_message = "backlog_record_count must be a whole number of at least 1."
+    condition     = var.backlog_record_count >= 3 && floor(var.backlog_record_count) == var.backlog_record_count
+    error_message = "backlog_record_count must be a whole number of at least 3: the daemon cards a principal with fewer than three late rows, so a smaller burst is carded, not digested."
   }
 }
 

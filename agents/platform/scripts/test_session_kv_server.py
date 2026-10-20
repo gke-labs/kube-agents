@@ -6526,7 +6526,7 @@ class TestDriftBacklog(unittest.TestCase):
                         break
                 time.sleep(0.01)
         digest_workers = [t for t in started if t.name == "drift-backlog-digest"]
-        self.assertGreaterEqual(len(digest_workers), 1, "no backlog row started a digest worker")
+        self.assertEqual(len(digest_workers), 1, "the arming row did not start exactly one digest worker")
         self.assertIsNone(session_kv_server._drift_backlog_thread, "the worker did not stop after the digest")
         self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_HEADLESS})
 
@@ -6553,14 +6553,26 @@ class TestDriftBacklog(unittest.TestCase):
         events = self.client.get("/v1/intercepted-events").json()["events"]
         self.assertEqual([e["status"] for e in events if e["name"] == "checkout"][:1], [session_kv_server.FEED_STATUS_INJECTED])
 
-    def test_a_carded_row_the_ceiling_refuses_starts_no_turn(self):
+    def test_a_lone_row_the_ceiling_refuses_stays_in_the_digest(self):
         self._chat()
         self._post(insert_id="lone", principal="ada@example.com")
-        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)), patch.object(
+            session_kv_server.subprocess, "run"
+        ) as run:
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         [row] = self._rows()
-        self.assertEqual((row["backlog"], row["notified"]), (session_kv_server.DRIFT_BACKLOG_CARDED, 0))
+        self.assertEqual((row["backlog"], row["notified"]), (session_kv_server.DRIFT_BACKLOG_DIGESTED, 0))
+        self.assertIn("ada@example.com (1)", run.call_args.args[0][-1])
         time.sleep(0.05)
+        self.trigger.assert_not_called()
+
+    def test_a_row_that_cannot_be_carded_stays_pending_and_the_worker_survives(self):
+        self._chat()
+        self._post(insert_id="lone", principal="ada@example.com")
+        locked = session_kv_server.sqlite3.OperationalError("database is locked")
+        with patch.object(session_kv_server, "create_session", side_effect=locked):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
         self.trigger.assert_not_called()
 
     def test_a_backlog_row_carries_the_reason_the_end_of_day_report_excludes(self):

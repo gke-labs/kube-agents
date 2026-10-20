@@ -5,13 +5,15 @@
 # 1. Plant one Deployment and move its memory limit to drift_field_manager, so
 #    the live record has a real object and a real ownership change to report.
 # 2. Stop the detector process (SIGSTOP) in its sidecar, publish
-#    backlog_record_count records to the topic, then kill it. start-services.sh
+#    backlog_record_count records by backlog_principal, one by lone_principal
+#    and kubectl_record_count kubectl writes by backlog_principal, then kill it. start-services.sh
 #    relaunches it; the records published before its first pull are backlog.
 #    This is the detector's own path, not a payload marked by hand: the case
 #    goes red on a detector that does not mark them, as well as on a daemon
 #    that triages them.
 # 3. Wait for a ledger row for every backlog record, then publish one live
-#    record and wait for its card.
+#    record and wait for its card, and for a card for each late record that
+#    must be carded.
 # 4. Read the ledger and the board, and write the verdict ConfigMap the task's
 #    safeguard reads.
 #
@@ -51,6 +53,10 @@ resource "null_resource" "drift_backlog" {
       error_message = "drifted_memory must differ from declared_memory: the live record reports a field changing hands."
     }
     precondition {
+      condition     = var.lone_principal != var.backlog_principal && var.lone_principal != var.live_principal
+      error_message = "lone_principal must differ from backlog_principal and live_principal, or its record joins the burst and is digested."
+    }
+    precondition {
       condition     = var.live_principal != var.backlog_principal
       error_message = "live_principal and backlog_principal must differ, so a card for one is not read as a card for the other."
     }
@@ -65,6 +71,7 @@ resource "null_resource" "drift_backlog" {
       var.namespace, var.live_workload, var.live_container, var.gitops_field_manager,
       var.drift_field_manager, var.declared_memory, var.drifted_memory, var.live_principal,
       var.backlog_principal, tostring(var.backlog_record_count), var.host_cluster_name,
+      var.lone_principal, tostring(var.kubectl_record_count),
     ]))
   }
 

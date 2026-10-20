@@ -555,7 +555,7 @@ func realMain(argv []string) error {
 		// Said either way, because the two modes differ only for records that
 		// arrive late, and an install that has just come up is all late records.
 		if injectHandler.backlogRoute {
-			log.Printf("%s: backlog records (published before this process's first pull, or waiting over %s) go to %s for one digest, not a card each", commandName, backlogMaxWait, driftBacklogPath)
+			log.Printf("%s: backlog records (published before this process's first pull, or waiting over %s) go to %s for one digest, not a card each; a late kubectl write is carded", commandName, backlogMaxWait, driftBacklogPath)
 		} else {
 			log.Printf("%s: the daemon does not advertise %q; backlog records will be injected as a card each, as live ones are", commandName, featureDriftBacklog)
 		}
