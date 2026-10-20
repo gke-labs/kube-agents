@@ -3138,7 +3138,7 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
     assert t not in store
     assert res == {}
 
-    # Exit 8: tasks list item with status blocked, transient kind, but absent runs -> evicts stale store
+    # Exit 8: tasks list item with status blocked, transient kind, but absent runs -> preserves live store
     traj_tasks_blocked_transient_no_runs = [
         {
             "name": "kanban_list",
@@ -3147,13 +3147,31 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
             }),
         }
     ]
-    store = {t: ["stale"]}
+    store = {t: ["live_entry"]}
     res = KubeAgentsHarness._extract_trajectory_failure_summaries(
         traj_tasks_blocked_transient_no_runs, [t], store=store
     )
     assert res is store
-    assert t not in store
-    assert res == {}
+    assert t in store
+    assert store[t] == ["live_entry"]
+
+    # Exit 8b: task item with status blocked, transient kind, but absent/empty runs -> preserves live store
+    traj_task_blocked_transient_no_runs = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "blocked", "block_kind": "transient"},
+                "runs": [],
+            }),
+        }
+    ]
+    store_task = {t: ["live_entry"]}
+    res_task = KubeAgentsHarness._extract_trajectory_failure_summaries(
+        traj_task_blocked_transient_no_runs, [t], store=store_task
+    )
+    assert res_task is store_task
+    assert t in store_task
+    assert store_task[t] == ["live_entry"]
 
 
 def test_gitops_fix_cycle_skipped_on_infra_failure(
@@ -4345,6 +4363,94 @@ def test_a_429_blocked_card_unblocked_and_done_without_delivered_result_records_
     ]
     rep = _classify(results_json(result), "helm")
     assert rep.outcome == "infra"
+
+
+def test_record_unsettled_prepends_marked_ceiling_error_preserving_existing_errors(results_json: Any) -> None:
+    """When has_delivery is False, _record_unsettled prepends marked ceiling errors so scoring reads it at errors[0]."""
+    result = AgentResult(output="acknowledged", trajectory=[], errors=["agent reported no status for 3 turns running; still waiting on: t2"])
+    harness._record_unsettled(
+        result,
+        ["t1"],
+        {"t1": "blocked"},
+        {"t1": "running"},
+        has_delivery=False,
+    )
+    assert len(result.errors) == 2
+    assert result.errors[0] == (
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated task t1 was reported blocked during wait but running at settle; nothing delivered"
+    )
+    assert result.errors[1] == "agent reported no status for 3 turns running; still waiting on: t2"
+    rep = _classify(results_json(result), "helm")
+    assert rep.outcome == "infra"
+
+
+def test_record_unsettled_appends_unmarked_report_when_has_delivery() -> None:
+    """When has_delivery is True, _record_unsettled appends plain reports without marker."""
+    result = AgentResult(output="done", trajectory=[], errors=["prior warning line"])
+    harness._record_unsettled(
+        result,
+        ["t1"],
+        {"t1": "blocked"},
+        {"t1": "running"},
+        has_delivery=True,
+    )
+    assert result.errors == [
+        "prior warning line",
+        "delegated task t1 was reported blocked during wait but running at settle; nothing delivered",
+    ]
+
+
+def test_a_delegated_worker_status_turn_kanban_list_reported_blocked_is_infrastructure(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """When a status turn reports a card blocked via kanban_list without runs, stored prefix is preserved and marks infra."""
+    stub_agent.turns = [
+        _create_turn(),
+        _turn(
+            *_call(
+                "kanban_list",
+                {},
+                {
+                    "tasks": [{"id": _TASK_ID, "status": "blocked", "block_kind": "transient"}],
+                },
+                "call_list",
+            ),
+            _text(f"Task {_TASK_ID} is blocked."),
+        ),
+    ]
+
+    reads = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                payload = {
+                    "statuses": {_TASK_ID: "blocked"},
+                    "summaries": {
+                        _TASK_ID: (
+                            "provider rate limit: API retries exhausted (failure_reason=rate_limit): "
+                            "HTTP 429 quota exhausted"
+                        )
+                    },
+                    "errors": {},
+                    "block_kinds": {_TASK_ID: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert result.output == ""
+    assert len(result.trajectory) >= 1
 
 
 def test_a_triage_card_at_deadline_on_api_lane_records_ceiling_once(

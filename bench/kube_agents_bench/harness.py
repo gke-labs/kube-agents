@@ -1341,6 +1341,8 @@ def _record_unsettled(
     has_delivery: bool = False,
 ) -> None:
     """Record that failure cards unblocked to non-terminal at settle delivered no result."""
+    marked: list[str] = []
+    plain: list[str] = []
     for t in unsettled:
         last = last_statuses.get(t, "unknown")
         live = live_statuses.get(t, "unknown")
@@ -1348,8 +1350,13 @@ def _record_unsettled(
             f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
         )
         if not has_delivery:
-            report = f"{DELEGATION_CEILING_MARKER}: {report}"
-        result.errors.append(report)
+            marked.append(f"{DELEGATION_CEILING_MARKER}: {report}")
+        else:
+            plain.append(report)
+    if marked:
+        result.errors = [*marked, *result.errors]
+    if plain:
+        result.errors.extend(plain)
 
 
 def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) -> None:
@@ -2657,7 +2664,7 @@ class KubeAgentsHarness(AgentHarness):
                                         found.pop(tid, None)
                                 else:
                                     found.pop(tid, None)
-                            else:
+                            elif status == "failed":
                                 found.pop(tid, None)
         return found
 
