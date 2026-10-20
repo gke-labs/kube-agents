@@ -216,14 +216,16 @@ new rule adds its entry in that order.
   minimum-driver matrix), or recreate the pool with the driver the images need; upgrade a canary GPU
   pool first.
 - `in-tree-volumes` (In-tree volumes), entry 19, blocker. Reads: Every PersistentVolume with an
-  in-tree `gcePersistentDisk` source, its claim, and the pods and templates that mount the claim,
-  against `addonsConfig.gcePersistentDiskCsiDriverConfig.enabled`. With the add-on off, a volume a
-  workload mounts blocks (the rescheduled pod cannot attach it), naming the volume and the workload,
-  and an unmounted one is a risk; with the add-on on, every in-tree volume is a risk, since it still
-  depends on the migration shim rather than on the driver. PersistentVolumes not read is unknown
-  and, since the rule can block, moves the verdict; Pods not read is unknown too, with the templates
-  still graded. Action: Enable the PD CSI driver add-on before the upgrade, and move the volume's
-  StorageClass to `pd.csi.storage.gke.io`.
+  in-tree `gcePersistentDisk` source, the claim bound to it (the volume `Bound` and the claim its
+  `claimRef` names carrying `spec.volumeName` for it; a `Released` volume's stale `claimRef`, or a
+  claim since rebound to another volume, counts no consumer and is a note), and the pods and
+  templates that mount the claim, against `addonsConfig.gcePersistentDiskCsiDriverConfig.enabled`.
+  With the add-on off, a volume a workload mounts blocks (the rescheduled pod cannot attach it),
+  naming the volume and the workload, and an unmounted one is a risk; with the add-on on, every
+  in-tree volume is a risk, since it still depends on the migration shim rather than on the driver.
+  PersistentVolumes not read is unknown and, since the rule can block, moves the verdict; Pods not
+  read is unknown too, with the templates still graded. Action: Enable the PD CSI driver add-on
+  before the upgrade, and move the volume's StorageClass to `pd.csi.storage.gke.io`.
 - `retired-registry` (Retired registry), entry 20, risk. Reads: A container or init container
   pulling from `k8s.gcr.io`, `gcr.io/google-containers`, `gcr.io/google_containers` or
   `gcr.io/kubernetes-helm` is a `risk`, named with the image, the host and what the host does today:
