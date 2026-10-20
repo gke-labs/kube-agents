@@ -799,13 +799,15 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
     An empty batch is a run that found nothing: refused without a complete
     `scope` (there is nothing to do), accepted with one, where the point is
     that every row the claim covers was absent (§5.2). A complete claim
-    reaches the rows its `check_prefix` names, whatever wrote them, where the
-    prefix is a check family (it ends with `-`) and, when the batch is not
-    empty, one every row of the batch belongs to; else the rows of the batch's
-    own sources, or of `scope.source`, which must be a known source and, when
-    the batch is not empty, one the batch wrote; a complete claim that names
-    neither a prefix nor a source and carries no findings is refused, since it
-    would reach every row on the cluster and no caller means that.
+    reaches the rows its `check_prefix` names, where the prefix is a check
+    family (it ends with `-`) and, when the batch is not empty, one every row
+    of the batch belongs to: whatever wrote them, or, when `scope.source`
+    names a source beside the prefix, that source's rows in the family alone;
+    without a prefix, the rows of the batch's own sources, or of
+    `scope.source`, which must be a known source and, when the batch is not
+    empty, one the batch wrote; a complete claim that names neither a prefix
+    nor a source and carries no findings is refused, since it would reach
+    every row on the cluster and no caller means that.
     """
     if not isinstance(findings, list):
         raise FindingError("findings must be a list")
@@ -846,10 +848,11 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
             raise FindingError("scope.source names a source the batch did not write; a claim reaches only what the run read")
         if named:
             sources = {named}
-        if check_prefix:
-            # The prefix is the claim: the batch's sources narrow nothing further,
-            # so the review's batch on a cluster with findings reaches the same
-            # rows as its empty batch on a clean one.
+        if check_prefix and not named:
+            # The prefix alone is the claim: the batch's sources narrow nothing
+            # further. A claim that names its source beside the prefix reaches
+            # that source's rows in the family alone, so the review's batch, empty
+            # or not, never lowers an `upgrade-` row another writer filed.
             sources = set()
         if not check_prefix and not sources:
             raise FindingError("a complete scope with no findings needs check_prefix or source to say what it covers")

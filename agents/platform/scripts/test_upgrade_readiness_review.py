@@ -182,7 +182,7 @@ class TheMapping(unittest.TestCase):
         self.assertFalse(review.member_complete(seeded_b(), [{"project": PROJECT, "location": "us-central1-a", "cluster": "seeded-b", "error": "x"}]))
         # A location whose get-server-config failed left its members no target:
         # no pool verdicts and no exclusion decisions, so the cluster was not
-        # read in full even though no row names it (the watch counts it unread).
+        # read in full even though no row names it, whatever verdict the watch keeps for it.
         location_failed = [{"project": PROJECT, "location": "us-central1-a", "message": "get-server-config: 503"}]
         self.assertFalse(review.member_complete(seeded_b(), location_failed))
         self.assertTrue(review.member_complete(seeded_b(), [{"project": PROJECT, "location": "europe-west1", "message": "get-server-config: 503"}]))
@@ -242,7 +242,7 @@ class Registration(unittest.TestCase):
 
         def fake_request(path, body):
             calls.append((path, body))
-            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
         partial = gemma()
         partial["readiness"]["webhook_read_error"] = "timed out"
@@ -253,7 +253,7 @@ class Registration(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/seeded-b"})
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0][1]["scope"], {"project": PROJECT, "cluster": "seeded-b", "complete": True, "check_prefix": review.CHECK_PREFIX})
+        self.assertEqual(calls[0][1]["scope"], {"project": PROJECT, "cluster": "seeded-b", "complete": True, "check_prefix": review.CHECK_PREFIX, "source": review.SOURCE})
         self.assertNotIn("scope", calls[1][1])
         self.assertEqual(set(outcomes.values()), {"created"})
         self.assertEqual(len(outcomes), len(findings))
@@ -263,13 +263,13 @@ class Registration(unittest.TestCase):
 
         def fake_request(path, body):
             calls.append(body)
-            return {"results": []}
+            return {"results": [], "downgraded": 0}
 
         clean = member("seeded-c")
         with mock.patch.object(review, "kv_request", fake_request):
             outcomes, problems, claimed = review.register([clean], [], [])
         self.assertEqual((outcomes, problems, claimed), ({}, [], {f"{PROJECT}/us-central1-a/seeded-c"}))
-        self.assertEqual(calls, [{"findings": [], "scope": {"project": PROJECT, "cluster": "seeded-c", "complete": True, "check_prefix": review.CHECK_PREFIX}}])
+        self.assertEqual(calls, [{"findings": [], "scope": {"project": PROJECT, "cluster": "seeded-c", "complete": True, "check_prefix": review.CHECK_PREFIX, "source": review.SOURCE}}])
         partial = member("seeded-c")
         partial["readiness"]["read_error"] = "timed out"
         calls.clear()
@@ -277,12 +277,44 @@ class Registration(unittest.TestCase):
             review.register([partial], [], [])
         self.assertEqual(calls, [])
 
+    def test_an_answer_that_does_not_acknowledge_the_batch_registers_nothing_and_lands_no_claim(self):
+        # A redirected POST that urllib turned into a GET answers the findings list: a dict,
+        # status 200, no results. Neither its rows nor its claim count as registered.
+        def listing_answer(path, body):
+            return {"findings": []}
+
+        members = [seeded_b(), member("seeded-c")]
+        findings = [item for m in members for item in review.member_findings(m)]
+        with mock.patch.object(review, "kv_request", listing_answer):
+            outcomes, problems, claimed = review.register(members, [], findings)
+        self.assertEqual(claimed, set())
+        self.assertEqual(set(outcomes.values()), {review.REGISTRATION_FAILED})
+        self.assertEqual(len(problems), 2)
+        self.assertTrue(all(review.CLAIM_FAILED_MARK in p and "without a result" in p for p in problems), problems)
+
+        # Results for some rows only, or a claim answered without the count it lowered, are refused too.
+        def partial_answer(path, body):
+            return {"results": [{"id": review.item_id(item), "outcome": "created"} for item in findings[:1]], "downgraded": 0}
+
+        def no_count(path, body):
+            return {"results": [{"id": fq.validate_finding(f)["id"], "outcome": "created"} for f in body["findings"]]}
+
+        with mock.patch.object(review, "kv_request", partial_answer):
+            _outcomes, problems, claimed = review.register(members, [], findings)
+        # seeded-b's batch came back short, so its claim did not land; seeded-c's empty batch was answered in full.
+        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/seeded-c"})
+        self.assertEqual([p.split(":")[0] for p in problems], [f"{PROJECT}/seeded-b"])
+        with mock.patch.object(review, "kv_request", no_count):
+            _outcomes, problems, claimed = review.register(members, [], findings)
+        self.assertEqual(claimed, set())
+        self.assertEqual(len(problems), 2)
+
     def test_a_cluster_past_the_batch_limit_is_sent_in_pieces_without_a_claim(self):
         calls = []
 
         def fake_request(path, body):
             calls.append(body)
-            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
         big = member("seeded-z", "blocked", pdbs={"blocking": [budget(name=f"b{i}") for i in range(review.KV_BATCH_LIMIT + 1)]})
         findings = review.member_findings(big)
@@ -333,7 +365,7 @@ class Registration(unittest.TestCase):
 
         def fake_request(path, body):
             calls.append(body)
-            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
         west = member("prod", "blocked", pdbs={"blocking": [budget(name="pinned")]})
         east = member("prod", "blocked", pdbs={"blocking": [budget(name="pinned")]})
@@ -416,7 +448,7 @@ class Registration(unittest.TestCase):
 
         def fake_request(path, body):
             calls.append(body)
-            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
         odd = seeded_b()
         odd["readiness"]["maintenance"]["exclusions"].append({"name": "freeze", "scope": "NO_MINOR_UPGRADES", "end_time": "2027-01-05T00:00:00Z", "blocks": True, "detail": "a second exclusion"})
@@ -673,7 +705,7 @@ class TheTick(unittest.TestCase):
 
     def fake_kv(self, path, body):
         self.registered.append(body)
-        return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+        return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
     def fake_copy(self, report_md, summary_doc):
         self.copies.append((report_md, summary_doc))
@@ -732,8 +764,8 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")):
             code, out = self.run_main()
         self.assertEqual(code, 0)
-        # seeded-b's five rows failed; seeded-c's clean read sent a claim that failed.
-        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 1 clean-cluster claim(s) did not reach the findings queue:", out)
+        # seeded-b's five rows and its claim failed; seeded-c's clean read sent a claim that failed.
+        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 2 completeness claim(s) did not reach the findings queue:", out)
         self.assertIn("503", out)
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertEqual(len(latest["registration_errors"]), 2)
@@ -745,7 +777,8 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")):
             code, out = self.run_main()
         self.assertEqual(code, 0)
-        self.assertIn(f"{review.LOG_PREFIX}: 4 finding(s) and 0 clean-cluster claim(s) did not reach the findings queue:", out)
+        # Each complete cluster's one batch carried its claim, so each failure lost a claim too.
+        self.assertIn(f"{review.LOG_PREFIX}: 4 finding(s) and 4 completeness claim(s) did not reach the findings queue:", out)
         self.assertIn(review.OVERFLOW_NOTE.format(count=1), out)
         self.assertEqual(out.count("HTTP 503"), review.MAX_PROBLEMS_IN_LINE)
 
@@ -839,6 +872,28 @@ class TheTick(unittest.TestCase):
         self.assertEqual(report.count("### acme-prod"), 1)
         self.assertNotIn(f"### {numbered}", report)
 
+    def test_a_number_the_watchs_ledger_maps_to_an_id_already_read_is_not_run(self):
+        """The daily watch learned that the number is the id's project: the review reads the id
+        and runs nothing for the number, rather than a second full readiness run it drops."""
+        numbered = "123456789012"
+        ledger = watch.empty_ledger()
+        ledger[watch.PROJECT_IDS_KEY] = {numbered: PROJECT}
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps(ledger), encoding="utf-8")
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            return {"exit": 0, "tables": "| t |", "report": {"projects": [PROJECT], "members": [seeded_b(), member("seeded-c")], "errors": []}}
+
+        with mock.patch.object(watch, "projects", return_value=[numbered, PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(calls, [PROJECT])
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["projects"], [PROJECT])
+        self.assertNotIn(numbered, latest.get("project_failures") or {})
+
     def test_a_numbered_project_the_report_resolved_whose_listing_failed_is_not_read(self):
         numbered = "123456789012"
 
@@ -907,7 +962,7 @@ class TheTick(unittest.TestCase):
 
         def kv(path, body):
             events.append(("kv", body["scope"]["cluster"] if "scope" in body else body["findings"][0]["cluster"]))
-            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]]}
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: f"{PROJECT},{OTHER_PROJECT}"}), mock.patch.object(watch, "run_report", side_effect=run_report), mock.patch.object(review, "kv_request", side_effect=kv):
             self.run_main()

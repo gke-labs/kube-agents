@@ -338,14 +338,21 @@ MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the chat line; the
 MAX_NAMES_IN_LINE = 6  # projects named in the partial line
 OVERFLOW_NOTE = "and {count} more in the record"
 OVERFLOW_NOTE_PLAIN = "and {count} more"  # for the line of a run that wrote no record
-CLAIM_FAILED_MARK = "the clean read's claim did not reach the queue"
+CLAIM_FAILED_MARK = "the completeness claim did not reach the queue"
+# A 200 answer that does not acknowledge the batch: a result for every row sent, and for a
+# claim the count it lowered. Anything else is not the findings route answering (a redirect
+# urllib turned into a GET answers the findings list), so nothing in the batch is counted.
+UNACKNOWLEDGED_DETAIL = "the queue's answer does not acknowledge the batch ({missing} of {sent} row(s) without a result{claim})"
+UNACKNOWLEDGED_CLAIM = ", no count of the rows the claim lowered"
+ANSWER_RESULTS_KEY = "results"
+ANSWER_DOWNGRADED_KEY = "downgraded"
 DUPLICATE_DETAIL_SEPARATOR = " | also: "  # two rows of one member that derive one queue id
 SHARED_DETAIL_SEPARATOR = " | also on {member}: "  # two same-named clusters whose objects coincide
 TMP_SUFFIX = watch.LEDGER_TMP_SUFFIX  # a file is written beside its name and renamed over it
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
 PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
-REGISTRATION_FAILED_LINE = "{prefix}: {rows} finding(s) and {claims} clean-cluster claim(s) did not reach the findings queue: {detail}; the findings are in the report, not on the queue, and the brief says so; a cluster whose claim did not land keeps last week's rows at full confidence"
+REGISTRATION_FAILED_LINE = "{prefix}: {rows} finding(s) and {claims} completeness claim(s) did not reach the findings queue: {detail}; the findings are in the report, not on the queue, and the brief says so; a cluster whose claim did not land keeps last week's rows at full confidence"
 COPY_FAILED_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads the previous copy until the next review"
 # A failure is announced once per distinct cause: the marker keeps the failure's text
 # with every number replaced, so a timeout that reads 1187s one week and 1203s the
@@ -764,8 +771,9 @@ def ordered_names(names: list[str], previous: dict | None) -> list[str]:
     project that failed on its own (its full timeout, a refusal, a listing
     failure) keeps its place, so it does not take the budget off the top
     every week. Within each group a spelling by number runs after the ids,
-    so a project the roster spells both ways is read under its id and the
-    number's run is the one skipped."""
+    so a project the roster spells both ways is read under its id first; the
+    number is then skipped when the watch's ledger maps it to that id
+    (``run_projects``), else run and dropped once its report resolves it."""
     failures = (previous or {}).get("project_failures") or {}
     budget = {p for p, detail in failures.items() if str(detail) == BUDGET_EXHAUSTED_DETAIL or str(detail).startswith(BUDGET_FAILURE_PREFIXES)}
 
@@ -775,22 +783,40 @@ def ordered_names(names: list[str], previous: dict | None) -> list[str]:
     return group([n for n in names if n in budget]) + group([n for n in names if n not in budget])
 
 
+def learned_project_ids() -> dict[str, str]:
+    """The spelling-to-id map the daily watch keeps in its ledger
+    (``learn_project_id``), or none when the ledger cannot be read: the
+    review then learns a duplicate spelling from the report, as before."""
+    try:
+        ids = watch.load_ledger(watch.watch_home() / watch.LEDGER_FILE_NAME).get(watch.PROJECT_IDS_KEY)
+    except (OSError, ValueError, RuntimeError):
+        return {}
+    return {str(k): str(v) for k, v in ids.items()} if isinstance(ids, dict) else {}
+
+
 def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], list[dict], dict[str, str], dict[str, str], set[str]]:
     """One readiness run per project inside the total budget. Returns the
     members, the report errors, the report script's tables per project, the
     projects that failed with why, and the ids the report resolved and read.
     `on_project(members, errors)` runs as each project returns, which is where
     registration happens, so a run the hour cuts short keeps what it
-    registered. A run whose resolved id was already read (the roster spelled
-    one project by number and by id) is dropped whole: no table, no errors,
-    no failure, nothing registered."""
+    registered. A spelling the watch's ledger maps to an id already read this
+    run (the roster spelled one project by number and by id) is not run at
+    all; one the ledger does not map yet is run, and dropped whole once its
+    report resolves it to an id already read: no table, no errors, no
+    failure, nothing registered."""
     members: list[dict] = []
     errors: list[dict] = []
     tables: dict[str, str] = {}
     failures: dict[str, str] = {}
     read_ids: set[str] = set()
+    known_ids = learned_project_ids()
     deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     for project in names:
+        if watch.canonical_project(project, known_ids) in read_ids - {project}:
+            # The same project, already read under its id this run: the number's
+            # run would cost a full readiness run and leave nothing.
+            continue
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
             failures[project] = BUDGET_EXHAUSTED_DETAIL
@@ -887,20 +913,29 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
             body = {"findings": [payload(item) for item in chunk]}
             claims = complete and len(chunks) == 1
             if claims:
-                body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX}
+                # The family and the review's own source together: the claim reaches only
+                # the rows this job wrote in its family, never the `upgrade-` rows the audit
+                # streams or the retrospective write under their own sources.
+                body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX, "source": SOURCE}
             try:
                 answer = kv_request(KV_FINDINGS_PATH, body)
+                sent = {item_id(item) for item in chunk}
+                results = answer.get(ANSWER_RESULTS_KEY)
+                acknowledged = {str(r["id"]) for r in results if isinstance(r, dict) and r.get("id")} if isinstance(results, list) else set()
+                missing = sent - acknowledged
+                if not isinstance(results, list) or missing or (claims and not isinstance(answer.get(ANSWER_DOWNGRADED_KEY), int)):
+                    raise ValueError(UNACKNOWLEDGED_DETAIL.format(missing=len(missing), sent=len(sent), claim=UNACKNOWLEDGED_CLAIM if claims else ""))
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
-                # An empty complete batch is the clean read's claim: nothing is
-                # marked failed, and the line counts the claim, since last
-                # week's rows for the cluster keep their confidence.
-                problems.append(f"{project}/{cluster}: {CLAIM_FAILED_MARK}: {exc}" if not chunk else f"{project}/{cluster}: {exc}")
+                # A batch that carried the claim lost it with its rows, whatever
+                # the rows: the line counts it, since last week's rows for the
+                # cluster keep their confidence.
+                problems.append(f"{project}/{cluster}: {CLAIM_FAILED_MARK}: {exc}" if claims else f"{project}/{cluster}: {exc}")
                 for item in chunk:
                     outcomes[item_id(item)] = REGISTRATION_FAILED
                 continue
             if claims:
                 claimed.add(key)
-            for result in answer.get("results") or []:
+            for result in answer[ANSWER_RESULTS_KEY]:
                 if isinstance(result, dict) and result.get("id"):
                     outcomes[str(result["id"])] = str(result.get("outcome") or "")
     return outcomes, problems, claimed

@@ -490,6 +490,28 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(fq.get_finding(self.conn, foreign_id)["rubric"]["C"], 0.6)
         self.assertEqual(fq.get_finding(self.conn, inventory_id)["rubric"]["C"], 1.0)
 
+    def test_a_prefixed_claim_that_names_its_source_reaches_only_its_rows_in_the_family(self):
+        # The review's batch names its family and its source: an `upgrade-` row the audit
+        # stream filed (`upgrade-blocked`) keeps its confidence, and the review's own row the
+        # week no longer reports loses it, empty batch or not.
+        audit = sample(source="audit", check="upgrade-blocked", namespace="", object="prod-eu")
+        stale = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="old-pool")
+        self.register(audit, stale)
+        audit_id, stale_id = fq.validate_finding(audit)["id"], fq.validate_finding(stale)["id"]
+        mine = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
+        scope = {"project": "acme-prod", "cluster": "prod-eu", "complete": True, "check_prefix": "upgrade-", "source": "upgrade-readiness"}
+
+        result = self.register(mine, scope=scope)
+
+        self.assertEqual(result["downgraded"], 1)
+        self.assertEqual(fq.get_finding(self.conn, stale_id)["rubric"]["C"], 0.6)
+        self.assertEqual(fq.get_finding(self.conn, audit_id)["rubric"]["C"], 1.0)
+        # The empty batch of a clean read reaches the review's own rows in the family, both of
+        # them now, and still not the audit's.
+        self.register(stale)
+        self.assertEqual(self.register(scope=scope)["downgraded"], 2)
+        self.assertEqual(fq.get_finding(self.conn, audit_id)["rubric"]["C"], 1.0)
+
     def test_a_prefixed_claim_must_name_the_batchs_own_family(self):
         upgrade = sample(source="upgrade-readiness", check="upgrade-pool-skew", namespace="", object="default-pool")
         self.register(upgrade)

@@ -6,11 +6,11 @@
 > rules (§5.2), the endpoints and MCP tools (§6.1), and the inventory sweep's registration
 > path (§5). A second writer ships beside the sweep: the Saturday `upgrade-readiness-weekly-review` job
 > (`agents/platform/scripts/upgrade_readiness_review.py`) registers the readiness report's blockers
-> and risks as `source: upgrade-readiness` rows under its own `upgrade-` check family rather than the audit
+> and risks as `source: upgrade-readiness` rows under `upgrade-` check slugs of its own rather than the audit
 > streams' slugs (`pool-skew`, `blocking-exclusion`, `blocking-pdb`, which those streams file to their
 > ledgers, not to the queue): one problem must stay one row across weeks here, and the review also
 > reads objects no stream names (fail-closed webhooks, the readiness rules' rows); its completeness
-> claim is scoped to that family (`scope.check_prefix`), so it lowers no other family's confidence, and its own source keeps another writer's claim off its rows. Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
+> claim names that family and its own source (`scope.check_prefix`, `scope.source`), so it lowers only its own rows in the family: no other family's, and not the `upgrade-` rows the audit streams (`upgrade-blocked`) or the retrospective write under their own sources. Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Item 8
 > ships in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
 > entry in `jobs.json` post a paced version of §7.2's message, hourly: at most two new criticals a
 > UTC day, a few non-criticals in the afternoon, nothing new while a non-critical it named waits for
