@@ -1942,7 +1942,9 @@ class ReadinessTest(unittest.TestCase):
         # on the cluster record: `none` under `other blockers`, the zonal risk under `risks`.
         row = [line for line in text.splitlines() if "| seeded-a |" in line][1]  # the readiness table's row, between the version table's and the add-ons table's
         self.assertEqual(row.count("| read failed |"), 1, row)  # the PDB cell alone; the note names the read in prose
-        self.assertIn("| none | zonal-control-plane: ", row)
+        # `other blockers` is `none`; the risks cell carries the known-issues rows the page lists for the fake fleet's version, then the zonal risk.
+        self.assertIn("| none | known-issues-matrix: ", row)
+        self.assertIn("zonal-control-plane: ", row)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
         self.assertEqual(data["rollout"]["missing_members"], [])
@@ -2391,7 +2393,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("target-patch-valid: channel REGULAR; target 1.35.1-gke.1000 valid; control plane 1.35.1-gke.1000 listed in validVersions at us-central1-a", a["note"])
         self.assertIn("control-plane-upgrade-history: 0 capacity failure(s) among 0 upgrade or repair operation(s) in the last 90 days; maintenance window none", a["note"])
         self.assertIn("lb-connection-draining: no backend service on this cluster's pools or NEGs drains for more than 600 s (0 matched of 0 in the project)", a["note"])
-        self.assertIn("known-issues-matrix: 0 add-on(s) inventoried in kube-system, gmp-system; 0 known issue(s) match", a["note"])
+        self.assertRegex(a["note"], r"known-issues-matrix: 0 add-on\(s\) inventoried in kube-system, gmp-system; \d+ known issue\(s\) match")  # the page lists rows for every current minor, add-on-less ones included
         self.assertEqual(a["addons"], [])
         self.assertEqual(data["errors"], [])
 

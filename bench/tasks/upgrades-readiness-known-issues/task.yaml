@@ -1,7 +1,7 @@
 # Catalogue entry 10 at patch granularity: the add-on inventory against the published known issues per GKE patch.
 #
 # The rule reads a condition that cannot be planted on a healthy seeded cluster
-# (a published add-on issue at the running patch is the provider's to publish, and a fresh table matches nothing on a current fleet), so this case does not grade a detection: it grades the
+# (which issues the page publishes for the running patch is the provider's; the table carries the page's rows for every minor from 1.32, so a current cluster matches whatever the page lists for its version), so this case does not grade a detection: it grades the
 # rule's declared report line for every seeded cluster in its "no finding" form,
 # which is red on `main` (no rule prints such a line, and an agent cannot
 # invent the numbers it carries) and green once the rule prints it; the rule's
@@ -36,7 +36,7 @@ prompt: >-
   form, no other words on the line: "<cluster>: known-issues-matrix: <n> add-on(s) inventoried; <n> known issue(s) match; table generated <YYYY-MM-DD>; table <fresh|stale>".
 
 expected_output: >-
-  The version table, the readiness table and the add-ons table read during this run, with every seeded cluster's managed add-ons inventoried by image and tag (fluent-bit, gke-metadata-server, the PD CSI driver, the metrics agents, kube-dns, managed Prometheus's collector and operator among them), no published known issue matching its running or target version, and the table's generation date quoted, with whether the report found it fresh or stale. The answer says what a match would mean (target the patch the issue names as fixed, or hold) and that none was found. It ends with the declared lines, each reading "known-issues-matrix: <n> add-on(s) inventoried; 0 known issue(s) match; table generated <date>; table fresh|stale" with the numbers copied from the report. It cites no CVE identifiers and performs no upgrade.
+  The version table, the readiness table and the add-ons table read during this run, with every seeded cluster's managed add-ons inventoried by image and tag (fluent-bit, gke-metadata-server, the PD CSI driver, the metrics agents, kube-dns, managed Prometheus's collector and operator among them), the count of published known issues the report matched to its running or target version (zero or more: the table carries the page's rows for every minor from 1.32, so a current cluster matches what the page lists for its version), and the table's generation date quoted, with whether the report found it fresh or stale. The answer says what a match means (target the patch the issue names as fixed, or hold) and names the matches it found, if any. It ends with the declared lines, each reading "known-issues-matrix: <n> add-on(s) inventoried; <n> known issue(s) match; table generated <date>; table fresh|stale" with the numbers copied from the report. It cites no CVE identifiers and performs no upgrade.
 
 infrastructure:
   deployer: noop

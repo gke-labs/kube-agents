@@ -662,6 +662,7 @@ if __name__ == "__main__":
 import copy  # noqa: E402
 import json  # noqa: E402
 from datetime import timedelta  # noqa: E402
+from unittest.mock import patch  # noqa: E402
 
 from readiness_rules import cluster_status_age, control_plane_upgrade_history, known_issues_matrix, lb_connection_draining, orphan_node_objects, target_patch_valid  # noqa: E402
 
@@ -1084,6 +1085,9 @@ class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
 
 
 class KnownIssuesMatrixRuleTest(unittest.TestCase):
+    PAGE = "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues"
+    SPEC_KEYS = {"from", "to", "to_exclusive", "minor", "through_minor", "from_minor", "all_versions"}
+
     def test_the_inventory_lists_the_recorded_addons_by_image_and_tag(self):
         addons = known_issues_matrix.inventory(seeded_b_read())
         by_image = {(row["namespace"], row["kind"], row["name"], row["container"]): (row["image"], row["tag"]) for row in addons}
@@ -1096,55 +1100,134 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
         self.assertIn("fluent-bit v0.0.422-gke.21", known_issues_matrix.inventory_cell(addons))
         self.assertEqual(known_issues_matrix.inventory_cell([]), "none")
 
-    def test_the_shipped_table_loads_and_the_recorded_cluster_matches_nothing(self):
+    def test_the_shipped_table_loads_under_its_stated_grammar(self):
         table, error = known_issues_matrix.load_table()
         self.assertIsNone(error)
-        self.assertEqual(set(table) >= {"generated", "source", "issues", "newest_gke_version"}, True)
+        self.assertEqual(set(table) >= {"generated", "source", "source_note", "newest_gke_version", "issues"}, True)
+        self.assertEqual(table["source"], self.PAGE)
+        self.assertIn("Inclusion rule", table["source_note"])
+        self.assertIsNotNone(target_patch_valid.parse_version(table["newest_gke_version"]))
+        ids = [issue["id"] for issue in table["issues"]]
+        self.assertEqual(len(ids), len(set(ids)))
         for issue in table["issues"]:
-            self.assertEqual(set(issue) >= {"id", "gke_versions", "addon", "addon_versions", "summary", "fixed_in", "url"}, True, issue["id"])
-            self.assertTrue(issue["url"].startswith("https://"), issue["id"])
+            self.assertEqual(set(issue) >= {"id", "category", "summary", "identified", "fixed_in", "gke_versions", "addon", "addon_versions", "url"}, True, issue["id"])
+            self.assertTrue(issue["url"].startswith(self.PAGE + "#"), issue["id"])
+            self.assertTrue(issue["identified"] and issue["fixed_in"] and issue["summary"], issue["id"])
+            self.assertTrue(issue["gke_versions"], issue["id"])
+            for spec in issue["gke_versions"]:
+                if isinstance(spec, str):
+                    self.assertIsNotNone(target_patch_valid.parse_version(spec), (issue["id"], spec))
+                    continue
+                self.assertTrue(set(spec) <= self.SPEC_KEYS and set(spec) - {"to_exclusive"}, (issue["id"], spec))
+                for key in ("from", "to"):
+                    if key in spec:
+                        self.assertIsNotNone(target_patch_valid.parse_version(spec[key]), (issue["id"], spec))
+                for key in ("minor", "through_minor", "from_minor"):
+                    if key in spec:
+                        self.assertIsNotNone(known_issues_matrix._minor(spec[key]), (issue["id"], spec))
+        # The two rows the first table carried, under the page's own anchors and cells.
+        oom = next(i for i in table["issues"] if i["id"] == "gke-metadata-server-oomkilled")
+        self.assertEqual((oom["addon"], oom["fixed_in"], len(oom["gke_versions"])), ("gke-metadata-server", "none listed", 9))
+        self.assertTrue(all(v.startswith("1.32.3-gke.") for v in oom["gke_versions"]))
+        pdcsi = next(i for i in table["issues"] if i["id"] == "excessive-volume-group-logging")
+        self.assertEqual((pdcsi["addon"], pdcsi["gke_versions"], pdcsi["fixed_in"]), ("gcp-compute-persistent-disk-csi-driver", ["1.32.4-gke.1236007", "1.32.4-gke.1353001"], "1.32.4-gke.1353003 and later"))
+
+    def test_the_recorded_cluster_matches_the_rows_the_page_lists_for_its_versions(self):
+        # seeded-b as recorded: 1.34.12-gke.1011000, with gke-metadata-server, gke-metrics-agent and the PD CSI driver in its inventory.
         record = seeded_b()
         result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4-gke.1391002"))
-        self.assertEqual((result["blocking"], result["risks"], result["unknown"]), ([], [], []))
-        self.assertEqual(result["notes"], [f"{len(known_issues_matrix.inventory(seeded_b_read()))} add-on(s) inventoried in kube-system, gmp-system; 0 known issue(s) match GKE 1.34.12-gke.1011000 or target 1.36.4-gke.1391002; table generated {table['generated']} ({len(table['issues'])} issue(s))"])
+        self.assertEqual((result["blocking"], result["unknown"]), ([], []))
+        running = {f["issue"] for f in result["risks"] if f["kind"] == "running"}
+        target = {f["issue"] for f in result["risks"] if f["kind"] == "target"}
+        # "1.34 and earlier"; "All versions" with the add-on present; "All versions" with no add-on named; "1.33 and later".
+        self.assertTrue({"image-screaming-too-many-links", "gke-metrics-agent-ds-race-condition", "gke-ui-blocked-autorepair", "unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane"} <= running, running)
+        self.assertNotIn("excessive-volume-group-logging", running)  # 1.32.4 builds only
+        # The target: "1.35 and later" with gke-metadata-server present matches; a 1.36 range that ends at this very build (its fix) does not.
+        self.assertIn("metadata-server-connection-timeouts", target)
+        self.assertNotIn("workload-identity-post-token-bad-request", target)
+        self.assertNotIn("gb300-bare-metal-workload-failures", target)
+        table, _ = known_issues_matrix.load_table()
+        self.assertEqual(result["notes"], [f"{len(known_issues_matrix.inventory(seeded_b_read()))} add-on(s) inventoried in kube-system, gmp-system; {len(result['risks'])} known issue(s) match GKE 1.34.12-gke.1011000 or target 1.36.4-gke.1391002; table generated {table['generated']} ({len(table['issues'])} issue(s), newest known version {table['newest_gke_version']})"])
+        # An issue naming no add-on matches by version alone, and its text says so.
+        console = next(f for f in result["risks"] if f["issue"] == "gke-ui-blocked-autorepair")
+        self.assertEqual(known_issues_matrix.describe(console), f"known issue gke-ui-blocked-autorepair (Google Cloud console UI becomes uneditable during node auto-repair) applies to GKE 1.34.12-gke.1011000 (the page names no add-on); fixed in TBD: {self.PAGE}#gke-ui-blocked-autorepair")
 
     def test_a_running_or_target_version_on_a_published_issue_is_a_risk_naming_the_fix(self):
         record = {**seeded_b(), "currentMasterVersion": "1.32.4-gke.1236007"}
         result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.32.4-gke.1353003"))
-        running = [f for f in result["risks"] if f["kind"] == "running"]
-        self.assertEqual(sorted(f["issue"] for f in running), ["gke-metadata-server-oomkilled-tpu-gpu", "pdcsi-driver-excessive-logging"])
-        text = known_issues_matrix.describe(next(f for f in running if f["issue"] == "pdcsi-driver-excessive-logging"))
-        self.assertEqual(text, "known issue pdcsi-driver-excessive-logging (The PDCSI driver might log excessively) applies to GKE 1.32.4-gke.1236007 with gcp-compute-persistent-disk-csi-driver v1.23.1-gke.37; fixed in 1.32.4-gke.1353003 and later: https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues")
-        self.assertEqual([f for f in result["risks"] if f["kind"] == "target"], [])  # the fixed version is not a match
-        # A target inside the range is a target risk; the range's exclusive end is not.
-        result = known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text="1.33.0-gke.1000000"))
-        self.assertEqual([(f["kind"], f["issue"]) for f in result["risks"]], [("target", "gke-metadata-server-oomkilled-tpu-gpu")])
-        self.assertTrue(known_issues_matrix.describe(result["risks"][0]).startswith("target 1.33.0-gke.1000000 lands on known issue gke-metadata-server-oomkilled-tpu-gpu"))
-        self.assertEqual(known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text="1.33.0-gke.1552000"))["risks"], [])
-        # Without the add-on in the inventory the issue does not apply.
-        without = read(items=[row for row in recorded("addons_seeded_b.json") if row["metadata"]["name"] not in ("gke-metadata-server", "pdcsi-node", "pdcsi-node-windows")])
-        self.assertEqual(known_issues_matrix.evaluate(record, {}, without, None, context_for(record))["risks"], [])
-        self.assertTrue(known_issues_matrix.version_matches("1.32.4-gke.1000000", {"from": "1.32.0-gke.1358000", "to": "1.32.4-gke.1106006"}))
-        self.assertFalse(known_issues_matrix.version_matches("1.32.4-gke.1106007", {"from": "1.32.0-gke.1358000", "to": "1.32.4-gke.1106006"}))
-        self.assertFalse(known_issues_matrix.version_matches("junk", "junk-too"))
+        running = {f["issue"]: f for f in result["risks"] if f["kind"] == "running"}
+        self.assertTrue({"excessive-volume-group-logging", "dangling-status-nodependingresize-1-32"} <= set(running), set(running))
+        self.assertEqual(known_issues_matrix.describe(running["excessive-volume-group-logging"]), f"known issue excessive-volume-group-logging (The PDCSI driver might log excessively) applies to GKE 1.32.4-gke.1236007 with gcp-compute-persistent-disk-csi-driver v1.23.1-gke.37; fixed in 1.32.4-gke.1353003 and later: {self.PAGE}#excessive-volume-group-logging")
+        self.assertNotIn("excessive-volume-group-logging", {f["issue"] for f in result["risks"] if f["kind"] == "target"})  # the fixed build is not a match
 
-    def test_a_stale_table_is_a_risk_by_age_and_by_version(self):
+        def targets(text):
+            return {f["issue"] for f in known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text=text))["risks"] if f["kind"] == "target"}
+
+        # A target inside the 1.33.0 range is a target risk; the range's exclusive end, the fixed build, is not.
+        self.assertIn("dangling-status-nodependingresize-1-32", targets("1.33.0-gke.1000000"))
+        self.assertNotIn("dangling-status-nodependingresize-1-32", targets("1.33.0-gke.1552000"))
+        self.assertTrue(known_issues_matrix.describe(next(f for f in known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text="1.33.0-gke.1000000"))["risks"] if f["issue"] == "dangling-status-nodependingresize-1-32")).startswith("target 1.33.0-gke.1000000 lands on known issue dangling-status-nodependingresize-1-32"))
+        # Without the add-on in the inventory an add-on issue does not apply.
+        without = read(items=[row for row in recorded("addons_seeded_b.json") if row["metadata"]["name"] not in ("pdcsi-node", "pdcsi-node-windows")])
+        self.assertNotIn("excessive-volume-group-logging", {f["issue"] for f in known_issues_matrix.evaluate(record, {}, without, None, context_for(record))["risks"]})
+
+    def test_the_version_grammar(self):
+        vm = known_issues_matrix.version_matches
+        self.assertTrue(vm("1.32.4-gke.1236007", "1.32.4-gke.1236007"))
+        self.assertFalse(vm("1.32.4-gke.1236008", "1.32.4-gke.1236007"))
+        inclusive = {"from": "1.32.0-gke.1358000", "to": "1.32.4-gke.1106006"}
+        self.assertTrue(vm("1.32.4-gke.1000000", inclusive))
+        self.assertTrue(vm("1.32.4-gke.1106006", inclusive))
+        self.assertFalse(vm("1.32.4-gke.1106007", inclusive))
+        self.assertFalse(vm("1.32.0-gke.1357999", inclusive))
+        self.assertFalse(vm("1.33.0-gke.1552000", {"from": "1.33.0-gke.0", "to": "1.33.0-gke.1552000", "to_exclusive": True}))
+        self.assertTrue(vm("1.34.0-gke.1", {"to": "1.34.0-gke.2285000", "to_exclusive": True}))
+        self.assertFalse(vm("1.34.0-gke.2285000", {"to": "1.34.0-gke.2285000", "to_exclusive": True}))
+        self.assertTrue(vm("1.37.9-gke.1", {"from": "1.35.3-gke.1234000"}))
+        bounded_minor = {"minor": "1.35", "to": "1.35.6-gke.1250001", "to_exclusive": True}
+        self.assertTrue(vm("1.35.5-gke.9", bounded_minor))
+        self.assertFalse(vm("1.35.6-gke.1250001", bounded_minor))
+        self.assertFalse(vm("1.34.9-gke.1", bounded_minor))
+        self.assertFalse(vm("1.36.0-gke.1", bounded_minor))
+        self.assertTrue(vm("1.35.9-gke.1", {"minor": "1.35"}))
+        self.assertFalse(vm("1.36.0-gke.1", {"minor": "1.35"}))
+        self.assertTrue(vm("1.32.9-gke.1", {"minor": "1.32", "from": "1.32.4-gke.1198000"}))
+        self.assertFalse(vm("1.32.4-gke.1197999", {"minor": "1.32", "from": "1.32.4-gke.1198000"}))
+        self.assertTrue(vm("1.34.12-gke.1011000", {"through_minor": "1.34"}))
+        self.assertTrue(vm("1.27.1-gke.1", {"through_minor": "1.34"}))
+        self.assertFalse(vm("1.35.0-gke.1", {"through_minor": "1.34"}))
+        self.assertTrue(vm("1.33.0-gke.1", {"from_minor": "1.33"}))
+        self.assertFalse(vm("1.32.99-gke.1", {"from_minor": "1.33"}))
+        self.assertTrue(vm("1.20.0-gke.1", {"all_versions": True}))
+        self.assertFalse(vm("1.20.0-gke.1", {"all_versions": False}))
+        for junk in ("junk", {"minor": "1"}, {}, {"from": "x"}, {"to_exclusive": True}, 7, None):
+            self.assertFalse(vm("1.34.12-gke.1011000", junk), junk)
+        self.assertFalse(vm("junk", "junk-too"))
+        self.assertFalse(vm(None, {"minor": "1.34"}))
+
+    def test_a_stale_table_is_a_risk_by_age_alone(self):
         record = seeded_b()
         later = context_for(record, at=RECORDED_AT + timedelta(days=45))
         result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, later)
-        self.assertEqual([f["kind"] for f in result["risks"]], ["stale-age"])
-        self.assertIn("known-issues table is stale: generated 2026-10-20, 45 days ago, past 30 days", known_issues_matrix.describe(result["risks"][0]))
+        stale = [f for f in result["risks"] if f["kind"].startswith("stale")]
+        self.assertEqual([f["kind"] for f in stale], ["stale-age"])
+        self.assertIn("known-issues table is stale: generated 2026-10-20, 45 days ago, past 30 days", known_issues_matrix.describe(stale[0]))
+        # A server config listing a version newer than the table knows grades nothing; the note names what the table knows.
         newer = copy.deepcopy(recorded("server_config_us_central1_a.json"))
-        newer["channels"][0]["validVersions"].insert(0, "1.38.0-gke.1")
-        reads = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: newer})
-        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=reads))
-        self.assertEqual([f["kind"] for f in result["risks"]], ["stale-version"])
-        self.assertIn("before 1.38.0-gke.1 was listed", known_issues_matrix.describe(result["risks"][0]))
+        newer["channels"][0]["validVersions"].insert(0, "1.99.0-gke.1")
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: newer})))
+        self.assertEqual([f for f in result["risks"] if f["kind"].startswith("stale")], [])
+        table, _ = known_issues_matrix.load_table()
+        self.assertIn(f"newest known version {table['newest_gke_version']}", result["notes"][0])
         # A failed DaemonSet read: the inventory lists Deployments only, said as unknown (and the rule cannot block).
         result = known_issues_matrix.evaluate(record, {}, read(items=recorded("addons_seeded_b.json"), read_errors={"daemonset": "forbidden"}), None, context_for(record))
         self.assertEqual(result["unknown"], ["the DaemonSets were not read (forbidden), so the add-on inventory lists Deployments only"])
         self.assertFalse(known_issues_matrix.CAN_BLOCK)
         self.assertEqual((known_issues_matrix.RULE_ID, known_issues_matrix.ENTRY), ("known-issues-matrix", 10))
+        # The table is read through the module loader, as the removal table is: a loader that serves nothing is unknown, naming the table.
+        with patch.object(known_issues_matrix.pkgutil, "get_data", return_value=None):
+            table, error = known_issues_matrix.load_table()
+        self.assertEqual((table, error), (None, "known-issues table known_issues.json could not be read beside upgrade_shape_tables (the module loader served no data)"))
 
 
 class RegistryOrderTest(unittest.TestCase):

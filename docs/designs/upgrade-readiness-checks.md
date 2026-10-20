@@ -338,11 +338,13 @@ Four ways a workload breaks on a new version:
   Deployments in `kube-system` and `gmp-system` per member by image name and tag (the JSON's
   `addons`, and a table after the readiness table), and the `known-issues-matrix` rule compares the
   inventory and the member's control-plane and target versions with
-  `fleet-upgrade-verification/scripts/known_issues.json`, a table of published issues keyed by GKE
-  version and add-on, each with the patch that fixes it and the page it was read from; a match is a
-  risk naming the fix. The table is data with a date: when it is older than thirty days, or the
-  server config lists a patch newer than the newest the table knew, the rule files a risk that the
-  table is stale rather than passing a clean matrix. The operator add-ons (cert-manager, Istio, the
+  `fleet-upgrade-verification/scripts/known_issues.json`, a table of the page's issues whose
+  identified versions name a minor from 1.32 up (the JSON's source note states the rule and how
+  each row's versions are read; a row naming no add-on matches by version alone), each with the
+  page's cells, the patch that fixes it and the page anchor; a match is a risk naming the fix. The
+  table is data with a date: when it is older than thirty days the rule files a risk that the table
+  is stale rather than passing a clean matrix, and the newest version the table knows is in the
+  note, not graded. The operator add-ons (cert-manager, Istio, the
   GPU operator) and their vendor matrices are still the work.
 - **Admission webhooks that fail closed.** A webhook with `failurePolicy: Fail` rejects everything
   it matches while its own backend is down, which is exactly what happens when the node that backend
