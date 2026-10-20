@@ -8,7 +8,9 @@ strand a pod and are never graded. A label (or label value) in `DROPPED_NODE_LAB
 `blocking` only when the upgrade crosses the drop for a pool the template can land on: the
 pool's current minor is below the drop and the target at or past it. A drop every such pool
 has passed already is a note: the pods either run or are already unschedulable, and neither
-is the upgrade's doing. A label that no pool's `config.labels` defines and no node in the
+is the upgrade's doing; so is a drop after this upgrade's target (a later upgrade's), and a
+selector naming a pool the cluster record lacks; a pool whose version did not parse is
+`unknown`, since whether it crosses the drop cannot be read. A label that no pool's `config.labels` defines and no node in the
 template's pools carries today is a `risk`, named as such: nothing in the cluster's
 configuration sets it, so the rebuilt nodes carry it no more. A key GKE sets from the pool's
 configuration (`GKE_NODE_LABEL_PREFIXES`: the pool, accelerator, OS and machine labels) or one
@@ -39,6 +41,11 @@ ANY_VALUE_FORMAT = "{key}"
 DROPPED_DETAIL = "selects on {label} ({where}), dropped at {minor}: {source}; pool(s) {pools} cross the drop in this upgrade to {target}, and the rebuilt nodes carry it no more"
 DROPPED_NO_TARGET_DETAIL = "selects on {label} ({where}), dropped at {minor}: {source}; whether a pool crosses the drop needs a target"
 DROPPED_PASSED_NOTE = "{kind} {object} selects on {label} ({where}), dropped at {minor}, which {pools} passed already; the pods either run or are already unschedulable, and the upgrade changes neither"
+DROPPED_AFTER_TARGET_NOTE = "{kind} {object} selects on {label} ({where}), dropped at {minor}, after this upgrade's target {target}; a later upgrade crosses the drop"
+DROPPED_NO_POOL_NOTE = "{kind} {object} selects on {label} ({where}), dropped at {minor}; {scope} not in the cluster record, so no pool crosses the drop in this upgrade"
+DROPPED_VERSION_UNKNOWN_DETAIL = "selects on {label} ({where}), dropped at {minor}; the version of pool(s) {pools} did not parse, so whether they cross the drop in this upgrade is unknown"
+SCOPE_NO_POOL_RECORD = "the cluster record lists no pool, so none is"
+SCOPE_NAMED_POOLS_MISSING = "pool(s) {pools} are"
 NOT_CARRIED_DETAIL = "selects on {label} ({where}): no pool's labels define it and no node in {scope} carries it today; the rebuilt nodes carry it no more"
 # Where a pool's configuration defines its nodes' labels (NodeConfig.labels).
 POOL_LABELS_KEY = "labels"
@@ -127,10 +134,20 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
                     detail = DROPPED_NO_TARGET_DETAIL.format(label=drop_text, where=where, minor=minor_text, source=source)
                     result["unknown"].append(_unknown(obj, detail, label=key, value=value))
                     continue
-                crossing = [p.get("name", "") for p in pools if p.get("parsed") is not None and p["parsed"][:2] < minor <= tuple(target[:2])]
+                target_minor = tuple(target[:2])
+                crossing = [p.get("name", "") for p in pools if p.get("parsed") is not None and p["parsed"][:2] < minor <= target_minor]
+                unparsed = [p.get("name", "") for p in pools if p.get("parsed") is None]
                 if crossing:
                     detail = DROPPED_DETAIL.format(label=drop_text, where=where, minor=minor_text, source=source, pools=rules.LIST_SEPARATOR.join(crossing), target=rules.minor_text(target))
                     result["blocking"].append(rules.new_finding(RULE_ID, ENTRY, rules.GRADE_BLOCKING, obj, detail, label=key, value=value, dropped_at=minor_text, pools_crossing=crossing))
+                elif target_minor < minor:
+                    result["notes"].append(DROPPED_AFTER_TARGET_NOTE.format(minor=minor_text, target=rules.minor_text(target), **{**common, "label": drop_text}))
+                elif not pools:
+                    missing = SCOPE_NAMED_POOLS_MISSING.format(pools=rules.LIST_SEPARATOR.join(named)) if named else SCOPE_NO_POOL_RECORD
+                    result["notes"].append(DROPPED_NO_POOL_NOTE.format(minor=minor_text, scope=missing, **{**common, "label": drop_text}))
+                elif unparsed:
+                    detail = DROPPED_VERSION_UNKNOWN_DETAIL.format(label=drop_text, where=where, minor=minor_text, pools=rules.LIST_SEPARATOR.join(unparsed))
+                    result["unknown"].append(_unknown(obj, detail, label=key, value=value))
                 else:
                     passed = SCOPE_POOLS.format(pools=rules.LIST_SEPARATOR.join(pool_names)) if named else POOLS_ALL
                     result["notes"].append(DROPPED_PASSED_NOTE.format(minor=minor_text, pools=passed, **{**common, "label": drop_text}))

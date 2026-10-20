@@ -207,6 +207,19 @@ class RemovedNodeLabelTest(unittest.TestCase):
         out = run(removed_node_label, self.NODES + [pinned], target=None)
         self.assertIn("whether a pool crosses the drop needs a target", out["unknown"][0]["detail"])
         self.assertTrue(out["unknown"][0]["reason"].startswith("Deployment seeded-shapes/docker-pinned: "))
+        # A target below the drop: nothing has passed it; a later upgrade crosses it.
+        out = run(removed_node_label, self.NODES + [pinned], pools=[pool(version="1.22.17-gke.1")], target=parse_version("1.23.0-gke.1"))
+        self.assertEqual((out["blocking"], out["unknown"]), ([], []))
+        self.assertEqual(out["notes"], ["Deployment seeded-shapes/docker-pinned selects on cloud.google.com/gke-container-runtime=docker (nodeSelector), dropped at 1.24, after this upgrade's target 1.23; a later upgrade crosses the drop"])
+        # A pool whose version did not parse: whether it crosses the drop is unknown, not passed.
+        out = run(removed_node_label, self.NODES + [pinned], pools=[pool(version="latest")], target=parse_version("1.24.0-gke.1"))
+        self.assertEqual(out["notes"], [])
+        self.assertIn("dropped at 1.24; the version of pool(s) default-pool did not parse, so whether they cross the drop in this upgrade is unknown", out["unknown"][0]["detail"])
+        # A selector naming a pool the record lacks: no pool crosses the drop, and the note says which is missing.
+        ghost = template("Deployment", "ghost-pinned", {"containers": [busybox()], "nodeSelector": {tables.NODEPOOL_LABEL: "ghost", "cloud.google.com/gke-container-runtime": "docker"}})
+        out = run(removed_node_label, self.NODES + [ghost], target=parse_version("1.24.0-gke.1"))
+        self.assertEqual((out["blocking"], out["unknown"]), ([], []))
+        self.assertIn("dropped at 1.24; pool(s) ghost are not in the cluster record, so no pool crosses the drop in this upgrade", out["notes"][0])
         # The value that was not dropped, on a key GKE sets from the pool's configuration: no node of
         # the canned list carries it, and that is a pool shape, not this rule's risk.
         containerd = template("Deployment", "containerd-pinned", {"containers": [busybox()], "nodeSelector": {"cloud.google.com/gke-container-runtime": "containerd"}})
