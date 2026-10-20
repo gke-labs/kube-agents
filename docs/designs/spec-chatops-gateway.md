@@ -154,6 +154,67 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   serializing the conversation - new turns start new tasks - while its events, if
   they ever arrive, still relay. "Detached" and "non-detached" below mean exactly
   this state and its absence.
+
+  **Stopping the cards (gke-labs#3263).** Under `next` the front door's turn often ends
+  seconds after it files a kanban card, and the card is not a task the gateway holds. With
+  `A2A_CARD_STOP=true` (off by default; the operator renders it from its own environment), a
+  `stop` that names no task also sends the default addressee a card-stop control: a task of
+  its own whose message is the `cardStop` data part alone (spec-a2a-payloads, "Card work
+  after the task ends"). The bridge has session-kv archive every open card in the
+  conversation and the cards they spawned, and answers with what it stopped. The gateway
+  sends it:
+  - with nothing running, in a conversation that has run a task;
+  - right after the cancel, when a task is running, since the turn may already have filed a
+    card;
+  - on a later `stop` while a cancelled task's terminal is still pending, in place of
+    "cancel already sent".
+
+  One control at a time. A `stop` while one runs gets "🛑 already stopping this
+  conversation's cards — the answer comes when the executor confirms", or "cancel sent" when it cancelled a turn, and marks the control:
+  that stop's turn, or one started since the control went out, may have filed cards the
+  control has already passed by. When the marked control ends, however it ends, one
+  follow-up control goes out. It posts no placeholder and says nothing unless it stopped a
+  card or could not finish. One mark is held however many stops arrive. If a question asked
+  after the stop is running by then, the follow-up would wait for it and archive its cards
+  too, so it is not sent, and the room gets "⚠️ cards filed since the last stop weren't
+  stopped, because a newer question is running; say stop again to stop them". It is not sent
+  either when the card stop was turned off meanwhile (a restart with `A2A_CARD_STOP` off:
+  "… because stopping cards from chat has been turned off") or the conversation moved to a
+  session worker (`/session`, or a `delegate` re-home: "… because this conversation now goes
+  to a session worker"). The control
+  posts "🛑 stopping this conversation's cards…" and
+  edits it into the answer: "🛑 stopped N cards: <title>, …" naming at most five, then
+  "and K more", and clauses for what the stop could not promise (cards already finished,
+  ones that could not be stopped, ones still being stopped, a worker that may still start,
+  more cards than one stop takes, a stop that ran out of time). Titles are model text, so
+  each is cut to one line of at most 80 runes, with angle brackets and `@` replaced by
+  look-alikes so a title can't mention anyone, `[`, `]`, backticks, `~`, `|`, `*` and `_`
+  neutralised so it can't make a masked link or bleed formatting, and every dot and colon,
+  full-width and ideographic forms included, replaced by look-alikes (`․`, `꞉`) so a bare URL
+  or domain is not linked either. A stop that
+  found nothing open answers "🤷 nothing is running", which is then true, or "🤷 no card was
+  open in this conversation" when a question asked after the stop is already running. A control that is rejected (an older bridge
+  answers `no-text-parts`), fails, is canceled, completes with no `cardStop` part, or has
+  no terminal inside `A2A_CARD_STOP_TIMEOUT` (75s, above the bridge's worst case of about
+  60s) gets "⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working", never a success. On an armed install the card notice ("stopping a card
+  from chat isn't supported yet") is used only where no control is sent: a conversation whose
+  tasks go to a session worker (the session route, or after `delegate`). Past the timeout the gateway also cancels the
+  control. Each control's end is one log line, `card stop ended`, with the terminal's
+  `state`, its `reason` token and an `outcome`: `answered`, `no-result` (completed with no
+  part), `not-stopped` (rejected, failed or canceled; `rejected` with `no-text-parts` is a
+  bridge older than the control), `timed-out`, `expired` (started before a gateway restart)
+  or `not-started` (never reached the bus).
+
+  The doors differ. The inject door's cancel route reports the control as a stop that
+  reached the bus (`cancelPublished`). On the A2A door the placeholder could never be
+  edited (its Edit reaches only a task's line) and the answer comes after the turn with no
+  task to carry it, so a `stop` there answers "🛑 sent a stop to this conversation's cards;
+  this door doesn't report how it went". The console renders answers off TASKS, so the
+  page may show the bridge's own text for the control beside the gateway's reply. The control is never the conversation's active task
+  and never in its task history: the next message is an ordinary turn, and a status ask
+  does not report on it. It is not sent on the session route, to a `delegate` session, for
+  a top-level DM `stop`, or for a program's cancel that names a task.
+
 - **Delegate.** A prefix, not a phrase, and recognized only when no live task
   serializes the conversation; its own section below.
 
@@ -1617,7 +1678,8 @@ gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
 nothing running gets "nothing is running": the plain reply when the conversation has
 never run a task (a question refused at the session cap, say), and otherwise one that
 adds that if the agent filed a card, that card keeps working until it finishes, since
-`stop` cannot reach a card (gke-labs#3263). A top-level status question matches the exact
+`stop` cannot reach a card (gke-labs#3263). With `A2A_CARD_STOP=true` the second case
+stops the conversation's cards instead (Stop, above). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
 A bare `/session` asks for the next message in its thread.
 

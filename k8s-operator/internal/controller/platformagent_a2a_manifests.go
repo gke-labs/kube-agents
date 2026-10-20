@@ -390,6 +390,25 @@ const (
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
 	a2aWorkerImageName          = "a2a-worker"
 
+	// a2aCardStopEnvVar is a third controller-read override, rendered onto
+	// the gateway under the same name: whether a chat `stop` also stops the
+	// kanban cards the conversation filed (gke-labs#3263). Off unless the
+	// operator carries an explicit "true", so the rollout is opt-in per
+	// install: the control it sends needs a hermes-bridge sidecar and an
+	// agent image that answer it, and the operator cannot tell which images
+	// an install runs. An older bridge rejects the control and the gateway
+	// answers that it couldn't confirm the cards stopped, so an early flip
+	// is a hedged reply rather than broken; the default stays off until the
+	// images that answer it ship together. a2aCardStopTimeoutEnvVar is the gateway's wait for the
+	// control, rendered at the gateway's default (a2aCardStopTimeout).
+	a2aCardStopEnvVar        = "A2A_CARD_STOP"
+	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"
+	// a2aCardStopTimeout is the gateway's default wait for a card-stop
+	// control, rendered explicitly: above the bridge's worst case for one
+	// (about 60 s: its 5 s capability check, 20 s turn wait and 35 s POST;
+	// a2a/hermes-bridge/cardstop.go).
+	a2aCardStopTimeout = "75s"
+
 	// a2aCapabilityRequiredEnvVar is the other controller-read override, and
 	// it defaults the other way round. The capability check is armed unless
 	// an operator explicitly disarms it, because the posture it protects —
@@ -1151,6 +1170,16 @@ func imageRefHasTag(ref string) bool {
 // the tight setting is the one that can refuse legitimate history.
 func a2aStrictEventsWriter() string {
 	if os.Getenv(a2aStrictEventsWriterEnvVar) == "true" {
+		return "true"
+	}
+	return "false"
+}
+
+// a2aCardStop renders "false" for anything but an explicit "true", as
+// a2aStrictEventsWriter does: a typo leaves the card stop off, the reply a
+// stop has always had.
+func a2aCardStop() string {
+	if os.Getenv(a2aCardStopEnvVar) == "true" {
 		return "true"
 	}
 	return "false"
@@ -4677,6 +4706,15 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// own environment rather than the gateway's. Both
 		// routes, one switch.
 		{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+		// The card stop, rendered explicitly at its
+		// default (off) like the two lines above, so
+		// turning it on for an install is an edit to a
+		// value already in the live Deployment, through
+		// the operator's own environment; and its wait,
+		// at the gateway's default, so a reader sees the
+		// bound beside the switch.
+		{Name: a2aCardStopEnvVar, Value: a2aCardStop()},
+		{Name: a2aCardStopTimeoutEnvVar, Value: a2aCardStopTimeout},
 		// The namespace from the downward API, not a baked
 		// default: the boot-time owner resolution below
 		// reads the gateway's own Deployment in THIS

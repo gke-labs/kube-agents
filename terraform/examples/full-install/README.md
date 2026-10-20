@@ -104,6 +104,15 @@ install without the interview.
   `ca.crt`), and puts `openai_compatible_api_key`, when set, in the credentials
   Secret as `OPENAI_COMPATIBLE_API_KEY`. `model_default_name` has no default for
   it; the plan fails without it or the base URL.
+- Optionally (`litellm_env_secret_name`) a Secret you create in the agent's
+  namespace that the gateway reads whole as environment variables. No GCP
+  resource and nothing in state: the composition passes the name as the chart's
+  `litellm.envFromSecret`. It is how `model_provider = "sap"` (SAP AI Core,
+  `AICORE_SERVICE_KEY` and `AICORE_RESOURCE_GROUP`), any other LiteLLM provider
+  slug (its driver's variables; `model_default_name` is then required and the
+  plan fails without it) and an `openai_compatible` gateway behind OAuth2
+  client credentials (`OPENAI_COMPATIBLE_OAUTH_TOKEN_URL`, `_CLIENT_ID`,
+  `_CLIENT_SECRET`) get their credentials.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on

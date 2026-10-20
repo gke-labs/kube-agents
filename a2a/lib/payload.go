@@ -186,8 +186,9 @@ func SteerNoticeOf(parts []Part) (SteerNotice, bool) {
 // them (the executor's log names each card). truncated says the
 // conversation had more open cards than one stop takes, so some may still
 // be open; deadline that the stop ran out of time. listsCut says only that
-// the executor cut stopped or settled to fit the part: the cards themselves
-// are as the counts say. A stop that found nothing open answers empty lists.
+// the executor cut stopped or settled to fit the part, each at
+// CardStopListMax, so the list that was cut is one at that length: the
+// cards themselves are as the counts say. A stop that found nothing open answers empty lists.
 // A stop that failed answers no part: its terminal is failed, and the
 // reason says why.
 type CardStop struct {
@@ -196,6 +197,10 @@ type CardStop struct {
 	// one flat object either way, and a request carries none of them.
 	*CardStopResult
 }
+
+// CardStopListMax is the most cards a result's stopped or settled list
+// carries; an executor cuts a longer one there and sets listsCut.
+const CardStopListMax = 200
 
 // CardStopResult is the result form's fields (CardStop).
 type CardStopResult struct {

@@ -155,6 +155,9 @@
         "modelDefaultName": {
           "type": "string"
         },
+        "envFromSecret": {
+          "type": "string"
+        },
         "maxTokens": {
           "type": "integer",
           "minimum": 0
