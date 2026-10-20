@@ -469,9 +469,10 @@ class SurgeHalvesTest(unittest.TestCase):
         pool["maxPodsConstraint"] = {"maxPodsPerNode": "32"}
         self.assertEqual(capacity.pool_block_prefix(pool, record, []), 26)  # no node yet: the pool's limit
         del pool["maxPodsConstraint"]
-        self.assertEqual(capacity.pool_block_prefix(pool, record, []), 24)  # the cluster's default
+        record["defaultMaxPodsConstraint"] = {"maxPodsPerNode": "64"}
+        self.assertEqual(capacity.pool_block_prefix(pool, record, []), 25)  # the cluster's default, told from the /24 fallback
         del record["defaultMaxPodsConstraint"]
-        self.assertEqual(capacity.pool_block_prefix(pool, record, []), 24)
+        self.assertEqual(capacity.pool_block_prefix(pool, record, []), 24)  # the fallback
         # Free blocks are counted at the unit's alignment: a /26 node holds the /24 it sits in and
         # a /23 node holds two; a node outside the range, with no block or with one that does not
         # parse holds none of it; a unit larger than the range is the range itself.

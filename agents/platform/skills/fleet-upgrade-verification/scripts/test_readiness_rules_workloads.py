@@ -20,6 +20,7 @@ import readiness_rules as rules  # noqa: E402
 import upgrade_readiness as r  # noqa: E402
 import upgrade_shape_tables as tables  # noqa: E402
 from fleet_upgrade_report import parse_version  # noqa: E402
+from test_readiness_rules import affinity, pool, read, template  # noqa: E402
 from readiness_rules import (  # noqa: E402
     cgroup_v2_runtime,
     gpu_driver_mismatch,
@@ -38,27 +39,14 @@ WORKLOAD_RULES = {node_local_state: 4, removed_node_label: 12, cgroup_v2_runtime
 CAN_BLOCK = {removed_node_label, gpu_driver_mismatch}
 
 
-def template(kind, name, spec, namespace=NS, workload_spec=None):
-    pod = {"metadata": {"labels": {"app": name}}, "spec": spec}
-    if kind == "CronJob":
-        return {"kind": kind, "metadata": {"namespace": namespace, "name": name}, "spec": {"suspend": True, "jobTemplate": {"spec": {"template": pod}}}}
-    return {"kind": kind, "metadata": {"namespace": namespace, "name": name}, "spec": {"replicas": 1, "template": pod, **(workload_spec or {})}}
-
-
 def node(name, pool="default-pool", labels=None):
     base = {tables.NODEPOOL_LABEL: pool, "kubernetes.io/arch": "amd64", "beta.kubernetes.io/arch": "amd64", "kubernetes.io/os": "linux", "topology.kubernetes.io/zone": "us-central1-a"}
     return {"kind": "Node", "metadata": {"name": name, "labels": {**base, **(labels or {})}}}
 
 
-def pool(name="default-pool", version="1.33.4-gke.1000", autoscaling=None, **config):
-    return {"name": name, "version": version, "parsed": parse_version(version), "config": config, "autoscaling": autoscaling or {}}
-
-
 def read_of(items, read_errors=None):
-    """A `read` dict as fleet_upgrade_report.read_cluster_objects returns it."""
-    errors = {kind: None for kind in rules.READ_KINDS}
-    errors.update(read_errors or {})
-    return {"kubeconfig": "k", "items": list(items), "error": None, "read_errors": errors}
+    """The sibling's `read` over a list of items."""
+    return read(items=list(items), read_errors=read_errors)
 
 
 def context(pools, target_text=TARGET_TEXT, autopilot=False):
@@ -77,13 +65,6 @@ def busybox(command=None, name="worker", mounts=None):
     if mounts:
         container["volumeMounts"] = mounts
     return container
-
-
-def affinity(key, operator, values=None, required=True):
-    expr = {"key": key, "operator": operator, **({"values": values} if values else {})}
-    if required:
-        return {"affinity": {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{"matchExpressions": [expr]}]}}}}
-    return {"affinity": {"nodeAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [{"weight": 1, "preference": {"matchExpressions": [expr]}}]}}}
 
 
 WORKLOADS_UNREAD = {"daemonset": "daemonsets is forbidden", "cronjob": "daemonsets is forbidden"}
