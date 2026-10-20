@@ -123,13 +123,15 @@ TRIAGE_LABEL = "needs-triage"
 INFRA_LABEL = "Infra"
 DOMAIN_LABEL = "domain:{slug}"
 OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
-# Closed ones too, all of them (the label keeps the list small): a bug closed
+# Closed ones too, updated since the window's first night: a bug closed
 # after the streak's newest night has seen this streak, so it is not filed
 # again until a newer failing night (a fix that merged before the next
 # nightly closes its issue, and the streak on record is still red); one
-# handed off as not planned tracks the case however long ago it closed, so
-# no `since` horizon may drop it (``still_tracks``).
-CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&per_page=100"
+# handed off as not planned counts only while its close is on record
+# (``still_tracks``), so nothing older is needed.
+CLOSED_ISSUES_PATH = f"issues?labels={LABEL}&state=closed&since={{since}}&per_page=100"
+# `since` in UTC with a Z: a `+00:00` offset would reach GitHub as a space.
+GITHUB_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 ISSUES_PATH = "issues"
 COMMENTS_PATH = "issues/{number}/comments"
 COMMENTS_READ_PATH = "issues/{number}/comments?per_page=100"
@@ -207,7 +209,9 @@ MARKER_SAFE_LT = "\u2039"
 NO_REASON_LINE = "  - (no reason recorded)"
 WHY_CASE_OWNER = "the case's `owner:`"
 WHY_DOMAIN_OWNER = "domain owner; the case's `owner:` is {owner}"
-WHY_REFUSED = "domain owner; GitHub refused @{refused} as assignee"
+# A refused login is shown as code, not @-mentioned: GitHub just said it is
+# outside the project, and a mention would still notify that account.
+WHY_REFUSED = "domain owner; GitHub refused `{refused}` as assignee"
 WHY_UNASSIGNED_REFUSED = "GitHub refused {refused} as assignee"
 WHY_UNASSIGNED_NO_OWNER = "`docs/designs/domains.yaml` names no owner for `{domain}`"
 ASSIGNED = "**Assigned to** @{assignee} ({why})."
@@ -268,7 +272,7 @@ INFRA_RECOVERY_COMMENT = """\
 INFRA_ASSIGNED = "**Assigned to** @{owner} (the infra owner in `docs/designs/domains.yaml`).{backup}"
 INFRA_BACKUP_MENTION = " Infra backup: @{backup}."
 INFRA_UNASSIGNED = "**Unassigned:** `docs/designs/domains.yaml` names no `infra_owner`."
-INFRA_REFUSED = "**Unassigned:** GitHub refused @{owner}, the infra owner in `docs/designs/domains.yaml`, as assignee.{backup}"
+INFRA_REFUSED = "**Unassigned:** GitHub refused `{owner}`, the infra owner in `docs/designs/domains.yaml`, as assignee.{backup}"
 JOB_RECOVERED = "The {part} part (`{job}`) ran to its verdict"
 CASE_RECOVERED = "`{case}` was graded"
 WHY_INFRA_OWNER = "infra owner"
@@ -511,20 +515,22 @@ def closed_after(issue: dict | None, night: dict) -> bool:
 HANDED_OFF_REASONS = frozenset({"not_planned", "duplicate"})
 
 
-def still_tracks(issue: dict, newest: dict, good: list[dict]) -> bool:
+def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None) -> bool:
     """Whether a closed issue still tracks a streak ending at ``newest``.
     One closed after that night finished has seen it (``closed_after``). One
     handed off (HANDED_OFF_REASONS) tracks the problem until a good night --
     a pass, a clean run, a graded case -- finishes after the close: the
     problem is the other issue's until it clears, and a new one after that
     files fresh. A "completed" close that did not fix it files again on the
-    next bad night."""
+    next bad night. A hand-off closed before ``horizon`` (the start of the
+    window's first night) cannot be confirmed -- the record no longer shows
+    whether the case cleared since -- so it does not hold a new streak back."""
     if closed_after(issue, newest):
         return True
     if issue.get("state_reason") not in HANDED_OFF_REASONS:
         return False
     closed = nightly.parse_iso(issue.get("closed_at"))
-    if not closed:
+    if not closed or not horizon or closed < horizon:
         return False
     for night in good:
         ended = nightly.parse_iso(night.get("finished")) or nightly.parse_iso(night.get("started"))
@@ -538,6 +544,7 @@ class Filer:
         self.gh = gh
         self.repo_root = repo_root
         self.domains = load_domains(repo_root)
+        self.horizon = None
         try:
             self.domain_owners = case_owner.load_domain_owners(repo_root / case_owner.DOMAINS_PATH)
         except OSError as exc:
@@ -548,8 +555,8 @@ class Filer:
     def open_issues(self) -> list[dict] | None:
         return self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
 
-    def closed_issues(self) -> list[dict] | None:
-        return self.gh.call("GET", self.gh.path(CLOSED_ISSUES_PATH), paginate=True)
+    def closed_issues(self, since: str) -> list[dict] | None:
+        return self.gh.call("GET", self.gh.path(CLOSED_ISSUES_PATH.format(since=since)), paginate=True)
 
     def commented(self, number: int, marker: str) -> bool | None:
         comments = self.gh.call("GET", self.gh.path(COMMENTS_READ_PATH.format(number=number)), paginate=True)
@@ -564,8 +571,10 @@ class Filer:
         result = {"filed": [], "recovered": [], "noted": [], "tracked": [], "skipped": [], "failed": []}
         nights = graded_nights(data)
         parts = nightly_infra.part_nights(data, LOOKBACK_NIGHTS)
+        starts = [nightly.parse_iso(n.get("started")) for ns in parts.values() for n in ns]
+        self.horizon = min((t for t in starts if t), default=None)
         open_issues = self.open_issues()
-        closed_issues = self.closed_issues()
+        closed_issues = self.closed_issues(self.horizon.strftime(GITHUB_TIME_FORMAT)) if self.horizon else []
         if open_issues is None or closed_issues is None:
             log("warning: could not list the nightly-red issues; nothing filed or commented this pass")
             return result
@@ -576,7 +585,7 @@ class Filer:
             streak = red_streak(verdicts)
             if streak:
                 passes = [v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED]
-                closed = tracking_issue([i for i in closed_issues if still_tracks(i, streak[-1], passes)], case)
+                closed = tracking_issue([i for i in closed_issues if still_tracks(i, streak[-1], passes, self.horizon)], case)
                 if fields is None:
                     result["skipped"].append({"case": case, "why": "no readable task.yaml on this checkout"})
                 elif case not in active:
@@ -700,7 +709,7 @@ class Filer:
         this streak (``still_tracks``; ``good`` are the clean or graded
         nights). ``body(addressee=...)`` renders it with the assignment
         line."""
-        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good)], key, kind)
+        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good, self.horizon)], key, kind)
         if closed:
             result["tracked"].append({"case": key, "issue": closed["number"], "closed": True})
             return
@@ -715,7 +724,7 @@ class Filer:
             attempts.append((None, payload(None, refused=True)))
         created, assignee = self.create(attempts, key)
         number = created.get("number") if isinstance(created, dict) else None
-        why = WHY_INFRA_OWNER if assignee else WHY_UNASSIGNED_REFUSED.format(refused=f"@{self.infra_owner}") if self.infra_owner else WHY_NO_INFRA_OWNER
+        why = WHY_INFRA_OWNER if assignee else WHY_UNASSIGNED_REFUSED.format(refused=f"`{self.infra_owner}`") if self.infra_owner else WHY_NO_INFRA_OWNER
         entry = {"case": key, "assignee": assignee, "why": why, "mention": self.infra_backup, "labels": labels,
                  "nights": [n["date"] for n in nights], "runs": [n["run_url"] for n in nights], "issue": number}
         result["filed" if number or self.gh.dry_run else "failed"].append(entry)
@@ -770,7 +779,7 @@ class Filer:
         candidates = [(assignee, why)] if assignee else []
         if assignee and domain_owner and assignee.lower() != domain_owner.lower():
             candidates.append((domain_owner, WHY_REFUSED.format(refused=assignee)))
-        refused = ", ".join(f"@{login}" for login, _ in candidates)
+        refused = ", ".join(f"`{login}`" for login, _ in candidates)
         candidates.append((None, WHY_UNASSIGNED_REFUSED.format(refused=refused) if refused else WHY_UNASSIGNED_NO_OWNER.format(domain=domain)))
         labels = [LABEL, DOMAIN_LABEL.format(slug=domain), TRIAGE_LABEL]
         attempts, reasons = [], {}

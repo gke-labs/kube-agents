@@ -329,9 +329,7 @@ class DedupeTest(Harness):
         self.assertEqual(gh.writes(), [])
         self.assertIn("tracked: case-red by #3996 (closed, still tracking)", out)
         reads = [p for m, p, _ in gh.calls if m == "GET" and "state=closed" in p]
-        # Every closed one, with no `since` horizon: a hand-off from before
-        # the window still tracks its case.
-        self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&per_page=100"])
+        self.assertEqual(reads, [f"{ISSUES}?labels=nightly-red&state=closed&since=2026-10-15T00:00:30Z&per_page=100"])
         # A newer failing night after the close files again.
         later = data(*(night(d, [red(), green()]) for d in (15, 16, 17, 18)))
         gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
@@ -350,6 +348,11 @@ class DedupeTest(Harness):
         cleared = data(*(night(d, [red(), green()]) for d in (15, 16, 17)), night(18, [green("case-red"), green()]),
                        *(night(d, [red(), green()]) for d in (19, 20, 21)))
         gh, _, _ = self.run_once(cleared, FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh)), 1)
+        # A hand-off closed before the window's first night cannot be
+        # confirmed (the case may have passed since): it holds nothing back.
+        old = dict(closed, closed_at="2026-10-01T12:00:00Z")
+        gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(closed_issues=[old]))
         self.assertEqual(len(self.filed(gh)), 1)
 
     def test_a_bug_closed_while_the_newest_red_night_ran_is_filed_again(self):
@@ -504,7 +507,8 @@ class AssigneeTest(Harness):
         first, second = self.filed(gh)
         self.assertEqual(first["assignees"], ["alice"])
         self.assertEqual(second["assignees"], ["carol"])
-        self.assertIn("**Assigned to** @carol (domain owner; GitHub refused @alice as assignee).", second["body"])
+        self.assertIn("**Assigned to** @carol (domain owner; GitHub refused `alice` as assignee).", second["body"])
+        self.assertNotIn("@alice", second["body"], "a refused login is not pinged")
         self.assertNotIn("Assigned to** @alice", second["body"])
         self.assertIn("GitHub refused @alice", err)
         self.assertIn("file #4000: case-red [nightly-red, domain:capacity, needs-triage] assign @carol", out)
@@ -513,9 +517,9 @@ class AssigneeTest(Harness):
         gh, out, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(refuse_assignees=True))
         attempts = self.filed(gh)
         self.assertEqual([a.get("assignees") for a in attempts], [["alice"], ["carol"], None])
-        self.assertIn("**Unassigned** (GitHub refused @alice, @carol as assignee). Domain owner: @carol", attempts[2]["body"])
+        self.assertIn("**Unassigned** (GitHub refused `alice`, `carol` as assignee). Domain owner: @carol", attempts[2]["body"])
         self.assertNotIn("Assigned to", attempts[2]["body"])
-        self.assertIn("unassigned (GitHub refused @alice, @carol as assignee)", out)
+        self.assertIn("unassigned (GitHub refused `alice`, `carol` as assignee)", out)
 
 
 class DryRunTest(Harness):
@@ -814,6 +818,17 @@ class InfraCaseTest(Harness):
         # whose 17th was cut off after recording it: never kept from running.
         writers = [night(d, [green("case-red")], job=WRITERS_JOB, filler=False) for d in range(11, 17)]
         main = [night(d, []) for d in range(11, 17)] + [night(17, [green("case-red")], truncated=True)]
+        gh, _, _ = self.run_once(data(*sorted(writers + main, key=lambda r: r["build_id"])))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_a_moved_case_is_not_absent_while_its_new_part_has_not_landed(self):
+        # Kept on writers on the 14th and 15th, then moved to main: on the
+        # 16th and 17th writers ran clean without it and main has no clean
+        # build on record (not landed on the 16th, cut off before it on the
+        # 17th). The writers part's "no line" is not a kept night.
+        writers = [night(d, [infra_task("case-red")] if d < 16 else [], job=WRITERS_JOB) for d in (13, 14, 15, 16, 17)]
+        main = [night(d, []) for d in (13, 14, 15)] + [night(17, [], truncated=True)]
+        writers[0] = night(13, [green("case-red")], job=WRITERS_JOB)
         gh, _, _ = self.run_once(data(*sorted(writers + main, key=lambda r: r["build_id"])))
         self.assertEqual(self.filed(gh, infra=True), [])
 

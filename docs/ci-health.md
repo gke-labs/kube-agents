@@ -737,7 +737,9 @@ nights on record are still red, so the case is filed again only after a newer
 failing night. An issue closed as not planned (or a duplicate), the close a
 triager picks when handing an infra failure to the infra issue, keeps
 tracking the case until it passes on a night after the close; a red streak
-after that pass files a new issue. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
+after that pass files a new issue. A hand-off closed before the 14 nights on
+record holds nothing back: the record can no longer show whether the case
+passed since. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
@@ -756,7 +758,8 @@ rules). Neither changes the domain streak above.
   is not judged on its old nights.
 - **A case kept from running.** A case is kept from running on a night when its
   part (the one that recorded it that night; on a night neither did, the one
-  that last recorded it) ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
+  that last recorded it, and only when the other part ran clean that date too)
+  ran to its verdict and the case graded nothing: every repetition classified as infrastructure, or no line for it. 3
   such nights in a row file one issue naming the case and the classifier's
   reason. A night is skipped, not counted, when the part did not run or was
   lost (or any job of the part lost its build that date and was not re-run

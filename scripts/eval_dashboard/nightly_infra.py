@@ -249,6 +249,11 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
             usable = [p for p in recorders if day in eligible.get(p, {})]
             if recorders and not usable:
                 continue
+            # No part recorded it: "absent" only when every other part ran
+            # clean that date too; one whose build has not landed, or was
+            # lost, may be where the case runs now (a lane change).
+            if not recorders and any(n is None or n["lost"] or n["unrescued"] for n in (every[p].get(day) for p in every if p != home)):
+                continue
             # A verdict in either part claims the night, as graded_nights
             # reads it: an ungraded line in one part does not hide the other
             # part's grade.
