@@ -3138,6 +3138,23 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
     assert t not in store
     assert res == {}
 
+    # Exit 8: tasks list item with status blocked, transient kind, but absent runs -> evicts stale store
+    traj_tasks_blocked_transient_no_runs = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [{"id": t, "status": "blocked", "block_kind": "transient"}],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(
+        traj_tasks_blocked_transient_no_runs, [t], store=store
+    )
+    assert res is store
+    assert t not in store
+    assert res == {}
+
 
 def test_gitops_fix_cycle_skipped_on_infra_failure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
@@ -4137,10 +4154,10 @@ def test_a_429_blocked_card_unblocked_and_ready_at_settle_remains_graded(
     assert "Finished." in result.output
 
 
-def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_remains_graded(
+def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_records_ceiling(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None, results_json: Any
 ) -> None:
-    """A run where all cards were blocked and one is unblocked at settle with nothing delivered remains graded."""
+    """A run where all cards were blocked and one is unblocked at settle with nothing delivered records ceiling infra."""
     t1 = _TASK_ID
     t2 = _TASK_ID + "-2"
     stub_agent.turns = [
@@ -4233,12 +4250,11 @@ def test_a_429_blocked_card_unblocked_at_settle_with_nothing_delivered_remains_g
     result = KubeAgentsHarness().run("Check cards.")
 
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert result.errors == [
-        f"delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {t1} was reported blocked during wait but running at settle; nothing delivered"
     ]
     rep = _classify(results_json(result), "helm")
-    assert rep.outcome != "infra"
+    assert rep.outcome == "infra"
 
 
 def test_a_triage_card_at_deadline_on_api_lane_records_ceiling_once(

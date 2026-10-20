@@ -1337,14 +1337,19 @@ def _record_unsettled(
     unsettled: Sequence[str],
     last_statuses: Mapping[str, str],
     live_statuses: Mapping[str, str],
+    *,
+    has_delivery: bool = False,
 ) -> None:
     """Record that failure cards unblocked to non-terminal at settle delivered no result."""
     for t in unsettled:
         last = last_statuses.get(t, "unknown")
         live = live_statuses.get(t, "unknown")
-        result.errors.append(
+        report = (
             f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
         )
+        if not has_delivery:
+            report = f"{DELEGATION_CEILING_MARKER}: {report}"
+        result.errors.append(report)
 
 
 def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) -> None:
@@ -2652,7 +2657,7 @@ class KubeAgentsHarness(AgentHarness):
                                         found.pop(tid, None)
                                 else:
                                     found.pop(tid, None)
-                            elif status == "failed":
+                            else:
                                 found.pop(tid, None)
         return found
 
@@ -2879,11 +2884,13 @@ class KubeAgentsHarness(AgentHarness):
             if _status(t) not in _TERMINAL_STATUSES and t not in outstanding
         ]
         if unsettled:
+            has_delivery = any(_status(t) == "done" for t in awaited)
             _record_unsettled(
                 result,
                 unsettled,
                 poll_failure_statuses,
                 {t: _status(t) for t in unsettled},
+                has_delivery=has_delivery,
             )
         # The scorer reads an inject record with no activity marker and
         # nothing outside the envelope as one whose door showed no trace, and
@@ -3017,7 +3024,14 @@ class KubeAgentsHarness(AgentHarness):
                 live_statuses=live_statuses,
             )
             if unsettled:
-                _record_unsettled(result, unsettled, prior_statuses, live_statuses)
+                has_delivery = any(statuses.get(t) == "done" or live_statuses.get(t) == "done" for t in awaited)
+                _record_unsettled(
+                    result,
+                    unsettled,
+                    prior_statuses,
+                    live_statuses,
+                    has_delivery=has_delivery,
+                )
             self._settle(
                 result,
                 observed,
@@ -3242,7 +3256,14 @@ class KubeAgentsHarness(AgentHarness):
         if outstanding:
             unsettled = [t for t in unsettled if t not in outstanding]
         if unsettled:
-            _record_unsettled(result, unsettled, prior_statuses, live_statuses)
+            has_delivery = any(latest.get(t) == "done" or live_statuses.get(t) == "done" for t in awaited)
+            _record_unsettled(
+                result,
+                unsettled,
+                prior_statuses,
+                live_statuses,
+                has_delivery=has_delivery,
+            )
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.

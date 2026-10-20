@@ -2696,10 +2696,10 @@ def test_a_blocked_card_with_rate_limit_summary_on_inject_is_infrastructure(
     assert "rate_limit" in result.errors[0]
 
 
-def test_a_card_unblocked_between_poll_and_final_read_on_inject_remains_graded(
+def test_a_card_unblocked_between_poll_and_final_read_on_inject_records_ceiling(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A card unblocked between the poll that ended the loop and the final read remains graded and records the status discrepancy."""
+    """A card unblocked between the poll that ended the loop and the final read with nothing delivered records ceiling."""
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2725,16 +2725,15 @@ def test_a_card_unblocked_between_poll_and_final_read_on_inject_remains_graded(
 
     assert not infra(result)
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert result.errors == [
-        f"delegated task {CARD_A} was reported blocked during wait but ready at settle; nothing delivered"
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {CARD_A} was reported blocked during wait but ready at settle; nothing delivered"
     ]
 
 
-def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
+def test_a_card_unblocked_and_claimed_running_on_inject_records_ceiling(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A card unblocked and re-claimed running on the deliverable read has a fresh run row and remains graded."""
+    """A card unblocked and re-claimed running on the deliverable read with nothing delivered records ceiling."""
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
@@ -2765,9 +2764,8 @@ def test_a_card_unblocked_and_claimed_running_on_inject_remains_graded(
 
     assert not infra(result)
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
-    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
     assert result.errors == [
-        f"delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
+        f"{harness.DELEGATION_CEILING_MARKER}: delegated task {CARD_A} was reported blocked during wait but running at settle; nothing delivered"
     ]
     assert result.metadata.get("final_message") == ACK
 
@@ -2867,10 +2865,10 @@ def test_a_triage_card_with_transient_rate_limit_summary_on_inject_is_infrastruc
     ]
 
 
-def test_a_triage_card_with_non_transient_block_kind_on_inject_remains_graded(
+def test_a_triage_card_with_non_transient_block_kind_on_inject_records_ceiling_not_rate_limit(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A card in triage at the ceiling with non-transient block_kind remains graded on inject lane."""
+    """A triage card at the ceiling with a non-transient block_kind is not marked by the rate-limit classifier; the ceiling marker alone files it (scorer: infra via DELEGATION_CEILING_MARKER)."""
     build_session_store(tmp_path, created=[CARD_A])
     set_card(
         tmp_path,
