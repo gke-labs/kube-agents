@@ -202,7 +202,8 @@ POD_RANGE_FINDING_TEXT = (
 )
 ACCELERATOR_FINDING_TEXT = (
     "pool {pool} ({accelerators}) surges (maxSurge {max_surge}) with no reservation affinity: each surge node needs accelerator capacity the zone may not have, "
-    "and a pool upgrade that cannot create one stalls between versions; set the in-place strategy (max-surge 0, max-unavailable 1) or hold a reservation"
+    "and a pool upgrade that cannot create one stalls between versions; hold a reservation for the surge node, or, on a pool with a spare accelerator node for the drained pods, "
+    "set the in-place strategy (max-surge 0, max-unavailable 1)"
 )
 NOTE_ACCELERATOR_RESERVED = "pool {pool} ({accelerators}) surges (maxSurge {max_surge}) under reservation affinity {reservation}"
 UNKNOWN_SURGE_NO_TARGET = "surge pool(s) {pools}: no target, so whether their surge nodes are needed in this upgrade is unknown"

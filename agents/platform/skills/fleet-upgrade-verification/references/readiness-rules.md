@@ -48,13 +48,16 @@ new rule adds its entry in that order.
   the pools' `maxSurge`, and fewer free blocks than surge nodes blocks: a surge node with no block
   never registers. The cell names the range with its free, held and total blocks, the surge need and
   the pools, or the pool with its accelerators and `maxSurge`, and the action: lower `max-surge` or
-  add a secondary Pod range; set the in-place strategy (`max-surge` 0, `max-unavailable` 1) or hold
-  a reservation. No target is one unknown for the surge pools; Nodes not read, or a record with no
-  Pod range, is unknown for the range half while the accelerator half still grades. Quota is not
-  read here: the stockout-prevention audit reads it. Action: Keep `maxSurge` at least 1 and
-  `maxUnavailable` 0 with one node of headroom, or give the stranded pods a node they may schedule
-  on. For a short Pod range, lower `max-surge` or add a secondary Pod range. For an accelerator
-  pool, set the in-place strategy (`max-surge` 0, `max-unavailable` 1) or hold a reservation.
+  add a secondary Pod range; hold a reservation for the surge node, or set the in-place strategy
+  (`max-surge` 0, `max-unavailable` 1) on a pool with a spare accelerator node for the drained pods.
+  No target is one unknown for the surge pools; Nodes not read, or a record with no Pod range, is
+  unknown for the range half while the accelerator half still grades. Quota is not read here: the
+  stockout-prevention audit reads it. Action: Keep `maxSurge` at least 1 and `maxUnavailable` 0 with
+  one node of headroom, or give the stranded pods a node they may schedule on. For a short Pod
+  range, lower `max-surge` or add a secondary Pod range. For an accelerator pool, hold a reservation
+  for the surge node, or set the in-place strategy (`max-surge` 0, `max-unavailable` 1) only on a
+  pool with a spare accelerator node for the drained pods: on one whose accelerators are all
+  requested, in-place strands them, the placement half's blocker.
 - `data-on-the-node` (Data on the node), entry 4, risk. Reads: Deployments and StatefulSets are read
   for state, not scratch: a StatefulSet's `emptyDir` (its identity survives the rebuild, its
   node-local data does not), a `hostPath` a container mounts writable, a `hostPath` under a Local

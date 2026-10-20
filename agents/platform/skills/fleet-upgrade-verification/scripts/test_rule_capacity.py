@@ -403,7 +403,9 @@ class SurgeHalvesTest(unittest.TestCase):
         self.assertEqual((finding["finding"], finding["pool"], finding["accelerators"], finding["max_surge"], finding["reservation"]), ("accelerator", "gpu-pool", "1 x nvidia-l4", 1, None))
         text = capacity.describe(finding)
         self.assertIn("pool gpu-pool (1 x nvidia-l4) surges (maxSurge 1) with no reservation affinity", text)
-        self.assertIn("set the in-place strategy (max-surge 0, max-unavailable 1) or hold a reservation", text)
+        # The reservation comes first: in-place on a pool whose accelerators are all requested
+        # strands the drained pods, the placement half's blocker.
+        self.assertIn("; hold a reservation for the surge node, or, on a pool with a spare accelerator node for the drained pods, set the in-place strategy (max-surge 0, max-unavailable 1)", text)
         # NO_RESERVATION holds none either; a reservation the pool consumes is a note.
         record["nodePools"][1]["config"]["reservationAffinity"] = {"consumeReservationType": "NO_RESERVATION"}
         self.assertEqual(len(evaluate(record, nodes, target=GPU_TARGET)["blocking"]), 1)
