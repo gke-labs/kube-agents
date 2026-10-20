@@ -67,9 +67,11 @@ const (
 	// permitted to subscribe to a subject join any QUEUE GROUP on it, so
 	// `web` could join `cap-verifier` and take a share of the verify
 	// requests — not to answer them, which it cannot (no publish under
-	// `a2a.cap.reply.>`), but to swallow them. Check reads the resulting
-	// timeout as a denial, by design, so a browser credential would have
-	// rejected a proportion of every task on the bus. A subscriber on a
+	// `a2a.cap.reply.>`), but to swallow them. Check asks again after a
+	// swallowed ask, inside its reach window, so each one costs a task a
+	// timeout of delay, and a task whose asks are all swallowed for the
+	// window is refused: a browser credential would have slowed every
+	// task on the bus and rejected some of them. A subscriber on a
 	// request subject intercepts; it does not merely watch.
 	//
 	// So `web` is denied `a2a.cap.>` outright (webIdentity, in
@@ -213,9 +215,9 @@ func clip(s string) string {
 // Subscribe starts answering and returns as soon as the subscription is
 // established on the server. It exists in this shape so a caller can know the
 // verifier is listening before it lets anything ask: a request that races the
-// subscription is answered by the client's timeout, and the client reads a
-// timeout as a denial. Pair it with DrainAndCancel at shutdown; the context
-// handed here is the one that ordering is about.
+// subscription gets no answer, and a client that gets none for its whole
+// reach window reads that as a denial. Pair it with DrainAndCancel at
+// shutdown; the context handed here is the one that ordering is about.
 func (s *Service) Subscribe(ctx context.Context, nc *nats.Conn) (*nats.Subscription, error) {
 	sub, err := nc.QueueSubscribe(VerifySubscribe, VerifyQueue, func(m *nats.Msg) {
 		s.handle(ctx, m)
@@ -297,10 +299,52 @@ func (s *Service) handle(ctx context.Context, m *nats.Msg) {
 	}
 }
 
-// DefaultTimeout bounds a broker's wait. The verifier is on the request path,
-// so a broker that waits forever turns a verifier outage into a wedged task
-// rather than a refused one.
+// DefaultTimeout bounds one ask. The verifier is on the request path, so a
+// broker that waits forever turns a verifier outage into a wedged task rather
+// than a refused one.
 const DefaultTimeout = 5 * time.Second
+
+const (
+	// DefaultReachWindow is how long Check keeps asking a verifier it could
+	// not reach before it refuses. It is the bus coming back, not the
+	// verifier being down: when NATS restarts, every client reconnects on
+	// its own clock, and an executor that is back first refuses whatever
+	// lands before the verifiers are. gke-labs/kube-agents#3270 saw that
+	// gap at 3.75s (the executor back at 22:02:03.46, the surviving
+	// verifier at 22:02:07.21), and a task arriving at 22:02:06.31 was
+	// refused 2ms after it was accepted.
+	//
+	// Ten seconds covers the slower of the two ways a verifier comes back.
+	// A verifier that kept its pod reconnects within nats.go's default
+	// reconnect wait plus the verifier's jitter (2s + 0.5s, or 4s under
+	// TLS). A verifier whose bucket bind was in flight when the bus went
+	// away answers only after that bind attempt times out and the next one
+	// runs: jetstream's 5s API timeout plus cmd/verifier's 2s
+	// bindRetryInterval, so up to 7s after the bus is back. Ten is that plus
+	// a reconnect wait, and it stays far inside every grace the gateway
+	// gives a task: the first-event grace and the task deadline are
+	// floored at a minute, and the executor has already published
+	// `submitted` before it asks.
+	//
+	// It is not a longer outage tolerance. A verifier that stays away is
+	// refused with the same reason as before, ten seconds later.
+	DefaultReachWindow = 10 * time.Second
+
+	// reachBackoffInitial and reachBackoffMax pace the asks inside the
+	// window. No-responders comes back from the server in about a
+	// millisecond, so without a pause the loop would spin; the cap keeps a
+	// verifier that subscribes mid-window from waiting more than a second
+	// to be asked again.
+	reachBackoffInitial = 100 * time.Millisecond
+	reachBackoffMax     = time.Second
+
+	// unreachableRule is the refusal when no verifier answered. Callers
+	// and operators read it; it is unchanged by the retry.
+	unreachableRule = "the verifier could not be reached"
+	// malformedAnswerRule is the refusal when a verifier answered with
+	// something that does not parse.
+	malformedAnswerRule = "the verifier's answer was not well-formed"
+)
 
 // Client is the broker side. It knows its own name because the operator told
 // the pod, and it cannot lie about it: it can only publish on its own subject.
@@ -308,7 +352,14 @@ type Client struct {
 	nc      *nats.Conn
 	self    string
 	subject string
+	// Timeout bounds one ask; zero means DefaultTimeout.
 	Timeout time.Duration
+	// ReachWindow bounds how long Check keeps asking when no verifier
+	// answers: zero means DefaultReachWindow, negative means ask once.
+	ReachWindow time.Duration
+	// Log, when set, gets one line when a check reaches the verifier only
+	// after a retry, so a reconnect gap the window rode out is visible.
+	Log *slog.Logger
 }
 
 // NewClient builds the broker's verifier client. self is the principal's own
@@ -322,10 +373,21 @@ func NewClient(nc *nats.Conn, self string) (*Client, error) {
 	return &Client{nc: nc, self: self, subject: subj}, nil
 }
 
+// errUnreachable marks an ask that got no answer at all: no responders, a
+// timeout, or a publish or subscribe the connection refused. It is the only
+// outcome Check retries.
+var errUnreachable = refuse(unreachableRule)
+
 // Check asks whether the capability at ref permits verb v on resource r.
 // A nil error means permitted. Everything else — refused, unreachable,
 // malformed — is a denial, because the alternative is a broker that proceeds
 // when it could not find out.
+//
+// An ask nobody answers is asked again, with backoff, for up to ReachWindow
+// (or Timeout, if that is longer). Any answer ends it at once: a verdict is a
+// verdict whether it came first time or fifth, and a deny is never retried.
+// ctx ends the wait too, with the unreachable refusal, so a caller that is
+// shutting down or was canceled tells the two apart by ctx.Err() as before.
 func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 	b, err := json.Marshal(Request{Ref: ref, Verb: v, Resource: r})
 	if err != nil {
@@ -335,33 +397,96 @@ func (c *Client) Check(ctx context.Context, ref Ref, v Verb, r Scope) error {
 	if timeout <= 0 {
 		timeout = DefaultTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	window := c.ReachWindow
+	if window == 0 {
+		window = DefaultReachWindow
+	}
+	// The whole check, every retry included, ends at the later of one
+	// ask's timeout and the window, and never after the caller's own ctx.
+	budget := max(timeout, window)
+	reach, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+
 	// The reply subject is spelled here rather than taken from the
 	// connection's inbox prefix. Answers ride their own namespace, not
 	// _INBOX (see ReplyPrefix), so nats.Request would ask from a subject
 	// the verifier drops — and the client would read the drop as the
 	// verifier being down, a fail-closed bug that would take a deployment
 	// out silently.
+	//
+	// One reply subject and one subscription serve every ask of this
+	// check, so an answer that arrives after its own ask timed out still
+	// counts: a slow verifier's late verdict is used, not dropped and asked
+	// for again.
 	reply, err := ReplySubject(c.self)
 	if err != nil {
 		return err
 	}
-	sub, err := c.nc.SubscribeSync(reply)
-	if err != nil {
-		return refuse("the verifier could not be reached")
+	var sub *nats.Subscription
+	defer func() {
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+	}()
+
+	start := time.Now()
+	backoff := reachBackoffInitial
+	for attempt := 1; ; attempt++ {
+		if sub == nil {
+			// Subscribed here rather than once above so a subscribe the
+			// connection refuses is retried like any other unreachable ask.
+			if s, err := c.nc.SubscribeSync(reply); err == nil {
+				sub = s
+			}
+		}
+		err := errUnreachable
+		if sub != nil {
+			err = c.ask(reach, timeout, reply, sub, b)
+		}
+		if !errors.Is(err, errUnreachable) {
+			if attempt > 1 && c.Log != nil {
+				c.Log.Info("capability check reached the verifier after a retry",
+					"caller", c.self, "attempts", attempt,
+					"waited", time.Since(start).Round(time.Millisecond),
+					"allowed", err == nil)
+			}
+			return err
+		}
+		// A closed connection will not come back, and a caller whose ctx
+		// ended has stopped asking.
+		if window < 0 || c.nc.IsClosed() || reach.Err() != nil {
+			return err
+		}
+		select {
+		case <-reach.Done():
+			return err
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, reachBackoffMax)
 	}
-	defer func() { _ = sub.Unsubscribe() }()
-	if err := c.nc.PublishRequest(c.subject, reply, b); err != nil {
-		return refuse("the verifier could not be reached")
+}
+
+// ask is one request and its answer, on the check's reply subscription.
+// errUnreachable means nothing answered; any other error is the verifier's
+// verdict or an answer that did not parse.
+func (c *Client) ask(ctx context.Context, timeout time.Duration, reply string, sub *nats.Subscription, body []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := c.nc.PublishRequest(c.subject, reply, body); err != nil {
+		return errUnreachable
 	}
+	// No responders arrives here as nats.ErrNoResponders, within a
+	// millisecond: the server answers a request on a subject nobody is
+	// subscribed to with a 503 status. That is the shape of the gap after
+	// a bus restart, and the reason it was refused at once before the
+	// retry.
 	msg, err := sub.NextMsgWithContext(ctx)
 	if err != nil {
-		return refuse("the verifier could not be reached")
+		return errUnreachable
 	}
 	var resp Response
 	if err := json.Unmarshal(msg.Data, &resp); err != nil {
-		return refuse("the verifier's answer was not well-formed")
+		return refuse(malformedAnswerRule)
 	}
 	if !resp.Allowed {
 		return &Refusal{Rule: resp.Reason}

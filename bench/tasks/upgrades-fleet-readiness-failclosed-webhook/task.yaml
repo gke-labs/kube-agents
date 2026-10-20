@@ -93,9 +93,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # Named by ROLE, not cluster: bench/tf/fleet/fixtures.json. The gate the case is about,
 # plus the budget and the exclusion whose lines the first two objectives expect; each
 # check's `fixture_roles` names the role its object comes from, and the three roles share

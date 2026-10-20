@@ -161,6 +161,7 @@ currently fails.
 | A3  | the executor's derived grant does not reach its own `…in`                                 | 1        | `test_A3_the_executors_grant_does_not_reach_its_own_in_subject`                                     | the per-task wildcard `a2a.tasks.{addressee}.{taskId}.>`, which lets a worker steer and cancel itself as if from the user                                                                                                                                |
 | A3  | `…events` has no rendered writer (the executor's is derived)                              | 1        | `test_A3_the_events_subject_has_no_rendered_writer`                                                 | static `worker` held `a2a.tasks.*.*.events` for every addressee (gke-labs/kube-agents#1316). Closed by A5: the static half is `bridge`, whose grant names one addressee literally, and the callout half is `agent`, which holds no task-plane publish    |
 | A3  | the chat.notify subject has one writer, its reply namespace one                           | 1        | `test_A3_a_notify_has_one_writer_and_its_answer_has_one`                                            | a second principal able to make the install's bot speak in the home channel, or anyone, the agent included, forging the gateway's answer on where a post landed                                                                                          |
+| A3  | the chat.board subject has one writer, its reply namespace one                            | 1        | `test_A3_a_board_request_has_one_writer_and_its_answer_has_one`                                     | a second principal putting words on an admitted member's Home tab, or making the bridge read session-kv for it                                                                                                                                           |
 | A4  | the operator cannot escalate its own grants                                               | 1        | `test_A4_the_operator_cannot_escalate_its_own_grants`                                               | a controller with RBAC CRUD and `escalate` makes every ceiling advisory                                                                                                                                                                                  |
 | A4  | the chart grants the same ceiling as the kustomize role                                   | 1        | `test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role`                                   | a ceiling asserted on one install path only                                                                                                                                                                                                              |
 | A4  | triggering is delegation                                                                  | 1        | `test_A4_triggering_is_covered_by_the_A3_inject_finding`                                            | see A3 above — the one instance in this codebase                                                                                                                                                                                                         |
@@ -300,26 +301,13 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-115 mutations: 89 KILLED, 24 NOISY, two `must_survive` controls (one on the
-harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-25 against
-this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
-KILLED when it was added on 2026-09-30, `D1-platform-role-reaches-secrets`,
-KILLED when it was added on 2026-10-05, the four `C1-a2a-gateway-*` mutations and
-the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
-`B1-slack-method-shape-dropped`, KILLED when it was added on 2026-10-07,
-`A3-agent-answers-its-own-notify` (KILLED) and
-`A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
-they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
-`C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
-`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
-`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13, and
-`B2-script-merge`, `B2-enqueue-predicate-ignores-holds`,
-`B2-app-token-grants-pull-requests` and `B2-app-token-scopes-dropped`, all KILLED
-when they were added on 2026-10-13 and 2026-10-14;
-re-run the harness rather than trusting these numbers, which is the sentence this
-paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 113 of the 115: a
+206 mutations: 175 KILLED, 28 NOISY, three `must_survive` controls
+(`A3-fastpath-redundant`, `B1-denylist-rule` and
+`B1-gke-mcp-overlay-copy-redundant`), zero genuine survivors, zero stale.
+Measured 2026-10-19 on `main` at `1b783dac` plus #3261's re-aimed
+`A3-session-sends-a-notify`. Re-run the harness rather than trusting these
+numbers, which is the sentence this paragraph exists to make cheap.
+Note that the summary line the harness prints accounts for 203 of the 206: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is

@@ -207,8 +207,9 @@ kubectl top nodes
 `kubectl exec`, `kubectl port-forward` and `kubectl cp` reach into a running pod, and the
 broker refuses them; when a task needs one, give the user the command to run.
 
-Scaling a Deployment (its `replicas`) or installing a Helm chart is a manifest change,
-proposed as a pull request through `submit-suggestion`.
+Scaling a Deployment (its `replicas`) is a manifest change, proposed as a pull request
+through `submit-suggestion`. A Helm chart is never installed or upgraded with `helm`:
+declare it in the GitOps repository with the `gitops-helm-chart` skill.
 
 ## `parent` / `name` Format Quick Reference
 

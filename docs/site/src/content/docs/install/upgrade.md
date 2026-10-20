@@ -284,6 +284,11 @@ before it applies.
   [When an upgrade is refused](#when-an-upgrade-is-refused)). After it, edit the Slack app as
   [Moving an existing app to `next`](/kube-agents/install/slack-app/#moving-an-existing-app-to-next)
   describes.
+- **A home channel.** Under `next` the A2A gateway posts alerts, drift reports and scheduled reports
+  only to a home channel: set `SLACK_HOME_CHANNEL`, or `GOOGLE_CHAT_HOME_CHANNEL` when Google Chat is
+  on, before the switch ([Home channel](/kube-agents/install/slack-app/#home-channel)). Without one
+  those posts are dropped while conversations keep working; the run warns, and the PlatformAgent
+  carries the `HomeChannelUnset` condition.
 - **Switching back** to `today` is the same `install.env` edit the other way. Put the Slack app's
   slash commands back too, as that section says.
 - **A mode set on the PlatformAgent by hand** (`kubectl patch`, as 0.9.0 needed) survives upgrades,

@@ -64,13 +64,11 @@ node boot disk).
 ## Binding Manual Pools to ComputeClass
 
 Manual pools must be labeled/tainted to be eligible for a ComputeClass (unless
-it's the cluster default).
-
-```bash
-gcloud container node-pools update <POOL> \
-    --node-labels="cloud.google.com/compute-class=<CLASS-NAME>" \
-    --node-taints="cloud.google.com/compute-class=<CLASS-NAME>:NoSchedule"
-```
+it's the cluster default). `nodeConfig.labels` is immutable on an existing pool, so propose a new
+`ContainerNodePool` carrying the label `cloud.google.com/compute-class: <CLASS-NAME>`
+in `spec.nodeConfig.labels` and a `spec.nodeConfig.taint` entry with that key and
+value and the no-schedule effect, as Config Connector YAML through
+`gcp-config-connector`.
 
 When using node pool auto-creation, ComputeClasses auto-tolerate these taints;
 workloads do **not** need matching tolerations.
