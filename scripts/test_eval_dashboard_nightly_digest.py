@@ -20,7 +20,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
-from eval_dashboard import nightly_digest, post_health
+from eval_dashboard import nightly, nightly_digest, post_health
 
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_nightly_bugs"
 REPO = "gke-labs/kube-agents"
@@ -54,6 +54,14 @@ def infra(name):
     return task(name, "infra", "infra", "infra")
 
 
+def storm_partial(name):
+    """One rep passed, two recorded as failures with a quota reason."""
+    t = task(name, "pass", "fail", "fail")
+    for rep in t["reps"][1:]:
+        rep["reason"] = STORM_REASON
+    return t
+
+
 def night(day, tasks, truncated=False):
     """One main-part build started 00:00:30Z on 2026-10-<day>, with passing
     filler cases so a red or two is not a run-level event."""
@@ -65,7 +73,7 @@ def night(day, tasks, truncated=False):
 
 
 def data(*runs, extra_cases=()):
-    cases = [{"name": name, "domain": "capacity", "active": False, "nightly_active": True} for name in CASES]
+    cases = [{"name": name, "domain": "capacity", "active": False, "nightly_active": True} for name in CASES + list(FILLER)]
     cases += [{"name": name, "domain": domain, "active": False, "nightly_active": True} for name, domain in extra_cases]
     return {"schema_version": 1, "generated_at": NOW.isoformat(), "cases": cases, "runs": list(runs)}
 
@@ -139,7 +147,7 @@ class FullSectionTest(Harness):
         section = self.build(full_night(), FULL_ISSUES)
         self.assertFalse(section.quiet)
         self.assertEqual("\n".join(section.lines), "\n".join([
-            (f"🌙 *Nightly, Tue Oct 20* · 2 of 6 scenarios passed · 1 not graded (infrastructure or no line) · ran 9h 52m"
+            (f"🌙 *Nightly, Tue Oct 20* · 6 of 12 scenarios passed · 2 not graded (infrastructure or no line) · ran 9h 52m"
              f" · <{LOGS}/{JOB}/30000000000000200001|run> · {PAGE}"),
             "",
             "🔴 *New bugs filed* (failing every run, 3 nights in a row)",
@@ -186,7 +194,7 @@ class FullSectionTest(Harness):
             rc = post_health.main(argv, environ=environ, opener=Opener(), gh_runner=gh_runner)
         self.assertEqual(rc, 0)
         [digest] = sent
-        self.assertIn("\n🌙 *Nightly, Tue Oct 20* · 2 of 6 scenarios passed", digest)
+        self.assertIn("\n🌙 *Nightly, Tue Oct 20* · 6 of 12 scenarios passed", digest)
         self.assertIn("<users/1001> (backup <users/1002>)", digest)
         self.assertNotIn("🌙 Nightly:", digest, "the one-line summary gives way to the section")
         self.assertNotIn("skipped", digest)
@@ -197,14 +205,23 @@ class QuietDayTest(Harness):
         doc = data(*(night(day, [green("case-green"), green("case-red"), red("case-red-extended")]) for day in range(15, 21)))
         section = self.build(doc, [issue(4002, "case-red-extended", "2026-10-17T05:00:00Z")])
         self.assertTrue(section.quiet)
-        self.assertEqual(section.lines, [f"🌙 Nightly Oct 20: 2 of 3 passed (4 not graded), no new reds, nothing recovered, 1 still red · {PAGE}"])
+        self.assertEqual(section.lines, [f"🌙 Nightly Oct 20: 6 of 7 passed (6 not graded), no new reds, nothing recovered, 1 still red · {PAGE}"])
 
 
     def test_a_second_red_night_is_counted_on_a_quiet_day(self):
         doc = data(*(night(day, [green("case-green"), red("case-red") if day >= 19 else green("case-red")]) for day in range(15, 21)))
         section = self.build(doc)
         self.assertTrue(section.quiet)
-        self.assertEqual(section.lines, [f"🌙 Nightly Oct 20: 1 of 2 passed (5 not graded), no new reds, nothing recovered, 1 still red · {PAGE}"])
+        self.assertEqual(section.lines, [f"🌙 Nightly Oct 20: 5 of 6 passed (7 not graded), no new reds, nothing recovered, 1 still red · {PAGE}"])
+
+    def test_a_tracked_case_red_again_after_a_green_night_is_never_quiet(self):
+        # case-red-extended has an open issue from an earlier streak, passed
+        # on the 19th and failed every rep last night: a regression, not a
+        # case "still red".
+        doc = data(*(night(day, [green("case-green"), red("case-red-extended") if day != 19 else green("case-red-extended")]) for day in range(15, 21)))
+        section = self.build(doc, [issue(4002, "case-red-extended", "2026-10-17T05:00:00Z")])
+        self.assertFalse(section.quiet)
+        self.assertIn(f"• Capacity: case-red-extended, night 1 · <https://github.com/{REPO}/issues/4002|#4002> · <users/1001>", section.lines)
 
     def test_a_writers_part_cut_off_is_never_quiet(self):
         nights = [night(day, [green("case-green")]) for day in range(15, 21)]
@@ -213,6 +230,24 @@ class QuietDayTest(Harness):
         section = self.build(data(*nights, writers))
         self.assertFalse(section.quiet)
         self.assertIn("writers part cut off at the deadline, its cases not counted", section.lines[0])
+
+
+class NightlyPageAgreementTest(Harness):
+    def test_the_header_counts_are_the_nightly_pages(self):
+        # case-maint passed one rep and failed two on a 429: the filer's
+        # classifier reads those two as infrastructure and grades the case
+        # a pass, the Nightly page counts it partial (the 2026-10-20 night's
+        # 83 against 82). The header follows the page.
+        nights = [night(day, [green("case-green"), red("case-red-extended")]) for day in range(15, 20)]
+        nights.append(night(20, [green("case-green"), red("case-red-extended"), storm_partial("case-maint"), infra("case-outsider"), red("case-noowner")]))
+        for doc in (data(*nights), full_night()):
+            [page] = nightly.nightly_document(doc)["nights"][:1]
+            counts = page["counts"]
+            section = self.build(doc, [issue(4002, "case-red-extended", "2026-10-17T05:00:00Z")])
+            ungraded = counts["infra"] + counts["missing"]
+            self.assertFalse(section.quiet)
+            self.assertIn(f"{counts['passed']} of {counts['recorded']} scenarios passed · {ungraded} not graded", section.lines[0])
+        self.assertIn("5 of 9 scenarios passed", self.build(data(*nights), [issue(4002, "case-red-extended", "2026-10-17T05:00:00Z")]).lines[0])
 
 
 class TrackingTest(Harness):

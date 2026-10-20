@@ -811,14 +811,15 @@ where nearly every case failed give none), and cases marked `expected_fail`,
 off the nightly matrix, or with no `task.yaml` on the checkout are left out. An
 issue tracks a case as the filer reads it: an open `nightly-red` issue naming
 it, or a closed one that still tracks the streak (closed after its newest
-night, or handed off as not planned). Its counts therefore follow the filer's
-classifier, which drops repetitions it reads as infrastructure even when the
-collector recorded them as failures, and can differ by a case from the Nightly
-report's.
+night, or handed off as not planned). The lists follow the filer's classifier,
+which drops repetitions it reads as infrastructure even when the collector
+recorded them as failures; the header's counts do not, so they match the
+Nightly report's.
 
-- The header: the night's date, how many of the graded scenarios passed every
-  repetition, how many on the matrix were not graded, the wall clock, and links
-  to the run and the Nightly report.
+- The header: the night's date, how many of the recorded scenarios passed every
+  graded repetition, how many were not graded (lost to infrastructure, or on the
+  matrix with no line), the wall clock, and links to the run and the Nightly
+  report. The numbers are the Nightly report's "Passed all reps" and "Cases".
 - **🔴 New bugs filed:** red on 3 or more graded nights in a row, and its open
   issue was opened after last night's run finished. Domain name, issue,
   assignee and the domain's backup.
@@ -839,7 +840,8 @@ report's.
 
 Each list shows at most 5 lines; the rest are one line linking to the Nightly
 report. A night with no new bug, no case owed a bug for the first time, no
-case red for the first night, no recovery, no infra item and no part cut off is
+case red for the first night (a tracked case red again after a green night
+counts), no recovery, no infra item and no part cut off is
 one line instead: the date, the pass count and how many were not graded, "no
 new reds, nothing recovered", and how many are still red. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are

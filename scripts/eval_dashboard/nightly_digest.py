@@ -24,7 +24,9 @@ Nightly page. A night with no new or newly owed bug, no first-night red, no
 recovery, no infra item and no part cut off is one line (QUIET_LINE), which
 counts what is still red.
 
-The verdicts are ``nightly_bugs.graded_nights``: a part cut off at the job
+The header's counts are the Nightly page's (``header_counts``): cases that
+passed every graded repetition, of the cases recorded. The lists' verdicts
+are ``nightly_bugs.graded_nights``: a part cut off at the job
 deadline, a case with no graded repetition, and a run-level event (nearly
 every case failed) give no verdict. A night whose main part was cut off is
 labelled so and none of its cases are counted; a writers part cut off is
@@ -82,7 +84,7 @@ LOOKBACK_NIGHTS = nightly_bugs.LOOKBACK_NIGHTS
 INFRA_STREAK_NIGHTS = nightly_infra.INFRA_STREAK_NIGHTS
 
 HEADER = "{glyph} *Nightly, {date}*{sep}{body}{sep}ran {took}{sep}{run}{sep}{page}"
-HEADER_PASSED = "{passed} of {graded} scenarios passed"
+HEADER_PASSED = "{passed} of {recorded} scenarios passed"
 NOT_GRADED_NOTE = "{count} not graded (infrastructure or no line)"
 DATE_FORMAT = "{day:%a %b} {day.day}"
 SHORT_DATE_FORMAT = "{day:%b} {day.day}"
@@ -92,7 +94,7 @@ RUN_EVENT_BODY = "nearly every case failed: a run-level event, not counted per c
 UNKNOWN_WALL_CLOCK = "an unknown time"
 RUN_TEXT = "run"
 PAGE_TEXT = "Nightly page"
-QUIET_LINE = "{glyph} Nightly {date}: {passed} of {graded} passed{ungraded}, no new reds, nothing recovered{still} · {page}"
+QUIET_LINE = "{glyph} Nightly {date}: {passed} of {recorded} passed{ungraded}, no new reds, nothing recovered{still} · {page}"
 QUIET_UNGRADED = " ({count} not graded)"
 QUIET_STILL = ", {count} still red"
 
@@ -134,7 +136,7 @@ SKIP_NO_NIGHT = f"no nightly run started in the last {nightly.LAST_NIGHT_MAX_AGE
 SKIP_RUNNING = "last night's main part is still running"
 SKIP_NO_MAIN = "last night's main part is missing, so its numbers would be the writers part's alone"
 SKIP_BAD_LINK = "a link it would carry is malformed ({url})"
-SKIP_BAD_COUNT = "its counts do not add up ({passed} passed of {graded} graded, {expected} on the matrix)"
+SKIP_BAD_COUNT = "its counts do not add up ({passed} passed of {recorded} recorded)"
 
 
 class Skipped(Exception):
@@ -312,13 +314,10 @@ class Builder:
             self.check_links()
             return Section(lines, quiet=False)
 
-        graded = len(tonight)
-        passed = sum(1 for vs in tonight.values() if vs[-1]["outcome"] == classify.OUTCOME_PASSED)
-        on_matrix = len(expected) if expected else graded
-        if passed > graded or graded > on_matrix:
-            raise Skipped(SKIP_BAD_COUNT.format(passed=passed, graded=graded, expected=on_matrix))
-        notes = [HEADER_PASSED.format(passed=passed, graded=graded)]
-        ungraded = len({c for c in expected if fields.get(c) and not fields[c]["expected_fail"]} - set(tonight)) if expected else 0
+        passed, recorded, ungraded = header_counts(night)
+        if passed > recorded:
+            raise Skipped(SKIP_BAD_COUNT.format(passed=passed, recorded=recorded))
+        notes = [HEADER_PASSED.format(passed=passed, recorded=recorded)]
         if ungraded:
             notes.append(NOT_GRADED_NOTE.format(count=ungraded))
         cut = [PART_CUT_NOTE.format(part=nightly.PART_WORDS.get(p.get("part"), p.get("part"))) for p in night.get("parts") or [] if p.get("truncated")]
@@ -340,6 +339,9 @@ class Builder:
                 if issue and reds >= STREAK_NIGHTS and issue.get("state") != STATE_CLOSED and not nightly_bugs.opened_before(issue, v):
                     new.append((key, NEW_LINE.format(domain=name, case=case, issue=self.issue_link(issue), assignee=self.who(self.owner_of(case, f, issue)), backup=backup_text)))
                 elif issue:
+                    # Green the night before: a regression the issue's
+                    # filer does not comment on, so never a quiet day.
+                    first_night = first_night or reds == 1
                     still.append((key, STILL_LINE.format(domain=name, case=case, nights=count, issue=self.issue_link(issue), owner=self.who(self.owner_of(case, f, issue)))))
                 elif reds >= STREAK_NIGHTS:
                     # The filer owes it a bug and no issue tracks it: it is
@@ -358,7 +360,7 @@ class Builder:
 
         if not (new or newly_owed or first_night or recovered or lost_any or infra or cut):
             red = len(still) + len(unfiled) + len(first)
-            line = QUIET_LINE.format(glyph=nightly.DIGEST_GLYPH, date=short, passed=passed, graded=graded,
+            line = QUIET_LINE.format(glyph=nightly.DIGEST_GLYPH, date=short, passed=passed, recorded=recorded,
                                      ungraded=QUIET_UNGRADED.format(count=ungraded) if ungraded else "",
                                      still=QUIET_STILL.format(count=red) if red else "", page=self.page())
             self.check_links()
@@ -406,6 +408,16 @@ class Builder:
             tag = self.issue_link(issue)
             items.append(((1, name.lower(), case), KEPT_LINE.format(domain=name, case=case, nights=kept, issue=f"{nightly.SEP}{tag}" if tag else "")))
         return items, lost_any
+
+
+def header_counts(night: dict) -> tuple[int, int, int]:
+    """``(passed, recorded, not graded)`` for the header, read from the
+    night's ``counts`` exactly as the Nightly page reads them: a case passed
+    when every graded repetition passed (``nightly.case_state``), out of the
+    cases recorded; not graded is the cases lost to infrastructure plus the
+    matrix cases with no line."""
+    counts = night["counts"]
+    return counts["passed"], counts["recorded"], counts["infra"] + counts["missing"]
 
 
 def _takewhile_back(items: list, keep):
