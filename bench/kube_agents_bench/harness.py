@@ -2610,8 +2610,9 @@ class KubeAgentsHarness(AgentHarness):
             if isinstance(shown, dict):
                 tid = str(shown.get("id"))
                 if tid in wanted:
+                    status = shown.get("status")
                     if (
-                        shown.get("status") in ("blocked", "triage")
+                        status in ("blocked", "triage")
                         and shown.get("block_kind") != "transient"
                     ):
                         found.pop(tid, None)
@@ -2626,14 +2627,17 @@ class KubeAgentsHarness(AgentHarness):
                                 found.pop(tid, None)
                         else:
                             found.pop(tid, None)
+                    elif status == "failed":
+                        found.pop(tid, None)
             listed = payload.get("tasks")
             if isinstance(listed, list):
                 for item in listed:
                     if isinstance(item, dict):
                         tid = str(item.get("id"))
                         if tid in wanted:
+                            status = item.get("status")
                             if (
-                                item.get("status") in ("blocked", "triage")
+                                status in ("blocked", "triage")
                                 and item.get("block_kind") != "transient"
                             ):
                                 found.pop(tid, None)
@@ -2648,6 +2652,8 @@ class KubeAgentsHarness(AgentHarness):
                                         found.pop(tid, None)
                                 else:
                                     found.pop(tid, None)
+                            elif status == "failed":
+                                found.pop(tid, None)
         return found
 
     @staticmethod

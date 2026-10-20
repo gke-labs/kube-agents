@@ -3107,6 +3107,37 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
     assert t not in store
     assert res == {}
 
+    # Exit 6: task item with empty runs list -> evicts stale store
+    traj_task_empty_runs = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "failed"},
+                "runs": [],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_empty_runs, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 7: tasks list item with absent runs -> evicts stale store
+    traj_tasks_no_runs = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [{"id": t, "status": "failed"}],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_no_runs, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
 
 def test_gitops_fix_cycle_skipped_on_infra_failure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
@@ -3799,7 +3830,7 @@ def test_status_turn_refresh_and_evict_against_successful_board_read_remains_gra
     assert worker_failure in result.output
 
 
-def test_worker_authored_kanban_block_with_infra_prefix_remains_graded(
+def test_worker_authored_kanban_block_with_non_transient_kind_remains_graded(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
     """A worker-authored kanban_block with block_kind != transient is not treated as infra failure."""
