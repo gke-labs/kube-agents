@@ -405,7 +405,7 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// name different buckets is an authorization failure at runtime with
 		// a green suite.
 		"$KV.session-state.>",
-		// The kept 👎 ratings (a2a/gateway/feedback.go), the bucket's
+		// The kept 👍 and 👎 ratings (a2a/gateway/feedback.go), the bucket's
 		// data plane; its JetStream grants are a2aGatewayJetStreamGrants'.
 		"$KV.feedback.>",
 		// The console adapter's notices (spec-chatops-gateway.md, "The

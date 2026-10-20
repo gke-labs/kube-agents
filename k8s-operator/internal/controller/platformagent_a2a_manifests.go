@@ -1805,7 +1805,7 @@ func a2aAgentJetStreamGrants() []string {
 //     Create, Put and Delete are publishes on $KV.session-state.>, granted
 //     beside this list.
 //
-//   - KV_feedback, the kept 👎 ratings (a2a/gateway/feedback.go): the same
+//   - KV_feedback, the kept 👍 and 👎 ratings (a2a/gateway/feedback.go): the same
 //     four verbs for the same calls -- STREAM.INFO to bind it and read its
 //     max age at start, DIRECT.GET for a rating's note and the export's
 //     reads, and the watcher's CONSUMER.CREATE and CONSUMER.DELETE for the
@@ -2981,7 +2981,7 @@ $NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --hist
 $NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
 
-# feedback: the 👎 ratings chat users gave the gateway's answers, each with
+# feedback: the 👍 and 👎 ratings chat users gave the gateway's answers, each with
 # the exchange it rated (a2a/gateway/feedback.go). User content, so the max
 # age is the retention: NATS drops a rating 30 days after it was given, and
 # the gateway refuses to keep ratings in a bucket without one. Only the

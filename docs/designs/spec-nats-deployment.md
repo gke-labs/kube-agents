@@ -225,7 +225,8 @@ Four KV buckets ride the same JetStream deployment:
   `a2a/authcallout` against the config the operator renders.
 - `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
   exchange it rated: user content that can hold cluster data. The one bucket with a max
-  age (`--ttl=720h`), which is its retention, and capped at 64MiB. The gateway's user is
+  age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
+  past it a new rating is refused until older ones expire. The gateway's user is
   its only reader and writer by grant, with the registry's four verbs on `KV_feedback`,
   and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
   same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway

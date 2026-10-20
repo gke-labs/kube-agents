@@ -720,6 +720,8 @@ func (n *Notifier) postRatedText(job notifyJob, m OutMessage) bool {
 	if len(chunks) == 0 {
 		return false
 	}
+	// rated is the marked post accepted; a backend that draws no controls
+	// accepts it as text.
 	first, rated := "", false
 	for i, chunk := range chunks {
 		var message string

@@ -99,6 +99,11 @@ const (
 	// slackHomeFeedbackWindow, drawn when answer feedback is on.
 	slackHomeFeedbackWeek   = "This week: %d 👍, %d 👎"
 	slackHomeFeedbackWindow = 7 * 24 * time.Hour
+	// slackHomeTallyFresh and slackHomeTallyErrorFresh are how long a tally,
+	// and a failed one, is reused: a week's count moves slowly, and the
+	// tally reads the whole bucket.
+	slackHomeTallyFresh      = 5 * time.Minute
+	slackHomeTallyErrorFresh = time.Minute
 	// slackHomeHTTPS is the scheme prRepo reads a forge URL under.
 	slackHomeHTTPS = "https://"
 
@@ -288,16 +293,16 @@ func (s *SlackAdapter) homeFeedback() []slack.Block {
 }
 
 // homeTally is the cached tally of the last slackHomeFeedbackWindow's
-// ratings, read again on the board's schedule (homeBoard).
+// ratings, read again once it is older than slackHomeTallyFresh.
 func (s *SlackAdapter) homeTally(recorder FeedbackRecorder) (up, down int, err error) {
 	s.home.mu.Lock()
 	age := time.Since(s.home.tallyAt)
 	switch {
-	case s.home.tallyErr == nil && !s.home.tallyAt.IsZero() && age < slackHomeBoardFresh:
+	case s.home.tallyErr == nil && !s.home.tallyAt.IsZero() && age < slackHomeTallyFresh:
 		up, down = s.home.tallyUp, s.home.tallyDown
 		s.home.mu.Unlock()
 		return up, down, nil
-	case s.home.tallyErr != nil && age < slackHomeBoardErrorFresh:
+	case s.home.tallyErr != nil && age < slackHomeTallyErrorFresh:
 		err = s.home.tallyErr
 		s.home.mu.Unlock()
 		return 0, 0, err

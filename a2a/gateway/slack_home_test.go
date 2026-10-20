@@ -100,7 +100,7 @@ func TestSlackHomeCountsTheWeeksRatingsWhenFeedbackIsOn(t *testing.T) {
 	}
 	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
 	if rec.tallies != 1 {
-		t.Errorf("tally read %d times for two opens inside the board's freshness, want 1", rec.tallies)
+		t.Errorf("tally read %d times for two opens inside its freshness, want 1", rec.tallies)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 // (provisioned by the deployment; the gateway's user is the only writer).
 const SessionStateBucket = "session-state"
 
-// FeedbackBucket is the KV bucket holding the 👎 ratings chat users gave the
+// FeedbackBucket is the KV bucket holding the 👍 and 👎 ratings chat users gave the
 // gateway's answers, with the exchange each one rated (provisioned by the
 // deployment with a max age, which is the retention; the gateway's user is
 // the only reader and writer).

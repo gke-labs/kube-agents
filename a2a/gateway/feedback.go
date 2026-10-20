@@ -270,32 +270,39 @@ func (rec *SessionRecord) markCardsAnswer(taskID string) {
 }
 
 // Tally counts the ratings kept that were given at or after since, by
-// rating; a record that cannot be read is skipped.
+// rating, reading every current record over one watcher rather than a
+// request per key; a record that does not parse is skipped.
 func (d *feedbackDesk) Tally(ctx context.Context, since time.Time) (up, down int, err error) {
 	kv, err := d.g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
 		return 0, 0, fmt.Errorf("feedback bucket: %w", err)
 	}
-	keys, err := kv.ListKeys(ctx)
+	watcher, err := kv.WatchAll(ctx, jetstream.IgnoreDeletes())
 	if err != nil {
 		return 0, 0, fmt.Errorf("feedback bucket: %w", err)
 	}
-	for key := range keys.Keys() {
-		rec, err := getFeedback(ctx, kv, key)
-		if err != nil || rec.RatedAt.Before(since) {
-			continue
-		}
-		switch rec.Rating {
-		case FeedbackUp:
-			up++
-		case FeedbackDown:
-			down++
+	defer func() { _ = watcher.Stop() }()
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, 0, ctx.Err()
+		case entry, ok := <-watcher.Updates():
+			if !ok || entry == nil {
+				// nil marks the end of the records already there.
+				return up, down, nil
+			}
+			var rec FeedbackRecord
+			if json.Unmarshal(entry.Value(), &rec) != nil || rec.RatedAt.Before(since) {
+				continue
+			}
+			switch rec.Rating {
+			case FeedbackUp:
+				up++
+			case FeedbackDown:
+				down++
+			}
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return 0, 0, err
-	}
-	return up, down, nil
 }
 
 // KeptDays is the bucket's max age in whole days, at least one.

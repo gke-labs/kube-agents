@@ -16,7 +16,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
-// `/gateway feedback export [--since 7d]`: the kept 👎 ratings as draft eval
+// `/gateway feedback export [--since 7d]`: the kept 👍 and 👎 ratings as draft eval
 // cases, a tar on stdout (gateway.ExportFeedback). Run in the gateway's pod,
 // with its environment, because the gateway's NATS user is the feedback
 // bucket's only reader:

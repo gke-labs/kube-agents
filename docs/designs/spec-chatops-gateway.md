@@ -2017,8 +2017,9 @@ no sink files the drafts anywhere: nothing is filed automatically into the publi
 repository, and a rating leaves the install only if the customer chooses to send it.
 
 The Slack Home tab ends, under a divider, with "This week: N 👍, M 👎", the kept ratings given in
-the last seven days (`FeedbackRecorder.Tally`, a scan of the bucket's keys), read on the board's
-schedule and left out when feedback is off or the tally cannot be read.
+the last seven days (`FeedbackRecorder.Tally`, every current record read over one watcher),
+reused for five minutes (one minute after a failed read) and left out when feedback is off or the
+tally cannot be read; a new rating shows once the count is read again.
 
 An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
 operator renders `A2A_SLACK_ANSWER_FEEDBACK=false` on the gateway only for an explicit `false`, so an
