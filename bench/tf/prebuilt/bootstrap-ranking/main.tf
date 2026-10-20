@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery:
+# The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery and
+# bench/tasks/bootstrap-inventory-posture-scope:
 # plant a fixed INVENTORY.raw.md (`raw_report`, a file beside this one) on the
 # shell sandbox's data volume, file the `bootstrap-inventory-prioritize` card
 # the onboarding gate's hand-off files once it has written that file, wait until

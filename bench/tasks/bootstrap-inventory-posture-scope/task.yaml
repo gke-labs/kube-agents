@@ -79,9 +79,9 @@ verification_spec:
           This scan checked: startup probes, ResourceQuota and LimitRange,
           read-only root filesystems, Shielded Nodes, Dataplane V2, Managed
           Service for Prometheus, node auto-upgrade, static Google Cloud keys
-          in pods and added capabilities. Security and RBAC, reliability,
-          capacity and cost come from the first-run audits, which post their
-          own findings.
+          in pods, added capabilities, and lists any other problem it saw in
+          passing. Security and RBAC, reliability, capacity and cost come from
+          the first-run audits, which post their own findings.
       # The verdicts SOP Step 6 names, and the 10-20 reports' wording.
       forbidden_patterns:
         - '\bhealthy\b'

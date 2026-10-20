@@ -2178,7 +2178,12 @@ class FirstRunAuditsTest(unittest.TestCase):
 
     def test_the_not_covered_note_does_not_say_the_report_covers_them(self):
         self.assertNotIn("covers", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
-        self.assertIn(f"Nothing has checked {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE)
+        # The skips come a day or more after the sweep, when the scheduled audits have usually run,
+        # so the note speaks for this report, not for what the audits have done.
+        self.assertIn(
+            f"This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE
+        )
+        self.assertNotIn("Nothing has checked", bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE)
 
     def test_the_covered_note_claims_only_the_older_scans_own_checks(self):
         covered = bootstrap_delivery.AUDITS_COVERED_NOTE.split("so this report covers them", 1)[0]

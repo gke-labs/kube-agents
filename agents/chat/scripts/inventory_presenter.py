@@ -46,7 +46,9 @@ and 1 low") summed. With no
 roll-up, the total is a closing line's "all <n> findings", then the
 posture's "<n> findings" after a scan verb, then the largest of the closing
 lines' "<n> findings in total" (one may count one cluster), then any other
-"<n> findings" in the posture, then the listed items. The rest of the
+"<n> findings" in the posture, then the listed items. The posture line
+``inventory_findings.py select`` printed, naming what the scan checked, is kept
+whole, first on the line under the headline. The rest of the
 findings, the rest of the posture and any other roll-up paragraph are left out;
 every other closing line is kept as written, counts and all, since they are
 how a text reader asks for the rest. When the roll-up was the last of them,
@@ -55,7 +57,7 @@ how a text reader asks for the rest. When the roll-up was the last of them,
 ``blocks`` is the same card as Block Kit, which ``bootstrap_delivery``
 posts itself when it can: the headline, lead and the first :data:`CARD_ROWS`
 findings as rows with no count above them, the lead counting only those, a
-kept roll-up as a line under them, the other listed findings folded under
+kept roll-up and then the posture line, a sentence a line, under them, the other listed findings folded under
 "<n> more worth a look", then a primary "Fix the first one" button and, when the total is
 more than the findings the report lists, a "See all N" button, both answered as the
 clicker's turn: a click posts the button's label in the card's thread.

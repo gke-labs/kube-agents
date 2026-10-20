@@ -221,11 +221,11 @@ AUDITS_COVERED_NOTE = (
 )
 # Every other skip leaves the audits to their schedules, and the scan did not run their checks.
 AUDITS_NOT_COVERED_NOTE = (
-    f"Nothing has checked {inventory_findings.AUDIT_FAMILY_WORDS} yet; those audits check them on their schedules."
+    f"This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}; those audits check them on their schedules."
 )
 # A skip with the hand-off's no-coverage report (bootstrap_handoff.NO_RANKING).
 AUDITS_UNCHECKED_SCHEDULED_NOTE = (
-    "No cluster was audited either, so nothing has checked any cluster yet; those audits check "
+    "No cluster was audited either, so this report covers no cluster; those audits check "
     f"{inventory_findings.AUDIT_FAMILY_WORDS} on their schedules."
 )
 # The audits by what they report on, which the report's posture line names the same way.

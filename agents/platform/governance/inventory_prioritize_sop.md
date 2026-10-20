@@ -94,7 +94,7 @@ never as items in the ranked list, and never register them.
 
 **But a category that could not be checked must still be reported.** A record marking a category
 `unavailable`, `skipped`, or `error` is not a finding either, and it is not a clean result: it means
-that area was never examined. Say so in the posture sentence, naming the category and the reason
+that area was never examined. Say so in the posture (Step 6), naming the category and the reason
 ("control-plane checks did not run: no cloud-provider metrics available"). Dropping it leaves the
 user reading a report that looks like full coverage. A silent gap reads as "clean" — the same reason
 the discovery sweep is required to name a cluster whose scan failed rather than omit it.
@@ -430,7 +430,7 @@ Write clean Markdown that reads well in a chat client. Structure:
    - the `posture:` line `select` printed, copied exactly, without the `posture:` label.
 
    Nothing else: no judgement of the fleet, such as "healthy", "clean", or "no critical
-   vulnerabilities". The scan runs only the checks that line names. The first-run audits check
+   vulnerabilities". The scan runs only the checks that line names, and reports what else it saw in passing. The first-run audits check
    security and RBAC, reliability, capacity and cost minutes later and post their own findings,
    so a verdict here contradicts them.
 
