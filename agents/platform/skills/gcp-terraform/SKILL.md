@@ -55,6 +55,29 @@ the reviewer's or CI's step, because only CI has the state to plan against.
 
 ## Workflow
 
+### Step 0: A stop ends the request
+
+Every "stop" in this skill is the answer, not a reason to look for another
+way in. When one applies, report it in the words given, change nothing, and
+end: on a kanban card with `kanban_block(kind="needs_input")` and the stop as
+the reason. Do not go on to check what you are allowed to change, try another
+identity, or search for credentials or another repository.
+
+The first stop comes before anything else: the install must have a GitOps
+repository registered, and it must be reachable. One command answers both,
+and its one line is final:
+
+```bash
+python3 "$HERMES_HOME"/scripts/gitops_preflight.py
+python3 "$HERMES_HOME"/scripts/gitops_preflight.py --repo "<owner>/<repo>"
+```
+
+Run the first form before anything else, and the second once you know which
+repository the change goes to. `REGISTERED: ...` (exit 0) means go on. Any
+other line (`NO_REGISTERED_REPO`, `REPO_UNREACHABLE`, `STATE_UNREADABLE`,
+`BROKER_UNAVAILABLE`) is the stop: block with that line as the reason and
+change nothing.
+
 ### Step 1: Open the repository and learn its Terraform
 
 Open it with **submit-suggestion** `prepare` (its Step 1) on branch
