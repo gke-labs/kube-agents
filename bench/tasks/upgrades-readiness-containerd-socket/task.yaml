@@ -23,9 +23,13 @@
 # runtime version is the judge's. The line carries a `;`, which keeps the
 # verifier's value-wrap fold from removing a quote or angle bracket the agent
 # kept around it, so both of the cell objective's patterns admit one opener
-# before the text. The prompt asks for one declared line per socket client in
-# a fixed vocabulary; the deterministic objectives read those lines and
-# nothing else.
+# before the text. The required text stops before the rule's own `; ` (the
+# note's `; no pool's containerd major changes`, the risk's `; mounting the
+# runtime socket:`): the note column joins its entries on `; `, and an agent
+# that cuts the rule's entry there hands back the text up to the agent's name
+# or the pool's current major, which passes. The prompt asks for one declared
+# line per socket client in a fixed vocabulary; the deterministic objectives
+# read those lines and nothing else.
 #
 # `{cluster:a}` expands to the cluster the runner recorded for slot a.
 #
@@ -115,6 +119,10 @@ verification_spec:
   # neither. A report whose rule is missing prints no such line, so the slot
   # reads something else and the line fails here, whatever the other slots say.
   # The client count, the pool and the other clients are the fleet's, left open.
+  # The required text ends at the agent's name in the note form and at the
+  # pool's current major in the risk form, before the rule's own `; `: the note
+  # column joins its entries on that separator, so an agent that cuts the
+  # rule's entry there hands back a line that still passes.
   - name: the-planted-agents-line-quotes-the-reports-text
     role: objective
     mode: assert
@@ -125,9 +133,9 @@ verification_spec:
         - containerd-socket-agent
       # The `container-runtime: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe[^)\n]*\); no pool|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ [^\n]*mounting the runtime socket: [^\n]*daemonset seeded-shapes/node-runtime-probe)[^\n]*$'
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: ["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ )[^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe[^)\n]*\); no pool|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ [^\n]*mounting the runtime socket: [^\n]*daemonset seeded-shapes/node-runtime-probe))[^\n]*$'
+        - '(?m)^{cluster:a}/seeded-shapes/node-runtime-probe: kind [^;\n]+; mounts the runtime socket: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?!["''“‘<]?(?:container-runtime: )?(?:[0-9]+ workload\(s\) mount the container runtime socket \([^)\n]*daemonset seeded-shapes/node-runtime-probe|pool [^(\n]+\([^)\n]*\) runs containerd [0-9]+ ))[^\n]*$'
 
   - name: no-invented-cves
     role: objective

@@ -9758,6 +9758,10 @@ _CONTAINERD_RISK_CELL = (
     "container-runtime: pool default-pool (COS_CONTAINERD) runs containerd 1 on its nodes (containerd://1.7.34) and the target's node image "
     "ships containerd 2; mounting the runtime socket: DaemonSet seeded-shapes/node-runtime-probe (/run/containerd/containerd.sock)"
 )
+# The two lines cut at the rule's own `; `, as an agent that splits the note column on its
+# separator hands them back; the case's patterns stop before it.
+_CONTAINERD_NOTE_CUT = _CONTAINERD_NOTE_LINE.split("; ", 1)[0]
+_CONTAINERD_RISK_CUT = _CONTAINERD_RISK_CELL.split("; ", 1)[0]
 _INTREE_CELL = (
     "in-tree-volumes: PersistentVolume intree-pd (in-tree gcePersistentDisk seeded-a-intree-pd, claim seeded-shapes/intree-pd, Bound) "
     "attaches through CSI migration for Deployment seeded-shapes/intree-pd-reader; move it to pd.csi.storage.gke.io"
@@ -9885,6 +9889,12 @@ def test_rule_cases_accept_the_cell_however_the_agent_wrapped_it(case, objective
 @pytest.mark.parametrize("wrap", _CELL_WRAPS)
 def test_containerd_case_accepts_the_rules_risk_cell_on_a_fleet_whose_pool_changes_major(wrap):
     assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=_CONTAINERD_RISK_CELL)))
+
+
+@pytest.mark.parametrize("cell", [_CONTAINERD_NOTE_CUT, _CONTAINERD_RISK_CUT, _bare(_CONTAINERD_NOTE_CUT), _bare(_CONTAINERD_RISK_CUT)])
+@pytest.mark.parametrize("wrap", _CELL_WRAPS)
+def test_containerd_case_accepts_the_rules_entry_cut_at_its_first_separator(cell, wrap):
+    assert _case_grades(_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(wrap.format(cell=cell)))
 
 
 @pytest.mark.parametrize(
