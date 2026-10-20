@@ -3,8 +3,8 @@
 `hack/ci-eval-pr.sh` exports `AGENT_TRANSPORT=inject` and the door's bearer
 token, read from the Secret the operator renders beside the door, when the
 deploy ran under the flag; unset, section 4 fetches the agent token as it
-always has and exports neither. Every pull request runs the unset path, so
-that is the half pinned first, with five spellings of "not 1". The set half
+always has and exports neither. The today lane and every non-next job run
+the unset path, so that is the half pinned first, with five spellings of "not 1". The set half
 is run against a stubbed `kubectl` and checked for the exact Secret and key
 the operator writes and the harness reads -- three sources that have to agree
 on two strings, held together here rather than in three places by hand.

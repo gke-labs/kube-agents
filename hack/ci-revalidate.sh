@@ -225,6 +225,16 @@ readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/p
 # gsutil cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
 readonly REVALIDATION_HISTORY_LIMIT=20
+# A green from before the job changed what it grades is not a verdict this
+# run could only repeat. EVAL_REVALIDATION_NOT_BEFORE, a UTC time set in the
+# job's env in oss-test-infra (the swap to spec.mode next, or a rollback to
+# today), refuses a green build whose EARLIEST matching success status on
+# GitHub was created before it: the original crier event, which the sticky
+# re-pin's later copies (same build URL) cannot stand in for. GitHub's
+# time, not the GCS record's, for the trust-surface reason above. Unset or
+# empty, nothing changes; unparsable, or an event with no readable time, is
+# a full run. It binds greens only: an /override is the admin's decision.
+readonly REVALIDATION_NOT_BEFORE="${EVAL_REVALIDATION_NOT_BEFORE:-}"
 # The status read pages through GitHub's newest-first events (100 a page,
 # following `Link: rel="next"`) up to this many pages. One page is not
 # enough: the sticky re-pin posts a copy on every open head after every
@@ -672,22 +682,51 @@ print(base, head)
 import json
 import sys
 
-context, build = sys.argv[1], sys.argv[2]
+from datetime import datetime
+
+
+def utc(value):
+    parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(value)
+    return parsed
+
+
+context, build, not_before = sys.argv[1], sys.argv[2], sys.argv[3].strip()
 statuses = json.load(sys.stdin)
 needle = "/" + context + "/" + build
-for status in statuses:
-    if (
-        status.get("context") == context
-        and status.get("state") == "success"
-        and needle in (status.get("target_url") or "")
-    ):
-        print("attested")
+matches = [
+    status
+    for status in statuses
+    if status.get("context") == context
+    and status.get("state") == "success"
+    and needle in (status.get("target_url") or "")
+]
+if not matches:
+    print("absent")
+    sys.exit(0)
+if not_before:
+    try:
+        cutoff = utc(not_before)
+    except ValueError:
+        print("error EVAL_REVALIDATION_NOT_BEFORE is not a UTC time")
         sys.exit(0)
-print("absent")
-' "${REVALIDATION_JOB_NAME}" "${prev_green}" 2>/dev/null)" || attested="error unparsable"
+    try:
+        earliest = min(utc(status.get("created_at") or "") for status in matches)
+    except ValueError:
+        print("predates at an unreadable time")
+        sys.exit(0)
+    if earliest < cutoff:
+        print("predates " + earliest.isoformat())
+        sys.exit(0)
+print("attested")
+' "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_NOT_BEFORE}" 2>/dev/null)" || attested="error unparsable"
   fi
   case "${attested}" in
     attested) ;;
+    predates*)
+      _revalidation_no_green "green build ${prev_green} of PR #${pull_number} was first reported ${attested#predates }, before EVAL_REVALIDATION_NOT_BEFORE (${REVALIDATION_NOT_BEFORE}) -- a verdict from before the job changed what it grades"
+      return 1 ;;
     absent)
       _revalidation_no_green "GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green}${REVALIDATION_STATUS_PARTIAL:+ among the events read (the read stopped at ${REVALIDATION_STATUS_PARTIAL})} -- refusing to trust the GCS record alone"
       return 1 ;;

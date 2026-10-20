@@ -701,8 +701,9 @@ repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge 
 then dispatch `smoke-test-sticky.yml` by hand: the re-pin then never pins an older green, and makes
 one Tide still credits stale, which the change itself would not, as it moves nothing on `main`.
 Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
-matrix instead of reusing the old green, and drop that lever in a follow-up once the open queue
-has run under the new mode, about a week.
+matrix instead of reusing the old green. The follow-up that drops that lever sets
+`EVAL_REVALIDATION_NOT_BEFORE` on the job to the same time as the variable, so step 0 never reuses
+a green first reported before it, however long its pull request sat.
 Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.

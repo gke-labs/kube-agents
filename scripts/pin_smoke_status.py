@@ -267,7 +267,7 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
 def _expire(api, sha, status, main_sha, expected_main, reason, dry_run):
     """Make a pre-cutoff green stale if Tide still credits it (its base is the head of main)."""
     _, base_sha = split_description(status.get("description") or "")
-    main_now = _resolve(main_sha) if callable(main_sha) or expected_main is None else expected_main
+    main_now = expected_main if expected_main is not None else _resolve(main_sha)
     if base_sha is None or base_sha != main_now:
         return f"{sha[:SHORT_SHA]}: {reason}; already stale, so Tide retests it"
     latest = latest_status(api, sha)

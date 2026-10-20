@@ -1,7 +1,7 @@
 # The inject lane's exclusions: registered cases that do not run when the
 # matrix goes through the A2A gateway's inject door (the harness's
 # AGENT_TRANSPORT=inject, which hack/ci-eval-pr.sh exports under
-# EVAL_MODE_NEXT=1), because the case's premise needs something the door
+# EVAL_MODE_NEXT=1 except on the today lane), because the case's premise needs something the door
 # does not carry: a specialist's answer folded back into the chat thread, or
 # a card's wake, which the harness replays on the api transport only. A case
 # excluded while the lane pinned the bridge's cli executor, for a reason that

@@ -1559,7 +1559,7 @@ class CiEvalRollbackLaneTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("stub ran: kubeagents-system platform-agent end=today context=gke_p_r_c", result.stdout)
         self.assertIn("Rolled back to today; the matrix runs over the agent API", result.stdout)
-        self.assertTrue(result.stdout.rstrip().endswith("MATRIX NEXT"), result.stdout)
+        self.assertLess(result.stdout.index("Rolled back to today"), result.stdout.index("MATRIX NEXT"), result.stdout)
         self.assertIn("stub ran", (artifacts / "rollback-roundtrip.log").read_text())
         self.assertEqual((artifacts / "rollback-roundtrip.txt").read_text().splitlines(), ["PASS pre.mode-next: x"])
 

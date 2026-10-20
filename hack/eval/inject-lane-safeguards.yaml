@@ -1,6 +1,7 @@
 # The inject lane's safeguards: verification_spec entries every case on the
 # lane carries in addition to its own, appended by hack/ci-eval-pr.sh under
-# AGENT_TRANSPORT=inject (the switch it exports under EVAL_MODE_NEXT=1) to a
+# AGENT_TRANSPORT=inject (the switch it exports under EVAL_MODE_NEXT=1, bar
+# the today lane's EVAL_ROLLBACK_LANE=1) to a
 # copy of each task file before devops-bench reads it
 # (bench/kube_agents_bench/lane.py). The task files under bench/tasks/ are
 # untouched and the api lane's matrix is byte for byte what it was: on any

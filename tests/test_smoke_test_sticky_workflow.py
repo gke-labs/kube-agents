@@ -49,6 +49,9 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
     def test_it_starts_on_status_events_pushes_to_main_and_a_manual_dispatch(self):
         self.assertEqual(sorted(self.triggers), ["push", "status", "workflow_dispatch"])
         self.assertEqual(self.triggers["push"], {"branches": ["main"]})
+        # The job-level `if:` has to admit the dispatch too: on a dispatch
+        # github.event.context is empty, so the status clause alone skips it.
+        self.assertIn("github.event_name == 'workflow_dispatch'", self.condition)
 
     def test_the_job_carries_the_fork_guard(self):
         self.assertIn(_FORK_GUARD, self.condition)
