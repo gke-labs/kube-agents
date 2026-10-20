@@ -1972,10 +1972,11 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # case (decided 2026-09-15 on #1546/#1564): it lands there, builds its record
 # in the evidence store (EVAL_BASELINE_STORE below), and earns a presubmit
 # seat on that record; measured cost, presubmit redundancy or grading
-# something outside the core journeys keep a case there for good. The file's
-# header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=8 (6 from #1491 until oss-test-infra#2707, merged
-# 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# something outside the core journeys keep a case there for good. The budget
+# arithmetic its header used to carry (against the periodic's 480m deadline
+# at EVAL_TASK_PARALLELISM=8) is frozen in hack/eval/nightly-budget-history.txt
+# (#3495); a run's matrix is the "Eval matrix: ..." line below, and
+# `python3 scripts/eval_rosters.py --summary` counts the files. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took

@@ -576,7 +576,7 @@
 # oobe job the image ships;
 # the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
 # because each repetition runs four real audits back to back. Off the infra
-# lock (the 2026-10-15 paragraph above).
+# lock (the 2026-10-15 paragraph of nightly-budget-history.txt).
 ./tasks/oobe-first-run-audits/task.yaml
 
 # A delegated answer opens on one bold sentence and does not restate it
@@ -692,7 +692,8 @@
 # Priced at 900s in unit_cost_hint rather than the ~600s measured: those runs
 # met a quiet board, and the nightly shares one leased install across its
 # cases, so a busy board pushes this case's card wait toward its 1800s
-# ceiling. The dated paragraph above carries the budget arithmetic.
+# ceiling. Its dated paragraph in nightly-budget-history.txt carries the
+# budget arithmetic.
 ./tasks/gitops-drift-noise-filtered-triage/task.yaml
 
 # Asked for options to choose from, the card pauses on the question:

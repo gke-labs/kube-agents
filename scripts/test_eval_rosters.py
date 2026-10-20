@@ -280,9 +280,22 @@ DEMOTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
-# The presubmit file's cases when the nightly file was frozen (#3495), so the
-# held-out-seat history check knows which seats predate the sorted section.
-FROZEN_AT_3495 = frozenset(PRESUBMIT_AT_SPLIT) | {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
+# Held-out seats withdrawn since #3495: a withdrawal moves the line to the
+# nightly file's sorted section and records the case here, in the same edit
+# that deletes its HELD_OUT_IN_PRESUBMIT entry.
+WITHDRAWN_TO_SORTED: list[str] = []
+# The pinned cases whose lines may sit in the sorted section rather than the
+# frozen part. Nothing else may leave the frozen part.
+ALLOWED_IN_THE_SORTED_SECTION = (
+    {case for case, follows in DEMOTED_AFTER_THE_SPLIT if follows is None} | set(WITHDRAWN_TO_SORTED))
+# Every case that was ever in the presubmit file before the nightly file was
+# frozen (#3495): the split's TASKS array plus the two promoted since. Written
+# out, so it doesn't grow with later promotions. A held-out seat among these
+# must have a pinned nightly line; a seat for a case registered later can't.
+EVER_IN_THE_PRESUBMIT_BEFORE_3495 = frozenset(PRESUBMIT_AT_SPLIT) | {
+    "incident-triage-oom-event-probe",
+    "pdb-remediation-pr",
+}
 
 
 def with_insertions(base, insertions):
@@ -442,10 +455,10 @@ class SplitLostNothingTest(unittest.TestCase):
                     NIGHTLY_AT_SPLIT + ADDED_AFTER_THE_SPLIT + MOVED_TO_NIGHTLY + ADDED_AFTER_THE_MOVED_BLOCK
                     + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
                 )
-                if case in pinned_nightly or case in FROZEN_AT_3495:
-                    self.assertIn(case, pinned_nightly, "a held-out seat's nightly line is what moved")
-                # A case registered after the freeze came from the sorted
-                # section, which pins no history; its seat cites its record.
+                if case in EVER_IN_THE_PRESUBMIT_BEFORE_3495:
+                    self.assertIn(case, pinned_nightly, "a pre-freeze seat's nightly line is what moved")
+                # A seat for a case registered after the freeze came from the
+                # sorted section, which pins no history; its seat cites its record.
         for case in HELD_OUT_TO_NIGHTLY:
             if case in seated:
                 continue
@@ -480,9 +493,9 @@ class SplitLostNothingTest(unittest.TestCase):
             ],
             DEMOTED_AFTER_THE_SPLIT,
         )
-        # A pinned case whose line came back to the sorted section (a withdrawn
-        # seat, a demotion) is held there instead.
-        self.assertEqual(frozen, [c for c in pinned if c not in sorted_section])
+        # A demotion recorded with None, or a withdrawn seat, is held in the
+        # sorted section instead; nothing else may leave the frozen part.
+        self.assertEqual(frozen, [c for c in pinned if c not in ALLOWED_IN_THE_SORTED_SECTION])
 
     def test_a_demoted_case_is_in_the_nightly_only(self):
         for case in DEMOTED:
