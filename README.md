@@ -137,7 +137,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Observability | `gke-alert-configuration`, `gke-basics`, `gke-observability`, `kube-agents-observability` |
 | Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades` |
 | Manifests and remediation | `gcp-config-connector`, `gitops-helm-chart`, `gke-manifest-generation`, `submit-suggestion` |
-| Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `pr-conversation`, `version-control` |
+| Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
 | Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting` |
 
 <!-- prettier-ignore-end -->

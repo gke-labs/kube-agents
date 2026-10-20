@@ -685,6 +685,62 @@ func TestShellSandboxScopeDeclaredEnv(t *testing.T) {
 	}
 }
 
+// The audits' auto-promotion switch reaches the sandbox pod only when
+// spec.deployment.env carries it, and with the value given: finish runs here,
+// and an operator who set it on the agent would otherwise have set it on a
+// container that never reads it (#3439).
+func TestShellSandboxAuditAutoPromoteEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envAuditAutoPromote {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+	if _, ok := read(shellSandboxTestAgent()); ok {
+		t.Errorf("%s is set on the sandbox container with no spec.deployment.env entry; unset means the sweep's default", envAuditAutoPromote)
+	}
+	off := shellSandboxTestAgent()
+	off.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: "OTEL_SDK_DISABLED", Value: "true"},
+		{Name: envAuditAutoPromote, Value: "false"},
+	}}
+	got, ok := read(off)
+	if !ok || got != "false" {
+		t.Errorf("%s = %q, %v with spec.deployment.env setting it to false; want false, true", envAuditAutoPromote, got, ok)
+	}
+	// The pod carries the operator's two words, never the CR's bytes: a quoted
+	// or backslashed literal would stop the sandbox entrypoint before sshd.
+	for value, want := range map[string]string{" FALSE ": "false", "true": "true", "\"false\"": "true", "off": "true"} {
+		odd := shellSandboxTestAgent()
+		odd.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envAuditAutoPromote, Value: value}}}
+		if got, ok := read(odd); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", envAuditAutoPromote, got, ok, value, want)
+		}
+	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envAuditAutoPromote,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envAuditAutoPromote)
+	}
+	if _, other := func() (string, bool) {
+		sts := buildShellSandboxStatefulSet(off, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "OTEL_SDK_DISABLED" {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}(); other {
+		t.Error("OTEL_SDK_DISABLED reached the sandbox container: only the named switch is forwarded from spec.deployment.env")
+	}
+}
+
 func TestShellSandboxHostContextAndGKEEnv(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{

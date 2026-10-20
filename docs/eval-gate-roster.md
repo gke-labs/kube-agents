@@ -481,6 +481,15 @@ into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
 the set of requesting cases. The same approvers as the exclusion list, for the same reason.
 
+One thing about the lane's install differs too. That write safeguard
+(`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
+window to the case in flight, and the fleet audits' automatic remediation sweep opens one on its
+own wherever a pool repository declares a workload with a `major` finding on the sweep's list, the
+fresh install's first-run chain included. So `hack/ci-deploy.sh` installs the lane's agent with
+`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in `spec.deployment.env`: the audits still run and file
+their ledgers, `finish` opens nothing nobody asked for, and a `/remediate` still works. The api
+lane keeps the sweep on, where the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
+
 ## The GitLab lane
 
 The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
@@ -526,10 +535,11 @@ nightlies run, not what can red a pull request.
 
 If an admitted case reds a pull request its diff cannot explain on a graded failure,
 demote it: delete its line from `hack/eval/blocking-roster.txt` and from
-`hack/eval/presubmit-cases.txt`, add it to `hack/eval/nightly-cases.txt` with the issue as
-the `#` line above it, and reference that issue. A held-out seat has no roster name: it is
-withdrawn by moving its line back to `hack/eval/nightly-cases.txt` and deleting its
-`HELD_OUT_IN_PRESUBMIT` entry. Demotion is a same-day edit to those
+`hack/eval/presubmit-cases.txt`, add it to the sorted section of `hack/eval/nightly-cases.txt`
+with the issue as the `#` line above it (and its `DEMOTED_AFTER_THE_SPLIT` entry with `None`
+as its predecessor in `scripts/test_eval_rosters.py`), and reference that issue. A held-out
+seat has no roster name: it is withdrawn by moving its line back to that section, deleting
+its `HELD_OUT_IN_PRESUBMIT` entry and listing it in `WITHDRAWN_TO_SORTED`. Demotion is a same-day edit to those
 files — the files, not the Prow config, are deliberately the fast lever. It is the lever for rung-4 reds ONLY: a rung-1–3 red (a mutation, an
 erroring verifier, an empty record on a task that provisions nothing — a record whose
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its

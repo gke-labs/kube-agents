@@ -104,7 +104,7 @@ ENV_FILE="$HOME/kube-agents/install.env"
 )
 ```
 
-The subshell keeps the file's variables out of your shell. After the teardown, revoke the GitLab token in GitLab.
+The subshell keeps the file's variables out of your shell. After the teardown, revoke the GitLab token in GitLab, and the read-only token too, if you made one.
 
 ### What `spec.mode: next` leaves behind
 

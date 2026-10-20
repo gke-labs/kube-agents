@@ -210,6 +210,12 @@ release as `<RELEASE_VERSION>`. The latest release is on
 GitHub App and no token minter. The installer refuses `--github-app-id` and `--github-pem-path`
 with `--gitops-forge=gitlab`. The Go and Cloud KMS prerequisites of the PEM import do not apply.
 
+To let the agent read a private GitLab context repository, also set `GITLAB_READ_TOKEN_FILE` to a
+file or `<(command)` that holds a read-only token (Reporter role, `read_repository` scope only). Use
+a release whose `install.env.example` lists `GITLAB_READ_TOKEN_FILE`; an older release ignores it.
+See "Private context repositories" on the
+[GitLab install page](docs/site/src/content/docs/install/gitlab.md#private-context-repositories).
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
@@ -238,8 +244,8 @@ Rules for the agent:
   token of a dedicated account that is a Developer member of the project. It is never a person's
   own token.
 - The broker uses the token only for the declared repositories. Another project in the
-  same group gets no token; `inspect-repository` reads it without one, so only a public project
-  is readable. A project outside those groups is refused. For `platform/infra/gitops`, the group
+  same group gets no write token. `inspect-repository` reads a public project with no token, and a
+  private one only when it is a context repository and a read-only token is stored. A project outside those groups is refused. For `platform/infra/gitops`, the group
   is `platform/infra`. The token limits what GitLab lets the broker do. Tell the operator to use the token with the smallest reach. That
   is a project access token on the GitOps project, or a group access token on `platform/infra`,
   not on `platform`.
@@ -626,13 +632,14 @@ If you enabled Google Chat or Slack during the install, perform the following re
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
    - If you left `GOOGLE_CHAT_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its space the home channel, where scheduled reports post. To send them to a team space instead, send the first message there, or run `/sethome` there afterwards.
-   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and drops them while it is empty. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set.
+   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and drops them while it is empty. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve google_chat <PAIRING_CODE>
      ```
-   - Re-display these instructions at any time from the repository root:
+   - The A2A gateway under `spec.mode: next` has no pairing: it answers the addresses in `ALLOWED_USERS`, or everyone the app is visible to when that is empty.
+   - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist instead. This script takes the mode from `install.env` alone, while the checklist `install.sh` prints at the end of a run follows the mode it expects the PlatformAgent to be on after the apply, which can differ from the key when `spec.mode` was set by hand:
      ```bash
      ./scripts/installer/print_instructions_gchat.sh
      ```
@@ -666,7 +673,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
 
-- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead:
+- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints follows the mode it expects after the apply:
   ```bash
   ./scripts/installer/print_instructions_slack.sh
   ```

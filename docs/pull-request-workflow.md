@@ -742,7 +742,8 @@ not re-run: neither blocks anything. GitHub's own re-run button needs Write acce
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot
-re-run looks like). A run already on its third attempt is left alone (the
+re-run looks like). A green run whose comment got no reaction at all means GitHub refused the
+reaction; the run's warning and summary say so, and the re-run or the decline reason is still there. A run already on its third attempt is left alone (the
 second attempt is for a run that a lost runner or a superseding event cancelled on the way to the
 one re-run the flake is worth); someone with Write access reads its log and decides, re-running from
 the run's page or with `gh run rerun <run-id> --failed`. Either re-run is also a report.

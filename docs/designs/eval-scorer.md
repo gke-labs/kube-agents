@@ -1076,8 +1076,8 @@ periodic's timeout comment; the fixed provision-and-deploy term is inside that f
 why it sits far below the unit-loop speed-ups measured under [Open items](#open-items)), at which
 that night projected to ~470–490 minutes — `360m` would truncate most nights, and the job gates
 nothing, so a long night costs a lease and nothing else. The thirty-nine-task matrix since
-2026-09-16 prices at ~775–795 serial minutes (the budget paragraph in
-`hack/eval/nightly-cases.txt`), which at 1.15× is ~675–690 — over `480m` — and fits only if the
+2026-09-16 prices at ~775–795 serial minutes (the budget paragraph, now
+frozen in `hack/eval/nightly-budget-history.txt`), which at 1.15× is ~675–690 — over `480m` — and fits only if the
 nightly, alone on the quota and two lanes wider, realises ~1.65×; the first nights measure it
 (#1491). The fan-out is
 `EVAL_TASK_PARALLELISM=6`, wider than the presubmit's 4, because the nightly is alone on the model
