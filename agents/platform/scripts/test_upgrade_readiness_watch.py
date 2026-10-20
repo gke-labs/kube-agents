@@ -1054,6 +1054,17 @@ class Budget(Base):
         self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
         self.assertFalse(self.marker().exists())
 
+    def test_a_tick_whose_every_number_is_unresolved_names_six_and_counts_the_rest(self) -> None:
+        numbers = [f"12345{i}" for i in range(8)]
+        versions = envelope([member(f"c{i}", "lagging", project=f"proj-{i}") for i in range(8)])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(numbers)}):
+            sandbox = FakeSandbox(versions, aliases={n: f"proj-{i}" for i, n in enumerate(numbers)}, describe_down=set(numbers))
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertIn("ProjectUnresolved: no project was read under a key", out)
+        self.assertEqual(out.count("the project number did not resolve"), watch.MAX_NAMES_IN_LINE)
+        self.assertIn(watch.NAMES_OVERFLOW.format(more=2), out)
+
     def test_a_table_that_fails_for_every_project_is_one_failure_line(self) -> None:
         versions, readiness = self.two_projects()
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
@@ -1583,6 +1594,18 @@ class DeclaredScope(Base):
         self.assertIn("the tick failed: ReportRefused: p1: refused by the report script: the install's declared scope does not list p1", out)
         self.assertIn("; p2: refused by the report script: the install's declared scope lists p2 but the install could not read it", out)
         self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, sorted([["p1", watch.REFUSAL_OUTSIDE], ["p2", watch.REFUSAL_UNREAD.format(outcome="denied")]])])
+
+    def test_an_all_refused_tick_names_six_refusals_and_counts_the_rest(self) -> None:
+        """Bounded as the partial line is: a roster of outside projects posts one line
+        of six refusals and a count, and the marker still keys on every one."""
+        self.declare_scope(["mgmt"])
+        roster = [f"p{i}" for i in range(1, 9)]
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: ",".join(roster)}):
+            code, out = self.run_tick(FakeSandbox(envelope([])))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count("refused by the report script"), watch.MAX_NAMES_IN_LINE)
+        self.assertIn(watch.NAMES_OVERFLOW.format(more=2), out)
+        self.assertEqual([project for project, _ in json.loads(self.marker().read_text())[1]], roster)
 
     def test_a_refused_project_is_its_own_kind_of_partial_so_a_later_outage_is_still_announced(self) -> None:
         """A roster project the declared scope does not list is refused every

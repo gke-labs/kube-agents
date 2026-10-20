@@ -1632,14 +1632,15 @@ def versions_by_project(
             chosen = next((exc for exc in failed.values() if not isinstance(exc, ReportRefused)), next(iter(failed.values())))
             if isinstance(chosen, ReportRefused):
                 # Every run was refused: the line names each refusal it is keyed on, the
-                # project before its reason when there is more than one.
+                # project before its reason when there is more than one, bounded as the
+                # partial line is; the marker keys on every refusal.
                 if len(failed) > 1:
-                    chosen = ReportRefused(REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=project, message=exc) for project, exc in failed.items()), chosen.cause)
+                    chosen = ReportRefused(shown_names([PARTIAL_REASON.format(project=project, message=exc) for project, exc in failed.items()], REASONS_SEPARATOR), chosen.cause)
                 chosen.signature = refused_tick_signature(failed)
             raise chosen
         if unresolved:
             raise ProjectUnresolved(
-                UNRESOLVED_TICK_DETAIL.format(reasons=REASONS_SEPARATOR.join(PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()))
+                UNRESOLVED_TICK_DETAIL.format(reasons=shown_names([PARTIAL_REASON.format(project=p, message=d) for p, d in unresolved.items()], REASONS_SEPARATOR))
             )
     # Both budget shapes are one kind: the announcement must not re-post when a
     # cut-short run comes and goes beside the projects never reached.
