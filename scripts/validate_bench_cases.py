@@ -481,7 +481,10 @@ GREET_EVAL_PHRASE_MIN_LENGTH = 12
 # A case without a deployer runs against the install as it stands. {{CLUSTER_NAME}}
 # is the per-run task cluster hack/ci-eval-pr.sh names for the stacks that create
 # one, so a deployer-less case that names it asks the agent for a cluster that
-# never exists (stop-on-permission-refusal, four red nights in 2026-10).
+# never exists (stop-on-permission-refusal, four red nights in 2026-10). Which
+# cases are deployer-less is the scorer's loader's answer (kube_agents_bench.cases
+# NOOP_DEPLOYER and load_case): no `infrastructure:` block, or one naming no
+# deployer, is `noop` too.
 NO_DEPLOYER = "noop"
 RUN_CLUSTER_PLACEHOLDER = "{{CLUSTER_NAME}}"
 RUN_CLUSTER_PLACEHOLDER_FIELDS = ("prompt", "expected_output")
@@ -1179,7 +1182,13 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 "that is not a substring of its own 'prompt:', so no turn of "
                 "this case ever gets the greeting"
             )
-    if isinstance(infrastructure, dict) and infrastructure.get("deployer") == NO_DEPLOYER:
+    if infrastructure is None:
+        deployer = NO_DEPLOYER
+    elif isinstance(infrastructure, dict):
+        deployer = str(infrastructure.get("deployer") or NO_DEPLOYER).strip()
+    else:
+        deployer = None
+    if deployer == NO_DEPLOYER:
         for field in RUN_CLUSTER_PLACEHOLDER_FIELDS:
             value = spec.get(field)
             if isinstance(value, str) and RUN_CLUSTER_PLACEHOLDER in value:

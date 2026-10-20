@@ -584,6 +584,10 @@ class TestTheRulesReject(unittest.TestCase):
         placeholder = "On cluster {{CLUSTER_NAME}}, list the pods"
         self._only("never exists", infrastructure={"deployer": "noop"}, prompt=placeholder)
         self._only("never exists", infrastructure={"deployer": "noop"}, expected_output=placeholder)
+        # The loader's shapes for "no deployer": no block, an empty block, a blank deployer.
+        self._only("never exists", prompt=placeholder)
+        self._only("never exists", infrastructure={}, prompt=placeholder)
+        self._only("never exists", infrastructure={"deployer": ""}, prompt=placeholder)
         host = "On cluster platform-agent-host, list the pods"
         self.assertEqual(self._validate(infrastructure={"deployer": "noop"}, prompt=host), [])
         self.assertEqual(self._validate(infrastructure={"deployer": "tofu", "stack": "x"}, prompt=placeholder), [])
