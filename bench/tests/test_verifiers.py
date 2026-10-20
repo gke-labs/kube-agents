@@ -9412,3 +9412,233 @@ def test_a_kind_segment_before_the_object_is_admitted(case):
     parts.insert(len(parts) - 1, _OBJECT_KINDS[case])
     verdicts = _group5_verdicts(case, _group5_report("/".join(parts) + ": " + rest))
     assert verdicts and all(s == "pass" for s in verdicts.values()), verdicts
+
+
+# ------------------------------- the forbidden clauses, each pinned by a pair
+#
+# A table row above is one declared line, and one line is decided by
+# `any_of_patterns` alone, so no row depended on a case's `forbidden_patterns`
+# clause: the clause exists for a report that carries the accepted line and a
+# second line that contradicts it on the graded slot (two runtimes; `yes`
+# beside `no`). One row per forbidden pattern pairs the two: the case as
+# shipped refuses the pair, the pair passes with the clause removed, and the
+# pattern alone refuses it, so an edit that disables a clause fails here and
+# a task file that drops one fails the coverage test. A row's second line is
+# the accepted line with one graded slot wrong, as the `bad` rows above spell
+# it; the two group-3 cases take a second seeded-a line, or a seeded-c line,
+# beside the b/c/d lines `_group3_report` adds.
+
+_CONTRADICTIONS = {
+    "upgrades-drain-blocking-budget-named": {
+        "the-declared-line-carries-the-budgets-evidence": [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 1; minAvailable none; disruptionsAllowed 0; blocks a drain: yes",
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 1; blocks a drain: yes",
+        ],
+        "the-declared-line-says-the-budget-blocks-a-drain": [
+            "seeded-b/seeded-upgrade/pinned-batch-runner: maxUnavailable 0; minAvailable none; disruptionsAllowed 0; blocks a drain: no",
+        ],
+    },
+    "upgrades-no-surge-pool-recreate-warned": {
+        "the-declared-line-says-no-replacement-comes-first": [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: yes; workloads pinned to this pool: pinned-batch-runner",
+        ],
+        "the-declared-line-names-the-pinned-workload": [
+            "seeded-b/no-surge-pool: nodes 1; replacement node first: no; workloads pinned to this pool: none",
+        ],
+    },
+    "upgrades-zonal-skew-replicas-warned": {
+        "the-declared-line-says-all-replicas-share-a-zone": [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: no; cause: node affinity",
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 2; all replicas in one zone: yes; cause: node affinity",
+        ],
+        "the-declared-line-names-the-scheduling-cause": [
+            "seeded-d/seeded-topology/zone-pinned-api: replicas 2; zones in use 1; all replicas in one zone: yes; cause: capacity",
+        ],
+    },
+    "upgrades-exclusion-end-date-named": {
+        "the-declared-line-states-the-scope": [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: yes",
+        ],
+        "the-declared-line-states-the-end-date": [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 21 October 2026; holds the automatic minor upgrade: yes",
+        ],
+        "the-declared-line-says-it-holds-the-automatic-upgrade": [
+            "seeded-b: exclusion hold-the-minor-lag; scope NO_MINOR_UPGRADES; ends 2026-10-21; holds the automatic minor upgrade: no",
+        ],
+    },
+    "upgrades-removed-api-callers-distinguished": {
+        "no-seeded-cluster-is-said-to-call-a-removed-api": [
+            "seeded-a: next minor 1.36; removed apis still called: flowcontrol.apiserver.k8s.io/v1beta3 flowschemas; deprecated but still served: v1 endpoints",
+        ],
+        "seeded-a-keeps-the-endpoints-writer-under-deprecated": [
+            "seeded-a: next minor 1.36; removed apis still called: none; deprecated but still served: none",
+        ],
+    },
+    "upgrades-network-policy-enforcement-stated": {
+        "every-seeded-cluster-runs-the-legacy-dataplane": [
+            "seeded-a: dataplane GKE Dataplane V2; networkpolicy enforced: no; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+        ],
+        "no-seeded-cluster-is-said-to-enforce-policy-today": [
+            "seeded-a: dataplane legacy; networkpolicy enforced: yes; namespaces with policies: seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability",
+        ],
+        "seeded-a-lists-its-four-policy-namespaces": [
+            "seeded-a: dataplane legacy; networkpolicy enforced: no; namespaces with policies: none (seeded-capacity, seeded-debug, seeded-deprecation, seeded-reliability are unenforced)",
+        ],
+        "seeded-c-has-none": [
+            "seeded-c: dataplane legacy; networkpolicy enforced: no; namespaces with policies: seeded-reliability/default-deny",
+        ],
+    },
+    "upgrades-node-local-state-named": {
+        "the-declared-line-names-the-queue-volume": [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes cache; survives a node rebuild: no",
+        ],
+        "the-declared-line-says-the-state-does-not-survive": [
+            "seeded-a/seeded-shapes/cache-on-emptydir: node-local volumes queue; survives a node rebuild: yes",
+        ],
+    },
+    "upgrades-deprecated-node-label-selector-named": {
+        "the-declared-line-names-the-beta-arch-label": [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/os; deprecated: yes; replacement kubernetes.io/arch",
+        ],
+        "the-declared-line-says-it-is-deprecated-and-names-the-replacement": [
+            "seeded-a/seeded-shapes/arch-pinned-worker: label beta.kubernetes.io/arch; deprecated: no; replacement kubernetes.io/arch",
+        ],
+    },
+    "upgrades-containerd-socket-agent-named": {
+        "the-declared-line-says-the-socket-is-mounted": [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: no; path /run/containerd/containerd.sock",
+        ],
+        "the-declared-line-names-the-containerd-socket-path": [
+            "seeded-a/seeded-shapes/node-runtime-probe: runtime socket mounted: yes; path /var/run/docker.sock",
+        ],
+    },
+    "upgrades-intree-volume-named": {
+        "the-declared-line-says-the-source-is-in-tree": [
+            "seeded-a/intree-pd: source csi; bound by seeded-shapes/intree-pd; attaches through csi migration: yes",
+        ],
+        "the-declared-line-names-the-claim-and-the-migration": [
+            "seeded-a/intree-pd: source in-tree gcePersistentDisk; bound by seeded-shapes/intree-pd; attaches through csi migration: no",
+        ],
+    },
+    "upgrades-retired-registry-image-named": {
+        "the-declared-line-names-the-retired-host": [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host gcr.io; retired: yes",
+        ],
+        "the-declared-line-says-the-host-is-retired": [
+            "seeded-a/seeded-shapes/legacy-registry-pull: image k8s.gcr.io/pause:3.9; registry host k8s.gcr.io; retired: no",
+        ],
+    },
+    "upgrades-pod-security-latest-pinned-named": {
+        "the-declared-line-says-the-level-is-baseline": [
+            "seeded-a/seeded-defaults: enforce restricted; enforce-version latest; rule set changes at the next minor: yes",
+        ],
+        "the-declared-line-says-the-version-is-latest": [
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version v1.33; rule set changes at the next minor: yes",
+        ],
+        "the-declared-line-says-the-rule-set-moves": [
+            "seeded-a/seeded-defaults: enforce baseline; enforce-version latest; rule set changes at the next minor: no",
+        ],
+    },
+    "upgrades-stale-client-skew-named": {
+        "the-declared-line-names-the-stale-client": [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.34.1; server v1.34.1-gke.1234000; within supported skew: no",
+        ],
+        "the-declared-line-says-the-client-is-outside-the-skew": [
+            "seeded-a/seeded-shapes/stale-kubectl-client: client kubectl v1.29.0; server v1.34.1-gke.1234000; within supported skew: yes",
+        ],
+    },
+    "upgrades-cgroup-blind-runtime-named": {
+        "the-declared-line-names-the-pre-cgroup-v2-runtime": [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime eclipse-temurin:8u372-b07-jre; reads cgroup v2 limits: no; memory limit 192Mi",
+        ],
+        "the-declared-line-says-the-runtime-is-blind-to-cgroup-v2": [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: yes; memory limit 192Mi",
+        ],
+        "the-declared-line-names-the-memory-limit": [
+            "seeded-a/seeded-shapes/cgroup-blind-jvm: runtime docker.io/library/eclipse-temurin:8u302-b08-jre; reads cgroup v2 limits: no; memory limit 256Mi",
+        ],
+    },
+    "upgrades-multi-process-oom-group-named": {
+        "the-declared-line-says-the-container-runs-several-processes": [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container one; memory limit 32Mi; oom kills the whole container: yes",
+        ],
+        "the-declared-line-names-the-shared-limit": [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 64Mi; oom kills the whole container: yes",
+        ],
+        "the-declared-line-says-the-whole-container-dies": [
+            "seeded-a/seeded-shapes/multi-process-worker: processes per container several; memory limit 32Mi; oom kills the whole container: no",
+        ],
+    },
+    "upgrades-node-image-coupled-agent-named": {
+        "the-declared-line-says-the-agent-uses-the-host-network": [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: no; host paths /etc/cni/net.d; coupled to the node image: yes",
+        ],
+        "the-declared-line-names-the-cni-directory": [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths none; coupled to the node image: yes",
+        ],
+        "the-declared-line-says-the-agent-is-coupled": [
+            "seeded-a/seeded-shapes/cni-shaped-agent: host network: yes; host paths /etc/cni/net.d; coupled to the node image: no",
+        ],
+    },
+    "upgrades-cuda-pinned-gpu-job-named": {
+        "the-declared-line-names-the-accelerator": [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-tesla-t4; cuda 12.2; suspended: yes",
+        ],
+        "the-declared-line-names-the-cuda-pin": [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.4; suspended: yes",
+        ],
+        "the-declared-line-says-the-job-is-suspended": [
+            "seeded-a/seeded-shapes/cuda-pinned-trainer: accelerator nvidia-l4; cuda 12.2; suspended: no",
+        ],
+    },
+}
+
+
+def _forbidden_clauses(case: str) -> dict[str, list[str]]:
+    """The case's objectives that carry a forbidden clause, each with its patterns."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    return {
+        entry["name"]: list(entry["check"]["forbidden_patterns"])
+        for entry in spec["verification_spec"]
+        if entry.get("check", {}).get("forbidden_patterns")
+    }
+
+
+def _objective_verdict(case: str, objective: str, text: str, forbidden: list[str]) -> str:
+    """One objective's verdict on a report, its forbidden clause replaced (`[]` drops it)."""
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    entry = next(e for e in spec["verification_spec"] if e["name"] == objective)
+    check = {k: v for k, v in entry["check"].items() if k != "forbidden_patterns"}
+    if forbidden:
+        check["forbidden_patterns"] = forbidden
+    with tempfile.TemporaryDirectory(prefix="contradiction-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]))
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            v = parse_node(check)
+            _stash(_group3_report(case, text) if case in _GROUP3 else _group5_report(text))
+            return v.verify(5.0).status
+
+
+@pytest.mark.parametrize(
+    "case,objective,index,line",
+    [
+        (case, objective, index, line)
+        for case, objectives in _CONTRADICTIONS.items()
+        for objective, lines in objectives.items()
+        for index, line in enumerate(lines)
+    ],
+)
+def test_a_contradicting_second_line_fails_the_objective(case, objective, index, line):
+    _skip_if_parked(case)
+    pair = _bare_line(case) + "\n" + line
+    assert _verdicts_for_line(case, pair)[objective] == "fail", "the case as shipped accepts the pair"
+    assert _objective_verdict(case, objective, pair, []) == "pass", "the pair is refused without the clause, so the row does not test it"
+    assert _objective_verdict(case, objective, pair, [_forbidden_clauses(case)[objective][index]]) == "fail", "the row's pattern does not refuse its line"
+
+
+@pytest.mark.parametrize("case", _TABLED_CASES)
+def test_every_forbidden_pattern_has_a_contradiction_row(case):
+    _skip_if_parked(case)
+    rows = {objective: len(lines) for objective, lines in _CONTRADICTIONS.get(case, {}).items()}
+    clauses = {objective: len(patterns) for objective, patterns in _forbidden_clauses(case).items()}
+    assert rows == clauses, (rows, clauses)
