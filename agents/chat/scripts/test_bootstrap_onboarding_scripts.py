@@ -2183,7 +2183,9 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertIn(
             f"This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}", bootstrap_delivery.AUDITS_NOT_COVERED_NOTE
         )
-        self.assertNotIn("Nothing has checked", bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE)
+        for note in (bootstrap_delivery.AUDITS_UNCHECKED_SCHEDULED_NOTE, bootstrap_delivery.AUDITS_NONE_RAN_NOTE):
+            self.assertNotIn("nothing has checked", note.lower())
+            self.assertIn("this report", note)
 
     def test_the_covered_note_claims_only_the_older_scans_own_checks(self):
         covered = bootstrap_delivery.AUDITS_COVERED_NOTE.split("so this report covers them", 1)[0]

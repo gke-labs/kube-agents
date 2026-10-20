@@ -51,9 +51,10 @@ SOURCE = "inventory"
 
 # What the onboarding scan checks: the slug table in
 # governance/cluster_inventory_audit_sop.md, in its order, with the words the
-# report uses for each. The scan also reports what else it sees in passing (a
-# crash-looping workload), so the line says so; the report names this list and
-# the audits' areas rather than an exclusion list it cannot keep complete.
+# report uses for each. The scan also reports problems it sees in passing that
+# no first-run audit checks (a workload in CrashLoopBackOff), so the line says
+# so; the report names this list and the audits' areas rather than an exclusion
+# list it cannot keep complete.
 SCAN_CHECKS = (
     ("probes-startup", "startup probes"),
     ("no-resourcequota", "ResourceQuota and LimitRange"),
@@ -80,8 +81,8 @@ AUDIT_FAMILY_WORDS = f"{', '.join(_FAMILY_LIST[:-1])} and {_FAMILY_LIST[-1]}"
 # It names no state of the audits (running, finished, held): this terminal
 # cannot see it, and the delivery job's note says it.
 SCAN_SCOPE_SENTENCES = (
-    f"This scan checked: {', '.join(words for _, words in SCAN_CHECKS)}, "
-    "and lists any other problem it saw in passing.",
+    f"This scan checked: {', '.join(words for _, words in SCAN_CHECKS[:-1])} and {SCAN_CHECKS[-1][1]}.",
+    "It also lists other problems it saw in passing that the first-run audits do not check.",
     f"{AUDIT_FAMILY_WORDS[:1].upper()}{AUDIT_FAMILY_WORDS[1:]} come from the first-run audits, "
     "which post their own findings.",
 )
