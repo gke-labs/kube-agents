@@ -48,10 +48,11 @@ posture findings `finish` held back because the document recorded no complete de
 search (empty everywhere but on a declaring stream that skipped the step; see
 [`declared_intent_searched`](findings-document.md#declared_intent_searched)), and `unaccounted`, the ids of the previous
 findings a clean run was refused its close over (empty on every other outcome; see
-[The clean run](clean-run.md#the-clean-run)). A second `finish` of the same repository after one `start`
-also carries `refinish: true`, and `silent_floor: true` when an earlier `finish` in the run reported
-news: its `new` and `resolved` count against that earlier `finish`, and its `silent_ok` stays `false`.
-Report it as any other line. With `--manifest-file` the line also carries
+[The clean run](clean-run.md#the-clean-run)). A `finish` that follows an earlier `finish` of the same
+repository in the run also carries `refinish: true`. When that earlier `finish` reported news, it
+also carries `silent_floor: true`: its `silent_ok` stays `false`
+and its sweep opens no automatic pull request, so the findings it would have opened are listed
+as awaiting `/remediate`. Report it as any other line. With `--manifest-file` the line also carries
 `unpublished_candidates`, `wholly_unpublished_checks` and `uncorroborated_findings` — which are
 absent on every other run. The line also carries timing data in seconds, which decides nothing:
 `publish_s`, the time `finish` used to publish; `inspect_s`, the time from `start` to `finish`, when

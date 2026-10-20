@@ -40,6 +40,8 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
   delta: `new_ids` and `resolved_ids` are empty, and `new`/`resolved` 0, because nothing was claimed,
   not because nothing changed. Say the delta is unknown for that run. Envelopes written before the
   key existed lack it; read their counts as they are. `streams` and `show` carry it.
+- `silent_floor` true means an earlier `finish` in the same run reported news, so this run's
+  `silent_ok` was kept `false` and its counts may be measured against that `finish`.
 - `current_ids` is exactly what the body's hidden block published: the findings the body rendered
   plus the ids the collector held. Derive this run's full set from `document`.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to

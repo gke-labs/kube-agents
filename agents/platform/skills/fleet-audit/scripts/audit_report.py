@@ -3099,7 +3099,7 @@ def earlier_finish(audit_id: str, repo: str, now: datetime) -> dict | None:
     envelope the earlier one just stored as the previous run's, so on its own
     it measures no change and would call a run with news silent. A `finish`
     with no `start` fills no entry; it is taken for a later `finish` of the
-    same run only within the age limit of one that did.
+    same run only while the record of one that did is current.
     """
     record = _live_chat_record(audit_id, now)
     return None if record is None else _filled_part(record, repo)
@@ -16050,8 +16050,11 @@ def _open_promoted_prs(
     issue_number: int | None,
     generated_at: datetime,
     noun: str | None = None,
+    on_open: Callable[[], None] = lambda: None,
 ) -> list[str]:
     """Open (or refresh) one pull request per group holding a promoted finding.
+
+    `on_open` runs after each one, before the next is tried.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
@@ -16122,6 +16125,7 @@ def _open_promoted_prs(
                 raise
             if url:
                 opened.append(url)
+                on_open()
     finally:
         if started_on and started_on != "HEAD":
             git(["checkout", "--force", started_on], check=False)
@@ -18075,11 +18079,10 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         issue_number=number,
         generated_at=now,
         noun=noun,
+        # As each opens, and not only before the store write: a `finish` that
+        # dies after one keeps its lease, and the re-run must not sweep again.
+        on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now),
     )
-    # Now as well as before the store write: a `finish` that dies after this
-    # sweep keeps its lease, and the re-run must not sweep again.
-    if prs_opened:
-        save_chat_verdict(audit_id, repo, False, new_marked or [], now)
 
     # What the live ledger renders once this branch is done, for the store.
     ledger_body = rendered.body

@@ -26345,6 +26345,38 @@ class TestSecondFinishInOneRun(HarnessTestCase):
         self.assertEqual(self.finish_again(doc), 0, self.err)
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
 
+    def test_a_rerun_after_a_broker_lost_mid_sweep_opens_no_second_batch(self):
+        self.start()
+        findings = []
+        for i in range(audit_report.AUTO_PROMOTION_CAP + 2):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    remediation={"kind": "manifest", "path": path, "note": "n"},
+                )
+            )
+            self.touch(path)
+        doc = make_doc(findings=findings)
+        open_pr = audit_report.open_remediation_pr
+        calls = []
+
+        def broker_drops_on_the_third(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 3:
+                raise audit_report.BrokerUnavailable("the broker did not answer")
+            return open_pr(*args, **kwargs)
+
+        with patch.object(audit_report, "open_remediation_pr", broker_drops_on_the_third):
+            self.assertEqual(self.run_finish(doc), 2)
+        opened = len(self.harness.forge_calls("proposal-create"))
+        self.assertEqual(opened, 2)
+
+        self.assertEqual(self.finish_again(doc), 0, self.err)
+        self.assertLessEqual(
+            len(self.harness.forge_calls("proposal-create")), audit_report.AUTO_PROMOTION_CAP
+        )
+
     def test_a_start_after_a_finish_that_died_opens_a_new_run(self):
         now = datetime.now(timezone.utc)
         audit_report.open_chat_report(AUDIT, "acme/a", now)
