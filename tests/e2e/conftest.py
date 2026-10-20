@@ -595,8 +595,9 @@ def _discard_log(log: Any) -> None:
 def _gateway_pod_selector(namespace: str, note: Callable[[str], None]) -> str:
     """The label selector the agent Service itself uses, or the plain fallback.
 
-    Not a hardcoded `app=<name>-gateway`. Above one replica the operator adds
-    `kubeagents.io/is-leader: "true"` to that Service's selector
+    Not a hardcoded `app=<name>-gateway`. Above one replica the operator would add
+    `kubeagents.io/is-leader: "true"` to that Service's selector (it caps the
+    gateway at one replica today)
     (buildPlatformService), because only the leader runs `hermes gateway run` --
     a standby still answers on 8643, where the credential proxy's API listener
     is up, and the proxy then 502s trying to reach a Hermes that was never

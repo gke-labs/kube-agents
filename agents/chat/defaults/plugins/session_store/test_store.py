@@ -7,16 +7,19 @@ compromised database would leak.
 
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from chat_metrics import metrics as chat_metrics  # noqa: E402
 from common.redactor import SALT_ENV_VAR, AuditRedactor  # noqa: E402
 
 import store  # noqa: E402
@@ -151,6 +154,38 @@ class TestWriteThrough(SaltedTestCase):
         SessionMetadataStore._close_unlocked()
         with self.assertLogs(store.logger, level="ERROR"):
             store.write_session_metadata("sess-1", {"session_id": "sess-1"})
+
+    def _sessions_counted(self, registry):
+        return dict(re.findall(r'^kubeagents_chat_sessions_total\{platform="([a-z]+)"\} (\d+)$', registry.render(), re.M))
+
+    def test_a_session_is_counted_once_on_the_chat_metrics_registry(self):
+        # The first message of a session is the one that creates its row;
+        # every later message updates the row and counts no session. The
+        # count lands on the chat_metrics module's registry, the one its
+        # listener serves, under the platform spelling the operator reads.
+        registry = chat_metrics.ChatMetrics()
+        with mock.patch.object(chat_metrics, "REGISTRY", registry):
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+            log_event_to_db(_event(platform="slack", user_id="U123"), gateway=None, session_store=_SessionStore("sess-2"))
+        self.assertEqual({"googlechat": "1", "slack": "1"}, self._sessions_counted(registry))
+
+    def test_a_session_whose_row_was_not_written_is_not_counted(self):
+        os.environ["SESSION_KV_DB_PATH"] = "/proc/kube-agents-does-not-exist/session.db"
+        SessionMetadataStore._close_unlocked()
+        registry = chat_metrics.ChatMetrics()
+        with mock.patch.object(chat_metrics, "REGISTRY", registry), self.assertLogs(store.logger, level="ERROR"):
+            log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-1"))
+        self.assertEqual({}, self._sessions_counted(registry))
+
+    def test_a_registry_that_raises_is_logged_and_the_turn_continues(self):
+        class Exploding:
+            def record_session(self, platform):
+                raise RuntimeError("registry is down")
+
+        with mock.patch.object(chat_metrics, "REGISTRY", Exploding()), self.assertLogs(store.logger, level="ERROR"):
+            self.assertIsNone(log_event_to_db(_event(), gateway=None, session_store=_SessionStore("sess-9")))
+        self.assertIsNotNone(self._stored("sess-9"), "the row is written before the count")
 
     def test_an_empty_session_id_writes_nothing(self):
         # Not even the database file: the early return happens before the

@@ -843,6 +843,12 @@ platformAgent:
       pullPolicy: Always
     availability:
       # Number of agent pods. `null` omits the field; the operator defaults to 1.
+      # The operator runs the gateway as a single replica: a value above 1 is
+      # rendered as 1 and the PlatformAgent's ReplicasLimited condition says so.
+      # High availability is not supported yet: a second replica's leader
+      # election has no in-cluster token, and the data volumes are
+      # ReadWriteOnce. The chart's quota preflight still multiplies by this
+      # value, so above 1 it over-counts the agent pod.
       replicas: null
       # RuntimeClass for the agent pod. "gvisor" asks for GKE Sandbox kernel
       # isolation, and is the default because the agent executes model-authored

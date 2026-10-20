@@ -503,6 +503,37 @@ func TestInboundMessagesAreCountedByPlatform(t *testing.T) {
 	}
 }
 
+func metricsSessionsCount(t *testing.T, m *Metrics, platform string) float64 {
+	t.Helper()
+	return counterValue(t, m.sessions.WithLabelValues(platform))
+}
+
+// A session is counted once, when the gateway mints the conversation's
+// record, under the platform the first message arrived through: the second
+// message in a conversation adds nothing, a second conversation adds one, and
+// the series is pre-seeded for every platform and other.
+func TestSessionsAreCountedOncePerConversation(t *testing.T) {
+	r := startRig(t)
+	m := r.g.Metrics()
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/sess-1", Kind: "group", AuthorID: "1001", MessageID: "s-1", Text: "one"}
+	waitFor(t, "the first conversation's session counted", func() bool { return metricsSessionsCount(t, m, platformDiscord) == 1 })
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/sess-1", Kind: "group", AuthorID: "1001", MessageID: "s-2", Text: "two"}
+	waitFor(t, "the second message counted as a message", func() bool { return metricsInboundCount(t, m, platformDiscord) == 2 })
+	if got := metricsSessionsCount(t, m, platformDiscord); got != 1 {
+		t.Fatalf("a second message in the same conversation minted a session: %v, want 1", got)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/sess-2", Kind: "group", AuthorID: "1001", MessageID: "s-3", Text: "three"}
+	waitFor(t, "the second conversation's session counted", func() bool { return metricsSessionsCount(t, m, platformDiscord) == 2 })
+	for _, platform := range []string{platformGoogleChat, platformSlack, platformConsole, metricsLabelOther} {
+		if got := metricsSessionsCount(t, m, platform); got != 0 {
+			t.Errorf("%s = %v, want 0", platform, got)
+		}
+	}
+	if got := seriesCount(t, m, "kubeagents_a2a_gateway_sessions_total"); got != len(metricsPlatforms)+1 {
+		t.Errorf("the sessions counter carries %d series, want %d: every platform and other, pre-seeded", got, len(metricsPlatforms)+1)
+	}
+}
+
 // The body carries the process start time the operator's poller reads to tell
 // an in-place restart from a counter that fell: one series, the process's own
 // clock at construction, never re-derived.

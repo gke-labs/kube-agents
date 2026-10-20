@@ -1981,8 +1981,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
 {{- if .Values.platformAgent.enabled -}}
   {{- /* The agent pod is the one operator-rendered workload that scales: the gateway
          Deployment takes spec.replicas from availability.replicas, while the shell
-         StatefulSet and the credential proxy stay at 1 (see the platformagent-ha golden,
-         where the gateway goes to 3 and the other two do not). The footprint records one
+         StatefulSet and the credential proxy stay at 1. The operator now caps the gateway
+         at one replica (supportedGatewayReplicas in manifest_helpers.go), so above one
+         this multiply and the surge below over-count; that errs towards refusing a quota
+         rather than passing one the pods will not fit. The footprint records one
          pod's worth, so it is multiplied here — without this an HA install passes the
          check and then leaves its extra replicas Pending, which is the failure this
          whole template exists to prevent. An absent value means the operator's own
@@ -2105,10 +2107,10 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" $podReqEph "b" $agentReplicas))) | int64 -}}
   {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" $podLimEph "b" $agentReplicas))) | int64 -}}
   {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
-         RollingUpdate strategy only when availability.replicas is above 1 and renders
+         RollingUpdate strategy only above one effective replica and renders
          `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
-         k8s-operator/internal/controller/manifest_helpers.go; the default-CR golden
-         platformagent.yaml shows Recreate, the platformagent-ha one RollingUpdate). A
+         k8s-operator/internal/controller/manifest_helpers.go), and it caps the count at
+         one, so every gateway it renders today is Recreate. A
          Recreate rollout deletes the old Pod before creating the new one, so it needs no
          extra room. Counting the agent pod here at one replica made it win the max on
          every default install — it is the largest workload in the release — and the
