@@ -69,11 +69,12 @@ is the same card as a ``kube-agents.chat/v1`` message, which
 A report that lists no item, opened with the scan counts and the posture line
 as Step 6 fixes them, gets its own card (``_quiet``): "First look at your
 fleet: done", the counts with "no critical item in this scan's 9 checks", any
-gap sentence, a queue line from the roll-up's count and the install's pace (no
-delivery hour), the scan's checks folded under "What this scan checked", and a
+gap sentence, a queue line from the selection's queued count and the install's
+pace (no delivery hour), the scan's checks folded under "What this scan checked", and a
 "See all N findings" button when items are queued. It is built only when the
 delivery job's selection (what ``select`` chose) listed nothing and held no
-critical back; any other report goes as written. The text layout keeps the closing lines under it; the card leaves them
+critical back, and the report says "critical" nowhere but in "none of them
+critical"; any other report goes as written. The text layout keeps the closing lines under it; the card leaves them
 to its button.
 
 The report is model-written to the format in
@@ -85,7 +86,15 @@ import os
 import re
 from typing import NamedTuple
 
-from inventory_findings import SCAN_CHECKS, SCAN_SCOPE_LINE, SCAN_SCOPE_SENTENCES, fq
+from inventory_findings import (
+    SCAN_CHECKS,
+    SCAN_SCOPE_LINE,
+    SCAN_SCOPE_SENTENCES,
+    SELECTION_HELD,
+    SELECTION_LISTED,
+    SELECTION_QUEUED,
+    fq,
+)
 from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row
 
 BOLD_MARK = "**"
@@ -133,11 +142,10 @@ SEE_ALL = "See all {count}"
 #: its own card, since the headline above counts things to look at.
 QUIET_HEADLINE = "First look at your fleet: done"
 QUIET_COUNTS = "{scanned} · no critical item in this scan's {checks} checks"
-#: Keys of the selection ``bootstrap_delivery`` passes: what ``select`` chose for this batch
-#: (``inventory_findings.select_items``), so "no critical item" is a fact, not a reading of prose.
-SELECTION_LISTED = "listed"
-SELECTION_HELD = "held"
-SELECTION_QUEUED = "queued"
+#: The roll-up's own words for none critical. Any other "critical" in the report vetoes the card:
+#: the selection says nothing is critical, so a report that says otherwise goes as written.
+NONE_CRITICAL = re.compile(r"\bnone of them critical\b", re.IGNORECASE)
+CRITICAL_WORD = re.compile(r"critical", re.IGNORECASE)
 QUIET_COUNTS_JOIN = " · "
 QUIET_QUEUE = "{count} smaller {items} queued. I'll bring up to {daily} a day."
 QUIET_QUEUE_ASK = "{count} smaller {items} queued. Ask me when you want them."
@@ -811,7 +819,7 @@ def blocks(report: str, selection: dict | None = None) -> tuple[list[dict], str]
     """The Block Kit report's ``(blocks, text)``, or None when the report does not parse.
 
     ``text`` is the message's mrkdwn ``text`` field: the headline, the gap and
-    lead, then the top rows, and the lines under them.
+    lead, then the top rows, and for the short card its lines.
     """
     card = _card(report, selection)
     if card is None:
@@ -830,7 +838,9 @@ def blocks(report: str, selection: dict | None = None) -> tuple[list[dict], str]
     lead = " ".join(part for part in (card.headline, card.note, card.detail) if part)
     # The short card's fold is the scan's checks, not findings, so the fallback leaves it out.
     folded = [] if card.fold_title == CHECKS_FOLD_TITLE else card.folded
-    return built, fallback_text(lead, rows=card.rows + folded, after_rows=card.after)
+    # Only the short card's lines join its fallback: the gap there would otherwise read clean.
+    after = card.after if card.fold_title == CHECKS_FOLD_TITLE else ""
+    return built, fallback_text(lead, rows=card.rows + folded, after_rows=after)
 
 
 def chat(report: str, selection: dict | None = None) -> tuple[dict, str] | None:
@@ -893,6 +903,8 @@ def _quiet(report: str, selection: dict | None) -> _Quiet | None:
 
     lines = report.splitlines()
     if not selection or selection.get(SELECTION_LISTED) or selection.get(SELECTION_HELD) or NOT_QUIET.search(report):
+        return None
+    if CRITICAL_WORD.search(NONE_CRITICAL.sub("", report)):
         return None
     paragraphs = [" ".join(p.split()) for p in _paragraphs([line for line in lines if not HEADING.match(line)])]
     paragraphs = [p for p in paragraphs if p and not _is_title(p)]

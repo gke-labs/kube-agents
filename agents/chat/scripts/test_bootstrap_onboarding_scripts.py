@@ -871,6 +871,19 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
             ],
         )
 
+    def test_the_batch_it_registered_is_what_the_presenter_is_given(self):
+        # The short card decides "no critical item" from this, not from the report's words.
+        self._write()
+        with (
+            mock.patch.object(bootstrap_delivery, "_posted_as_blocks", return_value=False) as blocks,
+            mock.patch.object(bootstrap_delivery, "_presented", side_effect=lambda c, *a, **k: c) as presented,
+        ):
+            rc, _, _ = self._run()
+        self.assertEqual(rc, 0)
+        expected = {"listed": 0, "held": 0, "queued": 2}
+        self.assertEqual(blocks.call_args.args[1:], (expected,))
+        self.assertEqual(presented.call_args.kwargs["selection"], expected)
+
     def test_a_hand_off_that_filed_no_ranking_card_registers_nothing(self):
         # A no-coverage sweep writes the report itself; the items and scores are the last sweep's.
         self._write()

@@ -686,7 +686,11 @@ def _selection(items: list | None, scores: dict | None, suppressed: set[str]) ->
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: cannot tell what the report selected: {e}\n")
         return None
-    return {"listed": len(shown), "held": held, "queued": held + others}
+    return {
+        inventory_findings.SELECTION_LISTED: len(shown),
+        inventory_findings.SELECTION_HELD: held,
+        inventory_findings.SELECTION_QUEUED: held + others,
+    }
 
 
 def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:

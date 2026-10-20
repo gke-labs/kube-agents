@@ -169,6 +169,19 @@ class QuietCardTest(unittest.TestCase):
                 self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)
                 self.assertIsNone(inventory_presenter.blocks(report, QUIET_SELECTION))
 
+    def test_a_report_that_says_critical_otherwise_goes_as_written(self):
+        # The card would say "no critical item" above or instead of it.
+        for item in ("Critical: quote-api is down.", "**Critical** quote-api is down.",
+                     "No critical vulnerabilities were found."):
+            with self.subTest(item=item):
+                report = QUIET_REPORT.replace("The full inventory", f"{item}\n\nThe full inventory")
+                self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)
+                self.assertIsNone(inventory_presenter.blocks(report, QUIET_SELECTION))
+
+    def test_a_card_with_items_keeps_its_fallback_text(self):
+        _, text = inventory_presenter.blocks(REPORT)
+        self.assertNotIn("Also found", text)
+
     def test_a_report_without_the_exact_posture_line_goes_as_written(self):
         report = QUIET_REPORT.replace(inventory_presenter.SCAN_SCOPE_LINE, "The fleet looks healthy.")
         self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)

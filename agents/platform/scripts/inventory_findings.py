@@ -83,6 +83,11 @@ SCAN_SCOPE_SENTENCES = (
     f"This scan ran {len(SCAN_CHECKS)} configuration checks; {AUDIT_FAMILY_WORDS} come from the first-run audits.",
 )
 SCAN_SCOPE_LINE = " ".join(SCAN_SCOPE_SENTENCES)
+# What `select` chose, as bootstrap_delivery hands it to inventory_presenter: the items the
+# report lists, the criticals the limit held back, and every item left for the queue.
+SELECTION_LISTED = "listed"
+SELECTION_HELD = "held"
+SELECTION_QUEUED = "queued"
 # The checks by name, for the raw file.
 SCAN_CHECKS_SENTENCE = (
     f"The {len(SCAN_CHECKS)} checks: {', '.join(words for _, words in SCAN_CHECKS[:-1])} and {SCAN_CHECKS[-1][1]}."
