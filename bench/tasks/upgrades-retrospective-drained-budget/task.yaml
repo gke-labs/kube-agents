@@ -33,8 +33,9 @@
 # that keeps entry 1 open is refused as well. Lines about other objects match nothing and are
 # ignored; the verdicts and the advice around them are the judge's.
 #
-# The route check proves the answer came from the retrospective (its store, read in the
-# worker's terminal, or its collector), not from a readiness table or ad-hoc kubectl reads.
+# The route check proves the answer came from the retrospective (its store or the job's
+# chat record, read in the worker's terminal, or its collector), not from a readiness table
+# or ad-hoc kubectl reads.
 #
 # audit_streams: a fleet-wide question with a stale or missing report is a full run, and on
 # an install with a GitOps repository a full run files the stream's ledger issue, so the
@@ -90,8 +91,8 @@ fixtures:
 audit_streams: [upgrade-retrospective]
 
 verification_spec:
-  # The route: the worker read the retrospective's store or ran its collector in
-  # its terminal.
+  # The route: the worker read the retrospective's store, ran its collector, or read
+  # the job's chat record (`chat_report_upgrade-retrospective.json`) in its terminal.
   - name: the-answer-comes-from-the-retrospective
     role: objective
     # assert, not converge: the transcript is immutable once the run ends.
@@ -99,7 +100,7 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md'
+        - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
 
   # The verdict: the budget's line, entry 1, an aside after the number tolerated. The
   # forbids: the same object under any other entry number; a second number or a hedge

@@ -8,13 +8,20 @@
 # newer than the last upgrade operation on the clusters the question covers, the
 # worker answers from it and says when it was produced; otherwise it runs the
 # collector (`skills/fleet-audit/scripts/upgrade_retrospective.py`) first. Either way
-# the answer names the report file it came from.
+# the answer names the report file it came from. A third source counts as the
+# retrospective's: `/opt/data/scratch/chat_report_upgrade-retrospective.json`, the
+# fleet-audit skill's record of the job's last chat report, which the scheduled run
+# composed from the collector's manifest (the green runs on the dev install read it
+# and answered the retrospective's own lines from it). The SOP steers to the saved
+# report first, since the record carries no `generated_at` and none of the report's
+# entries, but an answer from the record is an answer from the retrospective, so the
+# route accepts it and the report-file check accepts its path.
 #
 # What is deterministic here is the route and the shape of the answer, not the
 # fleet's state: which seeded clusters were upgraded in the window, and what the
 # collector found on them, changes from night to night, so no line asserts a
-# verdict. Two checks read the route -- the worker's terminal reached the store or
-# the collector, and the reply names the report file -- and four read one declared
+# verdict. Two checks read the route -- the worker's terminal reached the store, the
+# collector or the job's chat record, and the reply names the report file -- and four read one declared
 # line per seeded cluster, in the form the sibling upgrade cases use: every value a
 # word from a closed set or an integer, so a hedge, a qualifier or a missing cluster
 # fails the line. The prose, the verdicts and the advice are the judge's.
@@ -98,9 +105,10 @@ fixtures:
 audit_streams: [upgrade-retrospective]
 
 verification_spec:
-  # The route: the worker read the retrospective's store or ran its collector in
-  # its terminal. An answer assembled from a version table, a readiness report or
-  # ad-hoc kubectl reads leaves no such command and fails here.
+  # The route: the worker read the retrospective's store, ran its collector, or read
+  # the job's chat record (`chat_report_upgrade-retrospective.json`) in its terminal.
+  # An answer assembled from a version table, a readiness report or ad-hoc kubectl
+  # reads leaves no such command and fails here.
   - name: the-answer-comes-from-the-retrospective
     role: objective
     # assert, not converge: the transcript is immutable once the run ends.
@@ -108,18 +116,20 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md'
+        - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
 
-  # The reply names the report it answered from: the latest link, or a dated
-  # report (a `-scoped` one when the question named clusters). Lowercase stamp
-  # letters: the verifier lowercases the reply before it matches.
+  # The reply names the report it answered from: the latest link, a dated report
+  # (a `-scoped` one when the question named clusters), or the job's chat record.
+  # Lowercase stamp letters: the verifier lowercases the reply before it matches,
+  # and it drops underscores as Markdown emphasis, so the record's name is spelled
+  # with each underscore optional.
   - name: the-reply-names-the-report-file
     role: objective
     mode: assert
     check:
       type: report_contains
       any_of_patterns:
-        - 'upgrade-retrospective/(?:reports/\d{8}t\d{6}z(?:-scoped)?\.md|upgrade-retro-report\.md)'
+        - 'upgrade-retrospective/(?:reports/\d{8}t\d{6}z(?:-scoped)?\.md|upgrade-retro-report\.md)|scratch/chat_?report_?upgrade-retrospective\.json'
 
   # One declared line per seeded slot. The accept is the whole line with every
   # value in its set; each forbid is the same anchor, any text, then one field

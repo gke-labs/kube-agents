@@ -8624,6 +8624,74 @@ def test_drained_budget_declared_line_refused(text, forbidden):
     assert ("forbidden patterns matched" in verdict.reason) is forbidden, (verdict.reason, text)
 
 
+# ------------------------------- the retrospective cases' route and report-file checks
+#
+# The route: the worker's terminal reached the retrospective's store, its collector,
+# or the job's chat record (`chat_report_upgrade-retrospective.json`, the fleet-audit
+# skill's record of the last run's report). The command sets are the dev install's:
+# the three green on-demand runs read the chat record; a drained-budget run ran the
+# collector; the reds answered from the readiness tooling.
+
+_ON_DEMAND_CASE = TASKS / "upgrades-retrospective-on-demand" / "task.yaml"
+_ON_DEMAND_SPEC = yaml.safe_load(_ON_DEMAND_CASE.read_text(encoding="utf-8"))
+_ROUTE_OBJECTIVE = "the-answer-comes-from-the-retrospective"
+_REPORT_FILE_OBJECTIVE = "the-reply-names-the-report-file"
+_ON_DEMAND_GREEN_COMMANDS = [
+    "ls -la /opt/data/state/fleet-upgrade-verification/",
+    "ls -la /opt/data/scratch/",
+    "cat /opt/data/scratch/chat_report_upgrade-retrospective.json",
+    "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json",
+    "cat /opt/data/scratch/chat_manifest_api_deprecations.json",
+]
+_COLLECTOR_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --probe-lock",
+    "python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py --full --manifest-file /opt/data/scratch/manifest_upgrade-retrospective.json",
+]
+_READINESS_COMMANDS = [
+    "python3 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --readiness",
+    "cat /opt/data/state/fleet-upgrade-verification/channel-default.json",
+    "kubectl get pdb -A",
+]
+
+
+def _route_check(case: str):
+    spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
+    return next(e["check"] for e in spec["verification_spec"] if e["name"] == _ROUTE_OBJECTIVE)
+
+
+@pytest.mark.parametrize("case", ["upgrades-retrospective-on-demand", "upgrades-retrospective-drained-budget"])
+@pytest.mark.parametrize(
+    "commands, passes",
+    [
+        (_ON_DEMAND_GREEN_COMMANDS, True),
+        (_COLLECTOR_COMMANDS, True),
+        (["readlink /opt/data/upgrade-retrospective/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], True),
+        (_READINESS_COMMANDS, False),
+        (["ls -la /opt/data/scratch/", "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json"], False),
+    ],
+)
+def test_retrospective_route_reads_the_store_the_collector_or_the_chat_record(case, commands, passes):
+    _stash_commands(commands)
+    assert parse_node(_route_check(case)).verify(5.0).success is passes, (case, commands)
+
+
+@pytest.mark.parametrize(
+    "final_message, passes",
+    [
+        ("Checking the upgrade retrospective. Report: /opt/data/scratch/chat_report_upgrade-retrospective.json", True),
+        ("Report: /opt/data/upgrade-retrospective/upgrade-retro-report.md (produced 2026-10-20T20:45Z)", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z.md", True),
+        ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z-scoped.md", True),
+        ("The fleet upgrade report file is located at: /opt/data/state/fleet-upgrade-verification/channel-default.json", False),
+        ("Report: /opt/data/scratch/chat_manifest_fleet_upgrade.json", False),
+    ],
+)
+def test_retrospective_reply_names_the_report_or_the_chat_record(final_message, passes):
+    check = next(e["check"] for e in _ON_DEMAND_SPEC["verification_spec"] if e["name"] == _REPORT_FILE_OBJECTIVE)
+    transcript.set(final_message, [], final_message=final_message)
+    assert parse_node(check).verify(1.0).success is passes, final_message
+
+
 # The readiness case for the same catalogue entry grades the readiness report's
 # own output: a fifth declared-line slot quotes the cell the report prints for
 # the finding. That cell carries a `;`, which keeps `_VALUE_WRAP` from removing
