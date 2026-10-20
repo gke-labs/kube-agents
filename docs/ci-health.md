@@ -846,7 +846,7 @@ one line instead: the date, the pass count and how many were not graded, "no
 new reds, nothing recovered", and how many are still red. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are
 counted, and only the infra list follows; a writers part cut off is named in the
-header and its cases are not counted.
+header; its cases stay in the pass count, as on the Nightly page, but its reds are not listed.
 
 Domain names, owners and backups come from
 [`docs/designs/domains.yaml`](designs/domains.yaml) and the case's `task.yaml`

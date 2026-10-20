@@ -229,7 +229,7 @@ class QuietDayTest(Harness):
         writers.update(job="ci-kube-agents-eval-nightly-writers", build_id="3000000000000020002")
         section = self.build(data(*nights, writers))
         self.assertFalse(section.quiet)
-        self.assertIn("writers part cut off at the deadline, its cases not counted", section.lines[0])
+        self.assertIn("writers part cut off at the deadline, its reds not listed below", section.lines[0])
 
 
 class NightlyPageAgreementTest(Harness):
