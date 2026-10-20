@@ -67,7 +67,15 @@ there or was pinned there before the change, and the change itself, in
 oss-test-infra, moves nothing on `main` -- is expired: re-posted with no base
 and EXPIRED_NOTE, which Tide reads as stale and this never pins again. So
 Tide retests the pull request rather than merging it on a verdict about the
-other mode. The time has to be later than the blocking job's spec.mode change
+other mode. The time compared is the build's first report, the earliest
+success status on the commit naming the same build, not the newest status:
+every re-pin is a fresh copy with its own creation time, and a copy made
+after the cutoff must not pass for a verdict from after it. That is one more
+read per green while the variable is set. What this cannot reach is a live
+ProwJob: Tide also credits a successful job at the head of `main` for its
+48h life, so a retest that started under the old mode merges on it until
+`main` moves; the swap procedure moves `main` once right after setting the
+variable. The time has to be later than the blocking job's spec.mode change
 (the swap to next, or a rollback to today) AND than the last run that started
 under the old mode can report, because a re-pin made before the variable was
 set, and a run in flight at the change, both create their status after the
@@ -165,6 +173,24 @@ def predates(status, not_before):
         return True
 
 
+def first_reported(api, sha, status):
+    """The earliest creation time among the success statuses on `sha` that name
+    the same build as `status` (its target URL), `status` included; "" when any
+    of them carries no readable time, which `predates` counts as before."""
+    url = status.get("target_url") or ""
+    copies = [status]
+    if url:
+        copies += [
+            s
+            for s in api.get_all(f"/repos/{api.repo}/commits/{sha}/statuses")
+            if s.get("context") == CONTEXT and s.get("state") == SUCCESS and s.get("target_url") == url
+        ]
+    try:
+        return min((s.get("created_at") or "" for s in copies), key=parse_utc)
+    except ValueError:
+        return ""
+
+
 def expired_description(description):
     """The same human-readable text with EXPIRED_NOTE and no base, within GitHub's limit."""
     human, _ = split_description(description)
@@ -236,6 +262,8 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
     status = latest_status(api, sha)
     if status_id is not None and status is not None and str(status.get("id")) != str(status_id):
         return f"{sha[:SHORT_SHA]}: status {status_id} is no longer the latest (now {status.get('id')}); leaving it"
+    if not_before is not None and status is not None and status.get("state") == SUCCESS:
+        status = dict(status, created_at=first_reported(api, sha, status))
     reason = skip_reason(status, _NO_MAIN, not_before)
     if reason and status is not None and status.get("state") == SUCCESS and predates(status, not_before):
         return _expire(api, sha, status, main_sha, expected_main, reason, dry_run)

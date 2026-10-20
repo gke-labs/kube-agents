@@ -232,8 +232,9 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 # GitHub was created before it: the original crier event, which the sticky
 # re-pin's later copies (same build URL) cannot stand in for. GitHub's
 # time, not the GCS record's, for the trust-surface reason above. Unset or
-# empty, nothing changes; unparsable, or an event with no readable time, is
-# a full run. It binds greens only: an /override is the admin's decision.
+# empty, nothing changes; unparsable, an event with no readable time, or a
+# status read stopped at its page cap (the original may lie past it), is a
+# full run. It binds greens only: an /override is the admin's decision.
 readonly REVALIDATION_NOT_BEFORE="${EVAL_REVALIDATION_NOT_BEFORE:-}"
 # The status read pages through GitHub's newest-first events (100 a page,
 # following `Link: rel="next"`) up to this many pages. One page is not
@@ -692,7 +693,7 @@ def utc(value):
     return parsed
 
 
-context, build, not_before = sys.argv[1], sys.argv[2], sys.argv[3].strip()
+context, build, not_before, partial = sys.argv[1], sys.argv[2], sys.argv[3].strip(), sys.argv[4]
 statuses = json.load(sys.stdin)
 needle = "/" + context + "/" + build
 matches = [
@@ -719,11 +720,17 @@ if not_before:
     if earliest < cutoff:
         print("predates " + earliest.isoformat())
         sys.exit(0)
+    if partial:
+        print("predates at a time the capped read may not reach")
+        sys.exit(0)
 print("attested")
-' "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_NOT_BEFORE}" 2>/dev/null)" || attested="error unparsable"
+' "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_NOT_BEFORE}" "${REVALIDATION_STATUS_PARTIAL:-}" 2>/dev/null)" || attested="error unparsable"
   fi
   case "${attested}" in
     attested) ;;
+    error\ EVAL_REVALIDATION_NOT_BEFORE*)
+      _revalidation_no_green "${attested#error } (${REVALIDATION_NOT_BEFORE}), so green build ${prev_green} of PR #${pull_number} is not reused"
+      return 1 ;;
     predates*)
       _revalidation_no_green "green build ${prev_green} of PR #${pull_number} was first reported ${attested#predates }, before EVAL_REVALIDATION_NOT_BEFORE (${REVALIDATION_NOT_BEFORE}) -- a verdict from before the job changed what it grades"
       return 1 ;;

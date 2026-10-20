@@ -66,6 +66,8 @@ class FakeAPI:
 
     def get_all(self, path):
         self.list_calls.append(path)
+        if "/statuses" in path:  # every status on the commit, newest first
+            return list(self.statuses.get(path.rsplit("/commits/", 1)[1].split("/")[0], []))
         assert path.endswith("/pulls?state=open&base=main"), path
         return [p for p in self.pulls if p["base"]["ref"] == "main"]
 
@@ -294,8 +296,10 @@ class ArgumentsTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
-    def _run(self, api, argv):
-        with unittest.mock.patch.dict("os.environ", {"GITHUB_TOKEN": "t"}), unittest.mock.patch.object(
+    def _run(self, api, argv, cutoff=""):
+        # The cutoff is always written, so one exported in the developer's shell never reaches a test.
+        env = {"GITHUB_TOKEN": "t", pin.NOT_BEFORE_ENV: cutoff}
+        with unittest.mock.patch.dict("os.environ", env), unittest.mock.patch.object(
             pin, "GitHubAPI", lambda *args, **kwargs: api
         ):
             return pin.main(["--repo", "gke-labs/kube-agents", *argv])
@@ -315,8 +319,23 @@ class MainTest(unittest.TestCase):
         self.assertEqual(len(api.posts), 1)
 
     def _run_with_cutoff(self, api, argv, cutoff):
-        with unittest.mock.patch.dict("os.environ", {pin.NOT_BEFORE_ENV: cutoff}):
-            return self._run(api, argv)
+        return self._run(api, argv, cutoff)
+
+    def test_a_copy_made_after_the_cutoff_does_not_launder_a_pre_cutoff_green(self):
+        """The newest status is a re-pin copy made after the cutoff time; the
+        build it names was first reported before it. Judged on the first
+        report, it is expired, not pinned again."""
+        copy = status(id=2, description=f"Job succeeded. {pin.PIN_NOTE} BaseSHA:{MAIN}", created_at="2026-10-21T09:00:00Z")
+        original = status(id=1, created_at="2026-10-15T09:00:00Z")
+        api = FakeAPI(statuses={HEAD: [copy, original]}, pulls=[pull(HEAD)], main=MAIN)
+        self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T14:00:00Z"), 0)
+        self.assertEqual(len(api.posts), 1)
+        self.assertIn(pin.EXPIRED_NOTE, api.posts[0][1]["description"])
+        # And a stale copy of it is left alone rather than re-pinned.
+        stale = status(id=2, description=f"Job succeeded. BaseSHA:{OLD}", created_at="2026-10-21T09:00:00Z")
+        api = FakeAPI(statuses={HEAD: [stale, original]}, pulls=[pull(HEAD)], main=MAIN)
+        self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T14:00:00Z"), 0)
+        self.assertEqual(api.posts, [])
 
     def test_a_green_from_before_the_cutoff_is_left_stale(self):
         """A verdict about the mode the gate graded before the swap must not
@@ -345,6 +364,7 @@ class MainTest(unittest.TestCase):
         api = FakeAPI(statuses={HEAD: [credited]}, pulls=[pull(HEAD)])
         self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T14:00:00Z"), 0)
         self.assertEqual(len(api.posts), 1)
+        self.assertEqual(api.ref_reads, 1, "an expiry compares against the sweep's one read of main")
         posted = api.posts[0][1]
         self.assertNotIn("BaseSHA:", posted["description"])
         self.assertIn(pin.EXPIRED_NOTE, posted["description"])

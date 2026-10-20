@@ -700,7 +700,9 @@ repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge 
 360-minute timeout (a run in flight at the change reports afterwards; later only costs retests),
 then dispatch `smoke-test-sticky.yml` by hand: the re-pin then never pins an older green, and makes
 one Tide still credits stale, which the change itself would not, as it moves nothing on `main`.
-Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
+Then move `main` once, with a docs-only pull request the job skips: Tide also credits a live
+ProwJob at `main`'s head, and a retest that started under the old mode stays credited that way
+until `main` moves. Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
 matrix instead of reusing the old green. The follow-up that drops that lever sets
 `EVAL_REVALIDATION_NOT_BEFORE` on the job to the same time as the variable, so step 0 never reuses
 a green first reported before it, however long its pull request sat.

@@ -975,6 +975,18 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
 
+    def test_a_partial_read_is_no_earliest_under_a_cutoff(self):
+        """Under EVAL_REVALIDATION_NOT_BEFORE the original report may lie
+        past the pages read, so a green attested by later copies alone is a
+        full run; without the cutoff the same read reuses it (above)."""
+        copies = [self._prow_event("success", "Job succeeded.", "2026-10-21T10:00:00Z", build="200") for _ in range(150)]
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, copies)
+        env = {"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "2", "EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"}
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides=env)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("capped read may not reach", proc.stdout)
+
     def test_an_unparsed_link_header_ends_the_walk_and_says_so(self):
         """RFC 8288 permits an unquoted rel; GitHub quotes it. A Link value
         the walk does not read is a stopped read, reported as one, not the
