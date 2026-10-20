@@ -384,10 +384,10 @@ class DiagnosticsTests(unittest.TestCase):
         # 4 miscellaneous cards
         cards = []
         context = {}
-        for i in range(23):
+        for i in range(24):
             tid = f"t_dns_{i}"
-            kind = "needs_input" if i < 17 else ("transient" if i < 21 else "capability")
-            age = 216 if i < 2 else (120 if i < 22 else 96)
+            kind = "needs_input" if i < 18 else ("transient" if i < 22 else "capability")
+            age = 216 if i < 2 else (120 if i < 23 else 96)
             cards.append({
                 "task_id": tid, "status": "blocked",
                 "title": "Scale kube-dns on platform-agent-host to 3 replicas",
@@ -414,6 +414,20 @@ class DiagnosticsTests(unittest.TestCase):
                 "reason": "The pinned kubeconfig is for a different cluster than this agent is scoped to.",
             }
 
+        # 4 miscellaneous cards
+        for i in range(4):
+            tid = f"t_misc_{i}"
+            cards.append({
+                "task_id": tid, "status": "blocked",
+                "title": f"Miscellaneous task {i}",
+                "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                                 "title": "x", "detail": "y", "data": {"age_hours": 72}}],
+            })
+            context[tid] = {
+                "kind": "transient",
+                "reason": f"Transient error {i}",
+            }
+
         payload = json.dumps(cards)
         lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
                                       runner=self.runner_for(0, payload)[0],
@@ -423,12 +437,12 @@ class DiagnosticsTests(unittest.TestCase):
         # 1. Output length must be well below 12,000 characters
         self.assertLess(len(text), 3000, f"Expected compact report under 3000 chars, got {len(text)}")
 
-        # 2. The 23 kube-dns cards collapsed into one group line
-        self.assertIn("Scale kube-dns on platform-agent-host to 3 replicas — 23 cards (17 needs_input, 4 transient, 2 capability, oldest 9d)", text)
+        # 2. The 24 kube-dns cards collapsed into one group line
+        self.assertIn("Scale kube-dns on platform-agent-host to 3 replicas — 24 cards (18 needs_input, 4 transient, 2 capability, oldest 9d)", text)
 
         # 3. The 6 recent outage triage cards (48h) appear BEFORE the kube-dns cards whose newest is 96h (4d)
         pos_triage = text.find("t_triage_0")
-        pos_dns_group = text.find("Scale kube-dns on platform-agent-host to 3 replicas — 23 cards")
+        pos_dns_group = text.find("Scale kube-dns on platform-agent-host to 3 replicas — 24 cards")
         self.assertTrue(0 <= pos_triage < pos_dns_group,
                         f"Expected outage triage cards (2d) before kube-dns group (4d): pos_triage={pos_triage}, pos_dns_group={pos_dns_group}")
 
@@ -1000,6 +1014,97 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("T" * kbh.TITLE_MAX_CHARS, text)
         self.assertNotIn("T" * (kbh.TITLE_MAX_CHARS + 1), text)
 
+    def test_min_stuck_floor_derived_from_actual_home_path(self):
+        cards = [(f"t_stuck_{i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24 + i}},
+                  {"task_id": f"t_stuck_{i:02d}", "status": "blocked", "title": f"Stuck {i:02d}"})
+                 for i in range(10)]
+        floor_short = kbh._min_stuck_floor(cards, Path("/opt/data"))
+        floor_long = kbh._min_stuck_floor(cards, Path("/var/run/kube-agents/long/home/path"))
+        # Floor scales with 4 * len(home)
+        diff_len = len("/var/run/kube-agents/long/home/path") - len("/opt/data")
+        self.assertEqual(floor_long - floor_short, 4 * diff_len)
+
+    def test_diagnostics_lines_stuck_reserve_pinned_by_long_home_path(self):
+        # A long home path (/var/run/kube-agents/long/home/path, len=35) scales the
+        # irreducible floor to 590 chars (113 header + (245 + 4*35) footer + 92 omission line).
+        # diagnostics_lines(home, max_chars=2000) with 20 error diagnostics (each 69 chars)
+        # and 3 distinct stuck cards must derive its stuck reserve dynamically from home:
+        # with dynamic reserve (590 chars), diag_budget is 1290 chars (18 lines + 99-char omission line = 1359),
+        # leaving remaining = 641 >= 590, so the whole report stays <= 2000.
+        # If the reserve were hardcoded to 500, diag_budget would take 19 lines (1428 chars),
+        # leaving remaining = 572 < 590, causing render_stuck_cards to emit its 590-char floor
+        # and blowing past 2000 (total = 2018 chars).
+        home = Path("/var/run/kube-agents/long/home/path")
+        entries = []
+        for i in range(20):
+            entries.append({
+                "task_id": f"t_e_{i:02d}",
+                "status": "failed",
+                "diagnostics": [{
+                    "kind": f"err_{i:02d}",
+                    "severity": "error",
+                    "title": f"Err {i:02d}",
+                    "detail": "x" * 33,
+                }],
+            })
+        for i in range(3):
+            entries.append({
+                "task_id": f"t_stuck_{i}",
+                "status": "blocked",
+                "title": f"Stuck {i}",
+                "diagnostics": [{
+                    "kind": "stuck_in_blocked",
+                    "severity": "warning",
+                    "data": {"age_hours": 24 + i},
+                }],
+            })
+        payload = json.dumps(entries)
+        runner = self.runner_for(0, payload)[0]
+        lines = kbh.diagnostics_lines(home, "error", runner=runner, binary="/x/hermes", env={}, max_chars=2000)
+        text = "\n".join(lines)
+        self.assertLessEqual(len(text), 2000)
+
+    def test_distinct_cards_agreeing_on_first_200_chars_not_merged_into_group(self):
+        # Two cards whose titles exceed TITLE_MAX_CHARS (200) and share their first 200 characters,
+        # differing only in their suffix (e.g., ' on pod-1' vs ' on pod-2').
+        # Grouping must use the full normalized title so distinct incidents are not merged.
+        prefix = "Triage incident " + ("x" * 190)
+        payload = json.dumps([
+            {"task_id": "t_inc_1", "status": "blocked", "title": prefix + " on pod-1",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 24}}]},
+            {"task_id": "t_inc_2", "status": "blocked", "title": prefix + " on pod-2",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 48}}]},
+        ])
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={})
+        text = "\n".join(lines)
+        # Must not be rendered as a single group with '— 2 cards'
+        self.assertNotIn("2 cards", text)
+        # Both distinct task IDs are rendered with their own lines
+        self.assertIn("t_inc_1", text)
+        self.assertIn("t_inc_2", text)
+
+    def test_diagnostics_omission_line_suppressed_when_diag_allowance_below_reserve(self):
+        # When diag_allowance (max_chars - min_stuck_reserve) is below 120,
+        # diagnostics omission line is not emitted so it does not uncharge over max_chars.
+        cards = [{"task_id": f"t_err_{i}", "status": "failed",
+                  "diagnostics": [{"kind": "repeated_failures", "severity": "error", "title": "Err", "detail": "x" * 50}]}
+                 for i in range(2)]
+        for i in range(20):
+            cards.append({
+                "task_id": f"t_stuck_{i}", "status": "blocked", "title": f"Stuck {i}",
+                "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24 + i}}],
+            })
+        payload = json.dumps(cards)
+        runner = self.runner_for(0, payload)[0]
+        # /opt/data floor is ~486 chars. With max_chars=520, diag_allowance is ~34 < 120.
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error", runner=runner, binary="/x/hermes", env={}, max_chars=520)
+        text = "\n".join(lines)
+        self.assertNotIn("other diagnostics omitted", text)
+
 
 
 
@@ -1115,16 +1220,6 @@ class ReportTests(unittest.TestCase):
         text_floor = "\n".join(lines_floor)
         self.assertEqual(len(text_floor), 486)
         self.assertIn("older stuck cards omitted (run hermes kanban list", text_floor)
-
-    def test_min_stuck_floor_derived_from_actual_home_path(self):
-        cards = [(f"t_stuck_{i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24 + i}},
-                  {"task_id": f"t_stuck_{i:02d}", "status": "blocked", "title": f"Stuck {i:02d}"})
-                 for i in range(10)]
-        floor_short = kbh._min_stuck_floor(cards, Path("/opt/data"))
-        floor_long = kbh._min_stuck_floor(cards, Path("/var/run/kube-agents/long/home/path"))
-        # Floor scales with 4 * len(home)
-        diff_len = len("/var/run/kube-agents/long/home/path") - len("/opt/data")
-        self.assertEqual(floor_long - floor_short, 4 * diff_len)
 
 
 class MainOutputContractTests(unittest.TestCase):

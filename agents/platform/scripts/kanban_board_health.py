@@ -458,7 +458,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
         kind = str(info.get("kind") or NO_KIND)
         assignee = str(info.get("assignee") or entry.get("assignee") or "?")
         raw_title = info.get("title") or entry.get("title") or ""
-        title = " ".join(str(raw_title).split())[:TITLE_MAX_CHARS] if raw_title else ""
+        title = " ".join(str(raw_title).split()) if raw_title else ""
         reason = " ".join(str(info.get("reason") or "").split())[:REASON_MAX_CHARS]
         age_hours = _card_age_hours(diag)
         parsed.append({
@@ -502,7 +502,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
             kind_counts = collections.Counter(c["kind"] for c in group)
             sorted_kinds = sorted(kind_counts.items(), key=lambda x: (-x[1], x[0]))
             kinds_summary = ", ".join(f"{cnt} {k}" for k, cnt in sorted_kinds)
-            head = f"  - {title} — {len(group)} cards ({kinds_summary}, oldest {oldest_str})"
+            head = f"  - {title[:TITLE_MAX_CHARS]} — {len(group)} cards ({kinds_summary}, oldest {oldest_str})"
             lines_for_group = [head]
             dropped_ids = []
             if len(group) <= GROUP_EXPAND_MAX:
@@ -529,7 +529,7 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                     dropped_ids = dropped_ids[1:]
             renderable_items.append({
                 "age_hours": newest_age,
-                "key": title,
+                "key": title[:TITLE_MAX_CHARS],
                 "lines": lines_for_group,
                 "card_count": len(group) - len(dropped_ids),
                 "cards": group,
@@ -680,6 +680,10 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     the engine grades it. Stuck cards are rendered from ``context`` (see
     ``blocked_context``) under their own heading; everything else keeps the
     engine's own title and detail.
+
+    When stuck items are present, guarantees output stays <= max_chars when
+    max_chars >= min_stuck_floor + 120. Below this allowance, render_stuck_cards preserves
+    its documented irreducible minimum floor.
     """
     try:
         exe = str(binary) if binary else str(hermes_bin())
@@ -747,7 +751,7 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, diag_budget)
     lines = list(shown_diag_lines)
     omitted_diags = len(diag_lines) - len(shown_diag_lines)
-    if omitted_diags > 0:
+    if omitted_diags > 0 and diag_allowance >= 120:
         lines.append(
             f"  ... and {omitted_diags} other diagnostic{'s' if omitted_diags != 1 else ''} omitted "
             f"(run hermes kanban diagnostics on the agent pod to view all)"
@@ -762,7 +766,12 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
 
 
 def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> list:
-    """The whole check. Empty list means healthy, which means silent."""
+    """The whole check. Empty list means healthy, which means silent.
+
+    Guarantees output stays <= max_chars (including 40-char main() reserve) for
+    max_chars >= (MAX_DIAGNOSTIC_CHARS + min_stuck_floor + reserves). Below that threshold,
+    render_stuck_cards preserves its documented minimum output floor.
+    """
     if max_chars is None:
         max_chars = MAX_REPORT_CHARS
     db = board_path(home)
@@ -780,17 +789,20 @@ def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> l
 
     used_chars = 40  # reserve for main() header: "kanban board health: attention required\n"
     if violations:
-        lines.append(
-            "Board invariant violations (a direct write to kanban.db is the usual cause):"
-        )
-        shown_violations = _take_within_budget(violations, MAX_INVARIANT_ITEMS, MAX_DIAGNOSTIC_CHARS)
+        header = "Board invariant violations (a direct write to kanban.db is the usual cause):"
+        lines.append(header)
+        header_len = len(header) + 1
+        used_chars += header_len
+        viol_allowance = max(0, max_chars - used_chars)
+        viol_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, viol_allowance) - 120)
+        shown_violations = _take_within_budget(violations, MAX_INVARIANT_ITEMS, viol_budget)
         lines.extend(shown_violations)
         omitted_violations = len(violations) - len(shown_violations)
-        if omitted_violations > 0:
+        if omitted_violations > 0 and viol_allowance >= 120:
             lines.append(
                 f"  ... and {omitted_violations} other invariant violation{'s' if omitted_violations != 1 else ''} omitted"
             )
-        used_chars += sum(len(ln) + 1 for ln in lines)
+        used_chars = 40 + sum(len(ln) + 1 for ln in lines)
 
     diag_header_reserve = len("Active kanban diagnostics:\n")
     remaining_chars = max(0, max_chars - used_chars - diag_header_reserve)
