@@ -566,3 +566,59 @@ def test_read_session_cards_returns_error_from_task_runs_when_last_failure_error
     assert read.cards[FRONT]["error"] == "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
 
 
+def test_read_board_state_skips_task_runs_for_non_failure_cards(tmp_path: Path) -> None:
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            (FRONT, "running", None),
+        )
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            (CHILD, "failed", None),
+        )
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT)")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            (FRONT, "in-progress report", None),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, summary, error) VALUES (?, ?, ?)",
+            (CHILD, "failure details", "provider rate limit"),
+        )
+    reply = _run_script(tmp_path, [FRONT, CHILD])
+    got = board.read_board_state(lambda script, timeout: reply, [FRONT, CHILD], 5.0)
+    assert got is not None
+    statuses, summaries, errors, block_kinds = got
+    assert statuses == {FRONT: "running", CHILD: "failed"}
+    # FRONT is running (non-failure status), so its task_runs summary is skipped
+    assert summaries == {CHILD: "failure details"}
+    assert errors == {CHILD: "provider rate limit"}
+
+
+def test_read_session_cards_reads_error_and_block_kind_only_when_wanted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    build_session_store(tmp_path, created=[FRONT])
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'transient', last_failure_error = ? WHERE id = ?",
+            ("provider rate limit: API retries exhausted (failure_reason=rate_limit): 429", FRONT),
+        )
+    shell = local_shell(tmp_path, monkeypatch)
+    # Without want, poll read carries statuses alone; error and block_kind are None
+    poll_read = board.read_session_cards(shell, SESSION, 5)
+    assert poll_read is not None
+    assert poll_read.cards[FRONT]["status"] == "blocked"
+    assert poll_read.cards[FRONT]["error"] is None
+    assert poll_read.cards[FRONT]["block_kind"] is None
+
+    # With want, error and block_kind are populated
+    final_read = board.read_session_cards(shell, SESSION, 5, want=[FRONT])
+    assert final_read is not None
+    assert final_read.cards[FRONT]["status"] == "blocked"
+    assert final_read.cards[FRONT]["error"] == "provider rate limit: API retries exhausted (failure_reason=rate_limit): 429"
+    assert final_read.cards[FRONT]["block_kind"] == "transient"
+
+
+

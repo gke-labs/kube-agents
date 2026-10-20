@@ -2947,7 +2947,7 @@ def test_board_card_messages_refuses_non_transient_triage() -> None:
 
 def test_extract_trajectory_failure_summaries_branches() -> None:
     t = "t-1"
-    # Exit 1: task blocked+transient with cleared newest run -> {}
+    # Exit 1: task blocked+transient with cleared newest run -> evicts stale store
     traj_cleared = [
         {
             "name": "kanban_show",
@@ -2960,9 +2960,13 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
             }),
         }
     ]
-    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_cleared, [t]) == {}
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_cleared, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
 
-    # Exit 2: task status failed with cleared newest run -> {}
+    # Exit 2: task status failed with cleared newest run -> evicts stale store
     traj_failed_cleared = [
         {
             "name": "kanban_show",
@@ -2975,7 +2979,36 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
             }),
         }
     ]
-    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_failed_cleared, [t]) == {}
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_failed_cleared, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 2b: tasks item blocked+transient with cleared newest run -> evicts stale store
+    traj_tasks_cleared = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {
+                        "id": t,
+                        "status": "blocked",
+                        "block_kind": "transient",
+                        "runs": [
+                            {"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: quota exhausted"},
+                            {"summary": None},
+                        ],
+                    },
+                ],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_cleared, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
 
     # Exit 3: tasks list item status failed with rate limit summary -> {t: [summary]}
     expected_sum = f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"
@@ -2991,7 +3024,7 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
     ]
     assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_failed, [t]) == {t: [expected_sum]}
 
-    # Exit 4: tasks item blocked without transient -> {}
+    # Exit 4: tasks item blocked without transient -> evicts stale store
     traj_tasks_blocked_nontransient = [
         {
             "name": "kanban_list",
@@ -3007,9 +3040,46 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
             }),
         }
     ]
-    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_blocked_nontransient, [t]) == {}
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_blocked_nontransient, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
 
-    # Exit 5: task triage without transient -> {}
+    # Exit 4b: task item blocked with absent block_kind key -> evicts stale store
+    traj_task_blocked_nokind = [
+        {
+            "name": "kanban_show",
+            "result": json.dumps({
+                "task": {"id": t, "status": "blocked"},
+                "runs": [{"summary": expected_sum}],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_blocked_nokind, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 4c: tasks item blocked with absent block_kind key -> evicts stale store
+    traj_tasks_blocked_nokind = [
+        {
+            "name": "kanban_list",
+            "result": json.dumps({
+                "tasks": [
+                    {"id": t, "status": "blocked", "runs": [{"summary": expected_sum}]},
+                ],
+            }),
+        }
+    ]
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_tasks_blocked_nokind, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
+
+    # Exit 5: task triage without transient -> evicts stale store
     traj_task_triage = [
         {
             "name": "kanban_show",
@@ -3019,7 +3089,11 @@ def test_extract_trajectory_failure_summaries_branches() -> None:
             }),
         }
     ]
-    assert KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_triage, [t]) == {}
+    store = {t: ["stale"]}
+    res = KubeAgentsHarness._extract_trajectory_failure_summaries(traj_task_triage, [t], store=store)
+    assert res is store
+    assert t not in store
+    assert res == {}
 
 
 def test_gitops_fix_cycle_skipped_on_infra_failure(
@@ -3747,6 +3821,143 @@ def test_worker_authored_kanban_block_with_infra_prefix_remains_graded(
     assert "Worker blocked on input." in result.output
 
 
+def test_failed_card_with_worker_failure_text_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A failed card whose error is ordinary worker failure text (even mentioning 429) is graded."""
+    worker_failure = "Traceback (most recent call last): HTTP 429 from the GKE API: rateLimitExceeded"
+    stub_agent.turns = [
+        _create_turn(),
+        _show_turn("failed", body=worker_failure, result=worker_failure),
+    ]
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            payload = {
+                "statuses": {_TASK_ID: "failed"},
+                "summaries": {},
+                "errors": {_TASK_ID: worker_failure},
+                "block_kinds": {},
+                "error": None,
+            }
+            return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Find the root cause.")
+
+    assert not result.has_errors()
+    assert not any(harness.INFRA_FAILURE_MARKER in err for err in result.errors)
+    assert worker_failure in result.output
+
+
+def test_extract_infra_failure_reason_classifier() -> None:
+    """_extract_infra_failure_reason matches exact hermes failure prefix and billing reasons."""
+    assert harness._extract_infra_failure_reason(None) is None
+    assert harness._extract_infra_failure_reason("") is None
+    assert harness._extract_infra_failure_reason("   ") is None
+    assert harness._extract_infra_failure_reason("upstream returned HTTP 429 rate limit") is None
+    assert harness._extract_infra_failure_reason("Traceback: 429 RESOURCE_EXHAUSTED") is None
+
+    # Exact prefix -> rate_limit
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: API retries exhausted"
+        )
+        == "rate_limit"
+    )
+    # failure_reason=billing -> billing
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=billing): credit exhausted"
+        )
+        == "billing"
+    )
+    # failure_reason=rate_limit -> rate_limit
+    assert (
+        harness._extract_infra_failure_reason(
+            f"{harness._RATE_LIMIT_REASON_PREFIX}: (failure_reason=rate_limit): 429"
+        )
+        == "rate_limit"
+    )
+
+
+def test_poll_loop_refreshes_retired_card_poll_failure_messages_remains_graded(
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
+) -> None:
+    """A retired card in poll_failure_messages is refreshed/evicted on subsequent polls and remains graded."""
+    t1 = _TASK_ID
+    t2 = _TASK_ID + "-2"
+    stub_agent.turns = [
+        # Turn 0: delegate t1 and t2
+        _turn(
+            *_call("kanban_create", {"title": "task 1"}, {"ok": True, "task_id": t1, "status": "ready"}, "c1"),
+            *_call("kanban_create", {"title": "task 2"}, {"ok": True, "task_id": t2, "status": "ready"}, "c2"),
+            _text("Delegated both."),
+        ),
+        # Turn 1: front agent shows t1 blocked -> t1 retires from outstanding
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t1},
+                {
+                    "task": {"id": t1, "status": "blocked", "block_kind": "transient"},
+                    "runs": [{"summary": f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"}],
+                },
+                "s1",
+            ),
+            _text("t1 is blocked, waiting on t2."),
+        ),
+        # Turn 2: front agent shows t2 done
+        _turn(
+            *_call(
+                "kanban_show",
+                {"task_id": t2},
+                {"task": {"id": t2, "status": "done", "result": "t2 finished"}, "runs": []},
+                "s2",
+            ),
+            _text("Finished."),
+        ),
+    ]
+
+    reads: list[str] = []
+
+    def _shell(script: str, timeout: float) -> str:
+        if board.BOARD_PRESENT in script:
+            idx = len(reads)
+            reads.append(script)
+            if idx == 0:
+                # Poll 0: t1 is blocked/transient with prefix, t2 is running
+                payload = {
+                    "statuses": {t1: "blocked", t2: "running"},
+                    "summaries": {t1: f"{harness._RATE_LIMIT_REASON_PREFIX}: 429 quota exhausted"},
+                    "errors": {},
+                    "block_kinds": {t1: "transient"},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            elif idx == 1:
+                # Poll 1: polled_ids includes t2 and t1. t1 is now running on the board (unblocked)
+                payload = {
+                    "statuses": {t1: "running", t2: "running"},
+                    "summaries": {},
+                    "errors": {},
+                    "block_kinds": {},
+                    "error": None,
+                }
+                return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
+            # Final settle read fails
+            return ""
+        return ""
+
+    monkeypatch.setattr(harness, "_agent_shell", _shell)
+
+    result = KubeAgentsHarness().run("Check cards.")
+
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in result.errors)
+
+
 def test_a_delegated_worker_rate_limit_on_board_early_settle_is_infrastructure(
     monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
@@ -3846,7 +4057,7 @@ def test_a_delegated_worker_rate_limit_on_board_fallback_when_final_read_fails(
     """When the final board read fails, fallback to poll failure summary marks infra."""
     stub_agent.turns = [
         _create_turn(),
-        _show_turn("blocked"),
+        _show_turn("blocked", block_kind="transient"),
     ]
     reads = []
 

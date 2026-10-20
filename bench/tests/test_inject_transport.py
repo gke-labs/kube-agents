@@ -2719,6 +2719,24 @@ def test_a_failed_card_with_rate_limit_error_on_inject_is_infrastructure(
     assert "rate_limit" in result.errors[0]
 
 
+def test_a_failed_card_with_worker_429_error_on_inject_remains_graded(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card failed with ordinary worker error (even mentioning 429) is graded, not marked infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(
+        tmp_path,
+        CARD_A,
+        "failed",
+        error="upstream returned HTTP 429: rateLimitExceeded",
+    )
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not infra(result)
+
+
 def test_worker_authored_kanban_block_with_infra_prefix_on_inject_remains_graded(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
