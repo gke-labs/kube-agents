@@ -849,6 +849,23 @@ class OverridesTest(unittest.TestCase):
         sweep = self.sweep(Path("/sandbox-root"), fake)
         self.assertEqual(sweep.warnings, [])
 
+    def test_a_vanished_entry_mid_listing_still_reports_and_sweeps(self):
+        rhome = Path("/sandbox-root") / "profiles" / "platform"
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 1, _find_output(("skills_override", "1", "4096", "d")),
+                                                   f"find: '{rhome}/tmp': No such file or directory")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(sweep.overrides_removed, ["sandbox platform/skills_override"])
+        self.assertTrue(any("exited 1" in w for w in sweep.warnings), sweep.warnings)
+
     def test_one_unremovable_tree_does_not_hide_the_others(self):
         rhome = Path("/sandbox-root") / "profiles" / "platform"
 

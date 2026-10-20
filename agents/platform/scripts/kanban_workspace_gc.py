@@ -708,18 +708,20 @@ def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
     except Exception as exc:  # noqa: BLE001 - a sweep must not die on one home
         sweep.warnings.append(f"listing {home} in the sandbox failed: {exc}")
         return []
+    found = sorted(name for name, _, _, kind in _parse_listing(result.stdout)
+                   if OVERRIDE_NAME.fullmatch(name) and kind in ("d", "l"))
     if result.returncode != 0:
         # A home the sandbox hasn't received yet (a profile scaffolded while it
-        # was down, a recreated volume) has nothing to sweep.  Any other failure,
-        # a home the worker locked from its own shell say, is reported rather
-        # than read as "nothing there".
-        if "No such file or directory" in (result.stderr or ""):
+        # was down, a recreated volume) has nothing to sweep: find's only
+        # complaint is then about the home itself.  Any other failure, a home the
+        # worker locked from its own shell or an entry that vanished mid-listing,
+        # is reported, and whatever the listing did return is still swept.
+        stderr = (result.stderr or "").strip()
+        if not found and stderr == f"{REMOTE_FIND.rsplit('/', 1)[-1]}: '{home}': No such file or directory":
             return []
-        sweep.warnings.append(f"listing {home} in the sandbox exited {result.returncode}, so its override trees "
-                              f"were not checked: {(result.stderr or '').strip()[:STDERR_EXCERPT_CHARS]}")
-        return []
-    return sorted(name for name, _, _, kind in _parse_listing(result.stdout)
-                  if OVERRIDE_NAME.fullmatch(name) and kind in ("d", "l"))
+        sweep.warnings.append(f"listing {home} in the sandbox exited {result.returncode}; override trees it "
+                              f"didn't list were not checked: {stderr[:STDERR_EXCERPT_CHARS]}")
+    return found
 
 
 def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep) -> Path | None:
