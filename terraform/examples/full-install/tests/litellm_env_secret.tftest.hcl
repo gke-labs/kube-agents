@@ -120,6 +120,15 @@ run "a_provider_that_is_not_a_slug_fails_the_plan" {
   expect_failures = [var.model_provider]
 }
 
+run "chatgpt_fails_the_plan_as_the_chart_would" {
+  command = plan
+  variables {
+    model_provider     = "chatgpt"
+    model_default_name = "gpt-5.4"
+  }
+  expect_failures = [var.model_provider]
+}
+
 run "a_bad_secret_name_fails_the_plan" {
   command = plan
   variables {

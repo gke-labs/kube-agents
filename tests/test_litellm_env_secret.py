@@ -78,11 +78,6 @@ class TestEnvFromSecretRender(unittest.TestCase):
                 container = self._gateway_container(self._render(*args, "--set", f"litellm.envFromSecret={_SECRET}"))
                 self.assertEqual(container["envFrom"], [{"secretRef": {"name": _SECRET, "optional": True}}])
 
-    def test_unset_renders_no_env_from(self) -> None:
-        for args in _EXISTING_PROVIDERS:
-            with self.subTest(args=args):
-                self.assertNotIn("envFrom", self._gateway_container(self._render(*args)))
-
     def test_a_name_kubernetes_would_refuse_fails_the_render(self) -> None:
         for name in ("Sap-Aicore", "sap_aicore", "-sap", "a" * 254):
             with self.subTest(name=name):

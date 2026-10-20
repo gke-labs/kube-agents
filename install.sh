@@ -4629,7 +4629,15 @@ validate_platform_agent_mode() {
 # provider, and validate_model_provider_inputs then asks for one.
 openai_compatible_model_for_run() {
   local provider="${1:-}" model="${2:-}" passed="${3:-false}" recorded="${4:-}"
-  if [ -z "$(default_model_for_provider "$provider")" ] && [ -n "$recorded" ] &&
+  # Which providers have no default: openai_compatible always, and a slug
+  # outside the table once installer_common.sh (sourced at step 2) can say so.
+  local no_default=false
+  if [ "$provider" = "openai_compatible" ]; then
+    no_default=true
+  elif declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "$provider"; then
+    no_default=true
+  fi
+  if [ "$no_default" = "true" ] && [ -n "$recorded" ] &&
     [ "$recorded" != "$provider" ] && [ "$passed" != "true" ]; then
     model=""
   fi
@@ -4659,10 +4667,16 @@ prompt_litellm_env_secret_provider() {
   fi
   while :; do
     prompt_read "LiteLLM provider slug (sap, azure, bedrock, databricks, ...)" provider "$provider"
-    if is_valid_model_provider "$provider" && [ "$provider" != "openai_compatible" ]; then
+    if is_valid_model_provider "$provider" && { [ "$provider" = "sap" ] || ! is_table_model_provider "$provider"; }; then
       break
     fi
-    print_error "'${provider}' is not a LiteLLM provider slug (lowercase letters, digits and underscores); openai_compatible has its own entry."
+    # The other table providers have their own entries, with their own
+    # credential prompts; accepting them here would skip those.
+    if is_table_model_provider "$provider"; then
+      print_error "'${provider}' has its own entry in the provider menu; this entry is for sap and any other LiteLLM provider slug."
+    else
+      print_error "'${provider}' is not a LiteLLM provider slug (lowercase letters, digits and underscores)."
+    fi
     [ "$can_retry" = "true" ] || return 1
   done
   model="$(default_model_for_provider "$provider")"
@@ -4675,9 +4689,15 @@ prompt_litellm_env_secret_provider() {
     print_error "A model name is required: the installer has no default for ${provider}."
     [ "$can_retry" = "true" ] || return 1
   done
-  prompt_read "Secret in the agent's namespace holding the provider's credentials (you create it)" "$secret_name_var" "${!secret_name_var}"
+  local secret_name="${!secret_name_var}"
+  while :; do
+    prompt_read "Secret in the agent's namespace holding the provider's credentials (you create it)" secret_name "$secret_name"
+    validate_litellm_env_secret_name "$secret_name" && break
+    [ "$can_retry" = "true" ] || return 1
+  done
   printf -v "$provider_var" '%s' "$provider"
   printf -v "$model_var" '%s' "$model"
+  printf -v "$secret_name_var" '%s' "$secret_name"
 }
 
 prompt_openai_compatible_settings() {

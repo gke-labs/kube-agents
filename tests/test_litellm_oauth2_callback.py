@@ -220,14 +220,25 @@ class TestHook(unittest.TestCase):
         self.assertEqual(out["api_key"], "tok-2")
         self.assertEqual(len(self.endpoint.requests), 2)
 
-    def test_a_response_without_expires_in_takes_the_default_lifetime(self):
-        endpoint = _TokenEndpoint(expires_in=None)
-        self.addCleanup(endpoint.close)
-        before = self.hook.time.monotonic()
-        self._run({"model": "model-default"}, env=dict(self.env, **{self.hook.TOKEN_URL_ENV: endpoint.url}))
-        lifetime = self.hook._cache.expires_at - before
-        self.assertGreater(lifetime, self.hook.DEFAULT_TOKEN_LIFETIME_SECONDS - 5)
-        self.assertLessEqual(lifetime, self.hook.DEFAULT_TOKEN_LIFETIME_SECONDS + 1)
+    def test_a_response_without_a_usable_expires_in_takes_the_default_lifetime(self):
+        # Absent, and the values json or float() admit that are not a finite
+        # positive number: NaN would make the token never usable and refetch on
+        # every request, Infinity would pin it forever.
+        for expires_in in (None, "nan", "inf", float("inf"), -5, 0, "soon"):
+            with self.subTest(expires_in=expires_in):
+                hook = _load_hook()
+                endpoint = _TokenEndpoint(expires_in=expires_in)
+                self.addCleanup(endpoint.close)
+                env = dict(self.env, **{hook.TOKEN_URL_ENV: endpoint.url})
+                before = hook.time.monotonic()
+                with mock.patch.dict(hook.os.environ, env), mock.patch.object(hook, "_router", return_value=_ROUTER):
+                    out = asyncio.run(hook.proxy_handler_instance.async_pre_call_hook(None, None, {"model": "model-default"}, "completion"))
+                    again = asyncio.run(hook.proxy_handler_instance.async_pre_call_hook(None, None, {"model": "model-default"}, "completion"))
+                self.assertEqual(out["api_key"], "tok-1")
+                self.assertEqual(again["api_key"], "tok-1", "the token must be cached, not refetched")
+                lifetime = hook._cache.expires_at - before
+                self.assertGreater(lifetime, hook.DEFAULT_TOKEN_LIFETIME_SECONDS - 5)
+                self.assertLessEqual(lifetime, hook.DEFAULT_TOKEN_LIFETIME_SECONDS + 1)
 
     def test_a_refused_exchange_fails_that_request_and_the_next_one_tries_again(self):
         bad = dict(self.env, **{self.hook.CLIENT_CREDENTIAL_ENV: "wrong"})

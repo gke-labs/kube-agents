@@ -44,6 +44,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import ssl
 import sys
@@ -180,6 +181,11 @@ def fetch_token(settings: dict[str, str], ca_bundle: str = "") -> tuple[str, flo
         lifetime = float(body.get(EXPIRES_IN_KEY, DEFAULT_TOKEN_LIFETIME_SECONDS))
     except (TypeError, ValueError):
         lifetime = float(DEFAULT_TOKEN_LIFETIME_SECONDS)
+    # json accepts NaN and Infinity, and float() accepts "inf": a lifetime that
+    # is not a finite positive number would pin the token forever or never, so
+    # it is treated as absent.
+    if not math.isfinite(lifetime) or lifetime <= 0:
+        lifetime = float(DEFAULT_TOKEN_LIFETIME_SECONDS)
     return token, lifetime
 
 
@@ -194,7 +200,8 @@ async def bearer_for(settings: dict[str, str], cache: TokenCache, ca_bundle: str
         try:
             token, lifetime = await asyncio.to_thread(fetch_token, settings, ca_bundle)
         except Exception as exc:  # noqa: BLE001 - the request that needed the token gets the error
-            logger.warning("oauth2: %s; the request fails and the next one tries again", exc)
+            # The exception text already starts with the oauth2 prefix.
+            logger.warning("%s; the request fails and the next one tries again", exc)
             raise
         cache.token, cache.expires_at = token, time.monotonic() + lifetime
         logger.info("oauth2: %s a bearer token from %s, valid for %d s", verb, settings["token_url"], int(lifetime))

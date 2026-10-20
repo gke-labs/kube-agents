@@ -334,8 +334,11 @@ variable "model_provider" {
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "openai_compatible", "sap"], var.model_provider) || can(regex("^[a-z][a-z0-9_]*$", var.model_provider))
-    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, or a LiteLLM provider slug (lowercase letters, digits and underscores)."
+    # One shape admits every provider the chart knows and every other LiteLLM
+    # slug; chatgpt is the slug the chart refuses by name (a subscription needs
+    # an OAuth token store it does not ship), so the plan refuses it here.
+    condition     = can(regex("^[a-z][a-z0-9_]*$", var.model_provider)) && var.model_provider != "chatgpt"
+    error_message = "model_provider must be gemini, anthropic, openai, vertex_ai, openai_compatible, sap, or another LiteLLM provider slug (lowercase letters, digits and underscores); chatgpt is not supported, use openai with an API key."
   }
 }
 

@@ -1411,7 +1411,21 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             'echo "RC2=${rc:-0} P2=$model_provider M2=[$model_default_name]"; '
             'model_provider="sap"; model_default_name=""; rc=0; '
             'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
-            'echo "RC3=${rc:-0} P3=$model_provider M3=$model_default_name"'
+            'echo "RC3=${rc:-0} P3=$model_provider M3=$model_default_name"; '
+            # A keyed table provider typed at the slug prompt belongs to its own
+            # entry: refused, variables untouched. prompt_read is stubbed to type
+            # it, since the seed for a recorded gemini is sap.
+            'typed() { case "$1" in *slug*) printf -v "$2" %s gemini;; *) printf -v "$2" %s "$3";; esac; }; '
+            'real_prompt_read=$(declare -f prompt_read); eval "${real_prompt_read/prompt_read/orig_prompt_read}"; '
+            'prompt_read() { typed "$@"; }; '
+            'model_provider="gemini"; model_default_name="m"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC4=${rc:-0} P4=$model_provider M4=$model_default_name"; '
+            'eval "${real_prompt_read}"; '
+            # A Secret name Kubernetes would refuse: refused here, variables untouched.
+            'model_provider="sap"; model_default_name="m"; litellm_env_secret_name="SAP-AICore"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC5=${rc:-0} P5=$model_provider M5=$model_default_name S5=$litellm_env_secret_name"'
         )
         proc = self._run_install_func(cmd)
         self.assertIn("RC=1 P=v-llm M=m S=s", proc.stdout, proc.stdout + proc.stderr)
@@ -1419,6 +1433,10 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertIn("RC2=1 P2=azure M2=[]", proc.stdout)
         self.assertIn("A model name is required", proc.stdout + proc.stderr)
         self.assertIn("RC3=0 P3=sap M3=anthropic--claude-4.5-sonnet", proc.stdout)
+        self.assertIn("RC4=1 P4=gemini M4=m", proc.stdout)
+        self.assertIn("has its own entry in the provider menu", proc.stdout + proc.stderr)
+        self.assertIn("RC5=1 P5=sap M5=m S5=SAP-AICore", proc.stdout)
+        self.assertIn("is not a valid Kubernetes Secret name", proc.stdout + proc.stderr)
 
     def test_validate_openai_compatible_inputs_refuses_what_the_chart_or_operator_would(self):
         # The chart cannot render without these, and the operator drops the

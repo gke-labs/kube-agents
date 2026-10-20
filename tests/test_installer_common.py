@@ -2476,7 +2476,7 @@ class InstallerCommonTest(unittest.TestCase):
     def test_a_provider_slug_is_accepted_and_needs_a_model(self):
         proc = self._run(
             'for p in sap azure bedrock databricks2 a_b; do is_valid_model_provider "$p" && echo "ok $p"; done; '
-            'for p in Azure v-llm 1azure "sap/" "" "azure bedrock"; do is_valid_model_provider "$p" || echo "no $p"; done; '
+            'for p in Azure v-llm 1azure "sap/" "" "azure bedrock" chatgpt; do is_valid_model_provider "$p" || echo "no $p"; done; '
             'is_table_model_provider sap && echo table-sap; is_table_model_provider azure || echo slug-azure; '
             'validate_model_provider_inputs azure "" ; echo "slug-no-model=$?"; '
             'validate_model_provider_inputs azure gpt-5.4; echo "slug-model=$?"; '
@@ -2485,7 +2485,7 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         for line in ("ok sap", "ok azure", "ok bedrock", "ok databricks2", "ok a_b",
-                     "no Azure", "no v-llm", "no 1azure", "no sap/", "no ", "no azure bedrock",
+                     "no Azure", "no v-llm", "no 1azure", "no sap/", "no ", "no azure bedrock", "no chatgpt",
                      "table-sap", "slug-azure", "slug-no-model=1", "slug-model=0", "sap-no-model=0",
                      "sap-default=anthropic--claude-4.5-sonnet azure-default=[]"):
             self.assertIn(line, proc.stdout)

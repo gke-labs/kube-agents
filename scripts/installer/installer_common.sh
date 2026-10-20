@@ -468,9 +468,11 @@ is_table_model_provider() {
 
 # Those, or any other LiteLLM provider slug (azure, bedrock, databricks, ...),
 # which the chart accepts when MODEL_DEFAULT_NAME names the model and whose
-# credentials arrive through LITELLM_ENV_SECRET_NAME.
+# credentials arrive through LITELLM_ENV_SECRET_NAME. chatgpt is a slug the
+# chart refuses by name (a subscription needs an OAuth token store it does
+# not ship), so it is refused here too, before anything is built.
 is_valid_model_provider() {
-  is_table_model_provider "${1:-}" || [[ "${1:-}" =~ $LITELLM_PROVIDER_SLUG_PATTERN ]]
+  [ "${1:-}" != "chatgpt" ] && { is_table_model_provider "${1:-}" || [[ "${1:-}" =~ $LITELLM_PROVIDER_SLUG_PATTERN ]]; }
 }
 
 # A provider outside the table has no default model, so the chart refuses to
@@ -782,7 +784,7 @@ validate_openai_compatible_inputs() {
 
   if [ -n "$ca_bundle_name" ] &&
     { [ "${#ca_bundle_name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] ||
-      [[ ! "$ca_bundle_name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+      [[ ! "$ca_bundle_name" =~ $K8S_SECRET_NAME_PATTERN ]]; }; then
     print_error "OPENAI_COMPATIBLE_CA_SECRET_NAME='${ca_bundle_name}' is not a valid Kubernetes Secret name."
     return 1
   fi
