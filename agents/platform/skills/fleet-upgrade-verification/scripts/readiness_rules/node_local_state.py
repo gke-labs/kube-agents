@@ -8,7 +8,8 @@ container mounts writable, a `hostPath` under a Local SSD mount, or a claim (or 
 StatefulSet's claim template) on a StorageClass whose provisioner is
 `kubernetes.io/no-provisioner`, how Local SSD becomes a PersistentVolume, is a `risk`, named
 with the volume. A Deployment's `emptyDir`, which every reschedule empties and the application
-rebuilds, a memory-backed `emptyDir` and a `hostPath` mounted read-only are notes. DaemonSets
+rebuilds, a memory-backed `emptyDir`, a `hostPath` mounted read-only and a `hostPath` declared
+but mounted by no container are notes. DaemonSets
 (per-node agents by design) and CronJobs (transient pods) are not read. When the StorageClass
 or claim read failed and a template mounts a claim, the claim's class is `unknown`. Nothing
 here blocks: a rebuild loses the data and GKE does not stop for it, so `CAN_BLOCK` is False.
@@ -35,6 +36,7 @@ EMPTY_DIR_TEXT = "{name} (emptyDir{stateful})"
 EMPTY_DIR_MEMORY_TEXT = "{name} (emptyDir, medium Memory)"
 HOST_PATH_TEXT = "{name} (hostPath {path}{ssd}{stateful})"
 HOST_PATH_READ_ONLY_TEXT = "{name} (hostPath {path}, mounted read-only)"
+HOST_PATH_UNMOUNTED_TEXT = "{name} (hostPath {path}, declared, mounted by no container)"
 HOST_PATH_SSD_TEXT = ", a Local SSD mount"
 CLAIM_TEXT = "{name} (claim {claim} on local StorageClass {storage_class})"
 CLAIM_TEMPLATE_TEXT = "{name} (volumeClaimTemplate on local StorageClass {storage_class})"
@@ -65,14 +67,16 @@ def _stateful(name: str) -> str:
     return STATEFUL_NAME_TEXT if tables.STATEFUL_VOLUME_NAME_RE.search(name or "") else ""
 
 
-def _writable_mounts(spec: dict) -> set[str]:
-    """Volume names at least one container mounts without `readOnly: true`."""
-    out = set()
+def _mounts(spec: dict) -> tuple[set[str], set[str]]:
+    """(volume names some container mounts, those at least one mounts without `readOnly: true`)."""
+    mounted, writable = set(), set()
     for container in rules.containers(spec):
         for mount in container.get("volumeMounts") or []:
-            if isinstance(mount, dict) and mount.get("name") and mount.get("readOnly") is not True:
-                out.add(mount["name"])
-    return out
+            if isinstance(mount, dict) and mount.get("name"):
+                mounted.add(mount["name"])
+                if mount.get("readOnly") is not True:
+                    writable.add(mount["name"])
+    return mounted, writable
 
 
 def _unknown(obj: dict, detail: str, **extra) -> dict:
@@ -85,7 +89,7 @@ def node_local_volumes(obj: dict, spec: dict, workload: dict, local_classes: set
     """(risks, scratch, claim names) for one template: the volumes that hold state on the
     node, the ones that hold scratch, and the claims mounted (for the unread-storage case)."""
     risks, scratch, claim_names = [], [], []
-    writable = _writable_mounts(spec)
+    mounted, writable = _mounts(spec)
     for volume in spec.get("volumes") or []:
         if not isinstance(volume, dict):
             continue
@@ -103,8 +107,10 @@ def node_local_volumes(obj: dict, spec: dict, workload: dict, local_classes: set
             if local_ssd or name in writable:
                 ssd = HOST_PATH_SSD_TEXT if local_ssd else ""
                 risks.append(HOST_PATH_TEXT.format(name=name, path=path, ssd=ssd, stateful=_stateful(name)))
-            else:
+            elif name in mounted:
                 scratch.append(HOST_PATH_READ_ONLY_TEXT.format(name=name, path=path))
+            else:
+                scratch.append(HOST_PATH_UNMOUNTED_TEXT.format(name=name, path=path))
         elif VOLUME_CLAIM in volume:
             claim_name = (volume.get(VOLUME_CLAIM) or {}).get("claimName") or ""
             claim_names.append(claim_name)

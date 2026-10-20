@@ -61,8 +61,9 @@ new rule adds its entry in that order.
   SSD mount, or a claim (or a StatefulSet's claim template) on a StorageClass whose provisioner is
   `kubernetes.io/no-provisioner` (how Local SSD becomes a PersistentVolume) is a `risk`, named with
   the volume; a volume name that suggests state is marked. A Deployment's `emptyDir`, a
-  memory-backed `emptyDir` and a `hostPath` mounted read-only are notes. Action: Keep state on
-  PersistentVolumes or object storage; node-local disk only for what the workload can rebuild.
+  memory-backed `emptyDir`, a `hostPath` mounted read-only and a `hostPath` declared but mounted by
+  no container are notes. Action: Keep state on PersistentVolumes or object storage; node-local disk
+  only for what the workload can rebuild.
 - `removed-api-callers` (Removed-API callers), entry 6, blocker. Reads: From the removed-release
   audit read: each caller is one principal, user agent and API (`core/v1 endpoints`). The operator's
   callers are user accounts, service accounts, and Kubernetes service accounts outside the system

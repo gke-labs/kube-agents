@@ -139,11 +139,12 @@ class NodeLocalStateTest(unittest.TestCase):
     def test_local_ssd_and_writable_hostpaths_are_risks_memory_and_read_only_are_notes(self):
         spec = {
             "containers": [busybox(mounts=[{"name": "scratch", "mountPath": "/scratch"}, {"name": "ssd", "mountPath": "/ssd", "readOnly": True}, {"name": "logs", "mountPath": "/host/log", "readOnly": True}, {"name": "work", "mountPath": "/work"}])],
-            "volumes": [{"name": "scratch", "emptyDir": {"medium": "Memory"}}, {"name": "ssd", "hostPath": {"path": "/mnt/disks/ssd0"}}, {"name": "logs", "hostPath": {"path": "/var/log"}}, {"name": "work", "hostPath": {"path": "/opt/work"}}, {"name": "cfg", "configMap": {"name": "c"}}],
+            "volumes": [{"name": "scratch", "emptyDir": {"medium": "Memory"}}, {"name": "ssd", "hostPath": {"path": "/mnt/disks/ssd0"}}, {"name": "logs", "hostPath": {"path": "/var/log"}}, {"name": "work", "hostPath": {"path": "/opt/work"}}, {"name": "spare", "hostPath": {"path": "/opt/spare"}}, {"name": "cfg", "configMap": {"name": "c"}}],
         }
         out = run(node_local_state, [template("Deployment", "d", spec)])
         self.assertEqual(out["risks"][0]["volumes"], ["ssd (hostPath /mnt/disks/ssd0, a Local SSD mount)", "work (hostPath /opt/work)"])
-        self.assertIn("scratch (emptyDir, medium Memory), logs (hostPath /var/log, mounted read-only)", out["notes"][0])
+        # A hostPath no container mounts is declared, not mounted read-only.
+        self.assertIn("scratch (emptyDir, medium Memory), logs (hostPath /var/log, mounted read-only), spare (hostPath /opt/spare, declared, mounted by no container)", out["notes"][0])
 
     def test_statefulset_on_a_local_storage_class_and_claims(self):
         items = [
