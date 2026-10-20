@@ -6566,14 +6566,29 @@ class TestDriftBacklog(unittest.TestCase):
         time.sleep(0.05)
         self.trigger.assert_not_called()
 
-    def test_a_row_that_cannot_be_carded_stays_pending_and_the_worker_survives(self):
+    def test_a_row_that_cannot_be_carded_is_named_in_the_digest(self):
+        self._chat()
+        self._burst()
+        self._post(insert_id="lone", principal="ada@example.com")
+        locked = session_kv_server.sqlite3.OperationalError("database is locked")
+        with patch.object(session_kv_server, "create_session", side_effect=locked), patch.object(
+            session_kv_server.subprocess, "run"
+        ) as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        self.assertIn("ada@example.com (1)", run.call_args.args[0][-1])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        self.trigger.assert_not_called()
+
+    def test_a_lone_row_that_cannot_be_carded_is_digested_not_spun_on(self):
         self._chat()
         self._post(insert_id="lone", principal="ada@example.com")
         locked = session_kv_server.sqlite3.OperationalError("database is locked")
-        with patch.object(session_kv_server, "create_session", side_effect=locked):
+        with patch.object(session_kv_server, "create_session", side_effect=locked), patch.object(
+            session_kv_server.subprocess, "run"
+        ) as run:
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
-        self.trigger.assert_not_called()
+        run.assert_called_once()
+        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
 
     def test_a_backlog_row_carries_the_reason_the_end_of_day_report_excludes(self):
         import eod_report_generator

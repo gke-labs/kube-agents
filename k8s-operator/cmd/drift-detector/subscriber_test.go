@@ -1091,3 +1091,66 @@ func TestPubsubSourcePullCarriesPublishTime(t *testing.T) {
 		t.Errorf("malformed publishTime parsed to %s, want zero", got[1].PublishTime)
 	}
 }
+
+// Run's two clocks across two pulls: the first-pull time is set once and
+// kept, and the current pull's time moves, so the age rule fires on the second
+// pull and the first-pull rule does not re-fire on it.
+func TestRunKeepsTheFirstPullAndMovesTheCurrentPull(t *testing.T) {
+	first := time.Date(2026, 10, 16, 20, 48, 0, 0, time.UTC)
+	second := first.Add(time.Hour)
+	var mu sync.Mutex
+	clock := first
+	source := &clockedSource{fakeSource: fakeSource{batches: [][]receivedMessage{
+		{
+			{AckID: "queued", Data: []byte(humanPatchEntry), PublishTime: first.Add(-time.Minute)},
+			{AckID: "live-1", Data: []byte(humanPatchEntry), PublishTime: first.Add(time.Second)},
+		},
+		{
+			{AckID: "stalled", Data: []byte(humanPatchEntry), PublishTime: first.Add(2 * time.Minute)},
+			{AckID: "live-2", Data: []byte(humanPatchEntry), PublishTime: second.Add(-time.Minute)},
+		},
+	}}, afterPull: func(pulls int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if pulls == 1 {
+			clock = second
+		}
+	}}
+	collector := &recordCollector{}
+	sub := newSubscriber(source, collector.handle, defaultMaxMessages, defaultBatchJoinBudget)
+	sub.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return clock
+	}
+
+	want := []bool{true, false, true, false}
+	handled := collector.runUntil(t, sub, len(want))
+	if len(handled) != len(want) {
+		t.Fatalf("handled %d record(s), want %d", len(handled), len(want))
+	}
+	for i, w := range want {
+		if handled[i].Backlog != w {
+			t.Errorf("record %d (published %s): Backlog = %t, want %t", i, handled[i].PublishTime, handled[i].Backlog, w)
+		}
+	}
+}
+
+// clockedSource is fakeSource with a hook run after each pull that returned
+// a batch, so a test can move the clock between batches.
+type clockedSource struct {
+	fakeSource
+	afterPull func(pulls int)
+	delivered int
+}
+
+func (c *clockedSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
+	batch, err := c.fakeSource.Pull(ctx, maxMessages)
+	if len(batch) > 0 {
+		c.delivered++
+		if c.afterPull != nil {
+			c.afterPull(c.delivered)
+		}
+	}
+	return batch, err
+}

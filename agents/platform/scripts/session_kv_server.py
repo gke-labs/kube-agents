@@ -4394,8 +4394,9 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
     A row the ceiling refuses stays in the digest, so the change is still named
     in chat. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
     crash after it cannot card it twice; a turn that fails after that is lost as
-    a live one would be. A row whose session or mark cannot be written stays
-    pending for the next digest. The turn runs on a thread of its own, so a slow
+    a live one would be. A row whose session or mark cannot be written goes to
+    the digest too, so it is named and marked with the rest rather than left
+    pending under a range mark that would stamp it digested unnamed. The turn runs on a thread of its own, so a slow
     gateway does not hold the digest's lease.
     """
     counts: Dict[str, int] = {}
@@ -4429,7 +4430,8 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
                         (DRIFT_BACKLOG_CARDED, session_id, row["id"]),
                     )
         except sqlite3.Error as exc:
-            logger.error(f"Late record {row['id']} could not be carded and stays pending: {exc}")
+            logger.error(f"Late record {row['id']} could not be carded and goes to the digest: {exc}")
+            digest.append(row)
             continue
         logger.info(f"Drift backlog: carding late record {row['id']} (its principal has {counts[row['principal']]} late row(s))")
         threading.Thread(

@@ -207,7 +207,9 @@ resource "null_resource" "drift_backlog" {
       detector_pids() {
         detector_exec bash -c 'for d in /proc/[0-9]*; do [ "$(cat "$d/comm" 2>/dev/null)" = drift-detector ] && echo "$${d#/proc/}"; done; true'
       }
-      mint_id() { echo "eval-drift-backlog-$(date -u +%s)-$RANDOM"; }
+      # Fixed-width suffix, so no id is a prefix of another: the board and the
+      # ledger are matched with LIKE '%id%'.
+      mint_id() { printf 'eval-drift-backlog-%s-%05d\n' "$(date -u +%s)" "$RANDOM"; }
       publish_record() {
         payload="$(python3 -c 'import json,sys,datetime; i,pr,ns,wl,ag,proj,loc,cl = sys.argv[1:]; print(json.dumps({"insertId": i, "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "resource": {"type": "k8s_cluster", "labels": {"project_id": proj, "location": loc, "cluster_name": cl}}, "protoPayload": {"serviceName": "k8s.io", "methodName": "io.k8s.apps.v1.deployments.patch", "resourceName": "apps/v1/namespaces/%s/deployments/%s" % (ns, wl), "authenticationInfo": {"principalEmail": pr}, "requestMetadata": {"callerSuppliedUserAgent": ag}, "status": {"code": 0}}}))' \
           "$1" "$2" "$3" "$4" "$5" "$project" "${var.host_cluster_location}" "${var.host_cluster_name}")"
