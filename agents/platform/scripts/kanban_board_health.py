@@ -154,6 +154,7 @@ HOME_ENV = "KANBAN_HEALTH_HOME"
 # first line, clipped, and the rest stays behind `hermes kanban diagnostics`.
 DETAIL_MAX_CHARS = 200
 REASON_MAX_CHARS = 200
+TITLE_MAX_CHARS = 200
 HOURS_PER_DAY = 24
 AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
@@ -315,7 +316,8 @@ def stuck_card_line(task_id: str, diag: dict, context: dict, entry: dict) -> str
     info = (context or {}).get(task_id) or {}
     kind = info.get("kind") or NO_KIND
     assignee = info.get("assignee") or entry.get("assignee") or "?"
-    title = info.get("title") or entry.get("title") or ""
+    raw_title = info.get("title") or entry.get("title") or ""
+    title = " ".join(str(raw_title).split())[:TITLE_MAX_CHARS] if raw_title else ""
     reason = " ".join((info.get("reason") or "").split())[:REASON_MAX_CHARS]
     age = render_age((diag.get("data") or {}).get("age_hours"))
     head = f"  - {task_id} ({assignee}, {kind}, blocked {age})"
@@ -390,7 +392,7 @@ def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=Non
             lines = [lines]
         item_chars = sum(len(ln) + 1 for ln in lines)
         if total_chars + item_chars > max_chars:
-            break
+            continue
         taken.append(item)
         total_chars += item_chars
     return taken
@@ -427,7 +429,8 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
         info = (context or {}).get(task_id) or {}
         kind = str(info.get("kind") or NO_KIND)
         assignee = str(info.get("assignee") or entry.get("assignee") or "?")
-        title = str(info.get("title") or entry.get("title") or "").strip()
+        raw_title = info.get("title") or entry.get("title") or ""
+        title = " ".join(str(raw_title).split())[:TITLE_MAX_CHARS] if raw_title else ""
         reason = " ".join(str(info.get("reason") or "").split())[:REASON_MAX_CHARS]
         age_hours = _card_age_hours(diag)
         parsed.append({
@@ -492,8 +495,9 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                 group_header_chars = len(head) + 1 + len(latest_sub) + 1 + len("    ids: ") + 1
                 group_ids_budget = min(MAX_GROUP_IDS_CHARS, max(0, available_for_items - group_header_chars))
                 formatted_ids, dropped_ids = _format_id_list_with_dropped(group_ids, group_ids_budget)
-                if formatted_ids and not formatted_ids.startswith("and "):
+                if len(dropped_ids) < len(group_ids):
                     lines_for_group.append(f"    ids: {formatted_ids}")
+                dropped_ids = [i for i in dropped_ids if i != newest_card["task_id"]]
             renderable_items.append({
                 "age_hours": newest_age,
                 "key": title,
@@ -519,16 +523,19 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
     taken_items = _take_within_budget(
         renderable_items, MAX_STUCK_ITEMS, available_for_items, line_fn=lambda it: it["lines"]
     )
-    if len(taken_items) < len(renderable_items) and len(taken_items) < MAX_STUCK_ITEMS:
-        next_item = renderable_items[len(taken_items)]
+    taken_set = {id(it) for it in taken_items}
+    untaken_items = [it for it in renderable_items if id(it) not in taken_set]
+
+    if len(untaken_items) == 1 and len(taken_items) < MAX_STUCK_ITEMS:
+        next_item = untaken_items[0]
         next_chars = sum(len(ln) + 1 for ln in next_item["lines"])
         current_chars = sum(sum(len(ln) + 1 for ln in it["lines"]) for it in taken_items)
         if (
-            len(taken_items) + 1 == len(renderable_items)
-            and not any(it.get("dropped_ids") for it in [*taken_items, next_item])
+            not any(it.get("dropped_ids") for it in [*taken_items, next_item])
             and (current_chars + next_chars <= budget_for_body)
         ):
             taken_items.append(next_item)
+            untaken_items = []
 
     lines = [header]
     for it in taken_items:
@@ -542,15 +549,15 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
         omitted_ids = []
         for it in taken_items:
             omitted_ids.extend(it.get("dropped_ids", []))
-        for it in renderable_items[len(taken_items):]:
+        for it in untaken_items:
             omitted_ids.extend(c["task_id"] for c in it["cards"])
         prefix = f"  ... and {omitted_cards} older stuck card{'s' if omitted_cards != 1 else ''} omitted"
         list_hint = "; run hermes kanban list on the agent pod to view all"
         omission_overhead = len(prefix) + len(" (ids: ") + len(list_hint) + len(")\n")
         max_ids_budget = remaining_for_omission - omission_overhead
         if max_ids_budget >= 15:
-            formatted_ids = _format_id_list(omitted_ids, max_chars=max_ids_budget)
-            if formatted_ids and not formatted_ids.startswith("and "):
+            formatted_ids, dropped_omitted = _format_id_list_with_dropped(omitted_ids, max_chars=max_ids_budget)
+            if len(dropped_omitted) < len(omitted_ids):
                 lines.append(f"{prefix} (ids: {formatted_ids}{list_hint})")
             else:
                 lines.append(f"{prefix} (run hermes kanban list on the agent pod to view all)")

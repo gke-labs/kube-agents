@@ -901,8 +901,64 @@ class DiagnosticsTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("Repeated title", text)
         self.assertNotIn("ids: and", text)
-        self.assertIn("omitted", text)
+        self.assertIn("latest: [t_grp_00]", text)
+        self.assertIn("... and 4 older stuck cards omitted", text)
+        self.assertNotIn("t_grp_00", text.split("omitted", 1)[1])
         self.assertLessEqual(len(text), 634)
+
+    def test_oversized_newest_item_skipped_allowing_subsequent_items_to_render(self):
+        # When an oversized newest item exceeds available_for_items, _take_within_budget
+        # skips it rather than breaking and emptying the section behind it.
+        cards = [
+            ("t_big_1", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 10}},
+             {"task_id": "t_big_1", "status": "blocked", "title": "Big Group"}),
+            ("t_big_2", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 10}},
+             {"task_id": "t_big_2", "status": "blocked", "title": "Big Group"}),
+            ("t_big_3", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 10}},
+             {"task_id": "t_big_3", "status": "blocked", "title": "Big Group"}),
+            ("t_small_1", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 20}},
+             {"task_id": "t_small_1", "status": "blocked", "title": "Small Card"}),
+        ]
+        context = {
+            "t_big_1": {"reason": "x" * 200},
+            "t_big_2": {"reason": "x" * 200},
+            "t_big_3": {"reason": "x" * 200},
+            "t_small_1": {"reason": "small"},
+        }
+        lines = kbh.render_stuck_cards(cards, context, Path("/opt/data"), max_chars=714)
+        text = "\n".join(lines)
+        self.assertIn("Small Card", text)
+        self.assertIn("t_small_1", text)
+        self.assertIn("... and 3 older stuck cards omitted", text)
+
+    def test_task_id_prefixed_with_and_not_misidentified_as_formatter_sentinel(self):
+        # A task ID starting with 'and ' (e.g. 'and 01') should not trigger an in-band
+        # sentinel check and cause group IDs or omission lines to be suppressed.
+        cards = [
+            (f"and {i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 10 + i}},
+             {"task_id": f"and {i:02d}", "status": "blocked", "title": "Repeated title"})
+            for i in range(5)
+        ]
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=2000)
+        text = "\n".join(lines)
+        self.assertIn("ids: and 00, and 01", text)
+
+        cards_omitted = [
+            (f"and {i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 10 + i}},
+             {"task_id": f"and {i:02d}", "status": "blocked", "title": f"Distinct title {i}"})
+            for i in range(4)
+        ]
+        lines2 = kbh.render_stuck_cards(cards_omitted, {}, Path("/opt/data"), max_chars=644)
+        text2 = "\n".join(lines2)
+        self.assertIn("older stuck cards omitted (ids: and ", text2)
+
+    def test_oversized_title_clipped_to_title_max_chars(self):
+        card = ("t_huge", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24}},
+                {"task_id": "t_huge", "status": "blocked", "title": "T" * 1000})
+        lines = kbh.render_stuck_cards([card], {}, Path("/opt/data"))
+        text = "\n".join(lines)
+        self.assertIn("T" * kbh.TITLE_MAX_CHARS, text)
+        self.assertNotIn("T" * (kbh.TITLE_MAX_CHARS + 1), text)
 
 
 
@@ -986,16 +1042,19 @@ class ReportTests(unittest.TestCase):
             payload = json.dumps(cards)
             runner = lambda argv, env, timeout: (0, payload, "")
 
-            # Call report with max_chars=3800
-            lines = kbh.report(Path(d), runner=runner, binary="/x/hermes", env={}, max_chars=3800)
-            text = "\n".join(lines)
-            # Both sections are present
-            self.assertIn("Board invariant violations", text)
-            self.assertIn("Active kanban diagnostics", text)
-            # Whole report strictly respects max_chars including 40-char main() reserve
-            self.assertLessEqual(len(text) + 40, 3800)
-            # Stuck cards were cut under the tight budget, omitting later cards
-            self.assertIn("older stuck cards omitted", text)
+            # Make the fixture own the footer length by patching commands to {home}-free strings
+            # so the test outcome is completely independent of tempdir path length.
+            with unittest.mock.patch.object(kbh, "UNBLOCK_COMMAND", "hermes kanban unblock {task_id}"), \
+                 unittest.mock.patch.object(kbh, "ARCHIVE_COMMAND", "hermes kanban archive {task_id}"):
+                lines = kbh.report(Path(d), runner=runner, binary="/x/hermes", env={}, max_chars=3800)
+                text = "\n".join(lines)
+                # Both sections are present
+                self.assertIn("Board invariant violations", text)
+                self.assertIn("Active kanban diagnostics", text)
+                # Whole report strictly respects max_chars including 40-char main() reserve
+                self.assertLessEqual(len(text) + 40, 3800)
+                # Stuck cards were cut under the tight budget, omitting later cards
+                self.assertIn("older stuck cards omitted", text)
 
     def test_stuck_cards_omission_count_only_fallback_under_starved_budget(self):
         # When remaining budget for omission cannot fit IDs (max_ids_budget < 15),
