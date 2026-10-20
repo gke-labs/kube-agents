@@ -11,7 +11,8 @@ clusters" is 3), then a lead
 ("Two are worth fixing first:") when the total is more than the rows
 shown. The part of the posture naming what was not scanned ("2 clusters could
 not be scanned (permission denied)") is kept, as written, on the line under
-the headline after the posture line, since a silent gap reads as clean; a sentence it shares with the
+the headline (after the posture line in the text layout), since a silent gap
+reads as clean; a sentence it shares with the
 scan counts is split at its clauses, so the counts stay in the headline. A gap
 named after the list joins it from the roll-up, which both layouts leave out,
 and on the card from the closing lines too, which only the text keeps. A

@@ -241,7 +241,7 @@ AUDITS_RAN_NOTE = (
     "when it finds something new."
 )
 AUDITS_NONE_RAN_NOTE = (
-    f"None of the first-run audits ran, so this report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}."
+    f"None of the first-run audits ran. This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}."
 )
 AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
