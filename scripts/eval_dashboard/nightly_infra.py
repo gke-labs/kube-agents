@@ -159,15 +159,16 @@ def graded(task: dict) -> bool:
 
 
 def lost_jobs(parts: dict[str, list[dict]]) -> list[dict]:
-    """Each part that lost JOB_LOST_MIN of its last JOB_LOST_WINDOW nights:
-    ``{job, part, nights}`` with those nights, oldest first. A part whose
-    newest night is not among the newest JOB_LOST_WINDOW dates on record
-    (its job stopped running) is not judged on its stale tail."""
+    """Each part that lost JOB_LOST_MIN of the newest JOB_LOST_WINDOW nightly
+    dates on record: ``{job, part, nights}`` with its nights on those dates,
+    oldest first. Only those dates count, so a job that stopped running is
+    not judged on its stale tail, and one paused and re-enabled is not filed
+    from losses before the pause."""
     recent = set(sorted({n["date"] for ns in parts.values() for n in ns})[-JOB_LOST_WINDOW:])
     out = []
     for part in nightly.PARTS:
-        tail = (parts.get(part) or [])[-JOB_LOST_WINDOW:]
-        if len(tail) == JOB_LOST_WINDOW and tail[-1]["date"] in recent and sum(n["lost"] for n in tail) >= JOB_LOST_MIN:
+        tail = [n for n in parts.get(part) or [] if n["date"] in recent]
+        if sum(n["lost"] for n in tail) >= JOB_LOST_MIN:
             out.append({"job": tail[-1]["job"], "part": part, "nights": tail})
     return out
 

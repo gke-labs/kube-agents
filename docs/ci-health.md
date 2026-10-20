@@ -752,10 +752,10 @@ rules). Neither changes the domain streak above.
 - **Nights lost.** Each part is judged on its own. A night of a part is lost
   when Prow ended the build before the eval loop's verdict (the deadline, an
   abort) or its pod went away; a clean re-run the same date rescues the night.
-  A part that lost 2 of its last 3 nights gets one issue for its job, listing
-  the three nights, their run links and where each stopped. A part whose
-  newest night is not among the last 3 nightly dates (its job stopped running)
-  is not judged on its old nights.
+  A part that lost 2 of the last 3 nightly dates on record gets one issue for
+  its job, listing those nights, their run links and where each stopped. Only
+  those dates count, so a job that stopped running, or was paused and
+  re-enabled, is not judged on its older nights.
 - **A case kept from running.** A case is kept from running on a night when its
   part (the one that recorded it that night; on a night neither did, the one
   that last recorded it, unless the other part was lost that date or has not

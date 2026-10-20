@@ -605,6 +605,13 @@ class LostJobTest(Harness):
         gh, _, _ = self.run_once(data(*sorted(runs, key=lambda r: r["build_id"])))
         self.assertEqual(self.filed(gh, infra=True), [])
 
+    def test_a_job_paused_and_resumed_is_not_filed_from_losses_before_the_pause(self):
+        # Writers lost the 10th and 11th, was paused, and ran clean on the
+        # 17th; main ran clean throughout.
+        runs = [night(d, [green()]) for d in range(10, 18)] + [night(d, [green("case-red")], job=WRITERS_JOB, truncated=d != 17) for d in (10, 11, 17)]
+        gh, _, _ = self.run_once(data(*sorted(runs, key=lambda r: r["build_id"])))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
     def test_an_open_issue_gets_one_comment_per_later_lost_night_and_one_on_recovery(self):
         issue = {"number": 3980, "title": "t", "body": f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", "created_at": "2026-10-16T12:00:00Z"}
         doc = data(night(15, [green()], truncated=True), night(16, [green()]), night(17, [green()], truncated=True))
