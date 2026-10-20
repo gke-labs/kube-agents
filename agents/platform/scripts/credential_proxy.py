@@ -42,6 +42,8 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+import credential_shapes
+import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
@@ -83,6 +85,9 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
 )
 
 LOGGER = logging.getLogger("credential-proxy")
+# The optional key, in the Secret a forge's credentialsRef names, that holds
+# its read-only token. Named in the log when a context clone presents none.
+FORGE_READ_TOKEN_KEY = "read-token"
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
@@ -625,6 +630,12 @@ AUDIT_STATUS_BLOCKED = "blocked"
 AUDIT_STATUS_REJECTED = "rejected"
 AUDIT_STATUS_FAILED = "failed"
 AUDIT_STATUS_ABANDONED = "abandoned"
+# The feedback verb's audit vocabulary: a closed pair, like every tool and
+# subcommand label here, never the route or the report's text.
+FEEDBACK_AUDIT_TOOL = "feedback"
+FEEDBACK_AUDIT_SUBCOMMAND = "submit"
+FEEDBACK_REASON_LOG_LENGTH = 200
+FEEDBACK_REASON_FAULT = "the broker could not complete the filing ({error}); nothing was sent"
 AUDIT_STATUS_BUSY = "busy"
 # Rule ids for the refusals the exec route decides itself rather than by a
 # policy rule. The response body and the audit record name the same constant,
@@ -661,16 +672,6 @@ def is_valid_repository(repository: Any) -> bool:
     return repo_ref.is_github_slug(repository)
 
 
-# Two shapes, because two are what the GitHub refresh helper handles: the
-# installation token Minty returns, and the Google OIDC identity token sent to
-# authenticate the request to it.
-_CREDENTIAL_SHAPES = re.compile(
-    r"gh[pousr]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
-)
-
-
 def redact_credentials(text: str) -> str:
     """Blank out token-shaped substrings so a subprocess's output can be logged.
 
@@ -685,12 +686,11 @@ def redact_credentials(text: str) -> str:
     header back in a 4xx would put a credential in a string we are about to log.
     Match on shape so that stops being an argument about someone else's service.
 
-    Deliberately not a general-purpose redactor. Two others already exist
-    (`AuditRedactor`, and `redact_secrets` in the fleet-audit skill) and both
-    cover more shapes; neither belongs in this container, which must not import
-    from the Hermes plugin tree. Consolidating the three is separate work.
+    The shapes are credential_shapes.py's, the list the feedback gate refuses
+    to publish: one copy for both, seeded from `AuditRedactor` in the chart,
+    which this container must not import from the Hermes plugin tree.
     """
-    return _CREDENTIAL_SHAPES.sub("[REDACTED]", text)
+    return credential_shapes.redact(text)
 
 
 def _redacted_fields(exc) -> dict:
@@ -1007,6 +1007,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
+    # The feedback form verb: the sandbox's one way to file a report about
+    # kube-agents itself (feedback_broker.py). The shell alone: a session pod
+    # files nothing on anyone's behalf.
+    ("/v1/feedback/", (CALLER_ROLE_SHELL,)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
     # The constant, not a literal: required_roles() answers () on a miss and
     # _role_permits then admits every role, so a prefix spelled twice is a
@@ -1302,7 +1306,8 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
       (GitLab), that token, through the forge's helper; on GitHub, nothing --
       the clone and push ride the ambient write credential the CLI installed,
       as they always have;
-    - context: the forge's read-only credential, and never the write token; a
+    - context: the forge's read-only credential, and never the write token
+      (on GitLab, the optional `read-token` key beside the write token); a
       forge that offers none clones with no credential;
     - unregistered: no credential at all, a public upstream read.
 
@@ -1343,16 +1348,31 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
     if role != ROLE_CONTEXT:
         return providers.NoCredential()
     # A context repository gets the forge's read-only credential, and never
-    # the write token: a forge that offers none -- GitLab's stored token has
-    # no read-only variant here -- clones it with no credential, which reads a
-    # public repository and refuses a private one at the clone.
+    # the write token: a forge that offers none -- GitLab without a
+    # `read-token` key in its credentials Secret -- clones it with no
+    # credential, which reads a public repository and refuses a private one
+    # at the clone.
     credential = forge.read_credential(repo)
     if isinstance(credential, providers.NoCredential) and _holds_stored_token(forge):
+        if not getattr(forge, "read_token_path", ""):
+            # The forge was given no read-token path: the forges file came
+            # from an operator older than the read token, so no change to the
+            # Secret can help until the operator is upgraded.
+            LOGGER.warning(
+                "content workspace open repo=%s role=context: the broker's "
+                "config names no readTokenPath for the %s forge (an operator "
+                "older than the read-only token rendered it), so the clone "
+                "presents none; a private repository will refuse it",
+                repository, forge.name,
+            )
+            return credential
         LOGGER.warning(
-            "content workspace open repo=%s role=context: the %s forge offers no "
-            "read-only credential and its stored token can write, so the clone "
-            "presents none; a private repository will refuse it",
-            repository, forge.name,
+            "content workspace open repo=%s role=context: the %s forge has no "
+            "usable read-only token (key %s in its credentials Secret: missing, "
+            "unreadable, empty, or not one line of printable ASCII) and its stored "
+            "token can write, so the clone presents none; a private repository "
+            "will refuse it",
+            repository, forge.name, FORGE_READ_TOKEN_KEY,
         )
     return credential
 
@@ -8738,6 +8758,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/vcs/"):
             self._handle_vcs_post()
             return
+        if self.path == feedback_broker.ROUTE:
+            self._handle_feedback_post()
+            return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
@@ -10166,6 +10189,82 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         self._json(HTTPStatus.OK, {"status": "refreshed", "forge": forge.name})
+
+    def _handle_feedback_post(self) -> None:
+        """`POST /v1/feedback/submit`: file a confirmed kube-agents report once.
+
+        feedback_broker owns the payload rules and the wire path; this route
+        reads the body, holds a request slot around the outbound calls as the
+        forge verbs do, and maps the outcome: the broker's status object on
+        200, a `BLOCKED` object on 400 when nothing was sent (a refused
+        payload, a form that cannot be reached), and the audit line carries
+        the title and the status, never the report's text.
+        """
+        request_id = str(uuid.uuid4())
+        principal = getattr(self, "principal", None)
+        principal_label = _sanitize_for_logging(
+            principal.describe() if principal is not None else "", max_length=PRINCIPAL_LOG_LENGTH
+        )
+
+        def audit(status: str) -> dict[str, Any]:
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                )
+            }
+
+        try:
+            payload = self._read_json_body()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        # Redacted before it is sanitized: the gate inside feedback_broker has
+        # not run yet, and a person's title can carry a token.
+        title = _sanitize_for_logging(redact_credentials(str(payload.get("title", ""))))
+        LOGGER.info(
+            "feedback submit request_id=%s principal=%s title=%s",
+            request_id, principal_label, title, extra=audit(AUDIT_STATUS_STARTED),
+        )
+        try:
+            with self._request_slot():
+                answer = feedback_broker.submit(payload)
+        except feedback_broker.Blocked as exc:
+            LOGGER.info(
+                "feedback submit blocked request_id=%s: %s",
+                request_id, _sanitize_for_logging(redact_credentials(exc.reason), max_length=FEEDBACK_REASON_LOG_LENGTH),
+                extra=audit(AUDIT_STATUS_BLOCKED),
+            )
+            self._json(HTTPStatus.BAD_REQUEST, feedback_broker.blocked_answer(exc.reason))
+            return
+        except CallerHungUp as exc:
+            LOGGER.info("feedback submit abandoned request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_ABANDONED))
+            return
+        except CommandSlotUnavailable as exc:
+            # A full broker is a 503 the client reads as "nothing was sent",
+            # like the exec and forge routes; a dropped connection would read
+            # as a lost answer and strand the caller's marker.
+            LOGGER.warning("feedback submit busy request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_BUSY))
+            self._busy(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 -- every outcome here must be an answer
+            # feedback_broker converts the wire's failures into Blocked or
+            # UNCONFIRMED itself; what reaches this arm is a fault in reading
+            # a page the form served. The POST has not happened before the
+            # page is read, so this is a BLOCKED, not a lost answer.
+            LOGGER.warning(
+                "feedback submit failed request_id=%s type=%s", request_id, type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED),
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                feedback_broker.blocked_answer(FEEDBACK_REASON_FAULT.format(error=type(exc).__name__)),
+            )
+            return
+        LOGGER.info(
+            "feedback submit %s request_id=%s title=%s",
+            answer.get("status"), request_id, title, extra=audit(AUDIT_STATUS_COMPLETED),
+        )
+        self._json(HTTPStatus.OK, answer)
 
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.

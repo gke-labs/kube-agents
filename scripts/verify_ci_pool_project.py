@@ -352,6 +352,9 @@ REPAIR_HOST_OTEL_SCOPE = (
     f"--managed-otel-scope={HOST_OTEL_SCOPE} (docs/ci-pool-projects.md section 2)"
 )
 FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
+# A missing Compute plant sweeper grant fails the hourly sweep, not a leased
+# run: the sweeper holds nothing an eval run uses.
+FINDING_COMPUTE_SWEEPER_MISSING = "iam/compute-sweeper/missing"
 # Findings a leased run passes with. Every other finding reds the run that
 # leases the project -- a missing grant, API, key or cluster is a 403 or a
 # missing resource in the agent's transcript -- and the health bot's pool-drift
@@ -367,7 +370,8 @@ FINDING_HOST_OTEL_SCOPE = "gke/host-otel-scope"
 # from the pool-state scan (health.py rule 3e), not from runs, so a nightly
 # red of that case on a project with only this finding is the case's record
 # and not a reason to reclassify.
-LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE})
+# A missing Compute plant sweeper grant is here too: it fails only the sweep.
+LEASE_SILENT_FINDINGS = frozenset({FINDING_HOST_OTEL_SCOPE, FINDING_COMPUTE_SWEEPER_MISSING})
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -591,6 +595,50 @@ NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.
 # section 8).
 PULL_SWEEP_MEMBER = "serviceAccount:eval-pull-sweeper@kube-agents-prow.iam.gserviceaccount.com"
 
+# The Compute plant sweep (hack/ci_sweep_compute_plants.py, the periodic
+# ci-kube-agents-compute-sweep on main) lists and deletes the plant networks,
+# subnets and addresses that a killed run left in a free project. It holds one
+# project-level custom role with exactly COMPUTE_SWEEP_PERMISSIONS, and nothing
+# else on the project. roles/compute.networkAdmin also covers the sweep, but it
+# holds almost a thousand permissions. A project without the grant fails every
+# sweep there, so the check names the commands that add it -- the provisioning
+# script must not be re-run on a registered project (docs/ci-pool-projects.md
+# sections 5.7 and 8). Kept equal to scripts/provision_ci_pool_project.sh and
+# the repair block in docs/ci-pool-projects.md by
+# scripts/test_verify_ci_pool_project.py.
+COMPUTE_SWEEP_MEMBER = "serviceAccount:eval-compute-sweeper@kube-agents-prow.iam.gserviceaccount.com"
+COMPUTE_SWEEP_ROLE_ID = "kubeAgentsComputePlantSweeper"
+COMPUTE_SWEEP_ROLE_TITLE = "kube-agents Compute plant sweeper"
+COMPUTE_SWEEP_ROLE_STAGE = "GA"
+COMPUTE_SWEEP_ROLE_TEMPLATE = "projects/{project_id}/roles/" + COMPUTE_SWEEP_ROLE_ID
+# One permission for each gcloud call the sweep makes, plus the operation
+# reads gcloud makes while it waits for each delete to finish.
+COMPUTE_SWEEP_PERMISSIONS = frozenset({
+    # `gcloud compute networks list`, and `networks delete` (a global operation).
+    "compute.networks.list",
+    "compute.networks.delete",
+    # `gcloud compute networks subnets list` (an aggregated list), and
+    # `subnets delete --region` (a regional operation).
+    "compute.subnetworks.list",
+    "compute.subnetworks.delete",
+    # `gcloud compute addresses list` (an aggregated list), and
+    # `addresses delete --region` (a regional operation). The plant's addresses
+    # are INTERNAL, and GCP checks deleteInternal to delete one; delete covers
+    # an external address. deleteInternal is at the TESTING support level for
+    # custom roles: a role may hold it, and gcloud warns when it does.
+    "compute.addresses.list",
+    "compute.addresses.delete",
+    "compute.addresses.deleteInternal",
+    # A plant address with no region is deleted with `--global`, and the
+    # aggregated address list can include global addresses.
+    "compute.globalAddresses.list",
+    "compute.globalAddresses.delete",
+    "compute.globalAddresses.deleteInternal",
+    # gcloud waits on each delete operation until it is done.
+    "compute.globalOperations.get",
+    "compute.regionOperations.get",
+})
+
 # Every identity that leases a pool project and runs hack/ci-eval-pr.sh in it,
 # as (label, the job it runs, member). Each must hold PROW_RUNNER_ROLES on the
 # project and roles/iam.serviceAccountTokenCreator on the fleet reader, and a
@@ -811,6 +859,16 @@ def _project_binding(project_id: str, member: str, role: str, remove: bool = Fal
 
 def _account_binding(project_id: str, account: str, member: str, role: str) -> str:
     return f'gcloud iam service-accounts add-iam-policy-binding {account} --project={project_id} --member="{member}" --role={role}'
+
+
+def _compute_sweep_repair(project_id: str) -> str:
+    """The two commands that give the Compute plant sweeper its role on one project."""
+    create = (
+        f"gcloud iam roles create {COMPUTE_SWEEP_ROLE_ID} --project={project_id} "
+        f'--title="{COMPUTE_SWEEP_ROLE_TITLE}" --permissions={",".join(sorted(COMPUTE_SWEEP_PERMISSIONS))} --stage={COMPUTE_SWEEP_ROLE_STAGE}'
+    )
+    role = COMPUTE_SWEEP_ROLE_TEMPLATE.format(project_id=project_id)
+    return f"{create}\n{_project_binding(project_id, COMPUTE_SWEEP_MEMBER, role)}"
 
 
 def run_cmd(
@@ -1353,7 +1411,7 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the runners', the reconciler's, the health bot's and the platform GSA's project roles, and the fleet reader's token-creator binding (the cross-project AR reader grants are check_warm_cache_readers)."""
+    """Verify Workload Identity, the runners', the reconciler's, the Compute plant sweeper's, the health bot's and the platform GSA's project roles, and the fleet reader's token-creator binding (the cross-project AR reader grants are check_warm_cache_readers)."""
     details = []
     warnings: List[str] = []
     findings: List[Finding] = []
@@ -1463,7 +1521,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             err,
             f"Failed reading the IAM policy for {project_id}: {err.strip()[:160]}",
             f"Could not read the project IAM policy on {project_id}, so both runners' twelve roles, "
-            "the seeded-fleet reconciler's roles, "
+            "the seeded-fleet reconciler's roles, the Compute plant sweeper's role, "
             "the platform agent GSA's read-only set and any public binding were not checked",
             details,
             warnings,
@@ -1477,6 +1535,7 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             runner_held = {member: set() for _, _, member in RUNNERS}
             reconciler_held = set()
+            compute_sweep_held = set()
             platform_held = set()
             litellm_held = set()
             bot_held = set()
@@ -1508,6 +1567,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     bot_held.add(b.get("role"))
                 if FLEET_RECONCILER_MEMBER in members:
                     reconciler_held.add(b.get("role"))
+                if COMPUTE_SWEEP_MEMBER in members:
+                    compute_sweep_held.add(b.get("role"))
 
             for label, job, member in RUNNERS:
                 missing = PROW_RUNNER_ROLES - runner_held[member]
@@ -1544,6 +1605,22 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                         f"The seeded-fleet reconciler is missing {role} on {project_id}",
                         _project_binding(project_id, FLEET_RECONCILER_MEMBER, role),
                     ))
+
+            # The binding only: the role's permissions are not read here. A
+            # role that lacks one shows in the sweep's own report as a
+            # refused list or delete.
+            compute_sweep_role = COMPUTE_SWEEP_ROLE_TEMPLATE.format(project_id=project_id)
+            if compute_sweep_role not in compute_sweep_held:
+                passed = False
+                _drift(
+                    details, findings, FINDING_COMPUTE_SWEEPER_MISSING,
+                    f"The Compute plant sweeper ({COMPUTE_SWEEP_MEMBER.split(':', 1)[1]}) lacks "
+                    f"{compute_sweep_role} on {project_id}, so the periodic Compute plant sweep fails "
+                    "here and leftover plant networks stay. Grant it without re-running the provisioning "
+                    "script (docs/ci-pool-projects.md section 5.7); if the role exists, run "
+                    "`gcloud iam roles update` with the same flags in place of `create`",
+                    _compute_sweep_repair(project_id),
+                )
 
             platform_missing = PLATFORM_GSA_ROLES - platform_held
             platform_extra = platform_held - PLATFORM_GSA_ROLES
@@ -1714,7 +1791,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         message = partial
     else:
         message = (
-            "Workload Identity (platform and LiteLLM), the runners', reconciler's, health bot's and platform GSA project roles, "
+            "Workload Identity (platform and LiteLLM), the runners', reconciler's, Compute plant sweeper's, "
+            "health bot's and platform GSA project roles, "
             "and the fleet reader's token-creator binding verified"
         )
 

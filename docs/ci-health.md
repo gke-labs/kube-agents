@@ -1005,7 +1005,8 @@ run passes with is said the other way round: the verifier lists those in
 `LEASE_SILENT_FINDINGS` (today `gke/host-otel-scope`, a host cluster that serves
 the lease and exports no traces; the one case that reads those traces,
 `observability-trace-latency-brokered`, runs in the nightly and fails its report
-check on such a cluster, while a presubmit run still passes the lease),
+check on such a cluster, while a presubmit run still passes the lease; and
+`iam/compute-sweeper/missing`, which fails only the Compute plant sweep),
 `health.py` splits the firing findings once,
 into the incident's `passes_leases` and `reds_runs` with the projects one of
 the latter is on under `reds_runs_projects` (the `pool_state` block carries the

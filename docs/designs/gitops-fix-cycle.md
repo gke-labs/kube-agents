@@ -285,7 +285,8 @@ Runs 1 to 13 used **env mode** instead: `GITOPS_BASE_BRANCH` set on the Platform
 into the agent container (each change rolled the agent pod, whose cold start took from 7
 to over 10 minutes). That mode is gone: on the shell-sandbox layout every command the
 agent runs executes in `platform-agent-shell-0`, whose environment is built from scratch
-and does not take `spec.deployment.env` (`docs/designs/agent-shell-sandboxing.md`), so the
+and takes no `spec.deployment.env` bar the normalised `KUBEAGENTS_AUDIT_AUTO_PROMOTE`
+(`docs/designs/agent-shell-sandboxing.md`), so the
 variable reaches the gateway container and never the process that opens the PR. A per-run
 base now goes in the GitOps repository's `baseBranch`, which the operator renders into the
 credential broker and never into the sandbox; pinned-base mode (above) sets it per run.
