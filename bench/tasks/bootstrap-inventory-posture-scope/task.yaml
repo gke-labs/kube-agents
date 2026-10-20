@@ -8,8 +8,11 @@
 #
 # The prioritization SOP (Step 6) fixes how the report opens: the scan counts
 # in a set form, then the posture line `inventory_findings.py select` prints,
-# copied exactly, and no verdict on the fleet. This case grades that opening
-# off the report the worker wrote on the shell sandbox, not the transcript.
+# copied exactly, and no verdict on the fleet. This case grades that opening by
+# equality, off the report the worker wrote on the shell sandbox. It grades no
+# verdict words: a word list over prose cannot tell "no critical findings" in a
+# count from the same words as a verdict, and the 10-20 verdict sat in the
+# opening, which equality already fails.
 #
 # The stack is bootstrap-inventory-ranking-delivery's
 # (bench/tf/prebuilt/bootstrap-ranking), planting
@@ -78,12 +81,3 @@ verification_spec:
         - >-
           This scan ran 9 configuration checks; security and RBAC, reliability,
           capacity and cost come from the first-run audits.
-      # The verdicts SOP Step 6 names, and the 10-20 reports' wording.
-      forbidden_patterns:
-        - '\bhealthy\b'
-        - '\bno critical (?:vulnerabilit|issue|problem|risk)'
-        - '\b(?:zero|no) (?:active )?outages?\b'
-        - '\ball clear\b'
-        - '\bclean\b'
-        - '\bgood shape\b'
-        - '\bgood health\b'

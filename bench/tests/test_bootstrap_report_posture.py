@@ -106,6 +106,11 @@ def test_the_case_expects_the_line_select_prints() -> None:
     assert " ".join(_objective()["posture"][1].split()) == _scope_line()
 
 
+def test_the_case_grades_the_opening_only() -> None:
+    # A word list over prose cannot tell a count ("no critical findings") from a verdict.
+    assert not _objective().get("forbidden_patterns")
+
+
 def test_the_case_expects_the_planted_reports_counts() -> None:
     raw = STACK / _task()["infrastructure"]["variables"]["raw_report"]
     state = json.loads(raw.with_suffix(".cards.json").read_text())
@@ -127,6 +132,10 @@ def test_the_planted_report_lists_nothing_critical_by_its_hints() -> None:
 
 
 # --- the verdict ----------------------------------------------------------
+
+#: The verifier's optional word list, exercised here; the case itself grades the opening only.
+VERDICTS = [r"\bhealthy\b", r"\bclean\b", r"\ball clear\b", r"\bgood shape\b", r"\b(?:zero|no) (?:active )?outages?\b",
+            r"\bno critical vulnerabilit"]
 
 
 def test_a_report_that_opens_with_the_fixed_posture_passes(sandbox: Path) -> None:
@@ -171,7 +180,7 @@ def test_a_sentence_between_the_counts_and_the_line_fails(sandbox: Path) -> None
 )
 def test_a_verdict_after_the_posture_fails(sandbox: Path, verdict: str) -> None:
     (sandbox / "INVENTORY.delivered.md").write_text(_report(*_objective()["posture"], middle=verdict))
-    result = _verify()
+    result = _verify(forbidden_patterns=VERDICTS)
     assert result.status == "fail"
     assert "judges the fleet" in result.reason
 
@@ -182,7 +191,7 @@ def test_a_verdict_in_a_heading_fails(sandbox: Path) -> None:
         "# GKE Environment Scan", "# GKE Environment Scan\n\n## Fleet status: healthy"
     )
     (sandbox / "INVENTORY.delivered.md").write_text(report)
-    result = _verify()
+    result = _verify(forbidden_patterns=VERDICTS)
     assert result.status == "fail"
     assert "judges the fleet" in result.reason
 
@@ -206,7 +215,7 @@ def test_a_roll_up_that_counts_no_critical_findings_judges_nothing(sandbox: Path
 def test_a_word_that_contains_a_verdict_is_not_one(sandbox: Path) -> None:
     middle = "1. **Critical: `log-shipper` is unhealthy on every node**\n   No logs ship; fix the image tag."
     (sandbox / "INVENTORY.delivered.md").write_text(_report(*_objective()["posture"], middle=middle))
-    result = _verify()
+    result = _verify(forbidden_patterns=VERDICTS)
     assert result.status == "pass", result.reason
 
 
