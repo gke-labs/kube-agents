@@ -12,7 +12,7 @@ is the nightly's counterpart of ``gate_issue.py``::
     and no OPEN issue labelled `nightly-red` already names it,
     and none was closed after the streak's newest night
     -> file one, labelled `nightly-red`, `domain:<slug>` and `needs-triage`,
-       assigned per the hybrid rule below
+       assigned per the rule below
 
     a case with an open `nightly-red` issue passed every graded repetition
     on a graded night after its last failing one
@@ -38,9 +38,9 @@ a real streak; skipping rather than counting keeps a night with no verdict
 from filing one. A date that ran twice (a re-run of the main job) is one
 night: the newest graded verdict of that date stands.
 
-**Who gets it.** The case's ``owner:`` in its task.yaml when that is a person
-listed in the root OWNERS file; otherwise -- ``owner: maintainers``, no
-owner, or a login OWNERS does not list -- the domain's ``owner:`` in
+**Who gets it.** The case's effective owner (``scripts/case_owner.py``):
+its ``owner:`` in task.yaml when that names a GitHub login, otherwise -- no
+owner, or the retired ``maintainers`` -- the domain's ``owner:`` in
 ``docs/designs/domains.yaml``. The domain owner is @-mentioned either way.
 When GitHub refuses the case owner as assignee, the issue goes to the domain
 owner; when it refuses that login too, it is filed unassigned and says so. Any
@@ -87,6 +87,11 @@ except ImportError:  # the workflow installs pyyaml; main() says so if absent
     yaml = None
 
 try:
+    import case_owner
+except ImportError:  # scripts/ is not on sys.path yet
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import case_owner
+try:
     from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/nightly_bugs.py
@@ -95,14 +100,6 @@ except ImportError:  # run as a script: scripts/eval_dashboard/nightly_bugs.py
     from eval_dashboard.post_health import NIGHTLY_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-TASKS_DIR = pathlib.Path("bench") / "tasks"
-TASK_FILE = "task.yaml"
-DOMAINS_FILE = pathlib.Path("docs") / "designs" / "domains.yaml"
-OWNERS_FILE = pathlib.Path("OWNERS")
-# The OWNERS lists a person is "real" in.
-OWNERS_LISTS = ("approvers", "reviewers")
-# task.yaml `owner:` values that name no person: the domain owner answers.
-OWNER_PLACEHOLDERS = frozenset({"maintainers"})
 # The top-level task.yaml keys read here, and the domains.yaml row keys.
 TASK_OWNER_KEY = "owner"
 TASK_DOMAIN_KEY = "domain"
@@ -282,7 +279,7 @@ def log(message: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# repository facts: task.yaml, domains.yaml, OWNERS
+# repository facts: task.yaml, domains.yaml
 
 
 def task_fields(case: str, repo_root: pathlib.Path) -> dict | None:
@@ -291,18 +288,17 @@ def task_fields(case: str, repo_root: pathlib.Path) -> dict | None:
     deleted). ``expected_fail`` is a YAML boolean, as bench-gate reads it."""
     if not CASE_NAME_RE.fullmatch(case or ""):
         return None
-    path = repo_root / TASKS_DIR / case / TASK_FILE
+    path = repo_root / case_owner.TASKS_PATH / case / case_owner.TASK_FILENAME
     if not path.is_file():
         return None
     doc = load_yaml(path)
     if not doc:
         return None
-
-    def text(key):
-        value = doc.get(key)
-        return str(value) if value is not None else None
-
-    return {"owner": text(TASK_OWNER_KEY), "domain": text(TASK_DOMAIN_KEY), "expected_fail": doc.get(TASK_EXPECTED_FAIL_KEY) is True}
+    # owner and domain through case_owner's line scan, the read the bench
+    # validator holds every case to, so the lint and the routing agree.
+    text = path.read_text()
+    return {"owner": case_owner.task_field(text, TASK_OWNER_KEY), "domain": case_owner.task_field(text, TASK_DOMAIN_KEY),
+            "expected_fail": doc.get(TASK_EXPECTED_FAIL_KEY) is True}
 
 
 def load_yaml(path: pathlib.Path) -> dict:
@@ -317,28 +313,20 @@ def load_yaml(path: pathlib.Path) -> dict:
 def load_domains(repo_root: pathlib.Path) -> dict[str, dict]:
     """``{slug: {name, owner, backup}}`` from domains.yaml."""
     out = {}
-    for row in load_yaml(repo_root / DOMAINS_FILE).get("domains") or []:
+    for row in load_yaml(repo_root / case_owner.DOMAINS_PATH).get("domains") or []:
         if isinstance(row, dict) and isinstance(row.get("slug"), str):
             out[row["slug"]] = {key: row.get(key) for key in DOMAIN_ROW_KEYS}
     return out
 
 
-def load_owners(repo_root: pathlib.Path) -> frozenset[str]:
-    """Every login the root OWNERS lists, lowercased (GitHub logins are
-    case-insensitive)."""
-    doc = load_yaml(repo_root / OWNERS_FILE)
-    return frozenset(str(login).lower() for key in OWNERS_LISTS for login in doc.get(key) or [])
-
-
-def resolve_assignee(case_owner: str | None, domain_owner: str | None, owners: frozenset[str]) -> tuple[str | None, str]:
-    """``(login, why)``: the case owner when OWNERS lists them, else the
-    domain owner. ``maintainers`` and a missing owner name nobody."""
-    if case_owner and case_owner not in OWNER_PLACEHOLDERS and case_owner.lower() in owners:
-        return case_owner, WHY_CASE_OWNER
-    shown = f"`{case_owner}`" if case_owner else "not set"
-    if case_owner and case_owner not in OWNER_PLACEHOLDERS:
-        shown += ", not in the root OWNERS file"
-    return domain_owner, WHY_DOMAIN_OWNER.format(owner=shown)
+def resolve_assignee(owner: str | None, domain: str, domain_owners: dict[str, str]) -> tuple[str | None, str]:
+    """``(login, why)``: ``case_owner.effective_owner`` -- the case owner when
+    it names a GitHub login, else the domain owner. Whether GitHub accepts
+    the login is the filer's check (``Filer.file``'s refusal fallback)."""
+    login = case_owner.effective_owner(owner, domain, domain_owners=domain_owners)
+    if case_owner.is_person_login(owner):
+        return login, WHY_CASE_OWNER
+    return login, WHY_DOMAIN_OWNER.format(owner=f"`{owner}`" if owner else "not set")
 
 
 # --------------------------------------------------------------------------
@@ -517,8 +505,12 @@ class Filer:
         self.gh = gh
         self.repo_root = repo_root
         self.domains = load_domains(repo_root)
-        self.owners = load_owners(repo_root)
-        self.infra_owner, self.infra_backup = gate_issue.infra_addressees(repo_root / DOMAINS_FILE)
+        try:
+            self.domain_owners = case_owner.load_domain_owners(repo_root / case_owner.DOMAINS_PATH)
+        except OSError as exc:
+            log(f"warning: could not read domains.yaml: {exc}")
+            self.domain_owners = {}
+        self.infra_owner, self.infra_backup = gate_issue.infra_addressees(repo_root / case_owner.DOMAINS_PATH)
 
     def open_issues(self) -> list[dict] | None:
         return self.gh.call("GET", self.gh.path(OPEN_ISSUES_PATH), paginate=True)
@@ -723,8 +715,8 @@ class Filer:
     def file(self, case: str, fields: dict, streak: list[dict]) -> dict:
         domain = fields.get("domain") or UNKNOWN
         row = self.domains.get(domain) or {}
-        domain_owner = row.get("owner")
-        assignee, why = resolve_assignee(fields.get("owner"), domain_owner, self.owners)
+        domain_owner = case_owner.domain_owner(domain, self.domain_owners)
+        assignee, why = resolve_assignee(fields.get("owner"), domain, self.domain_owners)
         # Who it goes to, in order: the resolved owner; the domain owner when
         # GitHub refuses a case owner; no one, saying who was refused.
         candidates = [(assignee, why)] if assignee else []
@@ -789,7 +781,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data", required=True, type=pathlib.Path, help="data.json the collector wrote")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO)
-    parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding bench/tasks, domains.yaml and OWNERS")
+    parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding bench/tasks and domains.yaml")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="dry_run", action="store_true", default=True, help="print every write instead of sending it (the default)")
     mode.add_argument("--live", dest="dry_run", action="store_false", help="send the writes")
@@ -799,7 +791,7 @@ def parse_args(argv=None):
 def main(argv=None, gh_runner=None) -> int:
     args = parse_args(argv)
     if yaml is None:
-        log("ERROR: pyyaml is required to read domains.yaml and OWNERS")
+        log("ERROR: pyyaml is required to read task.yaml and domains.yaml")
         return 1
     try:
         data = json.loads(args.data.read_text())

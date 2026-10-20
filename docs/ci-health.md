@@ -719,9 +719,8 @@ count, run link, transcript link and each failing check's reason, and what
 triage decides: a product bug gets a fixer, a priority and a date; a broken
 test is fixed or marked `expected_fail` with the issue linked; an infra
 failure is closed in favour of the infra issue. It is assigned to the case's
-`owner:` when the root `OWNERS` file lists that login, and otherwise (an
-`owner: maintainers`, no owner, or a login `OWNERS` does not list) to the
-domain's `owner:` in
+effective owner (`scripts/case_owner.py`): its `owner:` when that names a
+GitHub login, and otherwise (no owner) the domain's `owner:` in
 [`docs/designs/domains.yaml`](designs/domains.yaml). When GitHub refuses the
 case owner as assignee, the issue goes to the domain owner instead; when it
 refuses that login too, the issue is filed unassigned and says who was refused.

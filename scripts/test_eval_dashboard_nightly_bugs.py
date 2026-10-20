@@ -1,11 +1,10 @@
 """nightly_bugs.py: a case failing every graded repetition on three graded
-nights in a row gets one `nightly-red` issue, assigned per the hybrid rule,
-and one comment when it passes again.
+nights in a row gets one `nightly-red` issue, assigned to the case's
+effective owner (scripts/case_owner.py), and one comment when it passes again.
 
 The nights are synthetic, built like test_eval_dashboard_nightly.py's; the
-repository facts (task.yaml owners and markers, domains.yaml, the root
-OWNERS) come from testdata_nightly_bugs/, copied into a temporary checkout
-because a file named OWNERS anywhere in this tree is one Prow reads.
+repository facts (task.yaml owners and markers, domains.yaml) come from
+testdata_nightly_bugs/, copied into a temporary checkout.
 """
 
 import contextlib
@@ -142,7 +141,6 @@ class Harness(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = pathlib.Path(tmp.name) / "repo"
         shutil.copytree(TESTDATA, self.root)
-        (self.root / "OWNERS.fixture").rename(self.root / "OWNERS")
         self.dir = pathlib.Path(tmp.name)
 
     def run_once(self, doc, gh=None, live=True):
@@ -417,31 +415,24 @@ class RecoveryTest(Harness):
 
 
 class AssigneeTest(Harness):
-    def setUp(self):
-        super().setUp()
-        self.owners = nightly_bugs.load_owners(self.root)
-
-    def test_a_case_owner_in_owners_is_assigned(self):
-        self.assertEqual(nightly_bugs.resolve_assignee("alice", "carol", self.owners)[0], "alice")
-        self.assertEqual(nightly_bugs.resolve_assignee("bob", "carol", self.owners)[0], "bob", "reviewers count, case-insensitively")
+    def test_any_login_that_owns_a_case_is_assigned(self):
+        # case_owner.py's rule: any GitHub login, not only OWNERS members.
+        self.assertEqual(nightly_bugs.resolve_assignee("alice", "x", {"x": "carol"}), ("alice", nightly_bugs.WHY_CASE_OWNER))
+        self.assertEqual(nightly_bugs.resolve_assignee("zed", "x", {"x": "carol"})[0], "zed")
 
     def test_maintainers_or_no_owner_goes_to_the_domain_owner(self):
-        login, why = nightly_bugs.resolve_assignee("maintainers", "carol", self.owners)
+        login, why = nightly_bugs.resolve_assignee("maintainers", "x", {"x": "carol"})
         self.assertEqual(login, "carol")
         self.assertIn("`maintainers`", why)
-        self.assertEqual(nightly_bugs.resolve_assignee(None, "carol", self.owners)[0], "carol")
-
-    def test_an_owner_not_in_owners_goes_to_the_domain_owner(self):
-        login, why = nightly_bugs.resolve_assignee("zed", "sam", self.owners)
-        self.assertEqual(login, "sam")
-        self.assertIn("not in the root OWNERS file", why)
+        self.assertEqual(nightly_bugs.resolve_assignee(None, "x", {"x": "carol"})[0], "carol")
+        self.assertEqual(nightly_bugs.resolve_assignee(None, "x", {})[0], None)
 
     def test_end_to_end_each_rule_lands_on_the_issue(self):
         cases = ("case-maint", "case-outsider", "case-noowner")
         gh, _, _ = self.run_once(data(*(night(d, [red(c) for c in cases]) for d in (15, 16, 17))))
         by_case = {b["title"].split()[1]: b for b in self.filed(gh)}
         self.assertEqual(by_case["case-maint"]["assignees"], ["carol"])
-        self.assertEqual(by_case["case-outsider"]["assignees"], ["sam"])
+        self.assertEqual(by_case["case-outsider"]["assignees"], ["zed"], "any login, as case_owner.py resolves it")
         self.assertEqual(by_case["case-noowner"]["assignees"], ["sam"])
         self.assertIn("domain:security", by_case["case-outsider"]["labels"])
 
