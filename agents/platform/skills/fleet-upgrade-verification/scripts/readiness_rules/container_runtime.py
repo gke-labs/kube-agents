@@ -7,7 +7,8 @@ its socket, mounted from the host, is what that change breaks: a client pinned t
 `v1alpha2` CRI API, an agent reading the containerd 1.x configuration layout. The rule
 pairs the two reads. The runtime side compares each pool's current containerd major,
 read from its nodes' `status.nodeInfo.containerRuntimeVersion` (or, when the Nodes were
-not read, from the table by the pool's minor) with the major the target's node image
+not read or no node of the pool reports a runtime, from the table by the pool's minor,
+saying which) with the major the target's node image
 ships, from `upgrade_shape_tables.CONTAINERD_MAJOR_BY_GKE_MINOR` for the pool's image
 family. The workload side is every pod or template mounting a runtime socket through a
 `hostPath` volume, GKE's own agents included. A pool whose major changes at the target
@@ -65,7 +66,8 @@ RUNTIME_VERSION_KEY = "containerRuntimeVersion"
 MINOR_TEXT = "{major}.{minor}"
 
 CURRENT_OBSERVED = "containerd {major} on its nodes ({version})"
-CURRENT_FROM_TABLE = "containerd {major} by its version {minor}, nodes unread"
+CURRENT_FROM_TABLE_NODES_UNREAD = "containerd {major} by its version {minor}, nodes unread"
+CURRENT_FROM_TABLE_NO_NODE = "containerd {major} by its version {minor}; no node of the pool reports a runtime"
 FINDING_TEXT = "pool {pool} ({image}) runs {current} and the target's node image ships containerd {target_major}; mounting the runtime socket: {clients}"
 CLIENT_TEXT = "{owner} ({paths})"
 NOTE_CHANGE_NO_CLIENTS = "pool {pool} ({image}) runs {current} and the target's node image ships containerd {target_major}; no pod mounts the runtime socket"
@@ -107,14 +109,17 @@ def observed_runtime(nodes: list[dict], pool: str) -> tuple[str, int] | None:
     return lowest
 
 
-def current_major(pool: dict, pool_version, nodes: list[dict]) -> tuple[int, str]:
-    """The pool's containerd major now and how it was read."""
+def current_major(pool: dict, pool_version, nodes: list[dict], nodes_unread: bool = False) -> tuple[int, str]:
+    """The pool's containerd major now and how it was read: from its nodes, else from the
+    table by its minor, saying whether the Nodes were not read or none of the pool's reports
+    a runtime (an empty pool, or nodes not yet registered)."""
     observed = observed_runtime(nodes, pool.get("name", ""))
     if observed is not None:
         return observed[1], CURRENT_OBSERVED.format(major=observed[1], version=observed[0])
     minor = (pool_version[0], pool_version[1])
     major = containerd_major_at(minor, node_image_os_family(_image_type(pool)))
-    return major, CURRENT_FROM_TABLE.format(major=major, minor=MINOR_TEXT.format(major=minor[0], minor=minor[1]))
+    form = CURRENT_FROM_TABLE_NODES_UNREAD if nodes_unread else CURRENT_FROM_TABLE_NO_NODE
+    return major, form.format(major=major, minor=MINOR_TEXT.format(major=minor[0], minor=minor[1]))
 
 
 def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
@@ -122,7 +127,8 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     items = read_items(read)
     clients_unread = {kind: error for kind in (POD_READ_KIND, DAEMONSET_READ_KIND) if (error := read_error(read, kind))}
     clients = socket_clients(items) if not clients_unread else []
-    nodes = [] if read_error(read, NODE_READ_KIND) else items_of_kind(items, KIND_NODE)
+    nodes_unread = bool(read_error(read, NODE_READ_KIND))
+    nodes = [] if nodes_unread else items_of_kind(items, KIND_NODE)
     pools_parsed = {p.get("name"): p.get("parsed") for p in ((context or {}).get(CONTEXT_POOLS) or []) if isinstance(p, dict)}
     if target is None:
         if clients:
@@ -141,7 +147,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         if version >= target:
             continue
         image = _image_type(pool)
-        now, current = current_major(pool, version, nodes)
+        now, current = current_major(pool, version, nodes, nodes_unread)
         target_major = containerd_major_at((target[0], target[1]), node_image_os_family(image))
         if target_major <= now:
             continue

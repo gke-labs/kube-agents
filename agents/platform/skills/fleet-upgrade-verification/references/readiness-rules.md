@@ -139,7 +139,8 @@ new rule adds its entry in that order.
   (`kubernetes.io/arch`, `topology.kubernetes.io/zone`) before the pool crosses the drop.
 - `container-runtime` (Container runtime), entry 13, risk. Reads: For each pool below the target,
   the containerd major its nodes report (`status.nodeInfo.containerRuntimeVersion`, or the table by
-  the pool's minor when the nodes were not read) against the major the target's node image ships
+  the pool's minor when the nodes were not read or no node of the pool reports a runtime, saying
+  which) against the major the target's node image ships
   (`upgrade_shape_tables.CONTAINERD_MAJOR_BY_GKE_MINOR`: Linux images at 1.33, Windows Server at
   1.35, GKE's containerd 2 page as the source), paired with every pod or template that mounts a
   runtime socket (`/run/containerd/containerd.sock`, `/var/run/docker.sock`, either spelling)

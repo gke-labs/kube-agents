@@ -59,6 +59,18 @@ class ContainerRuntimeRuleTest(unittest.TestCase):
         record = cluster(name="seeded-a", pools=[pool_record("default-pool", "1.33.0-gke.1000")])
         self.assertEqual(evaluate(record, items_for(with_nodes=False), target=parse_version("1.34.1-gke.1000"), read_errors={"node": "x"})["risks"], [])
 
+    def test_a_pool_with_no_node_reporting_a_runtime_says_so_not_nodes_unread(self):
+        # The Node read answered and the pool is in it with no node (empty, or not yet registered):
+        # the table answers by the pool's minor, and the text says why, not that the nodes were unread.
+        record = cluster(name="seeded-a", pools=[pool_record("default-pool", "1.32.4-gke.1000")])
+        out = evaluate(record, items_for(with_nodes=False))
+        self.assertEqual(out["risks"][0]["current"], "containerd 1 by its version 1.32; no node of the pool reports a runtime")
+        self.assertNotIn("unread", container_runtime.describe(out["risks"][0]))
+        # A node of the pool with no parsable runtime version is the same answer.
+        blank = node("gke-a-default-1", "default-pool", runtime="")
+        out = evaluate(record, [blank] + items_for(with_nodes=False))
+        self.assertIn("; no node of the pool reports a runtime", out["risks"][0]["current"])
+
     def test_windows_pools_move_at_1_35(self):
         record = cluster(name="win", pools=[pool_record("win-pool", "1.34.2-gke.1000", image="WINDOWS_LTSC_CONTAINERD")])
         items = [template("DaemonSet", "win-agent", PROBE_SPEC, namespace="monitoring")]
