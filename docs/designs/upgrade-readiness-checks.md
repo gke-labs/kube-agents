@@ -280,8 +280,12 @@ Already served (see Scope). The additions:
   the pool and holds the cluster as a cluster operation does); the holder is the newest one still
   `RUNNING`. It files a blocker when the holder has run for more than four hours, naming the
   operation, its type and pool, its start and its age; a younger holder is a reconcile in
-  progress, noted and not a blocker. A cluster not `RUNNING` with no `RUNNING` operation is a
-  blocker quoting the cluster's `statusMessage`, with the newest finished operation as context.
+  progress, noted and not a blocker. A cluster not `RUNNING` with no `RUNNING` operation is
+  described once more (the clusters list is made before any member is graded, the operations
+  list at the project's first member, so an operation that ended in between leaves a list status
+  the cluster no longer has): `RUNNING` now is a note, a failed describe is unknown, and a status
+  still not `RUNNING` is a blocker quoting the cluster's `statusMessage`, with the newest finished
+  operation as context.
   The action is the `gke-upgrades` skill's Stuck operation procedure: freeze changes and, past a
   few hours, open a support case quoting the operation id, or the status and its message.
 - An automated control-plane upgrade, resize or repair needs compute capacity when it fires, and

@@ -1571,8 +1571,9 @@ class FakeReadinessCommands(FakeGcloud):
         "namespaces": "Namespace",
     }
 
-    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=(), failing_webhook_read=(), namespaced_objects_by_cluster=None, pods_by_cluster=None, cluster_objects_by_cluster=None, nodes_by_cluster=None, node_output_by_cluster=None, failing_reads=None, cut_reads=None, audit_by_cluster=None, failing_logging=(), **project_reads):
+    def __init__(self, clusters_by_project, config_by_location, objects_by_cluster, failing_kubectl=(), failing_credentials=(), failing_webhook_read=(), namespaced_objects_by_cluster=None, pods_by_cluster=None, cluster_objects_by_cluster=None, nodes_by_cluster=None, node_output_by_cluster=None, failing_reads=None, cut_reads=None, audit_by_cluster=None, failing_logging=(), described_status_by_cluster=None, **project_reads):
         super().__init__(clusters_by_project, config_by_location, **project_reads)
+        self.described_status_by_cluster = described_status_by_cluster or {}  # what `clusters describe` says now; RUNNING unless a test says otherwise
         self.objects_by_cluster = objects_by_cluster
         self.namespaced_objects_by_cluster = namespaced_objects_by_cluster or {}
         self.pods_by_cluster = pods_by_cluster or {}
@@ -1602,6 +1603,12 @@ class FakeReadinessCommands(FakeGcloud):
         return instances
 
     def __call__(self, cmd, timeout=None, env=None):
+        if cmd[:4] == ["gcloud", "container", "clusters", "describe"]:
+            self.calls.append(cmd)
+            described = self.described_status_by_cluster.get(cmd[4], "RUNNING")
+            if described is None:
+                return 1, "", "ERROR: (gcloud.container.clusters.describe) forbidden"
+            return 0, json.dumps({"status": described} if isinstance(described, str) else described), ""
         if cmd[:3] == ["gcloud", "logging", "read"]:
             self.calls.append(cmd)
             self.timeouts.append(timeout)
@@ -2445,6 +2452,31 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual([(f["rule"], f["node"], f["ready"], f["unschedulable"], f["holds"]) for f in a["rule_blocking"]], [("orphan-node-objects", "gke-seeded-a-default-pool-aaaa-ghost", "Unknown", True, ["node-pool"])])
         self.assertIn("| orphan-node-objects: Node gke-seeded-a-default-pool-aaaa-ghost names no instance in the project (providerID gce://p1/us-central1-a/gke-seeded-a-default-pool-aaaa-ghost; Ready=Unknown; unschedulable=true)", text)
         self.assertIn("orphan-node-objects: 1 orphan Node(s) (2 nodes, 1 instances in the project)", a["note"])
+
+    def test_a_member_listed_not_running_with_nothing_running_is_described_before_it_blocks(self):
+        # seeded-a listed RECONCILING with no RUNNING operation in the project's list: the status-age rule describes
+        # the cluster once through the report's runner, with the member's location and project, and grades what it
+        # says now. RUNNING now is a note; a status still not RUNNING blocks; a failed describe is unknown.
+        for record in self.clusters["p1"]:
+            if record["name"] == "seeded-a":
+                record["status"] = "RECONCILING"
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects)
+        rc, text, data = self._run(fake)
+        self.assertEqual(rc, report.EXIT_OK)
+        describes = [c for c in fake.calls if c[:4] == ["gcloud", "container", "clusters", "describe"]]
+        self.assertEqual(describes, [["gcloud", "container", "clusters", "describe", "seeded-a", "--location", "us-central1-a", "--project", "p1", "--format=json(status,statusMessage)"]])
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["status"], "ready")
+        self.assertIn("cluster-status-age: status RUNNING now (RECONCILING at list time; newest operation none listed)", a["note"])
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, described_status_by_cluster={"seeded-a": {"status": "DEGRADED", "statusMessage": "Node pool default-pool needs repair"}})
+        rc, text, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual(a["status"], "blocked")
+        self.assertEqual([(f["rule"], f["status"], f["listed_status"], f["status_message"]) for f in a["rule_blocking"]], [("cluster-status-age", "DEGRADED", "RECONCILING", "Node pool default-pool needs repair")])
+        fake = FakeReadinessCommands(self.clusters, {}, self.objects, described_status_by_cluster={"seeded-a": None})
+        rc, text, data = self._run(fake)
+        a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
+        self.assertEqual((a["status"], [u["rule"] for u in a["unknown"]]), ("unknown", ["cluster-status-age"]))
 
     def test_the_whole_run_is_listed_before_any_member_is_graded(self):
         seen = {}

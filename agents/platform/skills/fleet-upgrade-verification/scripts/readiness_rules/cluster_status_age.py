@@ -10,20 +10,32 @@ is RUNNING, and its age is from its start time. A cluster not `RUNNING` is a blo
 holder is older than STALE_AFTER_SECONDS, naming the operation, its type and pool, its start
 and its age; a younger holder is a note, a reconcile in progress, which is also why the
 report's own "upgrade in flight" treatment of `RECONCILING` stands for the version findings.
-A cluster not `RUNNING` with no RUNNING operation on it or its pools is held by something the
-operations list does not show (a `DEGRADED` cluster needs user action, an `ERROR` one is
-unusable, and the API puts the cause in `statusMessage`): a blocker quoting the cluster's
-`statusMessage`, with the newest operation of any status as context and never as the holder.
+A cluster not `RUNNING` with no RUNNING operation on it or its pools is first described again
+(`gcloud container clusters describe`, the rule's one read of its own, through the report's
+runner): the clusters list is made before any member is graded and the operations list at the
+project's first member, so an operation that ended in between leaves a list status the cluster
+no longer has. `RUNNING` now is a note; a describe that fails is `unknown`; a status still not
+`RUNNING` is held by something the operations list does not show (a `DEGRADED` cluster needs
+user action, an `ERROR` one is unusable, and the API puts the cause in `statusMessage`): a
+blocker quoting the cluster's `statusMessage` as described, with the newest operation of any
+status as context and never as the holder.
 A `RUNNING` cluster is a note naming its newest operation and that operation's status. The
 action is the gke-upgrades skill's Stuck operation procedure: freeze changes; past a few
 hours, open a support case quoting the operation id, or the status and its message when no
 operation holds the cluster.
 """
 
+import json
+
 from readiness_rules import (
     CONTEXT_AT,
     CONTEXT_CLUSTER_NAME,
     CONTEXT_LOCATION,
+    CONTEXT_PROJECT,
+    CONTEXT_RUN_CMD,
+    CONTEXT_TIMEOUT_SECONDS,
+    ERROR_EXCERPT_CHARS,
+    GCLOUD,
     HOLDS_BOTH,
     OPERATION_NAME_KEY,
     OPERATION_START_KEY,
@@ -35,6 +47,7 @@ from readiness_rules import (
     age_seconds,
     format_duration,
     new_result,
+    one_line,
     operation_target,
     parse_rfc3339,
     project_read,
@@ -56,6 +69,19 @@ CLUSTER_LOCATION_KEY = "location"
 STALE_AFTER_SECONDS = 4 * SECONDS_PER_HOUR
 NO_STATUS_MESSAGE = "none"
 NO_OPERATION_LISTED = "none listed"
+# The rule's one read of its own: the cluster's status as it stands now, for a cluster the list
+# showed not RUNNING with no RUNNING operation on it or its pools. The clusters list is made
+# before any member is graded and the operations list at the project's first member, so an
+# operation that ended in between leaves a list status the cluster no longer has.
+DESCRIBE_COMMAND = ("container", "clusters", "describe")
+DESCRIBE_LOCATION_FLAG = "--location"
+DESCRIBE_PROJECT_FLAG = "--project"
+DESCRIBE_FORMAT_FLAG = "--format=json(status,statusMessage)"
+NO_RUNNER = "the context carries no command runner"
+DESCRIBE_EXIT_FORMAT = "exit {rc}"
+DESCRIBE_NO_STATUS = "the response carries no status"
+DESCRIBE_FAILED_REASON = "status {status} at list time with no RUNNING operation on it or its node pools; `gcloud container clusters describe` could not confirm it ({error}), so whether it still stands is unknown"
+SETTLED_RUNNING_NOTE_FORMAT = "status RUNNING now ({listed} at list time; newest operation {newest})"
 TYPE_ON_POOL_FORMAT = "{type} on {pool}"
 ACTION = "freeze changes; past a few hours open a support case quoting the operation id: see the gke-upgrades skill's Stuck operation section"
 NO_HOLDER_ACTION = "freeze changes; read the statusMessage and the cluster's conditions, and past a few hours open a support case quoting the status, its message and the newest operation id: see the gke-upgrades skill's Stuck operation section"
@@ -111,6 +137,26 @@ def _newest_text(fields) -> str:
     return NEWEST_FORMAT.format(operation=fields["operation"], type=fields["operation_type"], op_status=fields["status"], started=fields["started"], age=format_duration(fields["age_seconds"]))
 
 
+def describe_status(context, name: str, location: str) -> tuple[str | None, str | None, str | None]:
+    """(status, statusMessage, error) of the cluster as `gcloud container clusters describe`
+    reports it now, through the context's runner; (None, None, why) when it could not say."""
+    run = context.get(CONTEXT_RUN_CMD)
+    if run is None:
+        return None, None, NO_RUNNER
+    cmd = [GCLOUD, *DESCRIBE_COMMAND, name, DESCRIBE_LOCATION_FLAG, location, DESCRIBE_PROJECT_FLAG, str(context.get(CONTEXT_PROJECT) or ""), DESCRIBE_FORMAT_FLAG]
+    timeout = context.get(CONTEXT_TIMEOUT_SECONDS)
+    rc, stdout, stderr = run(cmd, timeout) if timeout else run(cmd)
+    if rc != 0:
+        return None, None, one_line(stderr or DESCRIBE_EXIT_FORMAT.format(rc=rc), ERROR_EXCERPT_CHARS)
+    try:
+        record = json.loads(stdout)
+    except ValueError as e:
+        return None, None, one_line(str(e), ERROR_EXCERPT_CHARS)
+    if not isinstance(record, dict) or not record.get(STATUS_KEY):
+        return None, None, DESCRIBE_NO_STATUS
+    return str(record.get(STATUS_KEY)), str(record.get(STATUS_MESSAGE_KEY) or "") or None, None
+
+
 def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     out = new_result()
     name = str(cluster.get(CLUSTER_NAME_KEY) or context.get(CONTEXT_CLUSTER_NAME) or "")
@@ -138,7 +184,15 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         return out
     message = str(cluster.get(STATUS_MESSAGE_KEY) or "") or None
     if holder is None:
-        out["blocking"].append({"cluster": name, "status": status, "status_message": message, "operation": None, "operation_type": None, "pool": None, "started": None, "age_seconds": None, "newest": newest, "threshold_seconds": STALE_AFTER_SECONDS, "action": NO_HOLDER_ACTION})
+        # Nothing RUNNING holds it: the list status may be older than the operation that ended since. Ask once.
+        fresh_status, fresh_message, error = describe_status(context, name, location)
+        if error is not None:
+            out["unknown"].append(DESCRIBE_FAILED_REASON.format(status=status, error=error))
+            return out
+        if fresh_status == STATUS_RUNNING:
+            out["notes"].append(SETTLED_RUNNING_NOTE_FORMAT.format(listed=status, newest=_newest_text(newest)))
+            return out
+        out["blocking"].append({"cluster": name, "status": fresh_status, "listed_status": status, "status_message": fresh_message or message, "operation": None, "operation_type": None, "pool": None, "started": None, "age_seconds": None, "newest": newest, "threshold_seconds": STALE_AFTER_SECONDS, "action": NO_HOLDER_ACTION})
         return out
     age = age_seconds(at, holder_started)
     fields = {"operation": holder.get(OPERATION_NAME_KEY), "type": _type_text(holder, holder_pool), "started": holder.get(OPERATION_START_KEY), "age": format_duration(age), "threshold": format_duration(STALE_AFTER_SECONDS), "status": status}

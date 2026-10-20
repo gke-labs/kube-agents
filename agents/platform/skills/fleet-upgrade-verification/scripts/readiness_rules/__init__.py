@@ -143,6 +143,7 @@ CONTEXT_PROJECT = "project"
 CONTEXT_LOCATION = "location"
 CONTEXT_CLUSTER_NAME = "cluster_name"
 CONTEXT_RUN_CMD = "run_cmd"
+GCLOUD = "gcloud"  # the binary a rule's own read runs through the context's runner
 CONTEXT_TIMEOUT_SECONDS = "timeout_seconds"
 CONTEXT_AT = "at"
 CONTEXT_CACHE = "cache"
