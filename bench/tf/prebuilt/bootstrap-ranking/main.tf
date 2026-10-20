@@ -386,6 +386,10 @@ resource "null_resource" "ranking" {
         printf '%s' '${base64encode(local.disarm_py)}' | base64 -d | agent_py
       }
       resolve() {
+        printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py "${local.raw_b64}"
+      }
+      # The teardown an earlier run left may be the other case's on this stack.
+      resolve_planted() {
         printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py ${join(" ", local.planted_b64)}
       }
       # Writes base64 $1 to the sandbox path $2 aside and renames it, owned as
@@ -434,7 +438,7 @@ resource "null_resource" "ranking" {
         # `disarm` removed the state file, so the next run will not come back
         # here; the planted ids it registers again are the ones its own
         # teardown resolves.
-        if ! resolve >&2; then
+        if ! resolve_planted >&2; then
           echo "ERROR: could not finish the teardown an earlier run left on ${var.host_cluster_name}: delivery is disarmed, but its planted findings are still open on the queue. Nothing was planted; the next run's teardown resolves them." >&2
           exit 1
         fi

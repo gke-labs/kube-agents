@@ -112,6 +112,10 @@ _INTERPOLATIONS = {
         )
     ),
     "local.raw_b64": base64.b64encode(_RAW.read_bytes()).decode(),
+    # Every case's planted report: a leftover teardown resolves whichever case registered.
+    'join(" ", local.planted_b64)': " ".join(
+        base64.b64encode(raw.read_bytes()).decode() for raw in sorted(_STACK.glob("inventory-raw*.txt"))
+    ),
     "local.card_key": "bootstrap-inventory-prioritize",
     "local.card_assignee": "platform",
     "local.card_title": "Prioritize the onboarding inventory report",
@@ -472,6 +476,11 @@ class BootstrapRankingPlantTest(unittest.TestCase):
         self.assertLess(disarm[0], resolve[0])
         self.assertLess(resolve[0], states[1])
         self.assertLess(states[1], self._indices(calls, "[plant pod/platform-agent-shell-0]")[0])
+        # The leftover may be the other case's on this stack, so it resolves every planted report.
+        argv = (self._state / "resolve_argv").read_text().split("\n")
+        planted = [base64.b64encode(raw.read_bytes()).decode() for raw in sorted(_STACK.glob("inventory-raw*.txt"))]
+        self.assertEqual(len(planted), 2)
+        self.assertEqual(argv, ["/opt/hermes/.venv/bin/python3", "-", *planted])
 
     def test_a_leftover_arm_that_will_not_tear_down_stops_the_apply(self):
         for fail in ("DISARM_FAIL", "RESOLVE_FAIL"):

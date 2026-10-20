@@ -106,13 +106,16 @@ def test_the_stack_plants_the_report_the_tests_read() -> None:
 def test_each_planted_report_is_what_the_hand_off_writes_from_its_cards(raw: Path) -> None:
     # A hand-written copy drifts from the writer's layout; the cards file beside
     # each report is the sweep it stands for, composed at PLANTED_AT.
+    state = json.loads(raw.with_suffix(".cards.json").read_text())
+    # compose imports inventory_findings when it runs, so the path stays until it returns.
     sys.path[:0] = [str(HANDOFF_DIR), str(EXTRACT.parent)]
     try:
         import bootstrap_handoff
+
+        composed = bootstrap_handoff.compose(state, timed_out=False, now=PLANTED_AT)
     finally:
         del sys.path[:2]
-    state = json.loads(raw.with_suffix(".cards.json").read_text())
-    assert raw.read_text() == bootstrap_handoff.compose(state, timed_out=False, now=PLANTED_AT)
+    assert raw.read_text() == composed
 
 
 def test_the_stack_and_the_reader_spell_the_items_file_as_the_script_does() -> None:
