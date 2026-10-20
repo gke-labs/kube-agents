@@ -52,6 +52,11 @@ import (
 // (followUpCardStop). It is quiet: no placeholder, and it posts only when it
 // stopped a card or could not finish. One mark is held, however many stops
 // arrive.
+//
+// A control Slack's Stop button started speaks with the button's own replies
+// instead (CardStopRun.SlackStop, slack_stop.go): no placeholder, its result
+// worded by slackStopReply and its fallback slackStopCouldntReply, and so
+// does a follow-up the button's mark asked for.
 
 // The posts the card stop makes beside its reply (cardStopReply).
 const (

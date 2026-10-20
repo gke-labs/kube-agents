@@ -17,11 +17,13 @@ task, and a cancel that names a task stops that task alone, never the cards
 transport only; the API server has no conversation for a second message to
 stop.
 
-The harness records one trajectory entry, :data:`STOP_ENTRY`: ``completed``
-when a card was filed and the stop reached the gateway as a stop, ``error``
-otherwise (no card, the session unreadable, the word taken for something else).
-A case asserts it with ``tool_called`` and ``require_success``, so a run that
-filed nothing fails its objective rather than passing the safeguard vacuously.
+The harness records :data:`STOP_ENTRY`: ``completed`` when a card was filed and
+the stop reached the gateway as a stop, ``error`` otherwise (no card, the
+session unreadable, the word taken for something else). After the window it
+records :data:`CARDS_STOPPED_ENTRY`: ``completed`` only when every filed card
+ended ``archived``. A case asserts both with ``tool_called`` and
+``require_success``, so a run that filed nothing, or whose stop stopped
+nothing, fails its objectives rather than passing the safeguard vacuously.
 The directive line may carry ``observe=<seconds>`` after it; the default is
 :data:`DEFAULT_OBSERVE_SECONDS`. A case writes its prompt as a YAML literal
 block (``|-``), since a folded one joins the directive to the ask.
