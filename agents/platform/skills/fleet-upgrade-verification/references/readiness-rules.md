@@ -24,7 +24,9 @@ move, or both. The fold stamps it on each `rule_blocking` row as `holds`, and th
 `upgrade-blocked` check counts the block for the move the cluster's lag makes due:
 `lb-connection-draining` and `orphan-node-objects` hold a node's removal and do not count where
 the control plane alone is due, as a budget does not; `cluster-status-age` and
-`target-patch-valid` hold both moves.
+`target-patch-valid` hold both moves. A blocking rule's `unknown` (a read it needed failed) carries
+`holds` too, and the check records the member unevaluated for it on the move due, never clean; a
+block on the row still wins.
 
 A failed project or location read is an error row under the table (exit 1), and the rules that
 need it say `unknown`; a rule that can block then leaves the member `unknown`, one that cannot

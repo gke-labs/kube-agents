@@ -412,9 +412,10 @@ RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
 # What the fold stamps on a finding: the rule's id and entry on every one, the rule's own
 # rendering (`text`) on a blocker or risk and on an `unknown` entry (the note line), the
 # `reason` an `unknown` entry carries, whether the rule could have blocked, which is
-# what decides whether its `unknown` moves the verdict, and on a blocker the moves the
-# rule's mechanism holds (`holds`, from the module's `HOLDS`; absent when the module
-# declares none, which the Monday audit's join reads as both).
+# what decides whether its `unknown` moves the verdict, and on a blocker and on an `unknown`
+# entry the moves the rule's mechanism holds (`holds`, from the module's `HOLDS`; absent when
+# the module declares none, which the Monday audit's join reads as both), so the join can tell
+# a rule that could not read on the move due from one that could not read on a move that is not.
 RULE_KEY = "rule"
 ENTRY_KEY = "entry"
 TEXT_KEY = "text"
@@ -1382,9 +1383,10 @@ class RuleDefect(TypeError):
     text, and recorded by the fold as that text, not as the rule raising, which it did not."""
 
 
-def _unknown_entry(item, rule_id: str, entry, can_block: bool) -> dict:
+def _unknown_entry(item, rule_id: str, entry, can_block: bool, holds=None) -> dict:
     """One `unknown` entry as the JSON carries it: a dict with `reason` (whole), the rule's
-    id and entry, whether the rule could have blocked, and the `text` the note column prints,
+    id and entry, whether the rule could have blocked, the moves its mechanism holds when the
+    module declares them (`holds`), and the `text` the note column prints,
     the reason on one line of at most NOTE_EXCERPT_CHARS. `item` is a non-empty string or a
     dict whose `reason` or `detail` is one; anything else raises `RuleDefect`, the shape
     defect the fold records as the rule's `unknown`."""
@@ -1403,6 +1405,8 @@ def _unknown_entry(item, rule_id: str, entry, can_block: bool) -> dict:
     out[RULE_KEY] = rule_id
     out[ENTRY_KEY] = entry
     out[CAN_BLOCK_KEY] = can_block
+    if holds is not None:
+        out[HOLDS_KEY] = list(holds)
     out[TEXT_KEY] = RULE_PREFIX_FORMAT.format(rule=rule_id, text=readiness_rules.one_line(reason, readiness_rules.NOTE_EXCERPT_CHARS))
     return out
 
@@ -1477,7 +1481,7 @@ def _rule_result(rule, rule_id: str, entry, can_block: bool, holds, cluster: dic
         out["risks"] = out["blocking"] + out["risks"]
         out["blocking"] = []
         out["notes"].append(DEMOTED_BLOCKER_NOTE)
-    out["unknown"] = [_unknown_entry(item, rule_id, entry, can_block) for item in out["unknown"]]
+    out["unknown"] = [_unknown_entry(item, rule_id, entry, can_block, holds) for item in out["unknown"]]
     out["notes"] = [RULE_PREFIX_FORMAT.format(rule=rule_id, text=readiness_rules.one_line(note)) for note in out["notes"]]
     try:
         json.dumps(out, allow_nan=False)

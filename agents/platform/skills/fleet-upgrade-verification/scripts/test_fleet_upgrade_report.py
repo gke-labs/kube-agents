@@ -2413,7 +2413,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertIn("gcloud compute instances list --project=p1 --format=json(name,zone,status) failed (1)", rows[0]["message"])
         self.assertIn("- read failed for p1: gcloud compute instances list", text)
         a = next(m for m in data["members"] if m["cluster"] == "seeded-a")["readiness"]
-        self.assertEqual([(u["rule"], u["can_block"]) for u in a["unknown"]], [("orphan-node-objects", True)])
+        self.assertEqual([(u["rule"], u["can_block"], u["holds"]) for u in a["unknown"]], [("orphan-node-objects", True, ["node-pool"])])  # the audit's join reads `holds` on an unknown too
         self.assertIn("permission denied on p1", a["unknown"][0]["reason"])
         self.assertEqual(a["status"], "unknown")  # a rule that can block could not read: the verdict says so
         self.assertEqual(a["rules"]["orphan-node-objects"], {"entry": 22, "can_block": True, "blocking": 0, "risks": 0, "unknown": 1, "notes": 0})

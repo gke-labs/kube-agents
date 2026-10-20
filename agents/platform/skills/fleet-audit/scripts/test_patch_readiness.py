@@ -1751,6 +1751,23 @@ class UpgradeBlockedTest(unittest.TestCase):
         "text": "lag has been RECONCILING for 6d 3h on operation-1 (UPDATE_CLUSTER, RUNNING since 2026-10-14T00:00:00Z), past the 4h threshold; freeze changes",
     }
 
+    # A rule that can block and could not read, as the fold writes `readiness.unknown` rows.
+    ORPHAN_UNKNOWN = {
+        "rule": "orphan-node-objects",
+        "entry": 22,
+        "can_block": True,
+        "holds": ["node-pool"],
+        "reason": "gcloud compute instances list --project=acme --format=json(name,zone,status) failed (1): ERROR: (gcloud.compute.instances.list) permission denied",
+        "text": "orphan-node-objects: gcloud compute instances list --project=acme --format=json(name,zone,status) failed (1): ERROR: (gcloud.compute.instances.list) permission denied",
+    }
+    STATUS_UNKNOWN = {"rule": "cluster-status-age", "entry": 5, "can_block": True, "holds": ["cluster", "node-pool"], "reason": "status RECONCILING; the operations were not read (forbidden), so what holds it and for how long is unknown", "text": "cluster-status-age: status RECONCILING; the operations were not read (forbidden)"}
+    MATRIX_UNKNOWN = {"rule": "known-issues-matrix", "entry": 10, "can_block": False, "reason": "the DaemonSets were not read (forbidden), so the add-on inventory lists Deployments only", "text": "known-issues-matrix: the DaemonSets were not read (forbidden)"}
+
+    def member_with_unknowns(self, name, unknowns, **kwargs):
+        row = self.member(name, status=kwargs.pop("status", "unknown"), **kwargs)
+        row["readiness"]["unknown"] = list(unknowns)
+        return row
+
     def member_with_rules(self, name, rules, **kwargs):
         row = self.member(name, **kwargs)
         row["readiness"]["rule_blocking"] = list(rules)
@@ -1846,6 +1863,56 @@ class UpgradeBlockedTest(unittest.TestCase):
         readiness = {"status": "blocked", "pdbs": {"blocking": []}, "skew": {"blocking": []}, "rule_blocking": [self.DRAIN_RULE]}
         self.assertIsNone(pr._readiness_cause(readiness, budget_applies=False, moves=(pr.HOLDS_CLUSTER,)))
         self.assertEqual(pr._readiness_cause(readiness, moves=(pr.HOLDS_NODE_POOL,)).rules, [("lb-connection-draining", self.DRAIN_RULE["text"])])
+
+    def test_a_blocking_rules_unknown_is_unevaluated_never_clean(self):
+        """The symmetric case of a rule's block: a rule that can block could not
+        read, on a move the lag makes due. The reporter's `unknown` row with the
+        rule's reason is the gap a failed budget read is; the check is never
+        recorded clean on it."""
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_unknowns("lag", [self.ORPHAN_UNKNOWN])])["lag"]
+        self.assertNotIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        reason = self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK]
+        # The rule's reason, clipped to the ledger's reason length like any other `why`.
+        self.assertTrue(reason.startswith("the readiness reporter could not grade this cluster (readiness rule(s) orphan-node-objects could not grade the move due: gcloud compute instances list --project=acme --format=json(name,zone,status) failed (1)"), reason)
+        self.assertLessEqual(len(reason), len(pr.UNEVALUATED_REASON_FORMAT.format(why="")) + pr.UNEVALUATED_REPORT_MESSAGE_CHARS)
+        self.assertEqual([c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK], [])
+        # Two rules that could not read: both named.
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_unknowns("lag", [self.ORPHAN_UNKNOWN, self.STATUS_UNKNOWN])])["lag"]
+        self.assertIn("readiness rule(s) orphan-node-objects, cluster-status-age could not grade the move due: gcloud compute instances list", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+        # A rule that cannot block: its unknown is in the note, not a gap; the check ran clean.
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [self.member_with_unknowns("lag", [self.MATRIX_UNKNOWN], status="ready")])["lag"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        # On a pool-ahead lag the control plane's move is due: a node-pool rule's unknown is no gap there, a both-moves rule's is.
+        ahead = cluster(name="ahead", master=self.CURRENT, node_pools=[pool("default-pool", "1.31.0-gke.1")])
+        entry = self.collect([ahead], [self.member_with_unknowns("ahead", [self.ORPHAN_UNKNOWN])])["ahead"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        entry = self.collect([ahead], [self.member_with_unknowns("ahead", [self.STATUS_UNKNOWN])])["ahead"]
+        self.assertIn("readiness rule(s) cluster-status-age could not grade the move due", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+        # A row with no `holds` (an older reporter) counts on every lag.
+        legacy = {k: v for k, v in self.ORPHAN_UNKNOWN.items() if k != "holds"}
+        entry = self.collect([ahead], [self.member_with_unknowns("ahead", [legacy])])["ahead"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.unevaluated(entry))
+        # A no-target row (the reporter could not resolve the channel default this run) on a lag a budget can hold
+        # runs clean on the budget half alone; with such an unknown beside it, it is unevaluated, not run clean.
+        row = self.member_with_unknowns("lag", [self.ORPHAN_UNKNOWN])
+        row["target_version"] = None
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [row])["lag"]
+        self.assertIn("readiness rule(s) orphan-node-objects could not grade the move due", self.unevaluated(entry)[pr.UPGRADE_BLOCKED_CHECK])
+
+    def test_a_block_beside_a_rules_unknown_is_still_a_candidate(self):
+        """Blocked beats unknown: a drain blocker beside a rule that could not read is the
+        candidate, and the unknown is no gap on that row."""
+        row = self.member_with_rules("lag", [self.DRAIN_RULE])
+        row["readiness"]["unknown"] = [self.ORPHAN_UNKNOWN]
+        entry = self.collect([cluster(name="lag", master=self.BEHIND)], [row])["lag"]
+        self.assertIn(pr.UPGRADE_BLOCKED_CHECK, self.ran(entry))
+        self.assertNotIn("checks_unevaluated", entry)
+        hit = next(c for c in entry["candidates"] if c["check"] == pr.UPGRADE_BLOCKED_CHECK)
+        self.assertIn("readiness rule lb-connection-draining blocks it", hit["excerpt"])
+        self.assertEqual(pr._rule_unknowns(row["readiness"]), [("orphan-node-objects", self.ORPHAN_UNKNOWN["reason"])])
+        self.assertEqual(pr._rule_unknowns(row["readiness"], (pr.HOLDS_CLUSTER,)), [])
 
     def test_rule_rows_without_a_rule_id_are_not_a_cause(self):
         readiness = {"status": "blocked", "pdbs": {"blocking": []}, "skew": {"blocking": []}, "rule_blocking": ["junk", {"text": "no id"}, {"rule": "", "text": "blank"}]}

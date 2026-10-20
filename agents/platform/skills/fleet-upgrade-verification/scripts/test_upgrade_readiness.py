@@ -1090,6 +1090,10 @@ class ExtraRulesTest(unittest.TestCase):
         folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[holder, silent])
         self.assertEqual([(f["rule"], f.get("holds")) for f in folded["blocking"]], [("holder", ["node-pool"]), ("silent", None)])
         self.assertEqual(folded["unknown"], [])
+        # An `unknown` entry carries the module's HOLDS too, so a reader knows which move the rule could not grade.
+        unread = bare_module("unread", evaluate=returning(unknown=["the instances were not read"]), RULE_ID="unread", ENTRY=22, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[unread, silent])
+        self.assertEqual([(u["rule"], u["can_block"], u.get("holds")) for u in folded["unknown"]], [("unread", True, ["node-pool"])])
         # An attribute whose read itself raises is the same defect under the fold's guard: a
         # module that resolves its names through a module-level `__getattr__` (the lazy-import
         # idiom) and raises there is one unknown under its `__name__`; an ENTRY whose encoding

@@ -358,6 +358,17 @@ RULE_ROW_HOLDS_KEY = "holds"
 HOLDS_CLUSTER = "cluster"
 HOLDS_NODE_POOL = "node-pool"
 HOLDS_BOTH = (HOLDS_CLUSTER, HOLDS_NODE_POOL)
+# The reporter's `readiness.unknown` rows: a rule that could not read, each with the rule's id,
+# whether it could have blocked (`can_block`) and the fold's `holds`. One from a rule that can
+# block, on a move the lag makes due, is the gap a failed budget read is: unevaluated, never
+# clean; a block on the row still wins.
+READINESS_UNKNOWN_KEY = "unknown"
+RULE_ROW_CAN_BLOCK_KEY = "can_block"
+RULE_ROW_REASON_KEY = "reason"
+# The rules first, so their ids survive the reason clip; then each rule's reason.
+UNEVALUATED_RULE_UNKNOWN_FORMAT = "readiness rule(s) {rules} could not grade the move due: {reasons}"
+UNEVALUATED_RULE_UNKNOWN_RULES_SEPARATOR = ", "
+UNEVALUATED_RULE_UNKNOWN_SEPARATOR = "; "
 # Joins the clauses of one cause: every blocking budget, with the skew clause
 # before them when both block.
 CAUSE_SEPARATOR = "; "
@@ -1384,6 +1395,13 @@ def _holds_a_move(row: dict, moves) -> bool:
     return any(move in holds for move in moves)
 
 
+def _rule_unknowns(readiness: dict, moves=HOLDS_BOTH) -> list[tuple[str, str]]:
+    """`(rule id, reason)` for each `readiness.unknown` row from a rule that can block and holds
+    one of `moves`: the rule could not read what it grades, so the member is ungraded on it."""
+    rows = readiness.get(READINESS_UNKNOWN_KEY) or []
+    return [(str(row[RULE_ROW_RULE_KEY]), str(row.get(RULE_ROW_REASON_KEY) or row.get(RULE_ROW_TEXT_KEY) or "")) for row in rows if isinstance(row, dict) and row.get(RULE_ROW_RULE_KEY) and row.get(RULE_ROW_CAN_BLOCK_KEY) and _holds_a_move(row, moves)]
+
+
 def _rule_blocks(readiness: dict, moves=HOLDS_BOTH) -> list[tuple[str, str]]:
     """`(rule id, text)` for each of the reporter's `rule_blocking` rows whose
     rule holds one of `moves`, in the registry's order; a row that is not a
@@ -1942,6 +1960,13 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
         # holds (`holds`): blocked beats unknown here too, so a failed budget
         # read beside it is no gap.
         rule_blocked = readiness.get("status") == READINESS_BLOCKED and bool(_rule_blocks(readiness, due.moves))
+        # The symmetric gap: a rule that can block, on a move the lag makes due, could
+        # not read (a project list the agent's role cannot make or the proxy cut, a
+        # failed describe or server config). The reporter grades the member `unknown`
+        # with the rule's reason; like a failed budget read, that is unevaluated, never
+        # clean. A block on the row still wins, as it does over a failed budget read.
+        rule_unknowns = _rule_unknowns(readiness, due.moves)
+        rule_ungraded = bool(rule_unknowns)
         # `blocked` for something that is neither a budget, skew, a readiness
         # rule's block, nor an exclusion: a cause the reporter learned after
         # this join was written. Recording it as run-and-clean would publish an
@@ -1954,7 +1979,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             why = no_report
         elif member is None:
             why = UNEVALUATED_NO_ROW
-        elif no_target and due.budget_applies and not skew_blocked and not readiness.get("read_error") and not unrecognised_block:
+        elif no_target and due.budget_applies and not skew_blocked and not readiness.get("read_error") and not rule_ungraded and not unrecognised_block:
             # That row on a lag a budget can hold (a behind control plane,
             # or a pool behind its control plane): the target matters only to
             # the ceiling, so the budget half is all that is graded there, and
@@ -1975,7 +2000,7 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # Before the gap arms: a block of unknown cause is the fact to
             # publish, whatever else on the row went ungraded.
             why = UNEVALUATED_UNRECOGNISED_BLOCK
-        elif not skew_blocked and not budget_blocked and not rule_blocked and (budget_ungraded or ceiling_ungraded):
+        elif not skew_blocked and not budget_blocked and not rule_blocked and (budget_ungraded or ceiling_ungraded or rule_ungraded):
             # The reporter's own notes say why a row is `unknown`: the grade's
             # note (no target, so skew and exclusion scope ungraded) and the
             # row's (why there is no target: no channel, or a get-server-config
@@ -1986,7 +2011,8 @@ def _join_readiness(project: str, behind: list[dict], argv: list[str], result: R
             # The read error is the reason only where the budget read was the
             # gap; a pool-ahead row with a failed read and an ungraded ceiling
             # names the ceiling's note, not a read whose answer is discarded.
-            why = str((readiness.get("read_error") if budget_ungraded else None) or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
+            rule_reason = UNEVALUATED_RULE_UNKNOWN_FORMAT.format(rules=UNEVALUATED_RULE_UNKNOWN_RULES_SEPARATOR.join(rule for rule, _ in rule_unknowns), reasons=UNEVALUATED_RULE_UNKNOWN_SEPARATOR.join(reason for _, reason in rule_unknowns)) if rule_ungraded else None
+            why = str((readiness.get("read_error") if budget_ungraded else None) or rule_reason or UNEVALUATED_STATUS_FORMAT.format(status=readiness.get("status"), note=f": {note}" if note else ""))[:UNEVALUATED_REPORT_MESSAGE_CHARS]
         if why is not None:
             log(f"{project}/{entry['_bare_name']}: readiness not graded ({why}); upgrade-blocked unevaluated there")
             _unevaluated(entry, why)
