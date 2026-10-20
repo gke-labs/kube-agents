@@ -335,7 +335,7 @@ locals {
 # operators must be informed so deployments do not fail on ImagePullBackOff.
 check "unmirrored_third_party_images" {
   assert {
-    condition     = var.image_registry == "" || var.third_party_image_registry != ""
+    condition     = trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""
     error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
   }
 }

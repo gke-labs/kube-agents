@@ -185,6 +185,9 @@ class CompositionWiringTest(unittest.TestCase):
     def test_composition_warns_when_image_registry_set_and_third_party_empty(self):
         main_tf = _MAIN_TF.read_text()
         self.assertIn('check "unmirrored_third_party_images"', main_tf)
-        self.assertIn('var.image_registry == "" || var.third_party_image_registry != ""', main_tf)
+        self.assertIn(
+            'trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""',
+            main_tf,
+        )
         self.assertIn('var.image_registry is set', main_tf)
         self.assertIn('var.third_party_image_registry is empty', main_tf)
