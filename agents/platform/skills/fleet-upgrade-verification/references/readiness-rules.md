@@ -145,14 +145,15 @@ new rule adds its entry in that order.
   which) against the major the target's node image ships
   (`upgrade_shape_tables.CONTAINERD_MAJOR_BY_GKE_MINOR`: Linux images at 1.33, Windows Server at
   1.35, GKE's containerd 2 page as the source), paired with every pod or template that mounts a
-  runtime socket (`/run/containerd/containerd.sock`, `/var/run/docker.sock`, either spelling)
-  through a `hostPath` volume. A pool whose major changes under socket clients is a risk naming the
-  pool, both majors and the clients' owners; a change with no client, and clients with no change,
-  are notes; a change on a member whose Pods or DaemonSets were not read is unknown, and since the
-  rule can never block, that unknown goes in the note and leaves the verdict to the other rules.
-  Action: Move the agent to the CRI v1 API, or a build for the target's containerd major, before the
-  pool's major changes under it; a completed pool can be downgraded in place while GKE still offers
-  the previous version.
+  runtime socket (`/run/containerd/containerd.sock`, `/var/run/docker.sock`, either spelling) or the
+  directory it sits in (`/run`, `/var/run`, `/run/containerd`, `/var/run/containerd`) through a
+  `hostPath` volume. A pool whose major changes under socket clients is a risk naming the pool, both
+  majors and the clients' owners; a change with no client, and clients with no change, are notes; a
+  change on a member whose Pods or DaemonSets were not read is unknown, and since the rule can never
+  block, that unknown goes in the note and leaves the verdict to the other rules. Action: Move the
+  agent to the CRI v1 API, or a build for the target's containerd major, before the pool's major
+  changes under it; a completed pool can be downgraded in place while GKE still offers the previous
+  version.
 - `cgroup-v2-runtime` (cgroup v2 under an old runtime), entry 14, risk. Reads: A Java image tag
   below JDK 8u372, 11.0.16 or 15, or a .NET image tag below 5.0, on a pool the target moves to
   cgroup v2 (`effectiveCgroupMode` v1 and a target at or past GKE's 1.33 migration, or a pool pinned

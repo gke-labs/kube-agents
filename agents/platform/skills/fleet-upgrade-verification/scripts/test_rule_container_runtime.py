@@ -104,11 +104,21 @@ class ContainerRuntimeRuleTest(unittest.TestCase):
             deployment_pod("ops", "agent", "n1", volumes=[socket_volume("/var/run/docker.sock")]),
             template("StatefulSet", "db", {"containers": [{"name": "c"}], "volumes": [{"name": "data", "hostPath": {"path": "/mnt/data"}}]}, namespace="ops"),
             template("CronJob", "nightly", {"containers": [{"name": "c"}], "volumes": [socket_volume()]}, namespace="kube-system"),
+            # The socket's directory, mounted whole, reaches it too; a wider mount does not count.
+            template("DaemonSet", "falco", {"containers": [{"name": "c"}], "volumes": [{"name": "containerd-socket", "hostPath": {"path": "/run/containerd"}}, {"name": "var", "hostPath": {"path": "/var"}}]}, namespace="falco"),
+            template("DaemonSet", "cadvisor", {"containers": [{"name": "c"}], "volumes": [{"name": "run", "hostPath": {"path": "/var/run/"}}]}, namespace="monitoring"),
         ]
         self.assertEqual(
             container_runtime.socket_clients(items),
-            [{"owner": "CronJob kube-system/nightly", "paths": ["/run/containerd/containerd.sock"]}, {"owner": "Deployment ops/agent", "paths": ["/var/run/containerd/containerd.sock", "/var/run/docker.sock"]}],
+            [
+                {"owner": "CronJob kube-system/nightly", "paths": ["/run/containerd/containerd.sock"]},
+                {"owner": "DaemonSet falco/falco", "paths": ["/run/containerd"]},
+                {"owner": "DaemonSet monitoring/cadvisor", "paths": ["/var/run/"]},
+                {"owner": "Deployment ops/agent", "paths": ["/var/run/containerd/containerd.sock", "/var/run/docker.sock"]},
+            ],
         )
+        self.assertTrue(all(container_runtime.socket_mount(p) for p in ("/run", "/var/run", "/run/containerd/", "/var/run/containerd", "/var/run/docker.sock")))
+        self.assertFalse(any(container_runtime.socket_mount(p) for p in ("/", "/var", "/mnt/data", "/run/containerd-shim", "")))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ read from its nodes' `status.nodeInfo.containerRuntimeVersion` (or, when the Nod
 not read or no node of the pool reports a runtime, from the table by the pool's minor,
 saying which) with the major the target's node image
 ships, from `upgrade_shape_tables.CONTAINERD_MAJOR_BY_GKE_MINOR` for the pool's image
-family. The workload side is every pod or template mounting a runtime socket through a
+family. The workload side is every pod or template mounting a runtime socket, or the directory
+it sits in (`/run`, `/var/run`, `/run/containerd`, `/var/run/containerd`), through a
 `hostPath` volume, GKE's own agents included. A pool whose major changes at the target
 with socket clients in the cluster is a risk naming the pool, both majors and the
 clients' owners; a change with no client, and clients with no change, are notes; a
@@ -58,6 +59,11 @@ DAEMONSET_READ_KIND = "daemonset"
 SOCKET_CLIENT_KINDS = (KIND_DAEMONSET, KIND_DEPLOYMENT, KIND_STATEFULSET, KIND_CRONJOB)
 # The runtime sockets a node agent mounts; `/var/run` is a link to `/run`, so both spellings.
 SOCKET_PATHS = ("/var/run/docker.sock", "/run/docker.sock", "/run/containerd/containerd.sock", "/var/run/containerd/containerd.sock")
+# The directories a socket sits in, which an agent mounts whole to reach it (Falco mounts
+# `/run/containerd`, Datadog `/var/run/containerd`, cAdvisor-style agents `/var/run` or `/run`);
+# a wider mount (`/var`, `/`) reaches it too and is not read as a runtime client.
+SOCKET_DIRECTORIES = ("/run", "/var/run", "/run/containerd", "/var/run/containerd")
+PATH_SEPARATOR = "/"
 IMAGE_TYPE_KEY = "imageType"
 # `containerd://1.7.34` as a node reports it.
 RUNTIME_VERSION_RE = re.compile(r"^(?P<runtime>[a-z-]+)://(?P<major>\d+)\.")
@@ -77,13 +83,19 @@ UNKNOWN_VERSION = "pool {pool}: version unparsable, so whether its containerd ma
 UNKNOWN_CLIENTS_UNREAD = "pool {pool} ({image}) runs {current} and the target's node image ships containerd {target_major}; {kind} not read ({error}), so whether a pod mounts the runtime socket is unknown"
 
 
+def socket_mount(path: str) -> bool:
+    """Whether a hostPath reaches the runtime socket: the socket itself, or a directory it sits in."""
+    normalized = str(path or "").rstrip(PATH_SEPARATOR) or str(path or "")
+    return normalized in SOCKET_PATHS or normalized in SOCKET_DIRECTORIES
+
+
 def socket_clients(items) -> list[dict]:
-    """Pod owners whose spec mounts a runtime socket through a hostPath volume, from the
-    pods and the templates read, each once."""
+    """Pod owners whose spec mounts a runtime socket, or the directory it sits in, through a
+    hostPath volume, from the pods and the templates read, each once."""
     clients: dict[str, dict] = {}
     specs = [(pod_owner(pod), pod.get("spec") or {}) for pod in active_pods(items)] + template_specs(items, SOCKET_CLIENT_KINDS)
     for owner, spec in specs:
-        paths = sorted({path for path in hostpath_volumes(spec) if path in SOCKET_PATHS})
+        paths = sorted({path for path in hostpath_volumes(spec) if socket_mount(path)})
         if not paths:
             continue
         label = owner_label(owner)
