@@ -55,6 +55,7 @@ NODES_UNREAD_DETAIL = "selects on {label} ({where}); the Node read failed ({reas
 EMPTY_SCOPE_NOTE = "{kind} {object} selects on {label} ({where}) and {scope} has no node today{zero}; not graded as stranded"
 SCALES_FROM_ZERO_TEXT = " (the pool scales from zero)"
 SCOPE_POOLS = "pool(s) {pools}"
+SCOPE_POOLS_MISSING = "pool(s) {pools} (not in the cluster record)"
 SCOPE_CLUSTER = "the cluster"
 POOLS_ALL = "every pool"
 
@@ -116,7 +117,12 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
         pool_names = sorted(p.get("name", "") for p in pools)
         named = rules.selected_values(spec, tables.NODEPOOL_LABEL)
         node_list = [n for n in all_nodes if not named or rules.node_pool(n) in pool_names]
-        scope = SCOPE_POOLS.format(pools=rules.LIST_SEPARATOR.join(pool_names)) if named else SCOPE_CLUSTER
+        if named and not pools:
+            scope = SCOPE_POOLS_MISSING.format(pools=rules.LIST_SEPARATOR.join(named))
+        elif named:
+            scope = SCOPE_POOLS.format(pools=rules.LIST_SEPARATOR.join(pool_names))
+        else:
+            scope = SCOPE_CLUSTER
         seen = set()
         for selector in rules.selectors(spec):
             key, operator, values, where = selector["key"], selector["operator"], selector["values"], selector["where"]

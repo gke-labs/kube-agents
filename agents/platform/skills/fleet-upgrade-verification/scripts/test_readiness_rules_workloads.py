@@ -239,6 +239,11 @@ class RemovedNodeLabelTest(unittest.TestCase):
         out = run(removed_node_label, self.NODES + [ghost], target=parse_version("1.24.0-gke.1"))
         self.assertEqual((out["blocking"], out["unknown"]), ([], []))
         self.assertIn("dropped at 1.24; pool(s) ghost are not in the cluster record, so no pool crosses the drop in this upgrade", out["notes"][0])
+        # The carried question on the same missing pool names it too, rather than printing a blank list.
+        stale = template("Deployment", "stale", {"containers": [busybox()], "nodeSelector": {tables.NODEPOOL_LABEL: "ghost", "team": "ml"}})
+        out = run(removed_node_label, self.NODES + [stale])
+        self.assertEqual((out["blocking"], out["risks"], out["unknown"]), ([], [], []))
+        self.assertEqual(out["notes"], ["Deployment seeded-shapes/stale selects on team=ml (nodeSelector) and pool(s) ghost (not in the cluster record) has no node today; not graded as stranded"])
         # The value that was not dropped, on a key GKE sets from the pool's configuration: no node of
         # the canned list carries it, and that is a pool shape, not this rule's risk.
         containerd = template("Deployment", "containerd-pinned", {"containers": [busybox()], "nodeSelector": {"cloud.google.com/gke-container-runtime": "containerd"}})
