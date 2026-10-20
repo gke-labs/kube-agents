@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -115,8 +116,12 @@ func TestAnswerFeedbackTargetIsTheAskItsPlanNames(t *testing.T) {
 	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-1"); got != origin.TaskID {
 		t.Errorf("target = %q, want the ask's root %q", got, origin.TaskID)
 	}
-	// A second plan of the same ask (its follow-up cards) rates nothing more.
+	// A second plan of the same ask (its follow-up cards) is bound to it,
+	// and rates nothing more.
 	c.MarkConversation("discord:g1/fb12", "plan-2", MarkState{Ask: "diagnose"})
+	if rec, _ := r.g.reg.Get(ctx, "discord:g1/fb12"); rec == nil || rec.notifyChainIndex("plan-2") < 0 {
+		t.Fatal("the second plan's key must be bound to the ask")
+	}
 	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-2"); got != "" {
 		t.Errorf("a second card answer for one ask has target %q, want none", got)
 	}
@@ -129,6 +134,24 @@ func TestAnswerFeedbackTargetIsTheAskItsPlanNames(t *testing.T) {
 	r.g.feedback.Store(nil)
 	if got := c.AnswerFeedbackTarget("discord:g1/fb12", "plan-1"); got != "" {
 		t.Errorf("feedback off: target = %q, want none", got)
+	}
+}
+
+// One card answer per ask: the second claim is refused, and the oldest is
+// forgotten past the cap.
+func TestClaimCardAnswerOncePerAskWithinItsCap(t *testing.T) {
+	d := &feedbackDesk{}
+	if !d.claimCardAnswer("r-0") || d.claimCardAnswer("r-0") {
+		t.Fatal("the first claim must succeed and the second fail")
+	}
+	for i := 1; i <= feedbackCardAnswersMax; i++ {
+		d.claimCardAnswer(fmt.Sprintf("r-%d", i))
+	}
+	if !d.claimCardAnswer("r-0") {
+		t.Error("the oldest claim must be forgotten past the cap")
+	}
+	if d.claimCardAnswer(fmt.Sprintf("r-%d", feedbackCardAnswersMax)) {
+		t.Error("a recent claim must still be held")
 	}
 }
 

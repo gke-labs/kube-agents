@@ -1572,10 +1572,12 @@ rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
-escaped text instead. The gateway answers clicks only on the choice buttons it draws itself
-from a chat message (the Slack adapter section), so a button on such a card would be clicked
-into nothing: the gateway refuses any interactive block or element in raw blocks (an `actions`
-or `input` block, a button, a select, a date or time picker, a text input). The blocks are decoded into slack-go's types and sent again,
+escaped text instead. The gateway answers clicks only on the choice buttons and rating controls
+it draws itself (the Slack adapter section), so a button on such a card would be clicked into
+nothing, or, as a rating block, rate under a task id the sender chose: the gateway refuses any
+interactive block or element in raw blocks (an `actions` or `input` block, a button, a select, a
+date or time picker, a text input, a `context_actions` block and its `feedback_buttons` and
+`icon_button` elements). The blocks are decoded into slack-go's types and sent again,
 so a block type it does not know travels as written and a field it does not model may not. A
 home channel that is not a channel id leaves the route unarmed; the gateway logs
 "chat.notify route not armed" at start.
@@ -2014,7 +2016,7 @@ posts as text (an actionable one), on its last chunk; a key no ask holds is not 
 guessed at; so is a key bound to a chain that did not hand its ask to cards, and a second card
 answer for an ask that already has a rated one (an ask's follow-up cards can settle a second plan),
 which the gateway remembers per process. Some asks go unrated rather than rated wrongly: the notifier keeps the plan in
-memory, so a card that settles an ask after the agent restarted is not flagged (one that sent a progress note since the restart opened a new plan, whose key binds to the conversation's latest ask, and is rated only if that ask was handed to cards too); a last card that
+memory, so a card that settles an ask after the agent restarted is not flagged (one that sent a progress note since the restart opened a new plan, whose key binds to the conversation's latest ask, and is rated only if that ask was handed to cards too, taking that ask's one rated card answer, so its own report then posts unrated); a last card that
 gives up without a hard-wall reason posts no answer to flag; a plan records one answer, at the settle that first finished it, so a card unblocked after it gave up adds no second rated report; the flag is read once, so a report
 whose send is retried goes out unflagged; and a plan's key binds to the conversation's latest ask
 at the plan's first mark, so a follow-up asked before that mark takes the card's answer. Plan rows, progress, a question waiting on the

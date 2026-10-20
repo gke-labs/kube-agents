@@ -1313,15 +1313,17 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// child that never started does not: the room has the never-started
 		// notice, and there is no outcome to hand the session. The turn
 		// that ran the heal then routes against the wake as its active task.
+		// As the relay does: a task, a human turn or a child, that handed
+		// the ask to cards leaves the answer, and its rating, to the card's
+		// report (AnswerFeedbackTarget rates only such a chain).
+		toCards := healedTask != nil &&
+			(cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask)))
+		if toCards {
+			rec.markCardsAnswer(active.TaskID)
+		}
 		switch {
 		case child && healedTask != nil:
 			turns, result, reason := healedChildOutcome(healedTask)
-			// As the relay does: a child that handed the ask to cards leaves
-			// the answer, and its rating, to the card's report.
-			toCards := cardsPending(healedTask.State, healedTerminal) || handedOff(healedTask.State, foldHandedOff(healedTask))
-			if toCards {
-				rec.markCardsAnswer(active.TaskID)
-			}
 			// false: the heal's status card above carries no result text.
 			if woken, why := g.wakeSession(ctx, rec, ref, healedTask.State, turns, result, reason, false, toCards); !woken {
 				g.observeChildEnd(rec, ref, healedTask.State, healedSource, reason, why)
