@@ -1177,7 +1177,11 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         at_the_build = {**record, "currentMasterVersion": f"{minor}.998-gke.1"}
         self.assertEqual(target_patch_valid.evaluate(at_the_build, {}, None, None, context_for(at_the_build, target_text=f"{minor}.998", reads=node_only_reads))["blocking"], [])
         self.assertEqual([f["move"] for f in target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=f"{minor}.998", reads=node_only_reads))["blocking"]], ["control-plane move"])
-        self.assertTrue(target_patch_valid.control_plane_moves(f"{minor}.998", f"{minor}.998-gke.0", node_only_config["validNodeVersions"]) is False or True)  # a build-less target counts as its newest listed build on the channel roster
+        # A build-less target counts as the newest build of its patch the roster lists: above a control plane at build 0 of
+        # the patch (the control plane moves), not above one at that newest build (pools alone move).
+        self.assertTrue(target_patch_valid.control_plane_moves(f"{minor}.998", f"{minor}.998-gke.0", node_only_config["validNodeVersions"]))
+        self.assertFalse(target_patch_valid.control_plane_moves(f"{minor}.998", f"{minor}.998-gke.1", node_only_config["validNodeVersions"]))
+        self.assertTrue(target_patch_valid.control_plane_moves(f"{minor}.998-gke.2", f"{minor}.998-gke.1", node_only_config["validNodeVersions"]))  # a full target is itself
         self.assertEqual([f["version"] for f in target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=f"{minor}.998"))["blocking"]], [f"{minor}.998"])
         self.assertTrue(target_patch_valid.version_listed("1.36.4", ["1.36.4-gke.1495002"]))
         self.assertFalse(target_patch_valid.version_listed("1.36.4", ["1.36.40-gke.1"]))
