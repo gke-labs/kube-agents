@@ -748,7 +748,9 @@ rules). Neither changes the domain streak above.
   when Prow ended the build before the eval loop's verdict (the deadline, an
   abort) or its pod went away; a clean re-run the same date rescues the night.
   A part that lost 2 of its last 3 nights gets one issue for its job, listing
-  the three nights, their run links and where each stopped.
+  the three nights, their run links and where each stopped. A part whose
+  newest night is not among the last 3 nightly dates (its job stopped running)
+  is not judged on its old nights.
 - **A case kept from running.** A case is kept from running on a night when its
   part (the one that last recorded it) ran to its verdict and the case graded
   nothing: every repetition classified as infrastructure, or no line for it. 3

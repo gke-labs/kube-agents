@@ -254,6 +254,7 @@ Nightly report: {nightly_url}
 {triage}"""
 INFRA_NIGHT_LINE = "- {date}: {how} · [run]({run_url})"
 INFRA_CASE_LINE = "- {date}: {reason} · [run]({run_url}) · [transcript]({transcript_url})"
+INFRA_CASE_LINE_NO_TRANSCRIPT = "- {date}: {reason} · [run]({run_url})"
 INFRA_NIGHT_COMMENT = """\
 {marker}
 Again on the {date} nightly: {what} · [run]({run_url}).
@@ -369,11 +370,13 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                 name = task.get("name")
                 if not isinstance(name, str) or name in seen:
                     continue
-                seen.add(name)
                 counts = classify.rep_counts(task)
                 outcome = classify.outcome_of(counts)
                 if outcome not in GRADED_OUTCOMES:
                     continue
+                # Claimed only by a verdict: an ungraded line in one part does
+                # not hide another part's verdict for the case that night.
+                seen.add(name)
                 reasons = []
                 for rep in classify.task_reps(task):
                     reason = classify.clean_reason(rep.get("reason"))[:REASON_MAX_CHARS]
@@ -625,7 +628,8 @@ class Filer:
                     INFRA_CASE_BODY.format,
                     marker=BOT_MARKER.format(kind=KIND_INFRA, field=KEY_CASE, key=case), case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS,
                     job=job, domain=domain, domain_owner=self.infra_domain_owner(domain),
-                    nights_block="\n".join(INFRA_CASE_LINE.format(date=v["date"], reason=quoted(v["reason"]), run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
+                    nights_block="\n".join((INFRA_CASE_LINE if v["transcript_url"] else INFRA_CASE_LINE_NO_TRANSCRIPT).format(
+                        date=v["date"], reason=quoted(v["reason"]), run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
                     nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
                 self.file_infra(KIND_INFRA, case, streak[-1], title, body, streak, closed_issues, result)
 

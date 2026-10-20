@@ -223,6 +223,13 @@ class StreakTest(Harness):
         gh, _, _ = self.run_once(data(*sorted(nights + writers, key=lambda r: r["build_id"])))
         self.assertEqual(len(self.filed(gh)), 1)
 
+    def test_an_ungraded_line_in_one_part_does_not_hide_the_other_parts_verdict(self):
+        # The main part lost case-red to infra; the writers part graded it red.
+        nights = [night(d, [task("case-red", "infra", "infra", "infra")]) for d in (15, 16, 17)]
+        writers = [night(d, [red()], job=WRITERS_JOB, filler=False) for d in (15, 16, 17)]
+        gh, _, _ = self.run_once(data(*sorted(nights + writers, key=lambda r: r["build_id"])))
+        self.assertEqual(len(self.filed(gh)), 1)
+
     def test_infra_reps_are_not_failures_and_an_all_infra_night_is_skipped(self):
         all_infra = task("case-red", "infra", "infra", "infra")
         storm_graded_fail = task("case-red", "fail", "fail", "fail", reason=STORM_REASON)
@@ -569,6 +576,13 @@ class LostJobTest(Harness):
         self.assertIn(WRITERS_JOB, issue["title"])
         self.assertIn("writers part", issue["body"])
 
+    def test_a_part_that_stopped_running_is_not_judged_on_its_stale_tail(self):
+        # The writers job last ran on the 10th-12th, two of them cut off;
+        # main ran clean through the 17th. A week-old tail files nothing.
+        runs = [night(d, [green()]) for d in range(10, 18)] + [night(d, [green("case-red")], job=WRITERS_JOB, truncated=d != 10) for d in (10, 11, 12)]
+        gh, _, _ = self.run_once(data(*sorted(runs, key=lambda r: r["build_id"])))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
     def test_an_open_issue_gets_one_comment_per_later_lost_night_and_one_on_recovery(self):
         issue = {"number": 3980, "title": "t", "body": f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", "created_at": "2026-10-16T12:00:00Z"}
         doc = data(night(15, [green()], truncated=True), night(16, [green()]), night(17, [green()], truncated=True))
@@ -660,6 +674,7 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), *(night(d, []) for d in (15, 16, 17))))
         [issue] = self.filed(gh, infra=True)
         self.assertIn("no line for the case", issue["body"])
+        self.assertNotIn("eval_case-red_rep1.log", issue["body"], "no transcript link for a run that recorded nothing")
 
     def test_nights_before_a_case_first_ran_do_not_count(self):
         gh, _, _ = self.run_once(data(night(15, []), night(16, []), night(17, [infra_task("case-red")])))

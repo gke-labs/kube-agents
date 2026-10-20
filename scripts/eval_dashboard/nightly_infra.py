@@ -159,11 +159,14 @@ def graded(task: dict) -> bool:
 
 def lost_jobs(parts: dict[str, list[dict]]) -> list[dict]:
     """Each part that lost JOB_LOST_MIN of its last JOB_LOST_WINDOW nights:
-    ``{job, part, nights}`` with those nights, oldest first."""
+    ``{job, part, nights}`` with those nights, oldest first. A part whose
+    newest night is not among the newest JOB_LOST_WINDOW dates on record
+    (its job stopped running) is not judged on its stale tail."""
+    recent = set(sorted({n["date"] for ns in parts.values() for n in ns})[-JOB_LOST_WINDOW:])
     out = []
     for part in nightly.PARTS:
         tail = (parts.get(part) or [])[-JOB_LOST_WINDOW:]
-        if len(tail) == JOB_LOST_WINDOW and sum(n["lost"] for n in tail) >= JOB_LOST_MIN:
+        if len(tail) == JOB_LOST_WINDOW and tail[-1]["date"] in recent and sum(n["lost"] for n in tail) >= JOB_LOST_MIN:
             out.append({"job": tail[-1]["job"], "part": part, "nights": tail})
     return out
 
@@ -246,7 +249,8 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str]) -> dict[str, l
                 "build": run.get("build_id"),
                 "job": run.get("job") or nightly.DEFAULT_NIGHTLY_JOB,
                 "run_url": nightly.build_url(run),
-                "transcript_url": nightly.transcript_url(run, case),
+                # An absent case has no transcript: the build recorded nothing.
+                "transcript_url": None if state == STATE_ABSENT else nightly.transcript_url(run, case),
                 "state": state,
                 "reason": reason,
             })
