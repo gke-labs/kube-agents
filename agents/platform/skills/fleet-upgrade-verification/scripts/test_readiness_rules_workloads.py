@@ -14,6 +14,7 @@ import os
 import sys
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import readiness_rules as rules  # noqa: E402
@@ -531,11 +532,38 @@ class GpuDriverMismatchTest(unittest.TestCase):
         self.assertEqual((finding["kind"], finding["object"], finding["cuda"]), ("CronJob", "seeded-shapes/cuda-pinned-trainer", ["12.2"]))
         self.assertEqual(gpu_driver_mismatch.describe(finding), "CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries that accelerator; the target driver cannot be read, and the pin image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked")
 
-    def test_driver_below_the_major_floor_blocks_below_the_toolkit_minimum_is_a_risk_and_served_is_a_note(self):
+    def test_a_floor_the_pool_already_fails_today_is_a_risk_not_this_upgrades_block(self):
+        # DEFAULT is R535 at 1.32 and at 1.33: a CUDA 13.x pin fails on the running node image
+        # too, and the upgrade keeps the driver, so the miss is a risk naming both, not a blocker.
+        out = run(gpu_driver_mismatch, [self.trainer("nvidia/cuda:13.0.0-runtime-ubuntu24.04")], pools=[self.gpu_pool()], target=parse_version("1.33.0-gke.1"))
+        self.assertEqual((out["blocking"], out["unknown"], out["notes"]), ([], [], []))
+        finding = out["risks"][0]
+        self.assertEqual((finding["cuda"], finding["driver"], finding["running_driver"]), ("13.0", 535, 535))
+        self.assertIn("on pool gpu-pool; the running 1.32 node image ships driver R535 (gpuDriverVersion DEFAULT), below the R580 floor for CUDA 13.x, and the target 1.33 node image keeps it: the device does not open today, and the upgrade does not change that", finding["detail"])
+        # A driver that moves and stays below the floor is the same risk, naming both branches.
+        out = run(gpu_driver_mismatch, [self.trainer("nvidia/cuda:13.0.0-runtime-ubuntu24.04")], pools=[self.gpu_pool(version="1.27.3-gke.1")], target=parse_version("1.28.0-gke.1"))
+        self.assertEqual(out["blocking"], [])
+        self.assertIn("the running 1.27 node image ships driver R470 (gpuDriverVersion DEFAULT), below the R580 floor for CUDA 13.x, and the target 1.28 node image ships driver R535, below it too: the device does not open today", out["risks"][0]["detail"])
+
+    def test_a_floor_the_target_newly_falls_below_blocks_and_an_unread_running_branch_grades_the_target_alone(self):
+        # No row of the table as entered ships an older branch at a later minor, so the shape
+        # that newly breaks a served pin is set up on a copy of the COS table.
+        with patch.dict(tables.GKE_COS_GPU_DRIVERS, {(1, 33): (470, 580)}):
+            out = run(gpu_driver_mismatch, [self.trainer()], pools=[self.gpu_pool()], target=parse_version("1.33.0-gke.1"))
+        self.assertEqual((out["risks"], out["unknown"]), ([], []))
+        self.assertEqual((out["blocking"][0]["cuda"], out["blocking"][0]["driver"]), ("12.2", 470))
+        self.assertNotIn("running_driver", out["blocking"][0])
+        self.assertIn("on pool gpu-pool; the target 1.33 node image ships driver R470 (gpuDriverVersion DEFAULT), below the R525 floor for CUDA 12.x; the device does not open", out["blocking"][0]["detail"])
+        # A pool whose running minor the table lacks is graded against the target alone, as the
+        # catalogue's "Before" line defines the check; so is Autopilot, with no pool to read.
+        out = run(gpu_driver_mismatch, [self.trainer("nvidia/cuda:13.0.0-runtime-ubuntu24.04")], pools=[self.gpu_pool(version="1.25.8-gke.1")], target=parse_version("1.33.0-gke.1"))
+        self.assertEqual(([f["cuda"] for f in out["blocking"]], out["risks"]), (["13.0"], []))
+        self.assertIsNone(gpu_driver_mismatch.driver_today(self.gpu_pool(version="1.25.8-gke.1")))
+        self.assertIsNone(gpu_driver_mismatch.driver_today(self.gpu_pool(mode="INSTALLATION_DISABLED")))
+        self.assertEqual(gpu_driver_mismatch.driver_today(self.gpu_pool(mode="LATEST")), 580)
+
+    def test_below_the_toolkit_minimum_is_a_risk_and_served_is_a_note(self):
         target = parse_version("1.33.0-gke.1")
-        out = run(gpu_driver_mismatch, [self.trainer("nvidia/cuda:13.0.0-runtime-ubuntu24.04")], pools=[self.gpu_pool()], target=target)
-        self.assertEqual((out["blocking"][0]["cuda"], out["blocking"][0]["driver"]), ("13.0", 535))
-        self.assertIn("on pool gpu-pool; the target 1.33 node image ships driver R535 (gpuDriverVersion DEFAULT), below the R580 floor for CUDA 13.x; the device does not open", out["blocking"][0]["detail"])
         out = run(gpu_driver_mismatch, [self.trainer("pytorch/pytorch:2.6.0-cuda12.8-cudnn9-runtime")], pools=[self.gpu_pool()], target=target)
         self.assertEqual(out["blocking"], [])
         self.assertIn("below the R570 CUDA 12.8 names; the build runs under minor version compatibility", out["risks"][0]["detail"])

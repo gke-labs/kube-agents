@@ -201,16 +201,20 @@ new rule adds its entry in that order.
   `imageType` and `gpuDriverVersion` (`DEFAULT` or `LATEST`) pick a branch from GKE's per-minor
   table at the target's minor. On Autopilot GKE provisions the node itself, on Container-Optimized
   OS with the driver the template's `cloud.google.com/gke-gpu-driver-version` selector names
-  (`default` when absent), so the same table answers with no pool. A driver below the CUDA major's
-  floor is `blocking`; one below the toolkit's own minimum is a `risk` (minor version
-  compatibility); an image naming no CUDA version, or a Standard template whose accelerator no pool
-  carries, is a `risk`; a target past the driver table's last row (1.33 today, as GKE's GPU page's;
-  read 2026-10-20) is a `risk` naming the page to verify the floor against; a target below the first
-  row, an operator-installed driver, or a record with no install mode is `unknown`. A pin the driver
-  serves is a note, with the reminder that forward-compatibility packages inside the image are not
-  readable from the tag. Action: Match the driver to the images before the upgrade (GKE's driver
-  table at the target minor against NVIDIA's minimum-driver matrix), or recreate the pool with the
-  driver the images need; upgrade a canary GPU pool first.
+  (`default` when absent), so the same table answers with no pool. A target driver below the CUDA
+  major's floor is `blocking` when the pool's running node image (the same table at the pool's own
+  minor) serves the pin, and a `risk` naming both branches when the running driver is below the
+  floor too, since the device does not open today and the upgrade does not change that (Autopilot,
+  with no pool to read, and a running minor the table lacks grade the target alone); one below the
+  toolkit's own minimum is a `risk` (minor version compatibility); an image naming no CUDA version,
+  or a Standard template whose accelerator no pool carries, is a `risk`; a target past the driver
+  table's last row (1.33 today, as GKE's GPU page's; read 2026-10-20) is a `risk` naming the page to
+  verify the floor against; a target below the first row, an operator-installed driver, or a record
+  with no install mode is `unknown`. A pin the driver serves is a note, with the reminder that
+  forward-compatibility packages inside the image are not readable from the tag. Action: Match the
+  driver to the images before the upgrade (GKE's driver table at the target minor against NVIDIA's
+  minimum-driver matrix), or recreate the pool with the driver the images need; upgrade a canary GPU
+  pool first.
 - `in-tree-volumes` (In-tree volumes), entry 19, blocker. Reads: Every PersistentVolume with an
   in-tree `gcePersistentDisk` source, its claim, and the pods and templates that mount the claim,
   against `addonsConfig.gcePersistentDiskCsiDriverConfig.enabled`. With the add-on off, a volume a

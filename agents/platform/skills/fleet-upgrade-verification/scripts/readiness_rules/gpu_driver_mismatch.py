@@ -9,8 +9,14 @@ and the driver from the pools carrying an accelerator the template selects: the 
 `imageType` and `gpuDriverVersion` (DEFAULT or LATEST) pick a branch from GKE's per-minor
 table at the target's minor. On Autopilot GKE provisions the node itself, on
 Container-Optimized OS with the driver the template's `gke-gpu-driver-version` selector names
-(`default` when absent), so the same table answers with no pool. A driver below the CUDA
-major's floor is `blocking`; one below the toolkit's own minimum is a `risk` (the build runs
+(`default` when absent), so the same table answers with no pool. A target driver below the CUDA
+major's floor is `blocking` when the pool's running node image serves the pin (the same table
+at the pool's own minor), since the upgrade is what closes the device; when the running driver
+is below the floor too, the device does not open today and the upgrade keeps or moves the
+driver without changing that, so the miss is a `risk` naming both branches. On Autopilot there
+is no pool to read a running minor from, and a Standard pool whose running minor the table
+lacks reads the same way, so there the target alone grades. A driver below the toolkit's own
+minimum is a `risk` (the build runs
 under minor version compatibility and loses the features newer than the driver); a toolkit
 the minimum table has no row for, above its major's floor, is a note naming the missing row,
 never "serves"; an image
@@ -55,6 +61,9 @@ REASON_NO_TARGET_ROW = "the {image_type} driver table covers {first} to {last}, 
 PAST_TABLE_DETAIL = "requests {resource} with {pins} on {pool}; the {image_type} driver table has no row for {target} (its rows end at {last}); verify the driver floor the pin needs against GKE's GPU page ({source})"
 REASON_UNKNOWN_CUDA = "CUDA {cuda} is outside the table (majors {majors})"
 BLOCKING_DETAIL = "requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), below the {floor} floor for CUDA {major}.x; the device does not open"
+ALREADY_BELOW_DETAIL = "requests {resource} with {pin} on {pool}; the running {running} node image ships driver {current} ({mode}), below the {floor} floor for CUDA {major}.x, and the target {target} node image {change}: the device does not open today, and the upgrade does not change that"
+CHANGE_KEEPS_DRIVER = "keeps it"
+CHANGE_MOVES_DRIVER = "ships driver {driver}, below it too"
 RISK_DETAIL = "requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), below the {minimum} CUDA {cuda} names; the build runs under minor version compatibility and features newer than the driver fail"
 NOTE_SERVED = "{kind} {object} requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), which serves CUDA {cuda}; forward-compatibility packages inside the image are not readable from the tag"
 NOTE_TOOLKIT_UNLISTED = "{kind} {object} requests {resource} with {pin} on {pool}; the target {target} node image ships driver {driver} ({mode}), above the {floor} floor for CUDA {major}.x, but the toolkit table has no row for CUDA {cuda}, so whether it meets the toolkit's own minimum is not graded; a row from NVIDIA's release notes settles it"
@@ -131,12 +140,29 @@ def _table_driver(image_type: str, mode: str, target) -> tuple[int | None, str, 
     return row[0] if mode == tables.GPU_DRIVER_DEFAULT else row[1], "", None
 
 
+def _install_mode(config: dict) -> str | None:
+    """The pool's `gpuDriverVersion`, from the first accelerator that carries one."""
+    modes = {(a.get("gpuDriverInstallationConfig") or {}).get("gpuDriverVersion") for a in config.get("accelerators") or [] if isinstance(a, dict)}
+    return next((m for m in modes if m), None)
+
+
+def driver_today(pool: dict) -> int | None:
+    """The branch the pool's running node image ships: the same table at the pool's own minor.
+    None when the pool's version or install mode is unreadable or the table has no row for that
+    minor, which leaves the pin graded against the target alone."""
+    parsed = pool.get("parsed")
+    config = rules.pool_config(pool)
+    mode = _install_mode(config)
+    if parsed is None or mode not in (tables.GPU_DRIVER_DEFAULT, tables.GPU_DRIVER_LATEST):
+        return None
+    return _table_driver(config.get("imageType") or "", mode, parsed)[0]
+
+
 def driver_at_target(pool: dict, target) -> tuple[int | None, str, str, tuple | None]:
     """(driver branch, install mode text, reason when None, (image type, the table's last minor)
     when the target is past the table) for `pool` at the target's minor."""
     config = rules.pool_config(pool)
-    modes = {(a.get("gpuDriverInstallationConfig") or {}).get("gpuDriverVersion") for a in config.get("accelerators") or [] if isinstance(a, dict)}
-    mode = next((m for m in modes if m), None)
+    mode = _install_mode(config)
     mode_text = MODE_TEXT.format(mode=mode)
     if mode == tables.GPU_DRIVER_INSTALLATION_DISABLED:
         return None, mode_text, REASON_DISABLED, None
@@ -172,7 +198,10 @@ def _unknown(obj: dict, detail: str, **extra) -> dict:
     return finding
 
 
-def _grade_pins(result: dict, obj: dict, pins: list, pool_text: str, driver: int, mode_text: str, target) -> None:
+def _grade_pins(result: dict, obj: dict, pins: list, pool_text: str, driver: int, mode_text: str, target, current: int | None = None, running=None) -> None:
+    """Grades every pin against `driver`, the target's branch; `current` is the branch the pool
+    runs today (`running` its minor) when readable, which tells a floor the upgrade newly falls
+    below (blocking) from one the pool already fails (a risk)."""
     for (major, minor), where in pins:
         cuda = CUDA_FORMAT.format(major=major, minor=minor)
         fields = {"resource": tables.GPU_RESOURCE, "pin": where, "pool": pool_text, "target": rules.minor_text(target), "driver": DRIVER_FORMAT.format(branch=driver), "mode": mode_text, "cuda": cuda, "major": major}
@@ -182,7 +211,11 @@ def _grade_pins(result: dict, obj: dict, pins: list, pool_text: str, driver: int
             result["unknown"].append(_unknown(obj, detail, pool=pool_text, cuda=cuda))
             continue
         minimum = tables.CUDA_TOOLKIT_MIN_DRIVER.get((major, minor))
-        if driver < floor:
+        if driver < floor and current is not None and current < floor:
+            change = CHANGE_KEEPS_DRIVER if current == driver else CHANGE_MOVES_DRIVER.format(driver=fields["driver"])
+            detail = ALREADY_BELOW_DETAIL.format(floor=DRIVER_FORMAT.format(branch=floor), running=rules.minor_text(running), current=DRIVER_FORMAT.format(branch=current), change=change, **fields)
+            result["risks"].append(rules.new_finding(RULE_ID, ENTRY, rules.GRADE_RISK, obj, detail, pool=pool_text, cuda=cuda, driver=driver, running_driver=current))
+        elif driver < floor:
             detail = BLOCKING_DETAIL.format(floor=DRIVER_FORMAT.format(branch=floor), **fields)
             result["blocking"].append(rules.new_finding(RULE_ID, ENTRY, rules.GRADE_BLOCKING, obj, detail, pool=pool_text, cuda=cuda, driver=driver))
         elif minimum is None:
@@ -238,7 +271,7 @@ def evaluate(cluster: dict, member: dict, read, target, context: dict) -> dict:
                 detail = UNKNOWN_DRIVER_DETAIL.format(resource=tables.GPU_RESOURCE, pins=pins_text, pool=pool_text, reason=reason)
                 result["unknown"].append(_unknown(obj, detail, pool=pool.get("name", "")))
                 continue
-            _grade_pins(result, obj, pins, pool_text, driver, mode_text, target)
+            _grade_pins(result, obj, pins, pool_text, driver, mode_text, target, driver_today(pool), pool.get("parsed"))
     return result
 
 
