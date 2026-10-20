@@ -588,11 +588,11 @@ The two flags are separate because the images fall into two groups. `--registry-
 (`image_registry` in tfvars) replaces `ghcr.io/gke-labs/kube-agents` for the images this project
 builds — the operator, the agent, and the credential proxy. `--third-party-registry-prefix`
 (`third_party_image_registry`) covers the ones it does not: the LiteLLM gateway, the fluent-bit
-sidecar, the GitHub token minter, and Hindsight. **Neither implies the other** on the installer
-flags, so an install that mirrors everything passes both, as above. (The chart's own
-`global.thirdPartyImageRegistry` differs here, deliberately: it defaults to
-`global.imageRegistry`.) cert-manager is a separate Helm release the values never reach — see
-the composition README's mirrored-registry section for its recipe.
+sidecar, the GitHub token minter, and Hindsight. **Neither implies the other**, so an install
+that mirrors everything passes both, as above; empty leaves third-party images on their
+upstream registries across the installer, Terraform composition, and Helm chart.
+cert-manager is a separate Helm release the chart values never reach — the composition passes
+`third_party_image_registry` to it when set.
 
 See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
 inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild

@@ -74,11 +74,10 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   full run only, the `rollout` block and the per-member `progress` fields described below. A
   `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
   note where the progress section would be.
-  The file is written whole (a temp file, then a rename) when the run finishes and never
-  before, so a reader never meets a partial document and a run that dies leaves the path as it found
-  it. `/opt/data/scratch` is shared by every card, so an output name you choose carries this run's
-  own timestamp and the shell's PID, as the block above does (a timestamp alone is
-  second-resolution); the path the script prints on its `Wrote … to` line is the one to read back.
+  The file is written whole (a temp file, then a rename) at the end of the run, so a reader never
+  meets a partial document and a run that dies leaves the path as it found it. `/opt/data/scratch`
+  is shared by every card, so an output name you choose carries a timestamp and the shell's PID, as
+  the block above does; read back the path the script prints on its `Wrote … to` line.
   The weekly audit's collector is the exception: it moves its own per-run file onto the fixed name
   described below.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
