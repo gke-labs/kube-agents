@@ -659,6 +659,16 @@ class MainTest(unittest.TestCase):
             probe.assert_not_called()
             ensure.assert_not_called()
 
+    def test_main_refuses_an_abbreviated_flag(self):
+        # The bench credits a run by the flag's full word; argparse's prefix matching would run
+        # the scan on `--vers` and leave the run uncredited.
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            with redirect_stderr(err), self.assertRaises(SystemExit) as exc:
+                scan.main(["--vers", str(Path(tmp) / "absent.json"), "--manifests-dir", tmp])
+        self.assertEqual(exc.exception.code, scan.EXIT_USAGE)
+        self.assertIn("unrecognized arguments: --vers", err.getvalue())
+
 class ScanLeaseTest(unittest.TestCase):
     def test_explicit_lease_is_used_as_given(self):
         self.assertEqual(scan.scan_lease("my lease"), "my-lease")
