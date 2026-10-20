@@ -96,7 +96,8 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
     the newest (a clean re-run rescues its night; a lost re-run does not undo
     a clean build). A night is ``{date, started, finished, build, job, part,
     run_url, lost, how, run, tasks}``; ``tasks`` is ``{case: (task, run)}``
-    over every clean build of the part that date (the newest line wins), so
+    over every clean build of the part that date (the newest graded line
+    wins, else the newest line), so
     two builds with different case sets, such as two halves of one part,
     both count; a lost night's are its own build's. ``unrescued`` is true
     when a job of the part lost its build that date and no clean build of
@@ -117,8 +118,16 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
         if not lost:
             held_tasks = clean_tasks.setdefault((part, day), {})
             for task in classify.run_tasks(run):
-                if isinstance(task.get("name"), str):
-                    held_tasks[task["name"]] = (task, run)
+                name = task.get("name")
+                if not isinstance(name, str):
+                    continue
+                # A later line stands unless it graded nothing and an
+                # earlier one graded the case: a re-run lost to infra does
+                # not undo a verdict (as nightly_bugs.graded_nights reads it).
+                earlier = held_tasks.get(name)
+                if earlier and graded(earlier[0]) and not graded(task):
+                    continue
+                held_tasks[name] = (task, run)
         held = by_part.get(part, {}).get(day)
         if held and lost and not held["lost"]:
             continue
@@ -140,6 +149,12 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
             n["tasks"] = own if n["lost"] else clean_tasks.get((part, day), {})
             n["unrescued"] = bool(jobs_lost.get((part, day), set()) - jobs_clean.get((part, day), set()))
     return {part: [nights[d] for d in sorted(nights)] for part, nights in by_part.items()}
+
+
+def graded(task: dict) -> bool:
+    """Whether the case's line is a verdict: not every repetition infra, and
+    not unrecorded."""
+    return classify.outcome_of(classify.rep_counts(task)) not in (classify.OUTCOME_INFRA, None)
 
 
 def lost_jobs(parts: dict[str, list[dict]]) -> list[dict]:

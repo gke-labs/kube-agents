@@ -768,6 +768,19 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*runs))
         self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
+    def test_a_rerun_lost_to_infra_does_not_undo_a_graded_line(self):
+        # The 00:00 build graded case-red on the 17th; a 09:00 re-run lost
+        # it to infra. The night is graded, as the domain reader reads it.
+        doc = data(night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")]), night(17, [green("case-red")]),
+                   night(17, [infra_task("case-red")], hour="09"))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # The mirror: kept on the cron build, graded on the re-run, is graded.
+        doc = data(night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")]), night(17, [infra_task("case-red")]),
+                   night(17, [green("case-red")], hour="09"))
+        gh, _, _ = self.run_once(doc)
+        self.assertEqual(self.filed(gh, infra=True), [])
+
     def test_a_verdict_carries_the_clock_of_the_build_that_recorded_it(self):
         # case-red is kept on the 00:00 build (finished 00:59); the 09:00
         # build has no line for it. An issue opened at 05:00 already saw the
