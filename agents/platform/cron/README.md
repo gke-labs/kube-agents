@@ -291,8 +291,8 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 ## `upgrade-readiness-weekly-review` and `upgrade-readiness-weekly-brief` are one Saturday in two jobs
 
 The daily watch reads a cluster only while a release channel offers it a version it is below, and
-posts one line per report. The weekly pair reads every cluster in the declared scope whatever its
-version, and ends in one message a person reads.
+posts one line per report. The weekly pair reads every cluster of the roster's projects whatever its
+version (a declared scope refuses a project outside it), and ends in one message a person reads.
 
 `upgrade-readiness-weekly-review` (`0 6 * * 6`) is a `no_agent` script on this pod. It runs the
 `fleet-upgrade-verification` readiness report in the sandbox through the watch's own loader, one
