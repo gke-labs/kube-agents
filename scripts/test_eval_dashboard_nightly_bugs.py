@@ -578,6 +578,7 @@ class LostJobTest(Harness):
         self.assertEqual(issue["labels"], ["nightly-red", "Infra", "needs-triage"])
         self.assertEqual(issue["assignees"], ["ivan"])
         self.assertIn(JOB, issue["title"])
+        self.assertIn("lost 2 of the last 3 nightly dates", issue["title"], "what the rule counts")
         body = issue["body"]
         self.assertIn(f"<!-- kube-agents-bot:nightly-lost job={JOB} -->", body)
         self.assertIn("Infra backup: @iris", body)
@@ -797,18 +798,19 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), night(15, []), night(16, []), night(17, [], filler=False)))
         self.assertEqual(self.filed(gh, infra=True), [])
 
-    def test_a_night_with_two_fifths_of_its_cases_is_skipped_and_three_fifths_counts(self):
-        # The fullest night (the 14th) recorded 5 cases; "under half" of it
-        # is thin, so 2 is skipped and 3 is counted.
+    def test_a_night_missing_three_fifths_of_its_cases_is_skipped_and_two_fifths_counts(self):
+        # The fullest night (the 14th) recorded 5 cases: 3 missing is half
+        # or more graded nothing (skipped), 2 missing is not (counted).
         base = [night(14, [green("case-red")]), night(15, []), night(16, [])]
         two = [green("filler-1"), green("filler-2")]
         gh, _, _ = self.run_once(data(*base, night(17, two, filler=False)))
-        self.assertEqual(self.filed(gh, infra=True), [], "2 of 5: thin")
+        self.assertEqual(self.filed(gh, infra=True), [], "3 of 5 missing: skipped")
         gh, _, _ = self.run_once(data(*base, night(17, two + [green("filler-3")], filler=False)))
-        self.assertEqual(len(self.filed(gh, infra=True)), 1, "3 of 5: counted")
+        self.assertEqual(len(self.filed(gh, infra=True)), 1, "2 of 5 missing: counted")
 
     def test_exactly_half_infra_is_a_pool_wide_night_and_a_quarter_is_not(self):
-        base = [night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")])]
+        # Four cases every night: the 17th's 2 infra of 4 is exactly INFRA_EVENT_FRACTION.
+        base = [night(d, [infra_task("case-red"), green("filler-1"), green("filler-2"), green("filler-3")], filler=False) for d in (15, 16)]
         half = [infra_task("case-red"), infra_task("filler-1"), green("filler-2"), green("filler-3")]
         gh, _, _ = self.run_once(data(*base, night(17, half, filler=False)))
         self.assertEqual(self.filed(gh, infra=True), [], "2 of 4 infra: half or more, skipped")

@@ -17,10 +17,10 @@ not run or was lost (the job itself did not run, or one job of the part
 lost its build and no clean build of that job followed), when the night
 predates the case's first recorded night in the window (a case new to the
 matrix, or back on it, is not "never graded" on the nights it was not on
-it), when infrastructure took at least INFRA_EVENT_FRACTION of the part's
-cases (a pool-wide outage, which is not one case's problem), or when the
-part recorded under THIN_NIGHT_FRACTION of the cases its fullest night in
-the window did. A graded night ends the streak.
+it), or when infrastructure took at least INFRA_EVENT_FRACTION of the
+part's cases, counting the cases with no line against its fullest night in
+the window (a pool-wide outage or a short run, which is not one case's
+problem). A graded night ends the streak.
 
 Neither shape touches the domain streak: ``nightly_bugs.graded_nights``
 still drops every infrastructure repetition before it calls a night failing.
@@ -49,11 +49,6 @@ INFRA_STREAK_NIGHTS = 3
 # at all -- is a pool-wide infrastructure event: skipped for every case. The
 # worst nightly night of 2026-10-10..19 had 4 of 81 cases ungraded.
 INFRA_EVENT_FRACTION = 0.5
-# A part night that recorded fewer than this fraction of the cases the
-# part's fullest night in the window recorded (zero included) ran short in a
-# way no other rule names: every missing case would read "absent", so the
-# night is skipped for every case instead.
-THIN_NIGHT_FRACTION = 0.5
 # Verdicts of a case on an eligible night.
 STATE_INFRA = "infra"
 STATE_ABSENT = "absent"
@@ -192,10 +187,6 @@ def infra_event(tasks: list[dict], fullest: int) -> bool:
     return bool(size) and (ungraded + size - len(tasks)) / size >= INFRA_EVENT_FRACTION
 
 
-def thin_night(tasks: list, fullest: int) -> bool:
-    return len(tasks) < THIN_NIGHT_FRACTION * fullest or not tasks
-
-
 def case_homes(parts: dict[str, list[dict]]) -> dict[str, tuple[str, datetime.date]]:
     """``{case: (the part that last recorded it, the first date it was
     recorded)}`` over the window's nights only: a case dropped from the
@@ -237,7 +228,7 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
     for part, nights in parts.items():
         fullest = max((len(n["tasks"]) for n in nights), default=0)
         eligible[part] = {n["date"]: n for n in nights if not n["lost"] and not n["unrescued"]
-                          and not infra_event([t for t, _ in n["tasks"].values()], fullest) and not thin_night(list(n["tasks"]), fullest)}
+                          and not infra_event([t for t, _ in n["tasks"].values()], fullest)}
     every = {part: {n["date"]: n for n in nights} for part, nights in parts.items()}
     dates = sorted({n["date"] for nights in parts.values() for n in nights})
     out: dict[str, list[dict]] = {}
@@ -253,7 +244,7 @@ def case_verdicts(parts: dict[str, list[dict]], cases: list[str], tracked: dict[
                 continue
             recorders = [p for p in nightly.PARTS if case in every.get(p, {}).get(day, {}).get("tasks", {})]
             # A graded line is direct evidence the case ran: it claims the
-            # date even on a pool-wide, thin or unrescued night (not a lost
+            # date even on a pool-wide or unrescued night (not a lost
             # one, whose lines the domain reader skips too), so "a graded
             # night ends the streak" holds whatever the night's other cases did.
             graders = [p for p in recorders if not every[p][day]["lost"] and graded(every[p][day]["tasks"][case][0])]

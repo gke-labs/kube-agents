@@ -53,8 +53,8 @@ write).
 labelled `nightly-red`, `Infra` and `needs-triage` instead of a domain label,
 assigned to ``infra_owner`` in domains.yaml with ``infra_backup`` mentioned:
 
-    a part of the nightly (main, writers) lost JOB_LOST_MIN of its last
-    JOB_LOST_WINDOW nights -- cut off before its verdict, or its pod lost
+    a part of the nightly (main, writers) lost JOB_LOST_MIN of the last
+    JOB_LOST_WINDOW nightly dates -- cut off before its verdict, or its pod lost
     -> one issue for the job; a comment on each later lost night, and one
        when a later night runs to its verdict
 
@@ -244,10 +244,10 @@ INFRA_CASE_BODY = """\
 Nightly report: {nightly_url}
 
 {triage}"""
-INFRA_JOB_TITLE = "Nightly infra: {job} lost {lost} of its last {nights} nights"
+INFRA_JOB_TITLE = "Nightly infra: {job} lost {lost} of the last {nights} nightly dates"
 INFRA_JOB_BODY = """\
 {marker}
-The nightly's {part} part (`{job}`) lost {lost} of its last {nights} nights: Prow ended the build before the eval loop's verdict (the job deadline, an abort) or the pod went away, so the cases it had not reached were never graded.
+The nightly's {part} part (`{job}`) lost {lost} of the last {nights} nightly dates: Prow ended the build before the eval loop's verdict (the job deadline, an abort) or the pod went away, so the cases it had not reached were never graded.
 
 {addressee}
 

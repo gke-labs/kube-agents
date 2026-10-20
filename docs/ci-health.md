@@ -768,10 +768,9 @@ rules). Neither changes the domain streak above.
   predates the case's first recorded night in the last 14 (a case new to the
   matrix, or back on it), when infrastructure took half or more of the part's
   cases, counting the all-infra lines and the cases with no line against its
-  fullest night in the window (a pool-wide outage, which is not one case's
-  problem), or when the part recorded under half the cases of that fullest
-  night (a short run would otherwise make every missing case "absent"). A
-  graded line counts even on such a night, and a graded night ends the
+  fullest night in the window (a pool-wide outage, or a short run that would
+  otherwise make every missing case "absent"; neither is one case's
+  problem). A graded line counts even on such a night, and a graded night ends the
   streak. A case with an open kept-case issue is still read when no night in
   the window recorded it, so the issue keeps its notes and its recovery.
   `expected_fail` cases and cases off the matrix are not filed (an issue
