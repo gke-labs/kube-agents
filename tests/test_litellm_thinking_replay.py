@@ -1,9 +1,10 @@
 """The gateway keeps a Gemini model's replayed thinking out of the request, and only Gemini's.
 
-LiteLLM's Gemini transformation sends a replayed thinking block as an ordinary
-text part, so Gemini reads its earlier thought summaries as answer text and
-repeats them. The chart and the kustomize base mount a pre-call hook that drops
-those blocks from assistant messages bound for a Gemini model. These tests
+LiteLLM's Gemini transformation before v1.106.0 sent a replayed thinking block
+as an ordinary text part, so Gemini read its earlier thought summaries as
+answer text and repeated them. The chart and the kustomize base still mount a
+pre-call hook that drops those blocks from assistant messages bound for a
+Gemini model; the hook's header says why it stays. These tests
 hold the hook's behaviour, that both deployment paths ship the same file and
 register it, and that every chart render carries it. The render cases need
 `helm` and skip without it.

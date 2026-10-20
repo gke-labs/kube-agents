@@ -291,12 +291,29 @@ def parse_args(argv=None):
 
 
 def react(api, args, content):
+    """Put `content` on the `/retest` comment, if this run has one.
+
+    The reaction is decoration on a run that has already done its work, so a
+    refusal is a warning, not a failure: the first two `/retest` comments
+    after the workflow merged declined correctly and then exited red on a 403
+    from this call, which read as the command being broken. The re-run
+    result and the decline reason are already on the run; the person loses
+    the emoji, and the warning says so.
+    """
     if not args.react_to:
         return
     if args.dry_run:
         log(f"--dry-run: would react {content} to comment {args.react_to}")
         return
-    api.post(f"/repos/{args.repo}/issues/comments/{args.react_to}/reactions", {"content": content})
+    try:
+        api.post(f"/repos/{args.repo}/issues/comments/{args.react_to}/reactions", {"content": content})
+    except urllib.error.HTTPError as error:
+        if not is_refusal(error):
+            raise
+        message = f"Could not react {content} to comment {args.react_to}: GitHub refused ({error.code}: {refusal_message(error)})"
+        log(message)
+        warn([message])
+        summarize([message])
 
 
 def summarize(lines):
