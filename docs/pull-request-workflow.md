@@ -696,10 +696,13 @@ it lands on, and in a batch with the other pulls, is not tested before the merge
 on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.
 Neither carries a verdict across a change to what the job grades. When the blocking job's
 `spec.mode` changes in `oss-test-infra` (the swap to `next`, or a rollback to `today`), set the
-repository variable `SMOKE_PIN_NOT_BEFORE` to the UTC time it merged, never earlier, so the re-pin
-leaves every older green stale, and ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so
-the retests Tide then starts run the matrix instead of reusing the old green; drop the lever in a
-follow-up once the open queue has run under the new mode, about a week.
+repository variable `SMOKE_PIN_NOT_BEFORE` right after it merges, to that merge time plus the job's
+360-minute timeout (a run in flight at the change reports afterwards; later only costs retests),
+then dispatch `smoke-test-sticky.yml` by hand: the re-pin then never pins an older green, and makes
+one Tide still credits stale, which the change itself would not, as it moves nothing on `main`.
+Ship the change with `EVAL_SKIP_REVALIDATION=1` on the job, so the retests Tide then starts run the
+matrix instead of reusing the old green, and drop that lever in a follow-up once the open queue
+has run under the new mode, about a week.
 Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.

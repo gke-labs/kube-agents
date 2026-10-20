@@ -337,6 +337,36 @@ class MainTest(unittest.TestCase):
         self.assertEqual(self._run_with_cutoff(api, ["status", "--sha", HEAD, "--status-id", "1"], "2026-10-20T00:00:00Z"), 0)
         self.assertEqual(api.posts, [])
 
+    def test_a_pre_cutoff_green_tide_still_credits_is_expired(self):
+        """Pinned to the head of main before the swap, it would merge with no
+        retest, since the swap moves nothing on main: it is re-posted with no
+        base, which Tide reads as stale, and a later sweep leaves it alone."""
+        credited = status(description=f"Job succeeded. BaseSHA:{MAIN}", created_at="2026-10-20T13:00:00Z")
+        api = FakeAPI(statuses={HEAD: [credited]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T14:00:00Z"), 0)
+        self.assertEqual(len(api.posts), 1)
+        posted = api.posts[0][1]
+        self.assertNotIn("BaseSHA:", posted["description"])
+        self.assertIn(pin.EXPIRED_NOTE, posted["description"])
+        self.assertEqual((posted["state"], posted["target_url"]), ("success", URL))
+        self.assertLessEqual(len(posted["description"]), pin.MAX_DESCRIPTION)
+        # The expired copy is newer than the cutoff, and still never pinned.
+        api = FakeAPI(statuses={HEAD: [status(id=2, description=posted["description"], created_at="2026-10-20T15:00:00Z")]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T14:00:00Z"), 0)
+        self.assertEqual(api.posts, [])
+
+    def test_a_late_status_event_expires_its_own_commit(self):
+        """A run in flight at the swap reports after it, at a base that may be main's head."""
+        credited = status(description=f"Job succeeded. BaseSHA:{MAIN}", created_at="2026-10-20T13:00:00Z")
+        api = FakeAPI(statuses={HEAD: [credited]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run_with_cutoff(api, ["status", "--sha", HEAD, "--status-id", "1"], "2026-10-20T14:00:00Z"), 0)
+        self.assertIn(pin.EXPIRED_NOTE, api.posts[0][1]["description"])
+
+    def test_without_a_cutoff_an_expired_status_is_still_not_pinned(self):
+        api = FakeAPI(statuses={HEAD: [status(description=f"Job succeeded. {pin.EXPIRED_NOTE}")]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run(api, ["sweep"]), 0)
+        self.assertEqual(api.posts, [])
+
     def test_a_status_with_no_creation_time_is_not_pinned_under_a_cutoff(self):
         api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)])
         self.assertEqual(self._run_with_cutoff(api, ["sweep"], "2026-10-20T00:00:00Z"), 0)

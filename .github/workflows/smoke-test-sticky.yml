@@ -46,13 +46,17 @@ name: Smoke Test Sticky Status
 # A green from before the blocking job changed spec.mode is not pinned once
 # the repository variable SMOKE_PIN_NOT_BEFORE holds the UTC time of that
 # change (scripts/pin_smoke_status.py's docstring): a verdict about the other
-# mode must reach the merge through a retest, not a re-pin.
+# mode must reach the merge through a retest, not a re-pin. A green Tide still
+# credits is expired instead (made stale); the swap moves nothing on `main`, so
+# dispatch this workflow by hand once the variable is set to run that sweep
+# without waiting for a merge.
 #
 # A status created with GITHUB_TOKEN does not fire `status` again, so the
 # re-post cannot loop; a push to `main` is only ever Tide's merge.
 
 on:
   status:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -63,14 +67,14 @@ jobs:
   pin:
     name: Pin green smoke-test statuses to the head of main
     # The repository guard is required of any credentialed workflow that starts
-    # on its own (AGENTS.md, Pull Request Hygiene). A push to main always
-    # sweeps; a status event qualifies only when it is the smoke test and green
+    # on its own (AGENTS.md, Pull Request Hygiene). A push to main or a manual
+    # dispatch sweeps; a status event qualifies only when it is the smoke test and green
     # -- an admin override included -- the script checks the same things again
     # and is the reference, this expression is what keeps the other statuses
     # off a runner.
     if: >-
       github.repository == 'gke-labs/kube-agents' &&
-      (github.event_name == 'push' ||
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
         (github.event.context == 'pull-kube-agents-smoke-test' &&
           github.event.state == 'success'))
     runs-on: ubuntu-latest
@@ -90,7 +94,7 @@ jobs:
       # script reads the head of main just before each write rather than
       # pinning to the head this run started with.
       - name: Re-pin every open pull request after the merge
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SMOKE_PIN_NOT_BEFORE: ${{ vars.SMOKE_PIN_NOT_BEFORE }}

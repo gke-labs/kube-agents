@@ -61,12 +61,21 @@ for the next merge; the failure still sets the exit status.
 
 A green from before the gate changed what it grades is not pinned at all.
 When the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time
-(`2026-10-20T14:00:00Z`), a status created before it is left stale, so Tide
-retests the pull request rather than merging it on a verdict about the other
-mode: set it to the moment the blocking job's spec.mode changed in
-oss-test-infra (the swap to next, or a rollback to today), never earlier.
-Leaving it set afterwards is harmless, as every older status has long been
-superseded. An unparsable value pins nothing and exits non-zero.
+(`2026-10-20T14:00:00Z`), a status created before it is never re-pinned, and
+one Tide still credits -- its base already the head of `main`, because it ran
+there or was pinned there before the change, and the change itself, in
+oss-test-infra, moves nothing on `main` -- is expired: re-posted with no base
+and EXPIRED_NOTE, which Tide reads as stale and this never pins again. So
+Tide retests the pull request rather than merging it on a verdict about the
+other mode. The time has to be later than the blocking job's spec.mode change
+(the swap to next, or a rollback to today) AND than the last run that started
+under the old mode can report, because a re-pin made before the variable was
+set, and a run in flight at the change, both create their status after the
+change: set it, right after the change merges, to that merge time plus the
+job's timeout. Later only costs retests. The sweep a push to `main` starts
+and the manual dispatch of the workflow both expire what they find, and a
+late status event expires its own commit. Leaving the variable set afterwards
+is harmless. An unparsable value pins nothing and exits non-zero.
 """
 
 import argparse
@@ -99,6 +108,8 @@ HOLD_LABEL_PREFIX = "do-not-merge"
 SHORT_SHA = 8
 #: The cutoff (module docstring): a status created before this UTC time is not pinned.
 NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
+#: What an expired status says in place of a base; a status carrying it is never pinned again.
+EXPIRED_NOTE = "(predates SMOKE_PIN_NOT_BEFORE: retest)"
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
@@ -144,19 +155,34 @@ def not_before_from_env(environ=os.environ):
     return parse_utc(raw) if raw else None
 
 
+def predates(status, not_before):
+    """Whether `status` was created before the cutoff; an unreadable creation time counts as before."""
+    if not_before is None or status is None:
+        return False
+    try:
+        return parse_utc(status.get("created_at") or "") < not_before
+    except ValueError:
+        return True
+
+
+def expired_description(description):
+    """The same human-readable text with EXPIRED_NOTE and no base, within GitHub's limit."""
+    human, _ = split_description(description)
+    human = " ".join(human.replace(EXPIRED_NOTE, "").split())
+    room = MAX_DESCRIPTION - len(EXPIRED_NOTE) - 1
+    return f"{human[:room].rstrip()} {EXPIRED_NOTE}".strip()
+
+
 def skip_reason(status, main_sha, not_before=None):
     """Why a status is left alone, or None when it should be pinned."""
     if status is None:
         return f"no {CONTEXT} status on the commit"
     if status.get("state") != SUCCESS:
         return f"state is {status.get('state')!r}, not {SUCCESS}"
-    if not_before is not None:
-        try:
-            created = parse_utc(status.get("created_at") or "")
-        except ValueError:
-            return f"no readable created_at beside {NOT_BEFORE_ENV}"
-        if created < not_before:
-            return f"created {status.get('created_at')}, before {NOT_BEFORE_ENV} ({not_before.isoformat()})"
+    if EXPIRED_NOTE in (status.get("description") or ""):
+        return f"expired under {NOT_BEFORE_ENV}; a retest replaces it"
+    if predates(status, not_before):
+        return f"created {status.get('created_at') or 'at an unreadable time'}, before {NOT_BEFORE_ENV} ({not_before.isoformat()})"
     _, base_sha = split_description(status.get("description") or "")
     if base_sha == main_sha:
         return "already pinned to the head of main"
@@ -211,6 +237,8 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
     if status_id is not None and status is not None and str(status.get("id")) != str(status_id):
         return f"{sha[:SHORT_SHA]}: status {status_id} is no longer the latest (now {status.get('id')}); leaving it"
     reason = skip_reason(status, _NO_MAIN, not_before)
+    if reason and status is not None and status.get("state") == SUCCESS and predates(status, not_before):
+        return _expire(api, sha, status, main_sha, expected_main, reason, dry_run)
     if reason:
         return f"{sha[:SHORT_SHA]}: {reason}"
     main_now = expected_main if expected_main is not None else _resolve(main_sha)
@@ -234,6 +262,27 @@ def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True,
     if not dry_run:
         api.post(f"/repos/{api.repo}/statuses/{sha}", payload)
     return f"{sha[:SHORT_SHA]}: pinned to {main_sha[:SHORT_SHA]}: {payload['description']}"
+
+
+def _expire(api, sha, status, main_sha, expected_main, reason, dry_run):
+    """Make a pre-cutoff green stale if Tide still credits it (its base is the head of main)."""
+    _, base_sha = split_description(status.get("description") or "")
+    main_now = _resolve(main_sha) if callable(main_sha) or expected_main is None else expected_main
+    if base_sha is None or base_sha != main_now:
+        return f"{sha[:SHORT_SHA]}: {reason}; already stale, so Tide retests it"
+    latest = latest_status(api, sha)
+    if latest is None or str(latest.get("id")) != str(status.get("id")):
+        newer = latest.get("id") if latest else "none"
+        return f"{sha[:SHORT_SHA]}: status {status.get('id')} was superseded while deciding (now {newer}); leaving it"
+    payload = {
+        "state": SUCCESS,
+        "context": CONTEXT,
+        "target_url": status.get("target_url") or "",
+        "description": expired_description(status.get("description")),
+    }
+    if not dry_run:
+        api.post(f"/repos/{api.repo}/statuses/{sha}", payload)
+    return f"{sha[:SHORT_SHA]}: {reason}; expired: {payload['description']}"
 
 
 def in_tide_pool(pull_request):

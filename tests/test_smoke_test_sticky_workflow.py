@@ -46,8 +46,8 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
         self.condition = self.job["if"]
         self.steps = {step["name"]: step for step in self.job["steps"]}
 
-    def test_it_starts_on_status_events_and_pushes_to_main_only(self):
-        self.assertEqual(sorted(self.triggers), ["push", "status"])
+    def test_it_starts_on_status_events_pushes_to_main_and_a_manual_dispatch(self):
+        self.assertEqual(sorted(self.triggers), ["push", "status", "workflow_dispatch"])
         self.assertEqual(self.triggers["push"], {"branches": ["main"]})
 
     def test_the_job_carries_the_fork_guard(self):
@@ -75,7 +75,7 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
 
     def test_a_push_sweeps_and_a_status_pins_one_commit(self):
         sweep = self.steps["Re-pin every open pull request after the merge"]
-        self.assertEqual(sweep["if"], "github.event_name == 'push'")
+        self.assertEqual(sweep["if"], "github.event_name == 'push' || github.event_name == 'workflow_dispatch'")
         self.assertEqual(sweep["run"].strip(), f"python3 {_SCRIPT} sweep")
         one = self.steps["Re-pin this commit's green if main has already moved"]
         self.assertEqual(one["if"], "github.event_name == 'status'")
