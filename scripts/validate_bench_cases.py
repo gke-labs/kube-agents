@@ -161,6 +161,9 @@ KNOWN_UNREGISTERED = {
     # pool project's repository has one. Runs on the GitOps-wired dev lane
     # (ka-fleet-dev-1, sackheads/kage-fleet-dev at branch hcl) for #2936's
     # eval record.
+    "terraform-replacing-change-stops": (
+        "#2936: dev-lane case; the pool projects' GitOps repositories hold no Terraform"
+    ),
     "terraform-node-pool-autoscaling-pr": (
         "#2936: dev-lane case; the pool projects' GitOps repositories hold no Terraform"
     ),
