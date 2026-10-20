@@ -922,8 +922,8 @@ class TheTick(unittest.TestCase):
         self.assertNotIn(numbered, latest.get("project_failures") or {})
 
     def test_a_number_that_runs_first_reads_the_project_and_the_id_is_not_run_again(self):
-        """Last week's budget put the number ahead of the id: the number reads the project
-        under its id, and the id spelling is the same project, already read."""
+        """Last week's budget put the number ahead of the id: the number runs first, asked for
+        by the id the watch learned, and the id spelling is the same project, already read."""
         numbered = "123456789012"
         ledger = watch.empty_ledger()
         ledger[watch.PROJECT_IDS_KEY] = {numbered: PROJECT}
@@ -938,7 +938,7 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(review, "ordered_names", side_effect=lambda names, previous: [numbered, PROJECT]), mock.patch.object(watch, "projects", return_value=[numbered, PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
             code, out = self.run_main()
         self.assertEqual((code, out), (0, ""))
-        self.assertEqual(calls, [numbered])
+        self.assertEqual(calls, [PROJECT])  # the number's run, by its learned id; the id spelling is not run again
         report = (review.weekly_home() / review.LATEST_MD_NAME).read_text()
         self.assertIn("### acme-prod", report)  # the id the rows carry heads the table
         self.assertNotIn(f"### {numbered}", report)
@@ -992,9 +992,31 @@ class TheTick(unittest.TestCase):
         self.assertEqual(latest["projects"], [PROJECT])
         self.assertEqual(len(latest["clusters"]["reviewed"]), 2)
 
+    def test_on_an_undeclared_install_a_number_the_watch_learned_is_asked_for_by_its_id(self):
+        """An id needs no describe: asked for by the number, a describe that fails on Saturday
+        returns the number's clusters beside a listing row, and the project goes unread."""
+        numbered = "123456789012"
+        self.learn_ids({numbered: PROJECT})
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            if names[0] == numbered:
+                return {"exit": 0, "tables": "", "report": {"members": [member("ghost", "blocked", project=numbered, pdbs={"blocking": [budget()]})], "errors": [{"project": numbered, "location": None, "message": f"describe {numbered}: PERMISSION_DENIED"}]}}
+            return {"exit": 0, "tables": "| t |", "report": {"projects": [PROJECT], "members": [seeded_b(), member("seeded-c")], "errors": []}}
+
+        with mock.patch.object(watch, "projects", return_value=[numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(calls, [PROJECT])
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["project_failures"], {})
+        self.assertEqual(len(self.registered), 2)
+
     def test_a_project_that_failed_is_not_run_again_by_its_other_spelling(self):
-        """On any install: a second run would replace the first failure's cause, and a budget
-        that cut the second short would move the project ahead of every other next week."""
+        """Where the watch's ledger maps the number, declared scope or not: a second run would
+        replace the first failure's cause, and a budget that cut the second short would move
+        the project ahead of every other next week."""
         numbered = "123456789012"
         self.learn_ids({numbered: PROJECT})
         calls = []
@@ -1010,7 +1032,9 @@ class TheTick(unittest.TestCase):
         self.assertIn("failed: acme-prod: sandbox exited 137: OOMKilled", out)
         self.assertNotIn(numbered, out)
 
-    def test_a_project_whose_two_spellings_both_fail_is_counted_once_beside_a_project_read(self):
+    def test_a_project_that_failed_is_counted_once_beside_a_project_read(self):
+        """The ledger maps the number to the id that failed, so the number is not run, and the
+        partial line, the record's failures and its projects name the project once."""
         numbered = "123456789012"
         self.learn_ids({numbered: PROJECT})
 

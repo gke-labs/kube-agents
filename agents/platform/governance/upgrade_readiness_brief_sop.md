@@ -129,7 +129,7 @@ has a decision.` and the brief is shorter.
   headline says how many findings are in the report but not on the queue, and a critical among them
   goes under **Decide now** by its object (it has no id to reply with), with "not on the queue"
   after it: a user who dismisses it in chat has nothing to dismiss. A `registration_errors` entry
-  that says a clean read's claim did not reach the queue is a cluster whose last week's rows stand
+  that says a completeness claim did not reach the queue is a cluster whose last week's rows stand
   at full confidence; count those clusters in the headline, not as findings.
 - **Never invent.** Every id comes from the summary or the queue; every count comes from the
   summary. If the queue and the summary disagree on a row's state, the queue wins and you say
@@ -169,7 +169,7 @@ its shape is the one in section 3, kept identical by a test.
   findings (a drain-blocking budget over a single replica, a pool past the skew ceiling and a
   fail-closed webhook in the upgrade's path are critical; a budget over several replicas, a webhook
   refusing only what it matches today and a pool at the ceiling are major; a covering exclusion is
-  minor; a rule's risk takes the severity the review's rubric gives its catalogue entry), read the queue
+  minor; a rule's blocker is critical, and its risk takes the severity the review's rubric gives its catalogue entry), read the queue
   for any decision already recorded, and compose the same shape. Say "live brief, composed now; the
   weekly review has not run" in the headline, use the object's name where the queue would have an
   id, close with the live form of the last line (there is no report file and no id to reply with

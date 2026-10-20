@@ -109,9 +109,11 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        # The closing line's decision words, or the live brief's form of that
-        # line (no queue record yet, so no id to decide with until Saturday).
-        - "(?is)\\bdismiss\\b.{0,200}?\\bsnooze\\b.{0,200}?\\baccept\\b"
+        # The three decision words, in any order (what went red was their
+        # absence; "0 accepted, 0 snoozed, 0 dismissed" is not a match), or the
+        # live brief's form of the closing line (no queue record yet, so no id
+        # to decide with until Saturday).
+        - "(?is)(?=.*\\bdismiss\\b)(?=.*\\bsnooze\\b)(?=.*\\baccept\\b)"
         - "(?i)each gets an id you can decide with"
   - name: no-invented-cves
     role: objective

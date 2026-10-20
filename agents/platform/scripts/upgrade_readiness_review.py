@@ -38,7 +38,8 @@ job does not know the manifest that declares the object.
 Where it runs. On the agent pod, from the Platform Agent's roster, as the
 daily watch does: the readiness report itself runs in the shell sandbox
 through the watch's own loader (``upgrade_readiness_watch.run_report``), one
-run per project in the declared scope, and its JSON comes back here. Nothing
+run per roster project (a declared scope refuses any project outside it), and
+its JSON comes back here. Nothing
 the model can write to is on that path.
 
 What it writes. Under ``<agent home>/upgrade-readiness/weekly/``: one
@@ -790,7 +791,8 @@ def last_failures(previous: dict | None) -> dict[str, str]:
     """The last run's failures: the record's, or, when that run failed in every
     project and so wrote no record, the pairs its failure marker holds
     (``failure_signature``); a run that reads clears the marker. The marker
-    folds digits, and the budget details carry none, so they still read as
+    folds digits; budget failures are told by ``BUDGET_EXHAUSTED_DETAIL`` and
+    ``CUT_SHORT_PREFIX``, neither of which carries one, so they still read as
     budget failures."""
     try:
         pairs = json.loads(failure_marker().read_text(encoding="utf-8"))
@@ -821,9 +823,10 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     registered. A project is keyed by the id the watch's ledger learned for
     its spelling, so a project the roster spells by number and by id fails
     once, and a table is headed by the id its report resolved, which is what
-    the rows carry. Under a declared scope a spelling is asked for by that id,
-    as the watch asks: the scope lists ids, so the report reads it with no
-    describe. A spelling whose project is already read or already failed this
+    the rows carry. A spelling is asked for by that id on any install: an id
+    needs no describe, so a describe that fails on Saturday costs nothing for
+    a project the watch has resolved, and a declared scope, which lists ids,
+    reads it as listed. A spelling whose project is already read or already failed this
     run is not run at all, as the watch's table hop skips a tabled key: a
     second failure would replace the first one's cause, and one the budget cut
     short would put the project ahead of every other next week. One the
@@ -847,7 +850,7 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
             failures[key] = BUDGET_EXHAUSTED_DETAIL
             continue
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
-        asked = key if scope is not None else project
+        asked = key
         try:
             envelope = watch.run_report([asked], readiness=True, scope=scope, outside_stands=False, timeout=timeout)
         except watch.SandboxTimedOut as exc:
