@@ -1698,7 +1698,7 @@ class KubeAgentsHarness(AgentHarness):
             )
         if transport == TRANSPORT_INJECT:
             return self._execute_inject(prompt)
-        if prompt.partition("\n")[0].split()[:1] == [stop_hook.STOP_DIRECTIVE]:
+        if stop_hook.is_stopped_ask(prompt):
             return AgentResult.errored(
                 f"{stop_hook.STOP_DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
@@ -2458,7 +2458,8 @@ class KubeAgentsHarness(AgentHarness):
                 try:
                     started = stopper.submit()
                 except inject.InjectUnavailable as exc:
-                    return False, f"the stop could not reach the gateway: {exc}"
+                    # The door, not the agent: infrastructure, never graded.
+                    raise _TransportError(f"the stop could not reach the gateway: {exc}") from exc
                 if started:
                     # A task means the gateway read the word as an ask, not a
                     # stop; bound it like any stray.
@@ -2469,13 +2470,16 @@ class KubeAgentsHarness(AgentHarness):
                 return True, stopper.note
 
             context_id = exchange.probe.context_id if exchange.probe else ""
-            self._stop_after_first_card(
-                result,
-                board.api_session_id(context_id) if context_id else "",
-                stop,
-                send_stop=_send_stop,
-                poll_interval=poll_interval,
-            )
+            try:
+                self._stop_after_first_card(
+                    result,
+                    board.api_session_id(context_id) if context_id else "",
+                    stop,
+                    send_stop=_send_stop,
+                    poll_interval=poll_interval,
+                )
+            except _TransportError as exc:
+                return _infra_failure(str(exc))
             return result
 
         if delegation_timeout > 0:
@@ -2600,7 +2604,14 @@ class KubeAgentsHarness(AgentHarness):
             entry.update(status="error", result=f"nothing was stopped: {why}")
             result.errors.append(f"{stop_hook.STOP_ENTRY}: {why}")
             return
-        sent, detail = send_stop()
+        try:
+            sent, detail = send_stop()
+        except _TransportError:
+            # The stop never reached the gateway: the cards are left running,
+            # so archive them before the run is classed as infrastructure.
+            entry.update(status="error", result="the stop could not reach the gateway")
+            _archive_stalled_cards(cards, _EXEC_TIMEOUT)
+            raise
         entry.update(status="completed" if sent else "error", result=detail)
         if not sent:
             result.errors.append(f"{stop_hook.STOP_ENTRY}: {detail}")

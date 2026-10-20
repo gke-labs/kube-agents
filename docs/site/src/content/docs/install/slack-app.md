@@ -87,7 +87,8 @@ An app made for `today` from the `hermes slack manifest` output already has ever
 1. After the switch, open the app's **App Manifest** page.
 2. Delete the `features.slash_commands` block. Leave interactivity on: the gateway answers button clicks.
 3. For the [Home tab](/kube-agents/concepts/chatops/#the-slack-home-tab), set `features.app_home.home_tab_enabled` to `true` and add `app_home_opened` to `settings.event_subscriptions.bot_events`.
-4. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
+4. For the Stop button, add `agent_session_stopped` to `settings.event_subscriptions.bot_events`.
+5. Save. The edit changes no scopes; if Slack still asks you to reinstall, do so.
 
 Do it after the switch rather than before, because the `today` listener answers slash commands until then. Until you do, a slash command under `next` shows the member Slack's timeout error. Switching back to `today` means putting the block back, which the full manifest from `hermes slack manifest` does.
 

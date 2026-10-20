@@ -59,6 +59,12 @@ func isSlackStop(msg InboundMessage, backend string) bool {
 // since that turn may have filed cards the control has passed; a press that
 // cancelled nothing adds nothing, because the first press's reply is coming.
 func (g *Gateway) slackStop(ctx context.Context, rec *SessionRecord, authority Authority, backend string) {
+	// A thread that has run nothing has no cards to stop: answered without a
+	// control, as a typed `stop` is.
+	if rec.ActiveTask == nil && len(rec.Tasks) == 0 && rec.CardStop == nil {
+		g.post(rec.Key, slackStopNothingReply)
+		return
+	}
 	turn := false
 	if active := rec.ActiveTask; active != nil && !active.Detached {
 		if !g.cancelTaskVoiced(ctx, rec, authority, true) {

@@ -817,13 +817,12 @@ class ApiLaneExclusionsTest(unittest.TestCase):
         import yaml
 
         sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench.stop_hook import STOP_DIRECTIVE
+        from kube_agents_bench.stop_hook import is_stopped_ask
 
         excluded = eval_rosters.api_lane_exclusions()
         for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
             doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            words = str(doc.get("prompt") or "").strip().partition("\n")[0].split()
-            if words[:1] == [STOP_DIRECTIVE]:
+            if is_stopped_ask(str(doc.get("prompt") or "")):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 

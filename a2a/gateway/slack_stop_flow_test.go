@@ -241,6 +241,15 @@ func TestSlackStopButtonFromSomeoneElseStopsNothing(t *testing.T) {
 	}
 }
 
+func TestSlackStopButtonOnAThreadThatRanNothingSendsNoControl(t *testing.T) {
+	d := slackStopRig(t)
+	pressStop(d, "U1", "100.1", "200.1")
+	d.awaitPost(t, "the nothing-running reply", "D1", "100.1", slackStopNothingReply)
+	if n := messagesOn(t, d.r, "platform"); n != 0 {
+		t.Fatalf("a press on a thread that ran nothing sent %d message(s)", n)
+	}
+}
+
 func TestSlackStopButtonFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
 	d := slackStopRig(t)
 	askAndAnswer(t, d)

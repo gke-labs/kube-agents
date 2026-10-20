@@ -61,6 +61,12 @@ class Stop:
     observe_seconds: float
 
 
+def is_stopped_ask(prompt: str) -> bool:
+    """Whether ``prompt`` opens with the directive: the one test :func:`parse`
+    and every other reader of the grammar share."""
+    return prompt.partition("\n")[0].split()[:1] == [STOP_DIRECTIVE]
+
+
 def parse(prompt: str) -> Stop | None:
     """The stopped ask ``prompt`` holds, or ``None`` for an ordinary ask.
 
@@ -68,10 +74,10 @@ def parse(prompt: str) -> Stop | None:
         ValueError: The directive carries something other than one
             ``observe=<seconds>`` within bounds, or no ask follows it.
     """
+    if not is_stopped_ask(prompt):
+        return None
     first, _, rest = prompt.partition("\n")
     words = first.split()
-    if not words or words[0] != STOP_DIRECTIVE:
-        return None
     observe = DEFAULT_OBSERVE_SECONDS
     extra = words[1:]
     if len(extra) > 1 or (extra and not extra[0].startswith(OBSERVE_FIELD)):

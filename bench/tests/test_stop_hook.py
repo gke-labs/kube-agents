@@ -126,6 +126,24 @@ def test_an_unreadable_session_sends_no_stop(monkeypatch):
     assert sent == [] and entry["status"] == "error"
 
 
+def test_a_stop_the_door_never_carried_archives_and_is_infrastructure(monkeypatch):
+    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: _cards({"t_1": "running"}))
+    archived = []
+    monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, timeout: archived.extend(ids))
+
+    def _fail():
+        raise harness._TransportError("the stop could not reach the gateway: refused")
+
+    result = AgentResult(output="on it", trajectory=[])
+    with pytest.raises(harness._TransportError):
+        harness.KubeAgentsHarness()._stop_after_first_card(
+            result, "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
+            send_stop=_fail, poll_interval=0.0,
+        )
+    assert archived == ["t_1"]
+    assert result.trajectory[-1]["status"] == "error"
+
+
 def test_no_session_sends_no_stop(monkeypatch):
     monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: pytest.fail("read with no session"))
     result = AgentResult(output="on it", trajectory=[])
