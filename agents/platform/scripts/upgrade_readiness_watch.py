@@ -334,7 +334,7 @@ REMEDY_OUTSIDE_UNRESOLVED = (
     "named here again with its remedy; a lookup that keeps failing needs the install's read access on that folder, "
     "organisation or selector"
 )
-REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run): under a declared scope the reporter refuses a number before anything resolves it, so no grant lets it read one"
+REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reporter can resolve the number"
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
 # The unresolved note for a declaration the reconcile did resolve in part: a
 # container or selector lookup did not finish on its last run, so the set it
@@ -905,8 +905,9 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     (``ReportRefused``), so the partial line tells it from a sandbox that
     fails. Until a reconcile tick writes a snapshot that answers (the first on
     a new install, the next on one whose snapshot predates the ``boundary``
-    key) the render answers with the management project alone, so another
-    project is refused until that tick. The whole set goes because nothing
+    key) the render answers: the management project is the one project read,
+    and every project the declaration names explicitly goes as unread, so the
+    report refuses another project, with that reason, until that tick. The whole set goes because nothing
     records this argv: it is one line of the loader on the sandbox command's
     stdin, beside both scripts' sources."""
     if scope is None:
@@ -1535,8 +1536,12 @@ def versions_by_project(
             unrun.append(project)
             continue
         timeout = min(VERSION_TABLE_TIMEOUT_SECONDS, remaining)
+        # Under a declared scope a number is asked for by the id already learned for it:
+        # the scope lists ids, so the reporter reads it with no describe, and a describe
+        # that fails that morning is not a refusal the operator is told to fix.
+        asked = keyed(project) if scope is not None else project
         try:
-            envelope = run_report([project], readiness=False, scope=scope, outside_stands=stands_outside(standing, scope, project, keyed(project)), timeout=timeout)
+            envelope = run_report([asked], readiness=False, scope=scope, outside_stands=stands_outside(standing, scope, project, keyed(project)), timeout=timeout)
         except SandboxTimedOut as exc:
             if timeout < VERSION_TABLE_TIMEOUT_SECONDS:
                 # Killed by the budget, not by its own cap: not stamped, so it goes first next time.
@@ -1666,7 +1671,8 @@ def readiness_by_project(
             unfinished[project] = PROJECT_NOT_RUN_DETAIL.format(project=project, error=BUDGET_EXHAUSTED_DETAIL.format(project=project))
             continue
         timeout = min(READINESS_TIMEOUT_SECONDS, remaining)
-        asked = spelled.get(project, project)
+        # By the id under a declared scope, as the table hop asks; else by the roster's spelling.
+        asked = project if scope is not None else spelled.get(project, project)
         try:
             envelope = run_report([asked], readiness=True, scope=scope, outside_stands=stands_outside(standing, scope, project, asked), timeout=timeout)
         except SandboxTimedOut as exc:

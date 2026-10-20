@@ -133,7 +133,11 @@ class FakeSandbox:
             # test cannot stage a read or a refusal the reporter would not make.
             scope = fleet_scope_args.DeclaredScope()
             scope.set(flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG), flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG))
-            reason = scope.override_error(asked[0])
+            # On the id the report resolves, as `get_target_projects` checks it: a number
+            # resolves through `projects describe` (the aliases) unless describe is down, when
+            # the digits reach the rule, which refuses them.
+            resolved_id = asked[0] if asked[0] in self.describe_down else self.aliases.get(asked[0], asked[0])
+            reason = scope.override_error(resolved_id)
             if reason is not None:
                 # The script's usage exit, no report, the reason on stderr.
                 body = {"exit": 2, "tables": "", "report": None}
@@ -1495,6 +1499,40 @@ class DeclaredScope(Base):
         self.assertEqual(sandbox.calls[1][1], ["--project", "p1", *scope, "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR])
         self.assertIn(f"new target version {TARGET}, 1 cluster(s) pending (a): 1 blocked (a), 0 ready", out)
 
+    def test_under_a_declared_scope_a_number_resolves_before_the_scope_check(self) -> None:
+        """The roster spells the project by number and the scope lists its id: the report
+        resolves the number and reads it, as `get_target_projects` checks the resolved id."""
+        self.declare_scope(["my-proj"])
+        versions = envelope([member("a", "lagging", project="my-proj")])
+        readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready")])
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "123456"}):
+            code, out = self.run_tick(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}))
+        self.assertEqual(code, 0)
+        self.assertNotIn("refused", out)
+        self.assertEqual(self.ledger()["targets"][TARGET]["pending"], ["my-proj/us-central1-a/a"])
+
+    def test_under_a_declared_scope_a_learned_number_is_asked_by_its_id_through_a_describe_outage(self) -> None:
+        """Once a tick has learned that the number is my-proj, both hops ask the report for
+        my-proj, which the scope lists, so a morning whose describe fails reads the project
+        instead of refusing it as a number the operator must respell."""
+        self.declare_scope(["my-proj"])
+        versions = envelope([member("a", "lagging", project="my-proj")])
+        readiness = envelope([member("a", "lagging", project="my-proj", readiness="ready")])
+        env = {watch.PROJECTS_ENV: "123456"}
+        with mock.patch.dict(os.environ, env):
+            self.run_tick(FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}))
+        self.assertEqual(self.ledger()["project_ids"], {"123456": "my-proj"})
+        ledger = self.ledger()
+        ledger["targets"][TARGET]["last_report_at"] = (NOW - timedelta(days=8)).isoformat()
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
+        with mock.patch.dict(os.environ, env):
+            sandbox = FakeSandbox(versions, readiness, aliases={"123456": "my-proj"}, describe_down={"123456"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertNotIn("refused", out)
+        self.assertEqual([argv[1] for _, argv, _ in sandbox.calls if argv and argv[0] == "--project"], ["my-proj", "my-proj"])
+        self.assertIn("1 cluster(s) pending (a): 0 blocked, 1 ready;", out)
+
     def test_an_install_that_declares_no_scope_keeps_the_bare_project_flag(self) -> None:
         sandbox = FakeSandbox(envelope([member("a", "lagging")]))
         code, _ = self.run_tick(sandbox)
@@ -1792,7 +1830,7 @@ class DeclaredScope(Base):
             watch.refusal_detail(label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012"), resolved),
             (
                 "refused by the report script: the report script could not resolve project number 123456789012 to an id; "
-                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run): under a declared scope the reporter refuses a number before anything resolves it, so no grant lets it read one",
+                "the remedy is on the install, not this job: spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reporter can resolve the number",
                 "project number unresolved",
             ),
         )
