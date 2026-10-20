@@ -23,6 +23,28 @@ import slack_ux_clicks as clicks
 import slack_ux_moments as runtime
 import verify_slack_ux_moments as verifier
 
+try:
+    import gitops_workspace
+except ImportError:  # the runtime falls back without it too
+    gitops_workspace = None
+
+
+def setUpModule():
+    # gitops_workspace ignores GITOPS_STATE_PATH where the operator's
+    # /etc/gitops mount exists (in_operator_pod), and this module isolates its
+    # tests with that variable. Point the mount check away from any real one.
+    global _NO_MOUNT
+    if gitops_workspace is None:
+        _NO_MOUNT = mock.patch.dict({})
+        _NO_MOUNT.start()
+        return
+    _NO_MOUNT = mock.patch.object(gitops_workspace, "GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
+    _NO_MOUNT.start()
+
+
+def tearDownModule():
+    _NO_MOUNT.stop()
+
 PR = "https://github.com/acme/fleet-config/pull/412"
 SUB = {
     "task_id": "t_e0c1",
@@ -165,6 +187,57 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual(adapter.teams, ["T1"])
         self.assertIn("PR #412", post["text"])
 
+    def test_under_next_the_pr_card_is_a_chat_message_posted_once(self):
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((chat_id, content, chat, update, metadata))
+                return SimpleNamespace(success=True)
+
+        self.assertTrue(_run(runtime.pr_opened(StandIn(), SUB, f"Opened {PR}")))
+        self.assertFalse(_run(runtime.pr_opened(StandIn(), SUB, f"Report: opened {PR}")))
+        (chat_id, text, chat, update, metadata), = sent
+        self.assertEqual((chat_id, update, metadata), ("C0KAGE", "", {"thread_id": "1700000000.000100"}))
+        self.assertEqual(chat["tone"], "success")
+        self.assertEqual(chat["links"][0], {"text": "Open PR ↗", "url": PR, "primary": True})
+        self.assertIn(PR, text)
+
+    def test_under_next_a_card_that_asks_again_posts_a_new_question(self):
+        # Each question has its own key, so the second does not edit the first
+        # up the thread, and the first's settle cannot overwrite the second.
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((update, "choices" in chat))
+                return SimpleNamespace(success=True)
+
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        adapter = StandIn()
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 1)))
+        _run(runtime.settle_question(adapter, SUB, "unblocked", 2))
+        self.assertTrue(_run(runtime.needs_you(adapter, SUB, QUESTION, 3)))
+        self.assertEqual(sent, [("question-t_e0c1-1", True), ("question-t_e0c1-1", False), ("question-t_e0c1-3", True)])
+
+    def test_under_next_a_question_after_a_restart_takes_a_new_key(self):
+        # Named by its blocked event, the key does not repeat once the count is gone.
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append(update)
+                return SimpleNamespace(success=True)
+
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 7)))
+        for store in (runtime._questions, runtime._unsettled):
+            store.clear()
+        self.assertTrue(_run(runtime.needs_you(StandIn(), SUB, QUESTION, 9)))
+        self.assertEqual(sent, ["question-t_e0c1-7", "question-t_e0c1-9"])
+
     def test_the_pr_sits_beside_a_green_bar_under_its_headline(self):
         adapter = _Adapter()
         _run(runtime.pr_opened(adapter, SUB, f"Opened {PR}"))
@@ -216,12 +289,155 @@ class PrOpenedTest(unittest.TestCase):
         self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"- Opened {PR}\n- Opened {other}")))
         self.assertEqual([("PR #412" in p["text"], "PR #7" in p["text"]) for p in adapter.posts], [(True, False), (False, True)])
 
+    def test_a_gitlab_com_merge_request_posts_with_a_diffs_button(self):
+        adapter = _Adapter()
+        mr = "https://gitlab.com/acme/platform/infra/-/merge_requests/12"
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened MR !12: {mr}/diffs")))
+        post = adapter.posts[0]
+        self.assertIn("I opened merge request !12 in infra.", post["text"])
+        self.assertEqual([b["text"]["text"] for b in _buttons(_shown(post))], ["Open MR ↗", "Files changed ↗"])
+        self.assertEqual([b["url"] for b in _buttons(_shown(post))], [mr, mr + "/diffs"])
+
+    def test_a_self_managed_merge_request_posts_only_on_a_managed_gitlab_host(self):
+        managed = "https://gitlab.example.com/acme/infra/-/merge_requests/7"
+        unmanaged = "https://gitlab.other.example/acme/infra/-/merge_requests/8"
+        with_port = "https://gitlab.example.com:8443/acme/infra/-/merge_requests/3"
+        entries = (
+            '[{"type": "gitlab", "url": "https://gitlab.example.com/acme/platform/infra.git"},'
+            ' {"type": "github", "url": "https://gitlab.other.example/acme/infra"}]'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "managed_repos"
+            state.write_text(entries)
+            adapter = _Adapter()
+            with mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state)}):
+                self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"Opened {unmanaged}")))
+                self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {managed}")))
+                self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {with_port}")))
+        self.assertEqual(
+            [[b["url"] for b in _buttons(_shown(post))] for post in adapter.posts],
+            [[managed, managed + "/diffs"], [with_port, with_port + "/diffs"]],
+        )
+
+    def test_the_managed_list_is_read_only_for_a_text_with_a_merge_request(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime._gitops, "mounted_repo_entries", return_value=[]) as read:
+            self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {PR}")))
+            self.assertFalse(_run(runtime.pr_opened(adapter, SUB, "Checked the limits.")))
+            read.assert_not_called()
+            _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.com/acme/infra/-/merge_requests/7"))
+            read.assert_called_once()
+
+    def test_without_the_managed_list_only_gitlab_com_counts(self):
+        adapter = _Adapter()
+        with mock.patch.object(runtime, "_gitops", None):
+            self.assertFalse(
+                _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.example.com/acme/infra/-/merge_requests/7"))
+            )
+            self.assertTrue(
+                _run(runtime.pr_opened(adapter, SUB, "Opened https://gitlab.com/acme/infra/-/merge_requests/7"))
+            )
+
     def test_the_announced_map_is_bounded(self):
         adapter = _Adapter()
         with mock.patch.object(runtime, "ANNOUNCED_MAX", 2):
             for n in range(3):
                 _run(runtime.pr_opened(adapter, SUB, f"Opened {PR[:-3]}{n}"))
         self.assertEqual(len(runtime._announced), 2)
+
+
+class PrEventTest(unittest.TestCase):
+    """The PR a ``pr_opened`` event recorded posts whatever the worker says about it."""
+
+    EVENT = {"url": "https://github.com/acme/fleet-config/pull/99", "number": 99, "title": "Raise the checkout limit"}
+    NOTE = "Both fixes are up for review in PR #99"
+
+    def setUp(self):
+        runtime._announced.clear()
+
+    def test_posts_with_no_opened_verb_and_the_workers_line_as_evidence(self):
+        adapter = _Adapter()
+        self.assertTrue(_run(runtime.pr_event(adapter, SUB, self.EVENT, f"Checked seeded-a.\n{self.NOTE}")))
+        [post] = adapter.posts
+        self.assertEqual((post["channel"], post["thread_ts"]), ("C0KAGE", SUB["thread_id"]))
+        self.assertIn("I opened PR #99 in fleet-config. It's yours to review.", post["text"])
+        context = [b for b in post["attachments"][0]["blocks"] if b["type"] == "context"]
+        self.assertEqual(context[0]["elements"][0]["text"], self.NOTE)
+        self.assertEqual(
+            [b["url"] for b in _buttons(_shown(post))], [self.EVENT["url"], self.EVENT["url"] + "/files"],
+        )
+
+    def test_with_no_line_naming_it_the_title_is_the_evidence(self):
+        adapter = _Adapter()
+        self.assertTrue(_run(runtime.pr_event(adapter, SUB, self.EVENT, "Checked seeded-a.")))
+        self.assertIn("Raise the checkout limit", adapter.posts[0]["text"])
+
+    def test_a_gitlab_merge_request_gets_the_merge_request_layout(self):
+        adapter = _Adapter()
+        mr = "https://gitlab.com/acme/platform/infra/-/merge_requests/12"
+        self.assertTrue(_run(runtime.pr_event(adapter, SUB, {"url": mr, "number": 12, "title": "Bump"})))
+        self.assertIn("I opened merge request !12 in infra.", adapter.posts[0]["text"])
+        self.assertEqual([b["text"]["text"] for b in _buttons(_shown(adapter.posts[0]))], ["Open MR ↗", "Files changed ↗"])
+
+    def test_the_event_and_the_prose_fallback_post_a_pr_once_whichever_comes_first(self):
+        adapter = _Adapter()
+        self.assertTrue(_run(runtime.pr_event(adapter, SUB, self.EVENT, self.NOTE)))
+        self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"Opened {self.EVENT['url']}")))
+        self.assertFalse(_run(runtime.pr_event(adapter, SUB, self.EVENT)))
+        self.assertEqual(len(adapter.posts), 1)
+        runtime._announced.clear()
+        adapter = _Adapter()
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {self.EVENT['url']}/files")))
+        self.assertFalse(_run(runtime.pr_event(adapter, SUB, self.EVENT)))
+        self.assertEqual(len(adapter.posts), 1)
+
+    def test_a_url_the_prose_path_would_not_announce_posts_nothing(self):
+        adapter = _Adapter()
+        for payload in (
+            {"url": "https://github.example.com/acme/fleet/pull/3"},
+            {"url": "https://gitlab.other.example/acme/infra/-/merge_requests/8"},
+            {"url": "https://github.com/acme/fleet/issues/3"},
+            {"url": ""},
+            {},
+            None,
+            "https://github.com/acme/fleet/pull/3",
+        ):
+            with self.subTest(payload=payload), mock.patch.object(runtime._gitops, "mounted_repo_entries", return_value=[]):
+                self.assertFalse(_run(runtime.pr_event(adapter, SUB, payload)))
+        self.assertEqual(adapter.posts, [])
+
+    def test_a_pr_on_the_installs_github_enterprise_host_posts_and_another_host_does_not(self):
+        adapter = _Adapter()
+        ghe = "https://ghe.example.com/acme/fleet/pull/5"
+        with mock.patch.object(runtime, "_github_host", return_value="ghe.example.com"):
+            self.assertTrue(_run(runtime.pr_event(adapter, SUB, {"url": ghe, "number": 5, "title": "Bump"})))
+            self.assertFalse(_run(runtime.pr_event(adapter, SUB, {"url": "https://ghe.other.example/a/b/pull/5"})))
+        self.assertEqual([b["url"] for b in _buttons(_shown(adapter.posts[0]))], [ghe, ghe + "/files"])
+
+    def test_a_cited_pr_in_a_note_with_no_event_posts_nothing(self):
+        adapter = _Adapter()
+        self.assertFalse(_run(runtime.pr_opened(adapter, SUB, f"{self.EVENT['url']} is up for review")))
+        self.assertEqual(adapter.posts, [])
+
+    def test_under_next_the_event_posts_a_chat_message_and_the_prose_after_it_posts_nothing(self):
+        sent = []
+
+        class StandIn:
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                sent.append((chat_id, chat, metadata))
+                return SimpleNamespace(success=True)
+
+        self.assertTrue(_run(runtime.pr_event(StandIn(), SUB, self.EVENT, self.NOTE)))
+        self.assertFalse(_run(runtime.pr_opened(StandIn(), SUB, f"Opened {self.EVENT['url']}")))
+        (chat_id, chat, metadata), = sent
+        self.assertEqual((chat_id, metadata), ("C0KAGE", {"thread_id": SUB["thread_id"]}))
+        self.assertEqual(chat["links"][0], {"text": "Open PR ↗", "url": self.EVENT["url"], "primary": True})
+
+    def test_a_failed_post_is_retried_by_the_next_path(self):
+        adapter = _Adapter(fail=True)
+        self.assertFalse(_run(runtime.pr_event(adapter, SUB, self.EVENT)))
+        adapter.fail = False
+        self.assertTrue(_run(runtime.pr_opened(adapter, SUB, f"Opened {self.EVENT['url']}")))
 
 
 class NeedsYouTest(unittest.TestCase):

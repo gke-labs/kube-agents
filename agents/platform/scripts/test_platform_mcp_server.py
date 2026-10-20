@@ -914,8 +914,8 @@ class TestReportToChat(unittest.TestCase):
     @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
     @patch("urllib.request.urlopen")
     def test_the_wait_outlasts_the_relay_it_is_waiting_on(self, mock_urlopen):
-        """The route relays synchronously — it runs a whole Chat Agent turn, with
-        its own 300s ceiling, before it answers.
+        """The route relays synchronously — it posts to every enabled platform
+        before it answers, inside the relay plugin's 360s.
 
         Timing out first is not a harmless retry: nothing cancels the server, so
         the report is posted anyway while this tool returns an ERROR the job
@@ -926,7 +926,7 @@ class TestReportToChat(unittest.TestCase):
         """
         mock_urlopen.return_value = self._urlopen()
         report_to_chat("finding", job_id="j1")
-        self.assertGreater(platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS, 300.0)
+        self.assertGreaterEqual(platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS, 360.0)
         self.assertEqual(
             mock_urlopen.call_args.kwargs.get("timeout"),
             platform_mcp_server.CRON_REPORT_TIMEOUT_SECONDS,
@@ -1525,6 +1525,16 @@ class FleetScopeToolTest(unittest.TestCase):
         self.assertEqual(out["unread"], [{"project": "payments-staging", "outcome": "denied"}])
         self.assertEqual(out["collector_args"], "--scope-projects ops-mgmt,payments-prod --scope-unread payments-staging=denied")
         self.assertEqual(out["resolved_at"], "2026-10-09T12:00:00Z")
+
+    def test_excluded_clusters_are_reported_and_ride_in_the_collector_arguments(self):
+        # #3081: the scope is otherwise per project, so the agent and the
+        # collectors both need the clusters the operator left out.
+        declared = dict(self.SNAPSHOT["declared"], exclude={"projects": [], "clusters": [
+            {"projectId": "payments-prod", "location": "us-central1", "clusterName": "lane-b"}]})
+        out = self._call(dict(self.SNAPSHOT, declared=declared))
+        self.assertEqual(out["excluded_clusters"], [{"project": "payments-prod", "location": "us-central1", "cluster": "lane-b"}])
+        self.assertTrue(out["collector_args"].endswith(" --scope-exclude-clusters payments-prod/us-central1/lane-b"), out["collector_args"])
+        self.assertEqual(self._call(self.SNAPSHOT)["excluded_clusters"], [])
 
     def test_no_declared_scope_and_no_snapshot_both_report_undeclared(self):
         undeclared = dict(self.SNAPSHOT, declared={k: [] for k in ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes")})

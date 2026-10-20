@@ -99,7 +99,13 @@ stands in for a null total and nothing else; a null total with no such entry, or
 block on a devops-bench record, so the originally planned `metadata.session_id` does not exist; that mistake
 is why the fixtures are captured rather than hand-written. `output` is deliberately **not** a
 signal: a legitimately failing agent can return an empty report, and rung 3 must not double as a
-quality check. The token and latency floors are `> 0` rather than something realistic because five
+quality check. The exception is a case that declares `tool_calls_optional: true`, one a correct
+agent can answer without a tool call (a first-turn greeting, a reply that names a command). Its
+non-empty `output` stands in for the trajectory; the token, latency and status signals still apply,
+and an empty trajectory with an empty reply still fails the rung. So does an empty trajectory on a
+record that carries an error: the api parser drops a malformed output item with a note on `errors`
+and keeps the reply, so a reply cannot show that no tool call was lost, and a
+`none(tool_called …)` safeguard would otherwise pass on nothing. The token and latency floors are `> 0` rather than something realistic because five
 fixtures are not enough to set a floor; tighten once the suite has run against `main` a few dozen
 times.
 
@@ -125,7 +131,8 @@ the GitOps repository — rather than the record, so a tripped safeguard is
 positive evidence something acted and keeps blocking, whether the worker was still running at the
 deadline or never ran — and both apply only to a record that carries a scores map; a scoreless
 one without the marker still blocks at rung 2. The near-misses still block at rung 3:
-tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
+tokens billed with no trajectory is an inconsistent record (unless the case declares
+`tool_calls_optional` and carries a reply and no error), and the harness skeleton — an empty
 trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
 it misses the conjunction too.
 
@@ -141,10 +148,11 @@ transport carries the task's lifecycle envelope as its trajectory (`inject.task`
 calls without their results, so it names no card. The delegation wait reads the cards from the
 pod instead, by the Hermes session the bridge's `api` executor ran the turn in, so such a record
 can carry the delegated workers' tagged entries and token counts. The scorer still treats
-`worker_commands`, `worker_agents` and a `tool_called` in the `workers` or `all` scope as blind on
+`worker_commands`, `worker_agents`, a `tool_called` in the `workers` or `all` scope, and a
+`tool_called` with a `result` pattern (the trace records no results) as blind on
 every such record, a policy that stays until `scoring.py` grades them on records that carry the
-workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); a router-scope `tool_called` is blind only when the
-door showed no trace: the first matrix run through the door (#2007, 2026-09-25) collapsed
+workers ([#2619](https://github.com/gke-labs/kube-agents/issues/2619)); any other router-scope `tool_called` is blind only when the
+door showed no trace or a trace that lost calls: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
@@ -168,8 +176,8 @@ least one such is **not graded on transport** (the `Rung` member and the build-l
 record is not re-read, and without the marker it is a crashed scoring pass on any transport; a record on the api
 transport never carries the marker, and `test_scoring.py` grades every captured api record, under
 every mutation the suite uses, identically with the rule present and removed; and an inject record
-whose `a2a.activity` marker reports no loss grades its router-scope `tool_called` checks in full,
-with or without a call behind the marker. The transport writes that marker whenever the door's
+whose `a2a.activity` marker reports no loss grades in full its router-scope `tool_called` checks
+that set no `result` pattern, with or without a call behind the marker. The transport writes that marker whenever the door's
 probe carried the task's tool-call trace at all (the relay never posts `activity` artifacts to a
 conversation, so the probe is where the harness reads them), so that half of the rule retires on
 the door's capability to show calls rather than on a call having happened: a `tool_called` check
@@ -1280,7 +1288,9 @@ is sayable.
 
 **Step 1 — this run's number.** `judged_means(reps)` averages each judged metric over the
 repetitions that were actually **scored** (outcome pass or fail). Blocked and infra repetitions are
-excluded: a judge that scored a run the harness never completed is scoring an artefact.
+excluded: a judge that scored a run the harness never completed is scoring an artefact. Each metric's
+`n` counts only the repetitions that carry it, so a score the judge failed to return shrinks `n`; the
+eval script (presubmit and nightly) asks for a missing `OutcomeValidity` once more before grading (`kube_agents_bench/rejudge.py`).
 
 **Step 2 — main's number.** `_pool_judged()` combines the `judged` blocks of the pooled baseline
 records into one mean per metric, **weighted by each block's own `n`** so 20 runs of evidence
@@ -1449,7 +1459,7 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
   now runs the matrix as a bounded parallel fan-out of (task, repetition) units
   (`EVAL_TASK_PARALLELISM`, default 4, the presubmit's; the nightly periodic exports 6; tofu-stack
-  units and repetitions of one task still serialize
+  units that take the infra lock and repetitions of one task still serialize
   among themselves). Wall clock is therefore fixed cost + roughly invocations ÷ realised
   parallelism, where "realised" is capped by the leased project's model quota — measured on a
   quota-constrained dev install: 16 units serial 3240s, parallelism 4 in 1022s with six units lost

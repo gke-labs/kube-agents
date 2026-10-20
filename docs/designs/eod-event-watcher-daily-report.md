@@ -18,12 +18,12 @@ and for the gap it leaves.
 model. The script's stdout _is_ the report: the scheduler hands it to `_deliver_result` the same way
 it hands over a model's final turn, so `deliver` behaves here as it does on the watchdogs.
 
-The entry ships `deliver: "chat"`, as every report-producing entry on the roster does
-bar the two on `"all"`. That routes the report through the
-Chat Agent, which presents it in the channel and can then answer a follow-up about it — the
+The entry ships `deliver: "chat"`, as every report-producing entry on the roster does.
+That routes the report through the
+relay, which posts it into a thread whose replies reach the Chat Agent with it attached — the
 [relay design](cron-report-relay.md) is canonical. `"all"` is the wrong value
 even though it is audible: it expands to every platform with a home channel, and the relay now has
-one, so a job left on `"all"` reports twice — once flat and once through the Chat Agent. `"local"`
+one, so a job left on `"all"` reports twice — once from the scheduler and once through the relay. `"local"`
 resolves to no target and drops the report. The script still emits a bullet list rather than a
 Markdown table, which wraps badly in chat viewports.
 
@@ -36,7 +36,7 @@ scripts directory. It needs no cluster access.
 The `deliver: "chat"` route does not go through `home_target_env`: `profile_cron_tick.spawn_tick`
 sets `CHAT_HOME_CHANNEL` on every cron child unconditionally, so the target always resolves and the
 relay is always attempted. The home channel is needed one hop later, where the Session KV server
-posts what the Chat Agent composed: `_send_to_chat` runs `hermes send --to <platform>` with no
+posts the report: `_send_to_chat` runs `hermes send --to <platform>` with no
 chat id, and that bare form is the one `hermes send` documents as "platform (home channel)". Where
 there is none the send fails and the roster entry records a `last_delivery_error` that nests three
 layers of wrapping — the relay's own words inside the route's 502 detail inside the plugin's report
@@ -56,7 +56,15 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 
 The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
+`spec.mode: next` `/sethome` does not reach the gateway, so for the platform the gateway holds the CR
+field is the only way. The operator renders the Google Chat field into the gateway as
+`A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
+`spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
+only chat platform is the gateway's and has no home channel gets no send at all: the error names the
+platform and the field, as in
+`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`.
+A malformed home channel gets the same refusal without the platform. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
 so an install without a home channel loses those events entirely rather than seeing them late.
@@ -214,11 +222,36 @@ here — no workload, no reason, no message — because the listing has one subj
 informational churn. Each is **counted**, on its own line above the body:
 
 - **Alerts the daily ceiling withheld.** `ALERT_DAILY_LIMITS` stopped them. Reported as
-  `⚠️ *N alerts withheld by the daily ceiling and never reached chat.*` `N` is the number of
+  `⚠️ *N alerts from M workloads withheld by the daily ceiling and never reached chat.*` `N` is the number of
   workload incidents chat lost, counted per pod and reason — not the number of times the ceiling
   refused a post, which is larger because a refusal makes the watcher re-offer the same failure on
   every later sighting. `GET /v1/alert-quota` reports the refusals, and
   `k8s_event_watcher_events_quota_suppressed_total` breaks them down by reason and namespace.
+  `M` is the number of workloads that sent those alerts, keyed on cluster, namespace and workload
+  name. A row with no workload name counts as one workload for each object UID. For `N`, a row with
+  no UID counts by its workload in place of the UID. Thus `N` is not less than `M` while each object
+  keeps one workload name. If one object is stored under two names, for example after the cleaner
+  changes during a day, `M` can exceed `N`. The workload
+  key does not include the object kind, so a Pod event and a Deployment event with the same
+  workload name are one workload. The count has no drift or stall rows, because the recap leaves
+  them out (see [Where the numbers come from](#where-the-numbers-come-from)).
+  `clean_workload_name` in
+  [`session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py) sets the workload
+  name. It changes only Pod names, with two rules, and keeps all other names as they are:
+  - A Pod name that ends in a segment of eight to ten hexadecimal characters and then a segment of
+    five characters loses both segments. Thus, the pods of one Deployment fold into one workload.
+    The pods of all the runs of one CronJob also fold into one workload, because the run minute
+    has eight digits.
+  - If the first rule does not apply, a Pod name that ends in a segment of five lowercase letters
+    or digits loses that segment. Thus, the pods of one DaemonSet (`fluentd-x7k2p`) fold into one
+    workload, and the pod of a one-off Job folds to the Job name. The rule also removes a word of
+    five letters, so the pods `ingest-batch` and `ingest-queue` both become `ingest` and count as
+    one workload.
+  - A StatefulSet ordinal of one to four digits stays, so each StatefulSet pod (`db-0`, `db-1`) is
+    a separate workload.
+  - Each Job that a CronJob starts is a separate workload, because the CronJob puts the minute of
+    the run in the Job name. An event on the Job `backup-29340180` and an event on its pod are two
+    workloads, because the pod name folds to `backup`.
 - **Alerts whose delivery failed.** `notified = 1` is written before the chat post is attempted, so
   on its own it records an intention to deliver rather than a delivery. When the post fails the
   ingestion side clears the flag and records why in `delivery_error`. Reported as
@@ -293,25 +326,27 @@ The filter is an environment variable on the agent container:
 | ------------------------ | ----------------------------------------- | ------------------------------------------------- |
 | `EOD_EXCLUDE_NAMESPACES` | `kube-system,kube-public,kube-node-lease` | Comma-separated; an empty value excludes nothing. |
 
-Set it the way the alert ceiling's `ALERT_DAILY_LIMIT_*` are set — on the `PlatformAgent` CR, under
-`spec.deployment.env`:
+Set it through the chart value `platformAgent.deployment.env`, which the chart renders into the
+`PlatformAgent` CR's `spec.deployment.env`. On the Terraform install, put the same block in
+`extra_helm_values`. Do not edit the CR by hand. Each apply that changes the list that the chart
+renders replaces the full list on the CR, and the hand edit is lost.
 
 ```yaml
-spec:
+platformAgent:
   deployment:
     env:
       - name: EOD_EXCLUDE_NAMESPACES
         value: kube-system,kube-public,kube-node-lease,istio-system
 ```
 
-**The CR is the only route that works, and this is why.** Environment on that container is rendered
-by the operator and filtered through `safeSandboxEnvOverrides`, an allowlist — a name that is not on
-it is dropped with no error, no event and no status condition, so the edit appears to succeed and
-changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the Deployment with `kubectl set env` is not
-a shortcut: it mutates `spec.template`, so it rolls the pod, and the next reconcile re-renders the
-Deployment from the CR and reverts it.
+**The CR's `spec.deployment.env` is the only source that works, and this is why.** Environment on
+that container is rendered by the operator and filtered through `safeSandboxEnvOverrides`, an
+allowlist — a name that is not on it is dropped with no error, no event and no status condition, so
+the edit appears to succeed and changes nothing. `EOD_EXCLUDE_NAMESPACES` is on it. Editing the
+Deployment with `kubectl set env` is not a shortcut: it mutates `spec.template`, so it rolls the
+pod, and the next reconcile re-renders the Deployment from the CR and reverts it.
 
-Applying the CR change rolls the pod, and the next tick after it comes up uses the new value. The
+A change to the value rolls the pod, and the next tick after it comes up uses the new value. The
 script re-reads it on every run, so nothing further is needed once the pod is up. No value can fail
 the run: `excluded_namespaces()` is a `getenv`, a `split(",")` and a `strip()`, with no parse step
 to reject anything and no fallback behind it. That matters here because this job's stdout is the

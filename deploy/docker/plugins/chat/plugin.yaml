@@ -3,9 +3,9 @@ label: Chat Agent
 kind: platform
 version: 1.0.0
 description: >
-  Delivery-only platform that hands a cron job's finished report to the Chat
-  Agent instead of posting it, so the finding lands in a thread that can answer
-  the follow-up. Registers no inbound adapter: the only hook it implements is
+  Delivery-only platform that hands a cron job's finished report to the chat
+  relay, which posts it into a thread whose replies reach the Chat Agent with
+  the report attached. Registers no inbound adapter: the only hook it implements is
   standalone_sender_fn, which POSTs the report to the Session KV server's
   /v1/cron-reports route over loopback.
 

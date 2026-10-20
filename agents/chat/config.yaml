@@ -93,6 +93,25 @@ model:
   # key so `/model … --global` cannot persist a different one.
   api_mode: chat_completions
 
+# Model-call deadlines for the gateway above. Hermes reads them per provider
+# (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
+# detectors: a stream with no first chunk, or no chunk for that long, and a
+# non-streamed call with no answer; then Hermes drops the stream and retries.
+# It is 600s because Gemini thinks in silence on this path: with the request
+# shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
+# 140-210s before its first chunk, so a shorter bound would cut off healthy
+# long thinks, and every retry would repeat the same think.
+# request_timeout_seconds is the per-read socket timeout (and the stream read
+# timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
+# its own. A call that stalls is retried inside each of Hermes' 3 attempts
+# (agent.api_max_retries) until five stale kills in a row trip its breaker, so
+# a persistent stall costs five or six 600s windows before the turn fails; a
+# one-off stall recovers at the first 600s kill.
+providers:
+  custom:
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
+
 # MCP Servers configuration. Routing/relay surface only.
 #
 # `args` is a ${HERMES_HOME} placeholder rather than a path because this file is
@@ -182,7 +201,7 @@ kanban:
   # the image patches that key in (deploy/docker/patches/kanban_notifier.py).
   #
   # `completed` is deliberately absent. The notifier has already delivered the
-  # worker's own status line and its full `result` to the thread by the time it
+  # worker's full `result` to the thread by the time it
   # wakes anyone, so the woken turn just re-reads the card and paraphrases a
   # message the user is looking at — 5.9s and 32,460 input tokens on task
   # t_c31a1f00, for nothing. Worse than nothing, now: the answer the notifier
@@ -411,10 +430,16 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
+    # Counts every inbound message on pre_gateway_dispatch and serves the count on
+    # the listener the operator reads into status.usage.chatMessagesInboundTotal.
+    # Rewrites nothing, so its place in the order does not matter.
+    - chat_metrics
     # Injects the routable-specialist roster into every turn, so choosing an
     # `assignee` costs no tool call. See defaults/plugins/agent_roster/README.md.
-    # The operator writes the deployed copy of this list; keep the two in sync
-    # (k8s-operator/internal/controller/platformagent_manifests.go).
+    # This list is the deployed list: the image seeds it onto a fresh volume
+    # and the entrypoint back-fills an existing one from it. The operator's
+    # DefaultBuiltInPlugins (platformagent_manifests.go) is only the roster an
+    # AgentPlugin may not shadow; keep the two in step.
     - agent_roster
 
 # Per-file character cap on context files (SOUL.md, AGENTS.md) in the system

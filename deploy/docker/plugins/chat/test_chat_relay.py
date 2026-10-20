@@ -696,10 +696,10 @@ class TestStandaloneSend(unittest.TestCase):
         self.assertIn("unrelayed", result["error"])
         self.assertIn("slack", result["error"])
 
-    def test_the_timeout_outlasts_a_chat_agent_turn(self):
+    def test_the_timeout_outlasts_the_routes_posts_budget(self):
         """Time out before the route answers and a delivered report is recorded
-        as a failure. `_run_relay_turn` allows the turn itself 300s."""
-        self.assertGreater(mod.RELAY_TIMEOUT_SECONDS, 300.0)
+        as a failure. The route's Slack work alone may take 180s."""
+        self.assertGreater(mod.RELAY_TIMEOUT_SECONDS, 180.0)
 
     def test_the_default_route_is_the_loopback_session_kv_server(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -938,6 +938,43 @@ class TestSiblingDeliveryTargets(unittest.TestCase):
         )
 
 
+class TestSchedulerFailureFlag(unittest.TestCase):
+    """The scheduler's failure line is flagged so the relay posts it as written."""
+
+    TITLE = "Security & RBAC Posture Audit"
+
+    def send(self, body):
+        with RecordingRelay() as relay:
+            with patch.dict(os.environ, {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url}):
+                asyncio.run(mod.standalone_send(None, "cron-reports", wrapped(self.TITLE, "compliance-audit", body)))
+        return relay.requests[0]["body"]
+
+    def test_a_failure_line_for_this_job_is_flagged(self):
+        body = self.send(
+            "⚠️ Cron 'Security & RBAC Posture Audit' failed: provider quota limit. "
+            "Fallback chain exhausted. Full details saved in cron output."
+        )
+        self.assertIs(body["scheduler_failure"], True)
+
+    def test_a_blocked_config_line_is_flagged(self):
+        body = self.send(
+            "⛔ Cron 'Security & RBAC Posture Audit' blocked by configuration validation "
+            "(no LLM call was made): bad model. This alert is sent once."
+        )
+        self.assertIs(body["scheduler_failure"], True)
+
+    def test_a_report_is_not_flagged(self):
+        self.assertNotIn("scheduler_failure", self.send("Security & RBAC Posture Audit: 1 new, 0 resolved."))
+
+    def test_a_failure_line_naming_another_job_is_not_flagged(self):
+        body = self.send("⚠️ Cron 'Stockout Prevention' failed: provider rate limit.")
+        self.assertNotIn("scheduler_failure", body)
+
+    def test_a_long_message_that_starts_like_a_failure_is_not_flagged(self):
+        body = self.send("⚠️ Cron 'Security & RBAC Posture Audit' failed: " + "notes " * 500)
+        self.assertNotIn("scheduler_failure", body)
+
+
 class TestRegistration(unittest.TestCase):
     """What the scheduler reads off the ``PlatformEntry``."""
 
@@ -961,7 +998,7 @@ class TestRegistration(unittest.TestCase):
         )
 
     def test_reports_are_never_chunked(self):
-        """A split report would start one Chat Agent turn per piece."""
+        """A split report would post as several messages, each its own piece."""
         captured = {}
 
         class Ctx:

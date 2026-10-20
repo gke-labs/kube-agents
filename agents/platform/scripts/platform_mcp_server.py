@@ -43,9 +43,9 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 DEFAULT_AGENT_HOME = "/opt/data"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
-# synchronously — it creates the session, runs a whole Chat Agent turn (its own
-# 300s ceiling) and blocks on `hermes send` before answering — so this has to
-# outlast the work, not just a connect stall. Deliberately the same 360s the
+# synchronously — it blocks on `hermes send` to every enabled platform, and on a
+# Slack audit headline's ledger read, before answering — so this has to outlast
+# the work, not just a connect stall. Deliberately the same 360s the
 # delivery plugin uses (`RELAY_TIMEOUT_SECONDS`,
 # deploy/docker/plugins/chat/adapter.py), for the same reason and with the same
 # ordering: the server's verdict must be what the caller records.
@@ -438,8 +438,9 @@ def fleet_scope() -> str:
     Reads the reconcile's snapshot (fleet_scope.json at the data volume's
     root). Returns JSON:
       {"declared": true, "resolved_at": "...", "projects": [...],
-       "unread": [{"project": ..., "outcome": ...}], "collector_args": "...",
-       "source": "<the snapshot's path>"}
+       "unread": [{"project": ..., "outcome": ...}],
+       "excluded_clusters": [{"project": ..., "location": ..., "cluster": ...}],
+       "collector_args": "...", "source": "<the snapshot's path>"}
     `projects` is the sweep: every project the scope resolved to that this
     install could read (its Kubernetes Engine API off included; the collectors
     count such a project empty), plus the management project whatever the
@@ -449,8 +450,12 @@ def fleet_scope() -> str:
     One entry, `declared-scope=unresolved`, is not a project: it rides when
     the reconcile has not resolved the declaration (before its first tick, or
     on a tick that could not read the render while a folder, organisation or
-    selector is declared), and the collectors render it as its own sentence. `collector_args` is the string to append to
-    a collector command verbatim (`--scope-projects ... --scope-unread ...`);
+    selector is declared), and the collectors render it as its own sentence.
+    `excluded_clusters` names each cluster spec.scope.exclude.clusters leaves
+    out: leave it out of fleet answers and audits, so do not list, describe, audit or report
+    on it, even though its project is in `projects`. `collector_args` is the string to append to
+    a collector command verbatim (`--scope-projects ... --scope-unread ...
+    --scope-exclude-clusters ...`);
     when nothing is readable it carries `--scope-unread` alone, and the
     collector then reports that and sweeps nothing. When no snapshot answers
     that a boundary is in force (before the reconcile's first tick, or when
@@ -473,13 +478,15 @@ def fleet_scope() -> str:
     except Exception as e:  # noqa: BLE001 - a tool answers, it does not raise
         return f"ERROR: Could not read the scope snapshot: {e}"
     if targets is None:
-        return json.dumps({"declared": False, "projects": [], "unread": [], "collector_args": "",
+        return json.dumps({"declared": False, "projects": [], "unread": [], "excluded_clusters": [], "collector_args": "",
                            "note": "no declared scope: the collectors enumerate every project the identity can list"}, indent=2)
     return json.dumps({
         "declared": True,
         "resolved_at": targets.resolved_at,
         "projects": list(targets.projects),
         "unread": [{"project": project, "outcome": outcome} for project, outcome in targets.unread],
+        "excluded_clusters": [{"project": project, "location": location, "cluster": cluster}
+                              for project, location, cluster in targets.excluded_clusters],
         "collector_args": targets.collector_args(),
         **({"note": targets.note} if targets.note else {}),
         "source": targets.path,
@@ -1007,13 +1014,17 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     Send a report from a SCHEDULED (cron) job to the user's chat channel mid-run.
 
     You usually do NOT need this. A job created with deliver='chat' has its final
-    response relayed to the Chat Agent automatically, with nothing to call and
-    nothing to remember. Use this tool only when that is not enough: to report
+    response relayed to chat automatically, with nothing to call and nothing to
+    remember. Use this tool only when that is not enough: to report
     partway through a long run, or to send something other than your final answer.
 
     Having called it, return exactly `[SILENT]` so the same finding is not also
-    delivered as the run's result. The Chat Agent presents what you pass, so write
-    `report` as the finished message for a human reader, not as notes to yourself.
+    delivered as the run's result, unless the job is one of the shipped
+    fleet-audit streams: for those the report `finish` rendered is posted at the
+    end of the run in place of your final response, and `[SILENT]` would stop
+    it. What you pass is posted as written (on Slack a fleet-audit report is
+    shown as a headline linking its ledger issue), so write `report` as the
+    finished message for a human reader, not as notes to yourself.
 
     Prefer this over send_notification for scheduled work: send_notification posts
     with no conversational context, so a user replying to it reaches an agent that
@@ -1060,15 +1071,15 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
     # fan-out that reached some platforms and not others, and says which in
     # `relay` and `undelivered`. Reading both here is the difference between the
     # agent knowing what actually happened to its report and it believing the
-    # Chat Agent framed it for everyone. The relay adapter — the other caller of
+    # report reached everyone. The relay adapter — the other caller of
     # this route — reads the same two fields; a sibling that reads only one
     # reports a half-delivered report as a clean one.
     #
     # `relay_detail` is the route's own wording for the degradation, so this
-    # end stops hard-coding it: `degraded` has one cause today (the Chat Agent
-    # turn did not compose the report; a leg that never landed keeps `relay:
-    # ok` and shows up in `undelivered` instead). Older routes do not send it;
-    # the sentence they used to get is the fallback.
+    # end does not hard-code it. A current route never sends `degraded`; an
+    # older one did when its Chat Agent turn over the report failed, and its
+    # sentence is the fallback for a route too old to send a detail. A leg that
+    # never landed keeps `relay: ok` and shows up in `undelivered` instead.
     session = payload.get("session_id", "?")
     labels, caveats = [], []
     if payload.get("relay") == "degraded":
@@ -1102,7 +1113,7 @@ def report_to_chat(report: str, job_id: str, title: str = "") -> str:
         )
     return (
         f"SUCCESS: Report accepted for delivery to chat (session {session}). "
-        "The Chat Agent posts it; do not also call send_notification for this report."
+        "It is posted to chat; do not also call send_notification for this report."
     )
 
 

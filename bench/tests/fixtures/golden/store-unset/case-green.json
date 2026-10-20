@@ -43,6 +43,7 @@
         "OutcomeScore": 1.0
       },
       "latency": 46.67580479523167,
+      "turn1_s": null,
       "total_tokens": 135281,
       "not_applicable_checks": []
     },
@@ -61,6 +62,7 @@
         "OutcomeScore": 1.0
       },
       "latency": 47.00481715425849,
+      "turn1_s": null,
       "total_tokens": 135195,
       "not_applicable_checks": []
     },
@@ -79,6 +81,7 @@
         "OutcomeScore": 1.0
       },
       "latency": 46.67580479523167,
+      "turn1_s": null,
       "total_tokens": 135281,
       "not_applicable_checks": []
     }

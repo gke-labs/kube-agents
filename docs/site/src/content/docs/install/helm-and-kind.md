@@ -8,6 +8,8 @@ description: A canonical GKE-oriented Helm chart and companion Terraform modules
 
 ## Install today
 
+A GitOps repository on a GitHub Enterprise Server is installed with `install.sh --gitops-host`, or with Terraform + Helm: see [GitHub Enterprise Server in INSTALL.md](https://github.com/gke-labs/kube-agents/blob/main/INSTALL.md#github-enterprise-server).
+
 - [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — `install.sh` bootstraps GKE, the operator, and the agent.
 - [Helm & Terraform (GitOps)](/kube-agents/deploy/release-versioning/) — deploy via versioned OCI Helm charts and SemVer Terraform modules. For a one-command IaC install (cluster + IAM + chart in a single `terraform apply`), see [`terraform/examples/full-install/`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install).
 - [Manual install](/kube-agents/install/manual/) — for other Hermes-compatible harnesses.

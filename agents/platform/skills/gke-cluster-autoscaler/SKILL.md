@@ -18,19 +18,21 @@ description: >-
 
 **Overlap Warning:** Defer to the `gke-compute-classes` skill for ComputeClass YAML generation, schemas, and priority configurations (including fallback configurations). Answer operational autoscaler questions directly, but refer users to `gke-compute-classes` when providing/explaining YAML.
 
+> A change goes out as a pull request to the GitOps repository, never as a write from here: Kubernetes objects as YAML through `gke-manifest-generation`, cluster settings and other Google Cloud resources as Config Connector YAML through `gcp-config-connector`, opened with `submit-suggestion`. Each profile's config offers only the `gke` MCP server's read tools, and the broker refuses `kubectl` and `gcloud` writes.
+
 ## Provisioning Enablement
 - **Modern GKE (1.33.3+):** Use ComputeClasses (`spec.nodePoolAutoCreation.enabled: true`). Cluster-level Node Auto Provisioning not required.
-- **Older GKE:** `gcloud container clusters update <C> --enable-autoprovisioning --max-cpu=200 --max-memory=800`
-- **Manual Pools (Standard clusters only):** `gcloud container node-pools update <P> --enable-autoscaling --min-nodes=1 --max-nodes=10`
+- **Older GKE:** cluster-level Node Auto Provisioning on the cluster's `ContainerCluster`: `spec.clusterAutoscaling.enabled: true` with `spec.clusterAutoscaling.resourceLimits` (`cpu` maximum 200, `memory` maximum 800), proposed through `gcp-config-connector`.
+- **Manual Pools (Standard clusters only):** `spec.autoscaling.minNodeCount: 1` and `spec.autoscaling.maxNodeCount: 10` on the pool's `ContainerNodePool`, proposed through `gcp-config-connector`.
 
 ## Optimization & Tuning
-- **Fast Scale-Down / Consolidation:** Switch cluster profile (`gcloud container clusters update <C> --autoscaling-profile=optimize-utilization`) AND reduce delay in ComputeClass (`spec.autoscalingPolicy.consolidationDelayMinutes: 5`).
+- **Fast Scale-Down / Consolidation:** Switch cluster profile (`spec.clusterAutoscaling.autoscalingProfile: OPTIMIZE_UTILIZATION` on the cluster's `ContainerCluster`, through `gcp-config-connector`) AND reduce delay in ComputeClass (`spec.autoscalingPolicy.consolidationDelayMinutes: 5`).
 - **Location Policy:** `location.locationPolicy: ANY` (Spot); `BALANCED` (HA On-Demand). `BALANCED` is **best-effort, NOT strict**: for unconstrained pods a single-zone stockout of the preferred family makes the autoscaler **skew that tier's scale-up to healthy zones** (e.g. 0/3/3), with NO fallback to a lower priority. Heavy fallback to the lowest-priority tier during a stockout comes from the stockout-cooldown cascade, NOT from `BALANCED` — see Commonly Missed.
 - **Spot Grace Period (GKE 1.35+):** Set `kubeletConfig.shutdownGracePeriodSeconds: 120` in ComputeClass to extend Spot preemption handling beyond default 30s.
 
 ## Quick Reference: Commonly Missed Facts
 - **Log ID:** Visibility logs: `container.googleapis.com/cluster-autoscaler-visibility` in Cloud Logging. Use `assets/log-autoscaler-events.sh <cluster-name>` to tail/parse.
-- **System Pod Segregation:** Label namespace to route non-DaemonSet system pods to cheap ComputeClass: `kubectl label ns kube-system cloud.google.com/default-compute-class-non-daemonset=system-pool`
+- **System Pod Segregation:** Label namespace to route non-DaemonSet system pods to cheap ComputeClass: `cloud.google.com/default-compute-class-non-daemonset: system-pool` on the `kube-system` Namespace, proposed as a pull request.
 - **Pool Fragmentation:** Avoid pool limits (>200 pools degrades performance) by using intent-based sizing (`machineFamily: n4`) instead of SKU-pinned ComputeClasses.
 - **CUDs vs Reservations:** CUDs are auto-consumed by matched machine families (no config). Reservations are NOT auto-consumed; target them explicitly via ComputeClass `reservations` block or Node Pool API. **New reservations lag Cluster Autoscaler's cache:** wait **≥30 min** after creating a reservation before driving scale-up against it — targeting it sooner makes Cluster Autoscaler back off that reservation and stall.
 - **CapacityBuffer (pre-warm / instant nodes / provisioning lag):** When nodes take too long to appear on traffic spikes and `--min-nodes` is unwanted, use the CapacityBuffer CRD — placeholder pods hold warm idle nodes, evicted instantly by real workloads. Size via `replicas: N` (fixed) or `percentage: 20` (dynamic). Example: `assets/capacity-buffer-serving.yaml`.
@@ -58,7 +60,7 @@ description: >-
 - `./assets/capacity-buffer-serving.yaml`: Example CapacityBuffer for serving workloads.
 
 ## Edge Cases & Advanced Troubleshooting
-*   **Stuck/Hanging VMs after Failure:** If node creation fails and the pool is at its `min-nodes` floor, Cluster Autoscaler won't delete unregistered VMs to avoid violating the minimum limit. Fix: Temporarily set `min-nodes` to 0 or delete instances manually in GCE.
+*   **Stuck/Hanging VMs after Failure:** If node creation fails and the pool is at its `min-nodes` floor, Cluster Autoscaler won't delete unregistered VMs to avoid violating the minimum limit. Fix: Temporarily set `min-nodes` to 0 (`spec.autoscaling.minNodeCount` on the pool's `ContainerNodePool`, through a pull request).
 *   **Volume Node Affinity Conflict:** "Volume node affinity conflict" means a volume zone differs from the node's zone (common with `VolumeBindingMode: Immediate`). Fix: Use a StorageClass with `volumeBindingMode: WaitForFirstConsumer`.
 *   **Missing CSI Driver (GKE 1.25+):** With `CSIMigrationGCE` in 1.25+, the default in-tree volume provisioner stops working. If pods fail to schedule on volume zone errors, enable the Compute Engine PD CSI Driver.
 *   **ComputeClass Reconciliation Loop:** Constant node pool churn (create/delete loop) with custom ComputeClasses can indicate unsupported enum values (e.g., `confidentialNodeType: CONFIDENTIAL_INSTANCE_TYPE_UNSPECIFIED`) bypassing GKE admission webhook. Fix: Remove invalid fields from ComputeClass YAML.

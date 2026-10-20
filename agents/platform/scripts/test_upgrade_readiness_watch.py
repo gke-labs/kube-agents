@@ -433,6 +433,19 @@ class Retired(Base):
         self.assertIn("1 ready;", out)
         self.assertNotIn(TARGET, self.ledger()["announced"].get("ungraded", {}))
 
+    def test_a_failed_audit_log_read_leaves_the_member_graded(self) -> None:
+        """The report lists a failed audit-log read under ``readiness.audit_log_failures``,
+        apart from ``errors``, so the watch's reading of a cluster-keyed error as a kubectl
+        read that failed never sees it: the member keeps its verdict."""
+        graded = member("a", "lagging", readiness=watch.READINESS_READY)
+        report = {
+            watch.MEMBERS_KEY: [graded],
+            watch.ERRORS_KEY: [],
+            watch.READINESS_KEY: {"audit_log_failures": [{"project": "p1", "location": "us-central1-a", "cluster": "a", "read": "removed", "message": "timed out"}]},
+        }
+        blocked, ready, unknown, unread = watch.readiness_verdicts(report, [watch.member_key(graded)])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [watch.member_key(graded)], [], []))
+
     def test_a_server_config_failure_leaves_the_location_s_unknown_members_unread(self) -> None:
         readiness = envelope(
             [member("a", "lagging", readiness="unknown")],
@@ -995,6 +1008,87 @@ class Budget(Base):
         self.assertEqual([c[2] for c in sandbox.calls if c[0] == "readiness"], [watch.READINESS_TIMEOUT_SECONDS])
 
 
+class WebhookReadFailure(unittest.TestCase):
+    """A member whose first read answered and whose other rules were graded is graded, not
+    unread, when only the second, webhook read failed: its `unknown` is a verdict."""
+
+    def _report(self, read_tag):
+        member = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        error = {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap"}
+        if read_tag:
+            error[watch.ERROR_READ_KEY] = read_tag
+        return {watch.MEMBERS_KEY: [member], watch.ERRORS_KEY: [error]}
+
+    def test_a_webhook_read_failure_leaves_the_member_graded_unknown(self) -> None:
+        key = watch.member_key({"project": "p", "location": "us-central1", "cluster": "big"})
+        blocked, ready, unknown, unread = watch.readiness_verdicts(self._report(watch.WEBHOOK_READ_ERROR), [key])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [], [key], []))
+
+    def test_a_first_read_failure_still_leaves_the_member_unread(self) -> None:
+        key = watch.member_key({"project": "p", "location": "us-central1", "cluster": "big"})
+        blocked, ready, unknown, unread = watch.readiness_verdicts(self._report(None), [key])
+        self.assertEqual((blocked, ready, unknown, unread), ([], [], [], [key]))
+
+    def test_the_markdown_lists_a_webhook_read_row_apart_from_the_unread_ones(self) -> None:
+        # The summary counts the member as graded (unknown); the row is listed under its own
+        # heading, not under the one that says its member is not graded, which the first-read
+        # row of another member still sits under.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        small = {"project": "p", "location": "us-central1", "cluster": "small", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+            {"project": "p", "location": "us-central1", "cluster": "small", "message": "get-credentials failed: 403"},
+        ]
+        keys = [watch.member_key(big), watch.member_key(small)]
+        text = watch.render_markdown(TARGET, "a new version", keys, envelope([big, small], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 unknown (p/us-central1/big; the table says what it could not decide) and 1 not read (p/us-central1/small;", text)
+        unread_at = text.index(watch.FAILED_READS_HEADING)
+        webhook_at = text.index(watch.WEBHOOK_READ_ROWS_HEADING)
+        self.assertLess(unread_at, webhook_at)
+        self.assertIn("- p/us-central1/small: get-credentials failed: 403", text[unread_at:webhook_at])
+        self.assertNotIn("big", text[unread_at:webhook_at])
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", text[webhook_at:])
+        self.assertTrue(watch.webhook_read_row(rows[0]) and not watch.unread_row(rows[0]))
+        self.assertTrue(watch.unread_row(rows[1]) and not watch.webhook_read_row(rows[1]))
+        self.assertFalse(watch.unread_row({"project": "p", "location": "us-central1", "message": "server config failed"}))
+
+    def test_a_member_with_a_first_read_row_and_a_webhook_row_is_listed_as_unread_with_both_rows(self) -> None:
+        # The first read timed out at the deadline (no skip marker), the second read then failed
+        # too: two rows for one member, which the summary counts as not read, so neither row
+        # sits under the heading that says the member was graded.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl get pdb,deploy,statefulset -A -o json timed out after 60 seconds"},
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+        ]
+        key = watch.member_key(big)
+        self.assertEqual(watch.readiness_verdicts({watch.MEMBERS_KEY: [big], watch.ERRORS_KEY: rows}, [key])[3], [key])
+        text = watch.render_markdown(TARGET, "a new version", [key], envelope([big], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 not read (p/us-central1/big;", text)
+        self.assertNotIn(watch.WEBHOOK_READ_ROWS_HEADING, text)
+        tail = text[text.index(watch.FAILED_READS_HEADING):]
+        self.assertIn("- p/us-central1/big: kubectl get pdb,deploy,statefulset -A -o json timed out after 60 seconds", tail)
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", tail)
+
+    def test_a_member_in_a_location_whose_server_config_failed_keeps_its_webhook_row_off_the_graded_heading(self) -> None:
+        # The summary counts the member as not read (its location's get-server-config failed and
+        # it is graded unknown, with no target), so its one webhook row is listed with the failed
+        # reads, not under the heading that says the member is graded.
+        big = {"project": "p", "location": "us-central1", "cluster": "big", "readiness": {"status": "unknown"}}
+        rows = [
+            {"project": "p", "location": "us-central1", "message": "get-server-config timed out"},
+            {"project": "p", "location": "us-central1", "cluster": "big", "message": "kubectl output cut at the credential proxy's cap", watch.ERROR_READ_KEY: watch.WEBHOOK_READ_ERROR},
+        ]
+        key = watch.member_key(big)
+        self.assertEqual(watch.readiness_verdicts({watch.MEMBERS_KEY: [big], watch.ERRORS_KEY: rows}, [key])[3], [key])
+        text = watch.render_markdown(TARGET, "a new version", [key], envelope([big], errors=rows), datetime(2026, 10, 14, tzinfo=timezone.utc), "Next report in 7 days")
+        self.assertIn("1 not read (p/us-central1/big;", text)
+        self.assertNotIn(watch.WEBHOOK_READ_ROWS_HEADING, text)
+        tail = text[text.index(watch.FAILED_READS_HEADING):]
+        self.assertIn("- p/us-central1: get-server-config timed out", tail)
+        self.assertIn("- p/us-central1/big: kubectl output cut at the credential proxy's cap", tail)
+
+
 class ProfileHome(unittest.TestCase):
     def test_a_hand_run_from_the_gateway_home_finds_the_profile_s_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -1375,7 +1469,8 @@ class Loader(unittest.TestCase):
     def test_the_loader_registers_the_readiness_module_and_calls_main_in_a_private_directory(self) -> None:
         source = watch.loader_source(["--project", "p1"])
         compile(source, "loader", "exec")
-        self.assertIn('sys.modules["upgrade_readiness"]', source)
+        self.assertIn("sys.meta_path.insert(0, Shipped())", source)
+        self.assertIn('importlib.import_module("fleet_upgrade_report")', source)
         self.assertIn("report.main(ARGV + ", source)
         self.assertIn("tempfile.mkdtemp(", source)
         self.assertIn("shutil.rmtree(private", source)
@@ -1388,6 +1483,69 @@ class Loader(unittest.TestCase):
             ["--project", "p1", "--project", "p2", "--readiness", "--kubeconfig-dir", watch.SANDBOX_KUBECONFIG_DIR],
         )
         self.assertEqual(watch.report_argv(["p1"], readiness=False), ["--project", "p1"])
+
+    def test_the_report_argv_never_carries_the_cluster_exclusion(self) -> None:
+        # #3081: the watch's report still covers the clusters
+        # spec.scope.exclude.clusters excludes (#3026), as the CRD field documents.
+        for readiness in (False, True):
+            self.assertNotIn("--scope-exclude-clusters", watch.report_argv(["ops-mgmt", "payments-prod"], readiness))
+
+    def test_the_shipped_set_is_every_skill_module_but_the_tests(self) -> None:
+        shipped = watch.shipped_modules()
+        for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "readiness_rules.finding", "upgrade_shape_tables"):
+            self.assertIn(name, shipped)
+        self.assertEqual([name for name in shipped if name.rsplit(".", 1)[-1].startswith(watch.SKILL_TEST_PREFIX)], [])
+        self.assertTrue(shipped["readiness_rules"][2])
+        self.assertFalse(shipped[watch.REPORT_MODULE][2])
+        self.assertTrue(all(Path(entry[1]).is_file() for entry in shipped.values()))
+        # The data files beside the modules ship too (the removal table), the test fixtures do not.
+        data = watch.shipped_data()
+        self.assertEqual(sorted(Path(path).name for path in data), ["removed_apis.json"])
+        self.assertTrue(all(Path(path).is_file() for path in data))
+        self.assertEqual(sorted(Path(path).name for path in watch.shipped_data(root="/elsewhere")), ["removed_apis.json"])
+        self.assertTrue(all(path.startswith("/elsewhere/") for path in watch.shipped_data(root="/elsewhere")))
+
+    def test_a_replacement_is_read_from_the_shipped_set_alone(self) -> None:
+        """The shape tables read the removal table through their module's loader. With the
+        set re-rooted to a directory that does not exist, as the sandbox's view of the
+        agent-side paths is, the replacement still comes from the shipped data; without
+        the data, the read fails loudly rather than as an empty table."""
+        with tempfile.TemporaryDirectory() as scratch:
+            absent = os.path.join(scratch, "absent")
+            program = watch.loader_preamble(root=absent) + "\n".join(
+                [
+                    "tables = importlib.import_module('upgrade_shape_tables')",
+                    "print(tables.replacement_for('extensions/v1beta1 networkpolicies'))",
+                ]
+            )
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip().splitlines()[-1], "networking.k8s.io/v1")
+            without_data = program.replace("DATA = {", "DATA = {}  # ", 1)
+            self.assertNotEqual(without_data, program)
+            completed = subprocess.run([sys.executable, "-I", "-"], input=without_data, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("removed_apis.json could not be read beside upgrade_shape_tables", completed.stderr)
+
+    def test_the_report_imports_from_the_shipped_set_alone(self) -> None:
+        """The finder alone, in an empty directory under ``-I``: every import the report
+        makes resolves from the shipped modules (or the shared scripts directory the report
+        appends itself), so a module a later change imports without shipping fails here,
+        not in the daily job."""
+        program = watch.loader_preamble() + "\n".join(
+            [
+                f"report = importlib.import_module({json.dumps(watch.REPORT_MODULE)})",
+                "print(json.dumps(sorted(name for name in sys.modules if name in SOURCES)))",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as scratch:
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": scratch, "TMPDIR": scratch}
+            completed = subprocess.run([sys.executable, "-I", "-"], input=program, capture_output=True, text=True, cwd=scratch, env=env, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        loaded = json.loads(completed.stdout.strip().splitlines()[-1])
+        for name in (watch.REPORT_MODULE, watch.READINESS_MODULE, "readiness_rules", "readiness_rules.audit_log", "readiness_rules.zonal_control_plane", "upgrade_shape_tables"):
+            self.assertIn(name, loaded)
 
     def test_the_loader_runs_the_checkout_copy_of_the_report_script(self) -> None:
         """End to end against the real scripts, with gcloud answering no

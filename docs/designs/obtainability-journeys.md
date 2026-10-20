@@ -237,4 +237,4 @@ stated start, the destination, a single firing) and `test_05_reactive_window_rep
 unattended re-plan (canonical re-probes, a revised recommendation or an honest no-window,
 retargeted manifests, no clarifying question). The schedule mechanism exists
 (`cronjob(action='create', deliver='chat')`); delivery into the thread that asked rather than the
-relay's per-job session is what R2 adds and the vehicle document's Scope table lists as not built.
+relay's per-job thread is what R2 adds and the vehicle document's Scope table lists as not built.

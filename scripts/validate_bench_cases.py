@@ -56,6 +56,8 @@ PLATFORM_JOBS_FILE = REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json"
 AUDIT_STREAMS_FILE = REPO_ROOT / "bench" / "kube_agents_bench" / "audit_streams.py"
 AUDIT_STREAMS_MODULE_NAME = "bench_audit_streams"
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
+YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
@@ -86,13 +88,14 @@ OWNER_MAINTAINERS = "maintainers"
 GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
 
 # The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
-# contributed case brings with it lives in one of these two trees -- the case
-# directory, and the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
-# put under bench/tf/prebuilt/<stack>/. Nothing else under bench/tf/ is
-# scanned: the shared modules and the seeded fleet are in-house and carry
-# in-house addresses on purpose.
+# contributed case brings with it lives in one of these trees -- the case
+# directory, the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
+# put under bench/tf/prebuilt/<stack>/, and shared modules under
+# bench/tf/modules/. Nothing else under bench/tf/ is scanned: the seeded
+# fleet is in-house and carries in-house addresses on purpose.
 PREBUILT_DIR = REPO_ROOT / "bench" / "tf" / "prebuilt"
-SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR)
+MODULES_DIR = REPO_ROOT / "bench" / "tf" / "modules"
+SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR, MODULES_DIR)
 # Local artefacts of running a stack, never committed and full of real
 # addresses by construction. A path component beginning with a dot
 # (.terraform/, .terraform.lock.hcl) is skipped for the same reason.
@@ -154,6 +157,18 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
 KNOWN_UNREGISTERED = {
+    # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
+    # as the stack cases below: a `stack:` case runs alone on lock-infra
+    # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
+    # chain is already at or past the 480m deadline on cost hints alone.
+    "gitops-drift-deleted-policy-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
+    "gitops-drift-load-bearing-change-triage": (
+        "#2889: stack case held out of the nightly until the infra-lock "
+        "chain has room"
+    ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
     # nightly is a tier decision nobody has made; this entry is the record
@@ -163,42 +178,41 @@ KNOWN_UNREGISTERED = {
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
     # confirmed or granted; a scheduled hack/ci_sweep_compute_plants.py; and
-    # room on the main part's infra-lock chain, measured with
-    # oobe-first-run-audits in it if that parked case returns first (or stack
-    # cases moved to a second project).
+    # room on the main part's infra-lock chain (or stack cases moved to a
+    # second project).
     # The entry goes when the case joins hack/eval/nightly-cases.txt.
     "networking-audit-subnet-range-exhaustion": (
         "#2755: stack case held out of the nightly until runner Compute "
         "permission, a scheduled plant sweep and infra-lock room land"
     ),
-    # Parked out of hack/eval/nightly-cases.txt on 2026-10-09 after its first
-    # night (build 2108346853085941760): its three repetitions held the infra
-    # lock 140 minutes and the deadline cut the main part, and each graded
-    # blocked, because its no-tool turn leaves an empty trajectory, which the
-    # gate's liveness rung reads as no agent run. The entry goes when the case
-    # can record a pass or a fail (#2699's tool_calls_optional would let its
-    # reply pass that rung) and the main part's infra-lock chain has room for
-    # it (or it runs on a job of its own); #2806 tracks both.
-    "oobe-first-run-audits": (
-        "#2806: parked 2026-10-09; 140 infra-lock minutes truncated the main "
-        "nightly, and its empty trajectory grades every repetition blocked"
+    # The chat-route twin of the case above (#2386): it plants the same stack
+    # and is held out of the nightly for the same #2755 preconditions. It is a
+    # regression guard (main already passes it, 3 of 3 on a dev install), run
+    # by hand on a dev install until then. The entry goes when
+    # the case joins hack/eval/nightly-cases.txt, with the 900s audit-band
+    # unit_cost_hint.
+    "networking-chat-request-runs-collector": (
+        "#2755: stack case held out of the nightly until runner Compute "
+        "permission, a scheduled plant sweep and infra-lock room land"
     ),
-    # Has its fixture and its eval record (three greens on a dev install, and
-    # a planted forwarded-churn record the stack's own observation catches --
-    # a ledger row or a DRIFT line, either one), and belongs
-    # in the nightly; held out for the same infra-lock budget as the case
-    # above. Every case with a `stack:` holds lock-infra for its whole unit,
-    # so the stack cases run one at a time whatever the parallelism. This
-    # one's worst case is card_timeout_seconds plus settle_seconds plus the
-    # plant and the publishes -- about 33 minutes on the lock before the
-    # agent turn, three times a night, and longest on exactly the nights the
-    # filter or the ingress is broken. Registering it would spend that out of
-    # other cases' repetitions when the deadline kill truncates the tail. The
-    # entry goes when the chain has room, with a unit_cost_hint sized to the
-    # measured cost and a roster paragraph carrying the new count.
-    "gitops-drift-noise-filtered-triage": (
-        "#2755: stack case held out of the nightly until the infra-lock "
-        "chain has room"
+    # It grades what a chat channel received, and every CI install deploys with
+    # GOOGLE_CHAT_ENABLED and SLACK_ENABLED false (hack/ci-deploy.sh), so the
+    # relay posts nowhere there and the case can only fail. Run by hand against
+    # an install with a chat platform, as for a relay change's eval loop. The
+    # entry goes when an eval lane has a chat platform.
+    "chat-relay-posts-report-as-written": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
+    "fleet-audit-chat-report-is-the-report": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
+    # It grades a GitHub forge declared at a GitHub Enterprise Server host,
+    # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
+    # it. No eval lane deploys either, so it runs by hand with the recipe in
+    # its header. The entry goes when a lane deploys both.
+    "ghes-pdb-remediation-pr": (
+        "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
+        "run by hand with the recipe in the case header"
     ),
 }
 
@@ -215,6 +229,11 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "scope-excluded-cluster-not-listed": (
+        "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
+        "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
+        "cluster exclusion and the case cannot patch the CR for a run"
+    ),
     "networking-world-open-ingress": (
         "#2682: needs bench/tf/fleet's world_open firewall rule and VM applied to "
         "every pool project (fleet re-apply); no pool project has a rule opening a "
@@ -255,6 +274,22 @@ FIXTURE_NOT_READY = {
         "project's id at the case's two sites: the command check's first forbidden "
         "pattern and the ledger check's forbidden phrase"
     ),
+    "fleet-audit-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
+    "gitops-drift-no-repository-triage": (
+        "#3313: needs an install with no usable GitOps repository (a PlatformAgent "
+        "whose spec.integration.repositories is empty); every CI eval install "
+        "registers one, so no CI tier can run it; run it by hand against such an "
+        "install"
+    ),
+    "fleet-cost-without-forge-keeps-the-report": (
+        "#2419: needs an install with no forge (a PlatformAgent with no "
+        "spec.integration); every CI eval install has a GitHub forge, so no CI tier "
+        "can run it; run it by hand against such an install"
+    ),
     "networking-audit-second-project": (
         "#1865: needs a second GCP project per pool project that the agent's "
         "service account can read, declared in the install's spec.scope.projects (or an "
@@ -272,6 +307,11 @@ FIXTURE_NOT_READY = {
         "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
         "(fleet re-apply); no pool project runs a VM whose startup script fails"
     ),
+    "gce-chat-request-runs-collector": (
+        "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
+        "(fleet re-apply), as gce-startup-script-failure does; until then it runs by "
+        "hand on a dev install with the VM planted"
+    ),
     "obtainability-major-pdb-auto-pr": (
         "#2228: needs checkout-gateway declared under clusters/seeded-a/ in "
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
@@ -286,72 +326,6 @@ FIXTURE_NOT_READY = {
         "#1873: needs the stalled-controller role applied to every pool "
         "project; fixture defined in #1893, waiting on fleet re-apply and pool "
         "verification sweep"
-    ),
-}
-
-# Cases that claim no domain because no row in domains.yaml describes them.
-# "Covers nothing, and we checked" is a real answer; an absent field is not,
-# because a domain with no case reports as uncovered and a case with no slug
-# can stay green for months while the report shows the gap.
-KNOWN_NO_DOMAIN = {
-    "observability-watcher-scrape-state": (
-        "a question about the agent's own observability, whether the event "
-        "watcher's metrics are scraped and what proves it, graded on the "
-        "delegation, the worker's read of the PodMonitoring and the final "
-        "answer; reads the agent's own install, not the fleet, and no "
-        "domains.yaml row describes the agent's own observability"
-    ),
-    "platform-worker-refuses-shipped-skill-edit": (
-        "a skill-governance refusal graded on the worker's card result and on "
-        "its skill_manage calls (none may succeed); reads no fleet, and no "
-        "domains.yaml row describes skill or self-modification governance"
-    ),
-    "vcs-forge-cli-request-uses-the-verbs": (
-        "a read-only forge question that names gh, graded on the route the "
-        "worker took to the answer (the version-control verbs, not a forge "
-        "CLI); like vcs-history-only-fact, no domains.yaml row describes "
-        "repository access"
-    ),
-    "vcs-history-only-fact": (
-        "a repository-history question graded on the answer and on the route "
-        "the worker took to it (the version-control verbs, never a credentialed "
-        "clone or gh from the sandbox); no domains.yaml row describes "
-        "repository access"
-    ),
-    "vcs-issue-resolver-triage": (
-        "the github-issue-resolver skill end to end -- poll, claim, "
-        "investigate, transition -- graded on the route the resolver took to "
-        "the forge and on the triage it produced; no domains.yaml row "
-        "describes issue triage, and incident-triage names the event-fired "
-        "autoops journey rather than this one"
-    ),
-    "vcs-review-feedback-read-back": (
-        "a second revision put on an existing proposal's branch and read back "
-        "from the forge before it is described, graded on the route the worker "
-        "took to the read-back; rca-remediation-pr owns the remediation "
-        "journey -- a proposed fix landing as a pull request -- and this case "
-        "proposes no fix"
-    ),
-    "vcs-spent-branch-reuse": (
-        "a second proposal opened under a branch name whose first proposal "
-        "was closed, graded on the branch the pull request came from; like "
-        "vcs-review-feedback-read-back it proposes no fix, and "
-        "rca-remediation-pr owns the remediation journey"
-    ),
-    "gpu-stress-test-diagnosis": (
-        "a chat-prompted post-incident RCA, not the event-fired autoops triage "
-        "that incident-triage names; no domains.yaml row describes it"
-    ),
-    "knowledge-grounding-sources-probe": (
-        "a grounded-knowledge citation probe: a pure GKE documentation "
-        "question graded on the persona's Sources contract; it reads no "
-        "fleet and no domains.yaml row describes knowledge retrieval"
-    ),
-    "platform-worker-shell-edit-of-shipped-skill": (
-        "a shell-sandbox integrity case: a worker told to edit a shipped skill "
-        "from its terminal, graded on the sandbox's copy still matching the "
-        "image; it reads no fleet and no domains.yaml row describes skill or "
-        "sandbox integrity"
     ),
 }
 
@@ -394,8 +368,18 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "any_of_patterns",
         "forbidden_patterns",
+        "required_patterns",
     ),
+    # The parsed manifest's fields and selector are the assertion; `kind` alone
+    # only names what to look for.
+    "report_manifest": ("fields", "selects", "excludes"),
     "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    # No field: a bold one-sentence lead, no heading and the length caps are
+    # the assertion, and every field narrows it.
+    "answer_first": (),
+    # No field: "this run's report is in the store" is the assertion, and
+    # `status` and `required_finding_phrases` only narrow it.
+    "audit_report_stored": (),
     # No field, deliberately: the freshness binding is the assertion and every
     # field only narrows it. See the empty-tuple rule in _check_assertions.
     "pull_request_opened": (),
@@ -405,7 +389,7 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # may also declare it.
     "github_writes": (),
     "tool_called": ("tool_names",),
-    "worker_commands": ("required_patterns", "forbidden_patterns"),
+    "worker_commands": ("required_patterns", "forbidden_patterns", "required_runs", "forbidden_runs", "forbidden_result_patterns"),
     "worker_agents": ("required_agents",),
     "replay_card": ("status_in", "status_not_in", "comment_phrases", "decoy_status_in"),
     # No assertion field: "the gateway would post nothing" is the assertion; `reply` only picks
@@ -440,6 +424,13 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading. No field: whether every post a planted
+    # report produced is that report, exactly, is the whole assertion.
+    "relay_posted_as_written": (),
+    # This repository, agent-pod- and sandbox-reading. No field: whether every
+    # post a fired audit run produced is the report its `finish` rendered is the
+    # whole assertion.
+    "audit_chat_report_posted": (),
 }
 
 # Check types that read live cluster state. A case using one is asserting on
@@ -501,9 +492,42 @@ class CaseError(Exception):
     """A case file that could not be read at all."""
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that refuses a key written twice in one mapping.
+
+    devops-bench loads a task with ruamel's safe loader, which raises on a
+    repeated key, while yaml.safe_load keeps the last value. With safe_load
+    here, a task.yaml the runner cannot load at all would pass this validator.
+    A key that overrides one brought in by a merge key (`<<: *anchor`) is not a
+    repeat; both loaders accept it.
+    """
+
+
+def _construct_unique_mapping(loader: _UniqueKeyLoader, node: yaml.MappingNode, deep: bool = False) -> Any:
+    # The mapping's own keys only, before construct_mapping flattens merged
+    # pairs into node.value, where an override would look like a repeat. Keys
+    # are compared as written (resolved tag and text), never constructed here:
+    # constructing one before construct_mapping normalises it can raise on a
+    # key both other loaders accept. A composite key is left to them.
+    seen: set[tuple[str, str]] = set()
+    for key_node, _ in node.value:
+        if key_node.tag == YAML_MERGE_TAG or not isinstance(key_node, yaml.ScalarNode):
+            continue
+        key = (key_node.tag, key_node.value)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark, f"found duplicate key {key_node.value!r}", key_node.start_mark
+            )
+        seen.add(key)
+    return loader.construct_mapping(node, deep=deep)
+
+
+_UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
+
 def _load_yaml(path: pathlib.Path) -> Any:
     try:
-        return yaml.safe_load(path.read_text(encoding="utf-8"))
+        return yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)  # noqa: S506 - a SafeLoader subclass
     except (OSError, yaml.YAMLError) as exc:
         raise CaseError(f"{path}: could not be parsed as YAML: {exc}") from exc
 
@@ -886,13 +910,11 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
     # is invisible to the count that decides whether a domain is covered.
     domain = spec.get("domain")
     if domain is None:
-        if name not in KNOWN_NO_DOMAIN:
-            problems.append(
-                "declares no 'domain:'. Claim a slug from "
-                "docs/designs/domains.yaml, or add a reviewed KNOWN_NO_DOMAIN "
-                "entry in scripts/validate_bench_cases.py saying why no row "
-                "describes this case"
-            )
+        problems.append(
+            "declares no 'domain:'. Claim a slug from docs/designs/domains.yaml; "
+            "if no row there describes this case, add one (with its owner, "
+            "backup and meaning) in the same change"
+        )
     elif not isinstance(domain, str):
         problems.append(f"claims domain {domain!r}, which is not a slug string")
     elif domain not in known_domains():
@@ -956,6 +978,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             f"'expected_fail:' {spec['expected_fail']!r} is not a YAML boolean; "
             "write a bare true or false. A quoted value is a string, which "
             "bench-gate refuses at spec-load time, after the lease"
+        )
+    if "tool_calls_optional" in spec and not isinstance(spec["tool_calls_optional"], bool):
+        problems.append(
+            f"'tool_calls_optional:' {spec['tool_calls_optional']!r} is not a YAML "
+            "boolean; write a bare true or false. bench-gate refuses a quoted "
+            "value at spec-load time, after the lease"
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
@@ -1385,7 +1413,6 @@ def stale_allowlist_entries() -> list[str]:
     stale = []
     for label, entries in (
         ("KNOWN_UNREGISTERED", KNOWN_UNREGISTERED),
-        ("KNOWN_NO_DOMAIN", KNOWN_NO_DOMAIN),
         ("KNOWN_JUDGE_ONLY", KNOWN_JUDGE_ONLY),
         ("FIXTURE_NOT_READY", FIXTURE_NOT_READY),
     ):

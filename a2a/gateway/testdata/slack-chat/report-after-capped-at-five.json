@@ -1,0 +1,168 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "Security & RBAC audit: 7 findings, 2 critical.",
+                "type": "text"
+              },
+              {
+                "text": " 2 are new since the last run.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "seeded-b and -c admit privileged pods",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "default SA is ",
+                "type": "text"
+              },
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "cluster-admin",
+                "type": "text"
+              },
+              {
+                "text": " on seeded-c",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "Also found: finding 1.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "text": "Also found: finding 2.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "text": "Also found: finding 3.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "text": "Also found: finding 4.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "text": "Also found: finding 5.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "look at: seeded-b and -c admit privileged pods",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "look at: seeded-b and -c admit privileged pods"
+          },
+          {
+            "action_id": "kage.link.0",
+            "text": {
+              "emoji": true,
+              "text": "Ledger issue #231 ↗",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "url": "https://l/231"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

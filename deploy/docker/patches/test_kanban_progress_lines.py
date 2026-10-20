@@ -235,7 +235,7 @@ class ApplierTest(unittest.TestCase):
         patched = self._notifier(root)
         self.assertIn('"heartbeat": _fmt_heartbeat,', patched)
         self.assertIn("def _fmt_heartbeat(ev, n) -> tuple:", patched)
-        self.assertIn('+ ("heartbeat",)', patched)
+        self.assertIn('+ ("heartbeat", "pr_opened")', patched)
         self.assertIn("self.progress_header = ", patched)
         self.assertIn("from gateway.kanban_progress_lines import progress_note", patched)
         self.assertIn("from gateway.kanban_progress_lines import deliver", patched)
@@ -338,7 +338,7 @@ class TerminalKindsLocatorTest(ApplierTest):
         patched = self._notifier(root)
         # Upstream's addition survives, and heartbeat is appended to it.
         self.assertIn('"abandoned"', patched)
-        self.assertIn('+ ("heartbeat",)', patched)
+        self.assertIn('+ ("heartbeat", "pr_opened")', patched)
 
     def test_a_reformatted_tuple_still_patches(self):
         multiline = (
@@ -352,7 +352,7 @@ class TerminalKindsLocatorTest(ApplierTest):
         )
         root = self._tree(kinds=multiline)
         applier.apply(root)
-        self.assertIn('+ ("heartbeat",)', self._notifier(root))
+        self.assertIn('+ ("heartbeat", "pr_opened")', self._notifier(root))
 
     def test_a_filter_that_lost_a_kind_fails_the_build(self):
         # Membership this patch reasons about is asserted, not searched on, so
@@ -444,6 +444,24 @@ class ResultLineTest(unittest.TestCase):
         self.assertEqual(result_line("completed", {"summary": None}), "")
         self.assertEqual(result_line("completed", None), "")
         self.assertEqual(result_line("gave_up", {"summary": "x"}), "")
+
+
+class SettlesAsTest(unittest.TestCase):
+    def test_a_hard_wall_block_settles_as_a_give_up(self):
+        self.assertEqual(kanban_progress_lines.settles_as("blocked", {"kind": "capability"}), "gave_up")
+
+    def test_every_other_event_settles_as_itself(self):
+        for kind, payload in (
+            ("blocked", {"kind": "needs_input"}),
+            ("blocked", {"kind": "transient"}),
+            ("blocked", {}),
+            ("blocked", None),
+            ("blocked", "capability"),
+            ("completed", {"kind": "capability"}),
+            ("gave_up", {}),
+        ):
+            with self.subTest(kind=kind, payload=payload):
+                self.assertEqual(kanban_progress_lines.settles_as(kind, payload), kind)
 
 
 class RenderTest(unittest.TestCase):
@@ -876,6 +894,53 @@ class SlackQuietTerminalTest(unittest.IsolatedAsyncioTestCase):
             held[sub_key(SLACK_SUB)], {3: ("gave_up", SLACK_SUB["chat_id"], "✖ gave up", {})},
         )
 
+    async def test_a_hard_wall_block_is_held_and_settles_the_ask_as_a_give_up(self):
+        # A card whose target does not exist: the wake explains it, and the ask gets ❌.
+        adapter, watcher = _Adapter(), SimpleNamespace()
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z."})
+        result = await deliver(watcher, adapter, SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertIsNone(result)
+        self.assertEqual(adapter.sent, [])
+        self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+        # Held as the worker's reason, so a wake that fails posts that, not a pause line.
+        held = getattr(watcher, kanban_notifier.HELD_ATTR)
+        self.assertEqual(
+            held[sub_key(SLACK_SUB)], {3: ("blocked", SLACK_SUB["chat_id"], "No cluster named seeded-z.", {})},
+        )
+
+    async def test_a_hard_wall_block_nobody_is_woken_for_posts_its_reason(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z."})
+        await deliver(SimpleNamespace(), adapter, sub, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertEqual(adapter.sent[-1][1], "No cluster named seeded-z.")
+
+    async def test_a_hard_wall_reason_over_the_limit_is_clipped(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        reason = "No cluster named seeded-z. " + "seeded-a " * 300
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": reason})
+        await deliver(SimpleNamespace(), adapter, sub, "blocked", block, "⏸ blocked", None, HEADER)
+        posted = adapter.sent[-1][1]
+        self.assertLessEqual(len(posted), 2000)
+        self.assertTrue(posted.startswith("No cluster named seeded-z."))
+        self.assertTrue(posted.endswith(ELLIPSIS))
+
+    async def test_a_hard_wall_block_without_a_reason_keeps_the_line(self):
+        adapter = _Adapter()
+        sub = dict(SLACK_SUB, delivery_mode="notify")
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability"})
+        await deliver(SimpleNamespace(), adapter, sub, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertEqual(adapter.sent[-1][1], "⏸ blocked")
+
+    async def test_any_other_block_still_settles_as_a_block(self):
+        for payload in ({"kind": "needs_input"}, {"kind": "transient"}, {}, None):
+            with self.subTest(payload=payload):
+                self.calls.clear()
+                block = SimpleNamespace(id=3, kind="blocked", payload=payload)
+                await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+                self.assertEqual(self.calls, [("t_e0c1", "blocked")])
+
     async def test_a_line_that_cannot_be_held_is_posted(self):
         adapter = _Adapter()
         with mock.patch("kanban_notifier.hold_explained", side_effect=RuntimeError("boom")):
@@ -924,6 +989,82 @@ FAILURE_LINES = {
     "blocked": f"⏸ {SLACK_HEAD} blocked: needs the prod-a kubeconfig",
     "timed_out": f"⏱ {SLACK_HEAD} timed out (max_runtime=600s); will retry",
 }
+
+
+class _MetadataAdapter(_Adapter):
+    """An adapter that records the metadata each post went out with."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.metadata = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.metadata.append(metadata)
+        return await super().send(chat_id, content, metadata)
+
+
+class _ChatNotifyStandIn(_MetadataAdapter):
+    """The chat.notify stand-in as kanban_progress_lines sees it: it has ``send_chat``."""
+
+    async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+        raise AssertionError("the terminal report goes through send, with the chat message in its metadata")
+
+
+class ChatNotifyAnswerTest(SlackQuietTerminalTest):
+    """Under next, a completed card's report through the chat.notify stand-in is laid out as an answer."""
+
+    def setUp(self):
+        super().setUp()
+        notify = SimpleNamespace(
+            chat_route=lambda adapter: callable(getattr(adapter, "send_chat", None)),
+            CHAT_METADATA_KEY="kage_chat",
+        )
+        gateway = sys.modules["gateway"]
+        gateway.kanban_chat_notify = notify
+        patcher = mock.patch.dict(sys.modules, {"gateway.kanban_chat_notify": notify})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_the_report_carries_its_answer(self):
+        adapter = _ChatNotifyStandIn()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.sent[-1][1], "Both pods are up. Seeded-a runs two.")
+        self.assertEqual(adapter.metadata[-1]["kage_chat"],
+                         {"schema": "kube-agents.chat/v1", "headline": "Both pods are up.", "detail": "Seeded-a runs two."})
+
+    async def test_an_actionable_report_and_a_non_hard_wall_failure_post_their_text_alone(self):
+        adapter = _ChatNotifyStandIn()
+        with mock.patch.object(kanban_notifier, "actionable_report", return_value=True):
+            await self._run(adapter, SLACK_SUB, "completed", "Down. Reply apply.")
+        self.assertNotIn("kage_chat", adapter.metadata[-1] or {})
+
+    async def test_a_hard_wall_block_on_a_conversation_posts_its_reason_as_an_answer(self):
+        # Under next a conversation card's wake reply goes nowhere, so the line is not held for it.
+        class Conversation(_ChatNotifyStandIn):
+            pass
+
+        sys.modules["gateway.kanban_chat_notify"].ConversationNotifyAdapter = Conversation
+        adapter = Conversation()
+        block = SimpleNamespace(
+            id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z. It has seeded-a."},
+        )
+        await deliver(SimpleNamespace(), adapter, SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertEqual(adapter.sent[-1][1], "No cluster named seeded-z. It has seeded-a.")
+        self.assertEqual(adapter.metadata[-1]["kage_chat"]["headline"], "No cluster named seeded-z.")
+        self.assertEqual(self.calls, [("t_e0c1", "gave_up")])
+
+    async def test_a_hard_wall_block_on_any_other_stand_in_is_still_held(self):
+        sys.modules["gateway.kanban_chat_notify"].ConversationNotifyAdapter = type("Conversation", (), {})
+        adapter = _ChatNotifyStandIn()
+        block = SimpleNamespace(id=3, kind="blocked", payload={"kind": "capability", "reason": "No cluster named seeded-z."})
+        result = await deliver(SimpleNamespace(), adapter, SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+        self.assertIsNone(result)
+        self.assertEqual(adapter.sent, [])
+
+    async def test_todays_adapter_gets_the_metadata_it_always_got(self):
+        adapter = _MetadataAdapter()
+        await self._run(adapter, SLACK_SUB, "completed", "Both pods are up. Seeded-a runs two.")
+        self.assertIsNone(adapter.metadata[-1])
 
 
 class SlackHeadsTest(unittest.IsolatedAsyncioTestCase):
@@ -1137,6 +1278,15 @@ class SlackPlanHookTest(unittest.IsolatedAsyncioTestCase):
         completed = SimpleNamespace(id=3, kind="completed", payload={"summary": "seeded-a · 1.33.4 = default"})
         await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", completed, "Done.", None, HEADER)
         self.assertEqual(self.results, ["seeded-a · 1.33.4 = default"])
+
+    async def test_a_hard_wall_block_settles_its_row_as_a_give_up(self):
+        # The row goes red, as a give-up's does; a question keeps the blocked row.
+        for payload, settled in (({"kind": "capability"}, "gave_up"), ({"kind": "needs_input"}, "blocked")):
+            with self.subTest(payload=payload):
+                self.settled.clear()
+                block = SimpleNamespace(id=3, kind="blocked", payload=payload)
+                await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "blocked", block, "⏸ blocked", None, HEADER)
+                self.assertEqual(self.settled, [("t_e0c1", settled)])
 
     async def test_a_terminal_event_names_the_card_for_a_row_it_opens(self):
         # A card that sent no note gets its row from the settle, led by its title.
@@ -1366,6 +1516,14 @@ class FanOutOpenTest(unittest.IsolatedAsyncioTestCase):
         self._set(stop, "blocked")
         self.assertTrue(await kanban_progress_lines._folds(SLACK_SUB, None))
 
+    async def test_a_creator_stopped_on_a_hard_wall_does_not(self):
+        # Its worker will not run again to carry the children's reports up, as with a give-up.
+        self._set("UPDATE tasks SET status = 'blocked' WHERE id = 't_parent'")
+        self._set(
+            "INSERT INTO task_events (task_id, kind, payload) VALUES ('t_parent', 'blocked', ?)", '{"kind": "capability"}',
+        )
+        self.assertFalse(await kanban_progress_lines._folds(SLACK_SUB, None))
+
     async def test_a_creators_only_child_does_not(self):
         # A single-cluster delegation: the Cluster Agent's whole report is the answer's evidence.
         self._set("DELETE FROM task_events WHERE task_id = 't_e0c2'")
@@ -1450,6 +1608,15 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             test.announced.append((sub["task_id"], text, len(adapter.sent)))
             return True
 
+        self.recorded = []
+        self.pr_event_raises = None
+
+        async def pr_event(adapter, sub, payload, text=""):
+            if test.pr_event_raises:
+                raise test.pr_event_raises
+            test.recorded.append((sub["task_id"], payload, text))
+            return True
+
         async def settle_delegated(adapter, sub, kind, board=None):
             test.settled.append((sub["task_id"], kind))
 
@@ -1464,6 +1631,7 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             asked=lambda sub, event_id: event_id == test.asked_event,
             needs_you=needs_you,
             pr_opened=pr_opened,
+            pr_event=pr_event,
             settle_question=settle_question,
         )
         self.modules = {
@@ -1518,6 +1686,14 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.sent, [])
         self.assertEqual(self.settled, [("t_e0c1", "completed")], "the arrival reaction was left on")
         self.assertEqual(self.announced, [("t_e0c1", f"seeded-a: {self.PR_NOTE}", 0)], "a PR it opened lost its message")
+
+    async def test_a_folded_completion_announces_a_pr_its_summary_alone_names(self):
+        # The folded row's message is the result alone; the summary still names the PR.
+        self._plan(shows=True, folds=True)
+        self.assertIsNone(await self._child(_Adapter(), payload={"summary": self.PR_NOTE}))
+        self.assertEqual(
+            self.announced, [("t_e0c1", f"seeded-a: 1.33.4 = default.\n{self.PR_NOTE}", 0)],
+        )
 
     async def test_a_completion_the_plan_does_not_show_or_with_no_open_fan_out_posts(self):
         for shows, folds in ((False, True), (True, False)):
@@ -1591,6 +1767,58 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
         await self._blocked(_Adapter(), {"kind": "capability", "reason": "no GPU"})
         self.assertEqual(self.questions_settled, ["t_e0c1"])
 
+    PR_EVENT = {"url": "https://github.com/acme/fleet/pull/99", "number": 99, "title": "Raise the limit"}
+
+    def _pr_batch(self, sub=SLACK_SUB):
+        events = [
+            SimpleNamespace(id=5, kind="pr_opened", payload=self.PR_EVENT),
+            _beat(6, "Both fixes are up for review in PR #99"),
+            SimpleNamespace(id=7, kind="completed", payload={"summary": "Raised the limit on seeded-a."}),
+        ]
+        return SimpleNamespace(sub=sub, adapter=_Adapter(), title="t", d={"events": events}), events
+
+    async def test_a_pr_opened_event_posts_its_pr_with_the_words_after_it(self):
+        # No "opened" anywhere: the event, not the wording, decides.
+        notification, events = self._pr_batch()
+        await silent_event(notification, events[0])
+        self.assertEqual(
+            self.recorded,
+            [("t_e0c1", self.PR_EVENT, "Both fixes are up for review in PR #99\nRaised the limit on seeded-a.")],
+        )
+        self.assertEqual(self.questions_settled, [], "a PR is not a reason to settle the card's question")
+
+    async def test_a_pr_opened_event_alone_posts_with_no_words(self):
+        notification, events = self._pr_batch()
+        notification.d["events"] = events[:1]
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [("t_e0c1", self.PR_EVENT, "")])
+
+    async def test_a_replayed_pr_opened_event_posts_nothing(self):
+        notification, events = self._pr_batch({**SLACK_SUB, "last_ping_event_id": 5})
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [])
+
+    async def test_a_wake_only_subscription_gets_no_pr_message(self):
+        # Upstream calls the silent hook before it checks send_passive.
+        notification, events = self._pr_batch()
+        notification.send_passive = False
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [])
+
+    async def test_a_pr_opened_event_posts_nothing_with_the_flag_off_or_off_slack(self):
+        notification, events = self._pr_batch(SUB)
+        await silent_event(notification, events[0])
+        self.flag = False
+        notification, events = self._pr_batch()
+        await silent_event(notification, events[0])
+        self.assertEqual(self.recorded, [])
+
+    async def test_a_pr_opened_event_that_fails_to_post_never_raises(self):
+        self.pr_event_raises = RuntimeError("channel_not_found")
+        notification, events = self._pr_batch()
+        await silent_event(notification, events[0])
+        await silent_event(SimpleNamespace(), events[0])
+
     async def test_an_unblocked_or_archived_card_settles_its_question(self):
         # Both format to None upstream, so only silent_event sees them.
         for kind in ("unblocked", "archived"):
@@ -1641,6 +1869,17 @@ class SlackMomentsHookTest(unittest.IsolatedAsyncioTestCase):
             [(text, sent) for _task, text, sent in self.announced],
             [("Checking seeded-a.", 1), (self.PR_NOTE, 1), (f"Done. {self.PR_NOTE}", 2)],
         )
+
+    async def test_an_opened_pr_in_the_summary_alone_is_announced(self):
+        adapter, report = _Adapter(), "Both overlays reconcile."
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), adapter, SLACK_SUB, "completed", ev, report, None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"{report}\n{self.PR_NOTE}"])
+
+    async def test_a_summary_already_in_the_message_is_scanned_once(self):
+        ev = SimpleNamespace(id=3, kind="completed", payload={"summary": self.PR_NOTE})
+        await deliver(SimpleNamespace(), _Adapter(), SLACK_SUB, "completed", ev, f"Done. {self.PR_NOTE}", None, HEADER)
+        self.assertEqual([text for _task, text, _sent in self.announced], [f"Done. {self.PR_NOTE}"])
 
     async def test_a_long_note_is_scanned_whole(self):
         # The rolling line clips at 300 characters, cutting a url past it whole.

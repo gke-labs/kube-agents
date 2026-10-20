@@ -9,7 +9,8 @@ gateway. Its callers include the gateway patches for reactions
 (``slack_ux_reactions``, which the kanban notifier also reaches), plan and
 session status (``slack_ux_status``, which reads only :func:`enabled`), moments
 (``slack_ux_moments``, which reads :func:`enabled` and lays out through
-``slack_moments``), incident triage (``slack_ux_incident``), button clicks
+``slack_moments``), incident triage (``slack_ux_incident``), a finished card's
+answer (``slack_ux_answer``, through :func:`split_lead`), button clicks
 (``slack_ux_clicks``), failure replies (``slack_ux_failure``, which bolds
 with ``_first_sentence`` and adds its offer with :func:`blocks_answer`) and
 the harness-message patch (``slack_boilerplate``, which reads only :func:`enabled`);
@@ -25,9 +26,10 @@ Everything a caller changes on screen is gated on :func:`enabled`, the
 take their upstream path unchanged; this module only answers questions.
 
 Layout: :func:`split_answer` takes the headline off an agent's markdown
-answer; link buttons, none for a url :func:`_safe_link_url` refuses, and choice
-buttons, whose value the caller sets, are built by ``_button`` and wrapped into
-rows by ``_actions``; :func:`fallback_text`
+answer, and :func:`split_lead` the same first sentence as written; link
+buttons, none for a url :func:`_safe_link_url` refuses, and choice buttons,
+whose value the caller sets, are built by ``_button`` and wrapped into rows by
+``_actions``; :func:`fallback_text`
 is the headline, links and choices as plain mrkdwn, for the message's ``text``
 field, with any report rows led by their severity as inline code (a bullet when
 they have none).
@@ -214,6 +216,10 @@ BACKTICK = "`"
 #: Characters per report row.
 ROW_TEXT_MAX = 300
 PRIMARY_STYLE = "primary"
+#: A report's fold: Slack's collapsible container, its title capped as a
+#: ``kube-agents.chat/v1`` fold title is.
+FOLD_BLOCK = "container"
+FOLD_TITLE_MAX = 40
 
 #: A code fence line; nothing between an opener and its closer is a heading, a bullet or markup.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
@@ -288,6 +294,9 @@ SAFE_URL = re.compile(
 )
 #: A space-aligned clip shorter than this share of the limit drops too much; it cuts hard instead.
 CLIP_MIN_SHARE = 2
+#: Stands in for each character of a code span while :func:`sentence_starts` looks for sentence
+#: ends, keeping offsets: :func:`_hold_code`'s placeholder character, so it reads as that does.
+CODE_FILLER = "\x00"
 INLINE_CODE = re.compile(r"`[^`]*`")
 #: :func:`to_mrkdwn` holds a code span's place with this; :data:`CODE_PLACEHOLDER` finds it again.
 CODE_HOLD = "\x00{}\x00"
@@ -372,8 +381,30 @@ COLON = ":"
 COMMA = ","
 CLAUSE_ENDS = ".!?"
 CLAUSE_STOP = "."
+#: Emphasis markers a clause head's end is read through: "**Lead!**" already ends in a stop.
+CLAUSE_EMPHASIS = "*_"
 #: A first word :func:`as_line` capitalizes; "seeded-c" or "kube-system" is a name and keeps its case.
 LOWER_WORD = re.compile(r"[a-z]+(?![\w-])")
+#: Where :func:`clause_cut` may cut a first sentence too long for the headline: after a comma, a
+#: semicolon or a spaced dash, or before "due to" or "because", which then open the rest.
+CLAUSE_BREAK = re.compile(r"(?:,|;|\s+[—–])\s+|(?P<connector>\s+)(?:due\s+to|because)\b", re.IGNORECASE)
+#: A rest a comma, semicolon or dash cut may not leave: one opening on a relative word hangs off the
+#: noun before the cut ("…, which exhausts its limit"), so it reads as no sentence of its own.
+CLAUSE_RELATIVE = re.compile(r"(?:which|who|whom|whose|where|that)\b", re.IGNORECASE)
+#: A head a comma, semicolon or dash cut may not leave: a leading subordinate clause ("If the pool
+#: is full.") states a condition, not the finding.
+CLAUSE_SUBORDINATE = re.compile(
+    r"(?:if|when|whenever|while|although|though|because|since|unless|until|after|before|once|as|whether)\b",
+    re.IGNORECASE,
+)
+#: How far into a first sentence :func:`clause_cut` looks for a break: no headline of at most
+#: ``HEADLINE_MAX`` plain characters starts further in, and an answer can be megabytes long.
+CLAUSE_SCAN_MAX = 4096
+#: The shortest headline a clause cut may leave, its stop included: "In seeded-a." names nothing.
+CLAUSE_HEADLINE_MIN = 20
+#: A clause cut never falls inside a parenthetical or a link's label or url.
+CLAUSE_OPENERS = "(["
+CLAUSE_CLOSERS = ")]"
 
 
 def enabled() -> bool:
@@ -655,14 +686,42 @@ def _link_url(url: str) -> str:
     return url.replace("&", "&amp;").translate(MRKDWN_URL_ESCAPES)
 
 
+def _closes_own_run(stem: str, closer: str) -> bool:
+    """Whether ``closer``, the emphasis markers after ``stem``'s stop, closes a run ``stem`` opened."""
+    if closer in BOLD_EDGES:
+        return stem.count(closer) % 2 == 1
+    if closer in ITALIC_EDGES:
+        return stem.replace(closer * 2, "").count(closer) % 2 == 1
+    return False
+
+
+def _ends_sentence(line: str, match: re.Match) -> bool:
+    """Whether ``match``, a :data:`SENTENCE_END` in ``line``, ends a sentence rather than an abbreviation."""
+    sentence = line[: match.start()]
+    stem = sentence.rstrip("*_")
+    tail = max(0, len(stem) - ABBREVIATION_TAIL)
+    numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
+    # An emphasis run this sentence opened and closes right after the stop ends it, whatever
+    # word it ends on.
+    return _closes_own_run(stem, sentence[len(stem) :]) or not (numbered or ABBREVIATION_END.search(stem, tail))
+
+
+def sentence_starts(line: str) -> list[int]:
+    """The offsets in ``line`` where a sentence after the first starts, by :func:`_first_sentence`'s rules.
+
+    A stop inside a code span ends nothing, and neither does one after an abbreviation.
+    """
+    masked = line
+    for start, end, _opener in _code_spans(line):
+        masked = masked[:start] + CODE_FILLER * (end - start) + masked[end:]
+    return [match.end() for match in SENTENCE_END.finditer(masked) if _ends_sentence(masked, match)]
+
+
 def _first_sentence(line: str) -> tuple[str, str]:
     """``(first sentence, the rest)`` of ``line``, not cut after an abbreviation."""
     for match in SENTENCE_END.finditer(line):
-        sentence = line[: match.start()]
-        stem = sentence.rstrip("*_")
-        tail = max(0, len(stem) - ABBREVIATION_TAIL)
-        numbered = NUMBER_ABBREVIATION_END.search(stem, tail) and NUMBER_NEXT.match(line, match.end())
-        if not (numbered or ABBREVIATION_END.search(stem, tail)):
+        if _ends_sentence(line, match):
+            sentence = line[: match.start()]
             rest = line[match.end() :].strip()
             # "**One. Two.**" splits inside the bold, which would leave both halves unpaired.
             for marker, (opener, closer) in BOLD_EDGES.items():
@@ -681,10 +740,82 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     """``(headline, body_sections)`` for an agent's markdown answer.
 
     The headline is the first sentence of the first paragraph, as plain text
-    capped at ``HEADLINE_MAX``. The rest of that paragraph and every later
-    paragraph are the body sections, still markdown, in order. Empty input
-    gives ``("", [])``, and an answer that opens with a code fence has no
-    headline: ``("", paragraphs)``.
+    capped at ``HEADLINE_MAX``; one longer than that is cut at a clause
+    (:func:`clause_cut`) and clipped only when no clause fits. The rest of that
+    paragraph and every later paragraph are the body sections, still markdown,
+    in order. Empty input gives ``("", [])``, and an answer that opens with a
+    code fence has no headline: ``("", paragraphs)``.
+    """
+    lead, body = split_lead(markdown)
+    return (_clip(_plain(lead), HEADLINE_MAX) if lead else ""), body
+
+
+def clause_cut(sentence: str) -> tuple[str, str] | None:
+    """``(headline, rest)`` for a first sentence longer than ``HEADLINE_MAX``, as markdown, or None.
+
+    The cut is the last :data:`CLAUSE_BREAK` outside a code span, a bracket and a bold or italic run
+    that leaves a headline of :data:`CLAUSE_HEADLINE_MIN` to ``HEADLINE_MAX`` characters once
+    plain, a stop added, and no rest opening on a relative word after a comma, semicolon or
+    dash (:data:`CLAUSE_RELATIVE`). The rest is the sentence after the cut, as written, its first
+    word capitalized as :func:`as_line` would, so it reads as a sentence of its own. A
+    sentence bold from end to end, as the report format asks a worker to write its first
+    one, is cut inside the bold, and each half stays bold.
+    """
+    for marker in BOLD_MARKERS:
+        inner = sentence[len(marker) : -len(marker)]
+        if len(sentence) > 2 * len(marker) and sentence.startswith(marker) and sentence.endswith(marker) \
+                and marker not in inner:
+            cut = clause_cut(inner)
+            return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
+    if len(sentence) > CLAUSE_SCAN_MAX:
+        # No headline comes from past the scan, so only its prefix is read, up to its last space,
+        # and the rest of the sentence follows the cut's rest as written.
+        end = sentence.rfind(" ", 0, CLAUSE_SCAN_MAX)
+        end = end if end > 0 else CLAUSE_SCAN_MAX
+        cut = clause_cut(sentence[:end])
+        return (cut[0], cut[1] + sentence[end:]) if cut else None
+    held, spans = _hold_code(sentence)
+    masked, depth = [], 0
+    for char in held:
+        if char in CLAUSE_OPENERS:
+            depth += 1
+        masked.append(char if not depth else CODE_FILLER)
+        if char in CLAUSE_CLOSERS and depth:
+            depth -= 1
+    found = None
+    for match in CLAUSE_BREAK.finditer("".join(masked)):
+        head = held[: match.start()].rstrip()
+        connector = match.group("connector") is not None
+        rest = held[match.end("connector") if connector else match.end() :].strip()
+        if not rest or any(head.count(marker) % 2 for marker in BOLD_MARKERS):
+            continue
+        # A lone italic marker this head opens and does not close, as _first_sentence counts them.
+        if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
+               for marker, (opener, _closer) in ITALIC_EDGES.items()):
+            continue
+        if not connector and CLAUSE_RELATIVE.match(rest):
+            continue
+        if not connector and CLAUSE_SUBORDINATE.match(_plain(_restore_code(head, spans))):
+            continue
+        if head.rstrip(CLAUSE_EMPHASIS)[-1:] not in CLAUSE_ENDS:
+            head += CLAUSE_STOP
+        title = len(_plain(_restore_code(head, spans)))
+        if title > HEADLINE_MAX:
+            # Every later break leaves a longer headline; stopping keeps a sentence of many commas linear.
+            break
+        if title >= CLAUSE_HEADLINE_MIN:
+            found = head, rest
+    if found is None:
+        return None
+    head, rest = (_restore_code(part, spans) for part in found)
+    return head, rest[:1].upper() + rest[1:] if LOWER_WORD.match(rest) else rest
+
+
+def split_lead(markdown: str, cut: bool = True) -> tuple[str, list[str]]:
+    """:func:`split_answer` with the first sentence as it was written: markdown, unclipped.
+
+    A first sentence longer than ``HEADLINE_MAX`` is cut at a clause (:func:`clause_cut`), the
+    rest leading the body; with ``cut`` False, or when no clause fits, it comes back whole.
     """
     paragraphs = _paragraphs((markdown or "").replace("\x00", ""))
     if not paragraphs:
@@ -706,10 +837,13 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     # A period inside a code span does not end the sentence.
     held, spans = _hold_code(LIST_MARKER.sub("", joined))
     sentence, remainder = (_restore_code(part, spans) for part in _first_sentence(held))
-    headline = _clip(_plain(sentence), HEADLINE_MAX)
+    clause = clause_cut(sentence) if cut and len(_plain(sentence)) > HEADLINE_MAX else None
+    if clause:
+        sentence, overflow = clause
+        remainder = " ".join(part for part in (overflow, remainder) if part)
     tail = "\n".join(part for part in (remainder, more_lines.strip("\n")) if part)
     body = ([tail] if tail.strip() else []) + rest
-    return headline, body
+    return sentence, body
 
 
 # --- blocks ----------------------------------------------------------------
@@ -1031,8 +1165,14 @@ def blocks_report(
     action_id_prefix: str = "kage",
     detail: str = "",
     after_rows: str = "",
+    fold_title: str = "",
+    fold_rows: Sequence[Any] = (),
 ) -> list[dict]:
     """Block Kit for a report: headline, the top rows between dividers, buttons.
+
+    ``fold_rows``, laid out like ``rows``, go in a collapsed container titled
+    ``fold_title`` under the lines after the rows, above the buttons; with none
+    there is no fold.
 
     ``headline`` is bold and ``note`` follows it plain, both one line;
     ``detail``, when given, is one more plain line under them, clipped like a
@@ -1069,6 +1209,15 @@ def blocks_report(
     if after_lines:
         blocks.append({"type": "rich_text", "elements": [
             {"type": "rich_text_section", "elements": [{"type": "text", "text": line}]} for line in after_lines]})
+    folded = _shown(fold_rows)
+    if folded:
+        blocks.append({
+            "type": FOLD_BLOCK,
+            "title": {"type": "plain_text", "text": _clip(_plain(fold_title), FOLD_TITLE_MAX)},
+            "is_collapsible": True,
+            "default_collapsed": True,
+            "child_blocks": [{"type": "rich_text", "elements": [_rich_row(row) for row in folded]}],
+        })
     choice_buttons = [
         _button(label, f"{action_id_prefix}.{CHOICE_ACTION}.{i}", value=label)
         for i, label in enumerate(_choice_labels(choices))

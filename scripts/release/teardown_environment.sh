@@ -3,21 +3,23 @@
 #
 # Both the RC pipeline and the nightly pipeline install a full GKE cluster per
 # run and would otherwise leave it idling between runs. This runs as the last
-# step so the cluster exists only for the length of a run. Which environment it
+# step of each install (the RC pipeline installs twice, today then next) so the
+# cluster exists only for the length of a run. Which environment it
 # destroys is whatever GCP_PROJECT_ID / GCP_REGION / GKE_CLUSTER_NAME name —
 # nothing here is RC-specific.
 #
-# It is reached ONLY when every earlier step succeeded — the job's `needs` carry
-# the implicit success() that gives that guarantee. A run that failed anywhere
-# leaves its environment standing on purpose, so the failure can be examined on
-# the live cluster.
+# On the RC pipeline it is reached ONLY when every earlier step succeeded —
+# the job's `needs` carry the implicit success() that gives that guarantee —
+# and a run that failed anywhere leaves its environment standing on purpose,
+# so the failure can be examined on the live cluster. The staging promotion
+# pipeline keeps that rule for a failed matrix and adds one way in: a deploy
+# that did not succeed, which leaves a half-built environment with nothing to
+# examine beyond the deploy log, is torn down in the same run.
 #
-# What clears it afterwards differs by pipeline, and the nightly answer is
-# "nobody". On the RC the next scheduled run's pre-install teardown in
-# provision_environment.sh removes it within three hours. The nightly pipeline
-# has no schedule yet, so nothing reclaims a nightly environment at all: it
-# stands, and bills, until someone dispatches the pipeline again or runs
-# uninstall.sh by hand. Revisit this paragraph when the nightly cron lands.
+# What clears a standing environment afterwards: on the RC the next scheduled
+# run's pre-install teardown in provision_environment.sh removes it within
+# three hours; on the nightly, the next daily promotion run's does, or
+# uninstall.sh by hand sooner.
 set -euo pipefail
 
 export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
@@ -62,7 +64,7 @@ case "${TEARDOWN_STATUS}" in
       "${TEARDOWN_STATUS}" "${TEARDOWN_LOG}" \
       "uninstall.sh exited ${TEARDOWN_STATUS}; the environment is STILL RUNNING and no later step will remove it." \
       "⚠️ Environment teardown failed — the environment is still running" \
-      "The pipeline passed, but \`uninstall.sh\` did not remove its environment." \
+      "The run reached its teardown, but \`uninstall.sh\` did not remove its environment." \
       "The GKE cluster, its node pools and the rest of the project's resources are" \
       "still there and still billing." \
       "" \
@@ -70,10 +72,9 @@ case "${TEARDOWN_STATUS}" in
       "" \
       "\`${UNINSTALL_BY_HAND}\`" \
       "" \
-      "On the RC pipeline the alternative is the next scheduled run's pre-install" \
-      "teardown, three hours away, which will fail the same way if the cause is not" \
-      "fixed. The nightly pipeline has no schedule, so there is no alternative there:" \
-      "nothing else will remove this environment."
+      "The alternative is the next scheduled run's pre-install teardown -- three" \
+      "hours away on the RC pipeline, the next day on the nightly -- which will fail" \
+      "the same way if the cause is not fixed."
     rm -f "${TEARDOWN_LOG}"
     exit "${TEARDOWN_STATUS}"
     ;;

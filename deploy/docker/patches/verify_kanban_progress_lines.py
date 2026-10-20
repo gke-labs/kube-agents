@@ -98,9 +98,11 @@ with open("gateway/kanban_watchers_notifier.py", encoding="utf-8") as _notifier_
 GOOGLE_CHAT_ADAPTER = "plugins/platforms/google_chat/adapter.py"
 
 # The `_progress_deliver` arguments, before or after apply_slack_ux_incident.py
-# wraps `adapter`; the Dockerfile re-runs this verifier on the final tree.
+# wraps `adapter` (and apply_slack_ux_answer.py the adapter inside that); the
+# Dockerfile re-runs this verifier on the final tree.
 RUNNER_ARGS = re.compile(
-    r"self\.runner,\s*(?:adapter|_kage_slack_incident\.adapter_for\(adapter\b[^\n]*\)),"
+    r"self\.runner,\s*(?:adapter|_kage_slack_incident\.adapter_for\("
+    r"(?:_kage_slack_answer\.adapter_for\()?adapter\b[^\n]*\)),"
     r"\s*sub, ev\.kind, ev, msg, metadata,"
 )
 
@@ -148,6 +150,13 @@ check(
     "heartbeat never wakes the creator",
     "heartbeat" not in notifier._WAKE_KINDS,
     "a progress note that costs a full LLM turn is the most expensive thing on the board",
+)
+check(
+    "pr_opened is claimed, wakes no one and has no formatter",
+    "pr_opened" in notifier.TERMINAL_KINDS
+    and "pr_opened" not in notifier._WAKE_KINDS
+    and "pr_opened" not in notifier._EVENT_FORMATTERS,
+    "the PR a worker opened reaches the thread only through silent_event, with no line and no turn",
 )
 check(
     "heartbeat has a formatter",

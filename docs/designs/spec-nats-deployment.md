@@ -593,6 +593,15 @@ Layout:
   `_INBOX`, so the gateway cannot publish into the inbox where the agent reads its JetStream
   replies. Core NATS, like the console subjects: the provision Job is untouched.
 
+- **The board route.** The Slack Home tab's read of the agent pod's board (spec-chatops-gateway.md,
+  "The Home tab"). The gateway user gains publish on `chat.board` and subscribe on
+  `chat.board.reply.gateway.>`; the bridge user gains the matching grants (subscribe on the
+  request, publish on the reply namespace), because the bridge is the bus participant in the
+  agent pod that holds session-kv's bearer. No other principal holds either subject, and the
+  reply namespace is its own for the notify route's reason. The bridge's password is reachable
+  from the agent's terminal like every grant in that pod, so a forged board can reach the Home
+  tab of an admitted member; it carries no authority beyond what it shows. Core NATS.
+
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the

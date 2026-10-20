@@ -16,19 +16,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CLUSTER_WORKLOAD_SECURITY = REPO_ROOT / "agents/cluster/skills/gke-workload-security/SKILL.md"
 # gke-manifest-generation's routing patch sends Config Connector manifests here.
 CONFIG_CONNECTOR_SKILL = REPO_ROOT / "agents/platform/skills/gcp-config-connector/SKILL.md"
+# gke-manifest-generation's routing patch and gke-basics' cli-reference patch send
+# third-party Helm charts here.
+HELM_CHART_SKILL = REPO_ROOT / "agents/platform/skills/gitops-helm-chart/SKILL.md"
 
 
 class ClusterWorkloadSecuritySkillTest(unittest.TestCase):
     def test_teaches_two_step_network_policy_enforcement(self):
-        # GKE rejects --enable-network-policy until the addon is on, and gcloud rejects both
-        # flags in one call, so the skill checks the dataplane and enables in two steps.
+        # GKE rejects node enforcement until the addon is on, so the skill checks the
+        # dataplane and proposes the two changes in order (the Cluster Agent is read-only).
         content = CLUSTER_WORKLOAD_SECURITY.read_text(encoding="utf-8")
         for text in (
-            "--enable-network-policy",
-            "--update-addons=NetworkPolicy=ENABLED",
+            "spec.addonsConfig.networkPolicyConfig.disabled: false",
+            "spec.networkPolicy.enabled: true",
             "networkConfig.datapathProvider",
             "--location <location>",
-            "node pools may be recreated; this can take several minutes",
+            "node pools may be recreated, which can take several minutes",
         ):
             self.assertIn(text, content)
 
@@ -36,6 +39,9 @@ class ClusterWorkloadSecuritySkillTest(unittest.TestCase):
 class RoutedSkillsExistTest(unittest.TestCase):
     def test_config_connector_skill_exists(self):
         self.assertTrue(CONFIG_CONNECTOR_SKILL.is_file())
+
+    def test_helm_chart_skill_exists(self):
+        self.assertTrue(HELM_CHART_SKILL.is_file())
 
 
 if __name__ == "__main__":

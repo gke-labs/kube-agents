@@ -135,6 +135,21 @@ func eventTrail(t *testing.T, events []*lib.Envelope) []string {
 	return trail
 }
 
+// progressTexts is each heartbeat's line: the progress artifact's text
+// parts, without the chat message beside each.
+func progressTexts(progress *lib.Artifact) []string {
+	if progress == nil {
+		return nil
+	}
+	var texts []string
+	for _, p := range progress.Parts {
+		if p.Kind == "text" {
+			texts = append(texts, p.Text)
+		}
+	}
+	return texts
+}
+
 func TestActivity_ToolCallsBecomeTheActivityArtifact(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
@@ -260,12 +275,18 @@ print("slow answer")
 		t.Fatalf("assertion 18: %v", err)
 	}
 	progress := task.Artifact(lib.ArtifactProgress)
-	if progress == nil || len(progress.Parts) < 2 {
+	texts := progressTexts(progress)
+	if len(texts) < 2 {
 		t.Fatalf("progress artifact = %+v, want at least two heartbeats", progress)
 	}
-	last := progress.Parts[len(progress.Parts)-1]
-	if last.Kind != "text" || !strings.HasPrefix(last.Text, "running ") || !strings.Contains(last.Text, "1 tool call(s), last kubectl") {
-		t.Fatalf("heartbeat = %q", last.Text)
+	last := texts[len(texts)-1]
+	if !strings.HasPrefix(last, "running ") || !strings.Contains(last, "1 tool call(s), last kubectl") {
+		t.Fatalf("heartbeat = %q", last)
+	}
+	// Each heartbeat's text has the ask's mark beside it (chat.go).
+	if tail := progress.Parts[len(progress.Parts)-1]; tail.Kind != "data" ||
+		string(tail.Data) != `{"schema":"kube-agents.chat/v1","mark":{"ask":"question"}}` {
+		t.Fatalf("heartbeat chat message = %+v", tail)
 	}
 	trail := eventTrail(t, replayEvents(t, url, "task-heartbeat"))
 	if trail[len(trail)-1] != "completed/final" || trail[len(trail)-2] != "result" {
@@ -991,7 +1012,7 @@ print("done")
 	submit(t, c, "task-heartbeat-budget", "wait")
 	task := waitTerminal(t, c, "task-heartbeat-budget")
 	progress := task.Artifact(lib.ArtifactProgress)
-	if progress == nil || len(progress.Parts) != 2 {
+	if len(progressTexts(progress)) != 2 {
 		t.Fatalf("progress parts = %v, want exactly the budget (2)", progress)
 	}
 	if got := activityEntries(t, task); len(got) != 0 {

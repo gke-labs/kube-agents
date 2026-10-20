@@ -112,6 +112,12 @@ first-install-hello-running
 # #2039: the same for the greeting once the first-look scan has finished.
 first-install-hello-done
 
+# #2039: grades the specialist's answer as the chat front door's card round
+# trip delivers it into the thread (answer_first reads each delivered card
+# result). The inject door addresses `platform` directly, so no card is
+# filed and no result is delivered, and the check fails every repetition.
+# Returns to the lane when the door routes through the chat profile.
+chat-voice-answer-first
 # #2039: grades the chat front door's ack for a fleet question and the
 # platform worker's fan-out beneath the one card it files. The same gap as
 # chat-voice-ack-names-target: under the default api executor the front
@@ -119,3 +125,20 @@ first-install-hello-done
 # thread and the lane's delegation wait reads no card ids. Returns to the
 # lane with agent-kanban-smoke.
 chat-fanout-fleet-restarts-rows
+# #2039: grades the worker's needs_input block under the one card the chat front
+# door files for an asked-for choice (scope: workers). The same gap as
+# chat-fanout-fleet-restarts-rows: the lane's delegation wait reads no card
+# ids, so the worker checks fail closed. Returns to the lane with
+# agent-kanban-smoke.
+chat-question-asked-to-choose-pauses
+# #2039: grades the chat front door's reply to the wake a blocked card sends
+# it, as chat-voice-failure-leads-with-fact does: a card-wake replay needs
+# AGENT_TRANSPORT=api and errors on this lane. Returns to the lane with it.
+chat-failure-reply-declares-next-step
+# #2039: grades the worker's answer under the one card the chat front door
+# files, as chat-question-asked-to-choose-pauses does: the lane's delegation
+# wait reads no card ids. Returns to the lane with agent-kanban-smoke.
+chat-answer-declares-next-step
+# #2039: grades the worker's answer under the door's one card, as
+# chat-answer-declares-next-step does. Returns to the lane with agent-kanban-smoke.
+chat-answer-tangent-offer-declares-no-step

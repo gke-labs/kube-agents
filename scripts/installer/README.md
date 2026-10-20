@@ -43,7 +43,8 @@ their own copies:
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
 | `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
-| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
+| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`  |
+| `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                  |
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
@@ -140,10 +141,17 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 `$HOME/kube-agents/install.env` is skipped unless all three of `--gcp-project-id`,
 `--gke-cluster-name`, and `--gcp-region` are given on the command line and match it.
 
-`install.sh` reads it and does not rewrite it. It creates one at the end of a first
-install, when there is nothing there, and after that changes no line of it; the one thing
-it adds is a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below. The Day-2 menu's "Save & Apply"
-is the one path that edits a key, one at a time, leaving comments and ordering intact. That
+`install.sh` reads it and writes to it only in these cases. The last two happen only when a run
+commits (the apply, or the `--generate-only` handoff; never a declined run or `--dry-run`):
+
+- it creates one at the end of a first install, when there is nothing there;
+- it appends a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below;
+- it records the GitOps keys described under [The GitOps forge](#the-gitops-forge): the forge
+  keys when the run applies a different forge (apply only), and `GITOPS_ORG`, `GITOPS_REPO` and
+  `GITHUB_APP_ID` when one is missing or this run applies a different value (that line only).
+
+Every other line, and the file's comments and ordering, are left as written. The Day-2 menu's
+"Save & Apply" is the path that edits any key, one at a time. That
 asymmetry is deliberate: a file the documentation tells you to edit and the next run
 overwrites is what made the old `vars.sh` confusing.
 
@@ -281,6 +289,10 @@ Loading the input first is also what fixes non-interactive re-runs (#1060). Ever
 file to inherit from makes inheritance the default path rather than something each flag
 has to remember, so the next flag added inherits too.
 
+A key added to `install.env` also needs a row in the Upgrade page's
+[Recovering `install.env`](../../docs/site/src/content/docs/install/upgrade.md#recovering-installenv)
+tables. They map each key back from a live install for an operator who lost the file.
+
 ### What is deliberately not in it
 
 Derived values are recomputed every run rather than stored, because a stored copy can
@@ -301,6 +313,12 @@ the configured value is discarded — which is what stops a hand-written
 to 0 and turning the next apply into a replacement. Nothing writes the probe's answer
 back, so the file never becomes an input and an output at once.
 
+A GitHub Enterprise Server forge is not in it either: no key selects one, and `install.sh`
+writes only the github.com spelling of a GitHub forge. A GitOps repository on a GitHub
+Enterprise Server is installed through the composition, with the forge in its
+`extra_helm_values`: see
+[GitHub Enterprise Server in INSTALL.md](../../INSTALL.md#github-enterprise-server).
+
 ### Credentials
 
 `PERSIST_SECRETS_ON_DISK=false` keeps them out of every file the installer writes: the
@@ -309,6 +327,79 @@ instead, and later runs recover them from the live `platform-agent-secrets` Secr
 when kubectl's current context is this install's cluster). `API_SERVER_KEY` is generated
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
+
+### The GitOps forge
+
+`GITOPS_FORGE` is `github` (the default) or `gitlab`. A github.com install records none of the
+forge keys. A GitHub Enterprise Server install (`--gitops-host` with the github forge) records
+these keys, beside `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, which name the repository and
+the App on the instance:
+
+| Key                | Value                                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`     | `github`                                                                                                     |
+| `GITOPS_HOST`      | The instance's hostname                                                                                      |
+| `GITOPS_CA_SECRET` | The name of the Secret that holds a private CA (default `github-forge-ca`); set only with `--gitops-ca-file` |
+
+`upgrade.sh` and `uninstall.sh` render the same forge from these keys. The generator writes
+`gitops_host` and `github_ca_secret_name` into `terraform.tfvars`, and the composition declares the
+github forge at that host. After the apply, `install.sh` writes the CA file into the Secret and
+restarts the token minter, which reads the CA when it starts. `--gitops-host=github.com` switches the
+install back to github.com and drops the three keys. The App and its KMS key belong to one GitHub
+host: a switch between github.com and an instance needs the other host's App and a new KMS key
+(`install.sh` refuses a change of host that keeps the recorded `GITHUB_APP_ID` or key), as
+[Switch between github.com and a GitHub Enterprise Server](../../INSTALL.md#switch-between-githubcom-and-a-github-enterprise-server)
+describes.
+
+A GitLab install records these keys:
+
+| Key                   | Value                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `GITOPS_FORGE`        | `gitlab`                                                                                                     |
+| `GITOPS_HOST`         | The self-managed instance's hostname; empty for gitlab.com                                                   |
+| `GITOPS_REPO`         | The project's full path (`group/subgroup/project`)                                                           |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `gitlab-forge-token`)                                   |
+| `GITOPS_CA_SECRET`    | The name of the Secret that holds a private CA (default `gitlab-forge-ca`); set only with `--gitops-ca-file` |
+
+The token, and the paths of the token file and the CA file, are never recorded.
+`GITLAB_TOKEN_FILE` and `GITOPS_CA_FILE` in the environment act like `--gitlab-token-file` and
+`--gitops-ca-file` for one run, and are never recorded either. One difference: with gitlab.com as
+the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag. With
+github.com, it refuses both.
+
+- `install.sh` records these keys on a first install, and on a later run that goes on to the apply
+  with a different forge, host, project or Secret name.
+- A run that you decline, or that ends with `--generate-only`, does not change them in an existing
+  file.
+- A switch to GitLab drops `GITOPS_ORG`, `GITHUB_APP_ID` and `GITHUB_PEM_PATH`, and a recorded
+  GitHub Enterprise Server host and CA Secret. A switch back to GitHub drops the GitLab keys.
+- A run on GitHub that changes the GitHub host or the CA Secret rewrites `GITOPS_ORG`,
+  `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` with the forge keys. It keeps
+  `GITHUB_PEM_PATH` (the path, never the key): the path this run uses (from `--github-pem-path` or
+  the PEM prompt), or else the recorded one. A move to another GitHub host does not keep the
+  recorded path, because it is the old App's key: give the new App's key with
+  `--github-pem-path`, or export `GITHUB_PEM_PATH` for the run when `install.env` records no
+  path (a recorded line wins over the shell). A run that does not need the file (the KMS key already has an `ENABLED`
+  version and the file is gone) records no path.
+- Once `install.env` exists, `install.sh` ignores a `GITOPS_FORGE`, `GITOPS_HOST`,
+  `GITLAB_TOKEN_SECRET` or `GITOPS_CA_SECRET` exported in the shell. Use the flags.
+
+On GitHub with the token minter (`GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID` all set), a run
+that goes on to the apply, or ends with the `--generate-only` handoff, records each of the three
+the file lacks, and replaces one it records
+with a different value (that line only). `upgrade.sh` renders from the file alone, so GitOps set
+up with `--gitops-org`, `--gitops-repo` and `--github-app-id` would otherwise be rendered off by
+the next full upgrade, which would destroy the minter's Cloud KMS key and service account. The PEM
+path is never recorded. A declined run, or `--dry-run`, leaves the file as it was.
+
+Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
+that would render GitOps off while the minter is running, and prints the lines to set with the
+live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
+Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
+in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
+settings page, **General**, "App ID"); `install.sh`, the Day-2 menu and `upgrade.sh` (on a GitHub
+install) refuse anything else.
 
 ### Projects, folders, organisations and selectors in scope
 
@@ -347,7 +438,28 @@ with nothing changed, `upgrade.sh --plan` included. The pool's listing of a cont
 the exception that check probes too, while the pool is armed, because `install.sh` enables the
 Asset API before that plan and a listing refused there would leave it enabled. The bindings themselves are the explicit
 projects' case: a resolved project the applying identity cannot set IAM policy in fails inside the
-apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
+apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. The drift audit-log sink the
+same apply creates in each `SCOPE_PROJECTS` entry is probed, by `check_scope_export_sink_access`
+beside the container preflight and as the same identity: for each entry less the host, less an
+exact or glob `SCOPE_EXCLUDE_PROJECTS` match and less `TF_VAR_drift_pubsub_source_exclude_projects`,
+while the drift ingress is on (`ENABLE_DRIFT_DETECTOR`, or `TF_VAR_enable_drift_pubsub` on its own), it
+asks the project whether the identity holds `logging.sinks.create`, and
+refuses the apply naming every project that lacks it, the role that grants it
+(`roles/logging.configWriter`) and the exclusion lever, because a sink that cannot be created fails
+the apply at that project after the host's resources and the other projects' sinks have changed. It
+warns on the routes the container preflight warns on. A denied project whose sink the install's
+Terraform state already holds, live rather than tainted or deposed, is warned about rather than
+refused when the identity can read it (`logging.sinks.get`, asked second), because an apply that
+leaves the sink as it is needs only that read: that is how an install made by an owner is upgraded
+by a narrower Day-2 identity; one that cannot read it either is refused, since the plan's read
+fails. An apply that changes the sink (a release that moves its filter), recreates it or removes
+it fails there all the same, since the roles that lack `logging.sinks.create` lack update and
+delete too, so the warning says so per route: on `--plan` the plan that follows shows which this
+apply is, and on an applying route, which goes ahead without a further prompt, the way to see first
+is to stop and run `upgrade.sh --plan`. The state is read once, and only on a denial. A
+selector's members are resolved in the
+plan and are not probed; the project's number read and its Logging service agent's mint are left
+to the apply. What the selectors do not have is a container's
 zero-touch onboarding: a service project attached, or a project added to the scope, after the last
 full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
 entry that names a Shared VPC service project by ID, or a monitored project by its project number,
@@ -450,6 +562,23 @@ the release rollback runbook's route, has no such refusal and drops it with its 
 "Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
 before it regenerates.
 
+When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
+`a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
+three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
+
+- a `SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list. The gateway
+  matches member IDs exactly.
+- a `SLACK_HOME_CHANNEL` that is not a channel ID (`C` or `G`, then two or more of `A-Z0-9`).
+  Its notify route does not arm.
+- a `SLACK_BOT_TOKEN` that holds more than one comma-separated token, reported by count, or one
+  token with a comma or space left in it. The gateway takes one token, whole.
+
+A token that only the live Secret holds is checked after the generator recovers it. That
+refusal also removes the `terraform.tfvars` just written, and in the menu restores
+`install.env` as it was before the save. `upgrade.sh --plan` and `install.sh --dry-run` warn
+instead of refusing. An interactive `install.sh` asks for these three in the gateway's terms
+and asks again on an answer the gateway cannot use.
+
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
 keys account for, printing the `SCOPE_*` lines that reproduce it; the scoped pool's switch
@@ -532,9 +661,24 @@ done
 
 The grants left in the unreachable project are orphaned, not revoked. A `custom` permission set
 made of custom IAM roles cannot declare a scope: a custom IAM role is never carried into scoped
-projects (only the six predefined read roles in `scope.tf`'s allowlist are, those of them the host
+projects (only the predefined read roles in `scope.tf`'s allowlist are, those of them the host
 project holds), and the plan is refused until `PLATFORM_AGENT_CUSTOM_ROLES` carries
 `roles/container.clusterViewer` or `roles/container.viewer`.
+
+### Daily alert ceilings
+
+`ALERT_DAILY_LIMIT_CRITICAL`, `ALERT_DAILY_LIMIT_WARNING`, `ALERT_DAILY_LIMIT_INFO` and
+`ALERT_DAILY_LIMIT_DRIFT` set the daily alert ceilings. `write_tfvars_from_state` writes each key
+that is set into `alert_daily_limits`, and the chart renders it into the `PlatformAgent`'s
+`spec.deployment.env`. An empty key is not written, so the agent image keeps its default for that
+bucket. For this reason, `install.defaults.env` has no entry for these keys. The generator refuses a
+value that is not a whole number of 0 or more, and names the key. `install.sh` records all four
+keys in a new `install.env`, empty included. No flag sets them. `uninstall.sh` blanks them, so a bad
+value cannot stop a teardown. Only `install.sh`, the Day-2 menu and `upgrade.sh --upgrade-mode=full`
+apply these keys. The operator and harness modes of `upgrade.sh` use the values that the release
+recorded. But each `upgrade.sh` run calls the generator before it selects the mode, so a bad value
+stops the run in every mode. The [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling)
+gives the buckets, the defaults, and what happens to entries added to the CR by hand.
 
 ### Cluster adoption and component toggles
 
@@ -610,7 +754,7 @@ is a hand-authored dotenv and a hand may well write `export`.
   the registry prefixes, cluster connection, the step runner. Sources
   `installer_common.sh`, so nothing is defined twice. `hack/ci-deploy.sh` sources
   `scripts/release/common.sh`, not this file.
-- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. The agent's runtime copy also selects `--internal-ip` for a cluster on its own VPC; this helper does not, for the reason its header gives. This is the roster the file's own header defers to: `common.sh`, `installer_common.sh`, `install.sh`, `upgrade.sh`, `hack/ci-env.sh`, `scripts/release/common.sh`, `scripts/release/reconcile_environment.sh`, `terraform/examples/full-install/lifecycle.sh`, and the staging-workload scripts all source it. It is kept out of `common.sh` and free of every helper in this directory so that each of them can take the predicate and nothing else — `hack/ci-env.sh` and `lifecycle.sh` want no part of the state file, and `installer_common.sh` is sourced by front doors that load no other helper. It sets `GKE_DNS_ENDPOINT_FLAG` rather than echoing, so that callers do not run it in a `$(...)` subshell that would discard its memo of whether the local gcloud offers the flag at all. That answer leaves it empty — as do a cluster with no externally reachable DNS endpoint and a describe call that fails — leaving today's IP-endpoint command untouched. `installer_common.sh` and `lifecycle.sh` fall back to a stub setting the same empty value when the file is absent, as `reconcile_environment.sh` does, so a tree without it reaches every cluster with a routable IP endpoint rather than refusing to run.
 - **[min_versions.sh](min_versions.sh)**: minimum tool versions, side-effect-free so
   `install.sh` can source it standalone before any checkout exists.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)** /

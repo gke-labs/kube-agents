@@ -162,8 +162,9 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`
-against a stub, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
+nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
@@ -697,6 +698,14 @@ Prow's own form of the re-pin — a `[prow:skip-retest]` sentinel written by `/o
 upstream but not in the Prow build this repository merges through; `scripts/pin_smoke_status.py`
 says when to switch.
 
+**A pull request on `main` can also carry `Smoke gate` and `Merge labels` statuses.** They
+are the gate checks of a GitHub merge queue that `main` does not use yet, posted by
+[`merge-gate.yml`](../.github/workflows/merge-gate.yml), and each restates something Tide already
+decides: the smoke result (or that the change touches only paths the smoke skips), and the label
+query above. Nothing requires them. Because Tide holds on any posted context
+that is not green, each is posted only when it is green, and a green can go stale until the next
+event. `scripts/merge_gate.py` is the reference for what each one reads.
+
 **`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
 reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
 `main` restricts pushes to the `google-oss-prow` app and GitHub scores that restriction as a block
@@ -719,9 +728,9 @@ gh pr view <number> --repo gke-labs/kube-agents --json labels --jq '[.labels[].n
 
 A GitHub Actions check that fails on a pull request whose diff cannot have caused it is worth one
 re-run, from the run's page or with `gh run rerun <run-id> --failed`. That re-run is also a report.
-[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) watches the completed
-attempts of the checks its `workflow_run` trigger lists, and when an attempt after the first passes
-on the same commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
+[`flaky-check-notify.yml`](../.github/workflows/flaky-check-notify.yml) sweeps the recent runs
+of the checks it watches every fifteen minutes, and when a run's latest attempt passed on the same
+commit an earlier attempt failed on, it opens a `ci:flaky` issue per failing test class
 (or Go test, or pytest file) the failed attempts' logs name, falling back to one per failing job and
 step when they name none or name more than a handful, or adds a row to the issue that class already
 has. The tree did not change
@@ -729,8 +738,10 @@ between the attempts, so the code was not the cause; the issue is where the occu
 until someone
 reads them together. It never closes an issue, because every green run of a flaky check looks like a
 fix from the outside; close it when the cause is fixed, and a recurrence opens a new one that links
-back. `scripts/notify_flaky_check.py` holds the reasoning; the workflow's header says why
-`Validate PR Title` and `Security Scanning` are left off.
+back. `scripts/notify_flaky_check.py` holds the reasoning and the watched list, and says why
+`Validate PR Title` and `Security Scanning` are left off. The sweep reads runs created in the last
+few days (`SWEEP_WINDOW_DAYS` in the script); a re-run later than that is recorded by dispatching
+the workflow with the run's id and `dry_run` off.
 
 A re-run that fails again records nothing, and neither does a push that happens to go green: only a
 same-commit pass after a failure is evidence the code was innocent. Prow's `/retest` on the smoke

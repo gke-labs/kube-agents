@@ -31,6 +31,10 @@ import os
 # next stack holds the chat backend (platformagent_manifests.go,
 # a2aNotifyPlatformEnvVar). Its value is a platform name as Hermes spells it.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
+# The variable the operator renders whenever the gateway arms its chat.notify
+# route, home channel or not (platformagent_manifests.go,
+# a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
+NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # The bus CLI in the agent image (a2a/cmd/a2a), on PATH.
@@ -56,6 +60,12 @@ NOTIFY_WAIT_SECONDS = 60
 NOTIFY_CONNECT_SECONDS = 30
 NOTIFY_MARGIN_SECONDS = 15
 NOTIFY_SUBPROCESS_TIMEOUT_SECONDS = NOTIFY_WAIT_SECONDS + NOTIFY_CONNECT_SECONDS + NOTIFY_MARGIN_SECONDS
+# The `a2a notify --update` key an event alert is posted under, one per alert
+# (its event session's id): the gateway edits the message it posted with that
+# key, which is how the alert's triage replaces the alert in place under next
+# (slack_ux_incident's chat route, which finds the session by the alert's
+# thread). Hermes's send has no such key, so the today path posts as before.
+ALERT_UPDATE_FORMAT = "alert-{session}"
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
 GCHAT_PLATFORM = "google_chat"
@@ -63,9 +73,23 @@ GCHAT_MESSAGES_TOKEN = "/messages/"
 GCHAT_THREADS_TOKEN = "/threads/"
 
 
+def alert_update_key(session_id: str) -> str:
+    """The ``--update`` key of the alert an event session posted, or "" for no session."""
+    return ALERT_UPDATE_FORMAT.format(session=session_id) if session_id else ""
+
+
 def routed_platform() -> str:
     """The platform whose posts go through the gateway, or "" when none does."""
     return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+
+
+def gateway_platform() -> str:
+    """The platform whose backend the gateway holds, or "" when it holds none.
+
+    Unlike :func:`routed_platform` this is set with no home channel, so it names
+    the platform an install has when nothing routes a proactive post there.
+    """
+    return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
 
 
 def routes(platform: str) -> bool:
@@ -88,13 +112,16 @@ def subprocess_timeout(target: str, default: float | None) -> float | None:
 
 
 def command(target: str, message: str, json_output: bool = True, hermes_bin: str = HERMES_CLI,
-            wait_seconds: float | None = None) -> list[str]:
+            wait_seconds: float | None = None, update: str = "") -> list[str]:
     """The argv that posts ``message`` to ``target``.
 
     ``target`` is a ``hermes send --to`` target. ``json_output`` asks the
     Hermes path for ``--json``; the gateway path always answers in JSON.
     ``wait_seconds`` bounds how long `a2a notify` waits for the gateway, for a
-    caller with a deadline shorter than the CLI's default.
+    caller with a deadline shorter than the CLI's default. ``update`` names the
+    message on the gateway path (``a2a notify --update``), so a later notify
+    with the same key in the same conversation edits it; the Hermes path has
+    no such key and ignores it.
     """
     platform, _, rest = target.partition(":")
     if not routes(platform):
@@ -106,6 +133,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     argv = [A2A_CLI, "notify", "--platform", platform]
     if wait_seconds is not None:
         argv += ["--timeout", f"{max(1, int(wait_seconds))}s"]
+    if update:
+        argv += ["--update", update]
     if thread:
         # A Slack thread is a bare ts, which names no channel: it goes out
         # qualified by the target's own channel, and the gateway posts it only
@@ -120,15 +149,16 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     return argv + ["--", message]
 
 
-def blocks_command(platform: str, thread: str, text: str, blocks_path: str, timeout_s: float = 0) -> list[str]:
-    """The argv that posts a Slack Block Kit message through the gateway.
+def chat_command(platform: str, thread: str, text: str, chat_path: str, timeout_s: float = 0) -> list[str]:
+    """The argv that posts a ``kube-agents.chat/v1`` message through the gateway.
 
-    ``blocks_path`` names a file holding the JSON array of blocks; ``text`` is
-    the notification and fallback. Only for a platform :func:`routes` sends
-    through the gateway; the today path posts blocks through the broker's
-    Slack relay (slack_blocks_post.py).
+    ``chat_path`` names a file holding the chat message's JSON object; ``text``
+    is its fallback, which the gateway posts when it does not lay the message
+    out. Only for a platform :func:`routes` sends through the gateway; the
+    today path posts Block Kit through the broker's Slack relay
+    (slack_blocks_post.py).
     """
-    argv = [A2A_CLI, "notify", "--platform", platform, "--blocks-file", blocks_path]
+    argv = [A2A_CLI, "notify", "--platform", platform, "--chat-file", chat_path]
     if thread:
         argv += ["--thread", thread]
     if timeout_s > 0:

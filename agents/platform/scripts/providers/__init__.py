@@ -26,6 +26,7 @@ from .credentials import (
     BrokeredCredential,
     Credential,
     MintedReadCredential,
+    MintedWriteCredential,
     NoCredential,
     StaticFileCredential,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "Guidance",
     "MAX_PAGE_SIZE",
     "MintedReadCredential",
+    "MintedWriteCredential",
     "NoCredential",
     "StaticFileCredential",
     "Registry",

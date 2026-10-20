@@ -524,9 +524,9 @@ func TestACABundleRefReachesThatForgesBrokerEntryOnly(t *testing.T) {
 	}
 }
 
-// The github provider reads no CA bundle, so the field is refused there
-// rather than ignored: an administrator who set it would believe the
-// certificate trusted. Names the API server would refuse on the broker
+// github.com presents a certificate the public CAs sign, so the field is
+// refused on a GitHub forge there rather than ignored: a private CA must never
+// vouch for it. Names the API server would refuse on the broker
 // Deployment are refused here too, and the forge is withheld.
 func TestACABundleRefIsRefusedWhereItCannotBeUsed(t *testing.T) {
 	github := ghForge("github", "acme")

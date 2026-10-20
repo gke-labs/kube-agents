@@ -115,14 +115,12 @@ The token crosses the cluster network in cleartext. And the sandbox holds that t
 credential where the design would prefer it held none — short-lived, audience-bound and revocable,
 but not non-exportable.
 
-One sharing is left, and it is the gateway's rather than the sandbox's. The broker runs under
+The gateway no longer shares the broker's cloud identity. The broker runs under
 `spec.security.serviceAccountName`, defaulting to the PlatformAgent's own name, which is the
-ServiceAccount the Workload Identity binding annotates — and that is also the gateway Pod's
-ServiceAccount. So the gateway retains an ambient cloud identity from the metadata server. Only
-`<agent>-shell`, the Pod that runs model-authored code, runs under a ServiceAccount bound to no
-Google service account. Closing the gateway gap needs either `spec.security.workloadIdentityFederation`,
-which moves the broker onto a federated credential and lets the annotation come off, or a separate
-ServiceAccount for the broker. Neither is on by default.
+ServiceAccount the Workload Identity binding annotates. The gateway Pod runs under
+`<agent>-gateway-agent`, which the operator mints with no annotation, and `<agent>-shell`, the Pod
+that runs model-authored code, runs under a ServiceAccount bound to no Google service account
+either.
 
 `spec.security.egressPolicy: Allowlist` renders a default-deny egress NetworkPolicy over the gateway
 Pod with the link-local metadata server's credential API left off the allowlist (port 53 to that
@@ -138,14 +136,14 @@ Pod's only policy and really does default-deny on an enforcing CNI). So enabling
 `egressPolicy: Allowlist` leaves the Pod's permitted egress a strict superset of what it was — wider
 by the credential broker on TCP 8765, and wider also by the managed collector namespace on 4317/4318
 when the agent is not exporting telemetry, since the gateway policy drops its own OTel rule in that
-case. It cannot take a destination away. The gateway policy permits `169.254.169.254/32` on TCP 80 and on port
-53, plus the discovered metadata-daemon port (`988` by default) to both link-local metadata
-addresses, so the metadata path stays open, and it permits TCP 443 to `0.0.0.0/0` minus the private
-ranges unless FQDNNetworkPolicy is enabled, so the exfiltration half stays open too.
+case. It cannot take a destination away. The gateway policy no longer opens the metadata path (it
+names `169.254.169.254/32` on port 53 only, as the resolver), but it permits TCP 443 to `0.0.0.0/0`
+minus the private and link-local ranges unless FQDNNetworkPolicy is enabled, so the exfiltration half
+stays open.
 
-The field is therefore a rendered, auditable statement of the destinations the agent is supposed to need, plus the refusal rules and the reconcile behaviour that a real control will need — not a control. Narrowing `<agent>-gateway-netpol`, which still permits the metadata path, is what turns it into one. Two conditions the operator will not be able to enforce even then: the policy does nothing on a cluster whose CNI does not enforce NetworkPolicy, and any other policy an administrator adds re-opens whatever it permits. The capability cost — the agent's DuckDuckGo web search, the `browser` toolset, the `gke` and `developer_knowledge` MCP servers, and direct `github.com` access from the sandbox — falls due at that point and not before; none of it is lost today, because the gateway policy still permits every one of those destinations.
+The field is therefore a rendered, auditable statement of the destinations the agent is supposed to need, plus the refusal rules and the reconcile behaviour that a real control will need — not a control. Narrowing `<agent>-gateway-netpol`'s internet rule is what turns it into one. Two conditions the operator will not be able to enforce even then: the policy does nothing on a cluster whose CNI does not enforce NetworkPolicy, and any other policy an administrator adds re-opens whatever it permits. The capability cost — the agent's DuckDuckGo web search, the `browser` toolset, and direct `github.com` access from the sandbox (the `gke` and `developer_knowledge` MCP servers go through the broker and are unaffected) — falls due at that point and not before; none of it is lost today, because the gateway policy still permits every one of those destinations.
 
-Removing the `iam.gke.io/gcp-service-account` annotation from the gateway Pod's ServiceAccount, once the broker has one of its own or is federated, is the complementary control: it takes the identity away rather than the route, and it does not depend on the CNI. It is separate, planned work.
+The gateway Pod's ServiceAccount carries no `iam.gke.io/gcp-service-account` annotation (the broker's does), which is the complementary control: it takes the identity away rather than the route, and it does not depend on the CNI.
 
 Credential values deliberately returned by an approved command or integration response are outside the filesystem and environment isolation scope.
 

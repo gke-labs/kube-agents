@@ -302,6 +302,7 @@ gcloud services enable \
   aiplatform.googleapis.com \
   logging.googleapis.com \
   monitoring.googleapis.com \
+  cloudtrace.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
   --project="${PROJECT_ID}"
@@ -617,13 +618,15 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # the second engine AGENTS.md forbids. Deliberately not enable_drift_detector,
     # which is the consumer: whether a given lease runs the detector is that
     # lease's helm upgrade to decide, and pinning it true here would be
-    # overwritten by the next one anyway. This reaches projects onboarded from
-    # here on and no project already registered: verify_ci_pool_project.py does
-    # not check the ingress yet, and section 8 of docs/ci-pool-projects.md
-    # forbids re-running this script on a registered project. So a project
-    # provisioned before this line fails a drift case as broken rather than
-    # reporting the gap, which section 3 of that file states rather than
-    # leaving to be discovered.
+    # overwritten by the next one anyway. This line turns the ingress on for a
+    # project this script onboards; it repairs no project already registered,
+    # because verify_ci_pool_project.py does not check the ingress and section
+    # 8 of docs/ci-pool-projects.md forbids re-running this script on one. The registered
+    # projects were repaired out of band rather than by this line, and section
+    # 3 of that page carries the reading, the two mechanisms that did it, and
+    # the projects still without it. A project this line never reached fails a
+    # drift case as broken rather than reporting the gap, and with no verifier
+    # check there is nothing between leases that would say so.
     #
     # drift_pubsub_topic_publishers is the pool's one departure from what an
     # install provisions, and it is confined to the pool for the reason the

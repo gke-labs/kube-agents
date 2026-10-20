@@ -7,13 +7,42 @@ http://inference-gateway.kubeagents-system.svc.cluster.local/v1 — the agent wi
 reach the LiteLLM gateway installed here ({{ .Release.Namespace }}). Install
 into kubeagents-system, or override the agent's model endpoint.
 {{- end }}
+{{- if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "openai_compatible") (hasPrefix "http://" (.Values.litellm.openaiCompatible.apiBase | default "")) }}
+{{- $upstreamEgress := include "kube-agents.openaiCompatibleEgress" . | default "{}" | fromJson }}
+{{- if not $upstreamEgress.namespace }}
+
+WARNING: litellm.openaiCompatible.apiBase {{ .Values.litellm.openaiCompatible.apiBase }}
+is plain http to a server outside the cluster. Prompts, which can carry cluster
+data, and the OPENAI_COMPATIBLE_API_KEY cross the network unencrypted. Serve the
+endpoint over https.
+{{- end }}
+{{- end }}
+{{- if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "openai_compatible") }}
+{{- $openaiCompatibleBase := .Values.litellm.openaiCompatible.apiBase | default "" | toString }}
+{{- $openaiCompatibleHost := $openaiCompatibleBase | trimPrefix "https://" | trimPrefix "http://" | splitList "/" | first | splitList ":" | first | lower }}
+{{- $openaiCompatibleLabels := splitList "." $openaiCompatibleHost }}
+{{- if and (eq (len $openaiCompatibleLabels) 2) (ne (index $openaiCompatibleLabels 1) "svc") (not (include "kube-agents.openaiCompatibleEgress" .)) }}
+
+WARNING: litellm.openaiCompatible.apiBase {{ $openaiCompatibleBase }} names a
+two-label host, which the chart reads as a public hostname, so the gateway gets
+no egress rule for it and reaches it only over its public port-443 rule. If it
+is an in-cluster Service, write it as <svc>.<ns>.svc ({{ $openaiCompatibleHost }}.svc),
+or every model call will time out.
+{{- end }}
+{{- end }}
 
 {{- if .Values.platformAgent.enabled }}
 
 Before the agent pod can start, the Secret "{{ .Values.platformAgent.credentials.secretName }}"
 must exist in {{ .Release.Namespace }} with an API_SERVER_KEY entry{{ if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "vertex_ai") }}. The
 vertex_ai provider needs no model API key — the gateway authenticates with
-Workload Identity.{{ else }} plus your
+Workload Identity.{{ else if and .Values.litellm.enabled (eq .Values.litellm.modelProvider "openai_compatible") }}. The
+openai_compatible provider's key is optional: add OPENAI_COMPATIBLE_API_KEY
+when the server at {{ .Values.litellm.openaiCompatible.apiBase }} checks one.
+{{- with .Values.litellm.openaiCompatible.caBundleSecretRef.name }}
+The gateway also mounts the CA bundle from the Secret "{{ . }}" (key
+"{{ $.Values.litellm.openaiCompatible.caBundleSecretRef.key }}"), which must exist in {{ $.Release.Namespace }}.
+{{- end }}{{ else }} plus your
 model-provider key (ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY).{{ end }}
 {{- if .Values.platformAgent.credentials.create }}
 This release created it from platformAgent.credentials.data, generating
@@ -26,7 +55,7 @@ pod-local Session KV server rejects every request, and identity pseudonyms are
 not stable across restarts. See the chart README.
 {{- end }}
 
-For GCP access, bind your Google Service Account to the agent's KSA
+For GCP access, bind your Google Service Account to the credential broker's KSA
 "{{ .Values.platformAgent.security.serviceAccountName }}" via Workload Identity
 (see the chart README).
 

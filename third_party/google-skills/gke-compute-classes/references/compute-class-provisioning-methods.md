@@ -106,3 +106,36 @@ spec:
 When Kueue admits the job, it automatically injects this `nodeSelector` into the
 Pod. The GKE Autoscaler will then provision hardware according to the
 ComputeClass's prioritized fallback list.
+
+## Standby & Headroom Patterns: `min-nodes` vs `CapacityBuffer` vs `minimumCapacity`
+
+| Mechanism | Scope / Type | Interaction with ComputeClass Priorities | Recommendation |
+|---|---|---|---|
+| **Manual `--min-nodes`** | Static floor on individual manual node pool | **Anti-pattern**: `kube-scheduler` assigns incoming pods to idle nodes held by `min-nodes` *before* Cluster Autoscaler evaluates ComputeClass priorities. If configured on fallback pools, workloads permanently schedule on fallback hardware, completely bypassing preferred tiers. | **Avoid on fallback pools**. Set `min-nodes: 0` when using ComputeClasses. |
+| **`CapacityBuffer` CRD (`autoscaling.x-k8s.io`)** | Dynamic or fixed balloon placeholder pods | **Recommended Golden Path**: Uses low/negative `PriorityClass` balloon pods to pre-warm nodes dynamically or by fixed count. Real workloads preempt balloon pods instantly without waiting 60–120s for node auto-creation, while Cluster Autoscaler continues evaluating ComputeClass priority tiers. | **Current Golden Path** for fast startup / bursty serving without priority bypass. |
+| **`spec.minimumCapacity.targetNodeCount`** | Native ComputeClass CRD field (In-tree GKE) | **In-Tree Native Mechanism**: Reconciled directly by Cluster Autoscaler using synthetic in-memory fake pods (`pkg/computeclass/processors/min_capacity_pod_list_processor.go`) against the ComputeClass priority ladder. | Planned native replacement for balloon pods once enabled/released in GKE. |
+
+### Why Manual `min-nodes` Bypasses ComputeClass Fallbacks
+
+```
+Incoming Pod (Selects ComputeClass: Preferred C4 -> Fallback N2)
+       |
+       v
++---------------------------------------------------------+
+| Kubernetes kube-scheduler (Evaluates existing capacity) |
++---------------------------------------------------------+
+       |
+       +---> Are there existing nodes with free capacity?
+             |
+             +--[YES, idle N2 nodes held by min-nodes: 20]---> Pod scheduled on N2 immediately!
+             |                                                (ComputeClass C4 evaluation BYPASSED)
+             |
+             +--[NO, cluster is fully utilized]--------------> Pod stays Pending
+                                                                    |
+                                                                    v
+                                              +--------------------------------------------+
+                                              | Cluster Autoscaler evaluates ComputeClass: |
+                                              | 1. Try C4 (Scale-up)                       |
+                                              | 2. Fall back to N2 only if C4 fails        |
+                                              +--------------------------------------------+
+```

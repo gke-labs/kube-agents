@@ -1,0 +1,167 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "The quota for n2 CPUs in us-central1 is exhausted.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "What's wrong",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "The quota for n2 CPUs in us-central1 is exhausted.",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n\n",
+                    "type": "text"
+                  },
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "Why",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "text": "Scale-up fails with QUOTA_EXCEEDED.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              },
+              {
+                "elements": [
+                  {
+                    "style": {
+                      "bold": true
+                    },
+                    "text": "What to do",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              },
+              {
+                "elements": [
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "Proposed fix (Lower the node pool max):",
+                        "type": "text"
+                      },
+                      {
+                        "text": " Set max nodes to 4 in the GitOps repo.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  },
+                  {
+                    "elements": [
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "To authorize:",
+                        "type": "text"
+                      },
+                      {
+                        "text": " reply ",
+                        "type": "text"
+                      },
+                      {
+                        "style": {
+                          "bold": true
+                        },
+                        "text": "'apply'",
+                        "type": "text"
+                      },
+                      {
+                        "text": " to open a GitOps Pull Request with this fix.",
+                        "type": "text"
+                      }
+                    ],
+                    "type": "rich_text_section"
+                  }
+                ],
+                "indent": 0,
+                "style": "bullet",
+                "type": "rich_text_list"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "why · what the fix does",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Lower the node pool max",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Lower the node pool max — apply"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

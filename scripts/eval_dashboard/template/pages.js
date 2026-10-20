@@ -119,6 +119,9 @@ const PAGE = {
   // A night split across two jobs names its parts as the digest does
   // (nightly.py's PART_WORDS).
   nightPartWords: { main: "main part", writers: "writers part" },
+  // The chat-turn target the opening turn's p95 is shown beside, as advice
+  // only (nightly.py's TURN1_P95_TARGET_S).
+  turn1P95TargetS: 10,
   // The Trend page (trend.py): a judged metric's name as a URL parameter,
   // the chart geometry (SVG user units; the chart scales to its card), and
   // where "score" is defined once.
@@ -127,6 +130,10 @@ const PAGE = {
   // Days of padding around the nights on the time axis, so a single night
   // and an incident marker both land inside the plot.
   trendPadDays: 1,
+  // The latency row's seconds axis: about this many steps from 0 to a max
+  // rounded up to 1, 2 or 5 times a power of ten.
+  trendSecondsSteps: 4,
+  niceSteps: [1, 2, 5, 10],
   scoreDocUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/designs/eval-scorer.md#what-a-score-is",
 };
 
@@ -258,6 +265,8 @@ function normalizeHealth(raw) {
       over_threshold: count(pool.over_threshold),
       threshold_p50_s: count(pool.threshold_p50_s),
       threshold_p95_s: count(pool.threshold_p95_s),
+      lease_failures: count(pool.lease_failures),
+      lease_failures_hours: count(pool.lease_failures_hours),
     } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
@@ -288,8 +297,9 @@ function poolSentence(h) {
     return ` No pool numbers${since}: the hourly pool check has stopped reporting.`;
   }
   if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read how long recent runs waited.";
-  // What tripped the verdict, which is a single day's row or the live queue --
-  // never the seven-day window, which one bad day leaves inside its own limit.
+  // What tripped the verdict: a single day's row, the live queue or a refused
+  // acquire -- never the seven-day window, which one bad day leaves inside
+  // its own limit.
   // The backlog's start while there is one, the episode's otherwise: the
   // verdict spans a week, so the episode can have opened days before the jam
   // the present tense below is describing.
@@ -311,6 +321,12 @@ function poolSentence(h) {
   if (p.over_threshold && p.threshold_p95_s != null) {
     found.push(`${p.over_threshold} run${p.over_threshold === 1 ? "" : "s"} queued past the ${Math.floor(p.threshold_p95_s / 60)} min limit`);
   }
+  // The third trigger, as post_health.pool_numbers lists it: a breach can
+  // rest on refusals alone, with nothing queued and no stretch to quote.
+  if (p.lease_failures) {
+    const window = p.lease_failures_hours ? ` in the last ${p.lease_failures_hours}h` : "";
+    found.push(`${p.lease_failures} run${p.lease_failures === 1 ? "" : "s"} refused a project${window}`);
+  }
   if (!found.length) return "";
   // health.pool_note's waiting_now. The verdict lasts a week, so most renders
   // of an episode find the queue already drained, and "are waiting" then sends
@@ -319,7 +335,12 @@ function poolSentence(h) {
   const live = p.waiting_now;
   // False is "nothing has waited past the limit", not "the queue is empty".
   const cleared = live === false ? " No backlog right now." : "";
-  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} Runs still pass; /retest makes the queue longer.`;
+  // A queued run starts late and passes; a refused run died at the acquire,
+  // so the tail says which, as post_health.render_pool does.
+  const tail = p.lease_failures
+    ? "A refused run did not start; retest once the pool has room."
+    : "Runs still pass; /retest makes the queue longer.";
+  return ` Runs ${live ? "are" : "were"} waiting to start${since}: ${found.join("; ")}.${cleared} ${tail}`;
 }
 
 /* ---- URL contract ---- */
@@ -680,8 +701,10 @@ function stormRetestMs(inc) {
   return null;
 }
 
-// One chip row: [{key, value, label, on}] as buttons the click handler reads.
-const chip = (key, value, label, on) => `<button type="button" data-${key}="${esc(value)}"${on ? ' class="on"' : ""}>${esc(label)}</button>`;
+// One chip row: [{key, value, label, on}] as buttons the click handler reads;
+// `title`, when given, is the chip's tooltip.
+const titleAttr = (title) => (title ? ` title="${esc(title)}"` : "");
+const chip = (key, value, label, on, title) => `<button type="button" data-${key}="${esc(value)}"${on ? ' class="on"' : ""}${titleAttr(title)}>${esc(label)}</button>`;
 
 /* ---- the Brief ---- */
 
@@ -966,7 +989,7 @@ function releasesHtml() {
 // The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
 // them out of every count above, so this section is the only place they
 // show. Each row links Spyglass under the lane's own job name.
-const laneBuildUrl = (run) => (run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
 function laneRow(run) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
@@ -991,7 +1014,17 @@ function gitlabLaneHtml() {
     body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>` +
       `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
   }
-  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}</div>`;
+  const nightlyJob = lane && lane.nightly_job || "ci-kube-agents-eval-nightly-gitlab";
+  const nights = lane && Array.isArray(lane.nights) ? lane.nights.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  let nightsHtml;
+  if (!nights.length) {
+    nightsHtml = `<p class="mut small">No GitLab night on record. <code>${esc(nightlyJob)}</code> runs the same list once a night on its own leased project.</p>`;
+  } else {
+    const nc = lane.night_counts || {};
+    nightsHtml = `<h3>Nights</h3><p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(nightlyJob)}</code>).</p>` +
+      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${nights.map(laneRow).join("")}</tbody></table>`;
+  }
+  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}${nightsHtml}</div>`;
 }
 
 function briefHtml(link) {
@@ -1203,16 +1236,26 @@ function runHtml(link) {
 
 /* ---- the per-case record (brief.json's cases{}) ---- */
 
+// A case carries the slug DOMAIN_UNKNOWN (collect.task_domain, nightly.py,
+// render.py, trend.py) when its task.yaml names no domain, when its
+// task.yaml is not on this checkout, or when the case is not in
+// data.json's cases. The data and the links keep the slug; the page
+// shows the label, and the tooltip on the chips and group headings.
+const DOMAIN_UNKNOWN = "unknown";
+const DOMAIN_UNKNOWN_LABEL = "no domain";
+const DOMAIN_UNKNOWN_TOOLTIP = "cases with no domain on record";
+
 function caseDocs() {
   const raw = brief.cases && typeof brief.cases === "object" && !Array.isArray(brief.cases) ? brief.cases : {};
   return Object.keys(raw).filter((name) => raw[name] && typeof raw[name] === "object").map((name) => Object.assign({
-    domain: "unknown", status: "retired", rates: {}, strip: [], issues: [], last_failure: null,
+    domain: DOMAIN_UNKNOWN, status: "retired", rates: {}, strip: [], issues: [], last_failure: null,
   }, raw[name], { name }));
 }
 const isBlocking = (c) => c.status === "blocking";
 const isHeldOut = (c) => c.status === "held_out" || c.status === "demoted";
 const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-const domainWords = (domain) => String(domain).replace(/-/g, " ");
+const domainWords = (domain) => (domain === DOMAIN_UNKNOWN ? DOMAIN_UNKNOWN_LABEL : String(domain).replace(/-/g, " "));
+const domainTooltip = (domain) => (domain === DOMAIN_UNKNOWN ? DOMAIN_UNKNOWN_TOOLTIP : "");
 // [passed, failed] -> the fraction, or null when nothing was graded.
 const rateOf = (pair) => (Array.isArray(pair) && pair.length === 2 && pair[0] + pair[1] > 0 ? pair[0] / (pair[0] + pair[1]) : null);
 const rate7d = (c) => rateOf((c.rates && c.rates.presubmit || [])[0]);
@@ -1275,12 +1318,24 @@ function lastFailureHtml(c) {
 // own -- a grader's reason is too long to share a row with eight columns.
 const CASE_COLUMNS = 8;
 
+// Seconds as the timing lines carry them: one decimal.
+const secText = (v) => `${v.toFixed(1)} s`;
+
+// The presubmit reps' timing (SCHEMA.md: cases[].latency), "" when none.
+function caseLatencyHtml(c) {
+  const l = c.latency && typeof c.latency === "object" ? c.latency : {};
+  const parts = [];
+  if (Number.isFinite(l.turn1_p50_s) && Number.isFinite(l.turn1_p95_s)) parts.push(`chat turn 1 p50 ${secText(l.turn1_p50_s)}, p95 ${secText(l.turn1_p95_s)}${Number.isFinite(l.n_turn1) ? ` (${plural(l.n_turn1, "rep")})` : ""}`);
+  if (Number.isFinite(l.agent_p50_s)) parts.push(`agent p50 ${secText(l.agent_p50_s)}${Number.isFinite(l.n_agent) ? ` (${plural(l.n_agent, "rep")})` : ""}`);
+  return parts.length ? `<small class="mut" title="presubmit repetitions not lost to infra">${esc(parts.join(" · "))}</small>` : "";
+}
+
 function caseRow(c, link) {
   const rates = c.rates || {};
   const pre = rates.presubmit || [], night = rates.nightly || [];
   const classes = [link.caseHash === c.name ? "hl" : "", c.status === "retired" ? "dim" : ""].filter(Boolean).join(" ");
   const issues = (c.issues || []).map(issueLink).join(" · ") || `<span class="mut">—</span>`;
-  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
+  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}${caseLatencyHtml(c)}<small><a href="${esc(trendHref([c.name]))}">trend on main →</a></small></td>` +
     `<td>${stripHtml(c)}</td><td>${rateCell(pre[0])}</td><td>${rateCell(pre[1])}</td><td>${rateCell(night[0])}</td><td>${rateCell(night[1])}</td>` +
     `<td>${statusPill(c)}</td><td class="iss">${issues}</td></tr>` +
     `<tr class="why ${classes}"><td colspan="${CASE_COLUMNS}">${lastFailureHtml(c)}</td></tr>`;
@@ -1294,7 +1349,7 @@ function caseGroups(cases, sort) {
     if (!primary.has(c.domain)) primary.set(c.domain, []);
     primary.get(c.domain).push(c);
   }
-  for (const [domain, list] of primary) groups.push({ label: domainWords(domain), cases: list, key: Math.min(...list.map(worstKey)) });
+  for (const [domain, list] of primary) groups.push({ label: domainWords(domain), title: domainTooltip(domain), cases: list, key: Math.min(...list.map(worstKey)) });
   if (sort === "worst") {
     groups.sort((a, b) => a.key - b.key || a.label.localeCompare(b.label));
     for (const g of groups) g.cases.sort(byWorst);
@@ -1322,7 +1377,7 @@ function casesHtml(link) {
   const columns = CASE_COLUMNS;
   const rows = [];
   for (const group of caseGroups(cases, sort)) {
-    if (group.label) rows.push(`<tr class="grp"><td colspan="${columns}">${esc(group.label)}</td></tr>`);
+    if (group.label) rows.push(`<tr class="grp"><td colspan="${columns}"${titleAttr(group.title)}>${esc(group.label)}</td></tr>`);
     if (group.collapsed) {
       rows.push(`<tr class="more"><td colspan="${columns}">${plural(group.cases.length, "case")} that no matrix runs on this checkout, kept for their history · <button type="button" data-toggle="retired" class="linklike">show</button></td></tr>`);
       continue;
@@ -1446,7 +1501,7 @@ function gridRows(cols, link, rowsFilter) {
     if (!primary.has(c.domain)) primary.set(c.domain, []);
     primary.get(c.domain).push(c);
   }
-  for (const [domain, list] of [...primary.entries()].sort((a, b) => a[0].localeCompare(b[0]))) groups.push({ label: `${domainWords(domain)} · blocking`, cases: list.sort(byName) });
+  for (const [domain, list] of [...primary.entries()].sort((a, b) => a[0].localeCompare(b[0]))) groups.push({ label: `${domainWords(domain)} · blocking`, title: domainTooltip(domain), cases: list.sort(byName) });
   const held = cases.filter((c) => !isBlocking(c) && !linked.has(c.name)).sort(byName);
   if (held.length) {
     const shown = ui.showHeld ? held : held.filter(failing);
@@ -1489,7 +1544,7 @@ function gridHtml(link) {
       ? `<button type="button" class="c ${state}${sel}" data-build="${esc(col.build)}" data-case="${esc(c.name)}" title="${esc(title)}" aria-label="${esc(title)}"></button>`
       : `<div class="c ${state}" title="${esc(title)}"></div>`;
   };
-  const body = groups.map((g) => `<div class="grp">${esc(g.label)}</div><div class="grp-fill"></div>` +
+  const body = groups.map((g) => `<div class="grp"${titleAttr(g.title)}>${esc(g.label)}</div><div class="grp-fill"></div>` +
     g.cases.map((c) => `<div class="nm${g.linked ? " lk" : isBlocking(c) ? "" : " h"}" title="${esc(c.name)}">${esc(c.name)}${!isBlocking(c) && !g.linked ? `<small>${esc(c.status === "demoted" && c.demoted_on ? `demoted ${String(c.demoted_on).slice(5)}` : PAGE.statusWords[c.status] || "")}</small>` : ""}</div>` +
       cols.map((col, i) => cell(c, col, states.get(c.name)[i])).join("")).join("") +
     (g.more ? `<div class="more">${plural(g.more, "more held-out case")} passed everything in this window · <button type="button" data-toggle="held">show</button></div><div class="grp-fill"></div>` : "")).join("");
@@ -1529,6 +1584,9 @@ function detailHtml() {
 
 const nights = () => (brief.nightly && Array.isArray(brief.nightly.nights) ? brief.nightly.nights.filter((n) => n && typeof n === "object" && n.counts) : []);
 const nightHref = (night) => `${PAGE.pages.nightly}#build=${enc(night.build)}`;
+// The Nightly page on `night` with the cases' timing night over night
+// (nightTimingHtml), so a link keeps both the night and the cases.
+const nightTimingHref = (night, names) => `${nightHref(night)}&cases=${names.map(enc).join(",")}`;
 const nightParts = (night) => (Array.isArray(night.parts) ? night.parts.filter((p) => p && typeof p === "object") : []);
 // A night is linked by its main part's build; a link to its other part's
 // build opens the same night.
@@ -1604,14 +1662,25 @@ function nightlyBriefHtml() {
   return `<div class="sec" id="nightly"><h2>Last night's run</h2>${body}${runningNoteHtml()}</div>`;
 }
 
-function nightCaseRow(night, c, newly) {
+// A night's case: its state as a pill, its reps as passed / graded, and a
+// time in seconds or a dash when none was recorded.
+const nightStatePill = (c) => `<span class="pill ${PAGE.nightStateClass[c.state] || "p-infra"}" title="${esc(PAGE.nightStateWords[c.state] || c.state)}">${esc(c.state)}</span>`;
+function nightRepText(c) {
   const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
   const total = reps.pass + reps.fail + reps.infra;
-  const repText = c.state === "infra" ? `${plural(total, "rep")} lost` : `${reps.pass}/${reps.pass + reps.fail}${reps.infra ? ` (+${reps.infra} lost)` : ""}`;
-  const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`].filter(Boolean).join(" · ");
+  return c.state === "infra" ? `${plural(total, "rep")} lost` : `${reps.pass}/${reps.pass + reps.fail}${reps.infra ? ` (+${reps.infra} lost)` : ""}`;
+}
+const secOrDash = (v) => (Number.isFinite(v) ? secText(v) : "—");
+
+function nightCaseRow(night, c, newly) {
+  const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`,
+    // A name the link grammar refuses could not reach the timing section.
+    linkCaseIds([c.case]).length ? `<a href="${esc(nightTimingHref(night, [c.case]))}">timing</a>` : ""].filter(Boolean).join(" · ");
+  const p90 = Number.isFinite(c.turn1_p90_s) || Number.isFinite(c.agent_p90_s) ? `<br><small class="mut">p90 ${esc(secOrDash(c.turn1_p90_s))} / ${esc(secOrDash(c.agent_p90_s))}</small>` : "";
   return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
-    `<td><span class="pill ${PAGE.nightStateClass[c.state] || "p-infra"}" title="${esc(PAGE.nightStateWords[c.state] || c.state)}">${esc(c.state)}</span></td>` +
-    `<td class="num" title="repetitions passed / graded">${esc(repText)}</td>` +
+    `<td>${nightStatePill(c)}</td>` +
+    `<td class="num" title="repetitions passed / graded">${esc(nightRepText(c))}</td>` +
+    `<td class="num tm" title="median opening chat turn / median agent wall clock, then the p90 of each, over the repetitions not lost to infra">${esc(secOrDash(c.turn1_p50_s))} / ${esc(secOrDash(c.agent_p50_s))}${p90}</td>` +
     `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
     `<td class="mut small">${links}</td></tr>`;
 }
@@ -1623,10 +1692,10 @@ function nightCasesTable(night) {
   const rows = [];
   let domain = null;
   for (const c of cases) {
-    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="5">${esc(domainWords(domain))}</td></tr>`); }
+    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="6"${titleAttr(domainTooltip(domain))}>${esc(domainWords(domain))}</td></tr>`); }
     rows.push(nightCaseRow(night, c, newly));
   }
-  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Turn 1 / agent</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
 }
 
 function nightChangesHtml(night) {
@@ -1640,6 +1709,34 @@ function nightChangesHtml(night) {
   if (night.fixed.length) parts.push(`<p><b>Passing again:</b> ${list(night.fixed)} — failed every rep the night before, passed every rep tonight.</p>`);
   if (night.missing.length) parts.push(`<p><b>Not recorded</b> (${plural(night.missing.length, "case")} the nightly matrix on this checkout expects): ${list(night.missing)}.</p>`);
   return parts.join("");
+}
+
+// The timing night over night, from the nights this page carries, newest
+// first: the whole night's opening chat turn, then each case the link
+// names (`#cases=`, a row's "timing" link).
+function nightTimingHtml(link) {
+  const list = nights().slice(0, PAGE.nightsListed);
+  const nightCell = (n) => `<td class="tm"><a href="${esc(link.cases.size ? nightTimingHref(n, [...link.cases]) : nightHref(n))}">${esc(nightDay(n))}</a></td>`;
+  const whole = list.map((n) => `<tr>${nightCell(n)}<td class="num">${esc(secOrDash(n.turn1_p50_s))}</td><td class="num">${esc(secOrDash(n.turn1_p95_s))}</td></tr>`).join("");
+  const parts = [`<h3>The whole night</h3><table class="rel"><thead><tr><th>Night</th><th>Chat turn 1 p50</th><th>Chat turn 1 p95</th></tr></thead><tbody>${whole}</tbody></table>` +
+    `<p class="mut small">Over every repetition of the night not lost to infra; advisory target p95 &lt; ${esc(PAGE.turn1P95TargetS)} s.</p>`];
+  for (const name of link.cases) {
+    const found = list.map((n) => (Array.isArray(n.cases) ? n.cases : []).find((c) => c && typeof c === "object" && c.case === name));
+    if (!found.some(Boolean)) {
+      parts.push(`<p class="mut">No night on this page recorded <code>${esc(name)}</code>.</p>`);
+      continue;
+    }
+    const rows = list.map((n, i) => {
+      const c = found[i];
+      if (!c) return `<tr>${nightCell(n)}<td class="mut" colspan="6">not recorded</td></tr>`;
+      return `<tr>${nightCell(n)}<td>${nightStatePill(c)}</td><td class="num">${esc(nightRepText(c))}</td>` +
+        [c.turn1_p50_s, c.turn1_p90_s, c.agent_p50_s, c.agent_p90_s].map((v) => `<td class="num tm">${esc(secOrDash(v))}</td>`).join("") + "</tr>";
+    }).join("");
+    parts.push(`<h3><code>${esc(name)}</code>, night over night</h3><table class="rel"><thead><tr><th>Night</th><th>State</th><th>Reps</th><th>Turn 1 p50</th><th>Turn 1 p90</th><th>Agent p50</th><th>Agent p90</th></tr></thead><tbody>${rows}</tbody></table>`);
+  }
+  if (!link.cases.size) parts.push(`<p class="mut small">A case's "timing" link in the table above adds its own table here.</p>`);
+  return `<div class="sec" id="timing"><h2>Timing, night over night</h2>${parts.join("")}` +
+    `<p class="mut small">The last ${plural(list.length, "night")} on record, newest first. p50 and p90 are nearest rank over the night's repetitions not lost to infra; with the nightly's few repetitions, p90 is the slowest one. A dash is a night whose reps carried no timing.</p></div>`;
 }
 
 function nightsListHtml(current) {
@@ -1687,17 +1784,20 @@ function nightlyHtml(link) {
   const head = `<div class="sec head">${nightPill(night)}<h1>${isLast ? "Last night's run" : `Night of ${esc(nightDay(night))}`}</h1>` +
     `<div class="lede">${esc(when)} · ${jobs}${night.head_sha ? ` at <code>${esc(night.head_sha)}</code>` : ""}${night.project ? ` · project ${esc(projectShort(night.project))}` : ""}${logs}</div>` +
     `<div class="lede">${ledeHow}</div>${isLast ? runningNoteHtml() : ""}</div>`;
-  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles">` +
+  // The night's opening chat turn, a sixth tile when its reps carried one.
+  const turn1 = Number.isFinite(night.turn1_p50_s) && Number.isFinite(night.turn1_p95_s);
+  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles${turn1 ? " six" : ""}">` +
     tile("Cases", `${c.recorded}`, c.expected ? `of ${c.expected} in the nightly matrix` : "recorded") +
     tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +
     tile("Partial", `${c.partial}`, "failed some repetitions") +
     tile("Failed", `${c.failed}`, `failed every graded rep · ${plural(c.infra, "case")} lost to infra`) +
     tile("Newly failing", `${night.previous_build == null || nightLacksMain(night) ? "—" : night.newly_failing.length}`, nightLacksMain(night) ? "no main part on record" : night.previous_build == null ? "first night on record" : "against the night before") +
+    (turn1 ? tile("Chat turn 1", `${night.turn1_p50_s.toFixed(1)}<small>s p50</small>`, `p95 ${secText(night.turn1_p95_s)} · advisory target p95 < ${PAGE.turn1P95TargetS} s`) : "") +
     `</div></div>`;
   return head + tiles +
     `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
-    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. The transcript is the first repetition's.</p></div>` +
-    nightsListHtml(night) + footHtml();
+    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. Turn 1 / agent are medians over the repetitions not lost to infra: the opening chat turn, then the agent's whole run, with the p90 of each under them. The transcript is the first repetition's.</p></div>` +
+    nightTimingHtml(link) + nightsListHtml(night) + footHtml();
 }
 
 /* ---- the Trend page (SCHEMA.md: brief.json's trend block; trend.py) ---- */
@@ -1706,6 +1806,30 @@ const trendDoc = () => (brief.trend && typeof brief.trend === "object" && !Array
 const trendCases = (t) => (t && t.cases && typeof t.cases === "object" && !Array.isArray(t.cases) ? t.cases : {});
 const trendDomains = (t) => (t && t.domains && typeof t.domains === "object" && !Array.isArray(t.domains) ? t.domains : {});
 const trendNights = (t) => (t && Array.isArray(t.nights) ? t.nights.filter((n) => n && typeof n === "object" && typeof n.id === "string") : []);
+// The latency row (trend.py's latency block, from data.json's nightly runs):
+// its nights, which the store may not hold, and a scope's points.
+const trendLatency = (t) => (t && t.latency && typeof t.latency === "object" && !Array.isArray(t.latency) ? t.latency : {});
+const latencyNights = (t) => (Array.isArray(trendLatency(t).nights) ? trendLatency(t).nights.filter((n) => n && typeof n === "object" && typeof n.id === "string") : []);
+function latencyPoints(t, kind, name) {
+  const block = trendLatency(t)[kind];
+  const points = kind === "all" ? block : block && typeof block === "object" ? block[name] : null;
+  return Array.isArray(points) ? points.filter((p) => p && typeof p === "object" && typeof p.at === "string") : [];
+}
+// The latency row's series (trend.py LATENCY_SERIES) and whether a point
+// carries timing for one of them, or for either.
+const LATENCY_KINDS = ["turn1", "agent"];
+const timed = (p, kind) => isNumber(p[`n_${kind}`]) && p[`n_${kind}`] > 0;
+const anyTimed = (p) => LATENCY_KINDS.some((kind) => timed(p, kind));
+const LATENCY_WORDS = { turn1: "chat turn 1", agent: "agent time" };
+const LATENCY_FIELDS = { turn1: "turn1_s", agent: "agent_s" };
+const LATENCY_HEADS = { turn1: "Turn 1", agent: "Agent" };
+const latencyTarget = (t) => (isNumber(trendLatency(t).target_s) ? trendLatency(t).target_s : PAGE.turn1P95TargetS);
+// A series' slow percentile as trend.json has it (trend.py LATENCY_SLOW_PCT:
+// the opening turn's p95, which its target is defined on; the agent run's
+// p90), its name, and the point field that carries it.
+const latencyPct = (t, kind) => { const pct = trendLatency(t).pct; return pct && isNumber(pct[kind]) ? pct[kind] : null; };
+const slowName = (t, kind) => (latencyPct(t, kind) != null ? `p${latencyPct(t, kind)}` : "the slow percentile");
+const slowField = (t, kind) => `${kind}_p${latencyPct(t, kind)}_s`;
 const pointAt = (p) => parseIso(p.at);
 const fmtRate = (passes, runs) => (runs ? `${pct(passes / runs)} (${passes}/${runs})` : "no graded run");
 const fmtMean = (value) => (isNumber(value) ? value.toFixed(2) : "—");
@@ -1717,7 +1841,7 @@ const fmtMean = (value) => (isNumber(value) ? value.toFixed(2) : "—");
 // The report link only when the report carries the night; otherwise the
 // build log, when the collector recorded one.
 function trendNight(t, id) {
-  const night = trendNights(t).find((n) => n.id === id);
+  const night = trendNights(t).find((n) => n.id === id) || latencyNights(t).find((n) => n.id === id);
   const ms = night ? parseIso(night.at) : null;
   const onReport = night && night.build != null && nights().some((n) => String(n.build) === String(night.build));
   return { night, ms, label: ms != null ? et(ms) : "an unknown night", href: onReport ? nightHref({ build: night.build }) : (night && night.log_url ? night.log_url : null) };
@@ -1771,29 +1895,47 @@ function segments(points, keep, joins) {
   return out;
 }
 
+// The y-scales a Trend chart draws on: the unit interval in percent (pass
+// rate, judged means), or seconds from 0 to a nice max (the latency row).
+const UNIT_SCALE = { max: 1, ticks: [0, 0.25, 0.5, 0.75, 1], fmt: (v) => `${Math.round(v * 100)}%` };
+function secondsScale(values) {
+  const top = Math.max(0, ...values.filter(isNumber));
+  const raw = top / PAGE.trendSecondsSteps || 1;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = PAGE.niceSteps.map((m) => m * mag).find((v) => v >= raw);
+  const count = Math.max(1, Math.ceil(top / step));
+  const ticks = Array.from({ length: count + 1 }, (_, i) => Number((i * step).toPrecision(12)));
+  return { max: ticks[ticks.length - 1], ticks, fmt: (v) => `${v} s` };
+}
+
 // One chart: `kind` is "rate" (bars for each night's pass rate, a line for
-// the trailing admission window, the bar) or "judged" (a line of means with
-// the spread band; a lone night is a hollow point). One series colour, the
-// page accent; text in text tokens; the tooltip carries every value.
-function trendChartHtml(t, points, kind, metric, range, markers, title, key) {
+// the trailing admission window, the bar), "judged" (a line of means with
+// the spread band; a lone night is a hollow point), or a LATENCY_KINDS
+// series (lines of the p50 and the series' slow percentile, dashed; a night
+// with no timed rep that counts is a gap; the opening turn carries the
+// advisory target). `scale` is the y-axis.
+// One series colour, the page accent; text in text tokens; the tooltip
+// carries every value.
+function trendChartHtml(t, points, kind, metric, range, markers, title, key, scale = UNIT_SCALE) {
   const g = PAGE.trendChart;
   const plotW = g.width - g.left - g.right, plotH = g.height - g.top - g.bottom;
   const x = (ms) => g.left + (range.toMs === range.fromMs ? plotW / 2 : (ms - range.fromMs) / (range.toMs - range.fromMs) * plotW);
-  const y = (v) => g.top + (1 - Math.max(0, Math.min(1, v))) * plotH;
+  const y = (v) => g.top + (1 - Math.max(0, Math.min(1, v / scale.max))) * plotH;
   const spanDays = Math.max(1, (range.toMs - range.fromMs) / PAGE.dayMs);
   const slot = plotW / spanDays;
   const barW = Math.max(3, Math.min(g.barMax, slot * 0.6 - g.gap));
   const parts = [];
-  // Grid: solid hairlines at 0, 25, 50, 75, 100 %, ticks in the muted ink.
-  for (const v of [0, 0.25, 0.5, 0.75, 1]) parts.push(`<line class="grid" x1="${g.left}" x2="${g.left + plotW}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"></line><text class="axis" x="${g.left - 6}" y="${(y(v) + 3.5).toFixed(1)}" text-anchor="end">${Math.round(v * 100)}%</text>`);
+  // Grid: solid hairlines at the scale's ticks (0, 25, 50, 75, 100 % on the
+  // unit interval), ticks in the muted ink.
+  for (const v of scale.ticks) parts.push(`<line class="grid" x1="${g.left}" x2="${g.left + plotW}" y1="${y(v).toFixed(1)}" y2="${y(v).toFixed(1)}"></line><text class="axis" x="${g.left - 6}" y="${(y(v) + 3.5).toFixed(1)}" text-anchor="end">${scale.fmt(v)}</text>`);
   // X ticks: one per night up to fourteen, thinned beyond; each a date.
   const nightsOnAxis = points.map((p) => pointAt(p)).filter((ms) => ms != null);
   const every = Math.max(1, Math.ceil(nightsOnAxis.length / 14));
   nightsOnAxis.forEach((ms, i) => { if (i % every === 0 || i === nightsOnAxis.length - 1) parts.push(`<text class="axis" x="${x(ms).toFixed(1)}" y="${g.height - 8}" text-anchor="middle">${esc(fmtParts(ms, { month: "short", day: "numeric" }))}</text>`); });
   const drawn = points.filter((p) => pointAt(p) != null);
-  const label = (px, py, text) => (px > g.left + plotW * 0.66
-    ? `<text class="lab" x="${(px - 8).toFixed(1)}" y="${(py + 4).toFixed(1)}" text-anchor="end">${esc(text)}</text>`
-    : `<text class="lab" x="${(px + 8).toFixed(1)}" y="${(py + 4).toFixed(1)}">${esc(text)}</text>`);
+  const label = (px, py, text, cls = "lab") => (px > g.left + plotW * 0.66
+    ? `<text class="${cls}" x="${(px - 8).toFixed(1)}" y="${(py + 4).toFixed(1)}" text-anchor="end">${esc(text)}</text>`
+    : `<text class="${cls}" x="${(px + 8).toFixed(1)}" y="${(py + 4).toFixed(1)}">${esc(text)}</text>`);
   if (kind === "rate") {
     const bar = isNumber(t.bar && t.bar.rate) ? t.bar.rate : null;
     if (bar != null) parts.push(`<line class="thr" x1="${g.left}" x2="${g.left + plotW}" y1="${y(bar).toFixed(1)}" y2="${y(bar).toFixed(1)}"></line><text class="thr-l" x="${g.left + 4}" y="${(y(bar) - 4).toFixed(1)}">${Math.round(bar * 100)}% bar</text>`);
@@ -1811,6 +1953,25 @@ function trendChartHtml(t, points, kind, metric, range, markers, title, key) {
     for (const p of line) parts.push(`<circle class="dot${p.window.full ? "" : " lone"}" cx="${x(pointAt(p)).toFixed(1)}" cy="${y(p.window.passes / p.window.runs).toFixed(1)}" r="${g.dot}"></circle>`);
     const last = line[line.length - 1];
     if (last) parts.push(label(x(pointAt(last)), y(last.window.passes / last.window.runs), `${pct(last.window.passes / last.window.runs)} of ${last.window.runs}${last.window.full ? "" : last.window.cut ? " · window reaches past this read" : " · window not full"}`));
+  } else if (LATENCY_KINDS.includes(kind)) {
+    const target = kind === "turn1" ? latencyTarget(t) : null;
+    // The target is a line with no label in the plot: the newest night's
+    // label sits beside its point, often just above it. The y-axis names its
+    // value when no tick does (a 20 s step has no 10 s tick).
+    if (isNumber(target)) {
+      parts.push(`<line class="thr" x1="${g.left}" x2="${g.left + plotW}" y1="${y(target).toFixed(1)}" y2="${y(target).toFixed(1)}"></line>`);
+      if (!scale.ticks.includes(target)) parts.push(`<text class="thr-l" x="${g.left - 6}" y="${(y(target) + 3.5).toFixed(1)}" text-anchor="end">${scale.fmt(target)}</text>`);
+    }
+    for (const field of [slowField(t, kind), `${kind}_p50_s`]) {
+      const slow = field === slowField(t, kind) ? " slow" : "";
+      const has = (p) => timed(p, kind) && isNumber(p[field]);
+      for (const seg of segments(drawn, has, () => true)) parts.push(`<path class="line${slow}" d="${seg.map((p, i) => `${i ? "L" : "M"}${x(pointAt(p)).toFixed(1)},${y(p[field]).toFixed(1)}`).join(" ")}"></path>`);
+      for (const p of drawn.filter(has)) parts.push(`<circle class="dot${slow}" cx="${x(pointAt(p)).toFixed(1)}" cy="${y(p[field]).toFixed(1)}" r="${g.dot}"></circle>`);
+    }
+    const last = drawn.filter((p) => timed(p, kind)).pop();
+    // Above its slow point, clear of the lines that reach it; the halo keeps
+    // it readable where the target or a line crosses it.
+    if (last) parts.push(label(x(pointAt(last)), y(last[slowField(t, kind)]) - g.dot * 3, `p50 ${secOrDash(last[`${kind}_p50_s`])} · ${slowName(t, kind)} ${secOrDash(last[slowField(t, kind)])} · n=${last[`n_${kind}`]}`, "lab halo"));
   } else if (metric) {
     const hasMetric = (p) => !!(p.judged && p.judged[metric]);
     const inBand = (p) => { if (!hasMetric(p)) return false; const j = p.judged[metric], s = j.spread || j; return isNumber(s.low) && isNumber(s.high) && (s.nights == null ? (s.cases || 0) > 1 : s.nights > 1); };
@@ -1856,6 +2017,8 @@ function trendChartHtml(t, points, kind, metric, range, markers, title, key) {
       lines.push(`nightly pass rate: ${fmtRate(p.passes, p.runs)}${p.cases ? ` over ${plural(p.cases, "case")}` : ""}`);
       if (p.window) lines.push(`trailing window: ${fmtRate(p.window.passes, p.window.runs)} across ${plural(p.window.lines, "night")}${p.window.full ? "" : p.window.cut ? " · reaches past this read" : " · not full yet"}`);
       if (p.blocked || p.infra) lines.push(`${p.blocked || 0} blocked · ${p.infra || 0} infra, not in the rate`);
+    } else if (LATENCY_KINDS.includes(kind)) {
+      lines.push(timed(p, kind) ? `${LATENCY_WORDS[kind]}: p50 ${secOrDash(p[`${kind}_p50_s`])} · ${slowName(t, kind)} ${secOrDash(p[slowField(t, kind)])} · ${plural(p[`n_${kind}`], "rep")}` : `${LATENCY_WORDS[kind]}: no timed rep that counts that night`);
     } else if (metric && p.judged && p.judged[metric]) {
       const j = p.judged[metric], s = j.spread || j;
       lines.push(`${metric}: ${fmtMean(j.mean)} mean · n=${j.n}`);
@@ -1874,6 +2037,52 @@ function trendLegendHtml(kind, metric, t) {
   if (kind === "rate") return `<div class="tlegend"><span><i></i>pass rate that night (passes / scored runs)</span><span><i class="line"></i>trailing window: newest nights at the same key pooled to ${esc(t.bar && t.bar.min_runs || 20)} runs (hollow: not full yet)</span><span><i class="thr"></i>the admission bar</span><span><i class="keym"></i>version key changed</span></div>`;
   return `<div class="tlegend"><span><i class="line"></i>${esc(metric || "judged")} mean per night (n in the tooltip)</span><span><i class="band"></i>range of the nightly means over the last ${spread} nights at the same key, or across a domain's cases</span><span><i class="keym"></i>version key changed</span></div>`;
 }
+
+function trendLatencyLegendHtml(kind, t) {
+  const target = kind === "turn1" ? `<span><i class="thr"></i>the end-state target, p95 under ${esc(latencyTarget(t))} s: advisory, nothing gates on it</span>` : "";
+  return `<div class="tlegend"><span><i class="line"></i>p50 per night</span><span><i class="line slow"></i>${esc(slowName(t, kind))} per night (reps in the tooltip; a gap is a night with no timed rep that counts; infra reps never count)</span>${target}</div>`;
+}
+
+// The latency points on the card's time axis: what the row draws and the
+// table lists.
+const latencyDrawn = (points, range) => points.filter((p) => { const ms = pointAt(p); return ms != null && ms >= range.fromMs && ms <= range.toMs; });
+
+// The latency row under a card's charts: the opening chat turn and the
+// agent run by night, on the card's time axis. A series no point carries
+// says so instead of drawing an empty chart.
+function trendLatencyRowHtml(t, points, range, markers, name, key) {
+  const drawn = latencyDrawn(points, range);
+  const chart = (kind, heading) => {
+    const head = `<div class="small mut">${heading}</div>`;
+    if (!drawn.some((p) => timed(p, kind))) return `<div>${head}<p class="mut">No timed <code>${LATENCY_FIELDS[kind]}</code> that counts for this scope in the nightly runs yet (infra reps never count).</p></div>`;
+    const values = drawn.flatMap((p) => [p[`${kind}_p50_s`], p[slowField(t, kind)]]);
+    if (kind === "turn1") values.push(latencyTarget(t));
+    return `<div>${head}${trendChartHtml(t, drawn, kind, null, range, markers, `${name}: ${LATENCY_WORDS[kind]} by night`, key, secondsScale(values))}${trendLatencyLegendHtml(kind, t)}</div>`;
+  };
+  if (!drawn.some(anyTimed)) return `<p class="mut small">No timing on record for this scope yet: no timed nightly rep in the window counts (infra reps never count).</p>`;
+  return `<div class="tgrid tlat">${chart("turn1", "Chat turn 1 by night · advisory")}${chart("agent", "Agent time by night")}</div>`;
+}
+
+// The table twin of the latency row, its nights newest first; "" with no
+// timing.
+function trendLatencyTableHtml(t, points, range, key) {
+  const drawn = latencyDrawn(points, range);
+  if (!drawn.some(anyTimed)) return "";
+  const tvKey = `${key}:latency`;
+  const rows = drawn.map((p) => {
+    const night = trendNight(t, p.night);
+    const when = night.href ? `<a href="${esc(night.href)}">${esc(night.label)}</a>` : esc(night.label);
+    return `<tr><td>${when}</td>${LATENCY_KINDS.map((kind) => `<td>${esc(secOrDash(p[`${kind}_p50_s`]))}</td><td>${esc(secOrDash(p[slowField(t, kind)]))}</td><td>${timed(p, kind) ? p[`n_${kind}`] : "—"}</td>`).join("")}</tr>`;
+  }).reverse();
+  return `<details class="tv" data-tv="${esc(tvKey)}"${ui.openTables.has(tvKey) ? " open" : ""}><summary>Latency table · ${plural(drawn.length, "night")}</summary><table class="tt"><thead><tr><th>Night</th>${LATENCY_KINDS.map((kind) => `<th>${LATENCY_HEADS[kind]} p50</th><th>${LATENCY_HEADS[kind]} ${esc(slowName(t, kind))}</th><th>${LATENCY_HEADS[kind]} reps</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></details>`;
+}
+
+// The timed latency points, for the card's time axis: a night of the
+// nightly runs the store has not recorded yet still lands inside the plot.
+const timedPoints = (points) => points.filter(anyTimed);
+// Version-key markers are about scoring, not timing: the latency row keeps
+// the incident's only.
+const latencyMarkers = (markers) => markers.filter((m) => m.cls === "incm");
 
 function trendMarkers(t, keyChanges, link) {
   const out = [];
@@ -1923,15 +2132,16 @@ function trendKeyChangesHtml(t, changes) {
 
 // `key` is the card's stable name (a case or a domain): the hit targets and
 // the table view carry it so focus and an open table survive a re-render.
-function trendCardHtml(t, title, sub, points, keyChanges, metric, range, link, perDomain, footer, key) {
+function trendCardHtml(t, title, sub, points, keyChanges, metric, range, link, perDomain, footer, key, latency) {
   const markers = trendMarkers(t, keyChanges, link);
   // The charts' accessible name is the card's name as text (`title` is markup).
   const name = key.startsWith("domain:") ? domainWords(key.slice("domain:".length)) : key.slice("case:".length);
-  if (!points.length) return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><p class="mut">No record in the store for this scope.</p></div>`;
-  return `<div class="tcard"><h3>${title}${sub ? `<small>${sub}</small>` : ""}</h3><div class="tgrid">` +
+  const h3 = `<h3${titleAttr(key.startsWith("domain:") ? domainTooltip(key.slice("domain:".length)) : "")}>`;
+  if (!points.length) return `<div class="tcard">${h3}${title}${sub ? `<small>${sub}</small>` : ""}</h3><p class="mut">No record in the store for this scope.</p></div>`;
+  return `<div class="tcard">${h3}${title}${sub ? `<small>${sub}</small>` : ""}</h3><div class="tgrid">` +
     `<div><div class="small mut">Pass rate by night</div>${trendChartHtml(t, points, "rate", null, range, markers, `${name}: pass rate by night`, key)}${trendLegendHtml("rate", null, t)}</div>` +
     `<div><div class="small mut">Judged ${esc(metric || "quality")} by night · advisory</div>${metric ? trendChartHtml(t, points, "judged", metric, range, markers, `${name}: ${metric} by night`, key) : `<p class="mut">No judged metric in the store yet.</p>`}${metric ? trendLegendHtml("judged", metric, t) : ""}</div>` +
-    `</div>${footer || ""}${trendTableHtml(t, points, metric, perDomain, key)}</div>`;
+    `</div>${trendLatencyRowHtml(t, latency, range, latencyMarkers(markers), name, key)}${footer || ""}${trendTableHtml(t, points, metric, perDomain, key)}${trendLatencyTableHtml(t, latency, range, key)}</div>`;
 }
 
 function trendStatusHtml(t) {
@@ -1948,7 +2158,7 @@ function trendStatusHtml(t) {
 
 function trendHtml(link) {
   const t = trendDoc();
-  const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back, each night dated by when its record was written. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
+  const lede = `Every night the nightly tier runs each case against <code>main</code> three times and appends one record per case to the evidence store; this page reads those records back, each night dated by when its record was written. <b>Pass rate is the gate's number</b>: passes over scored repetitions, with the trailing window computed admission reads drawn beside each night. <b>Judged quality is advisory</b> and is never shown as one point: the store carries a mean and its n per night, so the band is the range of nightly means over the last ${esc(t && t.spread_nights || 7)} nights at one version key (a domain's band is the range across its cases). A vertical marker is a night the version key changed, so a step has its explanation next to it. <b>Latency is advisory too</b>: under each card (and over every case above the domain cards), the opening chat turn and the agent run by night, p50 and ${esc(slowName(t, "turn1"))} for the turn, p50 and ${esc(slowName(t, "agent"))} for the run, over the scope's repetitions not lost to infra, from the nightly runs on record (the store carries no timing), beside the ${esc(latencyTarget(t))} s chat-turn target. <a href="${PAGE.scoreDocUrl}">What a score is</a> is written once, in the eval-scorer design.`;
   const head = (title) => `<div class="sec head"><h1>${title}</h1><div class="lede">${lede}</div></div>`;
   if (!t || (!t.source && !t.read_at) || !t.records) {
     const why = t && t.source ? `<p class="mut">The store <code>${esc(t.source)}</code> was read ${esc(et(parseIso(t.read_at)))} and holds no record inside its ${esc(t.window_days || "")}-day window yet. The first night that records fills this page.</p>` : "";
@@ -1959,7 +2169,7 @@ function trendHtml(link) {
   const cases = trendCases(t), domains = trendDomains(t);
   const metrics = Array.isArray(t.metrics) ? t.metrics.filter((m) => typeof m === "string") : [];
   const domainNames = Object.keys(domains).sort();
-  const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d)).join("")}` +
+  const ctl = `<div class="ctl">scope ${chip("scope", "", "all domains", !!scope.all)}${domainNames.map((d) => chip("scope", d, domainWords(d), scope.domain === d, domainTooltip(d))).join("")}` +
     (metrics.length > 1 ? `<span class="sep">·</span>judged metric ${metrics.map((m) => chip("metric", m, m, m === metric)).join("")}` : "") + `</div>`;
   const read = parseIso(t.read_at);
   const readLine = `<p class="mut small">Store <code>${esc(t.source)}</code> read ${esc(read != null ? et(read) : "at an unknown time")} · ${plural(t.records, "record")} over ${plural(trendNights(t).length, "night")} inside the last ${esc(t.window_days)} days · nightly records only (a pull request's run never writes the store).</p>`;
@@ -1967,11 +2177,11 @@ function trendHtml(link) {
   if (scope.cases) {
     const found = scope.cases.filter((name) => cases[name]);
     const missing = scope.cases.filter((name) => !cases[name]);
-    const range = trendRange(found.map((name) => cases[name].points || []), link);
+    const range = trendRange([...found.map((name) => cases[name].points || []), ...found.map((name) => timedPoints(latencyPoints(t, "cases", name)))], link);
     body = found.map((name) => {
       const c = cases[name];
-      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">its domain, ${esc(domainWords(c.domain))} →</a></p>`;
-      return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer, `case:${name}`);
+      const footer = trendRecordHtml(c.record) + trendKeyChangesHtml(t, c.key_changes) + `<p class="small"><a href="${esc(caseHref(name))}">this case on the Cases page →</a> · <a href="${esc(trendDomainHref(c.domain))}">${c.domain === DOMAIN_UNKNOWN ? `every case with ${DOMAIN_UNKNOWN_LABEL}` : `its domain, ${esc(domainWords(c.domain))}`} →</a></p>`;
+      return trendCardHtml(t, `<code>${esc(name)}</code>`, esc(domainWords(c.domain)), c.points || [], c.key_changes, metric, range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() }, link, false, footer, `case:${name}`, latencyPoints(t, "cases", name));
     }).join("");
     if (missing.length) body += `<div class="tcard"><h3><code>${missing.map(esc).join("</code>, <code>")}</code></h3><p class="mut">No record in the store for ${missing.length === 1 ? "this case" : "these cases"} inside the window: ${missing.length === 1 ? "it has" : "they have"} not run on a recording night yet, or the name is not a case.</p></div>`;
     const title = scope.cases.length === 1 ? `<code>${esc(scope.cases[0])}</code> on main` : `${plural(scope.cases.length, "case")} on main`;
@@ -1981,13 +2191,18 @@ function trendHtml(link) {
   if (scope.domain) {
     const d = domains[scope.domain];
     const members = (d.cases || []).filter((name) => cases[name]);
-    const range = trendRange([d.points || [], ...members.map((name) => cases[name].points || [])], link);
-    body = trendCardHtml(t, esc(domainWords(scope.domain)), `${plural(members.length, "case")} pooled per night`, d.points || [], d.key_changes, metric, range, link, true, "", `domain:${scope.domain}`) +
-      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendHref([name]))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record), `case:${name}`)).join("")}</div>`;
+    const domainLatency = latencyPoints(t, "domains", scope.domain);
+    const range = trendRange([d.points || [], ...members.map((name) => cases[name].points || []), timedPoints(domainLatency)], link);
+    body = trendCardHtml(t, esc(domainWords(scope.domain)), `${plural(members.length, "case")} pooled per night`, d.points || [], d.key_changes, metric, range, link, true, "", `domain:${scope.domain}`, domainLatency) +
+      `<div class="sec"><h2>Each case in ${esc(domainWords(scope.domain))}</h2>${members.map((name) => trendCardHtml(t, `<a href="${esc(trendHref([name]))}"><code>${esc(name)}</code></a>`, "", cases[name].points || [], cases[name].key_changes, metric, range, link, false, trendRecordHtml(cases[name].record), `case:${name}`, latencyPoints(t, "cases", name))).join("")}</div>`;
     return head(`${esc(domainWords(scope.domain))} on main`) + trendStatusHtml(t) + ctl + readLine + body + footHtml();
   }
-  const range = trendRange(domainNames.map((name) => domains[name].points || []), link);
-  body = domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendDomainHref(name))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "", `domain:${name}`)).join("");
+  const allLatency = latencyPoints(t, "all");
+  const range = trendRange([...domainNames.map((name) => domains[name].points || []), timedPoints(allLatency)], link);
+  // Every case's timing pooled per night, above the domains' cards.
+  const allRange = range || { fromMs: nowMs() - PAGE.dayMs, toMs: nowMs() };
+  const allRow = `<div class="sec"><h2>Latency, all domains</h2>${trendLatencyRowHtml(t, allLatency, allRange, latencyMarkers(trendMarkers(t, [], link)), "all domains", "all")}${trendLatencyTableHtml(t, allLatency, allRange, "all")}</div>`;
+  body = allRow + domainNames.map((name) => trendCardHtml(t, `<a href="${esc(trendDomainHref(name))}">${esc(domainWords(name))}</a>`, `${plural((domains[name].cases || []).length, "case")} pooled per night`, domains[name].points || [], domains[name].key_changes, metric, range, link, true, "", `domain:${name}`, latencyPoints(t, "domains", name))).join("");
   return head("Scores over time on main") + trendStatusHtml(t) + ctl + readLine + body + footHtml();
 }
 
@@ -2069,7 +2284,8 @@ function renderFreshness() {
 const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml, nightly: nightlyHtml, trend: trendHtml };
 
 // `scroll` is true for a navigation (boot, a hash change): the page then
-// scrolls to the `view=` section or the `#<case>` row it just rendered. The
+// scrolls to the `view=` section, the `#<case>` row or the Nightly page's
+// timing section for `#cases=` it just rendered. The
 // poll and a chip re-render with it false, so a reader who has scrolled on
 // is not pulled back.
 function renderAll(scroll = false) {
@@ -2104,6 +2320,9 @@ function renderAll(scroll = false) {
   } else if (scroll && page === "cases" && link.caseHash) {
     const row = document.getElementById(`case-${link.caseHash}`);
     if (row) row.scrollIntoView({ block: "center" });
+  } else if (scroll && page === "nightly" && link.cases.size) {
+    const section = document.getElementById("timing");
+    if (section) section.scrollIntoView();
   }
   if (page === "grid") {
     // First paint: a live window is read from its newest run, a linked

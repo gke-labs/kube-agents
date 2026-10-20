@@ -5,6 +5,25 @@ model:
   base_url: http://inference-gateway.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
+# Model-call deadlines for the gateway above. Hermes reads them per provider
+# (hermes_cli/timeouts.py). stale_timeout_seconds is the base of both stale
+# detectors: a stream with no first chunk, or no chunk for that long, and a
+# non-streamed call with no answer; then Hermes drops the stream and retries.
+# It is 600s because Gemini thinks in silence on this path: with the request
+# shape Hermes sends, no reasoning deltas stream, and a hard prompt measured
+# 140-210s before its first chunk, so a shorter bound would cut off healthy
+# long thinks, and every retry would repeat the same think.
+# request_timeout_seconds is the per-read socket timeout (and the stream read
+# timeout), not a cap on a whole call; the chart's LiteLLM sets no timeout of
+# its own. A call that stalls is retried inside each of Hermes' 3 attempts
+# (agent.api_max_retries) until five stale kills in a row trip its breaker, so
+# a persistent stall costs five or six 600s windows before the turn fails; a
+# one-off stall recovers at the first 600s kill.
+providers:
+  custom:
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 900
+
 # MCP Servers configuration.
 #
 # `agent_common` (the `call_agent` A2A tool) was declared here and is not any
@@ -55,6 +74,19 @@ mcp_servers:
   # deploy/docker/patches/apply_mcp_remote_forward_errors.py fixes that at build
   # time and carries the full analysis; this bounds the damage if it ever stops
   # applying. Healthy calls to these endpoints measure 0.47-0.48s.
+  #
+  # Neither server is reached directly. `${KUBE_AGENTS_MCP_RELAY_URL}/<server>`
+  # is the credential proxy's `/v1/mcp/<server>` route (the operator sets the
+  # variable on the agent container), which checks every call against
+  # agents/platform/scripts/mcp_policy.py and forwards it on the proxy's own
+  # credential; the agent container holds none for these servers to use.
+  # mcp-remote presents the gateway's projected token from the file
+  # MCP_REMOTE_BEARER_FILE names (deploy/docker/patches/
+  # apply_mcp_remote_bearer_file.py). `--allow-http` because the proxy is a
+  # cluster Service; `--transport http-only` because the relay answers GET with
+  # 405, so an SSE fallback could only fail more slowly. This is the canonical
+  # explanation; agents/platform/config.yaml and agents/cluster/config.yaml
+  # carry the same entries and point back here.
   # `lazy: true`: register tools from the per-profile schema cache without
   # spawning the node proxy; the child starts on first actual tool call. Kanban
   # workers are fresh processes per card, and the eager spawns were ~2-4s of
@@ -98,7 +130,8 @@ mcp_servers:
   #     for an interactive tool, which nothing here is.
   #   - One string, byte-identical at every call site. It names the product,
   #     the build and the mode and nothing else; the customer project is
-  #     already on the wire as X-Goog-User-Project. Keep it that way — the API
+  #     already on the wire as X-Goog-User-Project, which the credential proxy
+  #     sets from its own credential. The proxy forwards this header unchanged. Keep it that way — the API
   #     teams key dashboards on this value, and a variation added in one file
   #     splits that key.
   developer_knowledge:
@@ -107,7 +140,12 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://developerknowledge.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/developer_knowledge"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
@@ -117,28 +155,30 @@ mcp_servers:
       - "/opt/mcp-remote/dist/proxy.js"
       - "--header"
       - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION} (daemon)"
-      - "https://container.googleapis.com/mcp"
+      - "${KUBE_AGENTS_MCP_RELAY_URL}/gke"
+      - "--allow-http"
+      - "--transport"
+      - "http-only"
+    env:
+      MCP_REMOTE_BEARER_FILE: "${CREDENTIAL_PROXY_TOKEN_FILE}"
     lazy: true
     connect_timeout: 30
     timeout: 60
     # Read tools only: the 15 of the server's 23 that it annotates
-    # readOnlyHint. This server runs in the agent container on the pod's
-    # Workload Identity credential and never reaches the credential broker, so
-    # the broker's gcloud allowlist does not cover it. Unfiltered, a `custom`
-    # permission set that grants a write role hands the model create_cluster,
-    # patch_k8s_resource and the rest, with no pull request in between. This is
-    # the canonical note; agents/platform/config.yaml and
-    # agents/cluster/config.yaml carry the same list and point back here.
+    # readOnlyHint, the same set the credential proxy's relay enforces
+    # (agents/platform/scripts/mcp_policy.py GKE_READ_TOOLS, which B1 holds this
+    # list to). The relay refuses every other tool; this list keeps them out of
+    # the model's offer, so a refused call is not attempted. This is the
+    # canonical note; agents/platform/config.yaml and agents/cluster/config.yaml
+    # carry the same list and point back here.
     #
     #   - `include` is an allowlist (hermes tools/mcp_tool_registration.py
     #     `_make_tool_filter`), so a tool the server adds later stays hidden
     #     until it is named here. `exclude` would offer it the day it ships.
     #   - Exact names, no globs: `get_*` matches whatever the server names next.
-    #   - It is a declaration, not enforcement. The model cannot call a tool it
-    #     is not offered, but the credential behind the server is unchanged and
-    #     nothing refuses a call if this list drifts. The B1 conformance test
-    #     reads the config each profile actually runs with and fails on any
-    #     tool that is not a read.
+    #   - It is the offer, not the enforcement: the relay is what refuses a
+    #     call. The B1 conformance test reads the config each profile actually
+    #     runs with and fails on any tool that is not a read.
     #   - deploy/docker/merge_configs.py unions this list with the platform
     #     overlay's, so a write tool added to either copy reaches the Platform
     #     Agent.

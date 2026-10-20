@@ -34,11 +34,12 @@ carve-out (#2039) is the inject lane's: on that transport's record, a check
 that reads what the record cannot show is set aside as not applicable
 before the rungs -- failed or errored, it is neither a graded failure nor a
 rung-2 block there -- and the rungs grade what remains (see
-``_inject_lane_view``). A check that reads the delegated workers is set
-aside on every inject record; a router-scope ``tool_called`` only on one
-from a door that showed no tool-call trace (no ``a2a.activity`` marker),
-and it grades in full on one carrying the marker, whether or not the
-persona made a call.
+``_inject_lane_view``). A check that reads the delegated workers or a
+call's result is set aside on every inject record; any other router-scope
+``tool_called`` only on one from a door that showed no tool-call trace (no
+``a2a.activity`` marker) or whose marker reports a loss, and it grades in
+full on one whose marker reports none, whether or not the persona made a
+call.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -93,6 +94,11 @@ __all__ = [
 #: that exists but holds an unusable record, which is a different diagnosis.
 MISSING = "MISSING"
 
+#: The opening chat turn's seconds, which hack/ci-eval-pr.sh copies from the
+#: harness's KUBE_AGENTS_TIMING_FILE into the run directory, and its one key.
+_TIMING_FILE = "timing.json"
+_TIMING_TURN1_KEY = "turn1_s"
+
 #: ``VerificationCorrectness`` at or above this is a passing repetition. The
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
 DEFAULT_CORRECTNESS_FLOOR = 1.0
@@ -102,19 +108,26 @@ DEFAULT_CORRECTNESS_FLOOR = 1.0
 #: green presubmit runs since 2026-09-26 and the four clean nightlies at
 #: parallelism 8 (docs/designs/eval-scorer.md, "Sizing the aggregate
 #: margin"). With twelve admitted cases at three repetitions the pull
-#: request's side is 36 units, so the rate moves in steps of 1/36 = 0.028
+#: request's side was 36 units, so the rate moved in steps of 1/36 = 0.028
 #: and the margin is really a count of failed repetitions: at main's window
-#: rate of 0.924 (2026-09-29) it tolerates six failures out of 36 and reds
+#: rate of 0.924 (2026-09-29) it tolerated six failures out of 36 and redded
 #: the seventh; once the outage-era lines leave the window and main sits
-#: near 0.94 it tolerates five and reds the sixth. The worst green run in
-#: the sample had five (0.861 against 0.924, a deficit of 0.063, which the
-#: old 0.05 would have redded); the next worst had four. 0.10 leaves 0.037
-#: of headroom over that worst run, more than one unit of 36, and holds
-#: five failures until main's window rate passes 0.96. The two-proportion
+#: near 0.94 it tolerates five and reds the sixth. Since 2026-10-14
+#: (pdb-remediation-pr on the roster) the side is 39 units, steps of 1/39 =
+#: 0.026: six failures still pass at 0.924 and at 0.94, five at 0.96.
+#: Since 2026-10-17 (two demotions, #3269 and #3120) it is 33 units, steps
+#: of 1/33 = 0.030: five failures pass at 0.924 and at 0.94, four at 0.96,
+#: and five red once main's window rate passes about 0.948. The worst green
+#: run in the sample had five (0.861 against 0.924, a deficit of 0.063, which
+#: the old 0.05 would have redded); the next worst had four. 0.10 leaves
+#: 0.037 of headroom over that worst run, still more than one unit of 33
+#: (0.030), but a five-failure run like it now reds above 0.948. The two-proportion
 #: test at one-sided 5% reds none of the same runs either (its largest z
 #: was 1.26, on that five-failure run); it sits one failed repetition
 #: stricter than 0.10 at today's window. Revisit if main's window rate
-#: exceeds 0.96 or the roster leaves twelve.
+#: exceeds 0.96 or the roster leaves eleven (both demoted cases' returns
+#: restore 39 units). The aggregate is not armed by default
+#: (EVAL_AGGREGATE_ARMED); re-check these counts before arming it.
 DEFAULT_AGGREGATE_MARGIN = 0.10
 
 #: Scored repetitions the aggregate needs before it may BLOCK. Below this it
@@ -235,12 +248,13 @@ A2A_STATE_WORKING = "working"
 #: the persona never made fails there as it would on the api transport,
 #: while a check graded over a trace that lost calls could fail a call
 #: that happened, and a ``none``-wrapped safeguard could pass over one. A
-#: check that reads the delegated workers is set aside on every inject
-#: record, marker or not: the trace carries no card ids and no worker's
-#: entries (``cases.py``, ``worker_blind_checks``). The names are
-#: duplicated rather than imported, like the status entry, and so are the
-#: marker's three loss arguments (``inject_transport.ACTIVITY_LOSS_ARGS``);
-#: ``test_scoring.py`` asserts each agrees with the transport's.
+#: check that reads the delegated workers or a call's result is set aside
+#: on every inject record, marker or not: the trace carries no card ids,
+#: no worker's entries and no results (``cases.py``,
+#: ``worker_blind_checks``). The names are duplicated rather than imported,
+#: like the status entry, and so are the marker's four loss arguments
+#: (``inject_transport.ACTIVITY_LOSS_ARGS``); ``test_scoring.py`` asserts
+#: each agrees with the transport's.
 INJECT_TASK_EVENT = "inject.task"
 INJECT_POST_EVENT = "inject.post"
 INJECT_EDIT_EVENT = "inject.edit"
@@ -395,7 +409,8 @@ class RunRecord:
     ``results.json`` is the scoring contract: it is the only artifact carrying
     ``VerificationCoverage`` and the per-check ``verification_report``.
     ``manifest.json`` and ``rows.json`` are read for the version key and for
-    latency/token reporting.
+    latency/token reporting, and ``timing.json`` (copied in by
+    hack/ci-eval-pr.sh) for the opening turn's seconds.
     """
 
     run_dir: Path
@@ -404,6 +419,9 @@ class RunRecord:
     trajectory: list[Any]
     tokens: dict[str, Any]
     latency: float | None
+    #: Seconds of the opening chat turn, from ``timing.json``. None when the
+    #: file is absent or its value is not a finite number above zero.
+    turn1_s: float | None
     verification_report: list[dict[str, Any]]
     verification_parse_errors: list[Any]
     error: Any
@@ -422,8 +440,10 @@ class RunRecord:
     scoring_version: str | None
     agent_model: str | None
     #: The agent's final report as devops-bench recorded it (``output``, the
-    #: "Actual Output" the judge grades). Read for reporting only: the gate
-    #: quotes its first lines into the build log; no rung reads it.
+    #: "Actual Output" the judge grades). The gate quotes its first lines
+    #: into the build log, and rung 3 reads it only for a case that declares
+    #: ``tool_calls_optional``, where a reply on a record with no error
+    #: stands in for the trajectory.
     output: str = ""
 
     @property
@@ -506,6 +526,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
         return None
 
     manifest = _read_json(path / "manifest.json") or {}
+    turn1_s = _positive_seconds(_read_json(path / _TIMING_FILE), _TIMING_TURN1_KEY)
     rows = _read_json(path / "rows.json") or []
     row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
 
@@ -519,6 +540,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
             trajectory=list(rec.get("trajectory") or []),
             tokens=dict(rec.get("tokens") or {}),
             latency=_as_float(rec.get("latency")),
+            turn1_s=turn1_s,
             verification_report=[e for e in (report or []) if isinstance(e, dict)],
             verification_parse_errors=list(rec.get("verification_parse_errors") or []),
             error=rec.get("error") or (rec.get("errors") or None),
@@ -549,6 +571,17 @@ def _as_float(value: Any) -> float | None:
         return None
 
 
+def _positive_seconds(data: Any, key: str) -> float | None:
+    value = data.get(key) if isinstance(data, dict) else None
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        seconds = float(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
 def _as_str(value: Any) -> str | None:
     return str(value) if value is not None else None
 
@@ -575,6 +608,7 @@ class RepResult:
     judged: dict[str, float] = field(default_factory=dict)
     failed_checks: list[str] = field(default_factory=list)
     latency: float | None = None
+    turn1_s: float | None = None
     total_tokens: int | None = None
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
@@ -616,7 +650,7 @@ def _a2a_run_evidence(trajectory: list[Any]) -> bool:
     return False
 
 
-def _liveness_failures(record: RunRecord) -> list[str]:
+def _liveness_failures(record: RunRecord, *, tool_calls_optional: bool = False) -> list[str]:
     """Rung 3's signals. Every one must hold for the record to be a real run.
 
     These are the fields the fixtures showed are actually populated -- there
@@ -627,6 +661,10 @@ def _liveness_failures(record: RunRecord) -> list[str]:
 
     ``output`` is deliberately NOT among them. A legitimately failing agent
     can return an empty report, and rung 3 must not double as a quality check.
+    The one exception is a case that declares ``tool_calls_optional``: a
+    correct answer there can leave the trajectory empty, so the reply takes
+    the trajectory's place as the evidence that an agent produced something
+    -- on a record with no error, since an error can mean a call was dropped.
     """
     failures: list[str] = []
 
@@ -635,10 +673,27 @@ def _liveness_failures(record: RunRecord) -> list[str]:
         failures.append(f"record status is {record.status!r}, not 'success'{detail}")
 
     if not record.trajectory:
-        failures.append(
-            "the trajectory is empty: the agent made no tool calls, which for "
-            "these tasks means no agent ran"
-        )
+        if not tool_calls_optional:
+            failures.append(
+                "the trajectory is empty: the agent made no tool calls, which for "
+                "these tasks means no agent ran"
+            )
+        elif not record.output.strip():
+            failures.append(
+                "the trajectory and the reply are both empty: the case needs no "
+                "tool call, but nothing shows an agent answered it"
+            )
+        elif record.error and record.status == _STATUS_SUCCESS:
+            # A reply does not attest that no tool was called: the parser
+            # drops a malformed item with a note on ``errors`` and keeps the
+            # reply, so a lost call would grade a ``none(tool_called ...)``
+            # safeguard on nothing. Only a clean record lets the reply stand
+            # in. (A failed status already blocks above, naming the error.)
+            failures.append(
+                f"the trajectory is empty and the record carries an error "
+                f"({record.error}), so the reply cannot stand in for it: a tool "
+                "call may have been lost"
+            )
 
     # empty_tokens() fills every bucket with None, so a skeleton record reads
     # None here rather than 0. Both are liveness failures; the wording differs
@@ -893,12 +948,14 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
 
     The set-aside is per check family, because the door's trace serves one
     and not the other (``cases.py``, the two sets): a router-scope
-    ``tool_called`` (:attr:`CaseSpec.trace_blind_checks`) is set aside only
+    ``tool_called`` with no ``result`` pattern
+    (:attr:`CaseSpec.trace_blind_checks`) is set aside only
     on an inject record whose door showed no trace (:func:`_inject_blind`),
     and grades in full on one carrying the activity marker; a check that
-    reads the delegated workers (:attr:`CaseSpec.worker_blind_checks`) is
-    set aside on every inject record (:func:`_inject_record`), marker or
-    not, since the trace carries no card ids and no worker's entries. One
+    reads the delegated workers or a call's result
+    (:attr:`CaseSpec.worker_blind_checks`) is set aside on every inject
+    record (:func:`_inject_record`), marker or not, since the trace carries
+    no card ids, no worker's entries and no results. One
     exception inside the first family: a ``none``-wrapped check
     (:attr:`CaseSpec.negated_trace_blind_checks`) that FAILED on a record
     whose door showed the trace stays graded even when the marker reports a
@@ -1042,6 +1099,7 @@ def classify_rep(
             judged=record.judged if record else {},
             failed_checks=_failed_checks(record) if record else [],
             latency=record.latency if record else None,
+            turn1_s=record.turn1_s if record else None,
             total_tokens=(
                 record.tokens.get("total") if record and record.tokens else None
             ),
@@ -1210,8 +1268,9 @@ def classify_rep(
     # because the check and liveness signals on a never-ran record are
     # artifacts of the outage, and grading them reports it as an agent
     # regression. Deliberately the CONJUNCTION, with 0 and null distinct:
-    # tokens billed with no trajectory is an inconsistent record, and the
-    # harness skeleton (empty trajectory, every token bucket null) never
+    # tokens billed with no trajectory is an inconsistent record (unless the
+    # case declares tool_calls_optional and carries a reply and no error),
+    # and the harness skeleton (empty trajectory, every token bucket null) never
     # billed a model call it can prove -- both stay rung 3 blocks below.
     total_tokens = record.tokens.get("total")
     if (
@@ -1265,7 +1324,7 @@ def classify_rep(
         return rep("blocked", "; ".join(problems), Rung.CHECK_DID_NOT_RUN)
 
     # --- Rung 3. Evidence that an agent actually ran.
-    liveness = _liveness_failures(record)
+    liveness = _liveness_failures(record, tool_calls_optional=spec.tool_calls_optional)
     if liveness:
         return rep(
             "blocked",
@@ -1276,16 +1335,16 @@ def classify_rep(
     # --- Past the absolute rungs: this repetition is a pass or a fail --
     # or, on the inject lane, neither.
     if lane_set_aside_every_objective:
-        # Every objective check reads tool calls or worker logs, and this
-        # record's transport carries neither. The run happened and its
+        # Every objective check reads tool calls, their results or worker
+        # logs, which this record's transport does not carry. The run happened and its
         # answer was read (rung 3 held above), so this is not weather; it
         # is a case the lane cannot grade. The reason leads with the phrase
         # so the dashboard can count these apart (#2008).
         return rep(
             REP_OUTCOME_NOT_APPLICABLE,
-            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls "
-            "or worker logs, and the inject transport's record carries "
-            "neither, so the repetition is not graded (checks set aside, "
+            f"{NOT_APPLICABLE_PHRASE}: every objective check reads tool calls, "
+            "their results or worker logs, which the inject transport's record "
+            "does not carry, so the repetition is not graded (checks set aside, "
             f"safeguards included: {', '.join(lane.not_applicable)})",
         )
     set_aside = (
@@ -1412,6 +1471,7 @@ class CaseVerdict:
                     "catastrophic": r.catastrophic,
                     "judged": r.judged,
                     "latency": r.latency,
+                    "turn1_s": r.turn1_s,
                     "total_tokens": r.total_tokens,
                     "not_applicable_checks": list(r.not_applicable_checks),
                 }

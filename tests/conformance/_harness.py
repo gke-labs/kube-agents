@@ -57,6 +57,8 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # invisible precondition that turns into a skipped test later.
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
+import mcp_policy  # noqa: E402
+import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
@@ -110,6 +112,12 @@ SOURCES: dict[str, Source] = {
         "agents/platform/skills/fleet-audit/scripts/audit_report.py",
         ("def _ident(", "def _cell(", "def trim_command(", "def trim_excerpt("),
     ),
+    # B2 imports this module and drives `enqueue_action` over the label space,
+    # and greps it for the one allowed auto-merge call.
+    "merge_gate": Source(
+        "scripts/merge_gate.py",
+        ("def enqueue_action(", "enablePullRequestAutoMerge", "HOLD_LABELS"),
+    ),
     "credential_proxy": Source(
         "agents/platform/scripts/credential_proxy.py",
         (
@@ -123,6 +131,24 @@ SOURCES: dict[str, Source] = {
             "SLACK_REMOVE_ALLOWLIST",
             "SLACK_METHOD_SHAPE",
         ),
+    ),
+    # B1 imports this module: the per-tool allowlist the broker applies to
+    # every remote MCP call.
+    "mcp_policy": Source(
+        "agents/platform/scripts/mcp_policy.py",
+        ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
+    ),
+    # C1 imports this module: what the broker relays for the gateway's
+    # watchers under the watcher role.
+    "watcher_policy": Source(
+        "agents/platform/scripts/watcher_policy.py",
+        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX", "def project_cluster("),
+    ),
+    # C1 holds the operator's copy of the drift detector's default
+    # subscription to the detector's own.
+    "drift_detector_main_go": Source(
+        "k8s-operator/cmd/drift-detector/main.go",
+        ("defaultSubscriptionName =",),
     ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
@@ -162,7 +188,8 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews"),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
+         "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
@@ -280,24 +307,12 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
-    # D1's identity-table check reads the two Roles the next stack mints that
-    # no golden renders (every golden is `mode: today`): the gateway's and the
-    # callout's. Anchored on the rule each one grants, so the extractor that
-    # reads them cannot return an empty body and pass.
-    "a2a_gateway_role": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-        ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
-    ),
     # The operator-rendered Hermes bridge: built from the agent container, so
     # what it drops from that copy is the whole of what keeps it a separate
     # principal from the agent beside it.
     "a2a_bridge_render": Source(
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
         ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
-    ),
-    "a2a_callout_role": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
-        ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),
     ),
     # The A2A door is the inject door's sibling for an agent caller, gated and
     # resolved the same way; A3 reads the same two seams for it.
@@ -347,6 +362,10 @@ SOURCES: dict[str, Source] = {
     "operator_labels": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
+    ),
+    "operator_metrics_peer": Source(
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("operatorPodNameLabel", "operatorPodNameValue"),
     ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
@@ -596,17 +615,20 @@ SOURCES: dict[str, Source] = {
     # its overlay, and the Cluster Agent's template is copied as it is; the
     # Dockerfile anchors pin that model of the build, so the test cannot keep
     # asserting against a merge the image no longer does.
+    # The same three files are where B1 reads that every remote MCP server
+    # goes through the credential proxy's relay, so the anchor is the relay's
+    # variable rather than a Google URL.
     "shared_defaults_config": Source(
         "deploy/shared/defaults/config.yaml",
-        ("mcp_servers:", "container.googleapis.com/mcp"),
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
     "platform_config": Source(
         "agents/platform/config.yaml",
-        ("mcp_servers:", "container.googleapis.com/mcp"),
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
     "cluster_config": Source(
         "agents/cluster/config.yaml",
-        ("mcp_servers:", "container.googleapis.com/mcp"),
+        ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
     ),
     "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
     "dockerfile_profile_configs": Source(

@@ -13,7 +13,8 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013, #2016) -- and the nightly file holds the
+the documented exception: #2013; #2016's seat took its roster line 2026-10-14) and the
+cases demoted since (DEMOTED_AFTER_THE_SPLIT) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
 whatever landed there since (ADDED_AFTER_THE_SPLIT, ADDED_AFTER_THE_MOVED_BLOCK),
@@ -86,7 +87,7 @@ NIGHTLY_AT_SPLIT = [
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
     "chat-routing-board-read",
-    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); its held-out presubmit seat opened 2026-09-28 (HELD_OUT_IN_PRESUBMIT)
+    "pdb-remediation-pr",  # its 2026-09-22 promotion was withdrawn (the record predated its #1780 grader); seated held out 2026-09-28, promoted 2026-10-14 (#2016), demoted 2026-10-17 (#3120)
 ]
 # The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here had no
@@ -163,21 +164,50 @@ ADDED_AFTER_THE_MOVE = [
     "chat-voice-failure-leads-with-fact",  # the front door's reply to a blocked card
     "upgrades-zonal-control-plane-outage-warned",  # upgrade-failure catalogue entry 11, the first scenario case
     "oobe-first-run-audits",  # the oobe job's first-run audits stage
+    "chat-voice-answer-first",  # a delegated answer opens on its verdict
     "observability-watcher-scrape-state",  # the event watcher's scrape state, #2141
     "platform-security-secrets-encryption-currentstate-probe",  # the gke-basics/security skills sync
     "chat-fanout-fleet-restarts-rows",  # a fleet question fanned out one titled card per cluster
     "backup-dr-cmek-selected-namespaces-probe",  # the gke-backup-dr skill sync
     "findings-decision-covers-item",  # the findings queue's item-wide decision
+    "upgrades-fleet-readiness-failclosed-webhook",  # the readiness report's fail-closed webhook source
     "upgrades-freeze-runbook-probe",  # the gke-upgrades skill sync
+    "fleet-audit-clean-close-reads-clean",  # the clean close's banner, with close_ledger_reads_clean
     "session-crashloop-question-loads-a-skill",  # the session persona's skills, #2858
     "fleet-audit-unchanged-finding-keeps-wording",  # finish keeps the wording of an unchanged finding
     "upgrades-audit-reports-upgrade-blocked",  # the weekly upgrade audit's check 3.11, graded in the ledger
+    "scale-request-proposes-pr",  # the mirrored gke-* skills' pull request path, #2937
+    "session-cluster-question-wake-answers-once",  # a session's delegated question ends in a wake's answer
+    "gitops-drift-noise-filtered-triage",  # the drift detector's principal classifier, #2739's fixture
+    "chat-question-asked-to-choose-pauses",  # an asked-for choice pauses the card on a needs_input question
+    "manage-cluster-exclusion-installer-route-probe",  # the exclusion route on an installer-made install
+    "upgrades-readiness-zonal-control-plane",  # catalogue entry 11 through the readiness report's per-entry rules
+    "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
+    "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
+    "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
+    "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
+    "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
+    "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
+    "cost-chat-request-runs-collector",  # a plain cost request runs the waste collector, #2386
+    "reliability-chat-request-runs-collector",  # a plain workload-reliability request runs the obtainability collector, #2386
+    "stockout-chat-request-runs-collector",  # a plain stockout-risk request runs the stockout collector, #2386
+    "upgrade-chat-request-runs-collector",  # a plain upgrade-readiness request runs the patch collector, #2386
+    "drift-chat-request-runs-collector",  # a plain peer-consistency request runs the drift collector, #2386
+    "ai-security-chat-request-runs-collector",  # a plain AI-security request runs the AI security collector, #2386
+    "provisioning-cluster-request-never-creates",  # a cluster request ends in a PR or a stop, #2937
+    "provisioning-kcc-cluster-without-crds-stops",  # the KCC skill's no-CRDs stop, #2937
+    "cluster-agent-security-audit-script",  # a Cluster Agent runs its audit script from the path its skill names, #3402
+    "cluster-setting-request-proposes-pr",  # the gke-platform-security skill's pull request path, #2937
+    "fanout-absent-cluster-cards-complete",  # a fleet search's per-cluster cards complete, #2978
+    "chat-failure-reply-declares-next-step",  # a blocked card's reply declares the one next step, mock 06
+    "chat-answer-declares-next-step",  # a card's answer declares its one obvious next step, mock 07
+    "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
+    "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
+    "helm-chart-no-reconciler-stops",  # gitops-helm-chart stops where nothing renders charts, #2938
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
-PARKED_AFTER_THE_MOVE = [
-    "oobe-first-run-audits",  # 2026-10-09: truncated the main nightly, graded blocked
-]
+PARKED_AFTER_THE_MOVE: list[str] = []
 
 # Admitted after the split, each by a pull request that cited the record
 # (docs/eval-gate-roster.md, "Admitted on the record since the split"), as
@@ -188,6 +218,8 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
     # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
+    # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
+    ("pdb-remediation-pr", "obtainability-remediation-proposal"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -195,6 +227,7 @@ ADMITTED_AFTER_THE_SPLIT = [
 # it), since the nightly runs both files and lists no case twice.
 PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
+    ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
@@ -225,8 +258,18 @@ HELD_OUT_TO_NIGHTLY = [
 # less exactly this list.
 HELD_OUT_IN_PRESUBMIT = [
     ("compliance-rbac-overgrant", "agent-kanban-smoke"),  # #2013 step 2, seated 2026-09-29; the roster line is step 4
-    ("pdb-remediation-pr", "compliance-rbac-overgrant"),  # #2016 step 2, seat opened 2026-09-28; the roster line is step 4
 ]
+
+
+# Demoted after the split under docs/eval-gate-roster.md "Demoting a flaky
+# case": the line leaves blocking-roster.txt and presubmit-cases.txt and lands
+# in the nightly file with its issue above it, as (case, the nightly line it
+# follows). Restoring a case deletes its entry here.
+DEMOTED_AFTER_THE_SPLIT = [
+    ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
+    ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+]
+DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 
 
 def with_insertions(base, insertions):
@@ -285,7 +328,10 @@ class ParserTest(unittest.TestCase):
 
 class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
-        expected = [c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT) if c not in HELD_OUT_TO_NIGHTLY]
+        expected = [
+            c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
+            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+        ]
         self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
 
     def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
@@ -316,7 +362,10 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertIn(case, eval_rosters.nightly_cases())
 
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
-        self.assertEqual(eval_rosters.blocking_roster(), with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT))
+        self.assertEqual(
+            eval_rosters.blocking_roster(),
+            [c for c in with_insertions(ROSTER_AT_SPLIT, ADMITTED_AFTER_THE_SPLIT) if c not in DEMOTED],
+        )
 
     def test_the_nightly_file_is_the_nightly_array_plus_the_moved_cases_less_the_promoted_plus_the_held_out(self):
         promoted = {case for case, _ in PROMOTED_AFTER_THE_SPLIT}
@@ -328,15 +377,27 @@ class SplitLostNothingTest(unittest.TestCase):
         ]
         self.assertEqual(
             eval_rosters.nightly_cases(),
-            [
-                c
-                for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                if c not in seated and c not in PARKED_AFTER_THE_MOVE
-            ],
+            with_insertions(
+                [
+                    c
+                    for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
+                    if c not in seated and c not in PARKED_AFTER_THE_MOVE
+                ],
+                DEMOTED_AFTER_THE_SPLIT,
+            ),
         )
+
+    def test_a_demoted_case_is_in_the_nightly_only(self):
+        for case in DEMOTED:
+            with self.subTest(case=case):
+                self.assertIn(case, eval_rosters.nightly_cases())
+                self.assertNotIn(case, eval_rosters.presubmit_cases())
+                self.assertNotIn(case, eval_rosters.blocking_roster())
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
         for case, _ in PROMOTED_AFTER_THE_SPLIT:
+            if case in DEMOTED:
+                continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
                 self.assertIn(case, eval_rosters.presubmit_cases())
                 self.assertIn(case, eval_rosters.blocking_roster())
@@ -373,12 +434,21 @@ INJECT_LANE_EXCLUDED = [
     "chat-routing-fleet-question",  # the same as the ack: the answer is the specialist's, which the door's thread never gets
     "first-install-hello-running",  # #2039: grades the chat profile's onboarding greeting; excluded under cli, not yet graded on api
     "first-install-hello-done",  # the same once the first-look scan has finished
+    "chat-voice-answer-first",  # #2039: grades the card result the front door delivers; the inject door files no card
     "chat-fanout-fleet-restarts-rows",  # #2039: grades the front door's ack and the fan-out under its one card; same door
+    "chat-question-asked-to-choose-pauses",  # #2039: grades the worker's needs_input block under the door's one card; same door
+    "chat-failure-reply-declares-next-step",  # #2039: grades the front door's reply to a blocked card's wake; a card-wake replay
+    "chat-answer-declares-next-step",  # #2039: grades the worker's answer under the door's one card; same door
+    "chat-answer-tangent-offer-declares-no-step",  # the same
 ]
 # The directives a case's prompt opens with to replay a wake into the chat
 # front door (bench/kube_agents_bench/card_wake.py); the harness errors such
 # a run on any transport but api.
 FRONT_DOOR_WAKE_DIRECTIVES = ("[bench:card-failure-wake]", "[bench:slack-question-wake]")
+# Check types that read what only the chat front door's card round trip
+# delivers; on the inject lane there is no card, so the check fails rather
+# than being set aside (bench/README.md, the transport table).
+FRONT_DOOR_DELIVERY_CHECK_TYPES = frozenset({"answer_first"})
 # Each exclusion's api-lane tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
@@ -395,8 +465,81 @@ INJECT_LANE_EXCLUDED_TIER = {
     "chat-routing-fleet-question": "nightly",
     "first-install-hello-running": "nightly",
     "first-install-hello-done": "nightly",
+    "chat-voice-answer-first": "nightly",
     "chat-fanout-fleet-restarts-rows": "nightly",
+    "chat-question-asked-to-choose-pauses": "nightly",
+    "chat-failure-reply-declares-next-step": "nightly",
+    "chat-answer-declares-next-step": "nightly",
+    "chat-answer-tangent-offer-declares-no-step": "nightly",
 }
+
+
+def positive_check_types(node, negations: int = 0) -> set:
+    """The check types a task REQUIRES to pass: every `type:` under an even
+    number of negating `type: none` compounds (parity, as the bench's
+    `_negates_every_leaf` reads them) and under no `any` compound, where a
+    leaf is one alternative and not required. The other compounds
+    (`sequence`, `parallel`, `all`) are conjunctive and transparent."""
+    if isinstance(node, dict):
+        if node.get("type") == "any":
+            return set()
+        if node.get("type") == "none":
+            found = set()
+            for value in node.values():
+                found |= positive_check_types(value, negations + 1)
+            return found
+        found = {node["type"]} if isinstance(node.get("type"), str) and negations % 2 == 0 else set()
+        for value in node.values():
+            found |= positive_check_types(value, negations)
+        return found
+    if isinstance(node, list):
+        found = set()
+        for item in node:
+            found |= positive_check_types(item, negations)
+        return found
+    return set()
+
+
+class GitLabLaneTest(unittest.TestCase):
+    """hack/eval/gitlab-cases.txt: what the GitLab lane's presubmit
+    runs (kube-agents#2394). Registered cases only, every entry a case that
+    grades the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.gitlab_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered(self):
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.gitlab_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+
+    def test_every_lane_case_grades_the_forge(self):
+        import yaml
+
+        for case in eval_rosters.gitlab_cases():
+            with self.subTest(case=case):
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge; a chat probe proves nothing about GitLab")
+
+    def test_a_negated_forge_check_does_not_count(self):
+        # "The agent did not open a merge request" proves nothing on GitLab.
+        negated = {"verification_spec": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}
+        self.assertFalse(positive_check_types(negated) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "pull_request_opened"}]}) & self.FORGE_CHECKS)
+        # A none under a none undoes it, as the bench reads it (bench/tests/test_cases.py, doubly-negated).
+        double = {"verification_spec": [{"type": "none", "checks": [{"type": "none", "checks": [{"type": "pull_request_opened"}]}]}]}
+        self.assertTrue(positive_check_types(double) & self.FORGE_CHECKS)
+        # Under `any` the forge check is one alternative, not a requirement: a chat answer could pass the case instead.
+        either = {"verification_spec": [{"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}]}
+        self.assertFalse(positive_check_types(either) & self.FORGE_CHECKS)
+        self.assertTrue(positive_check_types({"verification_spec": [{"type": "all", "checks": [{"type": "ledger_issue_contains"}]}]}) & self.FORGE_CHECKS)
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GITLAB_CASES_FILE.read_text(encoding="utf-8")), [])
 
 
 class InjectLaneExclusionsTest(unittest.TestCase):
@@ -460,6 +603,28 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} replays a wake but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
 
+    def test_every_registered_front_door_delivery_case_is_excluded(self):
+        # answer_first fails on the inject lane rather than being set aside,
+        # so an unlisted case carrying one reds there every repetition.
+        import yaml
+
+        def check_types(node):
+            if isinstance(node, dict):
+                if isinstance(node.get("type"), str):
+                    yield node["type"]
+                for value in node.values():
+                    yield from check_types(value)
+            elif isinstance(node, list):
+                for value in node:
+                    yield from check_types(value)
+
+        excluded = eval_rosters.inject_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if FRONT_DOOR_DELIVERY_CHECK_TYPES & set(check_types(doc.get("verification_spec"))):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} reads a delivered card result but is not in {eval_rosters.INJECT_LANE_EXCLUSIONS_FILE.name}")
+
     def test_an_exclusion_is_not_a_demotion(self):
         # The api lane's roster is untouched by an entry here: an excluded
         # presubmit case still runs on every pull request and can still red
@@ -488,6 +653,10 @@ INJECT_LANE_SAFEGUARDS = [
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
     "cluster-agent-crashloop-fix-request",
+    # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
+    # may propose the change as a pull request; its objective's
+    # pull_request_opened leaf allows one.
+    "cluster-setting-request-proposes-pr",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the
@@ -499,6 +668,10 @@ INJECT_LANE_REQUESTING = [
     "obtainability-refusal-direct-mutation",
     "pdb-remediation-pr",
     "rca-remediation-pr",
+    # scale-request-proposes-pr: asked to scale a Deployment, it may propose
+    # the change as a pull request; its objective's pull_request_opened leaf
+    # allows one.
+    "scale-request-proposes-pr",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
     # beside the one its check grades.

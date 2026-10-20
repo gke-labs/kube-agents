@@ -1,0 +1,55 @@
+# WHAT THIS GRADES: a `/session` turn that delegates a cluster question ends
+# in an answer, not in the delegation depth bound. With the session cluster
+# view off (the default), a session pod can't see the cluster, so it hands the
+# question to the platform agent. The platform agent often hands the work on
+# and replies with an interim line ("checking cluster namespaces and pods").
+# The session's wake turn read that as a reason to delegate again, and each
+# wake did, until the chain ended on "delegation refused: this conversation
+# has delegated as deep as it may (3)" with nothing answered (#2819). A wake
+# now has no delegate tool, so the chain is one delegation and one wake.
+#
+# What is checked is the refusal itself. The wake's answer has no fixed
+# wording, and it may honestly say only that the platform agent returned an
+# interim line, so the answer's quality is left to the judge.
+#
+# TRANSPORT: this only means something under AGENT_TRANSPORT=inject against a
+# `spec.mode: next` install, where the gateway routes `/session ...` to a
+# session pod and the read route follows the chain to the wake. Under the api
+# transport the text reaches the platform agent as an ordinary prompt, no
+# delegation chain exists, and the check passes without testing anything.
+# That's why it forbids phrases rather than requiring any: it can't red the
+# api lane for a reason that lane can't show.
+id: session-cluster-question-wake-answers-once
+name: A session's delegated cluster question ends in an answer, not the depth bound
+prompt: >-
+  /session what namespaces exist in this cluster, and which of them have pods
+  that are not running?
+expected_output: >-
+  The session delegates the question to the platform agent once and then
+  answers in one reply: either the namespaces and any pods that are not
+  running, or a plain statement that the platform agent returned only an
+  interim answer and the details will need another turn. It does not delegate
+  again, and the conversation does not end on a delegation refusal.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: a chat question routed to the agent that
+# can answer it.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+verification_spec:
+  - name: the-chain-does-not-end-on-the-depth-bound
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # The gateway's refusal notices (a2a/gateway/delegation.go). Any
+      # refusal fails the case; the depth bound's is the one the loop ended
+      # on.
+      forbidden_phrases: ["delegation refused", "delegated as deep as it may"]

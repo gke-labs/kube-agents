@@ -195,6 +195,27 @@ func (s *sideDoorAdapter) Edit(conversation, messageID, text string) error {
 	return s.primary.Edit(conversation, messageID, text)
 }
 
+// PostMessage and EditMessage route like Post and Edit.
+func (s *sideDoorAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if door := s.doorFor(conversation); door != nil {
+		return door.PostMessage(conversation, m)
+	}
+	if s.primary == nil {
+		return "", fmt.Errorf("no ingress owns conversation %q", conversation)
+	}
+	return s.primary.PostMessage(conversation, m)
+}
+
+func (s *sideDoorAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
+	if door := s.doorFor(conversation); door != nil {
+		return door.EditMessage(conversation, messageID, m)
+	}
+	if s.primary == nil {
+		return fmt.Errorf("no ingress owns conversation %q", conversation)
+	}
+	return s.primary.EditMessage(conversation, messageID, m)
+}
+
 func (s *sideDoorAdapter) Roster(conversation string) ([]string, bool, error) {
 	if door := s.doorFor(conversation); door != nil {
 		return door.Roster(conversation)
@@ -203,6 +224,58 @@ func (s *sideDoorAdapter) Roster(conversation string) ([]string, bool, error) {
 		return nil, false, fmt.Errorf("no ingress owns conversation %q", conversation)
 	}
 	return s.primary.Roster(conversation)
+}
+
+// React and RemoveReaction route on the conversation's key like the posts.
+func (s *sideDoorAdapter) React(conversation, messageID, token string) error {
+	if door := s.doorFor(conversation); door != nil {
+		return door.React(conversation, messageID, token)
+	}
+	if s.primary == nil {
+		return fmt.Errorf("no ingress owns conversation %q", conversation)
+	}
+	return s.primary.React(conversation, messageID, token)
+}
+
+func (s *sideDoorAdapter) RemoveReaction(conversation, messageID, token string) error {
+	if door := s.doorFor(conversation); door != nil {
+		return door.RemoveReaction(conversation, messageID, token)
+	}
+	if s.primary == nil {
+		return fmt.Errorf("no ingress owns conversation %q", conversation)
+	}
+	return s.primary.RemoveReaction(conversation, messageID, token)
+}
+
+// MarkChanged and InboundVerified reach the primary for its own
+// conversations when it implements them; a door draws no mark and acts on no
+// verified message, so its conversations are told nothing.
+func (s *sideDoorAdapter) MarkChanged(conversation, ask, settle string) {
+	if s.doorFor(conversation) != nil {
+		return
+	}
+	if observer, ok := s.primary.(MarkObserver); ok {
+		observer.MarkChanged(conversation, ask, settle)
+	}
+}
+
+// ShowsTaskStatus answers for the primary's own conversations; a door keeps
+// its rolling line, which its caller reads.
+func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
+	if s.doorFor(conversation) != nil {
+		return false
+	}
+	shower, ok := s.primary.(StatusShower)
+	return ok && shower.ShowsTaskStatus(conversation)
+}
+
+func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verified bool) {
+	if s.doorFor(conversation) != nil {
+		return
+	}
+	if observer, ok := s.primary.(VerifiedObserver); ok {
+		observer.InboundVerified(conversation, messageID, verified)
+	}
 }
 
 // OpenDirect goes to the real backend, because a user id is not qualified the
@@ -295,6 +368,15 @@ func (s *sideDoorAdapter) TurnFinished(conversation string) {
 func (s *sideDoorAdapter) SetProbe(probe ConversationProbe) {
 	for _, d := range s.doors {
 		d.Door.SetProbe(probe)
+	}
+}
+
+// SetHome hands the Home tab's admission rule and board reader to the
+// primary, the half with a home view; implemented unconditionally for the
+// same reason as SetProbe.
+func (s *sideDoorAdapter) SetHome(admits HomeAdmits, board BoardReader) {
+	if sink, ok := s.primary.(HomeSink); ok {
+		sink.SetHome(admits, board)
 	}
 }
 

@@ -305,6 +305,9 @@ class PortalApiClient:
                     else None
                 ),
                 previous_error=str(row.get("previous_error", "")),
+                block_kind=str(row.get("block_kind") or ""),
+                gave_up=bool(row.get("gave_up")),
+                has_pr=bool(row.get("has_pr")),
             )
             for row in payload.get("tasks", [])
         )

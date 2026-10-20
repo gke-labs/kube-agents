@@ -94,9 +94,9 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Twenty-two fixtures: nineteen across the four cluster slots and three project-scoped. Most in-cluster
-fixtures are on slot `a`, across the nine seeded namespaces `seeded-debug`,
-`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom` and `seeded-stall`, plus both
+Thirty-three fixtures: thirty across the four cluster slots and three project-scoped. Most in-cluster
+fixtures are on slot `a`, across the eleven seeded namespaces `seeded-debug`,
+`seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
 configuration outlier. Slot `b` is the held-back control plane, and also carries the
 upgrade-readiness drain defects, which belong with the cluster whose subject is upgrading. Slot
@@ -133,6 +133,17 @@ its roles are never published.
 | `zonal-skew-scheduling`         | d       | 0   | `deployment/zone-pinned-api` in `seeded-topology`, two replicas, `ScheduleAnyway` zonal spread plus a required single-zone nodeAffinity                                                                                           |
 | `zonal-skew-volume`             | d       | 0   | `statefulset/zone-bound-store` in `seeded-topology`, two replicas on `seeded-zonal-pd`, a class pinned to the first zone                                                                                                          |
 | `zonal-skew-capacity`           | d       | 0   | `deployment/capacity-starved-worker` in `seeded-topology`, four replicas at 500m against an e2-small the sponge keeps full and an e2-standard-2 that fits one to three, so some stay Pending                                      |
+| `node-local-state`              | a       | 0   | `deployment/cache-on-emptydir` in `seeded-shapes`, one replica whose queue directory is an `emptyDir`                                                                                                                             |
+| `deprecated-label-selector`     | a       | 0   | `deployment/arch-pinned-worker` in `seeded-shapes`, a `nodeSelector` on `beta.kubernetes.io/arch`                                                                                                                                 |
+| `containerd-socket-agent`       | a       | 0   | `daemonset/node-runtime-probe` in `seeded-shapes`, the containerd socket mounted read-only from the host                                                                                                                          |
+| `intree-pd-volume`              | a       | 0   | `persistentvolume/intree-pd` on the in-tree `gcePersistentDisk` plugin, bound by `persistentvolumeclaim/intree-pd` and mounted by `deployment/intree-pd-reader` in `seeded-shapes`                                                |
+| `retired-registry-image`        | a       | 0   | `deployment/legacy-registry-pull` in `seeded-shapes`, `k8s.gcr.io/pause:3.9` pulled with `imagePullPolicy: Always`                                                                                                                |
+| `moving-admission-default`      | a       | 0   | `namespace/seeded-defaults` pinned to Pod Security `baseline` at version `latest`, with `deployment/baseline-edge-worker` admitted by today's rule set                                                                            |
+| `stale-client-skew`             | a       | 0   | `cronjob/stale-kubectl-client` in `seeded-shapes`, `kubectl` v1.29.0 against the control plane every ten minutes                                                                                                                  |
+| `cgroup-blind-runtime`          | a       | 0   | `deployment/cgroup-blind-jvm` in `seeded-shapes`, the eclipse-temurin 8u302 image under a 192Mi limit, a sleep as the process                                                                                                     |
+| `multi-process-container`       | a       | 0   | `deployment/multi-process-worker` in `seeded-shapes`, two forked workers under one 32Mi limit                                                                                                                                     |
+| `node-image-coupled-agent`      | a       | 0   | `daemonset/cni-shaped-agent` in `seeded-shapes`, host networking plus `/etc/cni/net.d` mounted read-only                                                                                                                          |
+| `cuda-pinned-gpu-job`           | a       | 0   | `cronjob/cuda-pinned-trainer` in `seeded-shapes`, suspended, one `nvidia.com/gpu` on an `nvidia-l4` selector with a CUDA 12.2 image                                                                                               |
 
 The `inference-server` HPA under `hpa-saturated` does not compute a stable desired
 replica count. Read on 2026-08-24, `status.desiredReplicas` on `seeded-a` was 3 in
@@ -154,7 +165,7 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the sixteen roles are called one
+`seeded-role=no-surge` on the no-surge pool's — so three of the thirty roles are called one
 thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -249,11 +260,15 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Seventeen of the nineteen are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+Twenty-eight of the thirty are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
-`readiness-*` roles on slot `b` and the three `zonal-skew-*` roles on slot `d`, covering
+`readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
+upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
+`containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
+`stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
+`cuda-pinned-gpu-job`), covering
 security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
-API deprecation and zonal skew between them. A corpus that leans on these can go green the day the fleet
+API deprecation, zonal skew and the upgrade-failure shapes between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail
 exists before the apply returns.
 
@@ -305,16 +320,20 @@ documented background ones, and nothing else — that is what lets a case assert
 finding set rather than a substring. One fixture used to break it, and the upgrade SOP's
 rule now keeps it intact.
 
-The pin in `bench/tf/fleet/main.tf` is drawn from the location-wide `valid_master_versions`
-rather than REGULAR's own list, so `seeded-b` can sit on a version absent from REGULAR's
-`validVersions` — for example `1.34.10-gke.1106000`, on RAPID's roster as measured 2026-09-23. The check once read
+The pin in `bench/tf/fleet/main.tf` is drawn from REGULAR's own `validVersions` by
+`seeded_b_pin.py`, so in steady state `seeded-b` sits on a version its channel carries. It
+can still sit on one absent from REGULAR's roster: a patch REGULAR dropped between reconciles,
+or the hold the pin keeps while the running patch is one REGULAR does not carry (on 2026-10-14,
+`1.34.12-gke.1011000` from RAPID's roster; the pin used to be drawn from the location-wide
+`valid_master_versions`, which is how it got there). The check once read
 that absence as branch (a) of upgrade SOP check 3.1 and graded the cluster critical. Branch
 (a) now fires only when a version is offered by no route at the location: not by the
 cluster's channel, not by any other channel, and not by `validMasterVersions`. The pin stays
 offered for as long as `validMasterVersions` or any channel's roster carries it, so branch
-(a) does not fire and `seeded-b` carries the intended branch (b) at major. If GKE drops the
-pinned version from all of them before the next reconcile re-draws it, branch (a) fires, and
-correctly.
+(a) does not fire and `seeded-b` carries the intended branch (b) at major. A held pin is not
+re-drawn: each reconcile returns the running version until REGULAR ships a patch above it, so
+if every roster drops that version meanwhile, branch (a) fires on every project, and correctly,
+until REGULAR catches up or the cluster is destroyed and re-created.
 
 A case touching `version-laggard` may assert that branch (a) is absent, and
 `upgrades-master-behind-offered-elsewhere` does: slot `b` graded critical is the defect it

@@ -320,7 +320,7 @@ jobs:
 
       - name: Upload the rollback leg's logs and diagnostics
         if: always() && steps.rollback.outputs.diagnostics_dir != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: promotion-rollback-leg
           path: ${{ steps.rollback.outputs.diagnostics_dir }}
@@ -608,12 +608,12 @@ jobs:
 
   step-7-teardown-env:
     name: Step 7 - Tear Down Nightly Environment
-    # A failure in resolve, deploy or the matrix leaves the environment standing
-    # to be examined live: the `if:` below names those results explicitly, in
-    # place of the implicit success() on `needs`, so that one job can be listed
-    # for ordering without its result deciding anything. An `always()` here
-    # would drop the gate and start destroying the environments this exists to
-    # preserve.
+    # A failure in resolve or the matrix leaves the environment standing to be
+    # examined live: the `if:` below names those results explicitly, in place
+    # of the implicit success() on `needs`, so that one job can be listed for
+    # ordering without its result deciding anything. An `always()` here would
+    # drop the gate and start destroying the environments this exists to
+    # preserve. A failed deploy is the exception, below.
     #
     # Steps 4 to 6 are deliberately absent from the list, and step 5 makes that
     # load-bearing rather than merely tidy. Waiting on the eval would hold a GKE
@@ -628,8 +628,8 @@ jobs:
     # `step-3b-rollback-leg` is in the list for ordering alone: it holds the
     # cluster after the matrix, and a red leg gates nothing, so its result is
     # deliberately absent from the condition below. `!cancelled()` replaces the
-    # implicit success() so that absence means "tear down anyway"; the two
-    # results named are the ones whose failure keeps the cluster for diagnosis.
+    # implicit success() so that absence means "tear down anyway"; the matrix
+    # result is the one whose failure keeps the cluster for diagnosis.
     needs:
       [
         step-1-resolve-candidate,
@@ -637,12 +637,23 @@ jobs:
         step-3-run-e2e-matrix,
         step-3b-rollback-leg,
       ]
+    # Two ways in. A green matrix, after which the cluster has served its
+    # purpose; and a deploy that did not succeed on its own, whatever stopped
+    # it (a GKE cluster in ERROR after a regional stockout, a post-apply gate,
+    # or the job's own timeout, which reports `cancelled` while the run is
+    # not), leaving an environment with nothing to examine beyond the deploy
+    # log, costing money and starting the next night dirty. A failed matrix is
+    # deliberately neither: that cluster stays standing to be examined live.
     if: |
       !cancelled() &&
       github.repository == 'gke-labs/kube-agents' &&
       needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true' &&
-      needs.step-2-deploy-env.result == 'success' &&
-      needs.step-3-run-e2e-matrix.result == 'success'
+      (
+        (needs.step-2-deploy-env.result == 'success' &&
+         needs.step-3-run-e2e-matrix.result == 'success') ||
+        needs.step-2-deploy-env.result == 'failure' ||
+        needs.step-2-deploy-env.result == 'cancelled'
+      )
     uses: ./.github/workflows/teardown-environment.yml
     permissions:
       contents: read
