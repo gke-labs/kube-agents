@@ -10,7 +10,8 @@ is the nightly's counterpart of ``gate_issue.py``::
     a case failed every graded repetition on its last STREAK_NIGHTS graded nights
     and its task.yaml does not carry `expected_fail: true`
     and no OPEN issue labelled `nightly-red` already names it,
-    and none was closed after the streak's newest night
+    and none was closed after the streak's newest night, or closed as
+        not planned with no pass since (``still_tracks``)
     -> file one, labelled `nightly-red`, `domain:<slug>` and `needs-triage`,
        assigned per the rule below
 
@@ -500,6 +501,34 @@ def closed_after(issue: dict | None, night: dict) -> bool:
     return bool(closed and ended and closed > ended)
 
 
+# GitHub's state_reason for a close that hands the issue off rather than
+# fixing it: "not planned" (or "duplicate") is what a triager picks when
+# closing in favour of another issue, a `Fixes #N` merge sets "completed".
+HANDED_OFF_REASONS = frozenset({"not_planned", "duplicate"})
+
+
+def still_tracks(issue: dict, newest: dict, good: list[dict]) -> bool:
+    """Whether a closed issue still tracks a streak ending at ``newest``.
+    One closed after that night finished has seen it (``closed_after``). One
+    handed off (HANDED_OFF_REASONS) tracks the problem until a good night --
+    a pass, a clean run, a graded case -- finishes after the close: the
+    problem is the other issue's until it clears, and a new one after that
+    files fresh. A "completed" close that did not fix it files again on the
+    next bad night."""
+    if closed_after(issue, newest):
+        return True
+    if issue.get("state_reason") not in HANDED_OFF_REASONS:
+        return False
+    closed = nightly.parse_iso(issue.get("closed_at"))
+    if not closed:
+        return False
+    for night in good:
+        ended = nightly.parse_iso(night.get("finished")) or nightly.parse_iso(night.get("started"))
+        if ended and ended > closed:
+            return False
+    return True
+
+
 class Filer:
     def __init__(self, gh: ghcli.Gh, repo_root: pathlib.Path = REPO_ROOT):
         self.gh = gh
@@ -544,7 +573,8 @@ class Filer:
             issue = tracking_issue(open_issues, case)
             streak = red_streak(verdicts)
             if streak:
-                closed = tracking_issue([i for i in closed_issues if closed_after(i, streak[-1])], case)
+                passes = [v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED]
+                closed = tracking_issue([i for i in closed_issues if still_tracks(i, streak[-1], passes)], case)
                 if fields is None:
                     result["skipped"].append({"case": case, "why": "no readable task.yaml on this checkout"})
                 elif case not in active:
@@ -594,7 +624,8 @@ class Filer:
                 nights=nightly_infra.JOB_LOST_WINDOW,
                 nights_block="\n".join(INFRA_NIGHT_LINE.format(date=n["date"], how=n["how"], run_url=n["run_url"]) for n in reversed(lost["nights"])),
                 nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
-            self.file_infra(KIND_LOST, job, losses[-1], title, body, lost["nights"], closed_issues, result)
+            clean = [n for n in parts.get(lost["part"], []) if not n["lost"]]
+            self.file_infra(KIND_LOST, job, losses[-1], title, body, lost["nights"], clean, closed_issues, result)
         candidates = sorted(c for c in active if c)
         for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates).items()):
             fields = task_fields(case, self.repo_root)
@@ -623,7 +654,8 @@ class Filer:
                     nights_block="\n".join((INFRA_CASE_LINE if v["transcript_url"] else INFRA_CASE_LINE_NO_TRANSCRIPT).format(
                         date=v["date"], reason=quoted(v["reason"]), run_url=v["run_url"], transcript_url=v["transcript_url"]) for v in reversed(streak)),
                     nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
-                self.file_infra(KIND_INFRA, case, streak[-1], title, body, streak, closed_issues, result)
+                cleared = [v for v in verdicts if v["state"] == nightly_infra.STATE_GRADED]
+                self.file_infra(KIND_INFRA, case, streak[-1], title, body, streak, cleared, closed_issues, result)
 
     def infra_domain_owner(self, domain: str) -> str:
         owner = (self.domains.get(domain) or {}).get("owner")
@@ -648,11 +680,12 @@ class Filer:
         if done is not None:
             result["noted" if done else "failed"].append({"case": key, "issue": issue["number"], "night": night["date"], "run": night["run_url"]})
 
-    def file_infra(self, kind, key, newest, title, body, nights, closed_issues, result) -> None:
-        """File the infra issue for ``key`` unless one closed after
-        ``newest`` already saw this streak. ``body(addressee=...)`` renders
-        it with the assignment line."""
-        closed = tracking_issue([i for i in closed_issues if closed_after(i, newest)], key, kind)
+    def file_infra(self, kind, key, newest, title, body, nights, good, closed_issues, result) -> None:
+        """File the infra issue for ``key`` unless a closed one still tracks
+        this streak (``still_tracks``; ``good`` are the clean or graded
+        nights). ``body(addressee=...)`` renders it with the assignment
+        line."""
+        closed = tracking_issue([i for i in closed_issues if still_tracks(i, newest, good)], key, kind)
         if closed:
             result["tracked"].append({"case": key, "issue": closed["number"], "closed": True})
             return

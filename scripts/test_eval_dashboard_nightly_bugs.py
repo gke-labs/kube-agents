@@ -325,6 +325,21 @@ class DedupeTest(Harness):
         gh, _, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
         self.assertEqual(len(self.filed(gh)), 1)
 
+    def test_a_bug_handed_off_to_an_infra_issue_is_not_filed_again_until_the_case_passes(self):
+        # Closed "not planned" in favour of an infra issue on the 17th; the
+        # 18th is red again: still the other issue's problem, nothing filed.
+        closed = {"number": 3997, "title": "t", "body": nightly_bugs.MARKER.format(case="case-red"), "closed_at": "2026-10-17T12:00:00Z",
+                  "state_reason": "not_planned"}
+        later = data(*(night(d, [red(), green()]) for d in (15, 16, 17, 18)))
+        gh, out, _ = self.run_once(later, FakeGh(closed_issues=[closed]))
+        self.assertEqual(self.filed(gh), [])
+        self.assertIn("tracked: case-red by #3997", out)
+        # A pass after the close clears it; a new streak after that files.
+        cleared = data(*(night(d, [red(), green()]) for d in (15, 16, 17)), night(18, [green("case-red"), green()]),
+                       *(night(d, [red(), green()]) for d in (19, 20, 21)))
+        gh, _, _ = self.run_once(cleared, FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh)), 1)
+
     def test_a_bug_closed_while_the_newest_red_night_ran_is_filed_again(self):
         # Closed at 00:30 on the 17th, between that night's start (00:00:30)
         # and its finish (00:59): the close did not see the night's verdict.
@@ -759,6 +774,21 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(*runs))
         [issue] = self.filed(gh, infra=True)
         self.assertIn(f"/logs/{JOB}/30000000000000170001/artifacts/eval_case-red_rep1.log", issue["body"])
+
+    def test_a_handed_off_infra_issue_tracks_until_the_case_is_graded(self):
+        closed = {"number": 3998, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->",
+                  "closed_at": "2026-10-16T12:00:00Z", "state_reason": "not_planned"}
+        doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16, 17)))
+        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # Closed as completed (fixed), the next kept night files again.
+        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[dict(closed, state_reason="completed")]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
+        # Graded after the close, then kept again: a new problem, filed.
+        doc = data(*(night(d, [infra_task("case-red")]) for d in (14, 15, 16)), night(17, [green("case-red")]),
+                   *(night(d, [infra_task("case-red")]) for d in (18, 19, 20)))
+        gh, _, _ = self.run_once(doc, FakeGh(closed_issues=[closed]))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1)
 
     def test_a_lost_half_is_not_vouched_for_by_a_clean_sibling_job(self):
         # Two jobs of the main part each date: the first runs clean, the

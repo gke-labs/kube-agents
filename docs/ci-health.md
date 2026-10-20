@@ -733,7 +733,10 @@ body, in any letter case, is adopted instead, so a case is filed once and a huma
 `nightly-red` issue for the case closed after the streak's newest night counts
 too: a fix that merged before the next nightly closes its issue while the
 nights on record are still red, so the case is filed again only after a newer
-failing night. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
+failing night. An issue closed as not planned (or a duplicate), the close a
+triager picks when handing an infra failure to the infra issue, keeps
+tracking the case until it passes on a night after the close; a red streak
+after that pass files a new issue. When the issues cannot be listed, nothing is written that tick. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
@@ -768,7 +771,8 @@ rules). Neither changes the domain streak above.
 An infra issue is deduplicated by its own marker alone: a bot issue of one
 kind never stands in for another, and a human's `nightly-red` issue about a
 case is about its code, so it neither replaces the infra issue nor receives its
-comments. A closed one counts as for domain bugs. While it is open, the newest
+comments. A closed one counts as for domain bugs (a not-planned close tracks
+until the part runs clean, or the case is graded, after it). While it is open, the newest
 night, when it is a lost night of the part or a kept night of the case, gets one
 comment whether or not the threshold is met again (a night that is no longer
 the newest when the step next runs live, after a mute for instance, is not
