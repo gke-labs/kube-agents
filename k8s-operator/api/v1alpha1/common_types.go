@@ -1593,7 +1593,9 @@ type ForgeSpec struct {
 	// group or project access token, or a dedicated account's personal access
 	// token where the tier offers neither. It is mounted into the credential
 	// broker's pod only, never the agent's or the sandbox's, and read on every
-	// call, so rotating the token is updating the Secret.
+	// call, so rotating the token is updating the Secret. The Secret may also
+	// hold a read-only token under the key `read-token`; the broker presents it
+	// only to clone the forge's context repositories, never on a write.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 

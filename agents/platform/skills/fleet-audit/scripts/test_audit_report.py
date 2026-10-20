@@ -4427,6 +4427,54 @@ class TestNewMarker(HarnessTestCase):
         second = self.harness.bodies_for("issue-update")[-1]
         self.assertEqual(self.marked(second), [derived_id(fid="b")])
 
+    def finish_opening_a_pull_request(self, render=None):
+        """Run `finish` over a remembered `a` and a new `b` whose fix the sweep opens.
+
+        `render`, when given, stands in for `render_issue_body` during the run only.
+        """
+        self.remember([make_finding(fid="a", title="Alpha finding")])
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        doc = make_doc(
+            findings=[
+                make_finding(fid="a", title="Alpha finding"),
+                make_finding(fid="b", title="Bravo finding"),
+            ]
+        )
+        with mock.patch.object(audit_report, "render_issue_body", render or audit_report.render_issue_body):
+            self.assertEqual(self.run_finish(doc), 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+
+    def test_the_body_relinked_to_an_opened_pull_request_keeps_the_marks(self):
+        # The relink edit is the live body when the relay posts, so the card reads its tags from it.
+        self.finish_opening_a_pull_request()
+        first, relinked = self.harness.bodies_for("issue-update")
+        self.assertEqual(self.marked(first), [derived_id(fid="b")])
+        self.assertEqual(self.marked(relinked), [derived_id(fid="b")])
+
+    def test_the_relink_renders_what_the_first_render_did(self):
+        # Only what the opened pull request changes may differ between the two renders.
+        calls = []
+        real = audit_report.render_issue_body
+
+        def recording(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real(*args, **kwargs)
+
+        self.finish_opening_a_pull_request(render=recording)
+        (first_args, first), (relink_args, relink) = calls
+        self.assertEqual(first_args, relink_args)
+        self.assertEqual(set(first), set(relink))
+        relinked = {"states", "pr_urls", "blocked_by"}
+        self.assertEqual(
+            {key: value for key, value in first.items() if key not in relinked},
+            {key: value for key, value in relink.items() if key not in relinked},
+        )
+
     def test_a_first_run_marks_nothing(self):
         # No ledger to measure against: everything would read as new.
         self.harness.replies = {

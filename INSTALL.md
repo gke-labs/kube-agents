@@ -210,6 +210,12 @@ release as `<RELEASE_VERSION>`. The latest release is on
 GitHub App and no token minter. The installer refuses `--github-app-id` and `--github-pem-path`
 with `--gitops-forge=gitlab`. The Go and Cloud KMS prerequisites of the PEM import do not apply.
 
+To let the agent read a private GitLab context repository, also set `GITLAB_READ_TOKEN_FILE` to a
+file or `<(command)` that holds a read-only token (Reporter role, `read_repository` scope only). Use
+a release whose `install.env.example` lists `GITLAB_READ_TOKEN_FILE`; an older release ignores it.
+See "Private context repositories" on the
+[GitLab install page](docs/site/src/content/docs/install/gitlab.md#private-context-repositories).
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
@@ -238,8 +244,8 @@ Rules for the agent:
   token of a dedicated account that is a Developer member of the project. It is never a person's
   own token.
 - The broker uses the token only for the declared repositories. Another project in the
-  same group gets no token; `inspect-repository` reads it without one, so only a public project
-  is readable. A project outside those groups is refused. For `platform/infra/gitops`, the group
+  same group gets no write token. `inspect-repository` reads a public project with no token, and a
+  private one only when it is a context repository and a read-only token is stored. A project outside those groups is refused. For `platform/infra/gitops`, the group
   is `platform/infra`. The token limits what GitLab lets the broker do. Tell the operator to use the token with the smallest reach. That
   is a project access token on the GitOps project, or a group access token on `platform/infra`,
   not on `platform`.
