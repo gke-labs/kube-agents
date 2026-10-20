@@ -26371,11 +26371,12 @@ class TestSecondFinishInOneRun(HarnessTestCase):
             self.assertEqual(self.run_finish(doc), 2)
         opened = len(self.harness.forge_calls("proposal-create"))
         self.assertEqual(opened, 2)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(100 + i, audit_report.group_branch_for(AUDIT, [finding])) for i, finding in enumerate(findings[:2])]
+        )
 
         self.assertEqual(self.finish_again(doc), 0, self.err)
-        self.assertLessEqual(
-            len(self.harness.forge_calls("proposal-create")), audit_report.AUTO_PROMOTION_CAP
-        )
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
 
     def test_a_start_after_a_finish_that_died_opens_a_new_run(self):
         now = datetime.now(timezone.utc)

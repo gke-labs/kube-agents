@@ -3129,8 +3129,8 @@ def save_chat_verdict(
 ) -> None:
     """Save this `finish`'s verdict on `repo`'s entry. Best-effort: never fails the run.
 
-    Called before the store write, so a `finish` that dies between that write
-    and its chat report still leaves the verdict for the call that retries it.
+    Called as each sweep pull request opens and before the store write, so a
+    `finish` that dies after either still leaves the verdict for its re-run.
     """
     record = _live_chat_record(audit_id, now)
     if record is None:
@@ -18080,7 +18080,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
         generated_at=now,
         noun=noun,
         # As each opens, and not only before the store write: a `finish` that
-        # dies after one keeps its lease, and the re-run must not sweep again.
+        # dies after one is re-run, and the re-run must not sweep again.
         on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now),
     )
 

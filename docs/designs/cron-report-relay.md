@@ -222,7 +222,7 @@ hours (the stream lease, which covers one step) and that holds no finished
 report for this repository is the same run; any other `start` opens a new
 record, and so does a `start` that finds no finished part, which a run that
 never reached `finish` left. An entry whose `finish` saved its verdict counts as finished
-here, so a `start` after a `finish` that died opens a new record. A `finish` applies the
+here, so a `start` after a `finish` that died after saving it opens a new record. A `finish` applies the
 age and repository rule, with one exception: a later `finish` of a repository whose entry
 `start` opened and an earlier `finish` filled, while the record's last step is within the
 two hours, is the same run. It adds its report under the earlier one's, below a label line,
@@ -231,7 +231,8 @@ report, the later one fills the entry in its place. The earlier `finish` saves i
 `silent_ok` on the entry as each pull request its sweep opens is created, and again before
 it writes the report store. When that was `false` the later one is not silent either and its automatic
 sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
-but while such a record is current it is taken for a later `finish` of that run, and the
+but while a current record holds this repository's entry with a saved verdict it is taken for a
+later `finish` of that run, and the
 relay posts that run's report again with its own under it. The relay
 reads the record, over the gateway's sandbox login where the shell runs in the
 shell sandbox (`sandbox_exec.read_bytes`).
