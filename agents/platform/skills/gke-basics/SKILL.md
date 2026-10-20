@@ -8,7 +8,8 @@ description: >-
   and workload deployment. Use when creating GKE clusters, fetching kubectl credentials,
   or deciding between Autopilot and Standard modes. Don't use for Workload Identity
   (use gke-workload-identity), GKE networking (use gke-networking), security hardening
-  (use gke-platform-security or gke-workload-security), or cluster upgrades (use gke-upgrades).
+  (use gke-platform-security or gke-workload-security), cluster upgrades (use gke-upgrades),
+  or deleting a resource (use submit-suggestion's "Deleting a resource").
 ---
 
 # GKE Basics & Critical Gotchas
@@ -42,7 +43,10 @@ Managed Kubernetes platform on Google Cloud. Defaults to Autopilot mode unless S
    * In Autopilot, CPU requests must be specified in increments of 250m (0.25 vCPU). If an unaligned CPU request (e.g., 300m) is requested, round up to the nearest 250m increment (500m / 0.5 vCPU).
    * Resource requests equal limits automatically. Omit `limits` to allow Autopilot to set defaults matching `requests`.
 
-4. **Cluster Credentials:**
+4. **Deleting Is Never `kubectl delete`:**
+   * A request to delete a namespace, workload or other resource is never `kubectl delete`: the agent's cluster access is read-only, and the policy refuses it. Open `submit-suggestion/SKILL.md`, "Deleting a resource", before running anything else; it says what to answer.
+
+5. **Cluster Credentials:**
    - Always explicitly specify the cluster's location (`--region` for regional clusters, `--zone` for zonal, or `--location` for either) when fetching credentials, and `export` a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` first, so the pin survives to every `kubectl` that follows and concurrent reads of different clusters do not race on one `current-context`:
      ```bash
      PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request
