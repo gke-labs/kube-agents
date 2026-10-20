@@ -155,16 +155,6 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
 KNOWN_UNREGISTERED = {
-    # Needs a GitOps repository whose provisioning/ path holds Terraform; no
-    # pool project's repository has one. Runs on the GitOps-wired dev lane
-    # (ka-fleet-dev-1, sackheads/kage-fleet-dev at branch hcl) for #2936's
-    # eval record.
-    "terraform-spot-replacement-pr": (
-        "#2936: dev-lane case; the pool projects' GitOps repositories hold no Terraform"
-    ),
-    "terraform-node-pool-autoscaling-pr": (
-        "#2936: dev-lane case; the pool projects' GitOps repositories hold no Terraform"
-    ),
     # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
     # as the stack cases below: a `stack:` case runs alone on lock-infra
     # whatever EVAL_TASK_PARALLELISM is, and the main nightly part's serial
@@ -237,6 +227,15 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository whose provisioning/ path holds Terraform; no
+    # pool project's repository has one. Run by hand on a dev install whose
+    # repository does (ka-fleet-dev-1, sackheads/kage-fleet-dev at branch hcl).
+    "terraform-spot-replacement-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    "terraform-node-pool-autoscaling-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "

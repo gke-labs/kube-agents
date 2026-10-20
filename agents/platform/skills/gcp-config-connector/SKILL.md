@@ -118,10 +118,11 @@ change is an edit to that file, and Step 2's answer is "edit".
 
 **Stopping before Step 5 leaves nothing to clean up.** The copy is on this
 filesystem, not on the credential broker, and nothing on the forge's side is
-held open by having read it. Stop where you need to — Terraform HCL under
-`provisioning/`, a stop or a question from Step 2's table, an immutable field
-in Step 3, a CRD Step 4 finds missing — and when the user answers and the work
-resumes, run `prepare` again. If it refuses because the copy holds revisions
+held open by having read it. Stop where you need to — a stop or a question
+from Step 2's table, an immutable field in Step 3, a CRD Step 4 finds missing
+— and when the user answers and the work resumes, run `prepare` again.
+Terraform HCL under `provisioning/` is not a stop here but `gcp-terraform`'s:
+switch to it. If it refuses because the copy holds revisions
 that were never published, that is an earlier run's work: read the refusal
 before reaching for `--force`.
 

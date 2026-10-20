@@ -25,7 +25,8 @@ from command_policy import (
 CONFIG_CONNECTOR_SKILL_DIR = (
     Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
 )
-FENCED_SHELL_BLOCK = re.compile(r"^```(?:bash|sh|shell)\n(.*?)^```", re.MULTILINE | re.DOTALL)
+# A fence may be indented, as one inside a numbered list is.
+FENCED_SHELL_BLOCK = re.compile(r"^[ \t]*```(?:bash|sh|shell)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
 GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
 # Fewer fenced commands than this means the parser or the path went stale
 # and the allowed-commands test would pass by finding nothing.
@@ -36,9 +37,13 @@ MIN_FENCED_COMMANDS = 8
 TERRAFORM_SKILL_DIR = Path(__file__).resolve().parents[1] / "skills" / "gcp-terraform"
 SHIPPED_SKILLS_ROOT = Path(__file__).resolve().parents[2]
 MIN_TERRAFORM_FENCED_COMMANDS = 3
-# A tofu or terraform invocation at a command position: the start of the
-# line, or after a separator or a common wrapper.
-IAC_INVOCATION = re.compile(r"(?:^|[;&|(]\s*|\b(?:sudo|env|timeout\s+\d+|xargs)\s+)(tofu|terraform)(?:\s+(\S+))?")
+# A tofu or terraform invocation at a command position: the positions
+# HELM_INVOCATION knows, with global options (`-chdir=DIR`) skipped to reach
+# the subcommand.
+IAC_INVOCATION = re.compile(
+    r"(?i)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)"
+    r"\s*(tofu|terraform)\b(?:(?:\s+-\S+)*\s+([^\s'\"`]+))?"
+)
 # The gitops-helm-chart skill declares a chart for a reconciler to install and
 # never runs helm, which the policy does not govern. Its reads are checked the
 # same way, and every shipped skill (gke-basics' reference among them, whose
@@ -1926,7 +1931,7 @@ class TheTerraformSkillStaysInsideThePolicy(unittest.TestCase):
             for path, line in self._fenced_lines(skill_dir):
                 for match in IAC_INVOCATION.finditer(line):
                     with self.subTest(skill=skill_dir.name, file=path.name, line=line):
-                        self.assertEqual(("tofu", "fmt"), (match.group(1), match.group(2)))
+                        self.assertEqual(("tofu", "fmt"), (match.group(1).lower(), match.group(2)))
 
     def test_what_the_skill_leaves_to_ci_is_refused(self):
         for argv, desc in (
