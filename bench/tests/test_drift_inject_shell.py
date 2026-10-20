@@ -32,7 +32,7 @@ carefully distinguish between a transport/curl/exec failure and an active
 daemon that lacks the requested capability.
 
 These tests lift functions from `drift_inject.sh` using `tests/_lift_shell.py`
-and exercise them against a stubbed `kubectl`, `curl`, and `jq` without
+and exercise them against a stubbed `kubectl` and `curl` without
 requiring a real cluster or live network calls.
 """
 
@@ -40,6 +40,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -47,9 +48,13 @@ import tempfile
 import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(REPO_ROOT / "tests"))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(REPO_ROOT / "tests") not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
 
 from _lift_shell import lift_function  # noqa: E402
+from tests.testing.common import get_isolated_test_env  # noqa: E402
 
 MODULE_DIR = REPO_ROOT / "bench" / "tf" / "modules" / "drift-inject"
 SCRIPT = MODULE_DIR / "drift_inject.sh"
@@ -191,46 +196,6 @@ sys.stdout.write(body)
 sys.exit(0)
 """
 
-_STUB_JQ_SCRIPT = """\
-#!/usr/bin/env python3
-import json
-import os
-import sys
-
-log_path = os.environ.get("JQ_LOG")
-if log_path:
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(sys.argv[1:]) + "\\n")
-
-raw = sys.stdin.read()
-if not raw.strip():
-    sys.exit(0)
-
-try:
-    decoder = json.JSONDecoder()
-    pos = 0
-    while pos < len(raw):
-        while pos < len(raw) and raw[pos].isspace():
-            pos += 1
-        if pos >= len(raw):
-            break
-        data, end = decoder.raw_decode(raw, pos)
-        pos = end
-        if data is None:
-            continue
-        if not isinstance(data, dict):
-            sys.exit(5)
-        kinds = data.get("inject_kinds", [])
-        if isinstance(kinds, list):
-            for k in kinds:
-                sys.stdout.write(f"{k}\\n")
-        elif isinstance(kinds, dict):
-            for v in kinds.values():
-                sys.stdout.write(f"{v}\\n")
-except Exception:
-    sys.exit(2)
-"""
-
 
 class DriftShellTestBase(unittest.TestCase):
     def setUp(self):
@@ -246,13 +211,8 @@ class DriftShellTestBase(unittest.TestCase):
         self.curl_bin.write_text(_STUB_CURL_SCRIPT, encoding="utf-8")
         self.curl_bin.chmod(self.curl_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-        self.jq_bin = self.bin_dir / "jq"
-        self.jq_bin.write_text(_STUB_JQ_SCRIPT, encoding="utf-8")
-        self.jq_bin.chmod(self.jq_bin.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
         self.log_file = pathlib.Path(self.temp_dir.name) / "kubectl_calls.log"
         self.curl_log_file = pathlib.Path(self.temp_dir.name) / "curl_calls.log"
-        self.jq_log_file = pathlib.Path(self.temp_dir.name) / "jq_calls.log"
         self.config_file = pathlib.Path(self.temp_dir.name) / "kubectl_config.json"
         self.script_text = SCRIPT.read_text(encoding="utf-8")
 
@@ -274,27 +234,44 @@ class DriftShellTestBase(unittest.TestCase):
         lines = self.curl_log_file.read_text(encoding="utf-8").strip().splitlines()
         return [json.loads(line) for line in lines if line.strip()]
 
-    def get_jq_calls(self) -> list[list[str]]:
-        if not self.jq_log_file.exists():
-            return []
-        lines = self.jq_log_file.read_text(encoding="utf-8").strip().splitlines()
-        return [json.loads(line) for line in lines if line.strip()]
-
     def run_bash(self, script: str, extra_env: dict | None = None) -> subprocess.CompletedProcess:
-        env = dict(os.environ)
-        env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
-        env["KUBECTL_LOG"] = str(self.log_file)
-        env["CURL_LOG"] = str(self.curl_log_file)
-        env["JQ_LOG"] = str(self.jq_log_file)
-        env["KUBECTL_CONFIG"] = str(self.config_file)
+        overrides = {
+            "KUBECTL_LOG": str(self.log_file),
+            "CURL_LOG": str(self.curl_log_file),
+            "KUBECTL_CONFIG": str(self.config_file),
+        }
         if extra_env:
-            env.update(extra_env)
+            overrides.update(extra_env)
+        env = get_isolated_test_env(
+            overrides=overrides,
+            bin_dir=str(self.bin_dir),
+            absent=("drift_planted_ns", "drift_failure_resources"),
+        )
         return subprocess.run(
             ["bash", "-c", script],
             capture_output=True,
             text=True,
             env=env,
         )
+
+    def test_run_bash_isolates_ambient_drift_env_variables(self):
+        old_planted = os.environ.get("drift_planted_ns")
+        old_failure = os.environ.get("drift_failure_resources")
+        os.environ["drift_planted_ns"] = "ambient_ns"
+        os.environ["drift_failure_resources"] = "ambient_res"
+        try:
+            proc = self.run_bash('echo "planted: ${drift_planted_ns:-empty}, failure: ${drift_failure_resources:-empty}"')
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "planted: empty, failure: empty")
+        finally:
+            if old_planted is not None:
+                os.environ["drift_planted_ns"] = old_planted
+            else:
+                os.environ.pop("drift_planted_ns", None)
+            if old_failure is not None:
+                os.environ["drift_failure_resources"] = old_failure
+            else:
+                os.environ.pop("drift_failure_resources", None)
 
 
 class DriftClearNamespaceTests(DriftShellTestBase):
@@ -662,6 +639,13 @@ exit 42
 
 
 class DriftRequireDaemonTests(DriftShellTestBase):
+    def setUp(self):
+        super().setUp()
+        if not shutil.which("jq"):
+            if os.environ.get("GITHUB_ACTIONS"):
+                self.fail("jq is not on PATH; the drift_require_daemon tests cannot run")
+            self.skipTest("jq is not on PATH")
+
     _DAEMON_SCRIPT = f"""\
 set -euo pipefail
 gcloud() {{ return 0; }}
@@ -772,7 +756,7 @@ drift_require_daemon
         })
         proc = self.run_daemon()
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("ERROR: could not read http://daemon:8080/healthz in platform-agent (exit 2)", proc.stderr)
+        self.assertIn("ERROR: could not read http://daemon:8080/healthz in platform-agent (exit 5)", proc.stderr)
         self.assertIn("This says nothing about which inject kinds the daemon advertises", proc.stderr)
 
     def test_refuses_when_daemon_returns_non_object_json_body(self):
@@ -853,10 +837,6 @@ drift_require_daemon
             curl_calls[0],
             ["-fsS", "--max-time", "10", "http://daemon:8080/healthz"],
         )
-
-        jq_calls = self.get_jq_calls()
-        self.assertEqual(len(jq_calls), 1)
-        self.assertEqual(jq_calls[0], ["-r", ".inject_kinds[]?"])
 
 
 class DriftInjectModuleStructureTests(DriftShellTestBase):
