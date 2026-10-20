@@ -1127,6 +1127,40 @@ class DiagnosticsTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertNotIn("other diagnostics omitted", text)
 
+    def test_repeated_title_group_id_budget_sized_against_remaining_room(self):
+        # A group's ids: line must be sized against room remaining when the group is reached,
+        # not available_for_items, so a group whose head and latest: fit is not skipped in
+        # favor of older single cards behind it.
+        cards = [
+            ("t_newest", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 1}},
+             {"task_id": "t_newest", "status": "blocked", "title": "Fresh card"}),
+        ]
+        for i in range(30):
+            cards.append((
+                f"t_grp_{i:02d}",
+                {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 2 + i}},
+                {"task_id": f"t_grp_{i:02d}", "status": "blocked", "title": "Repeated title"}
+            ))
+        cards.append((
+            "t_oldest",
+            {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 50}},
+            {"task_id": "t_oldest", "status": "blocked", "title": "Old card"}
+        ))
+
+        # max_chars=814 gives budget_for_body=420, available_for_items=300.
+        # S (Fresh card, 50 chars) is taken. Remaining room = 250.
+        # G (Repeated title, 30 cards) head + latest is 92 chars. Sizing ids: to remaining room
+        # allows G to fit (243 chars total) and be taken.
+        # Old card (50 chars) exceeds remaining room (7 chars) and is omitted.
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=814)
+        text = "\n".join(lines)
+        self.assertIn("Fresh card", text)
+        self.assertIn("Repeated title", text)
+        self.assertIn("latest: [t_grp_00]", text)
+        self.assertNotIn("Old card", text)
+        self.assertIn("... and 18 older stuck cards omitted", text)
+        self.assertLessEqual(len(text), 814)
+
 
 
 

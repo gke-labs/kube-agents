@@ -421,6 +421,38 @@ def _min_stuck_floor(stuck_items: list, home: Path) -> int:
     return header_chars + footer_chars + len(omission_sample)
 
 
+def _format_large_group(it: dict, available_chars: int) -> dict | None:
+    """Format a large group (>3 cards) with ids: line sized to available_chars."""
+    head = it["head"]
+    latest_sub = it["latest_sub"]
+    group = it["cards"]
+    group_ids = it["group_ids"]
+    head_chars = len(head) + 1 + len(latest_sub) + 1
+    if head_chars > available_chars:
+        return None
+    lines_for_group = [head, latest_sub]
+    rem_for_ids = available_chars - head_chars
+    ids_prefix_overhead = len("    ids: ") + 1
+    group_ids_budget = min(MAX_GROUP_IDS_CHARS, max(0, rem_for_ids - ids_prefix_overhead))
+    formatted_ids, dropped_ids = _format_id_list_with_dropped(group_ids, group_ids_budget)
+    if len(dropped_ids) < len(group_ids):
+        lines_for_group.append(f"    ids: {formatted_ids}")
+    if dropped_ids and len(dropped_ids) == len(group_ids):
+        dropped_ids = dropped_ids[1:]
+    return {
+        "age_hours": it["age_hours"],
+        "key": it["key"],
+        "lines": lines_for_group,
+        "card_count": len(group) - len(dropped_ids),
+        "cards": group,
+        "dropped_ids": dropped_ids,
+        "is_large_group": True,
+        "head": head,
+        "latest_sub": latest_sub,
+        "group_ids": group_ids,
+    }
+
+
 def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_chars: int | None = None) -> list:
     """Render stuck cards: grouped by title when duplicated, newest first, commands once.
 
@@ -512,29 +544,33 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                     if card["reason"]:
                         card_sub += f' — "{card["reason"]}"'
                     lines_for_group.append(card_sub)
+                renderable_items.append({
+                    "age_hours": newest_age,
+                    "key": title[:TITLE_MAX_CHARS],
+                    "lines": lines_for_group,
+                    "card_count": len(group),
+                    "cards": group,
+                    "dropped_ids": [],
+                })
             else:
                 newest_card = group[0]
                 newest_age_str = render_age(newest_card["age_hours"] if newest_card["age_hours"] != float("inf") else None)
                 latest_sub = f"    latest: [{newest_card['task_id']}] ({newest_card['kind']}, {newest_age_str})"
                 if newest_card["reason"]:
                     latest_sub += f' — "{newest_card["reason"]}"'
-                lines_for_group.append(latest_sub)
                 group_ids = [c["task_id"] for c in group]
-                group_header_chars = len(head) + 1 + len(latest_sub) + 1 + len("    ids: ") + 1
-                group_ids_budget = min(MAX_GROUP_IDS_CHARS, max(0, available_for_items - group_header_chars))
-                formatted_ids, dropped_ids = _format_id_list_with_dropped(group_ids, group_ids_budget)
-                if len(dropped_ids) < len(group_ids):
-                    lines_for_group.append(f"    ids: {formatted_ids}")
-                if dropped_ids and len(dropped_ids) == len(group_ids):
-                    dropped_ids = dropped_ids[1:]
-            renderable_items.append({
-                "age_hours": newest_age,
-                "key": title[:TITLE_MAX_CHARS],
-                "lines": lines_for_group,
-                "card_count": len(group) - len(dropped_ids),
-                "cards": group,
-                "dropped_ids": dropped_ids,
-            })
+                renderable_items.append({
+                    "age_hours": newest_age,
+                    "key": title[:TITLE_MAX_CHARS],
+                    "head": head,
+                    "latest_sub": latest_sub,
+                    "group_ids": group_ids,
+                    "cards": group,
+                    "is_large_group": True,
+                    "lines": [head, latest_sub],
+                    "card_count": 1,
+                    "dropped_ids": group_ids[1:],
+                })
 
     for card in no_title_cards:
         line = stuck_card_line(card["task_id"], card["diag"], context, card["entry"])
@@ -549,22 +585,45 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
 
     renderable_items.sort(key=lambda item: (item["age_hours"], item["key"]))
 
-    taken_items = _take_within_budget(
-        renderable_items, MAX_STUCK_ITEMS, available_for_items, line_fn=lambda it: it["lines"]
-    )
-    taken_set = {id(it) for it in taken_items}
-    untaken_items = [it for it in renderable_items if id(it) not in taken_set]
+    taken_items = []
+    total_chars = 0
+    taken_origins = set()
+    for item in renderable_items:
+        if len(taken_items) >= MAX_STUCK_ITEMS:
+            break
+        remaining_budget = available_for_items - total_chars
+        if item.get("is_large_group"):
+            formatted = _format_large_group(item, remaining_budget)
+            if formatted is None:
+                continue
+            item_to_take = formatted
+            item_chars = sum(len(ln) + 1 for ln in item_to_take["lines"])
+        else:
+            item_chars = sum(len(ln) + 1 for ln in item["lines"])
+            if total_chars + item_chars > available_for_items:
+                continue
+            item_to_take = item
+        taken_items.append(item_to_take)
+        taken_origins.add(id(item))
+        total_chars += item_chars
+
+    untaken_items = [it for it in renderable_items if id(it) not in taken_origins]
 
     if len(untaken_items) == 1 and len(taken_items) < MAX_STUCK_ITEMS:
         next_item = untaken_items[0]
-        next_chars = sum(len(ln) + 1 for ln in next_item["lines"])
         current_chars = sum(sum(len(ln) + 1 for ln in it["lines"]) for it in taken_items)
-        if (
-            not any(it.get("dropped_ids") for it in [*taken_items, next_item])
-            and (current_chars + next_chars <= budget_for_body)
-        ):
-            taken_items.append(next_item)
-            untaken_items = []
+        remaining_promo_budget = budget_for_body - current_chars
+        if not any(it.get("dropped_ids") for it in taken_items):
+            if next_item.get("is_large_group"):
+                promo_item = _format_large_group(next_item, remaining_promo_budget)
+                if promo_item and not promo_item.get("dropped_ids"):
+                    taken_items.append(promo_item)
+                    untaken_items = []
+            else:
+                next_chars = sum(len(ln) + 1 for ln in next_item["lines"])
+                if not next_item.get("dropped_ids") and (current_chars + next_chars <= budget_for_body):
+                    taken_items.append(next_item)
+                    untaken_items = []
 
     taken_items.sort(key=lambda item: (item["age_hours"], item["key"]))
 
