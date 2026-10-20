@@ -211,7 +211,6 @@ ADDED_AFTER_THE_MOVE = [
     "chat-answer-tangent-offer-declares-no-step",  # an offer about an unasked workload declares no step, mock 03
     "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
     "helm-chart-no-reconciler-stops",  # gitops-helm-chart stops where nothing renders charts, #2938
-    "upgrades-weekly-brief-decisions-named",  # the Saturday brief's on-request route
     "delete-namespace-unowned-stops",  # a delete the repository cannot carry ends in a stated stop, #3077
 ]
 # Taken back out of the nightly file after registering there, each with a
