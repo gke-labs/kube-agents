@@ -437,6 +437,79 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(text.count("drop it:"), 1)
         self.assertIn("<task_id>", text)
 
+    def test_small_group_renders_each_card_with_task_id_and_reason(self):
+        payload = json.dumps([
+            {"task_id": "t_scale_1", "status": "blocked", "title": "Scale kube-dns",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 24}}]},
+            {"task_id": "t_scale_2", "status": "blocked", "title": "Scale kube-dns",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 48}}]},
+        ])
+        context = {
+            "t_scale_1": {"kind": "needs_input", "reason": "Blocked on human approval"},
+            "t_scale_2": {"kind": "capability", "reason": "Missing gcloud tool"},
+        }
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context=context)
+        text = "\n".join(lines)
+        self.assertIn("Scale kube-dns — 2 cards (1 capability, 1 needs_input, oldest 2d)", text)
+        self.assertIn('[t_scale_1] (needs_input, 24h) — "Blocked on human approval"', text)
+        self.assertIn('[t_scale_2] (capability, 2d) — "Missing gcloud tool"', text)
+
+    def test_large_group_renders_latest_card_and_ids(self):
+        payload = json.dumps([
+            {"task_id": f"t_dns_{i}", "status": "blocked", "title": "Scale kube-dns",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 24 * (i + 1)}}]}
+            for i in range(5)
+        ])
+        context = {
+            f"t_dns_{i}": {"kind": "needs_input", "reason": f"Reason {i}"}
+            for i in range(5)
+        }
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context=context)
+        text = "\n".join(lines)
+        self.assertIn("Scale kube-dns — 5 cards (5 needs_input, oldest 5d)", text)
+        self.assertIn('latest: [t_dns_0] (needs_input, 24h) — "Reason 0"', text)
+        self.assertIn("ids: t_dns_0, t_dns_1, t_dns_2, t_dns_3, t_dns_4", text)
+
+    def test_distinct_title_outage_report_bounded_with_omitted_summary(self):
+        # 30 cards with distinct titles (wide outage scenario)
+        cards = [
+            {"task_id": f"t_outage_{i}", "status": "blocked",
+             "title": f"Triage stalled controller {i} in prod on cluster-1: pod-{i}",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 24 + i}}]}
+            for i in range(30)
+        ]
+        context = {
+            f"t_outage_{i}": {
+                "kind": "needs_input",
+                "reason": f"Controller {i} is crashlooping with OOMKilled status on pod-{i}." * 3,
+            }
+            for i in range(30)
+        }
+        payload = json.dumps(cards)
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={}, context=context)
+        text = "\n".join(lines)
+        # Bounded well below 12,000 chars limit
+        self.assertLess(len(text), 12000)
+        # Omission message indicates older cards omitted
+        self.assertIn("older stuck cards omitted (run hermes kanban list on the agent pod to view all)", text)
+        # Commands footer is preserved at the end
+        self.assertIn("Commands to move a card (run on the agent pod):", text)
+        self.assertIn("re-run it:", text)
+        self.assertIn("drop it:", text)
+        # Newest cards appear, oldest omitted
+        self.assertIn("t_outage_0", text)
+        self.assertNotIn("t_outage_29", text)
+
 
 
 

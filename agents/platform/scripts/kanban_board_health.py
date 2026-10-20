@@ -104,13 +104,16 @@ nothing periodically asked (#656).
 worker or operator block is sticky, nothing retries it until a human acts, and
 a card nobody is looking at is the one finding this check exists for. The rule
 is stateless and a card still blocked is named once a day until someone
-unblocks, comments on, or archives it, which is the intended nag. Each such
-Each such line carries the card's kind, reason and age, read here from the board.
-Cards are listed newest first so recent outages appear at the top. Where multiple
-cards share a title, they are grouped into a single summary line with their
-breakdown of block kinds and oldest age. The operator commands appear once in a
-footer (noting they run on the agent pod) rather than repeated under every card,
-keeping reports readable and within chat limits.
+unblocks, comments on, or archives it, which is the intended nag.
+Cards are listed newest first, each with its kind, reason, and age read from the
+board, so recent outages surface at the top. Where multiple cards share a title,
+they are grouped: small groups list each card's task ID, kind, age, and reason,
+while larger groups summarize the count, kind breakdown, and oldest age,
+followed by the newest card's details and task IDs. Long reports are bounded to
+keep recent outage cards and the footer commands within chat limits, summarizing
+any omitted older cards. The operator unblock and archive commands appear once
+in a footer (noting they run on the agent pod) rather than repeated under every
+card.
 
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 """
@@ -153,6 +156,9 @@ REASON_MAX_CHARS = 200
 HOURS_PER_DAY = 24
 AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
+MAX_STUCK_ITEMS = 15
+MAX_STUCK_CHARS = 5500
+GROUP_EXPAND_MAX = 3
 # Pinned to the board file this run read, the way `diagnostics_lines` pins the
 # engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
 UNBLOCK_COMMAND = 'HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban unblock --reason "<why>" {task_id}'
@@ -334,7 +340,7 @@ def _card_age_hours(diag: dict) -> float:
 
 
 def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
-    """Render stuck cards: grouped by title when duplicated, newest first, commands once."""
+    """Render stuck cards: grouped by title when duplicated, newest first, bounded, commands once."""
     if not stuck_items:
         return []
 
@@ -368,32 +374,90 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path) -> list:
     renderable_items = []
 
     for title, group in by_title.items():
+        group.sort(key=lambda c: (c["age_hours"], c["task_id"]))
         if len(group) == 1:
             card = group[0]
             line = stuck_card_line(card["task_id"], card["diag"], context, card["entry"])
-            renderable_items.append((card["age_hours"], card["task_id"], line))
+            renderable_items.append({
+                "age_hours": card["age_hours"],
+                "key": card["task_id"],
+                "lines": [line],
+                "card_count": 1,
+            })
         else:
-            newest_age = min(c["age_hours"] for c in group)
+            newest_age = group[0]["age_hours"]
             oldest_age_hours = max(c["age_hours"] for c in group)
             oldest_str = render_age(oldest_age_hours if oldest_age_hours != float("inf") else None)
             kind_counts = collections.Counter(c["kind"] for c in group)
             sorted_kinds = sorted(kind_counts.items(), key=lambda x: (-x[1], x[0]))
             kinds_summary = ", ".join(f"{cnt} {k}" for k, cnt in sorted_kinds)
-            line = f"  - {title} — {len(group)} cards ({kinds_summary}, oldest {oldest_str})"
-            renderable_items.append((newest_age, title, line))
+            head = f"  - {title} — {len(group)} cards ({kinds_summary}, oldest {oldest_str})"
+            lines_for_group = [head]
+            if len(group) <= GROUP_EXPAND_MAX:
+                for card in group:
+                    age_str = render_age(card["age_hours"] if card["age_hours"] != float("inf") else None)
+                    card_sub = f"    - [{card['task_id']}] ({card['kind']}, {age_str})"
+                    if card["reason"]:
+                        card_sub += f' — "{card["reason"]}"'
+                    lines_for_group.append(card_sub)
+            else:
+                newest_card = group[0]
+                newest_age_str = render_age(newest_card["age_hours"] if newest_card["age_hours"] != float("inf") else None)
+                latest_sub = f"    latest: [{newest_card['task_id']}] ({newest_card['kind']}, {newest_age_str})"
+                if newest_card["reason"]:
+                    latest_sub += f' — "{newest_card["reason"]}"'
+                lines_for_group.append(latest_sub)
+                ids = [c["task_id"] for c in group]
+                if len(ids) <= 10:
+                    lines_for_group.append(f"    ids: {', '.join(ids)}")
+                else:
+                    shown_ids = ", ".join(ids[:10])
+                    lines_for_group.append(f"    ids: {shown_ids} (and {len(ids) - 10} more)")
+            renderable_items.append({
+                "age_hours": newest_age,
+                "key": title,
+                "lines": lines_for_group,
+                "card_count": len(group),
+            })
 
     for card in no_title_cards:
         line = stuck_card_line(card["task_id"], card["diag"], context, card["entry"])
-        renderable_items.append((card["age_hours"], card["task_id"], line))
+        renderable_items.append({
+            "age_hours": card["age_hours"],
+            "key": card["task_id"],
+            "lines": [line],
+            "card_count": 1,
+        })
 
-    renderable_items.sort(key=lambda item: (item[0], item[1]))
+    renderable_items.sort(key=lambda item: (item["age_hours"], item["key"]))
 
     lines = [
         "Cards blocked with no one looking (a worker or operator block is sticky: "
         "nothing retries it until a human acts):"
     ]
-    for _, _, line in renderable_items:
-        lines.append(line)
+
+    shown_lines = []
+    rendered_cards = 0
+    items_rendered = 0
+    total_cards = len(stuck_items)
+
+    for item in renderable_items:
+        item_chars = sum(len(ln) + 1 for ln in item["lines"])
+        current_chars = sum(len(ln) + 1 for ln in shown_lines)
+        if items_rendered >= MAX_STUCK_ITEMS or (shown_lines and (current_chars + item_chars > MAX_STUCK_CHARS)):
+            break
+        shown_lines.extend(item["lines"])
+        rendered_cards += item["card_count"]
+        items_rendered += 1
+
+    lines.extend(shown_lines)
+
+    omitted_cards = total_cards - rendered_cards
+    if omitted_cards > 0:
+        lines.append(
+            f"  ... and {omitted_cards} older stuck card{'s' if omitted_cards != 1 else ''} omitted "
+            f"(run hermes kanban list on the agent pod to view all)"
+        )
 
     lines.append("  Commands to move a card (run on the agent pod):")
     tid = stuck_items[0][0] if len(stuck_items) == 1 else "<task_id>"
