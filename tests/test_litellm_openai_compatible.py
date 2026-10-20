@@ -401,7 +401,9 @@ class RenderRefusalTest(unittest.TestCase):
         )
 
     def test_an_unknown_provider_names_this_one(self) -> None:
-        res = _helm_template("--set", "litellm.modelProvider=vllm", *HARNESS_ARGS, check=False)
+        # A hyphen is outside the LiteLLM provider-slug shape, so this is a
+        # typo, not a provider the env Secret could serve.
+        res = _helm_template("--set", "litellm.modelProvider=v-llm", *HARNESS_ARGS, check=False)
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("vertex_ai, openai_compatible", res.stderr)
 

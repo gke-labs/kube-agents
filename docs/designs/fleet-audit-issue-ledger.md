@@ -1489,7 +1489,7 @@ exist.
 severity floor, but a genuinely bad fleet day could still open many at once. Consider a per-run cap with the withheld set
 named in the ledger.
 
-_Resolved: auto-promotion is capped at five PRs per `finish` run._ Withheld findings are named in the
+_Resolved: auto-promotion is capped at five PRs per run._ Withheld findings are named in the
 ledger as awaiting `/remediate` (a section a collector manifest can add two blocks to —
 [collector design §3.4](fleet-audit-collector-manifest.md)), so nothing is lost, only deferred to a human's judgement about which
 five matter first. An explicit `/remediate` is **uncapped** — a human asked for it, and a cap there
