@@ -316,6 +316,13 @@ class GchatStepsFollowTheModeTest(unittest.TestCase):
         self.assertIn("[ ] 3. No home channel", with_number)
         self.assertIn("[ ] 4. The A2A gateway answers only", with_number)
 
+    def test_google_chat_on_is_read_the_way_the_tfvars_generator_reads_it(self):
+        # hcl_bool renders enable_google_chat with is_truthy.
+        for spelling in ("yes", "1", "TRUE"):
+            with self.subTest(spelling=spelling):
+                env = self._env(mode="next").replace("GOOGLE_CHAT_ENABLED=true", f"GOOGLE_CHAT_ENABLED={spelling}")
+                self._assert_next(self._run(env))
+
     def test_today_keeps_the_listener_steps(self):
         for home in ("", self._SPACE):
             with self.subTest(home=home):

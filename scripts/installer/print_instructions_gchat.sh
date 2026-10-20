@@ -62,9 +62,8 @@ fi
 # Google Chat on the A2A gateway: no pairing, and a home channel that only
 # GOOGLE_CHAT_HOME_CHANNEL sets. $1 the number of the first step to print.
 print_a2a_gateway_steps() {
-  local step="$1" home="${GOOGLE_CHAT_HOME_CHANNEL:-}" not_a_space
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local step="$1" home not_a_space
+  home="$(trim_go_space "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
   not_a_space="$(gchat_home_channel_not_a_space_name "$home")"
   if [ -z "$home" ]; then
     echo -e "[ ] ${step}. No home channel is configured, so the agent posts no alerts or scheduled reports to Google Chat."

@@ -240,6 +240,16 @@ readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
 # The gateway and the operator hold the same rule; keep the three in step
 # (docs/README.md lists them; a test checks all three agree).
 readonly GCHAT_SPACE_PREFIX="spaces/"
+# What Go's strings.TrimSpace strips (unicode.IsSpace), as UTF-8: ASCII
+# whitespace, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
+# U+205F and U+3000. The operator and the gateway trim a home channel this
+# way, so a value pasted with a no-break space is still the space they use.
+readonly -a GO_TRIMSPACE_CHARS=(
+  $'\t' $'\n' $'\v' $'\f' $'\r' ' ' $'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80'
+  $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82' $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85'
+  $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88' $'\xe2\x80\x89' $'\xe2\x80\x8a'
+  $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
+)
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -1105,15 +1115,28 @@ slack_home_channel_not_an_id() {
   fi
 }
 
+# $1 with what Go's strings.TrimSpace strips (GO_TRIMSPACE_CHARS) removed
+# from both ends. Byte-wise, so the result does not depend on the locale.
+trim_go_space() {
+  local LC_ALL=C value="${1:-}" sp trimmed=false
+  until $trimmed; do
+    trimmed=true
+    for sp in "${GO_TRIMSPACE_CHARS[@]}"; do
+      if [[ "$value" == "$sp"* ]]; then value="${value#"$sp"}"; trimmed=false; fi
+      if [[ "$value" == *"$sp" ]]; then value="${value%"$sp"}"; trimmed=false; fi
+    done
+  done
+  printf '%s' "$value"
+}
+
 # A Google Chat home channel ($1), trimmed, when it is set and is not a bare
 # space name: "spaces/" and an id with no further "/". The gateway's
 # gchatIsSpaceName (a2a/gateway/gchat.go) refuses anything else and leaves
 # its notify route unarmed; the operator's a2aGchatHomeSpace holds the same
 # rule.
 gchat_home_channel_not_a_space_name() {
-  local home="${1:-}" id
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home id
+  home="$(trim_go_space "${1:-}")"
   [ -n "$home" ] || return 0
   id="${home#"$GCHAT_SPACE_PREFIX"}"
   if [ "$id" = "$home" ] || [ -z "$id" ] || [[ "$id" == */* ]]; then

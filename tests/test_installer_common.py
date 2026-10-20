@@ -5486,7 +5486,11 @@ class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         shell = (_REPO_ROOT / "scripts/installer/installer_common.sh").read_text()
         self.assertRegex(shell, r'(?m)^readonly GCHAT_SPACE_PREFIX="spaces/"$')
         cases = {"spaces/AAA": "", "  spaces/AAA ": "", "": "", "AAA": "AAA", "spaces/": "spaces/",
-                 "spaces/AAA/threads/B": "spaces/AAA/threads/B", " Spaces/AAA": "Spaces/AAA"}
+                 "spaces/AAA/threads/B": "spaces/AAA/threads/B", " Spaces/AAA": "Spaces/AAA",
+                 # strings.TrimSpace strips Unicode spaces too, so the operator
+                 # and the gateway take these as spaces/AAA.
+                 "\u00a0spaces/AAA\u3000": "", "\u0085spaces/AAA\u2009\t": "",
+                 "spaces/A\u00a0A": ""}
         script = "".join(f'printf "[%s]\\n" "$(gchat_home_channel_not_a_space_name {shlex.quote(v)})"\n'
                          for v in cases)
         proc = subprocess.run(["bash", "-c", f'source "{_INSTALLER_COMMON}"\n{script}'],
