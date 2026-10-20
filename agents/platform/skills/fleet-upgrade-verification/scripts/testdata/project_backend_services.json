@@ -1,0 +1,54 @@
+[
+  {
+    "backends": [
+      {
+        "balancingMode": "CONNECTION",
+        "group": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/instanceGroups/k8s-ig--b13b2880abfbd3e1"
+      }
+    ],
+    "connectionDraining": {
+      "drainingTimeoutSec": 0
+    },
+    "creationTimestamp": "2026-09-24T10:41:37.246-07:00",
+    "description": "{\"kubernetes.io/service-name\":\"kubeagents-system/vllm-gemma-internal\"}",
+    "fingerprint": "TB4n5Is9eS0=",
+    "healthChecks": [
+      "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/global/healthChecks/k8s-b13b2880abfbd3e1-node"
+    ],
+    "id": "4479466222040702526",
+    "kind": "compute#backendService",
+    "loadBalancingScheme": "INTERNAL",
+    "name": "a4875916f01614154b0b97515163abd1",
+    "protocol": "TCP",
+    "region": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1",
+    "selfLink": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1/backendServices/a4875916f01614154b0b97515163abd1",
+    "sessionAffinity": "NONE",
+    "timeoutSec": 30
+  },
+  {
+    "backends": [
+      {
+        "balancingMode": "CONNECTION",
+        "group": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/instanceGroups/k8s-ig--2d117bce3087cbc7"
+      }
+    ],
+    "connectionDraining": {
+      "drainingTimeoutSec": 0
+    },
+    "creationTimestamp": "2026-09-24T10:12:54.830-07:00",
+    "description": "{\"kubernetes.io/service-name\":\"kubeagents-system/vllm-gemma-internal\"}",
+    "fingerprint": "3G0Br3Hjy8U=",
+    "healthChecks": [
+      "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/global/healthChecks/k8s-2d117bce3087cbc7-node"
+    ],
+    "id": "6217802596704904441",
+    "kind": "compute#backendService",
+    "loadBalancingScheme": "INTERNAL",
+    "name": "ab512b90be8ed4382b87d2d96d4bb721",
+    "protocol": "TCP",
+    "region": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1",
+    "selfLink": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/us-central1/backendServices/ab512b90be8ed4382b87d2d96d4bb721",
+    "sessionAffinity": "NONE",
+    "timeoutSec": 30
+  }
+]

@@ -43,7 +43,16 @@ import re
 from datetime import datetime, time, timedelta, timezone
 
 import readiness_rules
-from readiness_rules import audit_log, zonal_control_plane
+from readiness_rules import (
+    audit_log,
+    cluster_status_age,
+    control_plane_upgrade_history,
+    known_issues_matrix,
+    lb_connection_draining,
+    orphan_node_objects,
+    target_patch_valid,
+    zonal_control_plane,
+)
 from readiness_rules import finding as finding_tiers  # the tier vocabulary; `finding` itself names a loop variable below
 
 # Per-member verdicts. `blocked` when any rule blocks; `unknown` when a rule could not be
@@ -391,7 +400,13 @@ RULE_NONE = "no rules"
 # this order, which is the order the table and the JSON list their findings in. One list,
 # grouped by entry number, the entry in the comment.
 EXTRA_RULES = [
+    control_plane_upgrade_history,  # entry 2: an upgrade or repair that failed on compute capacity, against the maintenance window
+    cluster_status_age,  # entry 5: a cluster held by an operation that has not ended
+    target_patch_valid,  # entry 10: the target and the running patch against the channel's valid versions
+    known_issues_matrix,  # entry 10: the add-on inventory against the published known issues per patch
     zonal_control_plane,  # entry 11
+    lb_connection_draining,  # entry 21: a backend service whose connection drain outlasts the node's deregistration wait
+    orphan_node_objects,  # entry 22: a Node whose instance is gone
 ]
 RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
 # What the fold stamps on a finding: the rule's id and entry on every one, the rule's own

@@ -42,8 +42,13 @@ reads the same thing once; the audit-log reads live under `audit_log.CACHE_KEY`)
 whole listing of the projects even when `--cluster` narrows which members are graded, since
 narrowing selects whom to grade, not whom a rule may see),
 `pools` (the member's pools: `name`, `version`, `parsed`, the record's `config` and
-`autoscaling`), `target_text`, `master` (the parsed control-plane version) and `autopilot`;
-tests may add `clock`, a monotonic clock for a read's time budget.
+`autoscaling`), `target_text`, `master` (the parsed control-plane version), `autopilot` and
+`project_reads`, the gcloud reads the report makes once per project or location for the
+rules (PROJECT_READS: the project's backend services, compute instances and GKE operations,
+and the location's server config), each `{"data": <parsed JSON>, "error": None}` or
+`{"data": None, "error": <why>}`; a rule asks `project_read(context, name)` and files one
+`unknown` naming the reason when the read it needs failed or was not made, grading what it
+has. Tests may add `clock`, a monotonic clock for a read's time budget.
 
 A finding is a dict the rule shapes; the fold copies it before it stamps it, so a rule may
 return the same object twice or cache what it returns. The fold in
@@ -73,6 +78,7 @@ unknown).
 
 import math
 import re
+from datetime import datetime, timedelta, timezone
 
 import upgrade_shape_tables as tables
 
@@ -132,6 +138,7 @@ CONTEXT_POOLS = "pools"
 CONTEXT_TARGET_TEXT = "target_text"
 CONTEXT_MASTER = "master"
 CONTEXT_AUTOPILOT = "autopilot"
+CONTEXT_PROJECT_READS = "project_reads"
 CONTEXT_KEYS = (
     CONTEXT_PROJECT,
     CONTEXT_LOCATION,
@@ -145,7 +152,23 @@ CONTEXT_KEYS = (
     CONTEXT_TARGET_TEXT,
     CONTEXT_MASTER,
     CONTEXT_AUTOPILOT,
+    CONTEXT_PROJECT_READS,
 )
+# The reads under `project_reads`, named once for the report that makes them and the rules
+# that ask for them: three per project (`gcloud compute backend-services list`, `gcloud
+# compute instances list`, `gcloud container operations list`) and one per location (`gcloud
+# container get-server-config`, the read the version table already makes). Each entry is a
+# dict with `data` (the parsed JSON, None when the read failed) and `error` (None, or why).
+PROJECT_READ_BACKEND_SERVICES = "backend_services"
+PROJECT_READ_INSTANCES = "instances"
+PROJECT_READ_OPERATIONS = "operations"
+LOCATION_READ_SERVER_CONFIG = "server_config"
+PROJECT_READS = (PROJECT_READ_BACKEND_SERVICES, PROJECT_READ_INSTANCES, PROJECT_READ_OPERATIONS, LOCATION_READ_SERVER_CONFIG)
+PROJECT_READ_DATA_KEY = "data"
+PROJECT_READ_ERROR_KEY = "error"
+# What a rule reports when the context carries no such read at all (a context built by hand,
+# or a report older than the read): the rule grades what it has and says so.
+PROJECT_READ_NOT_MADE_REASON = "the {read} read was not made, so the rule could not grade it"
 
 # The kinds the reads carry, as `kind` spells them.
 KIND_POD = "Pod"
@@ -184,6 +207,12 @@ MIRROR_POD_ANNOTATION = "kubernetes.io/config.mirror"
 TERMINAL_PHASES = ("Succeeded", "Failed")
 NODE_READY_CONDITION = "Ready"
 CONDITION_TRUE = "True"
+# `spec.providerID` as GKE sets it, `gce://<project>/<zone>/<instance>`: the compute instance
+# behind the Node. The zone label is the fallback when a record carries no providerID.
+NODE_PROVIDER_ID_KEY = "providerID"
+PROVIDER_ID_SEPARATOR = "/"
+PROVIDER_ID_PARTS = 2  # the zone and the instance name, the last two path components
+NODE_ZONE_LABEL = "topology.kubernetes.io/zone"
 # Kubernetes resource quantities: a decimal number with an optional SI or binary suffix.
 QUANTITY_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([A-Za-z]*)$")
 BINARY_SUFFIXES = {"Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5, "Ei": 1024**6}
@@ -286,6 +315,22 @@ SHELL_FORK_MARK = " & "
 # a crafted container command from costing the report more than a bounded walk.
 SHELL_NESTING_CAP = 64
 PATH_SEPARATOR = "/"
+# RFC 3339 as the GKE and Compute APIs write it (`2026-10-09T16:04:01.300210096Z`): a fraction
+# of up to nine digits, which `datetime.fromisoformat` does not read whole, so the fraction is
+# cut to the six it reads; `Z` is UTC.
+RFC3339_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$")
+RFC3339_FRACTION_DIGITS = 6
+RFC3339_UTC_SUFFIX = "Z"
+ISO_UTC_OFFSET = "+00:00"
+# How an age prints in a finding: the two largest units that are not zero (`6d 3h`, `3h 12m`,
+# `12m`), and `under a minute` below one.
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+DURATION_UNITS = ((SECONDS_PER_DAY, "d"), (SECONDS_PER_HOUR, "h"), (SECONDS_PER_MINUTE, "m"))
+DURATION_UNITS_SHOWN = 2
+DURATION_UNDER_A_MINUTE = "under a minute"
+DURATION_JOIN = " "
 
 
 # -------------------------------------------------------------------- results and reads
@@ -354,6 +399,55 @@ def unread_kinds(read, kinds) -> dict:
 
 def items_of_kind(items, kind: str) -> list[dict]:
     return [item for item in items or [] if isinstance(item, dict) and item.get("kind") == kind]
+
+
+def parse_rfc3339(text) -> datetime | None:
+    """An aware datetime from an RFC 3339 timestamp as the GKE and Compute APIs write it,
+    or None when the text is not one."""
+    if not isinstance(text, str):
+        return None
+    m = RFC3339_RE.match(text.strip())
+    if not m:
+        return None
+    base, fraction, offset = m.groups()
+    fraction = (fraction or "")[:RFC3339_FRACTION_DIGITS]
+    offset = ISO_UTC_OFFSET if offset == RFC3339_UTC_SUFFIX else offset
+    try:
+        parsed = datetime.fromisoformat(f"{base}{'.' + fraction if fraction else ''}{offset}")
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def format_duration(seconds) -> str:
+    """`6d 3h`, `3h 12m`, `12m`: the two largest non-zero units of a duration in seconds;
+    `under a minute` below one minute."""
+    remaining = max(0, int(seconds))
+    parts = []
+    for unit_seconds, label in DURATION_UNITS:
+        count, remaining = divmod(remaining, unit_seconds)
+        if count:
+            parts.append(f"{count}{label}")
+    return DURATION_JOIN.join(parts[:DURATION_UNITS_SHOWN]) if parts else DURATION_UNDER_A_MINUTE
+
+
+def age_seconds(at: datetime, started: datetime) -> int:
+    """Seconds from `started` to `at`, never negative."""
+    return max(0, int((at - started).total_seconds()))
+
+
+def project_read(context, name: str) -> tuple:
+    """(data, error) of one of the report's project or location reads (PROJECT_READS) as the
+    context carries it: `(None, <reason>)` when the read failed, or when the context carries no
+    such read (PROJECT_READ_NOT_MADE_REASON), so a rule files one `unknown` either way."""
+    reads = context.get(CONTEXT_PROJECT_READS) if isinstance(context, dict) else None
+    entry = reads.get(name) if isinstance(reads, dict) else None
+    if not isinstance(entry, dict):
+        return None, PROJECT_READ_NOT_MADE_REASON.format(read=name)
+    error = entry.get(PROJECT_READ_ERROR_KEY)
+    if error:
+        return None, str(error)
+    return entry.get(PROJECT_READ_DATA_KEY), None
 
 
 # ------------------------------------------------------------------------- quantities
@@ -597,6 +691,32 @@ def node_allocatable(node: dict) -> tuple[int | None, int | None]:
 
 def node_pool(node: dict) -> str:
     return ((node.get("metadata") or {}).get("labels") or {}).get(tables.NODEPOOL_LABEL, "")
+
+
+def node_provider_id(node: dict) -> str:
+    """The node's `spec.providerID`, or an empty string."""
+    return str((node.get("spec") or {}).get(NODE_PROVIDER_ID_KEY) or "")
+
+
+def node_instance(node: dict) -> tuple[str, str]:
+    """(zone, instance name) of the compute instance behind a Node: from `spec.providerID`
+    (`gce://<project>/<zone>/<instance>`), else the node's zone label and its name, since a
+    GKE node is named for its instance; the zone is an empty string when neither says."""
+    provider_id = node_provider_id(node)
+    parts = provider_id.rstrip(PROVIDER_ID_SEPARATOR).split(PROVIDER_ID_SEPARATOR)
+    if provider_id and len(parts) > PROVIDER_ID_PARTS and parts[-1]:
+        return parts[-PROVIDER_ID_PARTS], parts[-1]
+    meta = node.get("metadata") or {}
+    return str((meta.get("labels") or {}).get(NODE_ZONE_LABEL) or ""), str(meta.get("name") or "")
+
+
+def node_ready(node: dict) -> str:
+    """The Ready condition's status as the record spells it (`True`, `False`, `Unknown`), or
+    an empty string when the node carries none."""
+    for condition in (node.get("status") or {}).get("conditions") or []:
+        if isinstance(condition, dict) and condition.get("type") == NODE_READY_CONDITION:
+            return str(condition.get("status") or "")
+    return ""
 
 
 def node_schedulable(node: dict) -> bool:

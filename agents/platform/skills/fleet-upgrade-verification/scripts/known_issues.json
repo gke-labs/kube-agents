@@ -1,0 +1,37 @@
+{
+  "generated": "2026-10-20",
+  "source": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues",
+  "newest_gke_version": "1.37.1-gke.1552000",
+  "issues": [
+    {
+      "id": "gke-metadata-server-oomkilled-tpu-gpu",
+      "gke_versions": [
+        { "from": "1.32.0-gke.1358000", "to": "1.32.4-gke.1106006" },
+        "1.32.4-gke.1236007",
+        "1.32.4-gke.1353001",
+        "1.32.4-gke.1415001",
+        "1.32.4-gke.1533000",
+        {
+          "from": "1.33.0-gke.0",
+          "to": "1.33.0-gke.1552000",
+          "to_exclusive": true
+        }
+      ],
+      "addon": "gke-metadata-server",
+      "addon_versions": [],
+      "summary": "gke-metadata-server is OOMKilled on TPU/GPU nodes",
+      "fixed_in": "1.32.4-gke.1353003 and later, 1.33.0-gke.1552000 and later",
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues",
+      "note": "The page lists 1.33.0-gke.1552000 both as the last identified version and as the first fixed one; the fixed reading is taken, so the range stops short of it."
+    },
+    {
+      "id": "pdcsi-driver-excessive-logging",
+      "gke_versions": ["1.32.4-gke.1236007", "1.32.4-gke.1353001"],
+      "addon": "gcp-compute-persistent-disk-csi-driver",
+      "addon_versions": [],
+      "summary": "The PDCSI driver might log excessively",
+      "fixed_in": "1.32.4-gke.1353003 and later",
+      "url": "https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues"
+    }
+  ]
+}

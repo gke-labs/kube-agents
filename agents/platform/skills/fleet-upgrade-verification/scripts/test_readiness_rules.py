@@ -652,3 +652,390 @@ class ShapeTablesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ------------------------------------------------------------- the incident rules (#3524)
+# Recorded inputs under testdata/: the dev project's backend services, instances, operations
+# and server config as gcloud returned them on 2026-10-20, the seeded-b cluster record and
+# nodes, and the kube-system and gmp-system add-ons, projected to the fields the rules read.
+
+import copy  # noqa: E402
+import json  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+from readiness_rules import cluster_status_age, control_plane_upgrade_history, known_issues_matrix, lb_connection_draining, orphan_node_objects, target_patch_valid  # noqa: E402
+
+TESTDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata")
+# The instant the fixtures were recorded at, so the operations' ages and the table's age read as they did that day.
+RECORDED_AT = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+DEV_PROJECT = "haoxuw-gke-dev"
+
+
+def recorded(name):
+    with open(os.path.join(TESTDATA, name), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def project_reads(**overrides):
+    """The context's project reads from the recorded files, each or any replaced by a test."""
+    files = {
+        shared.PROJECT_READ_BACKEND_SERVICES: "project_backend_services.json",
+        shared.PROJECT_READ_INSTANCES: "project_instances.json",
+        shared.PROJECT_READ_OPERATIONS: "project_operations.json",
+        shared.LOCATION_READ_SERVER_CONFIG: "server_config_us_central1_a.json",
+    }
+    reads = {name: {shared.PROJECT_READ_DATA_KEY: recorded(path), shared.PROJECT_READ_ERROR_KEY: None} for name, path in files.items()}
+    for name, value in overrides.items():
+        reads[name] = value if isinstance(value, dict) and set(value) == {shared.PROJECT_READ_DATA_KEY, shared.PROJECT_READ_ERROR_KEY} else {shared.PROJECT_READ_DATA_KEY: value, shared.PROJECT_READ_ERROR_KEY: None}
+    return reads
+
+
+def failed_read(reason="permission denied"):
+    return {shared.PROJECT_READ_DATA_KEY: None, shared.PROJECT_READ_ERROR_KEY: reason}
+
+
+def seeded_b():
+    return recorded("cluster_seeded_b.json")
+
+
+def context_for(record, target_text=None, at=RECORDED_AT, reads=None):
+    member = {"project": DEV_PROJECT, "location": record["location"], "cluster": record["name"], "target_version": target_text}
+    context = report.readiness_context(member, at, [record], [], parse_version(record.get("currentMasterVersion")), False, project_reads() if reads is None else reads)
+    context[shared.CONTEXT_RUN_CMD] = lambda cmd, timeout=None, env=None: (1, "", "no runner in the rule tests")
+    return context
+
+
+def seeded_b_read(extra_items=(), **kw):
+    return read(items=list(recorded("nodes_seeded_b.json")) + list(recorded("addons_seeded_b.json")) + list(extra_items), **kw)
+
+
+class SharedReadHelpersTest(unittest.TestCase):
+    def test_project_read_answers_data_an_error_or_a_missing_read(self):
+        reads = project_reads(**{shared.PROJECT_READ_INSTANCES: failed_read("timed out")})
+        context = {shared.CONTEXT_PROJECT_READS: reads}
+        data, error = shared.project_read(context, shared.PROJECT_READ_OPERATIONS)
+        self.assertIsNone(error)
+        self.assertEqual(len(data), 31)
+        self.assertEqual(shared.project_read(context, shared.PROJECT_READ_INSTANCES), (None, "timed out"))
+        self.assertEqual(shared.project_read({}, shared.PROJECT_READ_INSTANCES), (None, shared.PROJECT_READ_NOT_MADE_REASON.format(read="instances")))
+        self.assertEqual(shared.project_read({shared.CONTEXT_PROJECT_READS: "junk"}, shared.PROJECT_READ_INSTANCES)[0], None)
+        self.assertIn(shared.CONTEXT_PROJECT_READS, shared.CONTEXT_KEYS)
+        self.assertEqual(set(reads), set(shared.PROJECT_READS))
+
+    def test_rfc3339_durations_and_node_instances(self):
+        parsed = shared.parse_rfc3339("2026-10-09T16:04:01.300210096Z")
+        self.assertEqual(parsed, datetime(2026, 10, 9, 16, 4, 1, 300210, tzinfo=timezone.utc))
+        self.assertEqual(shared.parse_rfc3339("2026-10-09T16:04:01+02:00"), datetime(2026, 10, 9, 14, 4, 1, tzinfo=timezone.utc))
+        self.assertIsNone(shared.parse_rfc3339("yesterday"))
+        self.assertIsNone(shared.parse_rfc3339(None))
+        self.assertEqual(shared.format_duration(6 * 86400 + 3 * 3600 + 7), "6d 3h")
+        self.assertEqual(shared.format_duration(3 * 3600 + 12 * 60), "3h 12m")
+        self.assertEqual(shared.format_duration(12 * 60 + 59), "12m")
+        self.assertEqual(shared.format_duration(30), "under a minute")
+        self.assertEqual(shared.age_seconds(RECORDED_AT, RECORDED_AT + timedelta(hours=1)), 0)
+        first = recorded("nodes_seeded_b.json")[0]
+        self.assertEqual(shared.node_instance(first), ("us-central1-a", "gke-seeded-b-default-pool-4176890d-q0q0"))
+        self.assertEqual(shared.node_provider_id(first), "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-q0q0")
+        self.assertEqual(shared.node_ready(first), "True")
+        bare = node("gke-x-default-pool-abc-1234", "default-pool", labels={shared.NODE_ZONE_LABEL: "us-east4-b"})
+        self.assertEqual(shared.node_instance(bare), ("us-east4-b", "gke-x-default-pool-abc-1234"))
+        self.assertEqual(shared.node_instance(node("n", "p")), ("", "n"))
+        self.assertEqual(shared.node_ready({"status": {}}), "")
+
+
+class LbConnectionDrainingRuleTest(unittest.TestCase):
+    def planted(self, timeout=3600, region=None, group=None):
+        """A backend service as the fixture plants it: the seeded-b default pool's instance group, draining 3600 s."""
+        record = seeded_b()
+        group = group or record["nodePools"][0]["instanceGroupUrls"][0].replace("instanceGroupManagers", "instanceGroups")
+        service = {"name": "drain-timeout-seeded-b", "selfLink": "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/global/backendServices/drain-timeout-seeded-b", "connectionDraining": {"drainingTimeoutSec": timeout}, "backends": [{"balancingMode": "UTILIZATION", "group": group}]}
+        if region:
+            service["region"] = f"https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/regions/{region}"
+        return service
+
+    def test_the_dev_projects_backend_services_match_no_pool_and_the_note_counts_them(self):
+        record = seeded_b()
+        result = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record))
+        self.assertEqual((result["blocking"], result["risks"], result["unknown"]), ([], [], []))
+        # The two ILB services sit on `k8s-ig--` groups, which the rule does not match: counted in the total, not as matched.
+        self.assertEqual(result["notes"], ["no backend service on this cluster's pools or NEGs drains for more than 600 s (0 matched of 2 in the project)"])
+
+    def test_a_backend_service_on_the_pool_above_the_wait_is_a_blocker_with_the_command(self):
+        record = seeded_b()
+        reads = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: recorded("project_backend_services.json") + [self.planted()]})
+        result = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=reads))
+        self.assertEqual(len(result["blocking"]), 1)
+        finding = result["blocking"][0]
+        self.assertEqual((finding["backend_service"], finding["timeout_seconds"], finding["pool"], finding["scope"]), ("drain-timeout-seeded-b", 3600, "default-pool", "--global"))
+        text = lb_connection_draining.describe(finding)
+        self.assertTrue(text.startswith("BackendService drain-timeout-seeded-b drains for 3600 s on pool default-pool; GKE waits 600 s per node during an upgrade, so each surge node's drain times out"), text)
+        self.assertIn("`gcloud compute backend-services update drain-timeout-seeded-b --global --connection-draining-timeout=600`", text)
+        self.assertEqual(result["notes"], [])
+        # A regional service names its region in the command; one at the wait is clean.
+        regional = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: [self.planted(region="us-central1")]})
+        finding = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=regional))["blocking"][0]
+        self.assertIn("--region us-central1 --connection-draining-timeout=600", finding["action"])
+        at_wait = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: [self.planted(timeout=600)]})
+        result = lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=at_wait))
+        self.assertEqual(result["blocking"], [])
+        self.assertEqual(result["notes"], ["no backend service on this cluster's pools or NEGs drains for more than 600 s (1 matched of 1 in the project)"])
+        # The pool's manager URL spells the group the same way: matched either way.
+        manager_url = record["nodePools"][0]["instanceGroupUrls"][0]
+        as_manager = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: [self.planted(group=manager_url)]})
+        self.assertEqual(len(lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=as_manager))["blocking"]), 1)
+        # Another cluster's pool is not this cluster's finding.
+        other = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: [self.planted(group="https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/instanceGroups/gke-seeded-a-default-pool-0000-grp")]})
+        self.assertEqual(lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=other))["blocking"], [])
+
+    def test_a_neg_the_cluster_annotates_is_matched_to_its_service(self):
+        record = seeded_b()
+        neg_service = {"kind": "Service", "metadata": {"namespace": "shop", "name": "web", "annotations": {"cloud.google.com/neg-status": json.dumps({"network_endpoint_groups": {"80": "k8s1-abc-shop-web-80-def"}, "zones": ["us-central1-a"]})}}}
+        neg_url = "https://www.googleapis.com/compute/v1/projects/haoxuw-gke-dev/zones/us-central1-a/networkEndpointGroups/k8s1-abc-shop-web-80-def"
+        reads = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: [self.planted(group=neg_url)]})
+        with_services = seeded_b_read()
+        with_services["webhook_items"] = [neg_service]
+        result = lb_connection_draining.evaluate(record, {}, with_services, None, context_for(record, reads=reads))
+        self.assertEqual((result["blocking"][0]["service"], result["blocking"][0]["pool"]), ("shop/web", None))
+        self.assertIn("on NEG k8s1-abc-shop-web-80-def of Service shop/web", lb_connection_draining.describe(result["blocking"][0]))
+        # Services not read: the NEG half is unknown only when a NEG backend was seen.
+        unread = seeded_b_read()
+        unread["webhook_items"], unread["webhook_error"] = None, "timed out"
+        result = lb_connection_draining.evaluate(record, {}, unread, None, context_for(record, reads=reads))
+        self.assertEqual(result["blocking"], [])
+        self.assertEqual(result["unknown"], ["the Services were not read (timed out), so a NEG-backed backend service was not matched"])
+        self.assertEqual(lb_connection_draining.evaluate(record, {}, unread, None, context_for(record))["unknown"], [])
+
+    def test_a_failed_or_missing_read_is_unknown(self):
+        record = seeded_b()
+        failed = project_reads(**{shared.PROJECT_READ_BACKEND_SERVICES: failed_read("gcloud compute backend-services list failed (1): forbidden")})
+        self.assertEqual(lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=failed))["unknown"], ["gcloud compute backend-services list failed (1): forbidden"])
+        self.assertEqual(lb_connection_draining.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads={}))["unknown"], [shared.PROJECT_READ_NOT_MADE_REASON.format(read="backend_services")])
+        self.assertTrue(lb_connection_draining.CAN_BLOCK)
+        self.assertEqual((lb_connection_draining.RULE_ID, lb_connection_draining.ENTRY), ("lb-connection-draining", 21))
+
+
+class OrphanNodeObjectsRuleTest(unittest.TestCase):
+    def test_the_recorded_nodes_are_live_and_the_note_counts_them(self):
+        record = seeded_b()
+        result = orphan_node_objects.evaluate(record, {}, seeded_b_read(), None, context_for(record))
+        self.assertEqual((result["blocking"], result["unknown"]), ([], []))
+        self.assertEqual(result["notes"], ["0 orphan Node(s) (2 nodes, 19 instances in the project)"])
+
+    def test_a_node_with_no_instance_behind_it_is_a_blocker_naming_its_state(self):
+        record = seeded_b()
+        ghost = copy.deepcopy(recorded("nodes_seeded_b.json")[0])
+        ghost["metadata"]["name"] = "gke-seeded-b-default-pool-4176890d-ghost"
+        ghost["spec"]["providerID"] = "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-ghost"
+        ghost["spec"]["unschedulable"] = True
+        ghost["status"]["conditions"] = [{"type": "Ready", "status": "Unknown"}]
+        result = orphan_node_objects.evaluate(record, {}, seeded_b_read([ghost]), None, context_for(record))
+        self.assertEqual(len(result["blocking"]), 1)
+        finding = result["blocking"][0]
+        self.assertEqual((finding["node"], finding["ready"], finding["unschedulable"], finding["action"]), ("gke-seeded-b-default-pool-4176890d-ghost", "Unknown", True, "kubectl delete node gke-seeded-b-default-pool-4176890d-ghost"))
+        self.assertEqual(orphan_node_objects.describe(finding), "Node gke-seeded-b-default-pool-4176890d-ghost names no instance in the project (providerID gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-ghost; Ready=Unknown; unschedulable=true): a pool upgrade waits on it; delete the Node object: `kubectl delete node gke-seeded-b-default-pool-4176890d-ghost`")
+        self.assertEqual(result["notes"], ["1 orphan Node(s) (3 nodes, 19 instances in the project)"])
+        # The join is on the zone too: the same instance name in another zone is not this node's instance.
+        moved = copy.deepcopy(recorded("nodes_seeded_b.json")[0])
+        moved["spec"]["providerID"] = moved["spec"]["providerID"].replace("us-central1-a", "us-central1-b")
+        result = orphan_node_objects.evaluate(record, {}, read(items=[moved]), None, context_for(record))
+        self.assertEqual([f["node"] for f in result["blocking"]], [moved["metadata"]["name"]])
+        # A node with no providerID is joined by its name alone, as the report's older node records are.
+        bare = node("gke-seeded-b-no-surge-pool-235d7913-2jpr", "no-surge-pool")
+        self.assertEqual(orphan_node_objects.evaluate(record, {}, read(items=[bare]), None, context_for(record))["blocking"], [])
+        self.assertEqual(len(orphan_node_objects.evaluate(record, {}, read(items=[node("gke-nowhere-1", "p")]), None, context_for(record))["blocking"]), 1)
+
+    def test_an_unread_node_list_or_instance_list_is_unknown(self):
+        record = seeded_b()
+        result = orphan_node_objects.evaluate(record, {}, read(items=[], read_errors={"node": "nodes is forbidden"}), None, context_for(record))
+        self.assertEqual(result["unknown"], ["the Nodes were not read (nodes is forbidden), so no Node could be checked against the instances"])
+        failed = project_reads(**{shared.PROJECT_READ_INSTANCES: failed_read("instances list cut at the cap")})
+        self.assertEqual(orphan_node_objects.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=failed))["unknown"], ["instances list cut at the cap"])
+        self.assertEqual((orphan_node_objects.RULE_ID, orphan_node_objects.ENTRY, orphan_node_objects.CAN_BLOCK), ("orphan-node-objects", 22, True))
+
+
+class ClusterStatusAgeRuleTest(unittest.TestCase):
+    NEWEST_OPERATION = "operation-1791398047406-3b2d8556-49f0-4c69-b3ed-8df036a6352e"  # seeded-b's newest recorded operation (UPDATE_CLUSTER, 2026-10-07T18:34:07Z, right after its UPGRADE_MASTER)
+
+    def test_a_running_cluster_notes_its_newest_operation(self):
+        record = seeded_b()
+        result = cluster_status_age.evaluate(record, {}, None, None, context_for(record))
+        self.assertEqual((result["blocking"], result["unknown"]), ([], []))
+        self.assertEqual(result["notes"], [f"status RUNNING; newest operation {self.NEWEST_OPERATION} (UPDATE_CLUSTER, started 2026-10-07T18:34:07.406867503Z, 12d 17h ago)"])
+
+    def test_a_status_other_than_running_blocks_past_the_threshold_and_is_noted_under_it(self):
+        record = {**seeded_b(), "status": "RECONCILING"}
+        result = cluster_status_age.evaluate(record, {}, None, None, context_for(record))
+        self.assertEqual(len(result["blocking"]), 1)
+        finding = result["blocking"][0]
+        self.assertEqual((finding["status"], finding["operation"], finding["operation_type"], finding["threshold_seconds"]), ("RECONCILING", self.NEWEST_OPERATION, "UPDATE_CLUSTER", 4 * 3600))
+        text = cluster_status_age.describe(finding)
+        self.assertTrue(text.startswith(f"seeded-b has been RECONCILING for 12d 17h on {self.NEWEST_OPERATION} (UPDATE_CLUSTER, started 2026-10-07T18:34:07.406867503Z), past the 4h threshold; freeze changes; past a few hours open a support case quoting the operation id"), text)
+        self.assertIn("Stuck operation section", text)
+        # Two hours into the same operation: a reconcile in progress, noted and not a blocker.
+        soon = datetime(2026, 10, 7, 20, 0, tzinfo=timezone.utc)
+        result = cluster_status_age.evaluate(record, {}, None, None, context_for(record, at=soon))
+        self.assertEqual(result["blocking"], [])
+        self.assertEqual(result["notes"], [f"status RECONCILING for 1h 25m on {self.NEWEST_OPERATION} (UPDATE_CLUSTER, started 2026-10-07T18:34:07.406867503Z); under the 4h threshold a reconcile in progress is not a blocker"])
+        # No operation of the cluster listed at all: the status has stood longer than the list reaches.
+        none_listed = project_reads(**{shared.PROJECT_READ_OPERATIONS: []})
+        result = cluster_status_age.evaluate({**record, "status": "DEGRADED"}, {}, None, None, context_for(record, reads=none_listed))
+        self.assertEqual(result["blocking"][0]["operation"], None)
+        self.assertEqual(cluster_status_age.describe(result["blocking"][0]), "seeded-b has been DEGRADED longer than the operations list reaches (no operation of this cluster is listed); " + cluster_status_age.ACTION)
+        self.assertEqual(cluster_status_age.evaluate(seeded_b(), {}, None, None, context_for(record, reads=none_listed))["notes"], ["status RUNNING; no operation of this cluster is listed"])
+
+    def test_an_unread_operations_list_is_unknown_only_when_the_status_needs_it(self):
+        record = seeded_b()
+        failed = project_reads(**{shared.PROJECT_READ_OPERATIONS: failed_read("operations list failed (1): forbidden")})
+        self.assertEqual(cluster_status_age.evaluate(record, {}, None, None, context_for(record, reads=failed))["notes"], ["status RUNNING; the operations were not read (operations list failed (1): forbidden)"])
+        result = cluster_status_age.evaluate({**record, "status": "ERROR"}, {}, None, None, context_for(record, reads=failed))
+        self.assertEqual(result["unknown"], ["status ERROR; the operations were not read (operations list failed (1): forbidden), so how long it has stood is unknown"])
+        self.assertEqual((cluster_status_age.RULE_ID, cluster_status_age.ENTRY, cluster_status_age.CAN_BLOCK), ("cluster-status-age", 5, True))
+
+
+class TargetPatchValidRuleTest(unittest.TestCase):
+    def test_a_valid_target_and_a_listed_control_plane_are_a_note(self):
+        record = {**seeded_b(), "currentMasterVersion": "1.35.8-gke.1626001"}
+        result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.36.4-gke.1391002"))
+        self.assertEqual((result["blocking"], result["risks"], result["unknown"]), ([], [], []))
+        self.assertEqual(result["notes"], ["channel REGULAR; target 1.36.4-gke.1391002 valid; control plane 1.35.8-gke.1626001 listed in validVersions at us-central1-a"])
+
+    def test_a_withdrawn_target_is_a_blocker_and_a_dropped_running_patch_a_risk(self):
+        # seeded-b as recorded: its master, 1.34.12-gke.1011000, is no longer among REGULAR's
+        # validVersions, though validMasterVersions still carries it, which is the exemption
+        # this rule refuses.
+        record = seeded_b()
+        config = recorded("server_config_us_central1_a.json")
+        self.assertIn(record["currentMasterVersion"], config["validMasterVersions"])
+        result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.36.4-gke.1391002"))
+        self.assertEqual(result["blocking"], [])
+        # REGULAR still lists an older 1.34 patch (1.34.11-gke.1209000), which is no target for a
+        # cluster on 1.34.12: the action names the next active version above it instead.
+        regular = sorted((v for v in next(c for c in config["channels"] if c["channel"] == "REGULAR")["validVersions"] if target_patch_valid.parse_version(v) > target_patch_valid.parse_version("1.34.12-gke.1011000")), key=target_patch_valid.parse_version)
+        self.assertEqual([(f["kind"], f["version"], f["newest"], f["next_version"]) for f in result["risks"]], [("control-plane", "1.34.12-gke.1011000", None, regular[0])])
+        self.assertEqual(target_patch_valid.describe(result["risks"][0]), f"control plane 1.34.12-gke.1011000 is not among the REGULAR channel's validVersions at us-central1-a (the channel has moved past it, whatever another channel still lists); no active patch of 1.34 at or above it on REGULAR; the next active version is {regular[0]}")
+        self.assertEqual(result["notes"], ["channel REGULAR; target 1.36.4-gke.1391002 valid; control plane 1.34.12-gke.1011000 not listed in validVersions at us-central1-a"])
+        # A target the channel does not list, and no node version either (a 1.35 patch pulled
+        # before the window): a blocker naming the newest active patch of its minor.
+        self.assertNotIn("1.35.8-gke.1000000", config["validNodeVersions"])
+        result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.35.8-gke.1000000"))
+        self.assertEqual([(f["kind"], f["version"], f["newest"]) for f in result["blocking"]], [("target", "1.35.8-gke.1000000", "1.35.8-gke.1626001")])
+        self.assertEqual(target_patch_valid.describe(result["blocking"][0]), "target 1.35.8-gke.1000000 is in neither the REGULAR channel's validVersions nor validNodeVersions at us-central1-a: a withdrawn patch stays selectable and a node pool upgrade to it fails on an image the provider no longer serves; target the newest active patch of the minor on REGULAR: 1.35.8-gke.1626001")
+        self.assertIn("target 1.35.8-gke.1000000 withdrawn", result["notes"][0])
+        # A target the channel dropped but validNodeVersions still serves is valid for a pool: no blocker.
+        node_only = next(v for v in config["validNodeVersions"] if v not in next(c for c in config["channels"] if c["channel"] == "REGULAR")["validVersions"])
+        self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=node_only))["blocking"], [])
+
+    def test_no_channel_unknown_channel_and_a_failed_read(self):
+        record = {**seeded_b(), "releaseChannel": {"channel": "UNSPECIFIED"}}
+        result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.36.4-gke.1391002"))
+        self.assertEqual(result["risks"], [])  # validMasterVersions still carries the running patch
+        self.assertTrue(result["notes"][0].startswith("channel no channel; target 1.36.4-gke.1391002 valid; control plane 1.34.12-gke.1011000 listed"))
+        record = {**seeded_b(), "releaseChannel": {"channel": "WEEKLY"}}
+        self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record))["unknown"], ["channel WEEKLY is not in get-server-config for us-central1-a, so the valid versions are unknown"])
+        failed = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: failed_read("get-server-config failed for us-central1-a")})
+        self.assertEqual(target_patch_valid.evaluate(seeded_b(), {}, None, None, context_for(seeded_b(), reads=failed))["unknown"], ["get-server-config failed for us-central1-a"])
+        self.assertEqual(target_patch_valid.active_versions_above("1.35.0-gke.1", ["1.35.8-gke.1626001", "1.35.8-gke.1439001", "1.36.4-gke.1391002"]), ("1.35.8-gke.1626001", "1.35.8-gke.1439001"))
+        self.assertEqual(target_patch_valid.active_versions_above("1.37.0-gke.1", ["1.36.4-gke.1391002"]), (None, None))
+        self.assertEqual(target_patch_valid.action_text({"version": "1.37.0-gke.1", "channel": "REGULAR", "newest": None, "next_version": None}), "no active version at or above it on REGULAR")
+        self.assertEqual((target_patch_valid.RULE_ID, target_patch_valid.ENTRY, target_patch_valid.CAN_BLOCK), ("target-patch-valid", 10, True))
+
+
+class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
+    def host(self):
+        return {"name": "platform-agent-host", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.8-gke.1439001", "releaseChannel": {"channel": "REGULAR"}, "nodePools": []}
+
+    def test_the_recorded_capacity_failure_is_a_risk_with_the_window(self):
+        record = self.host()
+        result = control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record))
+        self.assertEqual(len(result["risks"]), 1)
+        finding = result["risks"][0]
+        self.assertEqual((finding["operation_type"], finding["date"], finding["window"], finding["location"]), ("UPGRADE_MASTER", "2026-10-09", "none", "us-central1"))
+        self.assertEqual(control_plane_upgrade_history.describe(finding), "UPGRADE_MASTER on 2026-10-09 failed on compute capacity in us-central1 (Try a different location, or try again later: Google Compute Engine does not have enough resources available to fulfill request: us-central1.); maintenance window: none; set a maintenance window in an off-peak hour for the region and retry the upgrade in it; keep upgrade notifications consumed so a failed attempt is a message the same day")
+        self.assertEqual(result["notes"], ["1 capacity failure(s) among 3 upgrade or repair operation(s) in the last 90 days; maintenance window none"])
+        self.assertEqual(result["blocking"], [])
+        # A window set: named. Outside the lookback: not counted.
+        windowed = {**record, "maintenancePolicy": {"window": {"recurringWindow": {"window": {"startTime": "2026-01-03T01:00:00Z", "endTime": "2026-01-03T05:00:00Z"}, "recurrence": "FREQ=WEEKLY;BYDAY=SA,SU"}}}}
+        self.assertEqual(control_plane_upgrade_history.evaluate(windowed, {}, None, None, context_for(windowed))["risks"][0]["window"], "recurring FREQ=WEEKLY;BYDAY=SA,SU from 2026-01-03T01:00:00Z")
+        later = control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record, at=RECORDED_AT + timedelta(days=91)))
+        self.assertEqual(later["notes"], ["0 capacity failure(s) among 0 upgrade or repair operation(s) in the last 90 days; maintenance window none"])
+
+    def test_seeded_b_has_no_capacity_failure_and_a_daily_window(self):
+        record = seeded_b()
+        result = control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record))
+        self.assertEqual(result["risks"], [])
+        self.assertEqual(result["notes"], ["0 capacity failure(s) among 1 upgrade or repair operation(s) in the last 90 days; maintenance window daily at 03:00 UTC for PT4H0M0S"])
+        for message in ("ZONE_RESOURCE_POOL_EXHAUSTED", "Stockout in zone", "Insufficient quota"):
+            self.assertTrue(control_plane_upgrade_history.names_capacity(message), message)
+        self.assertFalse(control_plane_upgrade_history.names_capacity("operation aborted by the user"))
+        failed = project_reads(**{shared.PROJECT_READ_OPERATIONS: failed_read("operations list failed (1): forbidden")})
+        self.assertEqual(control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record, reads=failed))["unknown"], ["the operations were not read (operations list failed (1): forbidden), so the upgrade history is unknown"])
+        self.assertEqual((control_plane_upgrade_history.RULE_ID, control_plane_upgrade_history.ENTRY, control_plane_upgrade_history.CAN_BLOCK), ("control-plane-upgrade-history", 2, False))
+
+
+class KnownIssuesMatrixRuleTest(unittest.TestCase):
+    def test_the_inventory_lists_the_recorded_addons_by_image_and_tag(self):
+        addons = known_issues_matrix.inventory(seeded_b_read())
+        by_image = {(row["namespace"], row["kind"], row["name"], row["container"]): (row["image"], row["tag"]) for row in addons}
+        self.assertEqual(by_image[("kube-system", "DaemonSet", "gke-metadata-server", "gke-metadata-server")], ("gke-metadata-server", "gke_metadata_server_20260105.01_p0"))
+        self.assertEqual(by_image[("gmp-system", "Deployment", "gmp-operator", "operator")], ("operator", "v0.17.6-gke.0"))
+        self.assertEqual(by_image[("kube-system", "DaemonSet", "pdcsi-node", "gce-pd-driver")], ("gcp-compute-persistent-disk-csi-driver", "v1.23.1-gke.37"))
+        self.assertTrue(all(row["namespace"] in ("kube-system", "gmp-system") for row in addons))
+        self.assertEqual(len(addons), len({tuple(sorted(row.items())) for row in addons}))
+        self.assertEqual(known_issues_matrix.inventory(read(items=[])), [])
+        self.assertIn("fluent-bit v0.0.422-gke.21", known_issues_matrix.inventory_cell(addons))
+        self.assertEqual(known_issues_matrix.inventory_cell([]), "none")
+
+    def test_the_shipped_table_loads_and_the_recorded_cluster_matches_nothing(self):
+        table, error = known_issues_matrix.load_table()
+        self.assertIsNone(error)
+        self.assertEqual(set(table) >= {"generated", "source", "issues", "newest_gke_version"}, True)
+        for issue in table["issues"]:
+            self.assertEqual(set(issue) >= {"id", "gke_versions", "addon", "addon_versions", "summary", "fixed_in", "url"}, True, issue["id"])
+            self.assertTrue(issue["url"].startswith("https://"), issue["id"])
+        record = seeded_b()
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4-gke.1391002"))
+        self.assertEqual((result["blocking"], result["risks"], result["unknown"]), ([], [], []))
+        self.assertEqual(result["notes"], [f"{len(known_issues_matrix.inventory(seeded_b_read()))} add-on(s) inventoried in kube-system, gmp-system; 0 known issue(s) match GKE 1.34.12-gke.1011000 or target 1.36.4-gke.1391002; table generated {table['generated']} ({len(table['issues'])} issue(s))"])
+
+    def test_a_running_or_target_version_on_a_published_issue_is_a_risk_naming_the_fix(self):
+        record = {**seeded_b(), "currentMasterVersion": "1.32.4-gke.1236007"}
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.32.4-gke.1353003"))
+        running = [f for f in result["risks"] if f["kind"] == "running"]
+        self.assertEqual(sorted(f["issue"] for f in running), ["gke-metadata-server-oomkilled-tpu-gpu", "pdcsi-driver-excessive-logging"])
+        text = known_issues_matrix.describe(next(f for f in running if f["issue"] == "pdcsi-driver-excessive-logging"))
+        self.assertEqual(text, "known issue pdcsi-driver-excessive-logging (The PDCSI driver might log excessively) applies to GKE 1.32.4-gke.1236007 with gcp-compute-persistent-disk-csi-driver v1.23.1-gke.37; fixed in 1.32.4-gke.1353003 and later: https://docs.cloud.google.com/kubernetes-engine/docs/troubleshooting/known-issues")
+        self.assertEqual([f for f in result["risks"] if f["kind"] == "target"], [])  # the fixed version is not a match
+        # A target inside the range is a target risk; the range's exclusive end is not.
+        result = known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text="1.33.0-gke.1000000"))
+        self.assertEqual([(f["kind"], f["issue"]) for f in result["risks"]], [("target", "gke-metadata-server-oomkilled-tpu-gpu")])
+        self.assertTrue(known_issues_matrix.describe(result["risks"][0]).startswith("target 1.33.0-gke.1000000 lands on known issue gke-metadata-server-oomkilled-tpu-gpu"))
+        self.assertEqual(known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text="1.33.0-gke.1552000"))["risks"], [])
+        # Without the add-on in the inventory the issue does not apply.
+        without = read(items=[row for row in recorded("addons_seeded_b.json") if row["metadata"]["name"] not in ("gke-metadata-server", "pdcsi-node", "pdcsi-node-windows")])
+        self.assertEqual(known_issues_matrix.evaluate(record, {}, without, None, context_for(record))["risks"], [])
+        self.assertTrue(known_issues_matrix.version_matches("1.32.4-gke.1000000", {"from": "1.32.0-gke.1358000", "to": "1.32.4-gke.1106006"}))
+        self.assertFalse(known_issues_matrix.version_matches("1.32.4-gke.1106007", {"from": "1.32.0-gke.1358000", "to": "1.32.4-gke.1106006"}))
+        self.assertFalse(known_issues_matrix.version_matches("junk", "junk-too"))
+
+    def test_a_stale_table_is_a_risk_by_age_and_by_version(self):
+        record = seeded_b()
+        later = context_for(record, at=RECORDED_AT + timedelta(days=45))
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, later)
+        self.assertEqual([f["kind"] for f in result["risks"]], ["stale-age"])
+        self.assertIn("known-issues table is stale: generated 2026-10-20, 45 days ago, past 30 days", known_issues_matrix.describe(result["risks"][0]))
+        newer = copy.deepcopy(recorded("server_config_us_central1_a.json"))
+        newer["channels"][0]["validVersions"].insert(0, "1.38.0-gke.1")
+        reads = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: newer})
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, reads=reads))
+        self.assertEqual([f["kind"] for f in result["risks"]], ["stale-version"])
+        self.assertIn("before 1.38.0-gke.1 was listed", known_issues_matrix.describe(result["risks"][0]))
+        # A failed DaemonSet read: the inventory lists Deployments only, said as unknown (and the rule cannot block).
+        result = known_issues_matrix.evaluate(record, {}, read(items=recorded("addons_seeded_b.json"), read_errors={"daemonset": "forbidden"}), None, context_for(record))
+        self.assertEqual(result["unknown"], ["the DaemonSets were not read (forbidden), so the add-on inventory lists Deployments only"])
+        self.assertFalse(known_issues_matrix.CAN_BLOCK)
+        self.assertEqual((known_issues_matrix.RULE_ID, known_issues_matrix.ENTRY), ("known-issues-matrix", 10))
+
+
+class RegistryOrderTest(unittest.TestCase):
+    def test_the_incident_rules_are_registered_by_entry(self):
+        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix", "zonal-control-plane", "lb-connection-draining", "orphan-node-objects"])
