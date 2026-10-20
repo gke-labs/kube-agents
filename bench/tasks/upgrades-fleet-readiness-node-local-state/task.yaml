@@ -130,6 +130,9 @@ verification_spec:
   # verdict says. Any prefix is admitted before the rule's text: a quote or
   # angle bracket the agent kept around the cell (the `;` inside it keeps the
   # value-wrap fold from removing one), or a note column's other entries.
+  # The required text stops before the cell's first `; ` (inside `(emptyDir;
+  # the name suggests state)`), which the prompt tells the agent to split a
+  # column on: an agent that cuts there still carries the rule's wording.
   - name: cache-on-emptydir-line-quotes-the-reports-cell
     role: objective
     mode: assert
@@ -139,9 +142,9 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?data-on-the-node: deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir; the name suggests state\)[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?data-on-the-node: deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir[^\n]*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?data-on-the-node: deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir; the name suggests state\))[^\n]*$'
+        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?data-on-the-node: deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.
