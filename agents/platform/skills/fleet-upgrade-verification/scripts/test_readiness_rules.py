@@ -1304,6 +1304,36 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
         without = read(items=[row for row in recorded("addons_seeded_b.json") if row["metadata"]["name"] not in ("pdcsi-node", "pdcsi-node-windows")])
         self.assertNotIn("excessive-volume-group-logging", {f["issue"] for f in known_issues_matrix.evaluate(record, {}, without, None, context_for(record))["risks"]})
 
+    def test_a_target_without_its_build_is_graded_against_the_builds_the_channel_lists(self):
+        # REGULAR lists 1.36.4-gke.1495002 and 1.36.4-gke.1391002 (recorded): `--target-version 1.36.4` is one of them.
+        record = seeded_b()
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4"))
+        target_risks = {f["issue"] for f in result["risks"] if f["kind"] == "target"}
+        # The row whose 1.36 spec ends at 1.36.4-gke.1391002 (its fix) affects neither build: no risk, no partial note (build 0 would have matched).
+        self.assertNotIn("workload-identity-post-token-bad-request", target_risks)
+        self.assertFalse(any("workload-identity-post-token-bad-request" in n for n in result["notes"][1:]))
+        self.assertIn("or target 1.36.4 (", result["notes"][0])
+        table = {"generated": "2026-10-20", "source": self.PAGE, "newest_gke_version": "1.37.1-gke.1", "issues": [
+            {"id": "one-build", "summary": "one build of the patch", "gke_versions": ["1.36.4-gke.1391002"], "addon": None, "addon_versions": [], "fixed_in": "1.36.4-gke.1495002 and later", "url": self.PAGE + "#one-build"},
+            {"id": "whole-minor", "summary": "the whole minor", "gke_versions": [{"minor": "1.36"}], "addon": None, "addon_versions": [], "fixed_in": "1.37.0-gke.1 and later", "url": self.PAGE + "#whole-minor"},
+            {"id": "open-from", "summary": "open from the minor", "gke_versions": [{"from_minor": "1.36"}], "addon": None, "addon_versions": [], "fixed_in": "TBD", "url": self.PAGE + "#open-from"},
+        ]}
+        with patch.object(known_issues_matrix, "load_table", return_value=(table, None)):
+            result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4"))
+        self.assertEqual([(f["kind"], f["issue"], f["version"]) for f in result["risks"]], [("target", "whole-minor", "1.36.4")])  # every listed build affected: the target's risk
+        self.assertIn("1 known issue(s) match GKE 1.34.12-gke.1011000 or target 1.36.4 (1 open issue(s) with no published fix noted)", result["notes"][0])
+        self.assertEqual(result["notes"][1], f"1 open known issue(s) with no published fix on GKE 1.36.4, noted and not graded as risks: open-from; each is on {self.PAGE}")
+        self.assertEqual(result["notes"][2], f"target 1.36.4 is graded against the 2 listed build(s) of its patch (1.36.4-gke.1495002, 1.36.4-gke.1391002); known issue one-build (one build of the patch) affects 1.36.4-gke.1391002 of them, so whether the upgrade lands on it depends on the build picked; a target with its build says which: {self.PAGE}#one-build")
+        # A target with its build stays exact: the one-build row is its risk.
+        with patch.object(known_issues_matrix, "load_table", return_value=(table, None)):
+            exact = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4-gke.1391002"))
+        self.assertEqual(sorted((f["kind"], f["issue"]) for f in exact["risks"]), [("target", "one-build"), ("target", "whole-minor")])
+        # A patch the channel lists no build of: a note, no target grade.
+        with patch.object(known_issues_matrix, "load_table", return_value=(table, None)):
+            none = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.9"))
+        self.assertEqual([f for f in none["risks"] if f["kind"] == "target"], [])
+        self.assertEqual(none["notes"][-1], "target 1.36.9 names no build the REGULAR channel lists at us-central1-a, so the table was not read for it; a target with its build is graded")
+
     def test_the_version_grammar(self):
         vm = known_issues_matrix.version_matches
         self.assertTrue(vm("1.32.4-gke.1236007", "1.32.4-gke.1236007"))

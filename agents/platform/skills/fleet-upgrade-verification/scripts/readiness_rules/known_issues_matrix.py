@@ -21,7 +21,12 @@ later"; `all_versions`), the add-on image it is in where the page names one the 
 carries, and the page anchor. One risk when the cluster's control-plane version is in an
 issue's versions and the add-on it names is in the inventory (at a listed tag, or at any tag
 when the issue lists none; an issue naming no add-on matches by version alone); one more when
-the member's target version would land on one. The grade is the matched spec's: a match
+the member's target version would land on one. A target given without its build
+(`MAJOR.MINOR.PATCH`, which the API reads as the patch's newest listed build) is graded against
+every build of the patch the cluster's channel lists: an issue that affects all of them is the
+target's risk or open note as for a full version, one that affects some is a note naming the
+affected builds, and a patch the channel lists no build of is a note and no grade. The grade is
+the matched spec's: a match
 through a spec with no upper bound (`all_versions`, `from_minor`, `from` with no `to`), which
 stands on every later version until the page changes, is a note on the member naming the
 open issue, not a risk, and is not counted among the matches; a match through a bounded spec
@@ -39,19 +44,22 @@ from datetime import date
 from readiness_rules import (
     CONTEXT_ADDONS,
     CONTEXT_AT,
+    CONTEXT_LOCATION,
     CONTEXT_TARGET_TEXT,
     KIND_DAEMONSET,
     KIND_DEPLOYMENT,
     LIST_SEPARATOR,
     NAMESPACED_READ_KINDS,
+    LOCATION_READ_SERVER_CONFIG,
     containers,
     image_repository_and_tag,
     new_result,
     pod_template_spec,
+    project_read,
     read_error,
     read_items,
 )
-from readiness_rules.target_patch_valid import parse_version
+from readiness_rules.target_patch_valid import BUILD_SEPARATOR, CHANNEL_KEY, NO_CHANNEL_LABEL, NO_CHANNEL_VALUES, RELEASE_CHANNEL_KEY, channel_roster, parse_version
 
 RULE_ID = "known-issues-matrix"
 ENTRY = 10
@@ -107,6 +115,12 @@ TARGET_ADVICE = "target a fixed patch or hold"
 TARGET_ADVICE_NO_FIX = "hold"
 RUNNING_FORMAT = "known issue {id} ({summary}) applies to GKE {version} {addon_text}; {fix_text}: {url}"
 TARGET_FORMAT = "target {version} lands on known issue {id} ({summary}) {addon_text}; {fix_text}; {advice}: {url}"
+# A build-less target against the builds of its patch the channel lists.
+GRADE_RISK = "risk"
+GRADE_OPEN = "open"
+TARGET_BUILDS_SEPARATOR = ", "
+SHORT_TARGET_NO_BUILDS_NOTE = "target {target} names no build the {channel} channel lists at {location}, so the table was not read for it; a target with its build is graded"
+PARTIAL_TARGET_NOTE_FORMAT = "target {target} is graded against the {n} listed build(s) of its patch ({builds}); known issue {id} ({summary}) affects {affected} of them, so whether the upgrade lands on it depends on the build picked; a target with its build says which: {url}"
 NOTE_FORMAT = "{addons} add-on(s) inventoried in {namespaces}; {matches} known issue(s) match GKE {master} or target {target} ({open} open issue(s) with no published fix noted); table generated {generated} ({issues} issue(s), newest known version {newest})"
 OPEN_NOTE_FORMAT = "{n} open known issue(s) with no published fix on GKE {version}, noted and not graded as risks: {ids}; each is on {url}"
 OPEN_IDS_SEPARATOR = ", "
@@ -219,6 +233,33 @@ def spec_is_open(spec) -> bool:
     return spec.get(ALL_VERSIONS_KEY) is True or FROM_MINOR_KEY in spec or (RANGE_FROM_KEY in spec and RANGE_TO_KEY not in spec and MINOR_KEY not in spec)
 
 
+def target_builds(target_text, cluster: dict, context) -> tuple[list[str] | None, str | None]:
+    """The builds a target names: itself for a full version; for a build-less one, every build of
+    the patch the cluster's channel lists (validMasterVersions on no channel), newest first; (None,
+    a note) when the channel lists none."""
+    if not isinstance(target_text, str) or not target_text:
+        return None, None
+    if BUILD_SEPARATOR in target_text:
+        return [target_text], None
+    server_config, _ = project_read(context, LOCATION_READ_SERVER_CONFIG)
+    channel = str((cluster.get(RELEASE_CHANNEL_KEY) or {}).get(CHANNEL_KEY) or "")
+    roster, _ = channel_roster(server_config if isinstance(server_config, dict) else {}, channel)
+    prefix = target_text + BUILD_SEPARATOR
+    builds = [version for version in roster or [] if isinstance(version, str) and version.startswith(prefix)]
+    if builds:
+        return builds, None
+    return None, SHORT_TARGET_NO_BUILDS_NOTE.format(target=target_text, channel=channel if channel not in NO_CHANNEL_VALUES else NO_CHANNEL_LABEL, location=context.get(CONTEXT_LOCATION) or cluster.get("location") or "")
+
+
+def _grade(version, specs) -> str | None:
+    """How an issue's specs read a version: None when none matches, GRADE_OPEN when every matching
+    spec has no upper bound, GRADE_RISK otherwise (a bounded spec that matches names a fix)."""
+    matched = [spec for spec in specs if version_matches(version, spec)]
+    if not matched:
+        return None
+    return GRADE_OPEN if all(spec_is_open(spec) for spec in matched) else GRADE_RISK
+
+
 def addon_present(issue: dict, addons: list[dict]) -> str | None:
     """The tag the inventory runs the issue's add-on at (ANY_TAG for an issue with no add-on), or None."""
     addon = issue.get(ISSUE_ADDON_KEY)
@@ -257,8 +298,10 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         out["risks"].append({"kind": KIND_STALE_AGE, "generated": generated_text, "age_days": age_days, "limit_days": STALE_AFTER_DAYS})
     master = cluster.get("currentMasterVersion")
     target_text = context.get(CONTEXT_TARGET_TEXT)
+    builds, builds_note = target_builds(target_text, cluster, context)
     matches = 0
     open_issues = {master: [], target_text: []}  # the note-graded matches, per version
+    partial_notes = []
     for issue in table.get(TABLE_ISSUES_KEY) or []:
         if not isinstance(issue, dict):
             continue
@@ -269,10 +312,17 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         for kind, version in ((KIND_RUNNING, master), (KIND_TARGET, target_text)):
             if not version or (kind == KIND_TARGET and version == master):
                 continue
-            matched = [spec for spec in specs if version_matches(version, spec)]
-            if not matched:
+            if kind == KIND_TARGET and builds is None:
+                continue  # a build-less target the channel lists no build of: noted once below
+            candidates = builds if kind == KIND_TARGET else [version]
+            graded = [_grade(build, specs) for build in candidates]
+            affected = [build for build, grade in zip(candidates, graded) if grade]
+            if not affected:
                 continue
-            if all(spec_is_open(spec) for spec in matched):  # a bounded spec that matches too names a fix: the risk reading stands
+            if len(affected) < len(graded):  # a build-less target, some of whose builds the issue affects
+                partial_notes.append(PARTIAL_TARGET_NOTE_FORMAT.format(target=version, n=len(graded), builds=TARGET_BUILDS_SEPARATOR.join(candidates), id=issue.get(ISSUE_ID_KEY), summary=issue.get(ISSUE_SUMMARY_KEY), affected=TARGET_BUILDS_SEPARATOR.join(affected), url=issue.get(ISSUE_URL_KEY)))
+                continue
+            if GRADE_RISK not in graded:  # every build matched through open specs alone
                 open_issues[version].append(str(issue.get(ISSUE_ID_KEY)))
                 continue
             out["risks"].append(_issue_finding(kind, issue, version, tag))
@@ -282,6 +332,9 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     for version, ids in open_issues.items():
         if ids:
             out["notes"].append(OPEN_NOTE_FORMAT.format(n=len(ids), version=version, ids=OPEN_IDS_SEPARATOR.join(ids), url=table.get(TABLE_SOURCE_KEY)))
+    out["notes"].extend(partial_notes)
+    if builds_note:
+        out["notes"].append(builds_note)
     return out
 
 

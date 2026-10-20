@@ -350,7 +350,9 @@ Four ways a workload breaks on a new version:
   page's cells, the patch that fixes it and the page anchor; a match through a bounded version set
   is a risk naming the fix, and a match through one with no upper bound (`All versions`, a build or
   minor and later with no fixed build above it) is a note on the member, not a risk, since it would
-  stand on every later version until the page changes. The
+  stand on every later version until the page changes. A target given without its build is
+  graded against the builds of the patch the channel lists: the issue is the target's risk when it
+  affects every one, a note naming the affected builds otherwise. The
   table is data with a date: when it is older than thirty days the rule files a risk that the table
   is stale rather than passing a clean matrix, and the newest version the table knows is in the
   note, not graded. The operator add-ons (cert-manager, Istio, the
