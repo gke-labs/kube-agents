@@ -73,8 +73,8 @@ gap sentence, a queue line from the selection's queued count and the install's
 pace (no delivery hour), the scan's checks folded under "What this scan checked", and a
 "See all N findings" button when items are queued. It is built only when the
 delivery job's selection (what ``select`` chose) listed nothing and held no
-critical back, and the report says "critical" nowhere but in "none of them
-critical"; any other report goes as written. The text layout keeps the closing lines under it; the card leaves them
+critical back; any other report goes as written. Its other lines are only what
+``gap_parts`` finds in the report's prose, as on the item card. The text layout keeps the closing lines under it; the card leaves them
 to its button.
 
 The report is model-written to the format in
@@ -95,7 +95,7 @@ from inventory_findings import (
     SELECTION_QUEUED,
     fq,
 )
-from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row
+from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, sentence_starts, severity_row
 
 BOLD_MARK = "**"
 PARAGRAPH_BREAK = "\n\n"
@@ -142,13 +142,6 @@ SEE_ALL = "See all {count}"
 #: its own card, since the headline above counts things to look at.
 QUIET_HEADLINE = "First look at your fleet: done"
 QUIET_COUNTS = "{scanned} · no critical item in this scan's {checks} checks"
-#: The roll-up's own words for none critical. Any other "critical" in the report vetoes the card:
-#: the selection says nothing is critical, so a report that says otherwise goes as written.
-NONE_CRITICAL = re.compile(r"\bnone of them critical\b", re.IGNORECASE)
-# "non-critical" and "noncritical" are the pace line's own words, not a claim that something is critical.
-CRITICAL_WORD = re.compile(r"(?<!non-)(?<!non )\bcritical\b", re.IGNORECASE)
-#: Where a sentence ends inside the counts paragraph, so a gap written on the next line is kept.
-SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 QUIET_COUNTS_JOIN = " · "
 QUIET_QUEUE = "{count} smaller {items} queued. I'll bring up to {daily} a day."
 QUIET_QUEUE_ASK = "{count} smaller {items} queued. Ask me when you want them."
@@ -885,7 +878,7 @@ class _Card(NamedTuple):
 
 class _Quiet(NamedTuple):
     counts: str
-    #: The posture's own gap sentences, then the queue line.
+    #: The report's gaps on one line, then the queue line.
     after: list[str]
     #: Closing lines, which the text layout keeps and the card leaves to its buttons.
     closing: list[str]
@@ -895,19 +888,19 @@ class _Quiet(NamedTuple):
 def _quiet(report: str, selection: dict | None) -> _Quiet | None:
     """A report that lists no item, opened as SOP Step 6 fixes it; None for any other report.
 
-    ``selection`` is what ``select`` chose for this batch, from ``bootstrap_delivery``: the card
-    is built only when it listed no item and held no critical back, so "no critical item" and
-    the queued count come from the scorer, not from the report's prose. With no selection, a
-    list anywhere in the report, or no exact ``SCAN_SCOPE_LINE`` paragraph, the report goes
-    as written. The posture is every paragraph up to that line: the scan counts first, then
-    any sentence naming what could not be scanned. The queue line uses the install's pace
-    (``FINDINGS_NONCRITICAL_MAX``), so the card carries no delivery hour.
+    Everything the card claims comes from the scorer or from readers this module already
+    shares with the item card. ``selection`` is what ``select`` chose (from
+    ``bootstrap_delivery``): the card is built only when it listed no item and held no critical
+    back, so "no critical item" and the queued count are the scorer's answer. The counts are
+    the first sentence (``sentence_starts``) of the paragraphs before the exact
+    ``SCAN_SCOPE_LINE``; every other paragraph, roll-up and closing lines included, gives the
+    card only what ``gap_parts`` finds in it, as the item card does. With no selection, a list
+    anywhere, or no exact posture line, the report goes as written. The queue line uses the
+    install's pace (``FINDINGS_NONCRITICAL_MAX``), so the card carries no delivery hour.
     """
 
     lines = report.splitlines()
     if not selection or selection.get(SELECTION_LISTED) or selection.get(SELECTION_HELD) or NOT_QUIET.search(report):
-        return None
-    if CRITICAL_WORD.search(NONE_CRITICAL.sub("", report)):
         return None
     paragraphs = [" ".join(p.split()) for p in _paragraphs([line for line in lines if not HEADING.match(line)])]
     paragraphs = [p for p in paragraphs if p and not _is_title(p)]
@@ -917,19 +910,20 @@ def _quiet(report: str, selection: dict | None) -> _Quiet | None:
     posture, tail = paragraphs[:at], paragraphs[at + 1 :]
     if not posture:
         return None
-    first, *rest = SENTENCE_END.split(posture[0], 1)
-    first = [first]
+    cut = (sentence_starts(posture[0]) or [len(posture[0])])[0]
+    first, rest = posture[0][:cut].strip(), posture[0][cut:].strip()
     scanned = [
         _counted(count, nouns)
-        for count, nouns in ((_stated(CLUSTER_COUNT, first), CLUSTERS_NOUN), (_stated(WORKLOAD_COUNT, first), WORKLOADS_NOUN))
+        for count, nouns in ((_stated(CLUSTER_COUNT, [first]), CLUSTERS_NOUN), (_stated(WORKLOAD_COUNT, [first]), WORKLOADS_NOUN))
         if count is not None
     ]
     if not scanned:
         return None
-    rollup = next((p for p in tail if _rollup_count(p, 0) is not None), None)
     counts = QUIET_COUNTS.format(scanned=QUIET_COUNTS_JOIN.join(scanned), checks=len(SCAN_CHECKS))
-    queued = int(selection.get(SELECTION_QUEUED) or 0)
+    rollup = next((p for p in tail if _rollup_count(p, 0) is not None), None)
     closing = [p for p in tail if p is not rollup]
+    gaps = _gap_line([gap_parts(p) for p in [rest, *posture[1:], *tail] if p])
+    queued = int(selection.get(SELECTION_QUEUED) or 0)
     if queued:
         daily = fq.pacing_limits(os.environ).noncritical_max
         items = QUIET_ITEMS[queued != 1]
@@ -937,9 +931,8 @@ def _quiet(report: str, selection: dict | None) -> _Quiet | None:
                  else QUIET_QUEUE_ASK.format(count=queued, items=items))
     else:
         queue = ""
-    # The counts are the first sentence; anything after it in that paragraph (a gap written on the
-    # next line) is kept as written.
-    return _Quiet(counts, [*rest, *posture[1:], *filter(None, [queue])], closing, queued)
+    # One gap line and one queue line, so the gateway's five-line cap never drops the queue line.
+    return _Quiet(counts, [line for line in (gaps, queue) if line], closing, queued)
 
 
 def _card(report: str, selection: dict | None = None) -> _Card | None:

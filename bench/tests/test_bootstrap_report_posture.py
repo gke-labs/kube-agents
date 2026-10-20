@@ -166,6 +166,7 @@ def test_a_sentence_between_the_counts_and_the_line_fails(sandbox: Path) -> None
         "There are no active outages.",
         "All clear across the fleet.",
         "Your clusters are in good shape.",
+        "The scan came back clean.",
     ],
 )
 def test_a_verdict_after_the_posture_fails(sandbox: Path, verdict: str) -> None:
@@ -184,6 +185,22 @@ def test_a_verdict_in_a_heading_fails(sandbox: Path) -> None:
     result = _verify()
     assert result.status == "fail"
     assert "judges the fleet" in result.reason
+
+
+def test_a_bold_title_counts_as_the_heading(sandbox: Path) -> None:
+    report = _report(*_objective()["posture"]).replace("# GKE Environment Scan", "**GKE Environment Scan**")
+    (sandbox / "INVENTORY.delivered.md").write_text(report)
+    result = _verify()
+    assert result.status == "pass", result.reason
+
+
+def test_a_roll_up_that_counts_no_critical_findings_judges_nothing(sandbox: Path) -> None:
+    report = _report(*_objective()["posture"]).replace(
+        ROLLUP, "Also found: 4 more items, no critical findings among them, tracked in the findings queue."
+    )
+    (sandbox / "INVENTORY.delivered.md").write_text(report)
+    result = _verify()
+    assert result.status == "pass", result.reason
 
 
 def test_a_word_that_contains_a_verdict_is_not_one(sandbox: Path) -> None:

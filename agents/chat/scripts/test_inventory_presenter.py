@@ -94,7 +94,8 @@ The full inventory is available on request.
 """.format(line=inventory_presenter.SCAN_SCOPE_LINE)
 
 QUIET_COUNTS = "5 clusters · 221 workloads · no critical item in this scan's 9 checks"
-QUIET_GAP = "Secret inspection was skipped on `platform-agent-host` and `seeded-d`: no RBAC access to Secrets there."
+# What gap_parts keeps of the report's gap sentence, as the item card keeps it.
+QUIET_GAP = "Secret inspection was skipped on `platform-agent-host` and `seeded-d`."
 
 
 #: What `select` chose for QUIET_REPORT's batch, as bootstrap_delivery passes it.
@@ -169,14 +170,25 @@ class QuietCardTest(unittest.TestCase):
                 self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)
                 self.assertIsNone(inventory_presenter.blocks(report, QUIET_SELECTION))
 
-    def test_a_report_that_says_critical_otherwise_goes_as_written(self):
-        # The card would say "no critical item" above or instead of it.
-        for item in ("Critical: quote-api is down.", "**Critical** quote-api is down.",
-                     "No critical vulnerabilities were found."):
+    def test_the_selection_decides_and_prose_is_read_only_for_gaps(self):
+        # A verdict or a critical claim in the prose does not reach the card; the scorer said none.
+        for item in ("Critical: quote-api is down.", "The fleet looks healthy.", "Also, none critical."):
             with self.subTest(item=item):
-                report = QUIET_REPORT.replace("The full inventory", f"{item}\n\nThe full inventory")
-                self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)
-                self.assertIsNone(inventory_presenter.blocks(report, QUIET_SELECTION))
+                report = QUIET_REPORT.replace(f"\n\n{inventory_presenter.SCAN_SCOPE_LINE}",
+                                              f"\n\n{item}\n\n{inventory_presenter.SCAN_SCOPE_LINE}")
+                blocks, _ = inventory_presenter.blocks(report, QUIET_SELECTION)
+                self.assertNotIn(item.rstrip("."), json.dumps(blocks))
+
+    def test_a_gap_in_the_roll_up_or_after_the_posture_line_is_kept(self):
+        report = QUIET_REPORT.replace("tracked in the findings queue.", "tracked in the findings queue; seeded-e could not be scanned (403).")
+        self.assertNotEqual(report, QUIET_REPORT)
+        message, _ = inventory_presenter.chat(report, QUIET_SELECTION)
+        self.assertIn("seeded-e could not be scanned (403).", " ".join(message["after"]))
+
+    def test_the_counts_sentence_survives_an_abbreviation(self):
+        report = QUIET_REPORT.replace("Scanned 5 clusters and 221 workloads.", "Scanned 5 clusters and 221 workloads (approx. counts).")
+        out = inventory_presenter.present(report, QUIET_SELECTION)
+        self.assertIn(QUIET_COUNTS, out)
 
     def test_a_card_with_items_keeps_its_fallback_text(self):
         _, text = inventory_presenter.blocks(REPORT)

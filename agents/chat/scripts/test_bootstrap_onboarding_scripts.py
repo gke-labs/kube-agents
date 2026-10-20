@@ -896,6 +896,19 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
         self.assertEqual(blocks.call_args.args[1:], (expected,))
         self.assertEqual(presented.call_args.kwargs["selection"], expected)
 
+    def test_a_batch_the_queue_did_not_take_gives_no_selection(self):
+        # The short card would say the items are queued when they are in no queue.
+        self._write()
+        for failure in (urllib.error.URLError("connection refused"),
+                        urllib.error.HTTPError("http://q", 500, "refused", {}, None)):
+            with self.subTest(failure=type(failure).__name__):
+                self.post.stop()
+                with mock.patch.object(inventory_findings, "post_batch", side_effect=failure), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    _, items, scores = bootstrap_delivery._register_findings(self.d, False, False)
+                self.post.start()
+                self.assertIsNone(bootstrap_delivery._selection(items, scores, set()))
+
     def test_a_hand_off_that_filed_no_ranking_card_registers_nothing(self):
         # A no-coverage sweep writes the report itself; the items and scores are the last sweep's.
         self._write()

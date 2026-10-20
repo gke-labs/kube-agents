@@ -6012,9 +6012,17 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
         return "pass", f"the report's {len(items)} numbered item(s) {counts}, the limit of {self.limit}: {named}", raw
 
 
+# A title written as a bold line rather than a heading, as the Slack presenter also drops it.
+_BOLD_TITLE_RE = re.compile(r"^\s*\*\*[^*\n]+\*\*\s*$")
+
+
 def _report_body(text: str) -> str:
-    """The report with its heading lines dropped and every run of whitespace one space."""
-    return " ".join(" ".join(line for line in text.splitlines() if not line.lstrip().startswith("#")).split())
+    """The report with its heading lines and a leading bold title dropped, every run of whitespace one space."""
+    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    first = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if first is not None and _BOLD_TITLE_RE.match(lines[first]):
+        del lines[first]
+    return " ".join(" ".join(lines).split())
 
 
 @VERIFIERS.register("bootstrap_report_posture")

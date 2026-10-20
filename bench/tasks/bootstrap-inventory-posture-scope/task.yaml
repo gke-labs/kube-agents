@@ -81,9 +81,9 @@ verification_spec:
       # The verdicts SOP Step 6 names, and the 10-20 reports' wording.
       forbidden_patterns:
         - '\bhealthy\b'
-        - '\bno critical (?:vulnerabilit|issue|problem|risk|finding)'
+        - '\bno critical (?:vulnerabilit|issue|problem|risk)'
         - '\b(?:zero|no) (?:active )?outages?\b'
         - '\ball clear\b'
-        - '\bclean bill\b'
+        - '\bclean\b'
         - '\bgood shape\b'
         - '\bgood health\b'

@@ -616,7 +616,7 @@ def _register_findings(
     dismissed. With the shell sandbox on, ``select`` never learned them, so
     the report may list one; ``_mark_shown`` leaves them unmarked. Also the
     items and scores it read, for ``_selection``, or ``None`` for each when
-    they were not read.
+    they were not read or the queue did not take all of them.
 
     Never raises. Runs before the claim, so it adds nothing to the claimed
     run's work (``RETIRE_AFTER_SECONDS``), and the nudge holds until the claim.
@@ -650,24 +650,27 @@ def _register_findings(
         sys.stderr.write(f"bootstrap_delivery: could not read the sweep's findings; registering nothing: {detail}\n")
         return suppressed, None, None
     endpoint = _findings_endpoint()
+    # A batch the queue did not take is not "queued": the short card then claims nothing.
+    complete = True
     for where, batch, scope in batches:
         try:
             result = inventory_findings.post_batch(endpoint, batch, scope)
         except urllib.error.HTTPError as e:
             # This cluster only.
             sys.stderr.write(f"bootstrap_delivery: the findings queue refused {where}'s findings: {e.code}\n")
+            complete = False
             continue
         except Exception as e:
             sys.stderr.write(
                 f"bootstrap_delivery: the findings queue at {endpoint} did not answer ({e}); "
                 "not registering the rest\n"
             )
-            return suppressed, items, raw_scores[SCORES_KEY]
+            return suppressed, None, None
         outcomes = result.get("results") if isinstance(result, dict) else None
         for entry in outcomes if isinstance(outcomes, list) else []:
             if isinstance(entry, dict) and entry.get("outcome") == SUPPRESSED:
                 suppressed.add(str(entry.get("id")))
-    return suppressed, items, raw_scores[SCORES_KEY]
+    return (suppressed, items, raw_scores[SCORES_KEY]) if complete else (suppressed, None, None)
 
 
 def _selection(items: list | None, scores: dict | None, suppressed: set[str]) -> dict | None:
