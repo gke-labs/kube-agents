@@ -729,7 +729,8 @@ next tick's list finds, by its marker, an issue the failed call created anyway.
 
 An open `nightly-red` issue that carries the case's marker, or (for an issue
 without a marker, a human's) names the case as a whole word in its title or
-body, in any letter case, is adopted instead, so a case is filed once and a human's issue wins. A
+body, in any letter case (or links its transcript, `eval_<case>_rep1.log`), is
+adopted instead, so a case is filed once and a human's issue wins. A
 `nightly-red` issue for the case closed after the streak's newest night counts
 too: a fix that merged before the next nightly closes its issue while the
 nights on record are still red, so the case is filed again only after a newer

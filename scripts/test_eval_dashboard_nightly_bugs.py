@@ -294,6 +294,15 @@ class DedupeTest(Harness):
             with self.subTest(text=text):
                 self.assertFalse(nightly_bugs.names_case({"title": "", "body": text}, "case-red"))
 
+    def test_an_issue_naming_the_case_only_by_its_transcript_link_is_adopted(self):
+        link = f"https://prow.example/view/gs/bucket/logs/{JOB}/30000000000000170001/artifacts/eval_case-red_rep1.log"
+        gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[{"number": 3994, "title": "nightly failure, see transcript", "body": link}]))
+        self.assertEqual(gh.writes(), [])
+        # Another case's transcript, or a longer name's, is not this case.
+        for text in ("artifacts/eval_case-red_old_rep1.log", "artifacts/eval_case-red-extended_rep2.log", "artifacts/xeval_case-red_rep1.log"):
+            with self.subTest(text=text):
+                self.assertFalse(nightly_bugs.names_case({"title": "", "body": text}, "case-red"))
+
     def test_an_issue_naming_a_longer_case_name_is_not_a_match(self):
         issue = {"number": 3997, "title": "case-red-extended flakes", "body": nightly_bugs.MARKER.format(case="case-red-extended")}
         gh, _, _ = self.run_once(self.THREE_RED(), FakeGh(open_issues=[issue]))

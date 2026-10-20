@@ -157,6 +157,10 @@ INFRA_RECOVERY_MARKER = "<!-- kube-agents-bot:{kind}-recovered {field}={key} nig
 # `.`, `_` or `-` ends it unless a name character follows, so "fails on
 # case-red." names case-red and "case-red-extended" does not.
 NAME_IN_TEXT_RE = r"(?<![A-Za-z0-9._-]){name}(?![A-Za-z0-9]|[._-][A-Za-z0-9])"
+# The case's transcript artifact (nightly.TRANSCRIPT_ARTIFACT, any rep), which
+# a human pasting a run link names it by: `_` bounds the name only here, so
+# "case-red_old" is still another case.
+NAME_IN_TRANSCRIPT_RE = r"\beval_{name}_rep[0-9]+\.log"
 # GitHub's limits: a longer title or body is refused and files nothing.
 TITLE_MAX_CHARS = 256
 ISSUE_BODY_MAX_CHARS = 65536
@@ -468,8 +472,8 @@ def names_case(issue: dict, case: str, kind: str = KIND_RED) -> bool:
     markers = BOT_MARKER_RE.findall(body)
     if markers or kind != KIND_RED:
         return (kind, case) in markers
-    pattern = NAME_IN_TEXT_RE.format(name=re.escape(case))
-    return bool(re.search(pattern, f"{issue.get('title') or ''}\n{body}", re.IGNORECASE))
+    text = f"{issue.get('title') or ''}\n{body}"
+    return any(re.search(pattern.format(name=re.escape(case)), text, re.IGNORECASE) for pattern in (NAME_IN_TEXT_RE, NAME_IN_TRANSCRIPT_RE))
 
 
 def tracking_issue(issues: list[dict], case: str, kind: str = KIND_RED) -> dict | None:
