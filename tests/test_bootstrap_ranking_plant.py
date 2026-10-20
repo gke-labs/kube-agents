@@ -962,6 +962,15 @@ class ArmDisarmTest(unittest.TestCase):
                 out = self._py(read_state)
                 self.assertEqual((out.returncode, out.stdout.strip()), (0, answer), out.stderr)
 
+    def test_step_1_reads_a_conversation_binding_as_aligned(self):
+        for marker in (".user_aligned_conversation", "onboarding_conversation.json"):
+            with self.subTest(marker=marker):
+                (self._home / ".bootstrap_scan_filed").touch()
+                (self._home / marker).touch()
+                out = self._py(self._read_state())
+                (self._home / marker).unlink()
+                self.assertEqual((out.returncode, out.stdout.strip()), (0, "aligned"), out.stderr)
+
     def test_step_1_reads_a_greeted_marker_as_greeted(self):
         (self._home / ".bootstrap_scan_filed").touch()
         self._greeted.touch()

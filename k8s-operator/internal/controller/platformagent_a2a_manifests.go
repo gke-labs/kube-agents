@@ -555,7 +555,8 @@ const (
 	a2aSlackMinChannelIDLen = 3
 	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py,
 	// and kanban_event_routing.py, which addresses a card to the conversation):
-	// the platform whose gateway conversations a card reports back to. Its own
+	// the platform whose gateway conversations a card reports back to, and
+	// onboarding's first report too (agents/chat/scripts/bootstrap_delivery.py). Its own
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
 	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
