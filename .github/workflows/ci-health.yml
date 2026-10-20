@@ -227,10 +227,10 @@ env:
   COLLECT_TIMEOUT_S: "1500"
   # The refresh job's timeout-minutes in seconds (move the two together),
   # and what the store read must leave on that clock for the adjudicator,
-  # the render and the post after it (recent ticks spend 80-150 s on the
-  # whole job).
+  # the render, the nightly bug filer and the post after it (recent ticks
+  # spend 80-150 s on the whole job; the filer step is capped at 3 minutes).
   JOB_TIMEOUT_S: "1800"
-  JOB_TAIL_S: "240"
+  JOB_TAIL_S: "420"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
   # The seeded-fleet scan's knobs (scripts/eval_dashboard/fixture_state.py):
@@ -665,6 +665,9 @@ jobs:
       # reds the run.
       - name: File bugs for persistent nightly failures (dry run unless armed)
         continue-on-error: true
+        # Bounded, so a slow GitHub cannot run the job into its timeout and
+        # cancel the post after it (JOB_TAIL_S budgets this step too).
+        timeout-minutes: 3
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

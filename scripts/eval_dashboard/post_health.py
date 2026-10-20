@@ -10,8 +10,9 @@ sends a message only when:
     the state returned to GREEN             -> the recovery, with how long it lasted
     an OUTAGE grew to name a new case       -> the same shape, rate-limited
     it is the digest hour and none went out -> the daily digest with the 24h numbers,
-                                               plus one line on last night's
+                                               plus a section on last night's
                                                nightly run when --data is given
+                                               (nightly_digest.py)
 
 Everything else is silence. The last-posted state lives in a small JSON file
 (`--state`, a local path or a gs:// object) that this script is the only

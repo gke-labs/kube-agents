@@ -81,9 +81,10 @@ def issue(number, case, created, assignee=None, url=None):
 class StubGh:
     """ghcli.Gh's read surface: the open issues, or None for a failed read."""
 
-    def __init__(self, open_issues=(), fail=False):
+    def __init__(self, open_issues=(), fail=False, closed_issues=()):
         self.repo = REPO
         self.open_issues = list(open_issues)
+        self.closed_issues = list(closed_issues)
         self.fail = fail
         self.calls = []
 
@@ -92,7 +93,9 @@ class StubGh:
 
     def call(self, method, path, body=None, paginate=False):
         self.calls.append((method, path))
-        return None if self.fail else list(self.open_issues)
+        if self.fail:
+            return None
+        return list(self.closed_issues) if "state=closed" in path else list(self.open_issues)
 
 
 class Harness(unittest.TestCase):
@@ -148,8 +151,8 @@ class FullSectionTest(Harness):
             "🟠 *Still red, already tracked*",
             f"• Capacity: case-red-extended, night 6 · <https://github.com/{REPO}/issues/4002|#4002> · <users/1001>",
             "",
-            "🆕 *Red last night, first time* (no bug yet; one is filed after 3 red nights in a row)",
-            "• Security: case-noowner (0/3) · @sam",
+            "🆕 *Red last night, no bug yet* (one is filed after 3 red nights in a row)",
+            "• Security: case-noowner (0/3), night 1 · @sam",
             "",
             "✅ *Recovered*",
             f"• Security: case-reviewer, 3/3 after 3 red nights · <https://github.com/{REPO}/issues/4003|#4003>",
@@ -194,7 +197,40 @@ class QuietDayTest(Harness):
         doc = data(*(night(day, [green("case-green"), green("case-red"), red("case-red-extended")]) for day in range(15, 21)))
         section = self.build(doc, [issue(4002, "case-red-extended", "2026-10-17T05:00:00Z")])
         self.assertTrue(section.quiet)
-        self.assertEqual(section.lines, [f"🌙 Nightly Oct 20: 2 of 3 passed, no new reds, nothing recovered, 1 still red · {PAGE}"])
+        self.assertEqual(section.lines, [f"🌙 Nightly Oct 20: 2 of 3 passed (4 not graded), no new reds, nothing recovered, 1 still red · {PAGE}"])
+
+
+    def test_a_second_red_night_is_counted_on_a_quiet_day(self):
+        doc = data(*(night(day, [green("case-green"), red("case-red") if day >= 19 else green("case-red")]) for day in range(15, 21)))
+        section = self.build(doc)
+        self.assertTrue(section.quiet)
+        self.assertEqual(section.lines, [f"🌙 Nightly Oct 20: 1 of 2 passed (5 not graded), no new reds, nothing recovered, 1 still red · {PAGE}"])
+
+    def test_a_writers_part_cut_off_is_never_quiet(self):
+        nights = [night(day, [green("case-green")]) for day in range(15, 21)]
+        writers = night(20, [green("case-red")], truncated=True)
+        writers.update(job="ci-kube-agents-eval-nightly-writers", build_id="3000000000000020002")
+        section = self.build(data(*nights, writers))
+        self.assertFalse(section.quiet)
+        self.assertIn("writers part cut off at the deadline, its cases not counted", section.lines[0])
+
+
+class TrackingTest(Harness):
+    def test_a_handed_off_closed_issue_still_tracks_and_a_young_issue_is_not_new(self):
+        nights = [night(day, [green("case-green"), red("case-red") if day >= 17 else green("case-red"),
+                              red("case-maint") if day >= 19 else green("case-maint"),
+                              red("case-noowner") if day == 20 else green("case-noowner")]) for day in range(15, 21)]
+        handed_off = {**issue(4005, "case-red", "2026-10-17T05:00:00Z"), "state": "closed", "state_reason": "not_planned", "closed_at": "2026-10-18T05:00:00Z"}
+        # A human's issue opened this morning for a case red two nights:
+        # tracked, but not a new 3-night bug.
+        human = {"number": 4006, "title": "case-maint keeps failing", "body": "see case-maint", "created_at": "2026-10-20T03:00:00Z",
+                 "html_url": f"https://github.com/{REPO}/issues/4006", "assignees": []}
+        section = self.build(data(*nights), [human], gh=StubGh([human], closed_issues=[handed_off]))
+        text = "\n".join(section.lines)
+        self.assertNotIn("Owed a bug", text)
+        self.assertNotIn("New bugs filed", text)
+        self.assertIn(f"• Capacity: case-red, night 4 · <https://github.com/{REPO}/issues/4005|#4005> (closed) · <users/1001>", text)
+        self.assertIn(f"• Capacity: case-maint, night 2 · <https://github.com/{REPO}/issues/4006|#4006> · @carol", text)
 
 
 class TruncatedNightTest(Harness):
@@ -243,6 +279,9 @@ class MentionsTest(Harness):
 class CappingTest(Harness):
     def test_each_list_is_capped_at_five_lines(self):
         names = [f"cap-{n}" for n in range(1, 8)]
+        for name in names:
+            (self.root / "bench" / "tasks" / name).mkdir()
+            (self.root / "bench" / "tasks" / name / "task.yaml").write_text(f"id: {name}\ndomain: security\n")
         nights = [night(day, [green(n) for n in names]) for day in range(15, 20)]
         nights.append(night(20, [red(n) for n in names]))
         doc = data(*nights, extra_cases=[(n, "security") for n in names])
@@ -251,13 +290,13 @@ class CappingTest(Harness):
         for run in doc["runs"]:
             run["tasks"] += [green(f"filler-extra-{n}") for n in range(10)]
         section = self.build(doc)
-        first = section.lines[section.lines.index("🆕 *Red last night, first time* (no bug yet; one is filed after 3 red nights in a row)"):]
+        first = section.lines[section.lines.index("🆕 *Red last night, no bug yet* (one is filed after 3 red nights in a row)"):]
         self.assertEqual(first[1:7], [
-            "• Security: cap-1 (0/3) · @sam",
-            "• Security: cap-2 (0/3) · @sam",
-            "• Security: cap-3 (0/3) · @sam",
-            "• Security: cap-4 (0/3) · @sam",
-            "• Security: cap-5 (0/3) · @sam",
+            "• Security: cap-1 (0/3), night 1 · @sam",
+            "• Security: cap-2 (0/3), night 1 · @sam",
+            "• Security: cap-3 (0/3), night 1 · @sam",
+            "• Security: cap-4 (0/3), night 1 · @sam",
+            "• Security: cap-5 (0/3), night 1 · @sam",
             f"• …and 2 more: {PAGE}",
         ])
         self.assertEqual(first[7], "")

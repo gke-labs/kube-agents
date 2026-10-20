@@ -539,6 +539,12 @@ def still_tracks(issue: dict, newest: dict, good: list[dict], horizon=None) -> b
     return True
 
 
+def infra_issue_part(issue: dict) -> str:
+    """The part an open kept-case issue names: writers when its body names
+    the writers job, else main."""
+    return nightly.PART_WRITERS if f"`{nightly.NIGHTLY_WRITERS_JOB}`" in (issue.get("body") or "") else nightly.PART_MAIN
+
+
 class Filer:
     def __init__(self, gh: ghcli.Gh, repo_root: pathlib.Path = REPO_ROOT):
         self.gh = gh
@@ -645,8 +651,7 @@ class Filer:
         for case in candidates:
             open_issue = tracking_issue(open_issues, case, KIND_INFRA)
             if open_issue:
-                body_text = open_issue.get("body") or ""
-                tracked[case] = nightly.PART_WRITERS if f"`{nightly.NIGHTLY_WRITERS_JOB}`" in body_text else nightly.PART_MAIN
+                tracked[case] = infra_issue_part(open_issue)
         for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates, tracked).items()):
             fields = task_fields(case, self.repo_root)
             if fields is None:
