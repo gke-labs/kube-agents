@@ -474,7 +474,7 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(fq.get_finding(self.conn, upgrade_id)["rubric"]["C"], 1.0)
 
     def test_a_prefixed_claim_reaches_the_family_whatever_wrote_it(self):
-        # The review's ordinary batch: its own rows plus the `upgrade-` prefix.
+        # A prefix-alone claim (the review's batch names its source too; see the next test):
         # The claim is the family, so an `upgrade-` row another source wrote and
         # the review no longer reports loses confidence too, while the inventory
         # row outside the family keeps it.

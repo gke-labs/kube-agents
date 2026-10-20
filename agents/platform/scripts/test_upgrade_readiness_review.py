@@ -301,10 +301,21 @@ class Registration(unittest.TestCase):
 
         with mock.patch.object(review, "kv_request", partial_answer):
             _outcomes, problems, claimed = review.register(members, [], findings)
-        # seeded-b's batch came back short, so its claim did not land; seeded-c's empty batch was answered in full.
-        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/seeded-c"})
-        self.assertEqual([p.split(":")[0] for p in problems], [f"{PROJECT}/seeded-b"])
+        # seeded-b's batch came back short, and seeded-c's empty batch came back with an id it never
+        # sent: neither answer is that batch's, so neither claim lands.
+        self.assertEqual(claimed, set())
+        self.assertEqual([p.split(":")[0] for p in problems], [f"{PROJECT}/seeded-b", f"{PROJECT}/seeded-c"])
         with mock.patch.object(review, "kv_request", no_count):
+            _outcomes, problems, claimed = review.register(members, [], findings)
+        self.assertEqual(claimed, set())
+        self.assertEqual(len(problems), 2)
+
+        # A result for an id the batch never sent is not this batch's answer, whatever else it holds.
+        def extra_id(path, body):
+            results = [{"id": fq.validate_finding(f)["id"], "outcome": "created"} for f in body["findings"]]
+            return {"results": results + [{"id": "upgrade-pool-skew.elsewhere.other._.pool", "outcome": "created"}], "downgraded": 0}
+
+        with mock.patch.object(review, "kv_request", extra_id):
             _outcomes, problems, claimed = review.register(members, [], findings)
         self.assertEqual(claimed, set())
         self.assertEqual(len(problems), 2)
@@ -893,6 +904,55 @@ class TheTick(unittest.TestCase):
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertEqual(latest["projects"], [PROJECT])
         self.assertNotIn(numbered, latest.get("project_failures") or {})
+
+    def test_a_number_that_runs_first_reads_the_project_and_the_id_is_not_run_again(self):
+        """Last week's budget put the number ahead of the id: the number reads the project
+        under its id, and the id spelling is the same project, already read."""
+        numbered = "123456789012"
+        ledger = watch.empty_ledger()
+        ledger[watch.PROJECT_IDS_KEY] = {numbered: PROJECT}
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps(ledger), encoding="utf-8")
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            return {"exit": 0, "tables": "| t |", "report": {"projects": [PROJECT], "members": [seeded_b(), member("seeded-c")], "errors": []}}
+
+        with mock.patch.object(review, "ordered_names", side_effect=lambda names, previous: [numbered, PROJECT]), mock.patch.object(watch, "projects", return_value=[numbered, PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(calls, [numbered])
+
+    def test_an_id_that_failed_beside_a_number_that_read_is_not_booked_not_read(self):
+        numbered = "123456789012"
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            if names[0] == PROJECT:
+                raise watch.SandboxTimedOut(f"the sandbox run timed out after {int(timeout)}s")
+            return {"exit": 0, "tables": "| t |", "report": {"projects": [PROJECT], "members": [seeded_b(), member("seeded-c")], "errors": []}}
+
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [PROJECT, numbered])
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertNotIn(PROJECT, latest.get("project_failures") or {})
+        self.assertNotIn("not read", out)
+
+    def test_a_different_project_failing_the_same_way_is_announced_again(self):
+        def refused(names, readiness, *, scope, outside_stands, timeout=None):
+            raise RuntimeError(f"refused by the report script: project number {names[0]} did not resolve")
+
+        outs = []
+        for roster in (["123456789012"], ["123456789012"], ["987654321098"]):
+            with mock.patch.object(watch, "projects", return_value=roster), mock.patch.object(watch, "run_report", side_effect=refused):
+                outs.append(self.run_main()[1])
+        self.assertIn("123456789012", outs[0])
+        self.assertEqual(outs[1], "", "the same project failing the same way posts once")
+        self.assertIn("987654321098", outs[2], "another project failing the same way is a new line")
 
     def test_a_numbered_project_the_report_resolved_whose_listing_failed_is_not_read(self):
         numbered = "123456789012"

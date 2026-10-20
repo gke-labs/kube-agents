@@ -87,7 +87,7 @@ finding has a decision.` When nothing was found at all, the brief is the headlin
    - When a row's `outcome` is `failed`, the headline says how many findings are in the report but
      not on the queue, and a critical among them goes under **Decide now** by its object with "not on
      the queue" after it: there is no id to reply with. A `registration_errors` entry that says a
-     clean read's claim did not reach the queue is a cluster whose last week's rows stand at full
+     completeness claim did not reach the queue is a cluster whose last week's rows stand at full
      confidence; count those clusters in the headline, not as findings.
    - Every id and every count comes from the summary or the queue; invent nothing, name no CVE,
      recommend no version.

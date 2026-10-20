@@ -12,7 +12,7 @@ asks whether an upgrade has reached every cluster, which members are behind a ta
 fleet is from a release-channel default, whether one cluster's control plane is current for its
 channel (`--cluster <location>/<name>`), or whether the repositories are ready for a target
 version. Run the version report again during a rollout and it also says, per member, what changed
-since the previous run and which members have stopped moving (see "Track a rollout across runs").
+since the previous run and which members have stopped moving (see "Track a rollout across runs" and `references/track-a-rollout.md`).
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
 that blocks every node drain, a fail-closed admission webhook with an unreachable backend in the
 upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and
@@ -82,7 +82,7 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   `1.31.4-gke.1183000 channel default (REGULAR)`.
 - `--output` writes the same data as JSON: `members[]`, `errors[]`, a `summary` count per
   status, `narrowed_to` (the `--cluster` specs of a narrowed run, `null` on a full one) and, on a
-  full run only, the `rollout` block and the per-member `progress` fields described below. A
+  full run only, the `rollout` block and the per-member `progress` fields `references/track-a-rollout.md` describes. A
   `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
   note where the progress section would be.
   The file is written whole (a temp file, then a rename) at the end of the run, so a reader never

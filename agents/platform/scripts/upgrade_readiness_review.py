@@ -813,9 +813,9 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     known_ids = learned_project_ids()
     deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     for project in names:
-        if watch.canonical_project(project, known_ids) in read_ids - {project}:
-            # The same project, already read under its id this run: the number's
-            # run would cost a full readiness run and leave nothing.
+        if watch.canonical_project(project, known_ids) in read_ids:
+            # The same project, already read this run under its other spelling:
+            # this run would cost a full readiness run and leave nothing.
             continue
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
@@ -858,6 +858,10 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
             )
             continue
         read_ids |= resolved
+        # A spelling of this project that failed earlier this run (an id whose run
+        # timed out before its number read) is read now, not a project not read.
+        for spelling in [s for s in failures if s in resolved or watch.canonical_project(s, known_ids) in resolved]:
+            failures.pop(spelling)
         members.extend(found)
         if on_project is not None:
             on_project(found, read_errors)
@@ -923,7 +927,9 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                 results = answer.get(ANSWER_RESULTS_KEY)
                 acknowledged = {str(r["id"]) for r in results if isinstance(r, dict) and r.get("id")} if isinstance(results, list) else set()
                 missing = sent - acknowledged
-                if not isinstance(results, list) or missing or (claims and not isinstance(answer.get(ANSWER_DOWNGRADED_KEY), int)):
+                # Exactly the ids sent: a result for an id the batch never carried is
+                # not this batch's answer, and acknowledges neither its rows nor its claim.
+                if not isinstance(results, list) or acknowledged != sent or (claims and not isinstance(answer.get(ANSWER_DOWNGRADED_KEY), int)):
                     raise ValueError(UNACKNOWLEDGED_DETAIL.format(missing=len(missing), sent=len(sent), claim=UNACKNOWLEDGED_CLAIM if claims else ""))
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 # A batch that carried the claim lost it with its rows, whatever
@@ -1241,14 +1247,29 @@ def shown(entries: list[str], limit: int, tail: str = OVERFLOW_NOTE) -> str:
     return PARTIAL_DETAIL_SEPARATOR.join(entries[:limit] + [tail.format(count=len(entries) - limit)])
 
 
-def failure_signature(detail: str) -> str:
+class ProjectsFailed(RuntimeError):
+    """Every project failed: the text names each with its reason, and ``failures``
+    keys the announcement, so a project's spelling stays literal in the marker."""
+
+    def __init__(self, detail: str, failures: dict[str, str]) -> None:
+        super().__init__(detail)
+        self.failures = dict(failures)
+
+
+def failure_signature(detail: str, failures: dict[str, str] | None = None) -> str:
+    """The marker's key: the text with every number folded, or, for a run whose
+    every project failed, each project's spelling as written beside its folded
+    reason, so a timeout's figure re-posts nothing while a different project
+    failing the same way is a new line."""
+    if failures:
+        return json.dumps(sorted([p, FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, str(d))] for p, d in failures.items()))
     return FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, detail)
 
 
-def announce_failure_once(detail: str) -> bool:
+def announce_failure_once(detail: str, failures: dict[str, str] | None = None) -> bool:
     try:
         marker = failure_marker()
-        signature = failure_signature(detail)
+        signature = failure_signature(detail, failures)
         if marker.exists() and marker.read_text(encoding="utf-8") == signature:
             return False
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -1296,7 +1317,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
 
     members, errors, tables, failures, read_ids = run_projects(ordered_names(names, previous), scope, on_project=registered)
     if failures and len(failures) == len(set(names)):
-        raise RuntimeError(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN))
+        raise ProjectsFailed(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN), failures)
     report_path = home / stamp / REPORT_MD_NAME
     summary_doc = summary(
         stamp=stamp, now=now, names=names, members=members, errors=errors, failures=failures,
@@ -1342,7 +1363,7 @@ def main(argv: list[str] | None = None) -> int:
         lines, code = review(dry_run=args.dry_run)
     except Exception as exc:  # noqa: BLE001 - one line per distinct failure, then exit 0 so the schedule holds
         detail = str(exc) or exc.__class__.__name__
-        if args.dry_run or announce_failure_once(detail):
+        if args.dry_run or announce_failure_once(detail, exc.failures if isinstance(exc, ProjectsFailed) else None):
             print(FAILED_LINE.format(prefix=LOG_PREFIX, detail=detail))
         return 0
     for line in lines:

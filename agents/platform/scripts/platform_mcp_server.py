@@ -1184,7 +1184,8 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
             starts with 'check_prefix' when the scope names one (a run that
             reads one family of checks, such as 'upgrade-'; a family ends with
             '-', and a batch with findings must belong to it), whatever wrote
-            them; else the rows of the batch's own sources, or of 'source',
+            them, or, with 'source' beside it, that source's rows in the family;
+            else the rows of the batch's own sources, or of 'source',
             which must be a known source and one the batch wrote. An empty
             findings list with a complete scope is a complete run that found
             nothing; it must name 'check_prefix' or 'source', or it is refused.
