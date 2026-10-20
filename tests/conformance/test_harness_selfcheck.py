@@ -443,11 +443,12 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         import re
 
         readme = (Path(__file__).resolve().parent / "README.md").read_text()
+        plain = re.sub(r"[`*]", "", readme)  # a count in `code` or **bold** is still a count
         counts = re.findall(
-            r"\b\d+\s+(?:mutations?|KILLED|NOISY|SURVIVED|STALE|killed|noisy|survived|stale)\b"  # "206 mutations: 175 KILLED"
+            r"\b\d+\s+(?:must_survive\s+)?(?:mutations?|controls?|killed|noisy|survived|stale)\b"  # "206 mutations: 175 KILLED, 3 controls"
             r"|\b(?:killed|noisy|survived|stale)=\d+"  # a run's result line pasted in
             r"|\b\d+\s+of\s+the\s+\d+\b",  # "accounts for 203 of the 206", wrapped or not
-            readme)
+            plain, re.IGNORECASE)
         self.assertEqual(
             counts, [],
             "tests/conformance/README.md restates a mutation count; point at "
