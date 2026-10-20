@@ -63,9 +63,6 @@ validated: false
 # delegates to workers, run once at onboarding rather than on a schedule.
 domain: fleet-audits
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # A board read that leaves the sweep alone. The session this prompt reaches is
 # the Platform Agent's API session, not the worker running the sweep, and it
 # must not start, retry or complete any of the sweep's cards: the verifiers

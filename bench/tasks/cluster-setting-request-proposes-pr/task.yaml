@@ -59,8 +59,6 @@ validated: false
 
 domain: security
 
-owner: maintainers
-
 fixtures:
   - no-pdb-workload
 

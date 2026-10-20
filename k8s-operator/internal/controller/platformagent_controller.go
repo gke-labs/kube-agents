@@ -159,6 +159,19 @@ const (
 	reasonContainerError    = "Error"
 	reasonCrashLoopBackOff  = "CrashLoopBackOff"
 
+	// readyConditionType and degradedPhase are the condition and the phase
+	// getDeploymentStatusDetails reads back off the CR when a pod read failed.
+	readyConditionType = "Ready"
+	degradedPhase      = "Degraded"
+	// podScanMessagePrefixContainer and podScanMessagePrefixPod open every
+	// message getDeploymentStatusDetails writes, and nothing else that writes
+	// the Ready condition opens with either: the refusals in Reconcile name a
+	// Secret, a mode or a git URL. They are how a pass that could not read the
+	// pods tells a fault it is holding for itself from one another writer put
+	// there, which it must not re-assert after that writer's cause has gone.
+	podScanMessagePrefixContainer = "Container '"
+	podScanMessagePrefixPod       = "Pod "
+
 	// a2aVerifierContainerName is the verifier Deployment's only container
 	// (buildA2AVerifierDeployment). The pod scan names it to tell the one
 	// crash loop that is the a2a stack still coming up from a real fault;
@@ -513,6 +526,13 @@ type PlatformAgentReconciler struct {
 // where this grant is trimmed, block WaitForCacheSync forever behind a forbidden LIST.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
+// The GitOps reconcilers' objects, read-only, for the same escalation-prevention reason
+// as `nodes` above: buildMinimalPlatformRole grants them to the agent, so the operator
+// must hold them to apply that role. The operator itself never reads them.
+// +kubebuilder:rbac:groups=argoproj.io,resources=applications,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kustomize.toolkit.fluxcd.io,resources=kustomizations,verbs=get;list;watch
+// +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=gitrepositories;ocirepositories,verbs=get;list;watch
+// +kubebuilder:rbac:groups=configsync.gke.io,resources=rootsyncs;reposyncs,verbs=get;list;watch
 
 // isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
 // (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io,
@@ -4473,6 +4493,41 @@ func networkPolicyStatusUnchanged(status agentv1alpha1.NetworkPolicyStatus, prof
 	return true
 }
 
+// podReader returns the reader every Pod read goes through, and it is the live
+// API server for the same reason a2aReader is. No Owns() or Watches() names
+// Pods, so a cached Pod read is what starts their informer — and it starts a
+// cluster-wide one: client.InNamespace on a cached List filters the store after
+// the fact, it does not scope the watch. The cached client would hold every Pod
+// in the cluster to serve reads of a handful of this install's own (#3493), and
+// Pods outnumber every other kind in most clusters, so this one reader is the
+// difference between a cache that scales with the install and one that scales
+// with the cluster it runs on.
+//
+// What it costs instead, per agent and in steady state: 36 lists an hour from
+// the usage poll (its four groups share three distinct selectors, every
+// usageCountersPollInterval), one per reconcile while the CR has plugins, and
+// three more per reconcile while the agent is not Ready — five of those where
+// the A2A stack renders. Each is namespace-scoped and label-selected
+// server-side, and controller-runtime leaves client-side rate limiting off
+// (cfg.QPS = -1, API Priority and Fairness instead), so they queue behind
+// nothing of the operator's own.
+//
+// Nil falls back to the cached client, which is what tests supply.
+func (r *PlatformAgentReconciler) podReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// podScanWroteMessage reports whether a stored Ready-condition message is one
+// getDeploymentStatusDetails wrote, which is the only kind it may hold on a
+// pass that could not read the pods.
+func podScanWroteMessage(message string) bool {
+	return strings.HasPrefix(message, podScanMessagePrefixContainer) ||
+		strings.HasPrefix(message, podScanMessagePrefixPod)
+}
+
 // capBucketProvisioned is "this install has provisioned the bus at least
 // once", which is this operator's only cheap proxy for "the capability bucket
 // exists". It qualifies exactly one container's crash loop; see the verifier
@@ -4547,12 +4602,52 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	}
 
 	pods := make([]corev1.Pod, 0)
+	// A read that failed is not a selector that matched nothing, and since
+	// podReader goes to the API server it can fail for a reason outside this
+	// install: an apiserver rollout, a 429. Skipping the selector keeps every
+	// fault this pass could still see -- one found below wins, whichever
+	// selector it came from -- but finding none is then not evidence that none
+	// exists, and "none" is not an inert answer here. The caller's default in
+	// this arm IS this function's default (updateStatusReady: Provisioning /
+	// "Waiting for deployment replicas to be ready"), it writes it whenever the
+	// scan does not override, and the write re-enqueues the CR through an
+	// unfiltered watch -- so a scan that went blind would clear a Degraded the
+	// last pass wrote, then restore it, for every agent on the install while
+	// the control plane is away.
+	//
+	// So a pass that could not read every selector falls back to the fault the
+	// CR already carries instead of to the default. That answer equals what is
+	// stored, which is what makes it safe: the change check finds nothing
+	// moved and writes nothing at all.
+	//
+	// Only a fault this scan itself wrote, though, which is what the message
+	// prefixes test. Degraded with Ready=False is also what Reconcile's
+	// refusals write (ShellSandboxKeysMissing, ModeNotRecognized,
+	// A2AProvisionFailed) and what this pass's own git checks write, and those
+	// clear on evidence this pass has already gathered -- the Secret now
+	// exists, the mode was corrected. Re-asserting one of those because a Pod
+	// list got a 429 would contradict a check that ran, and on a spec edit the
+	// generation witness forces the write out, stamping a refusal as current
+	// against the generation that fixed it.
+	var unread error
+	unreadSelectors := 0
 	for _, selector := range selectors {
 		podList := &corev1.PodList{}
-		if err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+		if err := r.podReader().List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+			unread, unreadSelectors = err, unreadSelectors+1
 			continue
 		}
 		pods = append(pods, podList.Items...)
+	}
+	if unread != nil {
+		// One line per pass rather than one per selector: the causes above take
+		// every selector down together, and this runs on a 30s requeue.
+		logf.FromContext(ctx).Error(unread, "could not list every one of the agent's pods for the status scan; a fault this pass does not find is left as the CR last reported it",
+			"selectorsUnread", unreadSelectors, "selectorsTried", len(selectors))
+		if held := meta.FindStatusCondition(agent.Status.Conditions, readyConditionType); agent.Status.Phase == degradedPhase &&
+			held != nil && podScanWroteMessage(held.Message) {
+			phase, reason, message = agent.Status.Phase, held.Reason, held.Message
+		}
 	}
 	if len(pods) == 0 {
 		return phase, reason, message
@@ -5371,7 +5466,16 @@ func evaluatePluginReadiness(
 func (r *PlatformAgentReconciler) updatePluginStatuses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin, imageVolumeSupported bool) {
 	now := metav1.Now()
 	seenNames := make(map[string]bool)
-	pluginFailures := r.detectPluginFailures(ctx, agent, plugins)
+	pluginFailures, err := r.detectPluginFailures(ctx, agent, plugins)
+	if err != nil {
+		// Every status below is derived from that read: with no failures to
+		// find, a plugin stuck in ImagePullBackOff is written Ready/Applied,
+		// and the patch re-enqueues the agent through the AgentPlugin watch so
+		// the next pass undoes it. Leave the statuses standing for this pass
+		// instead; the requeue brings the scan back.
+		logf.FromContext(ctx).Error(err, "could not read the gateway's pods, so no AgentPlugin status is written this pass")
+		return
+	}
 
 	for _, plugin := range plugins {
 		original := plugin.DeepCopy()
@@ -5429,16 +5533,22 @@ func logPluginCondition(plugin *agentv1alpha1.AgentPlugin, condition metav1.Cond
 
 // detectPluginFailures maps plugin name to its detected failure when the agent pod
 // cannot pull the plugin image or when staging the plugin via init container fails.
-func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) map[string]pluginFailure {
+//
+// The error is the pod read's, and it is returned rather than folded into an
+// empty map because the two mean opposite things to the caller: no failures is
+// "every plugin is applied", which is a claim, and a read that did not happen
+// supports no claim at all. The read goes to the API server (podReader), so it
+// can fail for a reason outside this install.
+func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) (map[string]pluginFailure, error) {
 	failures := map[string]pluginFailure{}
 	if len(plugins) == 0 {
-		return failures
+		return failures, nil
 	}
 
 	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(agent.Namespace),
+	if err := r.podReader().List(ctx, podList, client.InNamespace(agent.Namespace),
 		client.MatchingLabels{"app": agent.Name + "-gateway"}); err != nil {
-		return failures
+		return failures, fmt.Errorf("listing the gateway's pods for the plugin scan: %w", err)
 	}
 
 	for _, pod := range podList.Items {
@@ -5497,7 +5607,7 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 			}
 		}
 	}
-	return failures
+	return failures, nil
 }
 
 func isPluginStagingContainer(name string) bool {
@@ -5531,9 +5641,11 @@ func formatStagingFailureMessage(exitCode int32, termMsg string, pluginImage str
 }
 
 // detectPluginImageFailures maps plugin name to the kubelet's message when the agent's
-// pod cannot pull that plugin's image.
+// pod cannot pull that plugin's image. A read that failed yields no entries, which is
+// why nothing in the reconcile path uses this: updatePluginStatuses needs to tell that
+// case from an install with no failures, and does.
 func (r *PlatformAgentReconciler) detectPluginImageFailures(ctx context.Context, agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) map[string]string {
-	all := r.detectPluginFailures(ctx, agent, plugins)
+	all, _ := r.detectPluginFailures(ctx, agent, plugins)
 	images := map[string]string{}
 	for name, f := range all {
 		if f.reason == pluginFailureReasonImagePull {

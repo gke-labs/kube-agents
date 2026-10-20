@@ -171,9 +171,6 @@ validated: false
 # carry.
 domain: incident-triage
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # The board read, not the diagnosis. The triage was produced minutes earlier by
 # a different session -- the one the daemon opened when it took the drift
 # record, worked by the cluster-* agent for this cluster -- and the thing under

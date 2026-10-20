@@ -1482,6 +1482,211 @@ class TestValidation(unittest.TestCase):
             audit_report.validate_findings(doc, AUDIT)
         self.assertIn("findings[1].evidence.command", str(exc.exception))
 
+    def test_usage_errors_name_the_command_that_makes_the_input(self):
+        for argv, hint in (
+            (["draft", "--audit", AUDIT], "--manifest-file <the manifest the SOP's collector command wrote>"),
+            (["finish", "--audit", AUDIT], "write it with `draft --audit <id> --manifest-file"),
+            (["run", "--audit", AUDIT], "then `finish --audit <id> --findings-file"),
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(SystemExit) as exit_:
+                    audit_report.build_parser().parse_args(argv)
+                self.assertEqual(exit_.exception.code, 2)
+                self.assertIn(hint, err.getvalue())
+
+    def test_a_subcommand_typo_gets_no_lifecycle_hint(self):
+        # The root parser reports a subcommand's leftover arguments; telling a
+        # `remediate` caller to go on to `finish` would republish the ledger.
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                audit_report.build_parser().parse_args(
+                    ["remediate", "--audit", AUDIT, "--findings-file", "f", "--finding", "x", "--bogus"]
+                )
+        self.assertIn("unrecognized arguments", err.getvalue())
+        self.assertNotIn(audit_report.LIFECYCLE_HINT, err.getvalue())
+
+    def test_a_missing_findings_file_names_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = str(Path(tmp) / "absent-findings.json")
+            with self.assertRaises(audit_report.ValidationError) as ctx:
+                audit_report.load_findings(absent, "compliance-audit", command="finish")
+            with self.assertRaises(audit_report.ValidationError) as remediate:
+                audit_report.load_findings(absent, "compliance-audit", command="remediate")
+        self.assertIn("does not exist", str(ctx.exception))
+        self.assertIn(
+            "audit_report.py draft --audit compliance-audit --manifest-file "
+            + audit_report.manifest_path_for("compliance-audit"),
+            str(ctx.exception),
+        )
+        self.assertIn(f"--out {absent}", str(ctx.exception))
+        # A run whose collector did not run is pointed at the manual fallback too.
+        self.assertIn("--no-collector-manifest", str(ctx.exception))
+        # `remediate` is not told to run `finish`, which would republish the ledger.
+        self.assertEqual(str(remediate.exception), f"--findings-file: {absent} does not exist")
+
+    def test_one_bad_field_reads_as_before(self):
+        # A single problem must give the same one line as before, with no
+        # second line from a check that read the bad field.
+        def manifest_finding(path):
+            finding = make_finding()
+            finding["remediation"] = {"kind": "manifest", "path": path, "note": "n"}
+            return finding
+
+        cases = {
+            "check null": lambda d: d["findings"][0].__setitem__("check", None),
+            "check empty": lambda d: d["findings"][0].__setitem__("check", ""),
+            "cluster empty": lambda d: d["findings"][0].__setitem__("cluster", ""),
+            "object empty": lambda d: d["findings"][0].__setitem__("object", ""),
+            "title null": lambda d: d["findings"][0].__setitem__("title", None),
+            "path null": lambda d: d["findings"].__setitem__(0, manifest_finding(None)),
+            "path empty": lambda d: d["findings"].__setitem__(0, manifest_finding("")),
+            "checks_run command empty": lambda d: d["scope"]["clusters"][0]["checks_run"][0].__setitem__("command", ""),
+            "cluster name null": lambda d: d["scope"]["clusters"][0].__setitem__("name", None),
+        }
+        for label, spoil in cases.items():
+            with self.subTest(case=label):
+                doc = make_doc()
+                spoil(doc)
+                with self.assertRaises(audit_report.ValidationError) as before:
+                    audit_report._validate_findings_document(copy.deepcopy(doc), AUDIT)
+                with self.assertRaises(audit_report.ValidationError) as now:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertEqual(str(now.exception), str(before.exception))
+
+    def test_every_field_error_is_reported_in_one_call(self):
+        # A worker fixes what the rejection names and runs finish again, so
+        # one field per call costs a run per field (#2856).
+        doc = make_doc(findings=[make_finding(), make_finding(fid="second")])
+        doc["scope"]["clusters"][0]["location"] = None
+        doc["findings"][0]["title"] = None
+        del doc["findings"][1]["evidence"]["command"]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        self.assertIn("3 problems", message)
+        self.assertIn("scope.clusters[0].location", message)
+        self.assertIn("findings[0].title", message)
+        self.assertIn("findings[1].evidence.command", message)
+
+    def test_the_gitlab_rep_errors_come_back_together(self):
+        # #2856's GitLab rep 2 took four rejected finish calls for these.
+        finding = make_finding()
+        finding["evidence"] = "kubectl get rolebinding -A"
+        finding["remediation"] = {"kind": "manifest", "path": None, "note": "n"}
+        del finding["title"]
+        doc = make_doc(findings=[finding])
+        doc["scope"]["clusters"][0]["location"] = None
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        for field in ("scope.clusters[0].location", "findings[0].title", "findings[0].evidence", "findings[0].remediation.path"):
+            self.assertIn(field, message)
+
+    def test_a_bad_identity_field_does_not_stop_later_findings(self):
+        # A missing key used to end collection at the next `finding[key]` read.
+        doc = make_doc(findings=[make_finding(), make_finding(fid="second", obj="Deployment/other")])
+        del doc["findings"][0]["cluster"]
+        doc["findings"][0]["check"] = None
+        del doc["findings"][1]["evidence"]["command"]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        for field in ("findings[0].check", "findings[0].cluster", "findings[1].evidence.command"):
+            self.assertIn(field, message)
+        self.assertNotIn("'None' is not a check", message)
+
+    def test_a_duplicate_identity_is_reported_beside_a_recorded_title(self):
+        # The duplicate is a problem of its own, not a repeat of the title.
+        doc = make_doc(findings=[make_finding(), make_finding()])
+        doc["findings"][1]["title"] = None
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("findings[1].title", str(exc.exception))
+        self.assertIn("findings[1]: same identity as findings[0]", str(exc.exception))
+
+    def test_a_null_limitations_still_shows_the_empty_checks_run(self):
+        doc = make_doc()
+        doc["scope"]["clusters"][0]["checks_run"] = []
+        doc["scope"]["clusters"][0]["limitations"] = None
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        self.assertIn("scope.clusters[0].limitations", str(exc.exception))
+        self.assertIn("scope.clusters[0].checks_run: empty", str(exc.exception))
+
+    def test_a_bad_scope_name_keeps_collecting_without_false_scope_errors(self):
+        for label, spoil in {
+            "absent": lambda c: c.pop("name"),
+            "null": lambda c: c.__setitem__("name", None),
+        }.items():
+            with self.subTest(name=label):
+                doc = make_doc(findings=[make_finding()])
+                spoil(doc["scope"]["clusters"][0])
+                doc["resolved_because"] = [resolved_entry()]
+                del doc["findings"][0]["evidence"]["command"]
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                message = str(exc.exception)
+                self.assertIn("scope.clusters[0].name", message)
+                self.assertIn("findings[0].evidence.command", message)
+                self.assertNotIn("is not in scope.clusters", message)
+
+    def test_a_recorded_entry_key_does_not_stop_the_next_entry(self):
+        # A second defect behind the recorded one, in each list round 1's
+        # skip covers: both must come back in one rejection.
+        def checks_run(doc):
+            run = doc["scope"]["clusters"][0]["checks_run"]
+            run[0]["check"] = None
+            run[1]["command"] = ""
+            return "scope.clusters[0].checks_run[0].check", "scope.clusters[0].checks_run[1].command"
+
+        def not_applicable(doc):
+            cluster = doc["scope"]["clusters"][0]
+            first, second = cluster["checks_run"][:2]
+            cluster["checks_run"] = cluster["checks_run"][2:]
+            cluster["checks_not_applicable"] = [
+                {"check": None, "reason": "Autopilot: Google manages the node pools here."},
+                {"check": second["check"], "reason": ""},
+            ]
+            del first
+            return "checks_not_applicable[0].check", "checks_not_applicable[1].reason"
+
+        def skipped(doc):
+            doc["scope"]["skipped"] = [{"reason": "the API refused the call"}, {"cluster": "x", "reason": ""}]
+            return "scope.skipped[0].cluster", "scope.skipped[1].reason"
+
+        def resolved(doc):
+            doc["resolved_because"] = [resolved_entry(reason=None), resolved_entry(object="")]
+            return "resolved_because[0].reason", "resolved_because[1].object"
+
+        for spoil in (checks_run, not_applicable, skipped, resolved):
+            with self.subTest(list=spoil.__name__):
+                doc = make_doc()
+                first, second = spoil(doc)
+                with self.assertRaises(audit_report.ValidationError) as exc:
+                    audit_report.validate_findings(doc, AUDIT)
+                self.assertIn(first, str(exc.exception))
+                self.assertIn(second, str(exc.exception))
+
+    def test_a_recorded_declared_key_does_not_stop_the_next_entry(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(check=None), make_declared(obj="")]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, DECLARING_AUDIT)
+        self.assertIn("declared[0].check", str(exc.exception))
+        self.assertIn("declared[1].object", str(exc.exception))
+
+    def test_reported_field_errors_are_capped(self):
+        findings = [make_finding(fid=f"f{i}") for i in range(25)]
+        doc = make_doc(findings=findings)
+        for finding in doc["findings"]:
+            del finding["evidence"]["command"]
+        with self.assertRaises(audit_report.ValidationError) as exc:
+            audit_report.validate_findings(doc, AUDIT)
+        message = str(exc.exception)
+        self.assertIn("findings[19].evidence.command", message)
+        self.assertNotIn("findings[20].evidence.command", message)
+        self.assertIn("5 more", message)
+
     def test_empty_evidence_command_rejected(self):
         doc = make_doc(findings=[make_finding(command="   ")])
         with self.assertRaises(audit_report.ValidationError) as exc:
@@ -4186,6 +4391,17 @@ class TestNewMarker(HarnessTestCase):
         self.assertEqual(self.run_finish(doc), 0, self.err)
         (body,) = self.harness.bodies_for("issue-update")
         return body
+
+    def test_a_second_finish_in_the_run_keeps_the_first_ones_marks(self):
+        alpha = make_finding(fid="a", title="Alpha finding")
+        doc = make_doc(findings=[alpha, make_finding(fid="b", title="Bravo finding")])
+        audit_report.open_chat_report(AUDIT, "acme/fleet", datetime.now(timezone.utc))
+        self.remember([alpha])
+        self.assertEqual(self.marked(self.finish(doc)), [derived_id(fid="b")])
+
+        self.assertEqual(self.run_finish(doc), 0, self.err)
+        second = self.harness.bodies_for("issue-update")[-1]
+        self.assertEqual(self.marked(second), [derived_id(fid="b")])
 
     def test_a_first_run_marks_nothing(self):
         # No ledger to measure against: everything would read as new.
@@ -15409,6 +15625,42 @@ class TestCarryUnchangedFindings(unittest.TestCase):
             )
             audit_report.degrade_missing_remediations([finding], Path(tmp))
         self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]))
+        # Each note of the Kustomize pass, whichever reason it gives.
+        for name, probe in self.kustomize_probes().items():
+            with self.subTest(kustomize=name):
+                finding = self.before(
+                    remediation={"kind": "manifest", "path": "apps/web/pdb.yaml", "note": "n"}
+                )
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(len(audit_report.degrade_unlisted_kustomize_additions([finding], probe)), 1)
+                self.assertTrue(audit_report._harness_wrote_note(finding["remediation"]), finding["remediation"])
+
+    def kustomize_probes(self):
+        """A probe for each reason the Kustomize pass gives, with no git and no broker."""
+
+        class Probe(audit_report._WorkingTreeProbe):
+            def __init__(self, committed, text, unanswered=""):
+                super().__init__("acme/fleet", Path("."))
+                self._answers, self._text, self._why = committed, text, unanswered
+
+            def committed(self, path):
+                self.unanswered = self._why if self._why and path.endswith("pdb.yaml") else ""
+                if self._why == "all":
+                    self.unanswered = "no answer"
+                    return True
+                return self._answers.get(path, False)
+
+            def read_committed(self, path):
+                self.unanswered = "" if self._text is not None else "cannot read"
+                return self._text
+
+        root = {"apps/web/kustomization.yaml": True}
+        return {
+            "unlisted": Probe(root, "resources: []\n"),
+            "unread": Probe(root, None),
+            "unseen": Probe({}, None, "all"),
+            "new file unchecked": Probe(root, "resources: []\n", "listing failed"),
+        }
 
     def test_a_carried_gcloud_note_is_normalised(self):
         stale = self.before(
@@ -16840,6 +17092,9 @@ class ContentModeTestCase(BaseTestCase):
         branch = self.branch_for(make_doc())
         first = self.origin_git(["rev-parse", branch]).strip()
 
+        # A second run starts again; a second `finish` after one `start` is
+        # the same run, and opens no pull request of its own.
+        self.start()
         self.write_manifest(
             "clusters/prod-us-east/payments-netpol.yaml",
             "kind: NetworkPolicy\nspec: {}\n",
@@ -16865,6 +17120,11 @@ class ContentModeTestCase(BaseTestCase):
             "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
         }
         self.assertEqual(self.run_finish(make_doc()), 0)
+        # A second run starts again, as above.
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
         self.assertEqual(self.run_finish(make_doc()), 0)
         self.assertEqual(len(self.harness.forge_calls("proposal-create")), 2)
 
@@ -17218,6 +17478,29 @@ class ContentModeTestCase(BaseTestCase):
         self.assertIn("BROKER UNAVAILABLE:", self.err)
         self.assertNotIn("FATAL", self.err)
 
+    def test_a_busy_broker_at_the_kustomize_check_is_the_same_refusal(self):
+        """A 503 at the probe's open is an outage: `finish` exits 2 with the
+        outage line and opens nothing, so the worker runs it again, and no fix
+        is degraded because the broker was busy."""
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+
+        def busy(*_args, **_kwargs):
+            raise credential_proxy_client.WorkspaceRequestError(503, {"error": "busy"})
+
+        with patch.object(credential_proxy_client.Workspace, "open", busy):
+            self.assertEqual(self.run_finish(make_doc()), 2)
+        self.assertIn("BROKER UNAVAILABLE:", self.err)
+        self.assertIn("checking whether a kustomization lists", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertEqual(self.harness.forge_calls("issue-create"), [])
+
     def test_a_broker_dropped_mid_answer_under_the_workspace_is_the_same_refusal(self):
         """Review finding: a broker evicted after taking the request surfaces
         from the response read, raw and not as a `URLError`, and exited 1."""
@@ -17504,6 +17787,21 @@ class TestLoadManifest(BaseTestCase):
         with self.assertRaises(audit_report.ValidationError) as ctx:
             audit_report.load_manifest(str(self.tmp_path / "absent.json"))
         self.assertIn("does not exist", str(ctx.exception))
+
+    def test_a_missing_manifest_names_the_next_step_for_the_command(self):
+        absent = str(self.tmp_path / "absent.json")
+        with self.assertRaises(audit_report.ValidationError) as finish:
+            audit_report.load_manifest(absent, "compliance-audit", command="finish")
+        # The next step, for both cases: the collector ran, or it did not.
+        self.assertIn(audit_report.manifest_path_for("compliance-audit"), str(finish.exception))
+        self.assertIn("--no-collector-manifest", str(finish.exception))
+        with self.assertRaises(audit_report.ValidationError) as draft:
+            audit_report.load_manifest(absent, "compliance-audit", command="draft")
+        self.assertIn(audit_report.manifest_path_for("compliance-audit"), str(draft.exception))
+        self.assertNotIn("--no-collector-manifest", str(draft.exception))
+        with self.assertRaises(audit_report.ValidationError) as remediate:
+            audit_report.load_manifest(absent, "compliance-audit", command="remediate")
+        self.assertEqual(str(remediate.exception), f"--manifest-file: {absent} does not exist")
 
     def test_malformed_json_is_a_validation_error(self):
         with self.assertRaises(audit_report.ValidationError) as ctx:
@@ -19187,13 +19485,35 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         )
         self.assertNotIn("kustomization.yaml", message)
 
+    def test_the_kustomize_instruction_names_only_the_kustomize_fixes(self):
+        message = audit_report.unwritten_refusal_message(
+            {
+                "a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True),
+                "b": audit_report.UnwrittenFix("apps/b/deploy.yaml", declared=True),
+            },
+            {
+                "a": "apps/a is inside a Kustomize root, where a new file renders only if listed",
+                "b": "the collector attached no selector to write it from",
+            },
+        )
+        self.assertIn("a: in a Kustomize root", message)
+        self.assertNotIn("b: in a Kustomize root", message)
+        self.assertNotIn("a, b: in a Kustomize root", message)
+        self.assertIn("b: the collector attached no selector", message)
+        self.assertIn("For these, and only these", message)
+
     def test_the_refusal_says_why_finish_did_not_write_a_fix(self):
         message = audit_report.unwritten_refusal_message(
             {"a": audit_report.UnwrittenFix("apps/a/deploy.yaml", declared=True)},
             {"a": "apps/a is inside a Kustomize root, where a new file renders only if listed"},
         )
         self.assertIn("`finish` did not write these itself: a: apps/a is inside a Kustomize root", message)
-        self.assertIn("`kustomization.yaml` `resources:`", message)
+        # One file cannot list itself, so the refusal does not ask for that: it
+        # says the guard makes such a fix manual, and what the note must hold.
+        self.assertNotIn("list the new file", message)
+        self.assertIn("`finish` makes a `manifest` fix that adds an unlisted file there `manual`", message)
+        self.assertIn("keep it `kind: manual`, put the new file's content and the `resources:` line", message)
+        self.assertIn("--decline-fix", message)
         self.touch("apps/kustomization.yaml")
         notes = {}
         manifest = self.manifest()
@@ -20204,6 +20524,7 @@ class TestCollectorStreamsRequireAManifest(HarnessTestCase):
         self.assertEqual(rc, 2)
         self.assertIn("--manifest-file is required for compliance-audit", self.err)
         self.assertIn("--no-collector-manifest", self.err)
+        self.assertIn(f"--manifest-file {audit_report.manifest_path_for('compliance-audit')}", self.err)
         self.assertFalse(self.harness.matching("issue"))
         self.assertFalse((self.reports_dir / AUDIT).exists())
 
@@ -24319,6 +24640,10 @@ class TestFinishWithoutAManifestIsUnchanged(HarnessTestCase):
     and puts the clean-close banner above the old body (`close_ledger_reads_clean`).
     The clean-over-a-gap run's JSON line now carries `unreported_under_gap`: the
     previous ledger listed a finding and this run, with a gap, does not publish it.
+    The Kustomize pass is recorded
+    the same way: `finish` asks git in one `ls-tree` a run if each
+    `manifest` fix's file and each possible kustomization for it are at the
+    audited commit. That adds one git call to the findings transcript.
     Nothing else moved.
 
     The move from `gh` to the broker's forge verbs is recorded the same way,
@@ -25313,6 +25638,603 @@ class TestPhaseTimers(HarnessTestCase):
         self.assertNotIn("collect_s", envelope)
 
 
+# --------------------------------------------------------------------------- #
+# Kustomize: a new file its kustomization does not list renders nothing
+# --------------------------------------------------------------------------- #
+
+
+def kustomize_fix(path, fid="pdb-fix"):
+    """A finding whose `manifest` fix is the new file at `path`."""
+    return make_finding(
+        fid=fid,
+        remediation={"kind": "manifest", "path": path, "note": "Add a PodDisruptionBudget."},
+    )
+
+
+class FakeBrokerWorkspace:
+    """The broker's view of the base: `list` and `read_text` over `files`.
+
+    `fail` names the paths whose read raises, and `list_fails` the prefixes
+    whose listing raises, as a broker that does not answer would."""
+
+    def __init__(self, files, fail=(), list_fails=()):
+        self.files = dict(files)
+        self.fail = set(fail)
+        self.list_fails = set(list_fails)
+
+    def list(self, prefix=None):
+        if prefix in self.list_fails:
+            raise RuntimeError("listing failed")
+        return [{"path": path} for path in self.files if prefix is None or path.startswith(prefix)]
+
+    def read_text(self, path):
+        if path in self.fail or path not in self.files:
+            raise RuntimeError(f"cannot read {path}")
+        return self.files[path]
+
+
+class TestUnlistedKustomizeAdditions(BaseTestCase):
+    """`degrade_unlisted_kustomize_additions` makes a `manifest` fix `manual`
+    when it adds a file that its Kustomize root does not list."""
+
+    OVERLAY = "clusters/prod/apps/checkout-gateway"
+    KUSTOMIZATION = f"{OVERLAY}/kustomization.yaml"
+    PDB = f"{OVERLAY}/checkout-gateway-pdb.yaml"
+
+    # --- directory mode: a real clone, the worker's file untracked --------- #
+
+    def clone(self, committed):
+        """A git clone at a commit that holds `committed`, path to text."""
+        git = shutil.which("git")
+        if git is None:  # pragma: no cover - git is present locally and in CI
+            self.skipTest("git not on PATH")
+        root = self.tmp_path / "clone"
+        root.mkdir()
+
+        def run(*args):
+            subprocess.run([git, *args], cwd=root, check=True, capture_output=True, text=True)
+
+        run("init", "-q", "-b", "main")
+        run("config", "user.email", "audit@example.invalid")
+        run("config", "user.name", "audit")
+        for path, text in committed.items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        return root
+
+    def write(self, root, path, text="kind: PodDisruptionBudget\n"):
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def degrade(self, root, findings):
+        probe = audit_report._RepositoryProbe("acme/fleet", root)
+        with contextlib.redirect_stderr(io.StringIO()):
+            return audit_report.degrade_unlisted_kustomize_additions(findings, probe)
+
+    def overlay(self, resources="- deployment.yaml\n"):
+        return {
+            f"{self.OVERLAY}/deployment.yaml": "kind: Deployment\n",
+            self.KUSTOMIZATION: "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n" + resources,
+        }
+
+    def test_a_new_unlisted_file_in_an_overlay_is_manual_and_names_the_line(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        remediation = finding["remediation"]
+        self.assertEqual((remediation["kind"], remediation["path"]), ("manual", ""))
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", remediation["note"])
+        self.assertIn("`- checkout-gateway-pdb.yaml` under `resources:`", remediation["note"])
+        # The guard's text comes first, so the ledger's clip never cuts it;
+        # the worker's own note follows the copied file.
+        self.assertTrue(remediation["note"].startswith("_(The audit did not open"))
+        self.assertTrue(remediation["note"].endswith("Add a PodDisruptionBudget."))
+        self.assertIn("```yaml\nkind: PodDisruptionBudget\n```", remediation["note"])
+
+    def test_the_note_copies_the_file_up_to_the_cap(self):
+        root = self.clone(self.overlay())
+        cap = audit_report.MANUAL_NOTE_MANIFEST_LINES
+        self.write(root, self.PDB, "".join(f"k{i}: v\n" for i in range(cap + 5)))
+        finding = kustomize_fix(self.PDB)
+        self.degrade(root, [finding])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"k{cap - 1}: v", note)
+        self.assertNotIn(f"k{cap}: v", note)
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
+
+        # Long lines stop where the room under the clip ends, still inside a
+        # closed block.
+        self.write(root, self.PDB, "".join(f"k{i}: {'v' * 100}\n" for i in range(cap)))
+        finding = kustomize_fix(self.PDB)
+        self.degrade(root, [finding])
+        note = finding["remediation"]["note"]
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
+        self.assert_fence_survives_the_clip(note)
+
+    def assert_fence_survives_the_clip(self, note):
+        """The note as the ledger renders it has every fence closed."""
+        clipped = audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS)
+        self.assertEqual(clipped.count("```") % 2, 0, clipped)
+
+    def test_a_long_path_leaves_the_block_only_the_room_under_the_clip(self):
+        deep = "/".join(f"level-{i:02d}-{'d' * 40}" for i in range(4))
+        overlay = f"clusters/prod/{deep}"
+        path = f"{overlay}/checkout-gateway-pdb.yaml"
+        root = self.clone({f"{overlay}/kustomization.yaml": "resources:\n- deployment.yaml\n"})
+        self.write(root, path, "".join(f"k{i}: {'v' * 60}\n" for i in range(40)))
+        finding = kustomize_fix(path, fid="pdb-fix")
+        finding["remediation"]["note"] = "w" * 3000
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        # Some of the file fits, and the block ends where the room ends.
+        self.assertIn("```yaml\nk0: ", note)
+        self.assertIn(audit_report.MANUAL_NOTE_TRUNCATED + "\n```", note)
+        self.assert_fence_survives_the_clip(note)
+
+    def test_a_long_broker_error_drops_the_block(self):
+        """No room is left after the note's own text, so the block goes."""
+        target = self.tmp_path / self.PDB
+        target.parent.mkdir(parents=True)
+        target.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        finding = kustomize_fix(self.PDB)
+        workspace = FakeBrokerWorkspace(self.overlay())
+        workspace.read_text = mock.MagicMock(side_effect=RuntimeError("e" * 2500))
+        self.assertEqual(self.degrade_via_workspace(workspace, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
+        self.assertNotIn("```", note)
+        self.assert_fence_survives_the_clip(note)
+
+    def degrade_with_open(self, opened):
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        finding = kustomize_fix(self.PDB)
+        with patch.object(credential_proxy_client.Workspace, "open", opened), contextlib.redirect_stderr(io.StringIO()):
+            return audit_report.degrade_unlisted_kustomize_additions([finding], probe), finding
+
+    def test_a_broker_that_refuses_the_open_degrades_and_says_so(self):
+        """`has_path` takes a yes and records only `unavailable`; the pass
+        still reads that as no answer, also for a file that may exist."""
+
+        def refused(*_args, **_kwargs):
+            raise credential_proxy_client.WorkspaceRequestError(403, {"error": "repository not managed"})
+
+        degraded, finding = self.degrade_with_open(refused)
+        self.assertEqual(degraded, ["pdb-fix"])
+        self.assertIn("could not check", finding["remediation"]["note"])
+        self.assertIn("WorkspaceRequestError", finding["remediation"]["note"])
+
+    def test_no_answer_in_a_repository_without_kustomize_names_no_kustomization(self):
+        """The probe takes a yes it did not see; the note must not state a
+        kustomization path as fact."""
+
+        def refused(*_args, **_kwargs):
+            raise credential_proxy_client.WorkspaceRequestError(403, {"error": "repository not managed"})
+
+        path = "clusters/prod/apps/web/web-pdb.yaml"
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        finding = kustomize_fix(path)
+        with patch.object(credential_proxy_client.Workspace, "open", refused), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not check whether the directory of `{path}` is under a kustomization", note)
+        self.assertIn("WorkspaceRequestError", note)
+        self.assertNotIn("kustomization.yaml", note)
+        self.assertNotIn("Kustomization`", note)
+
+    def test_a_server_error_at_the_open_stops_the_command(self):
+        """A 503 or 429 says "try again", so it is an outage, not a refusal."""
+        for status in (503, 429):
+            with self.subTest(status=status):
+
+                def busy(*_args, **_kwargs):
+                    raise credential_proxy_client.WorkspaceRequestError(status, {"error": "busy"})
+
+                with self.assertRaises(audit_report.BrokerUnavailable):
+                    self.degrade_with_open(busy)
+
+    def test_a_lost_broker_after_a_good_open_stops_the_command(self):
+        import urllib.error
+
+        class Lost(FakeBrokerWorkspace):
+            def list(self, prefix=None):
+                raise urllib.error.URLError("[Errno 111] Connection refused")
+
+        session = mock.MagicMock()
+        session.__enter__.return_value = Lost(self.overlay())
+        with self.assertRaises(audit_report.BrokerUnavailable):
+            self.degrade_with_open(lambda *_a, **_k: session)
+
+    def test_a_retried_open_that_succeeds_clears_the_outage(self):
+        """The Config Connector scan opens the probe twice when the first open
+        fails; a second open that succeeds answers for the first."""
+        import urllib.error
+
+        session = mock.MagicMock()
+        session.__enter__.return_value = FakeBrokerWorkspace(self.overlay())
+        attempts = iter([urllib.error.URLError("[Errno 111] Connection refused"), session])
+
+        def flapping(*_args, **_kwargs):
+            answer = next(attempts)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        finding = kustomize_fix(self.PDB)
+        with patch.object(credential_proxy_client.Workspace, "open", flapping), contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNotNone(probe.broker() or probe.broker())
+            self.assertEqual(audit_report.degrade_unlisted_kustomize_additions([finding], probe), ["pdb-fix"])
+        self.assertIn("does not list it", finding["remediation"]["note"])
+
+    def test_a_broker_that_does_not_answer_the_open_stops_the_command(self):
+        """An outage, as at publish: nothing is published or degraded, and
+        the worker runs `finish` again."""
+        import urllib.error
+
+        def lost(*_args, **_kwargs):
+            raise urllib.error.URLError("[Errno 111] Connection refused")
+
+        with self.assertRaises(audit_report.BrokerUnavailable):
+            self.degrade_with_open(lost)
+
+    def test_a_file_that_cannot_be_read_leaves_the_note_without_a_block(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        real_read = Path.read_text
+
+        def unreadable(path, *args, **kwargs):
+            if path.name == "checkout-gateway-pdb.yaml":
+                raise PermissionError("denied")
+            return real_read(path, *args, **kwargs)
+
+        finding = kustomize_fix(self.PDB)
+        with patch.object(Path, "read_text", unreadable):
+            self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertNotIn("```", note)
+        self.assertIn("`- checkout-gateway-pdb.yaml` under `resources:`", note)
+
+    def test_a_listed_file_is_kept(self):
+        for entry in ("checkout-gateway-pdb.yaml", "./checkout-gateway-pdb.yaml", "'checkout-gateway-pdb.yaml'"):
+            with self.subTest(entry=entry):
+                shutil.rmtree(self.tmp_path / "clone", ignore_errors=True)
+                root = self.clone(self.overlay(f"- deployment.yaml\n- {entry}\n"))
+                self.write(root, self.PDB)
+                finding = kustomize_fix(self.PDB)
+                self.assertEqual(self.degrade(root, [finding]), [])
+                self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_a_longer_name_that_contains_the_file_name_does_not_list_it(self):
+        root = self.clone(self.overlay("- deployment.yaml\n- old-checkout-gateway-pdb.yaml\n"))
+        self.write(root, self.PDB)
+        self.assertEqual(self.degrade(root, [kustomize_fix(self.PDB)]), ["pdb-fix"])
+
+    def test_an_edit_to_a_file_at_the_audited_commit_is_kept(self):
+        """An existing file is not an addition, listed or not."""
+        files = self.overlay()
+        files[self.PDB] = "kind: PodDisruptionBudget\n"
+        root = self.clone(files)
+        self.write(root, self.PDB, "kind: PodDisruptionBudget\nspec: {}\n")
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), [])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_a_file_outside_any_kustomize_root_is_kept(self):
+        root = self.clone({"clusters/prod/apps/web/deployment.yaml": "kind: Deployment\n"})
+        path = "clusters/prod/apps/web/web-pdb.yaml"
+        self.write(root, path)
+        self.assertEqual(self.degrade(root, [kustomize_fix(path)]), [])
+
+    def test_the_nearest_kustomization_is_the_one_that_must_list_the_file(self):
+        """A parent kustomization that names the file does not render it when
+        a nearer one is between them; a file in a plain subdirectory of the
+        root is listed by its path from the root."""
+        nested = f"{self.OVERLAY}/extra/checkout-gateway-pdb.yaml"
+        files = self.overlay()
+        files["clusters/prod/kustomization.yaml"] = "resources:\n- apps/checkout-gateway/extra/checkout-gateway-pdb.yaml\n"
+        root = self.clone(files)
+        self.write(root, nested)
+        finding = kustomize_fix(nested)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        self.assertIn(f"`{self.KUSTOMIZATION}`", finding["remediation"]["note"])
+        self.assertIn("`- extra/checkout-gateway-pdb.yaml`", finding["remediation"]["note"])
+
+        shutil.rmtree(self.tmp_path / "clone")
+        root = self.clone(self.overlay("- deployment.yaml\n- extra/checkout-gateway-pdb.yaml\n"))
+        self.write(root, nested)
+        self.assertEqual(self.degrade(root, [kustomize_fix(nested)]), [])
+
+    def test_a_new_kustomization_is_listed_by_its_directory(self):
+        sub = f"{self.OVERLAY}/budgets/kustomization.yaml"
+        root = self.clone(self.overlay())
+        self.write(root, sub, "resources:\n- pdb.yaml\n")
+        finding = kustomize_fix(sub)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        self.assertIn("`- budgets`", finding["remediation"]["note"])
+
+        shutil.rmtree(self.tmp_path / "clone")
+        root = self.clone(self.overlay("- deployment.yaml\n- budgets/\n"))
+        self.write(root, sub, "resources:\n- pdb.yaml\n")
+        self.assertEqual(self.degrade(root, [kustomize_fix(sub)]), [])
+
+    def test_the_worker_tree_does_not_count(self):
+        """A pull request carries one file, so the kustomization is read at
+        the audited commit: the worker's edit to it does not ship, and a
+        kustomization the worker wrote does not make a root."""
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        self.write(root, self.KUSTOMIZATION, "resources:\n- deployment.yaml\n- checkout-gateway-pdb.yaml\n")
+        self.assertEqual(self.degrade(root, [kustomize_fix(self.PDB)]), ["pdb-fix"])
+
+        shutil.rmtree(self.tmp_path / "clone")
+        root = self.clone({"clusters/prod/apps/web/deployment.yaml": "kind: Deployment\n"})
+        self.write(root, "clusters/prod/apps/web/kustomization.yaml", "resources: []\n")
+        self.write(root, "clusters/prod/apps/web/web-pdb.yaml")
+        self.assertEqual(self.degrade(root, [kustomize_fix("clusters/prod/apps/web/web-pdb.yaml")]), [])
+
+    def test_an_unreadable_kustomization_degrades_and_says_so(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        real = audit_report.git
+
+        def failing_show(args, **kwargs):
+            if args[:1] == ["show"]:
+                return CompletedProcess(args, 128, "", "fatal: bad object")
+            return real(args, **kwargs)
+
+        self.patch_attr("git", failing_show)
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}` to check whether it lists the file", note)
+        self.assertIn("exit 128", note)
+        self.assertIn("`- checkout-gateway-pdb.yaml`", note)
+
+    def test_a_kustomization_this_process_cannot_decode_degrades_and_says_so(self):
+        """`git show` decodes strictly, so a Latin-1 byte in the kustomization
+        raised `UnicodeDecodeError` and ended `finish` FATAL."""
+        root = self.clone({**self.overlay(), self.KUSTOMIZATION: "resources: []\n"})
+        (root / self.KUSTOMIZATION).write_bytes("# caf\u00e9\nresources:\n- deployment.yaml\n".encode("latin-1"))
+        subprocess.run(["git", "commit", "-qam", "latin-1"], cwd=root, check=True, capture_output=True)
+        self.write(root, self.PDB)
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
+        self.assertIn("UnicodeDecodeError", note)
+
+    def test_one_git_listing_answers_every_fix(self):
+        """One `ls-tree` a run, not one a fix."""
+        root = self.clone(self.overlay())
+        other = "clusters/prod/apps/web/web-pdb.yaml"
+        self.write(root, self.PDB)
+        self.write(root, other)
+        calls = []
+        real = audit_report.git
+
+        def counting(args, **kwargs):
+            calls.append(list(args))
+            return real(args, **kwargs)
+
+        self.patch_attr("git", counting)
+        findings = [kustomize_fix(self.PDB, fid="a"), kustomize_fix(other, fid="b")]
+        self.assertEqual(self.degrade(root, findings), ["a"])
+        self.assertEqual(len([c for c in calls if "ls-tree" in c]), 1)
+
+    def test_a_failed_git_listing_degrades_and_says_so(self):
+        root = self.clone(self.overlay())
+        self.write(root, self.PDB)
+        self.patch_attr("git", lambda args, **kwargs: CompletedProcess(args, 128, "", "fatal"))
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        # Git saw no kustomization, so the note names none.
+        self.assertIn(f"could not check whether the directory of `{self.PDB}` is under a kustomization", note)
+        self.assertNotIn("kustomization.yaml", note)
+
+    def test_a_non_ascii_directory_is_matched(self):
+        """`git ls-tree` quotes a non-ASCII name unless `-z` is given."""
+        overlay = "clusters/prod/apps/café-gateway"
+        files = {
+            f"{overlay}/kustomization.yaml": "resources:\n- deployment.yaml\n",
+            f"{overlay}/deployment.yaml": "kind: Deployment\n",
+        }
+        root = self.clone(files)
+        self.write(root, f"{overlay}/pdb.yaml")
+        finding = kustomize_fix(f"{overlay}/pdb.yaml")
+        self.assertEqual(self.degrade(root, [finding]), ["pdb-fix"])
+        self.assertIn(f"`{overlay}/kustomization.yaml` does not list it", finding["remediation"]["note"])
+        self.write(root, f"{overlay}/deployment.yaml", "kind: Deployment\nspec: {}\n")
+        self.assertEqual(self.degrade(root, [kustomize_fix(f"{overlay}/deployment.yaml")]), [])
+
+    def test_other_remediation_kinds_are_left_alone(self):
+        root = self.clone(self.overlay())
+        finding = make_finding(remediation={"kind": "manual", "note": "by hand"})
+        self.assertEqual(self.degrade(root, [finding]), [])
+        self.assertEqual(finding["remediation"], {"kind": "manual", "note": "by hand"})
+
+    # --- content mode: the broker holds the base ---------------------------- #
+
+    def degrade_via_broker(self, files, findings, **failures):
+        return self.degrade_via_workspace(FakeBrokerWorkspace(files, **failures), findings)
+
+    def degrade_via_workspace(self, workspace, findings):
+        session = mock.MagicMock()
+        session.__enter__.return_value = workspace
+        module = mock.MagicMock()
+        module.Workspace.open.return_value = session
+        self.patch_attr("content_mode", lambda: True)
+        # Content mode runs no git; a call here would be a bug.
+        self.patch_attr("git", mock.MagicMock(side_effect=AssertionError("git in content mode")))
+        probe = audit_report._RepositoryProbe("acme/fleet", self.tmp_path)
+        with mock.patch.dict("sys.modules", {"credential_proxy_client": module}), contextlib.redirect_stderr(io.StringIO()):
+            return audit_report.degrade_unlisted_kustomize_additions(findings, probe, "merge request")
+
+    def test_content_mode_degrades_an_unlisted_new_file(self):
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding]), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn("did not open a merge request", note)
+        # The scratch tree holds no file here, so the note has no block.
+        self.assertNotIn("```", note)
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", note)
+        self.assertIn("`- checkout-gateway-pdb.yaml`", note)
+
+    def test_content_mode_copies_the_scratch_file_into_the_note(self):
+        """The file is only in the scratch tree, so the note carries it."""
+        target = self.tmp_path / self.PDB
+        target.parent.mkdir(parents=True)
+        target.write_text("kind: PodDisruptionBudget\nmetadata:\n  name: checkout-gateway-pdb\n", encoding="utf-8")
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding]), ["pdb-fix"])
+        self.assertIn("```yaml\nkind: PodDisruptionBudget\nmetadata:\n  name: checkout-gateway-pdb\n```", finding["remediation"]["note"])
+
+    def test_content_mode_keeps_a_listed_file(self):
+        finding = kustomize_fix(self.PDB)
+        files = self.overlay("- deployment.yaml\n- checkout-gateway-pdb.yaml\n")
+        self.assertEqual(self.degrade_via_broker(files, [finding]), [])
+        self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_content_mode_keeps_a_file_on_the_base(self):
+        files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(files, [finding]), [])
+
+    def test_content_mode_reads_the_nearest_of_nested_roots(self):
+        nested = f"{self.OVERLAY}/extra/checkout-gateway-pdb.yaml"
+        files = {**self.overlay(), "clusters/prod/kustomization.yaml": "resources:\n- apps/checkout-gateway/extra/checkout-gateway-pdb.yaml\n"}
+        finding = kustomize_fix(nested)
+        self.assertEqual(self.degrade_via_broker(files, [finding]), ["pdb-fix"])
+        self.assertIn(f"`{self.KUSTOMIZATION}`", finding["remediation"]["note"])
+
+    def test_content_mode_degrades_an_unreadable_kustomization_and_says_so(self):
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding], fail={self.KUSTOMIZATION}), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn(f"could not read `{self.KUSTOMIZATION}`", note)
+        self.assertIn(f"cannot read {self.KUSTOMIZATION}", note)
+
+    def test_content_mode_degrades_when_the_listing_of_the_file_fails(self):
+        """The broker could not say if the file is new; the overlay does not
+        list it, so the fix degrades with the reason."""
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_via_broker(self.overlay(), [finding], list_fails={self.PDB}), ["pdb-fix"])
+        note = finding["remediation"]["note"]
+        self.assertIn("listing failed", note)
+        # The kustomization was read; only whether the file is new is open,
+        # and the note says so rather than that the kustomization was unread.
+        self.assertIn(f"could not check whether `{self.PDB}` is already in the repository", note)
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it.", note)
+        self.assertNotIn("could not read", note)
+
+    def test_content_mode_keeps_a_file_outside_any_root(self):
+        finding = kustomize_fix("clusters/prod/apps/web/web-pdb.yaml")
+        self.assertEqual(self.degrade_via_broker({"clusters/prod/apps/web/deployment.yaml": "x"}, [finding]), [])
+
+
+class TestUnlistedKustomizeAdditionsInFinish(HarnessTestCase):
+    """`finish` and `remediate` run the Kustomize pass: no pull request for a
+    file that renders nothing, and no refusal that asks for it again."""
+
+    KUSTOMIZATION = "clusters/prod-us-east/kustomization.yaml"
+    PATH = "clusters/prod-us-east/payments-netpol.yaml"
+
+    def overlay(self, resources="- deployment.yaml\n"):
+        # What the recorder answers for `git ls-tree` and `git show HEAD:`.
+        self.harness.replies = {
+            "issue-list": issues_view([]),
+            # `git ls-tree -z` ends each name in NUL.
+            "ls-tree": f"{self.KUSTOMIZATION}\0",
+            f"show HEAD:{self.KUSTOMIZATION}": "resources:\n" + resources,
+        }
+        self.touch(self.PATH)
+
+    def test_finish_publishes_the_unlisted_fix_as_manual_with_the_line(self):
+        self.overlay()
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        (body,) = self.harness.bodies_for("issue-create")
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", body)
+        self.assertIn("`- payments-netpol.yaml`", body)
+        # The worker's file, copied into the published row.
+        self.assertIn("```yaml\n# remediation\n```", body)
+        self.assertNotIn("their fix is not written", self.err)
+
+    def test_finish_opens_the_pull_request_for_a_listed_fix(self):
+        self.overlay("- deployment.yaml\n- payments-netpol.yaml\n")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_a_declared_fix_the_pass_degrades_is_not_refused_as_unwritten(self):
+        """The worker wrote the fix and the pass made it `manual`; a refusal
+        would ask for the same file again. Here the sweep would name it as a
+        declared `manual` fix, as it does for a major `no-pdb` finding."""
+        self.harness.replies = {"issue-list": issues_view([])}
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        self.overlay()
+        fid = derived_id()
+        self.patch_attr(
+            "unwritten_sweep_fixes",
+            lambda findings, *a, **k: {
+                str(f["id"]): audit_report.UnwrittenFix("clusters/prod-us-east/deploy.yaml", declared=True)
+                for f in findings
+                if (f.get("remediation") or {}).get("kind") == "manual"
+            },
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("their fix is not written", self.err)
+        (body,) = self.harness.bodies_for("issue-create")
+        self.assertIn(fid, body)
+        self.assertIn("`- payments-netpol.yaml`", body)
+
+    def test_remediate_refuses_the_unlisted_fix_by_name(self):
+        self.overlay()
+        path = self.write_findings(make_doc())
+        fid = derived_id()
+        rc = self.run_main(["remediate", "--audit", AUDIT, "--findings-file", path, "--finding", fid])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED {fid}", self.err)
+        self.assertIn("`- payments-netpol.yaml`", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_the_dry_run_warns_and_runs_no_git(self):
+        self.touch(self.PATH)
+        (self.workspace / self.KUSTOMIZATION).write_text("resources:\n- deployment.yaml\n", encoding="utf-8")
+        self.assertEqual(self.run_finish(make_doc(), argv_extra=["--dry-run"]), 0, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertIn("kustomization in the working tree does not list it", self.err)
+        # A warning only: the preview still shows the pull request.
+        self.assertIn("WOULD OPEN", self.err)
+
+    def test_the_dry_run_ignores_a_kustomization_the_worker_wrote(self):
+        """The real run reads the audited commit, where the worker's new
+        sub-kustomization is not; the dry run ignores it the same way."""
+        budgets = "clusters/prod-us-east/budgets"
+        (self.workspace / budgets).mkdir(parents=True)
+        (self.workspace / self.KUSTOMIZATION).write_text("resources:\n- deployment.yaml\n", encoding="utf-8")
+        (self.workspace / budgets / "pdb.yaml").write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        (self.workspace / budgets / "kustomization.yaml").write_text("resources:\n- pdb.yaml\n", encoding="utf-8")
+        findings = [
+            make_finding(fid="pdb", remediation={"kind": "manifest", "path": f"{budgets}/pdb.yaml", "note": ""}),
+            make_finding(fid="sub", remediation={"kind": "manifest", "path": f"{budgets}/kustomization.yaml", "note": ""}),
+        ]
+        self.assertEqual(self.run_finish(make_doc(findings=findings), argv_extra=["--dry-run"]), 0, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertIn(f"DRY RUN: {derived_id(fid='pdb')}'s remediation file is in a Kustomize root", self.err)
+        self.assertIn(f"DRY RUN: {derived_id(fid='sub')}'s remediation file is in a Kustomize root", self.err)
+
+
 class TestManifestRemediationLinks(HarnessTestCase):
     """Manifest remediation links on the ledger use `capabilities.fileUrl` when present."""
 
@@ -25699,7 +26621,15 @@ class TestNoForge(BaseTestCase):
         # The chat relay posts the summary, from the record `finish` leaves.
         record = json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
         self.assertEqual(
-            record["parts"], [{"repo": audit_report.NO_FORGE_REPO, "text": out["summary"]}]
+            record["parts"],
+            [
+                {
+                    "repo": audit_report.NO_FORGE_REPO,
+                    "text": out["summary"],
+                    audit_report.CHAT_REPORT_SILENT_OK_KEY: False,
+                    audit_report.CHAT_REPORT_NEW_IDS_KEY: [],
+                }
+            ],
         )
         self.assertEqual(latest["repo"], audit_report.NO_FORGE_REPO)
         self.assertIsNone(latest["issue_number"])
@@ -25718,6 +26648,22 @@ class TestNoForge(BaseTestCase):
         fixed = self.finish(make_doc(findings=THREE_SEVERITIES[1:]))
         self.assertEqual((fixed["new"], fixed["resolved"]), (0, 1))
         self.assertFalse(fixed["silent_ok"])
+
+    def test_a_second_finish_after_one_that_died_is_not_silent(self):
+        doc = make_doc(findings=THREE_SEVERITIES)
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        argv = ["finish", "--audit", AUDIT, "--findings-file", path]
+        with patch.object(audit_report, "append_chat_report", side_effect=RuntimeError("killed")):
+            self.assertNotEqual(self.run_main(argv), 0)
+        self.assertTrue((self.store() / "latest.json").exists())
+
+        self.assertEqual(self.run_main(argv), 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertFalse(out["silent_ok"])
+        self.assertTrue(out[audit_report.SILENT_FLOOR_KEY])
 
     def test_a_withheld_posture_is_not_reported_as_held(self):
         self.finish(make_doc())
@@ -26156,6 +27102,250 @@ class TestChatReport(HarnessTestCase):
             audit_report.append_chat_report(AUDIT, "acme/a", "text", NOW)
         self.assertIn(f"chat report for {AUDIT} not opened", err.getvalue())
         self.assertIn(f"chat report for {AUDIT} not written", err.getvalue())
+
+
+class TestSecondFinishInOneRun(HarnessTestCase):
+    """A run whose model calls `finish` again after one `start`.
+
+    The second call reads the envelope the first one stored as the previous
+    run's, so on its own it measures no change.
+    """
+
+    def setUp(self):
+        super().setUp()
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+            "rev-parse --abbrev-ref": "feature-branch\n",
+        }
+
+    def start(self):
+        audit_report.open_chat_report(AUDIT, "acme/fleet", datetime.now(timezone.utc))
+
+    def finish_again(self, doc):
+        """The second call, which finds the ledger the first one opened."""
+        self.harness.replies["issue-list"] = self.issue_list(7, "https://github.com/acme/fleet/issues/7")
+        return self.run_finish(doc)
+
+    def chat_record(self):
+        return json.loads(Path(audit_report.chat_report_path_for(AUDIT)).read_text(encoding="utf-8"))
+
+    def entries(self):
+        return [(part["repo"], part["text"]) for part in self.chat_record()["parts"]]
+
+    def test_a_second_finish_with_the_same_input_stays_news_and_keeps_the_report(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+        [(_, first_text)] = self.entries()
+        run = self.chat_record()["run"]
+
+        self.assertEqual(self.finish_again(doc), 0)
+        second = self.stdout_json()
+        self.assertFalse(second["silent_ok"])
+        self.assertTrue(second[audit_report.SILENT_FLOOR_KEY])
+        self.assertTrue(second[audit_report.REFINISH_KEY])
+        self.assertIn("SILENT FLOOR", self.err)
+        [(repo, text)] = self.entries()
+        self.assertEqual(repo, "acme/fleet")
+        kept, appended = text.split(f"\n\n{audit_report.CHAT_REPORT_REFINISH_LABEL}\n")
+        self.assertEqual(kept, first_text)
+        self.assertIn("0 new", appended.splitlines()[0])
+        self.assertNotEqual(self.chat_record()["run"], run)
+        stored = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertFalse(stored["silent_ok"])
+        self.assertTrue(stored[audit_report.SILENT_FLOOR_KEY])
+
+    def test_a_second_finish_keeps_an_earlier_repositorys_report(self):
+        now = datetime.now(timezone.utc)
+        audit_report.open_chat_report(AUDIT, "acme/a", now)
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", now)
+        self.start()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.finish_again(doc), 0)
+        self.assertEqual(self.entries()[0], ("acme/a", "report A"))
+        self.assertEqual([repo for repo, _ in self.entries()], ["acme/a", "acme/fleet"])
+
+    def test_a_second_finish_opens_no_more_pull_requests_and_keeps_the_withheld_list(self):
+        self.start()
+        findings = []
+        for i in range(audit_report.AUTO_PROMOTION_CAP + 2):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    title=f"Crit {i}",
+                    remediation={"kind": "manifest", "path": path, "note": "n"},
+                )
+            )
+            self.touch(path)
+        doc = make_doc(findings=findings)
+        self.assertEqual(self.run_finish(doc), 0)
+        opened = len(self.harness.forge_calls("proposal-create"))
+        self.assertEqual(opened, audit_report.AUTO_PROMOTION_CAP)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [
+                pr(100 + i, audit_report.group_branch_for(AUDIT, [finding]))
+                for i, finding in enumerate(findings[: audit_report.AUTO_PROMOTION_CAP])
+            ]
+        )
+
+        self.assertEqual(self.finish_again(doc), 0)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+        body = self.harness.bodies_for("issue-update")[-1]
+        for finding in findings[audit_report.AUTO_PROMOTION_CAP :]:
+            self.assertIn(f"`{derived_id(fid=finding['id'])}`", body)
+        self.assertIn("/remediate", body)
+        self.assertIn("an earlier finish in this run already ran the automatic sweep", body)
+        self.assertNotIn(f"cap of {audit_report.AUTO_PROMOTION_CAP} per run", body)
+
+    def test_a_finish_that_dies_after_the_store_write_still_leaves_its_verdict(self):
+        self.start()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        with patch.object(audit_report, "append_chat_report", side_effect=RuntimeError("killed")):
+            self.assertNotEqual(self.run_finish(doc), 0)
+        self.assertTrue((self.store_dir() / "latest.json").exists())
+
+        self.assertEqual(self.finish_again(doc), 0)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+        [(_, text)] = self.entries()
+        self.assertTrue(text.startswith(audit_report.CHAT_REPORT_RERUN_LABEL + "\n"))
+
+    def test_a_clean_second_finish_after_a_clean_one_with_news_is_not_silent(self):
+        self.start()
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": previous_body}),
+        }
+        doc = make_doc(findings=[])
+        doc["resolved_because"] = resolved_for(previous_body)
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+
+        self.assertEqual(self.run_finish(doc), 0)
+        second = self.stdout_json()
+        self.assertFalse(second["silent_ok"])
+        self.assertTrue(second[audit_report.SILENT_FLOOR_KEY])
+        self.assertTrue(second[audit_report.REFINISH_KEY])
+
+    def test_a_rerun_after_a_lost_broker_opens_no_second_batch(self):
+        self.start()
+        findings = []
+        for i in range(audit_report.AUTO_PROMOTION_CAP + 2):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    remediation={"kind": "manifest", "path": path, "note": "n"},
+                )
+            )
+            self.touch(path)
+        doc = make_doc(findings=findings)
+        listing = audit_report.list_remediation_prs
+        calls = []
+
+        def broker_drops_after_the_sweep(repo, audit_id):
+            calls.append(repo)
+            if len(calls) == 2:
+                raise audit_report.BrokerUnavailable("the broker did not answer")
+            return listing(repo, audit_id)
+
+        with patch.object(audit_report, "list_remediation_prs", broker_drops_after_the_sweep):
+            self.assertEqual(self.run_finish(doc), 2)
+        opened = len(self.harness.forge_calls("proposal-create"))
+        self.assertEqual(opened, audit_report.AUTO_PROMOTION_CAP)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [
+                pr(100 + i, audit_report.group_branch_for(AUDIT, [finding]))
+                for i, finding in enumerate(findings[: audit_report.AUTO_PROMOTION_CAP])
+            ]
+        )
+
+        self.assertEqual(self.finish_again(doc), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
+
+    def test_a_rerun_after_a_broker_lost_mid_sweep_opens_no_second_batch(self):
+        self.start()
+        findings = []
+        for i in range(audit_report.AUTO_PROMOTION_CAP + 2):
+            path = f"clusters/prod-us-east/f{i}.yaml"
+            findings.append(
+                make_finding(
+                    fid=f"crit-{i}",
+                    remediation={"kind": "manifest", "path": path, "note": "n"},
+                )
+            )
+            self.touch(path)
+        doc = make_doc(findings=findings)
+        open_pr = audit_report.open_remediation_pr
+        calls = []
+
+        def broker_drops_on_the_third(*args, **kwargs):
+            calls.append(args)
+            if len(calls) == 3:
+                raise audit_report.BrokerUnavailable("the broker did not answer")
+            return open_pr(*args, **kwargs)
+
+        with patch.object(audit_report, "open_remediation_pr", broker_drops_on_the_third):
+            self.assertEqual(self.run_finish(doc), 2)
+        opened = len(self.harness.forge_calls("proposal-create"))
+        self.assertEqual(opened, 2)
+        self.harness.replies["proposal-list"] = proposals_view(
+            [pr(100 + i, audit_report.group_branch_for(AUDIT, [finding])) for i, finding in enumerate(findings[:2])]
+        )
+
+        self.assertEqual(self.finish_again(doc), 0, self.err)
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), opened)
+
+    def test_a_start_after_a_finish_that_died_keeps_the_run_and_its_verdict(self):
+        now = datetime.now(timezone.utc)
+        audit_report.open_chat_report(AUDIT, "acme/a", now)
+        audit_report.append_chat_report(AUDIT, "acme/a", "report A", now)
+        self.start()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        with patch.object(audit_report, "append_chat_report", side_effect=RuntimeError("killed")):
+            self.assertNotEqual(self.run_finish(doc), 0)
+        run = self.chat_record()["run"]
+
+        self.start()
+        self.assertEqual(self.chat_record()["run"], run)
+        self.assertEqual(self.entries(), [("acme/a", "report A"), ("acme/fleet", None)])
+        self.assertEqual(self.finish_again(doc), 0)
+        self.assertTrue(self.stdout_json()[audit_report.SILENT_FLOOR_KEY])
+
+    def test_a_start_after_the_only_finish_died_keeps_its_verdict(self):
+        self.start()
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        with patch.object(audit_report, "append_chat_report", side_effect=RuntimeError("killed")):
+            self.assertNotEqual(self.run_finish(doc), 0)
+
+        self.start()
+        run = self.chat_record()["run"]
+        self.assertEqual(self.finish_again(doc), 0)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+        self.assertNotEqual(self.chat_record()["run"], run)
+
+    def test_a_finish_with_no_start_stays_a_run_of_its_own(self):
+        doc = make_doc(findings=[make_finding(fid="a", severity="major")])
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertFalse(self.stdout_json()["silent_ok"])
+        run = self.chat_record()["run"]
+
+        self.assertEqual(self.finish_again(doc), 0)
+        second = self.stdout_json()
+        self.assertTrue(second["silent_ok"])
+        self.assertNotIn(audit_report.REFINISH_KEY, second)
+        [(_, text)] = self.entries()
+        self.assertNotIn(audit_report.CHAT_REPORT_REFINISH_LABEL, text)
+        self.assertNotEqual(self.chat_record()["run"], run)
 
 
 if __name__ == "__main__":

@@ -50,9 +50,6 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: reliability
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 # A refusal that proposes the change inline needs no tool call, so when the
 # trajectory is empty rung 3 takes the reply as the evidence the agent ran
 # (docs/designs/bench-case-format.md). The pull-request route still calls tools.

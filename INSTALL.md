@@ -302,7 +302,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai` or `openai_compatible`),
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`, `sap`, or
+   another LiteLLM provider slug),
    where the model credential comes from, and, if the operator wants GitOps pull requests, the
    forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
@@ -335,7 +336,11 @@ An agent given that prompt, or reading this file on its own, follows these steps
    (`--openai-compatible-api-base`), and either the server pod's port for an in-cluster Service
    (`--openai-compatible-target-port`) or the CIDRs of a private address
    (`--openai-compatible-egress-cidrs`), and add those flags to the dry run; its key is optional and
-   goes in `OPENAI_COMPATIBLE_API_KEY`. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#openai-compatible-endpoints-self-hosted-or-private)
+   goes in `OPENAI_COMPATIBLE_API_KEY`. `sap` (SAP AI Core) and any other LiteLLM provider slug take
+   their credentials from a Secret the operator creates in the agent's namespace and names with
+   `--litellm-env-secret` (the SAP service key under `AICORE_SERVICE_KEY`; a slug outside the menu
+   also needs `--model-default-name`); the same flag carries an `openai_compatible` gateway's OAuth2
+   client credentials. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#a-credentials-secret-for-the-gateway)
    has every setting. For a GitOps repository on
    GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
    [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
@@ -583,11 +588,11 @@ The two flags are separate because the images fall into two groups. `--registry-
 (`image_registry` in tfvars) replaces `ghcr.io/gke-labs/kube-agents` for the images this project
 builds — the operator, the agent, and the credential proxy. `--third-party-registry-prefix`
 (`third_party_image_registry`) covers the ones it does not: the LiteLLM gateway, the fluent-bit
-sidecar, the GitHub token minter, and Hindsight. **Neither implies the other** on the installer
-flags, so an install that mirrors everything passes both, as above. (The chart's own
-`global.thirdPartyImageRegistry` differs here, deliberately: it defaults to
-`global.imageRegistry`.) cert-manager is a separate Helm release the values never reach — see
-the composition README's mirrored-registry section for its recipe.
+sidecar, the GitHub token minter, and Hindsight. **Neither implies the other**, so an install
+that mirrors everything passes both, as above; empty leaves third-party images on their
+upstream registries across the installer, Terraform composition, and Helm chart.
+cert-manager is a separate Helm release the chart values never reach — the composition passes
+`third_party_image_registry` to it when set.
 
 See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
 inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild
@@ -800,6 +805,17 @@ The App and its key belong to one GitHub host, so a switch needs the App on the 
 ```
 
 To switch back to github.com, use `--gitops-host=github.com` with the github.com App and its key (`--github-app-id`, `--github-pem-path` and another new `--kms-key`, or the key that already holds that App's private key). The applied run rewrites `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_CA_SECRET`, `GITOPS_ORG`, `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING`, `KMS_KEY` and `GITHUB_PEM_PATH` (the path that `--github-pem-path` gives; a move does not keep the old App's path, and a switch that gives no `--github-pem-path` removes the line; a `GITHUB_PEM_PATH` exported for the run counts as given when `install.env` records no path) in `install.env`, and a switch to github.com removes the first three. Apply the new `charts/kube-agents/crds/` first when you switch an install of an earlier release: the CRD of an earlier release refuses `caBundleRef` on a `github` forge (`install.sh` applies them on a re-run onto an existing cluster). The install then serves only the new host: repositories registered on the other host are skipped. With Terraform alone, you can instead import the new key into the existing key and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values` (see the next section).
+
+After the switch, the `platform-agent-gitops-state` ConfigMap still lists the repositories of the old host: the operator adds the repositories that the new forge declares, and it never removes an entry. After a switch to an instance, the agent and the token minter skip the old github.com entries, and each `submit-suggestion` call prints a `Skipping managed_repos repository '<url>'` line for each of them. After a switch back to github.com, the token minter cannot read an entry on the instance: it prunes no policy while the entry is listed, and the PlatformAgent reports `Degraded` with the reason `MinterPruningHeld`. In both directions, read the two lists, and write them back without the GitHub entries of the old host:
+
+```bash
+kubectl get configmap platform-agent-gitops-state -n kubeagents-system \
+  -o jsonpath='{.data.managed_repos}{"\n"}{.data.context_repos}{"\n"}'
+kubectl patch configmap platform-agent-gitops-state -n kubeagents-system --type merge \
+  -p '{"data":{"managed_repos":"[{\"type\":\"github\",\"url\":\"https://ghe.example.com/acme/infra\"}]","context_repos":"[]"}}'
+```
+
+Keep the GitOps repository first in `managed_repos`, and keep each context repository on the new host in `context_repos`.
 
 #### Terraform + Helm, without `install.sh`
 
@@ -1160,8 +1176,9 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 # For MODEL_PROVIDER=vertex_ai also export PROJECT_ID, LITELLM_KSA_NAME,
 # LITELLM_GSA_NAME, VERTEX_PROJECT_ID, and VERTEX_LOCATION — the vertex overlay
 # renders the gateway's Workload Identity ServiceAccount from them.
-# MODEL_PROVIDER=openai_compatible is not available here; install through
-# install.sh, the Terraform example or the Helm chart for it.
+# MODEL_PROVIDER=openai_compatible, sap and the gateway's credentials Secret
+# are not available here; install through install.sh, the Terraform example
+# or the Helm chart for them.
 make deploy-litellm
 
 # Deploy GitHub Integration (requires pre-provisioned Cloud KMS key and pre-created credentials secret)
@@ -1183,6 +1200,13 @@ export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
 export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
 make deploy-github
 ```
+
+This minter is not part of an `install.sh` install. To move this cluster to `install.sh` later,
+remove the minter first: run `make -C k8s-operator undeploy-github` with the same variables
+exported, and delete the `github-app-credentials` Secret. On a first `install.sh` run there is no
+`kube-agents` release yet, so the installer cannot tell this minter from its own: the run refuses
+while the minter runs, or, with `GITHUB_APP_ID` set, the apply fails on the minter's objects
+([When an upgrade is refused](docs/site/src/content/docs/install/upgrade.md#when-an-upgrade-is-refused)).
 
 ### Step 6: Apply Custom Resources
 
@@ -1284,7 +1308,9 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 
 `.bootstrap_scan_filed` means the scan's task has been filed. `.bootstrap_completed` means a
 delivery run has claimed the report; it is written before the chat post, so it does not prove the
-post arrived, and the report is not sent again. `ls` reports the one that does not exist yet.
+post arrived, and the report is not sent again. Under `spec.mode: next` a claim can be released and tried
+again later, five attempts in all (the plugin README's Rule 5 says when);
+`/opt/data/.bootstrap_conversation_attempts.json` says why the report has not gone yet. `ls` reports the one that does not exist yet.
 The site's [first-run onboarding](docs/site/src/content/docs/concepts/chatops.md#first-run-onboarding)
 section describes each stage.
 
@@ -1474,14 +1500,17 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
   ```
 - **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
   ```
+
   - The Slack lines (`dropping message from unverified sender`, `slack: ignoring a message from another workspace's member`, `chat backend stopped; restarting it, the console stays up`, and the empty-allowlist warning) and their fixes are in [Slack app setup → Verify](https://gke-labs.github.io/kube-agents/install/slack-app/#verify). A sender the allowlist refuses was sent the `⛔ I can't verify who you are …` notice once, unless all they did was reply under one of the bot's own posts without a mention, which logs only `dropping unaddressed message from unverified sender` at info level; on Google Chat, add their email to `ALLOWED_USERS` in `install.env` and run `./upgrade.sh`.
   - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map-next-optional)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
   - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).
   - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
   - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply more than 30 minutes after the thread's last task, is not a turn (a reply under one of the bot's own posts, such as an alert, is the exception). Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+
 - **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \
@@ -1518,5 +1547,5 @@ On Google Chat the gateway posts a status line for every task ([what a task look
        sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs /opt/data/kanban/logs 2>/dev/null | tail -n 20'
      ```
      `chat.notify: route unavailable; holding deliveries for …s` there means the agent could not reach the gateway's route and is retrying.
-- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. If it has run one, the reply adds that if the agent filed a card, that card keeps working until it finishes: the agent's turn ends seconds after it hands a question to a card, and `stop` cannot reach a card yet. (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. If it has run one, the reply adds that if the agent filed a card, that card keeps working until it finishes: the agent's turn ends seconds after it hands a question to a card, and by default `stop` cannot reach a card. To have `stop` stop the conversation's cards, deploy the operator with `A2A_CARD_STOP=true` (through the chart's `operator.extraEnv`); it renders the flag onto the gateway. That needs a hermes-bridge and agent image that answer the control. If one of them is older, or the stop fails or takes longer than `A2A_CARD_STOP_TIMEOUT` (75s), `stop` answers `⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working`. The gateway logs one `card stop ended` line per stop, with `state`, `reason` and `outcome`. `state=rejected reason=no-text-parts` means the hermes-bridge is older than the card stop. `state=failed reason=card-stop-unavailable` means the bridge got no usable answer from the agent container's session-kv, or its wait for the conversation's turn ran out (the bridge's log says which), `outcome` is one of `answered` (the reply names what was stopped), `no-result` (the control completed with no result part), `not-stopped` (the bridge rejected, failed or canceled it), `timed-out` (no answer inside the timeout), `expired` (it started before a gateway restart and ran past the timeout) or `not-started` (it never reached the bus). (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
 - **`🚦 not started: … session workers are already running (cap 10)`.** The task needed a session pod, because the conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route or the message started with `delegate`, and the install's session pods are all in use. Wait, `stop` a task of yours, ask without `delegate` or send `/session off` to go back to the `platform` route, or raise `spec.harness.tuning.maxSessions`.
