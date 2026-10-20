@@ -2457,6 +2457,54 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('openai_compatible_api_key = "oc-key"', content)
             self.assertIn("tfvar=oc-key", proc.stdout)
 
+    # ── the gateway's env Secret, and provider slugs ─────────────────────────
+
+    def test_tfvars_names_the_litellm_env_secret_only_when_set(self):
+        for env, expected in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap", "LITELLM_ENV_SECRET_NAME": "sap-aicore"}, True),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "sap"}, False),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": ""}, False),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                content = dest.read_text()
+                self.assertEqual('litellm_env_secret_name = "sap-aicore"' in content, expected, content)
+                self.assertIn(f'model_provider     = "{env["MODEL_PROVIDER"]}"', content)
+
+    def test_a_provider_slug_is_accepted_and_needs_a_model(self):
+        proc = self._run(
+            'for p in sap azure bedrock databricks2 a_b; do is_valid_model_provider "$p" && echo "ok $p"; done; '
+            'for p in Azure v-llm 1azure "sap/" "" "azure bedrock" chatgpt; do is_valid_model_provider "$p" || echo "no $p"; done; '
+            'is_table_model_provider sap && echo table-sap; is_table_model_provider azure || echo slug-azure; '
+            'validate_model_provider_inputs azure "" ; echo "slug-no-model=$?"; '
+            'validate_model_provider_inputs azure gpt-5.4; echo "slug-model=$?"; '
+            'validate_model_provider_inputs sap ""; echo "sap-no-model=$?"; '
+            'echo "sap-default=$(default_model_for_provider sap) azure-default=[$(default_model_for_provider azure)]"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for line in ("ok sap", "ok azure", "ok bedrock", "ok databricks2", "ok a_b",
+                     "no Azure", "no v-llm", "no 1azure", "no sap/", "no ", "no azure bedrock", "no chatgpt",
+                     "table-sap", "slug-azure", "slug-no-model=1", "slug-model=0", "sap-no-model=0",
+                     "sap-default=anthropic--claude-4.5-sonnet azure-default=[]"):
+            self.assertIn(line, proc.stdout)
+        self.assertIn("MODEL_PROVIDER='azure' is a LiteLLM provider slug", proc.stderr + proc.stdout)
+
+    def test_the_generator_refuses_a_slug_without_a_model_and_a_bad_secret_name(self):
+        for env, message in (
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "azure", "LITELLM_ENV_SECRET_NAME": "azure-openai"},
+             "set --model-default-name"),
+            ({"API_SERVER_KEY": "k", "MODEL_PROVIDER": "gemini", "LITELLM_ENV_SECRET_NAME": "Not_A_Secret"},
+             "is not a valid Kubernetes Secret name"),
+        ):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists(), "the file must be left untouched")
+
     def test_tfvars_writes_a_service_target_port_as_a_number(self):
         env = dict(self._OPENAI_COMPATIBLE_ENV,
                    OPENAI_COMPATIBLE_API_BASE="http://llm.models.svc.cluster.local/v1",
@@ -2951,7 +2999,7 @@ class InstallDefaultsFileTest(unittest.TestCase):
         proc = subprocess.run(
             ["bash", "-c",
              f'set -u; source "{self._INSTALLER_COMMON}"; '
-             'for p in gemini openai anthropic vertex_ai; do '
+             'for p in gemini openai anthropic vertex_ai sap; do '
              'echo "$p=$(default_model_for_provider "$p")"; done'],
             capture_output=True, text=True, cwd=str(_REPO_ROOT),
         )
@@ -5395,6 +5443,67 @@ class SlackHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertEqual(gateway, operator, "the gateway's and the operator's rules differ")
         letters, min_len = gateway
         self.assertEqual(regex.group(1), f"^[{letters}][A-Z0-9]{{{min_len - 1},}}$")
+
+
+class NextHomeChannelUnsetWarningTest(unittest.TestCase):
+    """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
+    gateway makes the proactive posts and arms them only on a home channel,
+    so a chat backend the gateway holds with none drops every alert while
+    conversations keep working. The front doors warn, never refuse, and the
+    closing summary says it again. The backend follows the operator's
+    a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
+
+    def _run(self, mode="next", slack="true", chat="false", slack_home="", chat_home="", flags=False, summary=False):
+        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, slack_home, chat_home) + (("flags",) if flags else ()))
+        script = (
+            'print_info() { echo "INFO: $*"; }\n'
+            'print_warning() { echo "WARN: $*"; }\n'
+            'print_error() { echo "ERROR: $*"; }\n'
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'rc=0; warn_next_home_channel_unset {args} || rc=$?; echo "rc=$rc key=$NEXT_HOME_CHANNEL_UNSET_KEY"\n'
+            + (f'print_next_home_channel_unset_summary {"flags" if flags else ""}\n' if summary else "")
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
+
+    def test_next_slack_without_a_home_channel_warns_and_names_the_key(self):
+        proc = self._run()
+        self.assertIn("rc=0 key=SLACK_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", proc.stdout)
+        self.assertIn("drop every one of them", proc.stdout)
+        self.assertIn("HomeChannelUnset", proc.stdout)
+        self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", proc.stdout)
+        self.assertIn("slack-app/#home-channel", proc.stdout)
+
+    def test_next_chat_without_a_home_channel_names_the_chat_key(self):
+        proc = self._run(slack="false", chat="true")
+        self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
+        self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
+
+    def test_chat_holds_the_gateway_when_both_are_on(self):
+        # Slack stays on the today path then, so only Chat's home counts.
+        self.assertIn("key=GOOGLE_CHAT_HOME_CHANNEL", self._run(chat="true", slack_home="C0123ABCD").stdout)
+        self.assertEqual(self._run(chat="true", chat_home="spaces/AAA").stdout, "rc=0 key=\n")
+
+    def test_flags_name_the_flag(self):
+        self.assertIn("install.env or --slack-home-channel", self._run(flags=True).stdout)
+        self.assertIn("install.env or --google-chat-home-channel", self._run(slack="false", chat="true", flags=True).stdout)
+
+    def test_silent_when_nothing_is_dropped(self):
+        for kw in ({"slack_home": "C0123ABCD"}, {"slack_home": "  ", "mode": "today"}, {"mode": "today"},
+                   {"slack": "false"}, {"slack": "false", "chat": "true", "chat_home": "spaces/AAA"}):
+            with self.subTest(**kw):
+                self.assertEqual(self._run(**kw).stdout, "rc=0 key=\n")
+
+    def test_a_blank_home_channel_counts_as_unset(self):
+        self.assertIn("key=SLACK_HOME_CHANNEL", self._run(slack_home="   ").stdout)
+
+    def test_the_summary_repeats_it_last(self):
+        proc = self._run(summary=True)
+        lines = [l for l in proc.stdout.splitlines() if l]
+        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
+        self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
+        self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
 
 if __name__ == "__main__":
     unittest.main()

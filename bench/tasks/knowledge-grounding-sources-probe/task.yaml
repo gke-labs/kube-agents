@@ -74,9 +74,7 @@
 # for it. No tofu, no fleet read.
 id: knowledge-grounding-sources-probe
 name: Grounded GKE knowledge answer cites its sources
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
+domain: chat-and-routing
 
 prompt: >-
   What compute classes does GKE Autopilot support, and which nodeSelector do
@@ -93,9 +91,8 @@ infrastructure:
   deployer: noop
 validated: false
 
-# No `domain:` — recorded in KNOWN_NO_DOMAIN (scripts/validate_bench_cases.py):
-# grounded knowledge retrieval is a cross-cutting behavior of every persona,
-# and no docs/designs/domains.yaml row describes it.
+# Domain chat-and-routing: a GKE question asked in chat, graded on
+# how the answer cites its sources.
 
 # Exact checks. Matching is normalized (lowercased, emphasis stripped) by
 # ReportContainsVerifier, so the phrases below are spelling-insensitive.

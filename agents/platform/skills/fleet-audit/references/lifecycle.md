@@ -5,8 +5,8 @@ Part of the `fleet-audit` skill (`/opt/data/profiles/platform/skills/fleet-audit
 ## The two-command lifecycle
 
 Run both commands by their full path, `/opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py`.
-A cron run starts in the profile directory, where `./skills/...` also resolves; a kanban worker starts
-in its card's workspace, where it does not. **You are not in a git checkout, and you do not need to
+A cron run starts in a directory of its own (`<profile>/cron/runs/<job>_<run>`) and a kanban worker
+in its card's workspace, so `./skills/...` resolves in neither. **You are not in a git checkout, and you do not need to
 be.** The harness establishes its own workspace at
 `/opt/data/gitops/<audit-id>/<owner>__<name>` and resolves every `remediation.path` against it. The
 workspace is keyed by audit id because the audit streams share the volume with each other and with

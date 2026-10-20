@@ -722,9 +722,10 @@ ConfigMap changed, the checksum did not, the Deployment did not roll. The
 gateway mounts this with subPath, and a subPath ConfigMap mount never receives
 in-place updates, so the running pod would have kept the old file indefinitely.
 
-Takes a dict of provider, model, callbacks, and maxTokens (optional; 0 or
-absent renders no max_tokens), plus apiBase and sslVerify (optional; absent
-renders neither key), which only openai_compatible passes.
+Takes a dict of provider, model, callbacks, maxTokens (optional; 0 or absent
+renders no max_tokens) and reasoningEffort (optional; empty or absent renders
+no reasoning_effort), plus apiBase and sslVerify (optional; absent renders
+neither key), which only openai_compatible passes.
 */}}
 {{- define "kube-agents.litellmConfig" -}}
 {{- /*
@@ -739,6 +740,18 @@ renders neither key), which only openai_compatible passes.
 */}}
 {{- $maxTokens := int (.maxTokens | default 0) -}}
 {{- /*
+  reasoning_effort on every alias when .reasoningEffort is set, and no key at
+  all otherwise, for the same reason as max_tokens above: the default render
+  and its checksum stay what they were. LiteLLM translates the OpenAI-style
+  value per provider (thinkingLevel on Gemini 3.x through gemini or vertex_ai,
+  adaptive thinking on Claude, reasoning_effort as-is on OpenAI and
+  hosted_vllm), and, like max_tokens, it is what a request that names no
+  reasoning_effort gets: a request's own value wins. The schema limits it to
+  low, medium and high, which LiteLLM maps on all three; "minimal" is left out
+  because Vertex AI refuses it on Gemini 3.x Flash (see the auxiliary block in
+  deploy/shared/defaults/config.yaml).
+*/}}
+{{- /*
   Recent Claude models (Opus 5 among them) answer temperature, top_p and top_k
   with a 400 ("`temperature` is deprecated for this model"), and LiteLLM
   refuses a temperature other than 1 for them before the request leaves the
@@ -751,10 +764,15 @@ renders neither key), which only openai_compatible passes.
   model, not only the ones that refuse: a name test that tracked which do
   would break on each new release, and an older Claude losing a caller's
   sampling override is a quieter failure than a 400. Claude only: anthropic
-  serves nothing else, vertex_ai serves Claude under claude-* names, and a
-  Gemini or OpenAI render stays byte-identical.
+  serves nothing else, vertex_ai serves Claude under claude-* names, sap (SAP
+  AI Core) under anthropic--* names and forwards temperature and top_p into
+  its orchestration request, and a Gemini or OpenAI render stays
+  byte-identical. $claudeDrop is that set; $claude, which also gates prompt
+  caching below, leaves sap out, because the cache_control markers have not
+  been shown to pass SAP's orchestration API.
 */}}
 {{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
+{{- $claudeDrop := or $claude (and (eq .provider "sap") (hasPrefix "anthropic--" .model)) -}}
 {{- /*
   openai_compatible goes through LiteLLM's hosted_vllm handler, which speaks the
   same OpenAI chat-completions API, rather than through openai/. Read from
@@ -778,7 +796,10 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
-      {{- if $claude }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: hermes-agent
@@ -793,7 +814,10 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
-      {{- if $claude }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: {{ .model }}
@@ -808,14 +832,17 @@ model_list:
       {{- if gt $maxTokens 0 }}
       max_tokens: {{ $maxTokens }}
       {{- end }}
-      {{- if $claude }}
+      {{- with .reasoningEffort }}
+      reasoning_effort: {{ . | quote }}
+      {{- end }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching, for Anthropic-family models only: the same $claude gate as
-  additional_drop_params above. On Gemini, LiteLLM turns these markers into
+  Prompt caching, for Anthropic-family models only: the $claude gate, which
+  leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
   Vertex explicit context caching: a cachedContents list before every call,
   and a create whenever the cached prefix is new. A create that Vertex holds
   past its request credential's life fails the whole turn (a 401 after a

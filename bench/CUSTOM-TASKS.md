@@ -96,6 +96,14 @@ in `tf/modules/` and reference it with `source = "../../modules/<module-name>"` 
 paths resolve whether the stack is applied in place (the default) or from the per-run copy of the
 whole `tf/` tree that `--parallel` makes.
 
+What several stacks share is often a shell or python helper rather than Terraform, because the work
+happens inside one `local-exec`. A module directory may hold those instead, run from the same
+relative path: `tf/modules/drift-inject/` is a bash library the three `gitops-drift-*` stacks
+`source` and two python files they execute. Prefer that to inlining the text with `file()`, which
+costs `shellcheck -x` its ability to follow the call and puts the whole helper into every rendered
+plan — and whose interpolation, placed at a smaller indent than the heredoc body, silently sets the
+`<<-` dedent to zero and leaves every embedded heredoc terminator indented.
+
 The deployer only reads `*.tf` and `*.tf.json` in the stack directory itself and never descends into
 modules, so re-declare every variable you want to reach a module in the stack's own `variables.tf`
 and pass it through.
@@ -206,7 +214,7 @@ answer reads like, and — where the answer is objectively checkable — asserts
 cluster.
 
 Every task in this repository carries a top-level `domain: <slug>` field, and a task that
-covers no row gets a reviewed `KNOWN_NO_DOMAIN` entry instead of an absent field —
+no row describes gets a new row (with its `owner:`, `backup:` and `meaning:`) instead of an absent field —
 `docs/designs/bench-case-format.md` is the contract, and this section is the how-to.
 The slugs live in `docs/designs/domains.yaml`, and
 `scripts/test_domain_coverage.py` counts a domain as covered only when a task carries its
@@ -217,9 +225,9 @@ uncovered until the roster line lands; that edit forces the allowlist edit in `d
 the same change. devops-bench
 ignores the extra key (`extra: "ignore"` on its task model), so the field is free to carry.
 
-Every task also carries a top-level `owner:` — a GitHub login without the at sign, or
-`maintainers` — naming who answers when the case flakes. The validator rejects a task without
-one; [CONTRIBUTING.md](CONTRIBUTING.md) says what the owner commits to.
+A task may carry a top-level `owner:`, the GitHub login whose bugs it is first; without one it
+belongs to its domain's owner. [CONTRIBUTING.md](CONTRIBUTING.md#ownership) has the rule and
+what the owner commits to.
 
 A task whose stack starts real audit runs lists them in a top-level `audit_streams:`, so
 the runner holds those streams' locks while it runs; see
@@ -267,7 +275,7 @@ fails if it reported anything, so a case that passes locally passes there too.
 id: my-provisioned-task
 name: Human-readable name
 domain: capacity # required; a slug from docs/designs/domains.yaml
-owner: maintainers # required; a GitHub login without the at sign, or maintainers -- see CONTRIBUTING.md
+owner: some-login # optional; a GitHub login, else the domain's owner -- see CONTRIBUTING.md
 fixtures: [] # required when the spec reads cluster state; seeded-fleet roles, or [] for none
 prompt: >-
   The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.
@@ -397,6 +405,7 @@ silently running the check with defaults.
 | `audit_report_stored`        | `audit` (a registered audit id) **required**; `status`, `required_finding_phrases` and `max_clock_skew_sec` optional                                                                                                                                                  | Execs into the shell sandbox, then the agent container, and reads every `latest.json` of `audit` in the fleet-audit report store. Passes when one finished since the run started (less `max_clock_skew_sec`), has `status` when given, and has a finding in its `document` whose id contains each `required_finding_phrases` entry. No such envelope is a fail; neither pod readable, or a run with no start time, is `status: "error"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `findings_item_state`        | `project`, `finding_ids` (one or more ids) and `state` (one of the queue's states), all **required**                                                                                                                                                                  | Execs into the agent container (as `bootstrap_delivered` does) and reads the rows under `project` from the findings queue through the Session KV server's `GET /v1/findings` on the pod's loopback, with the container's own `SESSION_KV_API_KEY`. Passes when every row in `finding_ids` is in `state`; a row in another state is a fail that names the state of each row not in `state`. A listed row the queue does not hold is `status: "error"` (the case's plant is missing), as is an unreadable pod or a queue that refuses the read. It reads the agent's own install, and a case using it plants the rows it names, so it declares `fixtures: []` (see `docs/designs/bench-case-format.md`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `relay_posted_as_written`    | none (`type` is the whole spec)                                                                                                                                                                                                                                       | Reads the `relay-report` stack's state file (the route's answer to the report it posted to `/v1/cron-reports`) and the Session KV server's `incidents` rows for the report's threads, in the agent container. Passes when the route answered `delivered`, at least one row is stored for those threads since the post, and every one is the report exactly; a route that did not deliver (a 502 on an install with no chat platform) or a post that differs from the report is a fail. A delivered send that registered no thread (its outcome unknown), no state file, an unreadable store or an unreachable pod is `status: "error"`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `audit_chat_report_posted`   | none (`type` is the whole spec)                                                                                                                                                                                                                                       | Reads the `audit-chat-report` stack's state file (when it fired the audit job and when the run ended), the Session KV server's `incidents` rows for the job's threads since the fire, in the agent container, and the `chat_report_<audit>.json` the run's `finish` left on the shell sandbox. Passes when the stored row, the scheduled delivery (the table keeps the latest post per thread, so a mid-run `report_to_chat` is not graded), is that report; a run that left no report from `finish`, a record older than the fire, a run that did not finish every repository it started, a row holding anything else, or an undelivered report is a fail. A silent run, a run that never ended, no thread to read back, no state file or an unreachable pod is `status: "error"`. Needs an install with a shell sandbox, where the report file lives.                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 The transcript verifiers read the run's stash (`kube_agents_bench/transcript.py`), so unlike
 the cluster verifiers they need no cluster and set `mode: assert` (the transcript is immutable;

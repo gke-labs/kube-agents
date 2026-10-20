@@ -45,9 +45,15 @@ name: Upgrades probe reports the control plane held behind its channel
 # where a check points"): it survives the default prefix and breaks loudly
 # and correctly if the prefix ever changes. The check below still addresses
 # nothing by name; the harness resolves clusters only through fixtures.json.
+# "Default version", not "what its release channel offers": get-server-config
+# also reports a per-channel upgradeTargetVersion, which sits BELOW the planted
+# version during a minor roll-out (2026-10-16: default 1.36.4, target
+# 1.35.8-gke.1439001, seeded-b 1.35.8-gke.1626001), so agents reading "offers"
+# as the target called the lagging cluster current in 34 of 141 repetitions
+# (#3269). The sibling fleet cases already ask against the channel default.
 prompt: >-
   Is the seeded-b cluster's control plane current? Check its version against
-  what its release channel offers and report what you find, citing the
+  its release channel's default version and report what you find, citing the
   versions you actually read. Do not change or upgrade anything.
 expected_output: >-
   A grounded readiness report stating that seeded-b's control plane is NOT
@@ -62,9 +68,6 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: upgrades
-
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
 
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
@@ -167,6 +170,11 @@ verification_spec:
           "not on the current default",
           "not on the default",
           "not running the default",
+          # 2026-10-16 (#3269): "not the default version for its REGULAR
+          # release channel", 3 of that day's 141 presubmit repetitions, and
+          # the words the prompt now uses. Absent from both recorded wrong
+          # answers.
+          "not the default",
           "trailing the channel default",
           # The lag as a comparison. Qualified with "version": bare "older
           # than" matches the two wrong answers, bare "older" is in "folder".

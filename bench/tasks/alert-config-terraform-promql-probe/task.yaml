@@ -19,6 +19,7 @@
 # Tier: nightly (hack/eval/nightly-cases.txt).
 id: alert-config-terraform-promql-probe
 name: GKE memory alert in Terraform uses PromQL, the cAdvisor limit and the skill label
+domain: observability
 
 owner: GinnyJI
 

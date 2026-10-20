@@ -137,8 +137,9 @@ Say so and stop.
 Most requests against an existing cluster are edits to mutable fields; the
 create case exists for a shop that provisions clusters through the repo.
 The shape decisions (Autopilot or Standard, private or public, release
-channel) come from the `gke-cluster-creation` skill's templates; this
-reference only turns them into KCC.
+channel, machine series) come from what will run on the cluster first, and
+from the `gke-cluster-creation` skill's templates only where the workload
+sets nothing; this reference only turns them into KCC.
 
 ### Fields
 

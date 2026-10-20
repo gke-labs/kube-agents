@@ -302,7 +302,8 @@ An agent given that prompt, or reading this file on its own, follows these steps
    `<RELEASE_VERSION>` below.
 2. Read the operator's environment and confirm the target with them before going further —
    project, cluster, its location (the zone, not the region, for a zonal cluster, exactly as
-   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai` or `openai_compatible`),
+   `clusters list` shows it), model provider (`gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`, `sap`, or
+   another LiteLLM provider slug),
    where the model credential comes from, and, if the operator wants GitOps pull requests, the
    forge that holds the GitOps repository (GitHub or GitLab) and its path:
 
@@ -335,7 +336,11 @@ An agent given that prompt, or reading this file on its own, follows these steps
    (`--openai-compatible-api-base`), and either the server pod's port for an in-cluster Service
    (`--openai-compatible-target-port`) or the CIDRs of a private address
    (`--openai-compatible-egress-cidrs`), and add those flags to the dry run; its key is optional and
-   goes in `OPENAI_COMPATIBLE_API_KEY`. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#openai-compatible-endpoints-self-hosted-or-private)
+   goes in `OPENAI_COMPATIBLE_API_KEY`. `sap` (SAP AI Core) and any other LiteLLM provider slug take
+   their credentials from a Secret the operator creates in the agent's namespace and names with
+   `--litellm-env-secret` (the SAP service key under `AICORE_SERVICE_KEY`; a slug outside the menu
+   also needs `--model-default-name`); the same flag carries an `openai_compatible` gateway's OAuth2
+   client credentials. [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#a-credentials-secret-for-the-gateway)
    has every setting. For a GitOps repository on
    GitLab, do not ask the operator to paste the GitLab token. The two safe ways are in
    [GitOps Repository on GitLab](#gitops-repository-on-gitlab).
@@ -621,6 +626,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
    - If you left `GOOGLE_CHAT_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its space the home channel, where scheduled reports post. To send them to a team space instead, send the first message there, or run `/sethome` there afterwards.
+   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and drops them while it is empty. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -660,7 +666,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
 
-- Re-display these instructions at any time from the repository root:
+- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead:
   ```bash
   ./scripts/installer/print_instructions_slack.sh
   ```
@@ -798,7 +804,7 @@ The App and its key belong to one GitHub host, so a switch needs the App on the 
   --github-app-id="12" --github-pem-path="/path/to/ghes-app.pem" --kms-key="github-token-minter-key-ghes"
 ```
 
-To switch back to github.com, use `--gitops-host=github.com` with the github.com App and its key (`--github-app-id`, `--github-pem-path` and another new `--kms-key`, or the key that already holds that App's private key). The applied run rewrites `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_CA_SECRET`, `GITOPS_ORG`, `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING` and `KMS_KEY` in `install.env`, and a switch to github.com removes the first three. Apply the new `charts/kube-agents/crds/` first when you switch an install of an earlier release: the CRD of an earlier release refuses `caBundleRef` on a `github` forge (`install.sh` applies them on a re-run onto an existing cluster). The install then serves only the new host: repositories registered on the other host are skipped. With Terraform alone, you can instead import the new key into the existing key and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values` (see the next section).
+To switch back to github.com, use `--gitops-host=github.com` with the github.com App and its key (`--github-app-id`, `--github-pem-path` and another new `--kms-key`, or the key that already holds that App's private key). The applied run rewrites `GITOPS_FORGE`, `GITOPS_HOST`, `GITOPS_CA_SECRET`, `GITOPS_ORG`, `GITOPS_REPO`, `GITHUB_APP_ID`, `KMS_KEYRING`, `KMS_KEY` and `GITHUB_PEM_PATH` (the path that `--github-pem-path` gives; a move does not keep the old App's path, and a switch that gives no `--github-pem-path` removes the line; a `GITHUB_PEM_PATH` exported for the run counts as given when `install.env` records no path) in `install.env`, and a switch to github.com removes the first three. Apply the new `charts/kube-agents/crds/` first when you switch an install of an earlier release: the CRD of an earlier release refuses `caBundleRef` on a `github` forge (`install.sh` applies them on a re-run onto an existing cluster). The install then serves only the new host: repositories registered on the other host are skipped. With Terraform alone, you can instead import the new key into the existing key and set `githubMinter = { kms = { keyVersion = "N" } }` in `extra_helm_values` (see the next section).
 
 #### Terraform + Helm, without `install.sh`
 
@@ -1159,8 +1165,9 @@ export MODEL_DEFAULT_NAME=gemini-3.5-flash
 # For MODEL_PROVIDER=vertex_ai also export PROJECT_ID, LITELLM_KSA_NAME,
 # LITELLM_GSA_NAME, VERTEX_PROJECT_ID, and VERTEX_LOCATION — the vertex overlay
 # renders the gateway's Workload Identity ServiceAccount from them.
-# MODEL_PROVIDER=openai_compatible is not available here; install through
-# install.sh, the Terraform example or the Helm chart for it.
+# MODEL_PROVIDER=openai_compatible, sap and the gateway's credentials Secret
+# are not available here; install through install.sh, the Terraform example
+# or the Helm chart for them.
 make deploy-litellm
 
 # Deploy GitHub Integration (requires pre-provisioned Cloud KMS key and pre-created credentials secret)
@@ -1283,7 +1290,9 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 
 `.bootstrap_scan_filed` means the scan's task has been filed. `.bootstrap_completed` means a
 delivery run has claimed the report; it is written before the chat post, so it does not prove the
-post arrived, and the report is not sent again. `ls` reports the one that does not exist yet.
+post arrived, and the report is not sent again. Under `spec.mode: next` a claim can be released and tried
+again later, five attempts in all (the plugin README's Rule 5 says when);
+`/opt/data/.bootstrap_conversation_attempts.json` says why the report has not gone yet. `ls` reports the one that does not exist yet.
 The site's [first-run onboarding](docs/site/src/content/docs/concepts/chatops.md#first-run-onboarding)
 section describes each stage.
 
@@ -1424,8 +1433,8 @@ When a Slack bot connects or is online in your workspace but never replies to me
   - The `*:history` scopes (`im:history`, `channels:history`, `groups:history`, `mpim:history`) are the most common cause of silent failures: without them, Socket Mode connects successfully, but Slack never forwards message contents to the bot.
   - Omitting `files:write` drops report artifact uploads quietly (logged as a warning).
   - Omitting `reactions:write` silently prevents reaction emoji from appearing on user messages.
-  - Under `spec.mode: next`, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)).
-  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`.
+  - Under `spec.mode: next`, the reactions, a question's answered line, Working… and the suggested prompts also need `users:read`, `assistant:write`, the `assistant_thread_started` event (`app_home_opened` on an agent-view app) and interactivity, which the `hermes slack manifest` output carries unless generated with `--no-assistant`; without them the answers still arrive and only those go missing. The Home tab's fleet dashboard needs `home_tab_enabled` and the `app_home_opened` event, and with `spec.integration.slack.allowedUsers` left empty also `users:read`, which the workspace check behind it (`users.info`) needs; without that scope the tab stays blank ([ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack)).
+  - For the complete manifest, instructions on generating it with `hermes slack manifest`, and event subscriptions, see [Step 5 §2 (Slack Configuration)](#2-slack-configuration-slack_enabledtrue) or run `./scripts/installer/print_instructions_slack.sh`; under `spec.mode: next` the manifest is on the [Slack app setup](docs/site/src/content/docs/install/slack-app.md#for-specmode-next-the-a2a-gateway) page.
 - **User Allowlist:** Check `spec.integration.slack.allowedUsers` on the `PlatformAgent` CR (or `SLACK_ALLOWED_USERS` in `install.env`). Under `mode: today` unlisted users are ignored without a reply; under `next` the A2A gateway answers once with a notice naming their member ID. An empty allowlist admits all members in the workspace. Under `spec.mode: next`, the A2A gateway refuses a message from a member of another workspace (a Slack Connect guest) before consulting the list; under `mode: today`, the legacy consumer has no such check: a guest in a shared channel is admitted by the allowlist alone, and under an empty list that is everyone. See the site's [ChatOps guide](docs/site/src/content/docs/concepts/chatops.md#slack) and the [PlatformAgent CRD reference](docs/site/src/content/docs/operator/platformagent-crd.md#specintegration).
 - **Single-Workspace vs Multi-Workspace (`spec.mode: next`):** Under the unsupported `spec.mode: next` toggle, the A2A gateway takes a single workspace bot token. If your secret holds a comma-separated list of tokens (supported under `mode: today`), Slack rejects it at `auth.test`; the gateway pod stays Running and Ready, retrying the Slack backend on a backoff, and Slack has no consumer until the secret holds one workspace's token or the install goes back to `today`. Because the operator arms on the CR alone, the CR's `.status` does not surface this failure; the error appears only in the gateway pod's log.
 
@@ -1473,14 +1482,17 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl get deploy platform-agent-a2a-gateway -n kubeagents-system
   ```
 - **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
   ```
+
   - The Slack lines (`dropping message from unverified sender`, `slack: ignoring a message from another workspace's member`, `chat backend stopped; restarting it, the console stays up`, and the empty-allowlist warning) and their fixes are in [Slack app setup → Verify](https://gke-labs.github.io/kube-agents/install/slack-app/#verify). A sender the allowlist refuses was sent the `⛔ I can't verify who you are …` notice once, unless all they did was reply under one of the bot's own posts without a mention, which logs only `dropping unaddressed message from unverified sender` at info level; on Google Chat, add their email to `ALLOWED_USERS` in `install.env` and run `./upgrade.sh`.
   - `the Slack principal map maps a member to a principal carrying the reserved member-id prefix; refusing it`: that member's entry in the `a2a-slack-principal-map` Secret maps them to a value starting with `slack:`. Correct the entry ([principal map](https://gke-labs.github.io/kube-agents/install/slack-app/#principal-map-next-optional)); the gateway reads the map only when it starts, so then run `kubectl rollout restart deployment/platform-agent-a2a-gateway -n kubeagents-system`.
   - `adapter` with `slack tokens look wrong` at startup: a token is not a Slack token at all (bot tokens start `xoxb-`, app tokens `xapp-`).
   - `nats connect` and a restarting pod: the gateway cannot reach the bus. Check the next point.
   - Nothing at all for the message: on Slack, a channel message that does not mention the bot, or an unmentioned thread reply more than 30 minutes after the thread's last task, is not a turn (a reply under one of the bot's own posts, such as an alert, is the exception). Mention the bot. The rules are in [ChatOps](docs/site/src/content/docs/concepts/chatops.md#which-messages-it-answers).
+
 - **`next`: is the bus up?** The bus refuses every new connection while no auth callout replica is ready, and the operator does not create a first gateway until one is. `Ready` reads `Provisioning` and its message names what it is waiting on; `BusCredentialsReady` reports the callout.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \
@@ -1517,5 +1529,5 @@ On Google Chat the gateway posts a status line for every task ([what a task look
        sh -c 'grep -rh -e "kanban event routing" -e "chat.notify" /opt/data/logs /opt/data/profiles/*/logs /opt/data/kanban/logs 2>/dev/null | tail -n 20'
      ```
      `chat.notify: route unavailable; holding deliveries for …s` there means the agent could not reach the gateway's route and is retrying.
-- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
+- **`stop` answers `🤷 nothing is running`.** The conversation you sent it in has no running task. If it has run one, the reply adds that if the agent filed a card, that card keeps working until it finishes: the agent's turn ends seconds after it hands a question to a card, and by default `stop` cannot reach a card. To have `stop` stop the conversation's cards, deploy the operator with `A2A_CARD_STOP=true` (through the chart's `operator.extraEnv`); it renders the flag onto the gateway. That needs a hermes-bridge and agent image that answer the control. If one of them is older, or the stop fails or takes longer than `A2A_CARD_STOP_TIMEOUT` (75s), `stop` answers `⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working`. The gateway logs one `card stop ended` line per stop, with `state`, `reason` and `outcome`. `state=rejected reason=no-text-parts` means the hermes-bridge is older than the card stop. `state=failed reason=card-stop-unavailable` means the bridge got no usable answer from the agent container's session-kv, or its wait for the conversation's turn ran out (the bridge's log says which), `outcome` is one of `answered` (the reply names what was stopped), `no-result` (the control completed with no result part), `not-stopped` (the bridge rejected, failed or canceled it), `timed-out` (no answer inside the timeout), `expired` (it started before a gateway restart and ran past the timeout) or `not-started` (it never reached the bus). (Top-level in a Slack DM the reply is `🤷 nothing is running here — …`, for the same reason.) On Slack, a new top-level message, in a channel or a DM, starts a new conversation, so send `stop` as a reply in the task's thread.
 - **`🚦 not started: … session workers are already running (cap 10)`.** The task needed a session pod, because the conversation is on the [`/session`](docs/site/src/content/docs/concepts/chatops.md#session) route or the message started with `delegate`, and the install's session pods are all in use. Wait, `stop` a task of yours, ask without `delegate` or send `/session off` to go back to the `platform` route, or raise `spec.harness.tuning.maxSessions`.

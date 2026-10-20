@@ -59,6 +59,9 @@ locals {
   litellm_ksa     = "kubeagents-litellm"
 
   use_openai_compatible = var.model_provider == "openai_compatible"
+  # The providers the chart knows a default model for; any other slug needs
+  # model_default_name, checked below so the plan fails rather than the render.
+  model_provider_has_default = contains(["gemini", "anthropic", "openai", "vertex_ai", "sap"], var.model_provider)
   # The key the CA bundle Secret holds the PEM under, as for the GitLab CA.
   openai_compatible_ca_key = "ca.crt"
 
@@ -913,6 +916,10 @@ resource "helm_release" "kube_agents" {
         modelDefaultName = var.model_default_name
         maxTokens        = var.model_max_tokens
       },
+      # Only when named, so an install without one renders the values it did.
+      var.litellm_env_secret_name != "" ? {
+        envFromSecret = var.litellm_env_secret_name
+      } : {},
       local.use_vertex ? {
         vertex = {
           serviceAccountName = local.litellm_ksa
@@ -1180,6 +1187,10 @@ resource "helm_release" "kube_agents" {
     precondition {
       condition     = !local.use_openai_compatible || var.openai_compatible_api_base != ""
       error_message = "model_provider = \"openai_compatible\" requires openai_compatible_api_base, the server's base URL including /v1."
+    }
+    precondition {
+      condition     = local.model_provider_has_default || local.use_openai_compatible || var.model_default_name != ""
+      error_message = "model_provider = \"${var.model_provider}\" is a LiteLLM provider slug outside the chart's table, which has no default model: set model_default_name to the model it serves."
     }
 
     precondition {

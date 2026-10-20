@@ -5,9 +5,10 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 ## Prerequisites
 
 - Kubernetes 1.29+ (GKE Autopilot or Standard) — the credential proxy is a native sidecar, and `SidecarContainers` is beta and on by default from 1.29 (alpha and off in 1.28, GA in 1.33)
-- A Google Service Account (GSA) with a Workload Identity binding to the agent's
-  Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
-  namespace by default (`platformAgent.security.serviceAccountName`):
+- A Google Service Account (GSA) with a Workload Identity binding to the credential
+  broker's Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
+  namespace by default (`platformAgent.security.serviceAccountName`). The agent
+  gateway runs as its own `<name>-gateway-agent`, which holds no cloud identity:
 
   ```bash
   gcloud iam service-accounts add-iam-policy-binding <GSA>@<PROJECT>.iam.gserviceaccount.com \
@@ -215,13 +216,19 @@ The agent's baked default model endpoint is
 `http://inference-gateway.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base` and its provider overlays. `litellm.modelProvider`
-(gemini/anthropic/openai/vertex_ai/openai_compatible) picks which provider `model-default` routes to
+(gemini/anthropic/openai/vertex_ai/openai_compatible/sap, or any other LiteLLM provider slug with
+`litellm.modelDefaultName` set) picks which provider `model-default` routes to
 — the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity, and `openai_compatible`, whose key is optional (both below); `litellm.modelDefaultName`
+uses Workload Identity, `openai_compatible`, whose key is optional, and `sap` and the other slugs,
+whose credentials come from the Secret `litellm.envFromSecret` names (all below); `litellm.modelDefaultName`
 overrides the per-provider default model; `litellm.maxTokens` (default `0`,
 meaning none) puts a `max_tokens` under every alias for a request that names
 none, which a self-hosted backend with one combined prompt-plus-output budget
-needs — a request's own `max_tokens` still wins. On a Claude model the gateway
+needs — a request's own `max_tokens` still wins. `litellm.reasoningEffort`
+(`low`/`medium`/`high`, default empty, meaning none) puts a `reasoning_effort`
+under every alias the same way; LiteLLM maps it to `thinkingLevel` on Gemini 3.x
+([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-reasoning-effort)).
+On a Claude model the gateway
 drops `temperature`, `top_p` and `top_k` from every request
 ([why](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#setting-the-default-model)),
 and only a Claude model gets the prompt-caching breakpoints
@@ -345,6 +352,45 @@ including `/v1`) are required, and the render fails without them. Set
 --set litellm.modelDefaultName=<served-model-name> \
 --set litellm.openaiCompatible.apiBase=http://vllm.models.svc.cluster.local:8000/v1 \
 --set litellm.openaiCompatible.targetPort=8000
+```
+
+#### A credentials Secret for the gateway (`litellm.envFromSecret`)
+
+`litellm.envFromSecret` names a Secret in the release namespace that the chart
+mounts whole into the gateway container as environment variables (`envFrom`,
+optional, so the pod starts without it). You create it; the chart only names
+it, and a Helm upgrade never touches it. It carries whatever the LiteLLM
+provider reads from the environment, which is how the providers without a
+key in the credentials Secret get theirs:
+
+- **SAP AI Core (`litellm.modelProvider=sap`).** LiteLLM's `sap/` driver
+  exchanges the service key's client credentials at your tenant's token URL
+  and renews the token itself. Put the service key JSON under
+  `AICORE_SERVICE_KEY` and the resource group under `AICORE_RESOURCE_GROUP`;
+  the default model is `anthropic--claude-4.5-sonnet`, SAP's
+  `<publisher>--<model>` name. A Claude model behind SAP has its sampling keys
+  dropped like any other Claude model; prompt caching stays off.
+- **Any other LiteLLM provider** (`azure`, `bedrock`, `databricks`, ...): set
+  `litellm.modelProvider` to the slug, `litellm.modelDefaultName` to the model
+  (required; the chart has no default for it), and the driver's variables in
+  the Secret.
+- **An OpenAI-compatible gateway behind OAuth2 client credentials.** With
+  `openai_compatible` and `OPENAI_COMPATIBLE_OAUTH_TOKEN_URL`,
+  `OPENAI_COMPATIBLE_OAUTH_CLIENT_ID` and `OPENAI_COMPATIBLE_OAUTH_CLIENT_SECRET`
+  in the Secret, the chart ships a pre-call hook that fetches the bearer token,
+  caches it and renews it before expiry
+  ([details](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#oauth2-client-credentials)).
+
+A variable the chart also sets from the credentials Secret (`GEMINI_API_KEY`,
+`HOSTED_VLLM_API_KEY`, ...) wins over the same name in this Secret. Rotating
+the Secret does not roll the pods: `kubectl rollout restart deployment/litellm`.
+
+```bash
+kubectl create secret generic sap-aicore -n kubeagents-system \
+  --from-file=AICORE_SERVICE_KEY=./aicore-service-key.json \
+  --from-literal=AICORE_RESOURCE_GROUP=default
+helm upgrade --install kube-agents ./charts/kube-agents -n kubeagents-system \
+  --set litellm.modelProvider=sap --set litellm.envFromSecret=sap-aicore
 ```
 
 #### Upgrade notes: inference-gateway Service rename
@@ -827,7 +873,7 @@ granted by hand.
 
 ### ServiceAccount ownership
 
-Exactly one owner creates the agent's KSA, depending on
+Exactly one owner creates the broker's KSA, depending on
 `platformAgent.security.serviceAccountAnnotations`:
 
 - **Annotations set** (the Workload Identity case): the **operator** creates
@@ -1027,7 +1073,6 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
-
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

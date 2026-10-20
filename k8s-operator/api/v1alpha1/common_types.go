@@ -150,8 +150,9 @@ var SensitiveEnvVars = map[string]struct{}{
 	// posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route. The
-	// operator renders it exactly when the gateway arms the route.
+	// gateway conversation a card was filed in, on the same route, and names
+	// the platform in the cron relay's refusal when no home channel is set.
+	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS": {},
 	"NATS_URL":                 {},
 	"NATS_USER":                {},
@@ -1197,22 +1198,19 @@ type SecuritySpec struct {
 	// What the gateway policy already permits, and therefore what this cannot
 	// take away:
 	//
-	//   - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
-	//     metadata addresses — the pre- and post-DNAT forms of a metadata
-	//     request (the 988 rule is suppressed when the resolved metadata
-	//     daemon IP is empty). So the metadata path stays open. The same
-	//     address is also permitted on port 53, where it is the Cloud DNS for
-	//     GKE resolver rather than a credential path.
+	//   - 169.254.169.254/32 on port 53 only, where it is the Cloud DNS for
+	//     GKE resolver rather than a credential path. The gateway policy opens
+	//     no metadata credential port: the gateway Pod holds no Google identity
+	//     (it runs as its own unannotated ServiceAccount), so there is no
+	//     metadata path left for this field to close.
 	//   - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of
 	//     what this control is meant to be.
 	//
-	// The overlap is deliberate rather than an oversight. Workload Identity
-	// needs the metadata path, and <name>-gateway-netpol still permits it to
-	// the agent Pod. Narrowing that allowance to the broker Pod, which is the
-	// only one that mints a cloud token, is the work that turns this field into
-	// a control.
+	// The overlap is deliberate rather than an oversight. Narrowing
+	// <name>-gateway-netpol's internet rule is the work that turns this field
+	// into a control.
 	//
 	// So what is this for today? Two things, and they are worth having, but
 	// neither is enforcement. It renders an auditable statement of the
@@ -1260,11 +1258,9 @@ type SecuritySpec struct {
 	//     disables;
 	//   - github.com reached directly from the sandbox, though not the gh and
 	//     git wrappers, which go through the broker;
-	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
-	//     script's project id. It fails soft after a five-second timeout and
-	//     falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
-	//     pinned empty in the managed .env (a project other than the pod's belongs in
-	//     spec.scope.projects, the management project still has to resolve).
+	//   - nothing in cluster_agent_reconcile.py, which reads its management
+	//     project from GKE_PROJECT_ID (pinned in the managed .env, beside
+	//     RECONCILE_PROJECT pinned empty) and asks no metadata server.
 	//
 	// Those would not be accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this
@@ -1804,9 +1800,9 @@ type NetworkPolicySpec struct {
 	AdditionalEgress []EgressRule `json:"additionalEgress,omitempty"`
 }
 
-// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target (rule 3).
+// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target in the LiteLLM policy (litellm-policy), the one generated policy that still opens the metadata path; the gateway policy opens none.
 type MetadataDaemonSpec struct {
-	// Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+	// Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
 	// the empty alternative in the pattern is required because the API server
 	// validates an explicitly-set "", which omitempty does not suppress.
 	// +kubebuilder:validation:Pattern=`^($|(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
@@ -1973,11 +1969,11 @@ type NetworkPolicyStatus struct {
 	// +optional
 	DNSClusterIPsSource string `json:"dnsClusterIPsSource,omitempty"`
 
-	// MetadataDaemonIP is the post-NAT daemon IP in rule 3, empty when suppressed.
+	// MetadataDaemonIP is the post-NAT daemon IP in the LiteLLM policy's metadata rule, empty when suppressed.
 	// +optional
 	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
 
-	// MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+	// MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
 	// DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
 	// +optional
 	MetadataDaemonPort int32 `json:"metadataDaemonPort,omitempty"`

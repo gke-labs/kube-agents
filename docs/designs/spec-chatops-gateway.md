@@ -154,6 +154,67 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   serializing the conversation - new turns start new tasks - while its events, if
   they ever arrive, still relay. "Detached" and "non-detached" below mean exactly
   this state and its absence.
+
+  **Stopping the cards (gke-labs#3263).** Under `next` the front door's turn often ends
+  seconds after it files a kanban card, and the card is not a task the gateway holds. With
+  `A2A_CARD_STOP=true` (off by default; the operator renders it from its own environment), a
+  `stop` that names no task also sends the default addressee a card-stop control: a task of
+  its own whose message is the `cardStop` data part alone (spec-a2a-payloads, "Card work
+  after the task ends"). The bridge has session-kv archive every open card in the
+  conversation and the cards they spawned, and answers with what it stopped. The gateway
+  sends it:
+  - with nothing running, in a conversation that has run a task;
+  - right after the cancel, when a task is running, since the turn may already have filed a
+    card;
+  - on a later `stop` while a cancelled task's terminal is still pending, in place of
+    "cancel already sent".
+
+  One control at a time. A `stop` while one runs gets "🛑 already stopping this
+  conversation's cards — the answer comes when the executor confirms", or "cancel sent" when it cancelled a turn, and marks the control:
+  that stop's turn, or one started since the control went out, may have filed cards the
+  control has already passed by. When the marked control ends, however it ends, one
+  follow-up control goes out. It posts no placeholder and says nothing unless it stopped a
+  card or could not finish. One mark is held however many stops arrive. If a question asked
+  after the stop is running by then, the follow-up would wait for it and archive its cards
+  too, so it is not sent, and the room gets "⚠️ cards filed since the last stop weren't
+  stopped, because a newer question is running; say stop again to stop them". It is not sent
+  either when the card stop was turned off meanwhile (a restart with `A2A_CARD_STOP` off:
+  "… because stopping cards from chat has been turned off") or the conversation moved to a
+  session worker (`/session`, or a `delegate` re-home: "… because this conversation now goes
+  to a session worker"). The control
+  posts "🛑 stopping this conversation's cards…" and
+  edits it into the answer: "🛑 stopped N cards: <title>, …" naming at most five, then
+  "and K more", and clauses for what the stop could not promise (cards already finished,
+  ones that could not be stopped, ones still being stopped, a worker that may still start,
+  more cards than one stop takes, a stop that ran out of time). Titles are model text, so
+  each is cut to one line of at most 80 runes, with angle brackets and `@` replaced by
+  look-alikes so a title can't mention anyone, `[`, `]`, backticks, `~`, `|`, `*` and `_`
+  neutralised so it can't make a masked link or bleed formatting, and every dot and colon,
+  full-width and ideographic forms included, replaced by look-alikes (`․`, `꞉`) so a bare URL
+  or domain is not linked either. A stop that
+  found nothing open answers "🤷 nothing is running", which is then true, or "🤷 no card was
+  open in this conversation" when a question asked after the stop is already running. A control that is rejected (an older bridge
+  answers `no-text-parts`), fails, is canceled, completes with no `cardStop` part, or has
+  no terminal inside `A2A_CARD_STOP_TIMEOUT` (75s, above the bridge's worst case of about
+  60s) gets "⚠️ couldn't confirm that this conversation's cards stopped; if the agent filed a card for it, it may still be working", never a success. On an armed install the card notice ("stopping a card
+  from chat isn't supported yet") is used only where no control is sent: a conversation whose
+  tasks go to a session worker (the session route, or after `delegate`). Past the timeout the gateway also cancels the
+  control. Each control's end is one log line, `card stop ended`, with the terminal's
+  `state`, its `reason` token and an `outcome`: `answered`, `no-result` (completed with no
+  part), `not-stopped` (rejected, failed or canceled; `rejected` with `no-text-parts` is a
+  bridge older than the control), `timed-out`, `expired` (started before a gateway restart)
+  or `not-started` (never reached the bus).
+
+  The doors differ. The inject door's cancel route reports the control as a stop that
+  reached the bus (`cancelPublished`). On the A2A door the placeholder could never be
+  edited (its Edit reaches only a task's line) and the answer comes after the turn with no
+  task to carry it, so a `stop` there answers "🛑 sent a stop to this conversation's cards;
+  this door doesn't report how it went". The console renders answers off TASKS, so the
+  page may show the bridge's own text for the control beside the gateway's reply. The control is never the conversation's active task
+  and never in its task history: the next message is an ordinary turn, and a status ask
+  does not report on it. It is not sent on the session route, to a `delegate` session, for
+  a top-level DM `stop`, or for a program's cancel that names a task.
+
 - **Delegate.** A prefix, not a phrase, and recognized only when no live task
   serializes the conversation; its own section below.
 
@@ -493,7 +554,7 @@ link in the mint's own write, the refusal in its own - so neither path runs a re
 child's result is already posted, so it tells the session to reply with what it means rather than
 repeat it; to a program behind a door, which sees only the wake's reply, it asks for the whole
 answer. Either way it says to state plainly when the child failed or reports more work still
-running. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
+running. When the child handed its work to kanban cards, a line after the header says a Cluster Agent card's report posts into the conversation on its own (#3258). Two signals count: the terminal's chat mark with `ask` set and no `settle` (Slack with `KAGE_SLACK_UX` on), and the `handoff` artifact (spec-a2a-payloads), which the bridge's API executor publishes on any recorded route, Google Chat and Slack with the flag off included. The wake has no delegate tool: a pod spawned for a wake that serves one task gets
 `A2A_DELEGATE_TOOL=off` from the spawner, and a pod that serves every turn has the tool turned
 off by its adapter for each task whose authority block carries `via`, which only a wake's does
 and only the gateway can publish. A wake that could delegate read an interim answer such as "still
@@ -1441,7 +1502,8 @@ half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
-conversation (below) is armed by its own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
+conversation (below), and onboarding's first report into the conversation the user first wrote in,
+are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
 operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
 serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
 subscribes to and wakes its creator when a card blocks or fails, reaches the same route
@@ -1612,9 +1674,12 @@ thread is the session in a DM as in a channel. So `stop`, a status question and
 the top of the DM is a conversation with nothing running in it, so it starts no task
 and its reply says to send it in the question's thread instead; the adapter marks such
 a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
-gateway keys the reply on that mark, not on the conversation's task history, so a
-`stop` in a thread with nothing running (a question refused at the session cap, say)
-gets the plain "nothing is running". A top-level status question matches the exact
+gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
+nothing running gets "nothing is running": the plain reply when the conversation has
+never run a task (a question refused at the session cap, say), and otherwise one that
+adds that if the agent filed a card, that card keeps working until it finishes, since
+`stop` cannot reach a card (gke-labs#3263). With `A2A_CARD_STOP=true` the second case
+stops the conversation's cards instead (Stop, above). A top-level status question matches the exact
 status phrases only; one shaped like a question ("how is the deploy doing") is an ask.
 A bare `/session` asks for the next message in its thread.
 
@@ -1756,7 +1821,8 @@ added, the name from `users.info` (display name, real name, handle; never an id)
 typed reply in a conversation whose question is still open answers it the same way, with the
 reply's first words; a gateway command (a stop, a status ask or a short question about
 progress in the wide form, `/session`, a delegate) answers nothing. A question is answered once, and a second click on it is dropped. The open question
-is the latest message the adapter laid out with choices in the conversation, and one laid out
+is the latest message the adapter laid out with choices in the conversation, other than choices
+that are all an answer's next steps (`next`), which ask nothing, and one laid out
 with choices again is a fresh question whatever answered it before; an edit that takes its
 choices away (a card's question settled by its notify `update` key, laid out or as text) closes
 it, and keeps the answered line when one was drawn. The open question and the answered set live in
@@ -1908,6 +1974,23 @@ mark (at most 16 keys a chain, the least recently used dropped first, as the not
 key reaches that ask while a newer chain runs. A `mark` with no key goes to the latest chain
 once nothing runs, and is dropped, logged and counted (`notify_marks_dropped_total`) while a
 chain runs.
+
+**The Home tab.** A member opening the app's Home tab (`app_home_opened`, tab `home`) is answered
+with `views.publish`: a dashboard of five panels, with no model in the loop (`slack_home.go`). Fleet,
+Running, Recent pull requests and Last audit are one board snapshot, read over the board route: the
+gateway publishes an empty request on `chat.board` with its reply under `chat.board.reply.gateway.`,
+and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
+every Cluster Agent profile's cluster and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total, the running
+kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
+store. Waiting on you is the adapter's own record: the open question of each conversation whose
+latest verified asker is the viewer, so it is per member and the rest is the install's, and it holds
+only questions posted since the gateway started. One snapshot serves every open for 30 seconds, and a failed read for 5; one republish pass runs at a time, from one read. A
+member who opened the tab in the last ten minutes is published to again, ten seconds after a burst
+of changes: a card's plan moving or a mark changing reads the board again, a question asked or
+answered recomputes who is waiting and reads the board only once the snapshot has aged out. At
+most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
+when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
+A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
 
 ## The console adapter (added 9/23)
 
