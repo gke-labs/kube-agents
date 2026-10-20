@@ -40,6 +40,16 @@ UNKNOWN_ROSTER = (
 )
 NO_DESCRIPTION = "(no description provided)"
 
+# The cluster_identity block a Cluster Agent's config.yaml carries
+# (agents/platform/scripts/cluster_agent_profile.py, _inject_cluster_identity):
+# the scaffold's yaml.safe_dump output, a top-level key then scalars indented by
+# IDENTITY_INDENT. Quote characters a dumped scalar may be wrapped in.
+PROFILE_CONFIG = "config.yaml"
+IDENTITY_BLOCK = "cluster_identity:"
+IDENTITY_KEYS = ("cluster", "project", "location")
+IDENTITY_INDENT = "  "
+YAML_QUOTES = "'\""
+
 
 def log(msg: str) -> None:
     print(f"[AGENT-ROSTER] {msg}", file=sys.stderr)
@@ -81,12 +91,6 @@ def _responsibilities(home: Path) -> str:
     return _summarize_soul(home)
 
 
-# The keys of the cluster_identity block a Cluster Agent's config.yaml carries
-# (agents/platform/scripts/cluster_agent_profile.py, _inject_cluster_identity).
-_IDENTITY_BLOCK = "cluster_identity:"
-_IDENTITY_KEYS = ("cluster", "project", "location")
-
-
 def _cluster_identity(home: Path) -> dict[str, str]:
     """The cluster a Cluster Agent's profile targets, from its config.yaml, or {}.
 
@@ -100,7 +104,7 @@ def _cluster_identity(home: Path) -> dict[str, str]:
     two-space-indented scalars.
     """
     try:
-        cfg = home / "config.yaml"
+        cfg = home / PROFILE_CONFIG
         if not cfg.is_file():
             return {}
         lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -110,13 +114,13 @@ def _cluster_identity(home: Path) -> dict[str, str]:
     inside = False
     for line in lines:
         if not inside:
-            inside = line.rstrip() == _IDENTITY_BLOCK
+            inside = line.rstrip() == IDENTITY_BLOCK
             continue
-        if not line.startswith("  ") or line.startswith("   "):
+        if not line.startswith(IDENTITY_INDENT) or line.startswith(IDENTITY_INDENT + " "):
             break
         key, sep, value = line.strip().partition(":")
-        value = value.strip().strip("'\"")
-        if sep and key in _IDENTITY_KEYS and value:
+        value = value.strip().strip(YAML_QUOTES)
+        if sep and key in IDENTITY_KEYS and value:
             identity[key] = value
     return identity if identity.get("cluster") else {}
 
