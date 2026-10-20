@@ -205,7 +205,7 @@ class ComposeTest(unittest.TestCase):
         self.assertIn("| c | ns | api | Deployment | 2/2 | no | otlp | yes |", text)
         self.assertNotIn("Requests/Limits", text)
         self.assertIn(inventory_findings.SCAN_SCOPE_LINE, text)
-        # The card's "What did the scan check?" is answered from this file.
+        # The full inventory a user asks for names the checks.
         for _, words in inventory_findings.SCAN_CHECKS:
             self.assertIn(words, text)
 

@@ -83,7 +83,7 @@ SCAN_SCOPE_SENTENCES = (
     f"This scan ran {len(SCAN_CHECKS)} configuration checks; {AUDIT_FAMILY_WORDS} come from the first-run audits.",
 )
 SCAN_SCOPE_LINE = " ".join(SCAN_SCOPE_SENTENCES)
-# The checks by name, for the raw file the agent answers "What did the scan check?" from.
+# The checks by name, for the raw file.
 SCAN_CHECKS_SENTENCE = (
     f"The {len(SCAN_CHECKS)} checks: {', '.join(words for _, words in SCAN_CHECKS[:-1])} and {SCAN_CHECKS[-1][1]}."
 )

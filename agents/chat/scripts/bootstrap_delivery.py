@@ -853,11 +853,15 @@ def _area(audit: str) -> str:
     return inventory_findings.AUDIT_FAMILIES.get(audit) or f"`{audit}`"
 
 
+def _in_area_order(audits: list[str]) -> list[str]:
+    """``audits`` in the posture line's order of their areas, any audit with no area last."""
+    order = list(inventory_findings.AUDIT_FAMILIES)
+    return sorted(audits, key=lambda a: order.index(a) if a in order else len(order))
+
+
 def _areas(audits: list[str]) -> str:
     """"The a, b and c audits", in the posture line's order of the areas."""
-    order = list(inventory_findings.AUDIT_FAMILIES)
-    ranked = sorted(audits, key=lambda a: order.index(a) if a in order else len(order))
-    words = [_area(a) for a in ranked]
+    words = [_area(a) for a in _in_area_order(audits)]
     joined = words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
     return AUDITS_AREAS.format(areas=joined, audits=AUDITS_WORD[len(words) != 1])
 
@@ -881,12 +885,9 @@ def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
     fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
     held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
     gave_up = _list(state.get(oobe.STATE_GAVE_UP))
-    not_run = [AUDITS_NOT_RUN_ITEM.format(area=_area(a), reason=held[a]) for a in oobe.FIRST_RUN_AUDITS if a in held]
-    not_run += [
-        AUDITS_NOT_RUN_ITEM.format(area=_area(a), reason=AUDITS_GAVE_UP_REASON)
-        for a in oobe.FIRST_RUN_AUDITS
-        if a in gave_up
-    ]
+    reasons = {a: held[a] for a in oobe.FIRST_RUN_AUDITS if a in held}
+    reasons.update({a: AUDITS_GAVE_UP_REASON for a in oobe.FIRST_RUN_AUDITS if a in gave_up and a not in reasons})
+    not_run = [AUDITS_NOT_RUN_ITEM.format(area=_area(a), reason=reasons[a]) for a in _in_area_order(list(reasons))]
     runs = _completed_runs(data_dir, fired)
     marks = state.get(oobe.STATE_MARKS) if isinstance(state.get(oobe.STATE_MARKS), dict) else {}
     # A mark that is not a number reads as no mark: this runs after the claim, and a raise here

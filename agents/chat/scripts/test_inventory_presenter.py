@@ -137,14 +137,27 @@ class QuietCardTest(unittest.TestCase):
             out = inventory_presenter.present(QUIET_REPORT)
         self.assertIn("19 smaller items are queued. Ask me when you want them.", out)
 
-    def test_a_roll_up_that_counts_held_back_criticals_is_kept_as_written(self):
-        rollup = "Also found: 4 more items, 2 of them critical, tracked in the findings queue; the list is turned off."
-        report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4], rollup)
-        self.assertNotEqual(report, QUIET_REPORT)
-        out = inventory_presenter.present(report)
-        self.assertTrue(out.startswith("**First look at your fleet: done**\n5 clusters · 221 workloads · 9 configuration checks\n"), out)
-        self.assertNotIn("no critical item", out)
-        self.assertIn(rollup, out)
+    def test_a_report_that_mentions_criticals_any_other_way_goes_as_written(self):
+        # The card would say "no critical item" above them.
+        rollups = (
+            "Also found: 4 more items, 2 of them critical, tracked in the findings queue.",
+            "Also found: 3 more items, 2 of which are critical, tracked in the findings queue.",
+            "Also found: 1 more item, which is critical, tracked in the findings queue.",
+        )
+        for rollup in rollups:
+            with self.subTest(rollup=rollup):
+                report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4], rollup)
+                self.assertNotEqual(report, QUIET_REPORT)
+                self.assertEqual(inventory_presenter.present(report), report)
+                self.assertIsNone(inventory_presenter.blocks(report))
+        for item in ("**Critical** quote-api is down.", "Critical — quote-api is down.", "## Critical\n\nquote-api is down."):
+            with self.subTest(item=item):
+                report = QUIET_REPORT.replace("The full inventory", f"{item}\n\nThe full inventory")
+                self.assertEqual(inventory_presenter.present(report), report)
+
+    def test_the_fallback_text_does_not_read_the_checks_as_findings(self):
+        _, text = inventory_presenter.blocks(QUIET_REPORT)
+        self.assertNotIn("startup probes", text)
 
     def test_nothing_queued_has_no_button_and_one_queued_is_singular(self):
         report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4] + "\n\n", "")

@@ -71,10 +71,9 @@ as Step 6 fixes them, gets its own card (``_quiet``): "First look at your
 fleet: done", the counts with "no critical item in this scan's 9 checks", any
 gap sentence, a queue line from the roll-up's count and the install's pace (no
 delivery hour), the scan's checks folded under "What this scan checked", and a
-"See all N findings" button when items are queued. With criticals held back
-(the first report's limit is 0) the counts make no claim and the roll-up is
-kept as written. A list or a severity label anywhere sends the report as
-written. The text layout keeps the closing lines under it; the card leaves them
+"See all N findings" button when items are queued. The card is built only when
+the report has no list and says "critical" nowhere but in the roll-up's "none of
+them critical"; any other report, held-back criticals included, goes as written. The text layout keeps the closing lines under it; the card leaves them
 to its button.
 
 The report is model-written to the format in
@@ -134,8 +133,10 @@ SEE_ALL = "See all {count}"
 #: its own card, since the headline above counts things to look at.
 QUIET_HEADLINE = "First look at your fleet: done"
 QUIET_COUNTS = "{scanned} · no critical item in this scan's {checks} checks"
-# Criticals held back (the first report's limit is 0): the roll-up says so, so the counts claim nothing.
-QUIET_COUNTS_HELD = "{scanned} · {checks} configuration checks"
+#: The one way the roll-up `select` prints says nothing is critical. "No critical item" is claimed
+#: only when every mention of "critical" in the report is this one; anything else goes as written.
+NONE_CRITICAL = re.compile(r"\bnone of them critical\b", re.IGNORECASE)
+CRITICAL_WORD = re.compile(r"critical", re.IGNORECASE)
 QUIET_COUNTS_JOIN = " · "
 QUIET_QUEUE = "{count} smaller {items} queued. I'll bring up to {daily} a day."
 QUIET_QUEUE_ASK = "{count} smaller {items} queued. Ask me when you want them."
@@ -143,9 +144,9 @@ QUIET_ITEMS = ("item is", "items are")
 SEE_ALL_FINDINGS = ("See the {count} finding", "See all {count} findings")
 #: The scan's checks, folded under the card's lines, so the card answers what it covered.
 CHECKS_FOLD_TITLE = "What this scan checked"
-#: Any list or severity label: a critical item written outside the numbered list Step 6 asks
-#: for is not a report with no item, so it goes as written.
-NOT_QUIET = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\*\*\d+[.)])|\bcritical\s*:", re.IGNORECASE | re.MULTILINE)
+#: Any list: an item written outside the numbered list Step 6 asks for is not a report with no
+#: item, so it goes as written.
+NOT_QUIET = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\*\*\d+[.)])", re.MULTILINE)
 #: The card shows this many of the listed findings as rows; the rest fold under FOLD_TITLE.
 CARD_ROWS = 2
 FOLD_TITLE = "{count} more worth a look"
@@ -826,7 +827,9 @@ def blocks(report: str) -> tuple[list[dict], str] | None:
         fold_rows=card.folded,
     )
     lead = " ".join(part for part in (card.headline, card.note, card.detail) if part)
-    return built, fallback_text(lead, rows=card.rows + card.folded)
+    # The short card's fold is the scan's checks, not findings, so the fallback leaves it out.
+    folded = [] if card.fold_title == CHECKS_FOLD_TITLE else card.folded
+    return built, fallback_text(lead, rows=card.rows + folded)
 
 
 def chat(report: str) -> tuple[dict, str] | None:
@@ -886,7 +889,7 @@ def _quiet(report: str) -> _Quiet | None:
     as written, as on the card for a report with items.
     """
     lines = report.splitlines()
-    if NOT_QUIET.search(report):
+    if NOT_QUIET.search(report) or CRITICAL_WORD.search(NONE_CRITICAL.sub("", report)):
         return None
     paragraphs = [" ".join(p.split()) for p in _paragraphs([line for line in lines if not HEADING.match(line)])]
     paragraphs = [p for p in paragraphs if p and not _is_title(p)]
@@ -904,15 +907,10 @@ def _quiet(report: str) -> _Quiet | None:
     if not scanned:
         return None
     rollup = next((p for p in tail if _rollup_count(p, 0) is not None), None)
-    held = rollup is not None and DEFERRED_CRITICALS.search(rollup) is not None
-    counts = (QUIET_COUNTS_HELD if held else QUIET_COUNTS).format(
-        scanned=QUIET_COUNTS_JOIN.join(scanned), checks=len(SCAN_CHECKS)
-    )
+    counts = QUIET_COUNTS.format(scanned=QUIET_COUNTS_JOIN.join(scanned), checks=len(SCAN_CHECKS))
     queued = (_rollup_count(rollup, 0) or 0) if rollup is not None else 0
     closing = [p for p in tail if p is not rollup]
-    if held:
-        queue = rollup
-    elif queued:
+    if queued:
         daily = fq.pacing_limits(os.environ).noncritical_max
         items = QUIET_ITEMS[queued != 1]
         queue = (QUIET_QUEUE.format(count=queued, items=items, daily=daily) if daily

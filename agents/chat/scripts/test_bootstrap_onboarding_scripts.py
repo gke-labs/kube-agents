@@ -2273,7 +2273,7 @@ class FirstRunAuditsTest(unittest.TestCase):
             with self.subTest(state=state):
                 note = self._note(state)
                 self.assertTrue(note.startswith(bootstrap_delivery.AUDITS_NONE_RAN_NOTE))
-                self.assertIn("Not run: the cost audit (", note)
+                self.assertIn("Not run: the security and RBAC audit (", note)
                 self.assertNotIn("now running", note)
                 self.assertNotIn("have started", note)
 
