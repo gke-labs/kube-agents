@@ -366,6 +366,9 @@ readonly SCOPE_PROBE_UNDECIDED=2
 # is nothing live to protect, not that the read failed.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="the server doesn't have a resource type|could not find the requested resource"
 readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
+# gcloud's answer for a cluster that does not exist. Any other describe failure
+# (auth expiry, a 403, a network blip) is a cluster that could not be read.
+readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -1298,6 +1301,39 @@ announce_platform_agent_mode_for_apply() {
     record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
   fi
   announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
+}
+
+# After announce_platform_agent_mode_for_apply, from the reads it left:
+# succeeds unless they show that no install runs next, that is no cluster, no
+# PlatformAgent type, a CR on today, or, with the CR gone, no release or one
+# that records today (the next apply recreates the CR from it). A read that
+# failed or did not happen is not today. upgrade.sh refuses a keyless
+# install.env on this, since such a file renders today.
+platform_agent_install_may_run_next() {
+  local live record
+  [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ] && return 1
+  case "${PLATFORM_AGENT_CR_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  if [ -n "$live" ]; then
+    [ "$(effective_platform_agent_mode "$live")" = "next" ]
+    return
+  fi
+  case "${PLATFORM_AGENT_RECORD_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  [ "${PLATFORM_AGENT_SERVED_READ:-}" = "$PLATFORM_AGENT_READ_FAILED" ] && return 0
+  if [ -n "${PLATFORM_AGENT_SERVED_REVISION:-}" ]; then
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
+  else
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+  fi
+  [ "$(effective_platform_agent_mode "$record")" = "next" ]
 }
 
 # upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
@@ -4074,6 +4110,13 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
   return 1
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the cluster does not exist. The tfvars generator and install.sh's mode
+# settle both ask this, so they cannot disagree about what absence is.
+gke_describe_error_is_not_found() {
+  printf '%s' "${1:-}" | grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN"
+}
+
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -4164,7 +4207,7 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! printf '%s' "$describe_err" | grep -qiE "not.?found|404"; then
+    if ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1

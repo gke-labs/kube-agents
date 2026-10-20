@@ -601,10 +601,15 @@ class UpgradeRunContractTest(unittest.TestCase):
     def test_a_full_upgrade_refuses_a_switch_out_of_a_file_with_no_mode(self):
         """A copied install.env.example names no mode and reads as today, so a
         full upgrade over a next install would switch it back with nothing
-        asked. The full arm's notice block, lifted as written, refuses that
-        and removes the tfvars; a key that names the mode, or no switch, goes
-        on; an older target that never sets the flag goes on too."""
+        asked. The full arm's notice block, lifted as written over the real
+        installer_common.sh with the notice stubbed to leave its reads, refuses
+        that and removes the tfvars whenever the reads leave next possible: a
+        switch the notice named, a hand-deleted CR whose release records next,
+        a release history that did not answer. A key that names the mode (empty
+        is a chosen today), reads that show no install on next, and an older
+        target that defines neither check go on."""
         source = _UPGRADE_SH.read_text()
+        common = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
         start = source.index(
             '      if declare -F announce_platform_agent_mode_for_apply >/dev/null; then\n'
             '        announce_platform_agent_mode_for_apply "$target_namespace" '
@@ -613,29 +618,43 @@ class UpgradeRunContractTest(unittest.TestCase):
         end = source.index("      # And the container preflight:", start)
         block = source[start:end]
         self.assertIn('[ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ]', block)
-        for mode, announced, define, refused in (
-            ("", "true", True, True),
-            ("next", "true", True, False),
-            ("", "false", True, False),
-            ("", "true", False, False),
+        cr_next = 'PLATFORM_AGENT_CR_READ=ok PLATFORM_AGENT_CR_JSON=\'{"items":[{"spec":{"mode":"next"}}]}\''
+        cr_today = 'PLATFORM_AGENT_CR_READ=ok PLATFORM_AGENT_CR_JSON=\'{"items":[{"spec":{}}]}\''
+        cr_gone = 'PLATFORM_AGENT_CR_READ=ok PLATFORM_AGENT_CR_JSON=\'{"items":[]}\''
+        for mode, announced, reads, define, refused in (
+            (None, "true", cr_next, True, True),
+            ("next", "true", cr_next, True, False),
+            ("", "true", cr_next, True, False),
+            (None, "false", cr_today, True, False),
+            (None, "false", "TFVARS_CLUSTER_EXISTS=false", True, False),
+            (None, "false", "PLATFORM_AGENT_CR_READ=none", True, False),
+            (None, "false", f"{cr_gone} PLATFORM_AGENT_RECORD_READ=none", True, False),
+            (None, "false", f"{cr_gone} PLATFORM_AGENT_RECORD_READ=ok PLATFORM_AGENT_RECORD_JSON='{{}}'", True, False),
+            (None, "false",
+             f"{cr_gone} PLATFORM_AGENT_RECORD_READ=ok PLATFORM_AGENT_RECORD_JSON='{{\"platformAgent\":{{\"mode\":\"next\"}}}}'",
+             True, True),
+            (None, "false", f"{cr_gone} PLATFORM_AGENT_RECORD_READ=ok PLATFORM_AGENT_SERVED_READ=failed", True, True),
+            (None, "false", "PLATFORM_AGENT_CR_READ=failed", True, True),
+            (None, "true", cr_next, False, False),
         ):
-            with self.subTest(mode=mode, announced=announced, define=define):
+            with self.subTest(mode=mode, announced=announced, reads=reads, define=define):
                 with tempfile.TemporaryDirectory() as tmp:
                     tfvars = pathlib.Path(tmp) / "terraform.tfvars"
                     tfvars.write_text("x = 1\n")
                     stub = (
-                        f'announce_platform_agent_mode_for_apply() {{ PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED={announced}; }}\n'
+                        f'source "{common}"\n'
+                        f'announce_platform_agent_mode_for_apply() {{ PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED={announced}; {reads}; }}\n'
                         if define else ""
                     )
                     script = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+{stub}
 print_error() {{ echo "ERROR: $*"; }}
 print_info() {{ echo "INFO: $*"; }}
-{stub}
 set -Eeuo pipefail
-unset PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
-DEFAULT_PLATFORM_AGENT_MODE=today PLATFORM_AGENT_MODE_NOTICE_UNGATED=ungated
-{"PLATFORM_AGENT_MODE=" + mode if mode else ":"}
+unset PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED TFVARS_CLUSTER_EXISTS
+: "${{DEFAULT_PLATFORM_AGENT_MODE:=today}}" "${{PLATFORM_AGENT_MODE_NOTICE_UNGATED:=ungated}}"
+{":" if mode is None else "PLATFORM_AGENT_MODE=" + mode}
 target_namespace=kubeagents-system tfvars_file={shlex.quote(str(tfvars))}
 {block}
 echo "went on"
@@ -646,7 +665,7 @@ echo "went on"
                     out = proc.stdout + proc.stderr
                     if refused:
                         self.assertNotEqual(proc.returncode, 0, out)
-                        self.assertIn("Refusing to switch spec.mode when install.env names no PLATFORM_AGENT_MODE", out)
+                        self.assertIn("install.env names no PLATFORM_AGENT_MODE and the install may run next", out)
                         self.assertFalse(tfvars.exists())
                     else:
                         self.assertIn("went on", proc.stdout, out)
@@ -3724,7 +3743,8 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         stubs = (
             "print_step() { :; }\n"
             "refuse_apply_over_undeclared_scope() { :; }\n"
-            "announce_platform_agent_mode_for_apply() { :; }\n"
+            # The notice, leaving the reads of a cluster with no PlatformAgent type.
+            "announce_platform_agent_mode_for_apply() { PLATFORM_AGENT_CR_READ=none; }\n"
             "check_scope_container_access() { :; }\n"
             "check_service_account_ownership() { :; }\n"
             'apply_crd_upgrades() { echo "APPLIED crds"; }\n'

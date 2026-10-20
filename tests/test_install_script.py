@@ -59,6 +59,12 @@ _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 # this is stuck -- on a prompt, if the terminal detach ever slips -- and the
 # bound turns that into a failure with output, not a hang.
 _INSTALLER_RUN_TIMEOUT_SECONDS = 60
+# What `gcloud container clusters describe` prints for a cluster that does not
+# exist, and for one it could not read.
+_GCLOUD_CLUSTER_NOT_FOUND = "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: c."
+_GCLOUD_CLUSTER_FORBIDDEN = (
+    "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Required container.clusters.get permission."
+)
 
 
 def _run_installer_bash(body, env, cwd=_REPO_ROOT):
@@ -6559,7 +6565,8 @@ class PlatformAgentModeTest(unittest.TestCase):
         "export PROJECT_ID=p REGION=r CLUSTER_NAME=c\n"
         "exec 3>&2\n"
         "gcloud() {{ echo \"GCLOUD KUBECONFIG=[${{KUBECONFIG:-}}] $*\" >&3; "
-        "case \"$*\" in *get-credentials*) echo 'current-context: gke_p_r_c' > \"${{KUBECONFIG:-$HOME/.kube/config}}\" ;; esac; "
+        "case \"$*\" in *get-credentials*) echo 'current-context: gke_p_r_c' > \"${{KUBECONFIG:-$HOME/.kube/config}}\" ;; "
+        "*describe*) [ {status} -eq 0 ] || echo '{describe_err}' >&2 ;; esac; "
         "return {status}; }}\n"
         "gke_dns_endpoint_flag() {{ :; }}\n"
         "read_platform_agent_install_state() {{ PLATFORM_AGENT_CR_READ='{read}'; "
@@ -6573,16 +6580,19 @@ class PlatformAgentModeTest(unittest.TestCase):
     )
 
     def _adopt(self, tmp, status=0, read="ok", json_list='{"items":[]}', record="none", values="{}",
-               error="", dry_run="false", generate_only="false", pre=":", content=None, extra_env=None):
+               error="", dry_run="false", generate_only="false", pre=":", content=None, extra_env=None,
+               describe_err=_GCLOUD_CLUSTER_NOT_FOUND):
         # No content is a first install, with no install.env: the file check is
-        # pinned above, so here it is set rather than arranged.
+        # pinned above, so here it is set rather than arranged. A failing
+        # describe prints describe_err, NOT_FOUND unless a test says otherwise.
         if content is None:
             content = ""
             pre = f"INSTALL_ENV_FOUND_AT_START=false; {pre}"
         path = self._file(tmp, content)
         return self._run(
             self._ADOPT.format(status=status, read=read, json=json_list, record=record, values=values,
-                               error=error, dry_run=dry_run, generate_only=generate_only, pre=pre),
+                               error=error, dry_run=dry_run, generate_only=generate_only, pre=pre,
+                               describe_err=describe_err),
             install_env=path, extra_env=extra_env,
         )
 
@@ -6658,6 +6668,77 @@ class PlatformAgentModeTest(unittest.TestCase):
                     keyless = self._adopt(tmp, read=read, content="PROJECT_ID=p\n")
                     self.assertIn("rc=0 FALLBACK=[today]", keyless.stdout, keyless.stderr)
                     self.assertIn("records no PLATFORM_AGENT_MODE", keyless.stdout + keyless.stderr)
+
+    def test_a_cluster_gcloud_cannot_describe_is_never_guessed_a_first_install(self):
+        # Only a NOT_FOUND is no cluster. Any other describe failure (an
+        # expired token, a 403) is a cluster that could not be read, settled
+        # as the read failures above are, and nothing past the describe runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            kwargs = {"status": 1, "describe_err": _GCLOUD_CLUSTER_FORBIDDEN}
+            applying = self._adopt(tmp, **kwargs)
+            out = applying.stdout + applying.stderr
+            self.assertIn("rc=1", applying.stdout, out)
+            self.assertIn("Cluster 'c' may exist and there is no install.env", out)
+            self.assertIn("code=403", out)
+            self.assertNotIn("get-credentials", applying.stderr)
+            preview = self._adopt(tmp, dry_run="true", **kwargs)
+            self.assertIn("rc=0 FALLBACK=[today]", preview.stdout, preview.stderr)
+            self.assertIn("An applying run would be refused.", preview.stdout + preview.stderr)
+            keyless = self._adopt(
+                tmp, content="PROJECT_ID=p\n", pre="trap 'echo \"GUESSED=[$PLATFORM_AGENT_MODE_GUESSED]\"' EXIT",
+                **kwargs,
+            )
+            self.assertIn("rc=0 FALLBACK=[today]", keyless.stdout, keyless.stderr)
+            self.assertIn("GUESSED=[true]", keyless.stdout, keyless.stderr)
+
+    def test_the_menu_names_the_key_rather_than_the_flag_it_refuses(self):
+        # --menu takes no --mode, so the remedies it prints name install.env.
+        with tempfile.TemporaryDirectory() as tmp:
+            guessed = self._adopt(tmp, read="failed", error="forbidden", content="PROJECT_ID=p\n",
+                                  pre="PARAM_MENU_MODE=true")
+            out = guessed.stdout + guessed.stderr
+            self.assertIn("stop and set PLATFORM_AGENT_MODE=next in ", out)
+            self.assertNotIn("ass --mode", out)
+            kept = self._adopt(tmp, json_list='{"items":[{"spec":{}}]}', content="PROJECT_ID=p\n",
+                               pre="PARAM_MENU_MODE=true")
+            out = kept.stdout + kept.stderr
+            self.assertIn("Set PLATFORM_AGENT_MODE=next in ", out)
+            self.assertNotIn("ass --mode", out)
+            # The menu runs with no install.env too.
+            no_file = self._adopt(tmp, read="failed", error="forbidden", pre="PARAM_MENU_MODE=true")
+            out = no_file.stdout + no_file.stderr
+            self.assertIn("Set PLATFORM_AGENT_MODE=today or PLATFORM_AGENT_MODE=next in ", out)
+            self.assertNotIn("ass --mode", out)
+            mirrored = self._run(
+                "PARAM_MENU_MODE=true PLATFORM_AGENT_MODE_FALLBACK=next; mirrored_first_install_mode mirror.example/x",
+                install_env=self._file(tmp, "PROJECT_ID=p\n"),
+            )
+            self.assertIn("Set PLATFORM_AGENT_MODE=next in ", mirrored.stdout + mirrored.stderr)
+
+    def test_the_menu_settles_a_mirrored_first_install_as_main_does(self):
+        # The menu's settle block, lifted as written, over a keyless install.env
+        # that records a mirror prefix and a cluster that does not exist: a
+        # mirrored first install, so today, saved; a pass that settled an
+        # earlier target does not leak into this one.
+        text = _INSTALL_SH.read_text()
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        start = text.index('        local menu_mode_to_save=""\n', arm)
+        end = text.index("        fi\n", start) + len("        fi\n")
+        block = text[start:end]
+        self.assertIn('mirrored_first_install_mode "${THIRD_PARTY_REGISTRY_PREFIX%/}"', block)
+        body = (
+            f"gcloud() {{ echo '{_GCLOUD_CLUSTER_NOT_FOUND}' >&2; return 1; }}\n"
+            "PLATFORM_AGENT_MODE_SETTLED=true\n"
+            "settle() {\n  local project_id=p cluster_name=c region=r\n"
+            f"{block}"
+            '  echo "SAVE=[$menu_mode_to_save] MODE=[$PLATFORM_AGENT_MODE]"\n}\nsettle\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for prefix, expected in (("mirror.example/x/", "today"), ("", "next")):
+                with self.subTest(prefix=prefix):
+                    content = f"PROJECT_ID=p\nTHIRD_PARTY_REGISTRY_PREFIX={prefix}\n" if prefix else "PROJECT_ID=p\n"
+                    proc = self._run(body, install_env=self._file(tmp, content))
+                    self.assertIn(f"SAVE=[{expected}] MODE=[{expected}]", proc.stdout, proc.stderr)
 
     def test_the_cluster_read_leaves_the_operators_kubeconfig_alone(self):
         # --dry-run and --generate-only promise no side effects; the read
@@ -6791,7 +6872,8 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertNotIn("PLATFORM_AGENT_MODE_FALLBACK", text[main_start:adopt])
         # Once in main, once in the menu's Save & Apply.
         self.assertEqual(text.count("adopt_live_platform_agent_mode \""), 2)
-        self.assertEqual(text.count("  mirrored_first_install_mode \""), 1)
+        # And in the menu, after its own adopt.
+        self.assertEqual(text.count("  mirrored_first_install_mode \""), 2)
         self.assertEqual(text.count("  queue_unrecorded_platform_agent_mode\n"), 1)
 
     def test_a_mirrored_first_install_defaults_to_today(self):
@@ -6827,6 +6909,31 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn('[ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ]', block)
         self.assertIn('rm -f "$tfvars_file"', block)
         self.assertIn("exit 1", block)
+        # Lifted as written with the notice stubbed to name a switch: a file
+        # with no key is refused; one that assigns the key, empty included
+        # (a chosen today), and a --mode go on.
+        body = (
+            "announce_platform_agent_mode_for_apply() { PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED=true; }\n"
+            'mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED" platform_agent_mode=today\n'
+            "tfvars_file=$(mktemp)\n{pre}\n"
+            f"{block}  fi\n"
+            'echo "went on"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, pre, refused in (
+                ("PROJECT_ID=p\n", ":", True),
+                ("PROJECT_ID=p\nPLATFORM_AGENT_MODE=\n", ":", False),
+                ("PROJECT_ID=p\nPLATFORM_AGENT_MODE=today\n", ":", False),
+                ("PROJECT_ID=p\n", "PARAM_PLATFORM_AGENT_MODE=today", False),
+            ):
+                with self.subTest(content=content, pre=pre):
+                    proc = self._run(body.replace("{pre}", pre), install_env=self._file(tmp, content))
+                    out = proc.stdout + proc.stderr
+                    if refused:
+                        self.assertIn("Refusing to switch spec.mode under -y", out)
+                        self.assertNotIn("went on", proc.stdout, out)
+                    else:
+                        self.assertIn("went on", proc.stdout, out)
 
     def test_the_switch_notice_says_whether_it_named_a_switch(self):
         cases = (

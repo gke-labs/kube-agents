@@ -168,8 +168,8 @@ rendered without one (`helm template`, Argo CD) would move an existing install:
   a deleted one whose release is still installed keeps the release's, and only a cluster with
   neither is a first install, which records `next` (`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`),
   or `today` when it mirrors its third-party images, whose NATS images are not mirrored. A
-  cluster that cannot be read is never taken for a first install. `upgrade.sh` and the other
-  front doors read a file with no key as `today` (`DEFAULT_PLATFORM_AGENT_MODE`), so
+  cluster that cannot be described or read is never taken for a first install. `upgrade.sh`
+  and the other front doors read a file with no key as `today` (`DEFAULT_PLATFORM_AGENT_MODE`), so
   `install.sh` records the mode it settled on there; under `-y` it refuses a switch that
   neither `--mode` nor the file asked for.
 

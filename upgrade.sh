@@ -2298,11 +2298,18 @@ main() {
       # A switch out of an install.env that names no mode was chosen by
       # nobody: such a file (one copied from install.env.example onto a
       # running install) reads as today here, and nothing asks before the
-      # apply, so a next install would move back. An older target's helpers
-      # never set the flag.
-      if [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] && [ -z "${PLATFORM_AGENT_MODE:-}" ]; then
+      # apply, so a next install would move back. So the file must assign the
+      # key (load_install_env unset it, and assigned empty is a chosen today)
+      # unless the reads showed no install that runs next: a read that failed
+      # is not today, nor is a hand-deleted CR whose release records next,
+      # and the notice names neither as a switch. An older target's helpers
+      # define neither check.
+      if [ -z "${PLATFORM_AGENT_MODE+set}" ] && {
+        [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] ||
+          { declare -F platform_agent_install_may_run_next >/dev/null && platform_agent_install_may_run_next; }
+      }; then
         rm -f "$tfvars_file"
-        print_error "Refusing to switch spec.mode when install.env names no PLATFORM_AGENT_MODE: nothing asked for the switch."
+        print_error "Refusing to render spec.mode today when install.env names no PLATFORM_AGENT_MODE and the install may run next: nothing asked for a switch."
         print_info "Set PLATFORM_AGENT_MODE in install.env to the mode the install runs, or run install.sh once, which records it, and run again. To switch, set the mode you want there."
         exit 1
       fi
