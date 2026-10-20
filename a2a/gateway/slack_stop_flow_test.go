@@ -181,7 +181,7 @@ func TestSlackStopButtonDuringACardStopCancelsANewTurnAndFollowsUp(t *testing.T)
 		return false
 	})
 	rec := waitForRecord(t, d.r, conv, "the follow-up marked in the Slack voice", func(rec *SessionRecord) bool {
-		return rec.CardStop != nil && rec.CardStop.Again != nil && rec.CardStop.AgainSlackStop && rec.CardStop.Promised
+		return rec.CardStop != nil && rec.CardStop.Again != nil && rec.CardStop.AgainSlackStop
 	})
 	if rec.CardStop.TaskID != control.TaskID {
 		t.Fatalf("the second press replaced the control in flight: %+v", rec.CardStop)

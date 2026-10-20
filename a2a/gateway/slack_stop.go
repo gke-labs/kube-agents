@@ -74,7 +74,6 @@ func (g *Gateway) slackStop(ctx context.Context, rec *SessionRecord, authority A
 		}
 		markCardStopAgain(rec, authority)
 		rec.CardStop.AgainSlackStop = true
-		rec.CardStop.Promised = true
 		return
 	}
 	g.stopCardsAs(ctx, rec, authority, backend, false, CardStopRun{SlackStop: true, TurnCancelled: turn})

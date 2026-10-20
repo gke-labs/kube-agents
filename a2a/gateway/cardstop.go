@@ -255,7 +255,7 @@ func (g *Gateway) stopCardsAs(ctx context.Context, rec *SessionRecord, authority
 	}
 	rec.CardStop = &CardStopRun{TaskID: taskID, CorrelationID: correlationID, Addressee: addressee,
 		Capability: capRef, StatusMsgID: statusMsgID, StartedAt: time.Now().UTC(), Quiet: quiet,
-		SlackStop: voice.SlackStop, TurnCancelled: voice.TurnCancelled}
+		SlackStop: voice.SlackStop, TurnCancelled: voice.TurnCancelled, Promised: voice.Promised}
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
 	g.relays[taskID] = &relayState{local: true}
@@ -400,7 +400,10 @@ func (g *Gateway) endCardStop(ctx context.Context, rec *SessionRecord) {
 	g.stopCardStopTimer(run.TaskID)
 	g.retireTaskRoute(ctx, run.TaskID)
 	if run.Again != nil {
-		g.followUpCardStop(ctx, rec, *run.Again, CardStopRun{SlackStop: run.AgainSlackStop, TurnCancelled: run.AgainSlackStop})
+		// A Slack Stop's follow-up answers its press in full: the press
+		// cancelled a turn, and its reply is that follow-up's.
+		g.followUpCardStop(ctx, rec, *run.Again, CardStopRun{SlackStop: run.AgainSlackStop,
+			TurnCancelled: run.AgainSlackStop, Promised: run.AgainSlackStop})
 	}
 }
 
