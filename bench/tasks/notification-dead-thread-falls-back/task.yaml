@@ -73,4 +73,4 @@ verification_spec:
       type: none
       checks:
         - type: tool_called
-          tool_names: ["send_notification"]
+          tool_names: ["mcp_platform_control_send_notification"]
