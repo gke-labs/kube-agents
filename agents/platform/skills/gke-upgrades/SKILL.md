@@ -269,8 +269,8 @@ reads Git only: point at GKE Deprecation Insights for live client usage.
 A cluster whose `status` is not `RUNNING` (`RECONCILING`, `DEGRADED`, `ERROR`) accepts no cluster
 or node pool change, and only the provider can end an operation that has wedged inside it. The
 fleet-upgrade-verification report's `cluster-status-age` rule files such a cluster as a blocker
-once the status has stood for more than four hours, naming the operation that holds it. What to
-do with it, in order:
+once its newest operation has stood for more than four hours, naming that operation, and at once
+when the operations list shows no operation for the cluster at all. What to do with it, in order:
 
 1. **Read the operation, not only the status.** List the cluster's newest operations:
    `gcloud container operations list --project <project> --filter="targetLink~/clusters/<cluster>$" --sort-by=~startTime --limit=5 --format=json`,

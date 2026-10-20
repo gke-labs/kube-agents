@@ -51,8 +51,8 @@ kube-agents/
 │       │                                          report-prioritization SOPs
 │       ├── skill-overlays/                        patches + append.md behind the mirrored
 │       │                                          gke-* skills (scripts/skill_overlay.py)
-│       └── skills/                                SKILL.md bundles + the
-│                                                  gke-compute-classes references
+│       └── skills/                                SKILL.md bundles + each
+│                                                  skill's references/ documents
 ├── a2a/docs/                                      design notes kept beside the A2A
 │                                                  bus Go module they describe
 ├── bench/                                         devops-bench evaluation harness README

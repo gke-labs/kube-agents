@@ -202,8 +202,10 @@ install's remedy, and the table carries each as that project's failure, and a ti
 refused fails, announced once. An install that declares none keeps the bare flag, and a scope
 render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
-the same as a run on request: one `get-credentials` and six `kubectl get`s
-per cluster (budgets, Deployments and StatefulSets; webhook configurations
+the same as a run on request: three `gcloud` list reads per project (backend
+services, instances and GKE operations, projected to the fields the rules read)
+beside the server config per location, then one `get-credentials` and six
+`kubectl get`s per cluster (budgets, Deployments and StatefulSets; webhook configurations
 with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
 claims, NetworkPolicies and Namespaces; every pod; the nodes through a
 jsonpath projection; StorageClasses and PersistentVolumes), plus
