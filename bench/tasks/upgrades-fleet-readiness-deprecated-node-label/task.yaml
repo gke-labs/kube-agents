@@ -7,13 +7,14 @@
 # through the agent's answer to the fleet readiness question.
 #
 # The rule reads every template's nodeSelector and node affinity against the
-# Node objects it read. A label the target minor drops is blocking; a label no
-# node carries today is a risk; a deprecated beta label the kubelet still sets
-# is a risk, named with its GA replacement. beta.kubernetes.io/arch is the
-# third: every node still carries it, no minor drops it, and
-# kubernetes.io/arch replaces it. So the declared line reads `blocks the
-# upgrade: no`, and the case grades that the agent names the Deployment and
-# keeps it a risk.
+# pools and the Node objects it read. A label the target minor drops blocks
+# when a pool the template can land on crosses the drop in this upgrade; a
+# label that no pool's configuration sets and no node in the template's pools
+# carries today is a risk; a deprecated beta label the kubelet still sets is a
+# risk, named with its GA replacement. beta.kubernetes.io/arch is the third:
+# every node still carries it, no minor drops it, and kubernetes.io/arch
+# replaces it. So the declared line reads `blocks the upgrade: no`, and the
+# case grades that the agent names the Deployment and keeps it a risk.
 #
 # What the deterministic checks read, and what they leave to the judge. The
 # prompt asks for one fixed-form line per object the report names, and the
