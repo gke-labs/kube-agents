@@ -1508,11 +1508,12 @@ def _rule_arguments(cluster: dict, member: dict, read, target, context: dict) ->
     return copy.deepcopy(cluster), copy.deepcopy(member), copy.deepcopy(read), target, own
 
 
-def _failed_result(reason: str, rule_id: str, entry, can_block: bool) -> dict:
+def _failed_result(reason: str, rule_id: str, entry, can_block: bool, holds=None) -> dict:
     """The result of a rule that was not evaluated: one `unknown` entry carrying `reason`,
-    built from the checked attributes and a string, so it needs no probe."""
+    built from the checked attributes (the module's `HOLDS` among them, when it declared one
+    and the reads returned) and a string, so it needs no probe."""
     result = {key: [] for key in RULE_RESULT_KEYS}
-    result["unknown"] = [_unknown_entry(reason, rule_id, entry, can_block)]
+    result["unknown"] = [_unknown_entry(reason, rule_id, entry, can_block, holds)]
     return result
 
 
@@ -1606,9 +1607,9 @@ def evaluate_extra_rules(cluster: dict, member: dict, read, target, context: dic
     folded["rules"] = {}
     for rule in EXTRA_RULES if rules is None else rules:
         # One guard from the attribute reads to the result: nothing between "next module" and
-        # "record written" leaves the fold. `rule_id` is None inside the guard while the
-        # attribute reads have not returned.
-        rule_id = None
+        # "record written" leaves the fold. `rule_id` and `holds` are None inside the guard while
+        # the attribute reads have not returned.
+        rule_id, holds = None, None
         try:
             rule_id, entry, can_block, holds, defect = _rule_attributes(rule)
             if defect is None and rule_id not in folded["rules"]:
@@ -1630,7 +1631,7 @@ def evaluate_extra_rules(cluster: dict, member: dict, read, target, context: dic
             folded["rules"][rule_id]["unknown"] += 1
             continue
         if defect is not None:
-            result = _failed_result(defect, rule_id, entry, can_block)
+            result = _failed_result(defect, rule_id, entry, can_block, holds)  # the module's HOLDS was read before it ran; its unknown says which move it could not grade
         # The record is the checked attributes and counts; the lists are what `_rule_result`
         # probed or `_failed_result` built from checked values: nothing the fold emits
         # reaches the writer unprobed.

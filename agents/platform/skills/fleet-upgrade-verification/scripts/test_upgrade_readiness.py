@@ -1094,6 +1094,16 @@ class ExtraRulesTest(unittest.TestCase):
         unread = bare_module("unread", evaluate=returning(unknown=["the instances were not read"]), RULE_ID="unread", ENTRY=22, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
         folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[unread, silent])
         self.assertEqual([(u["rule"], u["can_block"], u.get("holds")) for u in folded["unknown"]], [("unread", True, ["node-pool"])])
+        # A rule that raises, or returns a shape the contract forbids, carries its HOLDS on the unknown the fold files for it:
+        # the attributes were read before it ran, and the audit would otherwise read the row as holding both moves.
+        def raising(cluster, member, read, target, context):
+            raise ValueError("one odd record")
+
+        raiser = bare_module("raiser", evaluate=raising, RULE_ID="raiser", ENTRY=22, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
+        malformed = bare_module("malformed", evaluate=lambda cluster, member, read, target, context: {"blocking": "not a list"}, RULE_ID="malformed", ENTRY=21, CAN_BLOCK=True, HOLDS=(shared.HOLDS_NODE_POOL,))
+        folded = r.evaluate_extra_rules({}, {}, self.READ, TARGET, {}, rules=[raiser, malformed, silent])
+        self.assertEqual([(u["rule"], u["can_block"], u.get("holds")) for u in folded["unknown"]], [("raiser", True, ["node-pool"]), ("malformed", True, ["node-pool"])])
+        self.assertTrue(folded["unknown"][0]["reason"].startswith("rule raised ValueError('one odd record')"), folded["unknown"][0]["reason"])
         # An attribute whose read itself raises is the same defect under the fold's guard: a
         # module that resolves its names through a module-level `__getattr__` (the lazy-import
         # idiom) and raises there is one unknown under its `__name__`; an ENTRY whose encoding
