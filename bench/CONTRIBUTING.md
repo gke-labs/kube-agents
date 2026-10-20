@@ -17,8 +17,9 @@ repositories that CI pulls from.
    `bench/tf/modules/`) are what the rules below scan.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
    about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
-3. Register the case: add its `./tasks/<name>/task.yaml` line to
-   `hack/eval/nightly-cases.txt`, with a `#` line naming anything that still blocks it. That
+3. Register the case: add its `./tasks/<name>/task.yaml` line to the sorted section at the
+   foot of `hack/eval/nightly-cases.txt`, at its place in case-id order, with the `#` lines
+   directly above it saying why it's there and naming anything that still blocks it. That
    is where a new case lands; a presubmit seat (`hack/eval/presubmit-cases.txt`) is a later
    pull request that cites the case's nightly record, and it needs an `eval-crew` approver
    where the nightly line needs only the normal ones. A case whose fixture does not exist at

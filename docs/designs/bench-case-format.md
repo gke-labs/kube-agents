@@ -293,7 +293,10 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect. `findings_item_state` reads the findings queue through the
+grade an edit to them by its effect. A stack that runs Python in the sandbox does it as
+root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
+no `__pycache__` in the reference tree for this check to read as an edit. The check
+still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
@@ -444,7 +447,10 @@ the suite reports green around it — which is how `agent-kanban-smoke`, a case 
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
 
-A new case lands in the nightly file (decided 2026-09-15,
+A new case lands in the nightly file's sorted section, the last one, at its place in
+case-id order with its reason as the `#` lines directly above its entry (#3495; the roster
+test checks both, so two case pull requests don't edit the same lines). It lands there by
+decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
 the night it merges, its record accrues in the evidence store, and a presubmit seat is a
