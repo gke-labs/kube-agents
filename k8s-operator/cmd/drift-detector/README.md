@@ -699,7 +699,9 @@ backlog. That includes records nacked at shutdown and changes made within the si
 before the restart. Two rules keep a person's edit in that window carded: the kubectl rule above,
 and the daemon's, which cards every late row of a principal with fewer than three late rows in the
 digest. What is left without a card of its own is three or more late non-kubectl changes by one
-principal, which the digest names under that principal. A Helm upgrade the old detector is still running for is not covered:
+principal, which the digest names under that principal. On an install with no chat platform the
+digest is not posted, so those changes are visible only as the `backlog` rows of
+`GET /v1/intercepted-events`; on `main` each would have left a triage card. A Helm upgrade the old detector is still running for is not covered:
 its writes reach a running process and are triaged as live changes.
 
 ## Three things to know before changing it
