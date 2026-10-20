@@ -49,7 +49,7 @@ Takes the root context.
 */}}
 {{- define "kube-agents.thirdPartyImageRegistry" -}}
 {{- $g := .Values.global | default dict -}}
-{{- $g.thirdPartyImageRegistry | default $g.imageRegistry | default "" | trimSuffix "/" -}}
+{{- ($g.thirdPartyImageRegistry | default "") | trimSuffix "/" -}}
 {{- end }}
 
 {{/*

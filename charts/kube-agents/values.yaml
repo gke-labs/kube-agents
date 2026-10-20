@@ -51,8 +51,8 @@ global:
   # pulls from the mirror.
   imageRegistry: ""
   # Registry prefix for images this project does not build (LiteLLM,
-  # fluent-bit). Defaults to imageRegistry; set it only when the mirror keeps
-  # third-party images under a different path.
+  # fluent-bit, GitHub token minter, Hindsight). Empty leaves them on their
+  # upstream registries; set it only when the mirror keeps third-party images.
   thirdPartyImageRegistry: ""
   # Secrets holding credentials for a mirror that has to be authenticated to
   # (Harbor, Artifactory). Leave empty when the nodes can read it themselves —

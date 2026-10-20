@@ -59,8 +59,8 @@
 # release tag policy -- matched on the trailing path segment of the
 # repository. Matching on a registry prefix instead would be wrong for a
 # mirrored install: `mirror_images.sh` writes <prefix>/<name> and
-# thirdPartyImageRegistry falls back to imageRegistry, so a single-prefix
-# mirror puts fluent-bit under the same prefix as the release images and a
+# a single-prefix mirror sets both imageRegistry and thirdPartyImageRegistry,
+# so a single-prefix mirror puts fluent-bit under the same prefix as the release images and a
 # prefix rule would demand the deploy's tag of a third-party pin.
 #
 # Usage: confirm_agent_image.sh <namespace> <deployment> <tag>

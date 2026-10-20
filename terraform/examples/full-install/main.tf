@@ -224,11 +224,9 @@ locals {
   }
 
   # The registry third-party images are pulled from on a mirrored install:
-  # third_party_image_registry, falling back to image_registry, the same
-  # precedence the chart's kube-agents.thirdPartyImageRegistry helper applies.
-  # Empty means the upstream registries.
+  # third_party_image_registry. Empty means the upstream registries.
   third_party_registry = trimsuffix(
-    var.third_party_image_registry != "" ? var.third_party_image_registry : var.image_registry,
+    var.third_party_image_registry,
     "/"
   )
 

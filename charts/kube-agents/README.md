@@ -147,8 +147,9 @@ published chart, drop them and let `appVersion` pick the release.
 
 `global.imageRegistry` rewrites each image onto the prefix keeping the trailing
 name only, matching the flat layout `mirror-images` writes. Set
-`global.thirdPartyImageRegistry` as well if the mirror keeps LiteLLM and
-fluent-bit under a different path; it defaults to `global.imageRegistry`.
+`global.thirdPartyImageRegistry` to mirror third-party images (LiteLLM,
+fluent-bit, the GitHub token minter, Hindsight); empty leaves them on their
+upstream registries.
 
 It reaches more than the containers the chart renders. The operator resolves
 three images at reconcile time that appear in no chart template — the agent

@@ -508,8 +508,9 @@ the repository root, driven by `images.json` — then set `image_registry` to th
 same prefix. It reaches the two images the chart never renders as well (the
 agent Deployment and the fluent-bit sidecar the operator resolves at reconcile
 time); the [chart README](../../../charts/kube-agents/README.md) explains how.
-Add `third_party_image_registry` only if the mirror keeps LiteLLM and
-fluent-bit under a different path.
+Add `third_party_image_registry` to mirror third-party images (cert-manager,
+LiteLLM, fluent-bit, the GitHub token minter, Hindsight); empty leaves them on
+their upstream registries.
 
 `IMAGE_TAG` is not optional here. The four first-party images take whatever tag
 the mirror step was given (`latest` if it was given none), while Terraform asks
