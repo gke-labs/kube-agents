@@ -181,11 +181,13 @@ def _names(target: ast.expr) -> list[str | None]:
 
 
 def written_outcomes(cron_dir: str) -> set:
-    """Every constant the scheduler's source can put in a run's delivery_outcome.
+    """The literal values the scheduler's source writes straight into a run's delivery_outcome.
 
-    Read from the source rather than from a run, so a branch no check drives still counts: what is
-    assigned to a name or attribute called delivery_outcome (directly, or as the return value of the
-    function it is assigned from, by position when unpacked), and what is passed as delivery_outcome=.
+    Read from the source rather than from a run, so a branch no check drives still counts: a literal
+    assigned to a name or attribute called delivery_outcome (directly, or returned by the function it
+    is assigned from, by position when unpacked), or passed as delivery_outcome=. A value reached
+    through a variable or a named constant is not resolved; check 13 fails on its own when the walk
+    stops finding the failure value, so a refactor of that shape names this function.
     """
     trees = []
     for name in sorted(os.listdir(cron_dir)):
@@ -519,9 +521,14 @@ def main() -> None:
     #     writes are read too.
     written = written_outcomes(os.path.join(os.getcwd(), CRON_SOURCE_DIR))
     check(
-        DELIVERY_FAILED_VALUE in written and written <= set(DELIVERY_OUTCOME_CLASS),
-        f"every delivery_outcome the scheduler writes {sorted(map(str, written))} is one DELIVERY_OUTCOME_CLASS "
-        f"in {NOTE_SOURCE} classifies",
+        DELIVERY_FAILED_VALUE in written,
+        f"the source walk finds the scheduler writing {DELIVERY_FAILED_VALUE!r} to delivery_outcome "
+        f"(found {sorted(map(str, written))}); a miss means written_outcomes in this file needs updating, not the table",
+    )
+    check(
+        written <= set(DELIVERY_OUTCOME_CLASS),
+        f"every literal delivery_outcome the scheduler writes {sorted(map(str, written))} is one "
+        f"DELIVERY_OUTCOME_CLASS in {NOTE_SOURCE} classifies",
     )
 
     #     Then the real bookkeeping tail writes a run's row: check 7's refused delivery must read
@@ -532,6 +539,7 @@ def main() -> None:
 
     audit = create_job(AUDIT_PROMPT, AUDIT_SCHEDULE, name=title, deliver="chat")
     ledger = os.path.join(home, *LEDGER_PARTS)
+    columns = set()
     for delivery, expected in (
         (_RunDelivery(job=audit, success=True, error=None, delivery_attempted=True, delivery_error=refused,
                       should_deliver=True), LOST),
@@ -544,10 +552,6 @@ def main() -> None:
             row = conn.execute(
                 "SELECT status, delivery_outcome FROM executions WHERE id = ?", (run["id"],)
             ).fetchone()
-        check(
-            set(NOTE_LEDGER_COLUMNS) <= columns,
-            f"the run ledger still has the columns {NOTE_SOURCE} selects ({', '.join(NOTE_LEDGER_COLUMNS)})",
-        )
         status, outcome = row if row else (None, None)
         check(status == COMPLETED_STATUS, f"a run that reached delivery is recorded {COMPLETED_STATUS!r} (got {status!r})")
         check(
@@ -555,6 +559,10 @@ def main() -> None:
             f"a {'refused' if expected == LOST else 'silent'} run records an outcome {NOTE_SOURCE} reads as "
             f"{expected} (got {outcome!r})",
         )
+    check(
+        set(NOTE_LEDGER_COLUMNS) <= columns,
+        f"the run ledger still has the columns {NOTE_SOURCE} selects ({', '.join(NOTE_LEDGER_COLUMNS)})",
+    )
 
     print("\nverify_chat_relay: all checks passed")
 

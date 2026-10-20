@@ -7,7 +7,10 @@ and of the run status and two of the ledger columns the note reads; this keeps t
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -49,6 +52,50 @@ class OutcomeCopyTest(unittest.TestCase):
         self.assertEqual((oobe.PROFILES_DIR, oobe.PLATFORM_PROFILE), ("profiles", "platform"))
         self.assertEqual((oobe.CRON_DIR, oobe.EXECUTIONS_DB), verify_chat_relay.LEDGER_PARTS)
         self.assertEqual(verify_chat_relay.DELIVERY_FAILED_VALUE, bootstrap_delivery.DELIVERY_FAILED)
+
+
+class WrittenOutcomesTest(unittest.TestCase):
+    def _walk(self, source: str) -> set:
+        with tempfile.TemporaryDirectory() as cron:
+            with open(os.path.join(cron, "scheduler.py"), "w", encoding="utf-8") as fh:
+                fh.write(textwrap.dedent(source))
+            return verify_chat_relay.written_outcomes(cron)
+
+    def test_literals_written_straight_to_the_outcome_are_found(self):
+        written = self._walk(
+            """
+            def _classify(error):
+                if error:
+                    return "failed"
+                return "delivered"
+
+            def _crash():
+                return None, "suppressed_acked"
+
+            def run(d, error):
+                delivery_outcome = _classify(error)
+                err, delivery_outcome = _crash()
+                d.delivery_outcome = "queued" if d.waiting else None
+                delivery_outcome: str = "suppressed"
+                finish_execution(1, delivery_outcome="not_configured")
+            """
+        )
+        self.assertEqual(
+            written, {"failed", "delivered", "suppressed_acked", "queued", None, "suppressed", "not_configured"}
+        )
+
+    def test_a_value_behind_a_named_constant_is_not_resolved(self):
+        # The gap the canary covers: hoisting "failed" into a constant removes it from the walk,
+        # and check 13 then fails on the walker rather than passing.
+        written = self._walk(
+            """
+            FAILED = "failed"
+
+            def run(error):
+                delivery_outcome = FAILED if error else "delivered"
+            """
+        )
+        self.assertEqual(written, {"delivered"})
 
 
 if __name__ == "__main__":
