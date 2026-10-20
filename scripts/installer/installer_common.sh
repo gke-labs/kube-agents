@@ -237,6 +237,8 @@ readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
 # The prefix of a Google Chat space's resource name, the only home channel
 # form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
+# The gateway and the operator hold the same rule; keep the three in step
+# (docs/README.md lists them; a test checks all three agree).
 readonly GCHAT_SPACE_PREFIX="spaces/"
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
