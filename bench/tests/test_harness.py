@@ -3384,7 +3384,7 @@ def test_a_cleared_rate_limit_card_evicted_from_poll_fallback_remains_graded(
     stub_agent.turns = [
         _create_turn(),
         _turn(_text("still looking")),
-        _show_turn("blocked", body=worker_failure, result=worker_failure, call_id="call_show_2"),
+        _show_turn("failed", body=worker_failure, result=worker_failure, call_id="call_show_2"),
     ]
     reads = []
 
@@ -3434,7 +3434,7 @@ def test_a_cleared_rate_limit_card_evicted_by_status_turn_running_remains_graded
     stub_agent.turns = [
         _create_turn(),
         _show_turn("running", call_id="call_show_1"),
-        _show_turn("blocked", body=worker_failure, result=worker_failure, call_id="call_show_2"),
+        _show_turn("failed", body=worker_failure, result=worker_failure, call_id="call_show_2"),
     ]
     reads = []
 
@@ -3938,9 +3938,16 @@ def test_poll_loop_refreshes_retired_card_poll_failure_messages_remains_graded(
                 }
                 return f"{board.BOARD_PRESENT}\n{json.dumps(payload)}\n"
             elif idx == 1:
-                # Poll 1: polled_ids includes t2 and t1. t1 is now running on the board (unblocked)
+                # Status turn 1's clamped read fails, so the turn's own
+                # kanban_show (newest run carries the prefix, kind transient)
+                # keeps t1 in poll_failure_messages as it retires.
+                return ""
+            elif idx == 2:
+                # Poll 1: polled_ids = outstanding [t2] + stored [t1]. t1 has
+                # re-run and failed for its own fault with no text, so this
+                # poll is the only reader that can evict its stored prefix.
                 payload = {
-                    "statuses": {t1: "running", t2: "running"},
+                    "statuses": {t1: "failed", t2: "running"},
                     "summaries": {},
                     "errors": {},
                     "block_kinds": {},
@@ -5187,7 +5194,7 @@ def test_a_card_wake_answer_turn_502_with_rate_limit_is_an_agent_error_not_infra
 
 
 def test_a_card_wake_answer_turn_with_worker_rate_limit_preserves_wake_reply(
-    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer
+    monkeypatch: pytest.MonkeyPatch, stub_agent: _StubAgentServer, instant_polls: None
 ) -> None:
     """A worker rate limit on an answer turn records the failure on errors while preserving the wake reply."""
     scripts: list[str] = []

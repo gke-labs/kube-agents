@@ -430,6 +430,24 @@ def test_read_board_state_returns_summaries_and_errors(tmp_path: Path) -> None:
     assert block_kinds == {}
 
 
+def test_read_board_state_omits_last_failure_error_for_running_cards(tmp_path: Path) -> None:
+    """A running card that failed in an earlier run keeps last_failure_error in the DB, but the script omits it."""
+    with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")
+        conn.execute(
+            "INSERT INTO tasks (id, status, last_failure_error) VALUES (?, ?, ?)",
+            (FRONT, "running", "HTTP 429 TPM quota exhausted"),
+        )
+    reply = _run_script(tmp_path, [FRONT])
+    got = board.read_board_state(lambda script, timeout: reply, [FRONT], 5.0)
+    assert got is not None
+    statuses, summaries, errors, block_kinds = got
+    assert statuses == {FRONT: "running"}
+    assert summaries == {}
+    assert errors == {}
+    assert block_kinds == {}
+
+
 def test_read_board_state_returns_error_from_task_runs_when_last_failure_error_is_null(tmp_path: Path) -> None:
     with sqlite3.connect(tmp_path / board.BOARD_FILE) as conn:
         conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, last_failure_error TEXT)")

@@ -115,7 +115,7 @@ try:
         out["statuses"][str(tid)] = str(status)
         idx = 2
         if has_lfe:
-            if len(row) > idx and row[idx]:
+            if len(row) > idx and row[idx] and str(status) in ("blocked", "triage", "failed"):
                 out["errors"][str(tid)] = str(row[idx])
             idx += 1
         if has_bk:
