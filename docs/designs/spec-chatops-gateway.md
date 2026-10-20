@@ -1996,8 +1996,8 @@ the gateway turns feedback on only when the bucket exists and has a max age, and
 unmarked otherwise (an install whose operator predates the bucket, or a bucket someone recreated
 without one), looking again every minute for 30 minutes so that a provision Job finishing after an
 upgraded gateway started still turns it on, then stopping, so a NATS server that never grants the
-gateway the bucket does not log a refused request every minute; and the gateway's user is the bucket's only reader and writer by
-grant. It is capped at 64MiB, past which a rating is counted but not kept. Logs carry the task id, the
+gateway the bucket does not log a refused request every minute; and the gateway's user is the only reader and writer of its
+records by grant (provision and seed hold STREAM.INFO on it, which can list the keys: task id and rater). It is capped at 64MiB, past which a rating is counted but not kept. Logs carry the task id, the
 conversation and the rating, never the text; `answer_feedback_total` carries only the platform and
 the rating.
 

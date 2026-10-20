@@ -232,8 +232,9 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, blockID, value string)
 		return
 	}
 	conversation, thread, _ := slackClickConversation(p)
-	// The message's text is the mrkdwn fallback the adapter posted; its
-	// entities are undone so the draft reads as the answer did.
+	// The message's text is the mrkdwn fallback the adapter posted. Its
+	// &, < and > entities are undone; the rest of the mrkdwn rewrite
+	// (headings, bold, links) stays as Slack showed it.
 	rating := FeedbackRating{Platform: platformSlack, Backend: slackBackend, Rater: p.User.ID,
 		Conversation: conversation, MessageID: p.Message.TS, TaskID: taskID, Rating: value,
 		Answer: slackUnescaper.Replace(p.Message.Text)}

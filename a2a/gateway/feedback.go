@@ -30,7 +30,8 @@ import (
 // note, which said what went wrong), and the reverse. The
 // bucket's max age is the retention, set where the deployment provisions it,
 // and the gateway refuses to keep anything in a bucket without one. The
-// gateway's user is the bucket's only reader and writer; an operator reads
+// gateway's user is the only one that reads or writes its records (the
+// provision Job and the seed tooling can see its keys); an operator reads
 // it through the gateway binary (`/gateway feedback export`, feedback_export.go),
 // which writes each rating as a draft eval case: a 👎 as a case to fix, a
 // 👍 as a good answer to keep. Logs and the metric carry ids and the
@@ -359,6 +360,15 @@ func (d *feedbackDesk) Rate(r FeedbackRating) error {
 		note := rec.Note
 		if rating != FeedbackDown {
 			note = ""
+		}
+		// A re-rating after the session dropped the ask (AskTTL, a reap)
+		// keeps what the first rating kept.
+		ask, contextID := ask, contextID
+		if ask == "" {
+			ask = rec.Ask
+		}
+		if contextID == "" {
+			contextID = rec.ContextID
 		}
 		*rec = FeedbackRecord{
 			Rating:       rating,

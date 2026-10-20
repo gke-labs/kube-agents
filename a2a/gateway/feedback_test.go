@@ -344,6 +344,32 @@ func TestDeskKeepsAnUpAsAGoodAnswerAndTalliesTheWeek(t *testing.T) {
 	}
 }
 
+func TestDeskReRatingAfterTheAskIsGoneKeepsTheKeptAsk(t *testing.T) {
+	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
+	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	origin := completeTurn(t, r, "discord:g1/fb13", "d-1", "it is OOMKilled")
+	down := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb13",
+		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "it is OOMKilled"}
+	if err := desk.Rate(down); err != nil {
+		t.Fatal(err)
+	}
+	// The session no longer holds the ask, as after AskTTL or a reap.
+	up := down
+	up.Rating, up.Conversation = FeedbackUp, "discord:g1/reaped"
+	if err := desk.Rate(up); err != nil {
+		t.Fatal(err)
+	}
+	kv, err := r.client.KV(context.Background(), lib.FeedbackBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := getFeedback(context.Background(), kv, feedbackKey(origin.TaskID, "1001"))
+	if err != nil || rec.Rating != FeedbackUp || rec.Ask != "why is it crashing?" || rec.ContextID == "" {
+		t.Fatalf("record = %+v, %v; want the 👍 to keep the ask and context the 👎 kept", rec, err)
+	}
+}
+
 func TestFeedbackTurnsOnWhenTheBucketAppearsLater(t *testing.T) {
 	r := startRig(t)
 	if r.g.tryFeedback(context.Background(), true) {
