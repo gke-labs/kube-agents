@@ -222,7 +222,7 @@ INFRA_TRIAGE = """\
 - **Infrastructure** (pool projects, seeded fleet, Prow, quota): fix it, or link the infra issue that tracks it.
 - **Not infrastructure** (a case or harness defect that only looks like it): hand it to the domain owner, or mark the case `expected_fail: true` with this issue linked.
 
-Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs"). It comments here on each later night like these, and once when the job (or case) runs clean again; it never closes the issue.
+Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs"). It comments here on the newest night like these each time it runs, and once when the job (or case) runs clean again; it never closes the issue.
 """
 INFRA_CASE_TITLE = "Nightly infra: {case} kept from running {nights} nights in a row"
 INFRA_CASE_BODY = """\
@@ -597,7 +597,7 @@ class Filer:
                 nightly_url=NIGHTLY_URL, triage=INFRA_TRIAGE)
             self.file_infra(KIND_LOST, job, losses[-1], title, body, lost["nights"], closed_issues, result)
         candidates = sorted(c for c in active if c)
-        for case, verdicts in sorted(nightly_infra.case_verdicts(data, parts, candidates).items()):
+        for case, verdicts in sorted(nightly_infra.case_verdicts(parts, candidates).items()):
             fields = task_fields(case, self.repo_root)
             if fields is None or fields["expected_fail"]:
                 continue
@@ -615,7 +615,7 @@ class Filer:
             streak = nightly_infra.kept_streak(verdicts)
             if streak:
                 domain = fields.get("domain") or UNKNOWN
-                job = next((n["job"] for ns in parts.values() for n in ns if n["build"] == streak[-1]["build"]), nightly.DEFAULT_NIGHTLY_JOB)
+                job = streak[-1]["job"]
                 title = INFRA_CASE_TITLE.format(case=case, nights=nightly_infra.INFRA_STREAK_NIGHTS)
                 body = functools.partial(
                     INFRA_CASE_BODY.format,

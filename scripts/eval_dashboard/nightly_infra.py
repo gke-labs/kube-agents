@@ -14,11 +14,12 @@ every repetition classified as infrastructure (``classify.rep_kind``: an
 for the case at all. INFRA_STREAK_NIGHTS such nights in a row file one issue
 for the case. A night is not counted, either way, when the case's part did
 not run or was lost (the job itself did not run), when the night predates
-the case's first recorded night (a case new to the matrix is not "never
-graded" on the nights before it existed), when infrastructure took at least
-INFRA_EVENT_FRACTION of the part's cases (a pool-wide outage, which is not
-one case's problem), or when the part recorded under THIN_NIGHT_FRACTION of
-the cases its fullest night in the window did. A graded night ends the streak.
+the case's first recorded night in the window (a case new to the matrix,
+or back on it, is not "never graded" on the nights it was not on it), when
+infrastructure took at least INFRA_EVENT_FRACTION of the part's cases (a
+pool-wide outage, which is not one case's problem), or when the part
+recorded under THIN_NIGHT_FRACTION of the cases its fullest night in the
+window did. A graded night ends the streak.
 
 Neither shape touches the domain streak: ``nightly_bugs.graded_nights``
 still drops every infrastructure repetition before it calls a night failing.
@@ -93,15 +94,24 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
     window: the newest build of that part that date that was not lost, else
     the newest (a clean re-run rescues its night; a lost re-run does not undo
     a clean build). A night is ``{date, started, finished, build, job, part,
-    run_url, lost, how, run}``."""
+    run_url, lost, how, run, tasks}``; ``tasks`` is ``{case: (task, run)}``
+    over every clean build of the part that date (the newest line wins), so
+    two builds with different case sets, such as two halves of one part,
+    both count; a lost night's are its own build's."""
     window = window_dates(data, lookback)
     by_part: dict[str, dict[datetime.date, dict]] = {}
+    clean_tasks: dict[tuple[str, datetime.date], dict[str, tuple[dict, dict]]] = {}
     for run in nightly.sorted_nightly_runs(data):
         day = nightly.night_date(run)
         if day not in window:
             continue
         lost, how = stopped(run)
         part = nightly.night_part(run)
+        if not lost:
+            held_tasks = clean_tasks.setdefault((part, day), {})
+            for task in classify.run_tasks(run):
+                if isinstance(task.get("name"), str):
+                    held_tasks[task["name"]] = (task, run)
         held = by_part.get(part, {}).get(day)
         if held and lost and not held["lost"]:
             continue
@@ -117,6 +127,10 @@ def part_nights(data: dict, lookback: int) -> dict[str, list[dict]]:
             "how": how,
             "run": run,
         }
+    for part, nights in by_part.items():
+        for day, n in nights.items():
+            own = {t["name"]: (t, n["run"]) for t in classify.run_tasks(n["run"]) if isinstance(t.get("name"), str)}
+            n["tasks"] = own if n["lost"] else clean_tasks.get((part, day), {})
     return {part: [nights[d] for d in sorted(nights)] for part, nights in by_part.items()}
 
 
@@ -140,27 +154,27 @@ def first_clean_after_lost(nights: list[dict]) -> dict | None:
     return None if last is None else nights[last + 1]
 
 
-def infra_event(run: dict) -> bool:
-    tasks = classify.run_tasks(run)
+def infra_event(tasks: list[dict]) -> bool:
     ungraded = sum(1 for t in tasks if classify.outcome_of(classify.rep_counts(t)) == classify.OUTCOME_INFRA)
     return bool(tasks) and ungraded / len(tasks) >= INFRA_EVENT_FRACTION
 
 
-def thin_night(run: dict, fullest: int) -> bool:
-    return len(classify.run_tasks(run)) < THIN_NIGHT_FRACTION * fullest or not classify.run_tasks(run)
+def thin_night(tasks: list, fullest: int) -> bool:
+    return len(tasks) < THIN_NIGHT_FRACTION * fullest or not tasks
 
 
-def case_homes(data: dict) -> dict[str, tuple[str, datetime.date | None]]:
+def case_homes(parts: dict[str, list[dict]]) -> dict[str, tuple[str, datetime.date]]:
     """``{case: (the part that last recorded it, the first date it was
-    recorded)}`` over every nightly run on record."""
-    out: dict[str, tuple[str, datetime.date | None]] = {}
-    for run in nightly.sorted_nightly_runs(data):
-        day = nightly.night_date(run)
-        for task in classify.run_tasks(run):
-            name = task.get("name")
-            if isinstance(name, str):
-                first = out[name][1] if name in out else day
-                out[name] = (nightly.night_part(run), first)
+    recorded)}`` over the window's nights only: a case dropped from the
+    matrix and re-listed is new again, not kept from running on the nights
+    it was off the list."""
+    nights = sorted((n for ns in parts.values() for n in ns), key=lambda n: (n["date"], nightly.PARTS.index(n["part"])))
+    out: dict[str, tuple[str, datetime.date]] = {}
+    for night in nights:
+        day = datetime.date.fromisoformat(night["date"])
+        for name in night["tasks"]:
+            first = out[name][1] if name in out else day
+            out[name] = (night["part"], first)
     return out
 
 
@@ -172,24 +186,27 @@ def infra_reason(task: dict) -> str:
     return INFRA_REASON.format(infra=counts["infra"] + counts["ceiling"], reps=reps, ceiling=ceiling, reason=reason)
 
 
-def case_verdicts(data: dict, parts: dict[str, list[dict]], cases: list[str]) -> dict[str, list[dict]]:
+def case_verdicts(parts: dict[str, list[dict]], cases: list[str]) -> dict[str, list[dict]]:
     """``{case: [verdict, ...]}``, oldest first, over the eligible nights
-    (module docstring). A verdict is ``{date, started, build, run_url,
-    transcript_url, state, reason}``; ``state`` is infra, absent or graded."""
-    homes = case_homes(data)
+    (module docstring). A verdict is ``{date, started, finished, build, job,
+    run_url, transcript_url, state, reason}``, the build being the one that
+    recorded the case (the night's own when none did); ``state`` is infra,
+    absent or graded."""
+    homes = case_homes(parts)
     eligible = {}
     for part, nights in parts.items():
-        fullest = max((len(classify.run_tasks(n["run"])) for n in nights), default=0)
-        eligible[part] = [n for n in nights if not n["lost"] and not infra_event(n["run"]) and not thin_night(n["run"], fullest)]
+        fullest = max((len(n["tasks"]) for n in nights), default=0)
+        eligible[part] = [n for n in nights if not n["lost"] and not infra_event([t for t, _ in n["tasks"].values()])
+                          and not thin_night(list(n["tasks"]), fullest)]
     out: dict[str, list[dict]] = {}
     for case in cases:
         if case not in homes:
             continue
         part, first = homes[case]
         for night in eligible.get(part, []):
-            if first and datetime.date.fromisoformat(night["date"]) < first:
+            if datetime.date.fromisoformat(night["date"]) < first:
                 continue
-            task = next((t for t in classify.run_tasks(night["run"]) if t.get("name") == case), None)
+            task, run = night["tasks"].get(case, (None, night["run"]))
             if task is None:
                 state, reason = STATE_ABSENT, ABSENT_REASON.format(part=part)
             elif classify.outcome_of(classify.rep_counts(task)) == classify.OUTCOME_INFRA:
@@ -202,9 +219,10 @@ def case_verdicts(data: dict, parts: dict[str, list[dict]], cases: list[str]) ->
                 "date": night["date"],
                 "started": night["started"],
                 "finished": night["finished"],
-                "build": night["build"],
-                "run_url": night["run_url"],
-                "transcript_url": nightly.transcript_url(night["run"], case),
+                "build": run.get("build_id"),
+                "job": run.get("job") or nightly.DEFAULT_NIGHTLY_JOB,
+                "run_url": nightly.build_url(run),
+                "transcript_url": nightly.transcript_url(run, case),
                 "state": state,
                 "reason": reason,
             })

@@ -691,6 +691,54 @@ class InfraCaseTest(Harness):
         gh, _, _ = self.run_once(data(night(14, [green("case-red")]), night(15, []), night(16, []), night(17, [], filler=False)))
         self.assertEqual(self.filed(gh, infra=True), [])
 
+    def test_a_night_with_two_fifths_of_its_cases_is_skipped_and_three_fifths_counts(self):
+        # The fullest night (the 14th) recorded 5 cases; "under half" of it
+        # is thin, so 2 is skipped and 3 is counted.
+        base = [night(14, [green("case-red")]), night(15, []), night(16, [])]
+        two = [green("filler-1"), green("filler-2")]
+        gh, _, _ = self.run_once(data(*base, night(17, two, filler=False)))
+        self.assertEqual(self.filed(gh, infra=True), [], "2 of 5: thin")
+        gh, _, _ = self.run_once(data(*base, night(17, two + [green("filler-3")], filler=False)))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1, "3 of 5: counted")
+
+    def test_exactly_half_infra_is_a_pool_wide_night_and_a_quarter_is_not(self):
+        base = [night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")])]
+        half = [infra_task("case-red"), infra_task("filler-1"), green("filler-2"), green("filler-3")]
+        gh, _, _ = self.run_once(data(*base, night(17, half, filler=False)))
+        self.assertEqual(self.filed(gh, infra=True), [], "2 of 4 infra: half or more, skipped")
+        quarter = [infra_task("case-red"), green("filler-1"), green("filler-2"), green("filler-3")]
+        gh, _, _ = self.run_once(data(*base, night(17, quarter, filler=False)))
+        self.assertEqual(len(self.filed(gh, infra=True)), 1, "1 of 4 infra: counted")
+
+    def test_two_builds_of_one_part_on_one_date_both_count(self):
+        # Two clean main builds each date with different cases (the main
+        # part split in halves): a case on the earlier build is not "absent"
+        # because the later one has no line for it.
+        runs = [r for d in (15, 16, 17) for r in (night(d, [green("case-red")], filler=False), night(d, [], hour="09"))]
+        gh, _, _ = self.run_once(data(*runs))
+        self.assertEqual(self.filed(gh, infra=True), [])
+        # Kept from running on the earlier build: filed, with that build's links.
+        runs = [r for d in (15, 16, 17) for r in (night(d, [infra_task("case-red")], filler=False), night(d, [], hour="09"))]
+        gh, _, _ = self.run_once(data(*runs))
+        [issue] = self.filed(gh, infra=True)
+        self.assertIn(f"/logs/{JOB}/30000000000000170001/artifacts/eval_case-red_rep1.log", issue["body"])
+
+    def test_a_case_recorded_only_before_the_window_is_new_again(self):
+        # Recorded on the 1st, then off the matrix for the 14 nights on
+        # record and re-listed: not kept from running on nights it was not
+        # on the list.
+        gh, _, _ = self.run_once(data(night(1, [green("case-red")]), *(night(d, []) for d in range(2, 18))))
+        self.assertEqual(self.filed(gh, infra=True), [])
+
+    def test_only_the_newest_kept_night_is_noted(self):
+        # The issue footer and docs promise a note on the newest night a tick
+        # sees; an older kept night after the issue opened is not walked.
+        issue = {"number": 3972, "title": "t", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-14T12:00:00Z"}
+        doc = data(night(15, [infra_task("case-red")]), night(16, [infra_task("case-red")]), night(17, [infra_task("case-red")]))
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [(_, comment)] = self.comments(gh)
+        self.assertIn("2026-10-17", comment)
+
     def test_a_domain_bug_is_not_taken_for_the_infra_issue_or_the_reverse(self):
         infra_issue = {"number": 3960, "title": "Nightly infra: case-red", "body": "<!-- kube-agents-bot:nightly-infra case=case-red -->", "created_at": "2026-10-20T00:00:00Z"}
         gh, _, _ = self.run_once(data(*(night(d, [red()]) for d in (15, 16, 17))), FakeGh(open_issues=[infra_issue]))

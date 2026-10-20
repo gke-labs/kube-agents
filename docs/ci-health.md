@@ -754,22 +754,24 @@ rules). Neither changes the domain streak above.
   nothing: every repetition classified as infrastructure, or no line for it. 3
   such nights in a row file one issue naming the case and the classifier's
   reason. A night is skipped, not counted, when the part did not run or was
-  lost, when it predates the case's first recorded night (a case new to the
-  matrix), when infrastructure took half or more of the part's cases (a
-  pool-wide outage, which is not one case's problem), or when the part recorded
-  under half the cases of its fullest night in the window (a short run would
-  otherwise make every missing case "absent"). A graded night ends the streak.
+  lost, when it predates the case's first recorded night in the last 14 (a case
+  new to the matrix, or back on it), when infrastructure took half or more of
+  the part's cases (a pool-wide outage, which is not one case's problem), or
+  when the part recorded under half the cases of its fullest night in the
+  window (a short run would otherwise make every missing case "absent"). A
+  graded night ends the streak.
   `expected_fail` cases and cases off the matrix are not filed.
 
 An infra issue is deduplicated by its own marker alone: a bot issue of one
 kind never stands in for another, and a human's `nightly-red` issue about a
 case is about its code, so it neither replaces the infra issue nor receives its
-comments. A closed one counts as for domain bugs. While it is open, every later
-lost night of the part, or kept night of the case, gets one comment whether or
-not the threshold is met again, and a later clean night (the part runs to its
-verdict, or the case is graded) gets one recovery comment. With no
-`infra_owner` in `domains.yaml`, or when GitHub refuses that login, the issue is
-filed unassigned and says so.
+comments. A closed one counts as for domain bugs. While it is open, the newest
+night, when it is a lost night of the part or a kept night of the case, gets one
+comment whether or not the threshold is met again (a night that is no longer
+the newest when the step next runs live, after a mute for instance, is not
+commented), and a later clean night (the part runs to its verdict, or the case
+is graded) gets one recovery comment. With no `infra_owner` in `domains.yaml`,
+or when GitHub refuses that login, the issue is filed unassigned and says so.
 
 The step runs in dry run until armed: it reads the open issues and the comments
 it needs, prints what it would file, comment and assign, and writes nothing.
