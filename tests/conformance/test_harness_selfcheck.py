@@ -294,6 +294,21 @@ class TheSuiteCoversEveryInvariant(unittest.TestCase):
         self.assertEqual(set(_TEST_MODULES), discovered)
 
 
+def _load_mutation_harness():
+    """hack/conformance-mutations.py loaded by path, the way the STALE test loads it."""
+    import importlib.util
+
+    source = Path(__file__).resolve().parents[2] / "hack" / "conformance-mutations.py"
+    spec = importlib.util.spec_from_file_location("conformance_mutations", source)
+    harness = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = harness  # dataclasses looks the defining module up here
+    try:
+        spec.loader.exec_module(harness)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return harness
+
+
 class EveryAssertionHasBeenAttacked(unittest.TestCase):
     """A test nobody has tried to break is a test whose existence is a guess.
 
@@ -419,6 +434,29 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         self.assertEqual(seen, len(harness.MUTATIONS),
                          "a mutation is built some way other than a literal Mutation(...) call")
         self.assertEqual(stale, [], "rewrite these mutations against the current source")
+
+    def test_the_summary_counts_the_table(self) -> None:
+        """--summary is where the README sends a reader for the counts (#3553)."""
+        harness = _load_mutation_harness()
+        text = harness.summary(harness.MUTATIONS)
+        controls = [m.id for m in harness.MUTATIONS if m.must_survive]
+        self.assertIn(f"{len(harness.MUTATIONS)} mutations, {len(controls)} must_survive control(s)", text)
+        for control in controls:
+            self.assertIn(control, text)
+        self.assertIn(f"counts the other {len(harness.MUTATIONS) - len(controls)}", text)
+
+    def test_the_readme_keeps_no_hand_written_mutation_count(self) -> None:
+        """A count restated in the README conflicts on every pull request that
+        adds a mutation and drifts anyway (#3553); --summary and a run's own
+        last line carry them instead."""
+        import re
+
+        readme = (Path(__file__).resolve().parent / "README.md").read_text()
+        counts = re.findall(r"\b\d+ (?:mutations?|KILLED|NOISY|killed|noisy)\b", readme)
+        self.assertEqual(
+            counts, [],
+            "tests/conformance/README.md restates a mutation count; point at "
+            "`hack/conformance-mutations.py --summary` or a run's result line instead")
 
     def test_every_bucket_one_assertion_is_named_by_a_mutation(self) -> None:
         _load_every_test_module()

@@ -296,20 +296,21 @@ deleted with its suite byte-identical, and only a dedicated task caught it.
 how it stays true:
 
 ```
-python3 hack/conformance-mutations.py          # every mutation
+python3 hack/conformance-mutations.py            # every mutation
 python3 hack/conformance-mutations.py --list
-python3 hack/conformance-mutations.py -k C1    # substring filter on the id
+python3 hack/conformance-mutations.py --summary  # counts, nothing run
+python3 hack/conformance-mutations.py -k C1      # substring filter on the id
 ```
 
-206 mutations: 175 KILLED, 28 NOISY, three `must_survive` controls
-(`A3-fastpath-redundant`, `B1-denylist-rule` and
-`B1-gke-mcp-overlay-copy-redundant`), zero genuine survivors, zero stale.
-Measured 2026-10-19 on `main` at `1b783dac` plus #3261's re-aimed
-`A3-session-sends-a-notify`. Re-run the harness rather than trusting these
-numbers, which is the sentence this paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 203 of the 206: a
-`must_survive` control's verdict is `SURVIVED (expected)`, which is neither
-killed, noisy, nor a survivor. Each mutation names the control it removes,
+This page doesn't keep a count. `--summary` prints how many mutations there
+are and which are `must_survive` controls, straight from the table, and a full
+run ends with its own `killed= noisy= survived= stale=` line. Those last
+numbers are true only of the commit they ran on, so a pull request that runs
+the harness puts its result line in its own description. (Until #3553 this
+paragraph restated them by hand, and every pull request that added a mutation
+conflicted with every other one over it.) A full run's last line doesn't count
+the `must_survive` controls: their verdict is `SURVIVED (expected)`, which is
+neither killed, noisy nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
 not run in CI — it edits tracked files in place — so it is a thing to run
 when adding a test, which step 4 below says to do. Its STALE check needs no
