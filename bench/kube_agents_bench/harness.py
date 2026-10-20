@@ -1332,6 +1332,21 @@ def _record_ceiling(
     result.errors.append(report)
 
 
+def _record_unsettled(
+    result: AgentResult,
+    unsettled: Sequence[str],
+    last_statuses: Mapping[str, str],
+    live_statuses: Mapping[str, str],
+) -> None:
+    """Record that failure cards unblocked to non-terminal at settle delivered no result."""
+    for t in unsettled:
+        last = last_statuses.get(t, "unknown")
+        live = live_statuses.get(t, "unknown")
+        result.errors.append(
+            f"delegated task {t} was reported {last} during wait but {live} at settle; nothing delivered"
+        )
+
+
 def _fold_status_turn(base: AgentResult, turn: AgentResult, *, settled: bool) -> None:
     """Fold a status turn's *accounting* into the result, and nothing else.
 
@@ -2642,6 +2657,7 @@ class KubeAgentsHarness(AgentHarness):
         fallback_messages: Mapping[str, Sequence[str]] | None = None,
         poll_interval: float = 0.1,
         unsettled: list[str] | None = None,
+        live_statuses: dict[str, str] | None = None,
     ) -> list[str]:
         """Read summary and error from the board for any awaited cards in failure statuses.
 
@@ -2672,6 +2688,8 @@ class KubeAgentsHarness(AgentHarness):
             if live_status is not None and live_status not in _TERMINAL_STATUSES:
                 if unsettled is not None:
                     unsettled.append(t)
+                if live_statuses is not None:
+                    live_statuses[t] = live_status
                 if isinstance(statuses, dict):
                     statuses[t] = live_status
             card_msgs = KubeAgentsHarness._extract_board_card_messages(final_bstate, t)
@@ -2850,15 +2868,16 @@ class KubeAgentsHarness(AgentHarness):
                 {t: _status(t) for t in outstanding},
                 delegation_timeout,
             )
-        unsettled = [t for t in poll_failure_statuses if _status(t) not in _TERMINAL_STATUSES]
+        unsettled = [
+            t for t in poll_failure_statuses
+            if _status(t) not in _TERMINAL_STATUSES and t not in outstanding
+        ]
         if unsettled:
-            _record_ceiling(
+            _record_unsettled(
                 result,
-                observed,
-                awaited,
                 unsettled,
+                poll_failure_statuses,
                 {t: _status(t) for t in unsettled},
-                delegation_timeout,
             )
         # The scorer reads an inject record with no activity marker and
         # nothing outside the envelope as one whose door showed no trace, and
@@ -2981,11 +3000,18 @@ class KubeAgentsHarness(AgentHarness):
             )
         if not outstanding:
             unsettled: list[str] = []
+            live_statuses: dict[str, str] = {}
+            prior_statuses = dict(statuses)
             board_messages = self._final_board_failures(
-                awaited, statuses, poll_failure_messages, poll_interval=poll_interval, unsettled=unsettled
+                awaited,
+                statuses,
+                poll_failure_messages,
+                poll_interval=poll_interval,
+                unsettled=unsettled,
+                live_statuses=live_statuses,
             )
             if unsettled:
-                _record_ceiling(result, observed, awaited, unsettled, statuses, delegation_timeout)
+                _record_unsettled(result, unsettled, prior_statuses, live_statuses)
             self._settle(
                 result,
                 observed,
@@ -3197,11 +3223,20 @@ class KubeAgentsHarness(AgentHarness):
         if outstanding and timed_out:
             _record_ceiling(result, observed, awaited, outstanding, latest, delegation_timeout)
         unsettled: list[str] = []
+        live_statuses: dict[str, str] = {}
+        prior_statuses = dict(latest)
         board_messages = self._final_board_failures(
-            awaited, latest, poll_failure_messages, poll_interval=poll_interval, unsettled=unsettled
+            awaited,
+            latest,
+            poll_failure_messages,
+            poll_interval=poll_interval,
+            unsettled=unsettled,
+            live_statuses=live_statuses,
         )
+        if timed_out and outstanding:
+            unsettled = [t for t in unsettled if t not in outstanding]
         if unsettled:
-            _record_ceiling(result, observed, awaited, unsettled, latest, delegation_timeout)
+            _record_unsettled(result, unsettled, prior_statuses, live_statuses)
         # Only the deadline path leaves transcripts behind: a card still
         # outstanding after a transport failure or a mute agent did not stall,
         # and the run stopped for a reason the record already names.
