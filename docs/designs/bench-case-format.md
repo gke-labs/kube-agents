@@ -102,11 +102,10 @@ say) names one role per slot it reads and grounds the objective that needs every
 `report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
 slots; the grep then still finds it when a slot's cluster is replaced.
 
-`owner` is who answers for the case when it flakes: a GitHub login written without the at
-sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
-the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to, and
-`bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
-spelled out.
+`owner` is optional: the person whose bugs the case is first, falling back to the domain's
+owner. The demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to that
+effective owner, and [`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership) states
+the rule.
 
 `expected_fail` is the eval-driven-development marker, for a case whose fix is not yours: the
 case lands red so the gap is on record, and `bench-gate` reads it inverted — failing is the
@@ -402,12 +401,10 @@ while the coverage report shows the domain it actually exercises as a gap, and n
 finds out until someone writes a second case for a domain that already had one. So a case
 declares a domain.
 
-The exception is a case that genuinely covers no row in `domains.yaml` — the way
-`gpu-stress-test-diagnosis` is a chat-prompted post-incident RCA and not the event-fired
-autoops triage `incident-triage` names. That is a real answer, and the answer is recorded
-as a reviewed entry in the validator's `KNOWN_NO_DOMAIN` map with its reason, not as an
-absent field. The distinction the map owns is the one between "covers nothing, and we
-checked" and "nobody remembered".
+There is no exemption. A case no row describes gets a new row in `domains.yaml`, with
+the `owner:` who answers for the domain's cases as a set, a different `backup:`, and a
+one-sentence `meaning:` a reader outside the code understands; `scripts/test_domain_coverage.py`
+fails a row missing any of them. A new row with no blocking-roster case starts on that file's allowlist.
 
 ## Every case declares a verification spec
 
@@ -459,8 +456,7 @@ may first seat its candidate in the presubmit file without a roster line, to ear
 presubmit volume; it cannot red a pull request on quality there, only on rungs 1–3) and cites that record — never the pull request that makes it pass. Cases that stay in the nightly for good are
 the ones kept out of the presubmit for cost, because a cheaper probe holds their presubmit
 seat, or because what they grade is not one of the core journeys the presubmit gate is
-for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`, and a case
-that claims no domain there is outside them by construction. A case the agent cannot pass
+for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A case the agent cannot pass
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
 
@@ -488,8 +484,8 @@ statement of the rule; `bench/CUSTOM-TASKS.md`, `bench/CONTRIBUTING.md` and
 id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
-a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
+a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
+written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
@@ -498,8 +494,8 @@ also applies the entry vocabulary above — role, the severity pairing, the reje
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
 
-It also scans what the case brings with it: every text file under `bench/tasks/` and
-`bench/tf/prebuilt/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
+It also scans what the case brings with it: every text file under `bench/tasks/`,
+`bench/tf/prebuilt/` and `bench/tf/modules/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
 string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 `sanitizer: allow <reason>` as the per-line escape. `bench/CONTRIBUTING.md` is the home of
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
@@ -529,7 +525,7 @@ is a populated list, and the empty string is in every text there has ever been, 
 check reads as an assertion and can only pass; the validator treats a blank phrase as no
 phrase.
 
-The three allowlists (`KNOWN_UNREGISTERED`, `KNOWN_NO_DOMAIN`, `KNOWN_JUDGE_ONLY`) all
+The two allowlists (`KNOWN_UNREGISTERED`, `KNOWN_JUDGE_ONLY`) both
 work the same way: an entry names a case and carries the reason, and an entry whose case
 no longer exists fails the lint.
 

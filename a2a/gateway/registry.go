@@ -122,6 +122,19 @@ type SessionRecord struct {
 	SessionAuthorsFor     string          `json:"sessionAuthorsFor,omitempty"`
 	SessionAuthorsUnknown bool            `json:"sessionAuthorsUnknown,omitempty"`
 	SessionAuthorsSince   time.Time       `json:"sessionAuthorsSince,omitzero"`
+	// CardStop is the card-stop control in flight on this conversation, nil
+	// when there is none (cardstop.go). Not ActiveTask and not in Tasks: the
+	// control is the gateway's own errand for a stop, not a turn, so it
+	// serializes nothing, steers nothing, is no status ask's subject, and
+	// never counts as a task the conversation ran.
+	CardStop *CardStopRun `json:"cardStop,omitempty"`
+	// RetiredCardStops are the last controls that ended, newest last, at most
+	// cardStopRetiredKept, kept so a late event for one is dropped even when
+	// its task index outlived the route's retirement (a failed DropTask):
+	// read as an ordinary task, its terminal would post the executor's raw
+	// text. More than one, because a follow-up ends seconds after the control
+	// it follows.
+	RetiredCardStops []string `json:"retiredCardStops,omitempty"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,

@@ -168,6 +168,16 @@ readonly HELM_LOCK_POLL_INTERVAL_DEFAULT=10
 # Timeout for rolling back a stuck pending release to the last healthy revision.
 readonly HELM_ROLLBACK_TIMEOUT_DEFAULT="2m"
 
+# ─── Cloud KMS Propagation Defaults ───────────────────────────────────────────
+# Defaults for Cloud KMS resource creation retry across the first-enablement
+# propagation window. Matching lifecycle.sh:203-204 without colliding with exported
+# variables or lifecycle.sh re-declarations.
+readonly KMS_API_PROPAGATION_DEFAULT_ATTEMPTS=5
+readonly KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS=60
+# Cloud KMS answers some requests with 403 for a few minutes after a project's
+# first enablement. Declared without readonly so sourcing lifecycle.sh does not collide.
+KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
+
 # ─── Chart contract ───────────────────────────────────────────────────────────
 # Names the kube-agents chart fixes and the front doors address by name: the
 # Helm release, the operator and agent Deployments, and the Secret the agent's
@@ -210,6 +220,9 @@ readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/
 # The Slack app setup page's allowlist section, which says how to find a
 # member ID; refuse_next_slack_gateway_settings points at it.
 readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
+# The same page's home channel section, which next_home_channel_unset_remedy
+# points at.
+readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#home-channel"
 # A Slack home channel the A2A gateway arms its notify route on: a public
 # (C...) or private (G...) channel id, the prefix letter then two or more of
 # A-Z0-9. This mirrors the gateway's slackIsHomeChannelID and
@@ -1137,6 +1150,89 @@ refuse_next_slack_gateway_settings_from_env() {
     "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
 }
 
+# Under spec.mode next the A2A gateway, not the agent, makes the agent's
+# proactive posts (alerts, drift reports, scheduled reports), and it arms them
+# only on a home channel. A reply in a conversation still arrives without one,
+# so an install with none looks healthy while every unprompted post is dropped
+# (#3320). The front doors warn rather than refuse: some installs want chat
+# with no posts, and a CI install never posts. The operator reports the same
+# state as the HomeChannelUnset condition.
+#
+# The install.env key of the home channel the gateway's chat backend lacks,
+# or nothing: $1 the mode the apply renders, $2 SLACK_ENABLED, $3
+# GOOGLE_CHAT_ENABLED, $4 SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL.
+# The backend follows the operator: Chat holds the gateway when enabled, and
+# Slack only when Chat is not (slack_moves_to_a2a_gateway).
+next_home_channel_unset_key() {
+  local home
+  [ "${1:-}" = "next" ] || return 0
+  if is_truthy "${3:-}"; then
+    home="${5:-}"
+    home="${home//[[:space:]]/}"
+    [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
+    return 0
+  fi
+  if is_truthy "${2:-}"; then
+    home="${4:-}"
+    home="${home//[[:space:]]/}"
+    [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
+  fi
+  return 0
+}
+
+# The warning for that key ($1), one line.
+next_home_channel_unset_message() {
+  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so it will drop every one of them; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+}
+
+# What to set for that key ($1); $2 is "flags" when install.sh's flags can
+# set it too.
+next_home_channel_unset_remedy() {
+  local via="install.env"
+  case "${1:-}" in
+    SLACK_HOME_CHANNEL)
+      [ "${2:-}" = "flags" ] && via="install.env or --slack-home-channel"
+      printf '%s' "Set SLACK_HOME_CHANNEL to a channel id (C... or G..., at the bottom of the channel details' About tab) in ${via} and run again, with the app invited to that channel. Slack app setup: ${SLACK_HOME_CHANNEL_DOC}"
+      ;;
+    GOOGLE_CHAT_HOME_CHANNEL)
+      [ "${2:-}" = "flags" ] && via="install.env or --google-chat-home-channel"
+      printf '%s' "Set GOOGLE_CHAT_HOME_CHANNEL to a space name (spaces/<id>, from the space's URL) in ${via} and run again, with the app added to that space."
+      ;;
+  esac
+}
+
+# Set by warn_next_home_channel_unset so the front door's closing summary can
+# say it again where the reader of a non-interactive run's log will see it.
+NEXT_HOME_CHANNEL_UNSET_KEY=""
+
+# Warns when the apply leaves the gateway's chat backend without a home
+# channel, and records the key for the closing summary. Takes
+# next_home_channel_unset_key's five arguments, then "flags" as $6. Never
+# refuses.
+warn_next_home_channel_unset() {
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
+  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
+  print_warning "$(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
+  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${6:-}")"
+  return 0
+}
+
+# warn_next_home_channel_unset on the exported keys; $1 is its $6.
+warn_next_home_channel_unset_from_env() {
+  warn_next_home_channel_unset "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" \
+    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
+    "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
+}
+
+# The closing summary's block, when warn_next_home_channel_unset found the
+# key empty: printed last, so a non-interactive log ends on it. $1 "flags".
+print_next_home_channel_unset_summary() {
+  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
+  echo ""
+  print_warning "No home channel: proactive posts are dropped. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
+  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
+}
+
 # Said when a read the notice needs failed, so the run does not go on as if
 # the notice had been weighed and found nothing to say. $1 what could not be
 # read, $2 the key, $3 namespace.
@@ -1793,6 +1889,74 @@ tf_state_bucket() {
 tf_state_prefix() {
   local cluster="${1:-${CLUSTER_NAME:-}}"
   echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${cluster}}"
+}
+
+# ─── Cloud KMS ─────────────────────────────────────────────────────────────────
+# Cloud KMS answers some requests with 403 "Google Cloud KMS API has not been
+# used in project <n> before or it is disabled" for a few minutes after a
+# project's FIRST enablement -- which is the enablement install.sh performs
+# seconds before creating the key ring and key.
+
+_sanitize_kms_int() {
+  local val="$1" default_val="$2" min_val="${3:-0}" name="${4:-}"
+  if [ -z "$val" ]; then
+    echo "$default_val"
+    return 0
+  fi
+  if [[ "$val" =~ ^[0-9]{1,9}$ ]] && [ "$val" -ge "$min_val" ]; then
+    echo "$val"
+  else
+    if [ -n "$name" ]; then
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      else
+        echo -e "  ⚠ ${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      fi
+    fi
+    echo "$default_val"
+  fi
+}
+
+# Retries a Cloud KMS command on Cloud KMS's first-enablement 403
+# (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
+# for a few minutes after being enabled. Output of the command is preserved and
+# echoed on completion; retry warnings are printed to stderr.
+retry_kms_create() {
+  local max_attempts
+  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-}" "$KMS_API_PROPAGATION_DEFAULT_ATTEMPTS" 0 "KMS_API_PROPAGATION_ATTEMPTS")"
+  local wait_seconds
+  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-}" "$KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS" 0 "KMS_API_PROPAGATION_WAIT_SECONDS")"
+  local attempt=1 status=0 output=""
+  while :; do
+    output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        if type print_warning >/dev/null 2>&1; then
+          print_warning "Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        else
+          echo -e "  ⚠ Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        fi
+        [ -n "$output" ] && printf '%s\n' "$output"
+        return "$status"
+      fi
+      attempt=$((attempt + 1))
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        print_warning "Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      else
+        echo -e "  ⚠ Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        echo -e "  ⚠ Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      fi
+      sleep "$wait_seconds"
+      continue
+    fi
+    [ -n "$output" ] && printf '%s\n' "$output"
+    return "$status"
+  done
 }
 
 # The basename of the first ENABLED version of a Cloud KMS key, or nothing.

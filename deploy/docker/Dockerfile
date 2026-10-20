@@ -462,6 +462,22 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
 
+# Cron: a run directory per agent run (gke-labs/kube-agents#2989). A job with
+# no workdir (all of ours) started its terminal in the sandbox's unwritable
+# login home, so a run that needed scratch made its own on the shared volume,
+# the profile home among it, where it stayed and became a later run's input. The patch
+# records <hermes home>/cron/runs/<job>_<execution> as the run's tool-layer cwd;
+# the session cwd, and so context-file loading, is unchanged, and script jobs
+# keep their cwd. kanban_workspace_gc.py prunes old run directories.
+COPY deploy/docker/patches/apply_cron_run_workdir.py \
+     deploy/docker/patches/verify_cron_run_workdir.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-run-workdir/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/apply_cron_run_workdir.py /opt/hermes && \
+    grep -q "kube-agents patch: cron run workdir" /opt/hermes/cron/scheduler.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-run-workdir/verify_cron_run_workdir.py /opt/hermes && \
+    rm -rf /tmp/cron-run-workdir
+
 # Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
 # Must run after cron_tirith_scan: anchors into tools/approval.py at the point
 # introduced by apply_cron_tirith_scan.py.
@@ -1591,6 +1607,16 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # turn can still answer.
 # See the module docstring in deploy/docker/patches/kanban_wake_guard.py.
 #
+# kanban_fanout_reaper: a per-cluster card a platform worker fanned out (to a
+# Cluster Agent, with no parents, in one burst with a sibling) that has run 30 minutes
+# is stopped and settled with a result saying it didn't finish on its cluster, so
+# a child waiting on a workload its cluster doesn't have can't hold a worker
+# slot for hours (#2978). Heartbeats don't matter; cards a person filed are
+# never touched. It hooks the dispatcher's reclaim phase right after
+# enforce_max_runtime, which is anchored on upstream's line, after the
+# kanban-scheduling stage's edits to the same file.
+# See the module docstring in deploy/docker/patches/kanban_fanout_reaper.py.
+#
 # kanban_priority: user cards ahead of background
 # triage. The dispatcher half (one slot held for user cards, the saturation
 # record, the `queued` events) is in the kanban-scheduling stage above, which
@@ -1675,6 +1701,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_wake_guard.py \
      deploy/docker/patches/apply_kanban_wake_guard.py \
      deploy/docker/patches/verify_kanban_wake_guard.py \
+     deploy/docker/patches/kanban_fanout_reaper.py \
+     deploy/docker/patches/apply_kanban_fanout_reaper.py \
+     deploy/docker/patches/verify_kanban_fanout_reaper.py \
      deploy/docker/patches/kanban_chat_notify.py \
      deploy/docker/patches/apply_kanban_chat_notify.py \
      deploy/docker/patches/verify_kanban_chat_notify.py \
@@ -1750,6 +1779,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF 'headers[_KANBAN_WAKE_HEADER]' /opt/hermes/gateway/wake.py && \
     grep -qF '_kanban_wake_marked(OpenAICompatRoutesMixin._handle_chat_completions)' /opt/hermes/gateway/platforms/api_server.py && \
     grep -qF 'run_in_executor(None, _kanban_wake_carry(_run))' /opt/hermes/gateway/platforms/api_server.py && \
+    cp /tmp/latency-patches/kanban_fanout_reaper.py /opt/hermes/tools/kanban_fanout_reaper.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_fanout_reaper.py /opt/hermes && \
+    grep -qF '_kanban_reap_overdue_fanout(conn)' /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_priority.py /opt/hermes && \
     grep -qF 'priority=_kanban_stamp_priority(_opt_int(args.get("priority"), 0), self_task, self_tid),' /opt/hermes/tools/kanban_tools.py && \
     grep -qF '**_kanban_queue_fields(conn, new_tid, args.get("board")),' /opt/hermes/tools/kanban_tools.py && \
@@ -1790,6 +1822,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_guard.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_fanout_reaper.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_self_copy.py && \

@@ -3192,18 +3192,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		envVars = append(envVars, corev1.EnvVar{Name: "SLACK_HOME_CHANNEL", Value: a2aSlackHomeChannel(agent)})
 	}
 	// A kanban card's report back to the gateway conversation it was filed
-	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
+	// in, and onboarding's first report into the conversation the user first
+	// wrote in, ride the same route whenever the gateway arms it, home channel
+	// or not. The kanban notifier and onboarding route by this; the cron relay
+	// only names it when it refuses a report for want of a home channel.
 	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	} else if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformSlack})
-	}
-	// A kanban card's report back to the gateway conversation it was filed
-	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
-	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
@@ -5612,6 +5608,37 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 			{
 				APIGroups: []string{"apiextensions.k8s.io"},
 				Resources: []string{"customresourcedefinitions"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			// The GitOps reconcilers' sync objects: which repository and directory
+			// syncs a cluster is often recorded only here, applied once by hand or
+			// by an installer. The gitops-helm-chart skill reads it to decide how to
+			// declare a chart; this grant merges after that skill, so the reader is in
+			// the tree before the read is. Only the kinds that name a sync's source and
+			// destination; HelmReleases, ApplicationSets, AppProjects and
+			// HelmRepositories are not needed for that and stay out, as do Argo
+			// CD's cluster and repository Secrets. An Application can still carry
+			// inline Helm values and a Kustomization substitutions, which this
+			// grant makes readable: the same exposure as the ConfigMap read above,
+			// accepted for now. Inert where the CRDs are absent.
+			{
+				APIGroups: []string{"argoproj.io"},
+				Resources: []string{"applications"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"kustomize.toolkit.fluxcd.io"},
+				Resources: []string{"kustomizations"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"source.toolkit.fluxcd.io"},
+				Resources: []string{"gitrepositories", "ocirepositories"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"configsync.gke.io"},
+				Resources: []string{"rootsyncs", "reposyncs"},
 				Verbs:     []string{"get", "list", "watch"},
 			},
 		},

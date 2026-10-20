@@ -3924,16 +3924,25 @@ ensure_existing_cluster_cmek() {
   local key_resource="projects/${project_id}/locations/${kms_location}/keyRings/${keyring}/cryptoKeys/${key}"
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
-  gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose="encryption" --project="$project_id" 2>/dev/null || true
+  local kr_err="" k_err=""
+  kr_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id")" || true
+  if printf '%s\n' "$kr_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS keyring create failed after propagation retries: $kr_err"
+    return 1
+  fi
+  k_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+    --purpose="encryption" --project="$project_id")" || true
+  if printf '%s\n' "$k_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS key create failed after propagation retries: $k_err"
+    return 1
+  fi
   local project_number service_agent
   project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)")
   service_agent="service-${project_number}@container-engine-robot.iam.gserviceaccount.com"
   gcloud beta services identity create --service=container.googleapis.com --project="$project_id" 2>/dev/null || true
-  gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
+  retry_kms_create gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
     --member="serviceAccount:${service_agent}" \
-    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet >/dev/null
+    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet --format=none
   print_info "Updating the live cluster control plane; this can take several minutes..."
   gcloud container clusters update "$cluster_name" --location "$region" \
     --database-encryption-key="$key_resource" --project "$project_id" --quiet
@@ -5579,23 +5588,34 @@ import_github_pem() {
   # "already exists" is the expected answer — would print two fatal-looking
   # abort banners and leave a FAILED install report behind mid-run.
   local kms_ring_err="" kms_key_err=""
-  kms_ring_err="$(trap - ERR; gcloud kms keyrings create "$keyring" --location="$kms_location" \
-    --project="$project_id" 2>&1)" || true
+  kms_ring_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" \
+    --project="$project_id")" || true
 
   # --skip-initial-version-creation is required, not optional: KMS answers
   # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
   # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
   # which is where the key normally comes from.
-  kms_key_err="$(trap - ERR; gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-    --import-only --skip-initial-version-creation \
-    --protection-level=software --project="$project_id" 2>&1)" || true
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_key_err="skipped: keyring creation exhausted Cloud KMS API propagation retry budget"
+  else
+    kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
+      --import-only --skip-initial-version-creation \
+      --protection-level=software --project="$project_id")" || true
+  fi
 
   # The assertion, not the create, is what makes a failure visible. Whatever went
   # wrong above, the import cannot work without this key, and saying so here names
   # the cause instead of leaving a confusing failure two steps later.
-  if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
-    --project="$project_id" >/dev/null 2>&1; then
+  local kms_describe_failed=0
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN" || \
+     printf '%s\n' "$kms_key_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_describe_failed=1
+  elif ! retry_kms_create gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
+    --project="$project_id" >/dev/null; then
+    kms_describe_failed=1
+  fi
+  if [ "$kms_describe_failed" -ne 0 ]; then
     # Deliberately says "could not be confirmed" rather than "does not exist":
     # describe also fails on an IAM denial for cloudkms.cryptoKeys.get or an API
     # blip, and asserting absence from that would be stating more than was
@@ -5778,8 +5798,13 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
-            prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-              google_chat_home_channel "$google_chat_home_channel"
+            if [ "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" = "next" ]; then
+              prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            else
+              prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            fi
             ;;
           2) slack_enabled="true" ;;
           3) google_chat_enabled="false"; slack_enabled="false" ;;
@@ -5882,11 +5907,15 @@ run_menu_system() {
         # the menu on failure.
         validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
           "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || continue
+        # The chat screen's home channel, which the home-channel warning below
+        # reads; save_env_var exports it again when it writes install.env.
+        export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
         # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
         # from install.env, and if Slack moves to the A2A gateway under next,
         # the settings it cannot use are refused (and again after the
         # generator, for a bot token it recovers from the live Secret).
         refuse_next_slack_gateway_settings_from_env || return 1
+        warn_next_home_channel_unset_from_env
         # Kept until the check after the generator has passed, so that a
         # refusal there puts install.env back as it was.
         # The copy holds install.env's credentials, so it is 0600 under a
@@ -6104,6 +6133,7 @@ main() {
       exit 1
     fi
     run_menu_system
+    print_next_home_channel_unset_summary
     exit 0
   fi
 
@@ -6588,15 +6618,17 @@ main() {
       slack_allowed_hint=""
     done
     while :; do
-      prompt_read "Slack Home Channel ID (optional, a channel ID such as C0123456789)" \
+      prompt_read "Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)" \
         slack_home_channel "$slack_home_channel"
       bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
-      { [ -n "$bad" ] && $can_ask; } || break
-      print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
-      # Not the re-ask's default: the value is optional, and prompt_read
-      # turns an empty answer into the default, so a bad one could never be
-      # cleared.
-      slack_home_channel=""
+      if [ -n "$bad" ] && $can_ask; then
+        print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+        # Not the re-ask's default: prompt_read turns an empty answer into
+        # the default, so a bad one could never be cleared.
+        slack_home_channel=""
+        continue
+      fi
+      _confirm_no_home_channel SLACK_HOME_CHANNEL "$slack_home_channel" "$can_ask" && break
     done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"
@@ -6625,8 +6657,34 @@ main() {
     fi
     chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
-    prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-      google_chat_home_channel "$google_chat_home_channel"
+    if [ "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" != "next" ]; then
+      prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      return 0
+    fi
+    local can_ask=true
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      _confirm_no_home_channel GOOGLE_CHAT_HOME_CHANNEL "$google_chat_home_channel" "$can_ask" && break
+    done
+  }
+
+  # Under next the A2A gateway posts alerts and reports only to a home
+  # channel (#3320). An empty answer is allowed, after a warning and a yes:
+  # true to keep the answer, false to ask again. $1 the key, $2 the answer,
+  # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
+  # the warning before the apply and the closing summary say it then.
+  _confirm_no_home_channel() {
+    local home="${2//[[:space:]]/}" keep=""
+    [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
+    print_warning "$(next_home_channel_unset_message "$1")"
+    prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
+    case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
+    return 1
   }
 
   # Both chat platforms are opt-in and default off, so this is the common
@@ -7595,6 +7653,9 @@ main() {
     print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
     exit 1
   fi
+  # A chat backend the gateway holds with no home channel (#3320): a
+  # warning, never a refusal, repeated at the end of the run.
+  warn_next_home_channel_unset_from_env flags
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a
@@ -7825,6 +7886,7 @@ main() {
     fi
     print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
     write_json_report "DRY_RUN_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -7870,6 +7932,7 @@ main() {
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
+        print_next_home_channel_unset_summary flags
         exit 0
         ;;
     esac
@@ -7885,6 +7948,7 @@ main() {
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -8104,6 +8168,7 @@ main() {
     echo ""
     _prompt_no_chat_enabled
   fi
+  print_next_home_channel_unset_summary flags
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

@@ -157,7 +157,9 @@ def main() -> None:
     #    findings queue's pacing limits take it to `findings_nudge.py` and to
     #    `bootstrap_handoff.py`, which hands them to the first inventory
     #    report's selection; a scrubbed one would silently fall back to its
-    #    default.
+    #    default. Onboarding's delivery under next runs `a2a notify` from the
+    #    `oobe` child, which needs the bus and the conversation route's
+    #    platform; scrubbed, the report would wait for good.
     for name in (
         "SESSION_KV_API_KEY",
         "CRON_REPORT_RELAY_URL",
@@ -167,6 +169,10 @@ def main() -> None:
         "FINDINGS_DAILY_CRITICALS",
         "FINDINGS_NONCRITICAL_MAX",
         "FINDINGS_NONCRITICAL_AFTER_HOUR",
+        "A2A_NOTIFY_CONVERSATIONS",
+        "A2A_NOTIFY_PLATFORM",
+        "NATS_URL",
+        "A2A_BUS_USER",
     ):
         child_env = build_subprocess_env(base={**os.environ, name: "sentinel"})
         check(
