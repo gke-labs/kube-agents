@@ -31,25 +31,19 @@ them on their public defaults. Takes the root context.
 {{- end }}
 
 {{/*
-The same for images this project does not build (LiteLLM, fluent-bit). Falls
-back to imageRegistry, since a single-prefix mirror is the common case and a
-chart that mirrored only its own images would render a half-mirrored install —
-the operator handing its managed pods public references after `helm install`
-reported success.
-
-This deliberately does NOT match third_party_registry_prefix in
-scripts/installer/common.sh, which requires THIRD_PARTY_REGISTRY_PREFIX
-explicitly. The asymmetry is about history, not preference: REGISTRY_PREFIX
-shipped before this inventory existed and has always meant "the registry
-holding the images this project builds", so widening it would redirect working
-installs to images their mirror was never given. global.imageRegistry is new
-here and carries no such promise, so it can take the safer default.
+The same for images this project does not build (LiteLLM, fluent-bit, the
+GitHub token minter, Hindsight, the cleanup hook). Empty leaves them on their
+upstream registries; it does NOT fall back to imageRegistry. That matches
+third_party_registry_prefix in scripts/installer/common.sh and
+local.third_party_registry in terraform/examples/full-install/main.tf, so an
+empty third-party prefix means "upstream" at every layer, and an install that
+mirrors everything sets both.
 
 Takes the root context.
 */}}
 {{- define "kube-agents.thirdPartyImageRegistry" -}}
 {{- $g := .Values.global | default dict -}}
-{{- $g.thirdPartyImageRegistry | default $g.imageRegistry | default "" | trimSuffix "/" -}}
+{{- ($g.thirdPartyImageRegistry | default "") | trimSuffix "/" -}}
 {{- end }}
 
 {{/*
@@ -764,10 +758,15 @@ neither key), which only openai_compatible passes.
   model, not only the ones that refuse: a name test that tracked which do
   would break on each new release, and an older Claude losing a caller's
   sampling override is a quieter failure than a 400. Claude only: anthropic
-  serves nothing else, vertex_ai serves Claude under claude-* names, and a
-  Gemini or OpenAI render stays byte-identical.
+  serves nothing else, vertex_ai serves Claude under claude-* names, sap (SAP
+  AI Core) under anthropic--* names and forwards temperature and top_p into
+  its orchestration request, and a Gemini or OpenAI render stays
+  byte-identical. $claudeDrop is that set; $claude, which also gates prompt
+  caching below, leaves sap out, because the cache_control markers have not
+  been shown to pass SAP's orchestration API.
 */}}
 {{- $claude := or (eq .provider "anthropic") (and (eq .provider "vertex_ai") (hasPrefix "claude-" .model)) -}}
+{{- $claudeDrop := or $claude (and (eq .provider "sap") (hasPrefix "anthropic--" .model)) -}}
 {{- /*
   openai_compatible goes through LiteLLM's hosted_vllm handler, which speaks the
   same OpenAI chat-completions API, rather than through openai/. Read from
@@ -794,7 +793,7 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: hermes-agent
@@ -812,7 +811,7 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
   - model_name: {{ .model }}
@@ -830,14 +829,14 @@ model_list:
       {{- with .reasoningEffort }}
       reasoning_effort: {{ . | quote }}
       {{- end }}
-      {{- if $claude }}
+      {{- if $claudeDrop }}
       additional_drop_params: ["temperature", "top_p", "top_k"]
       {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*
-  Prompt caching, for Anthropic-family models only: the same $claude gate as
-  additional_drop_params above. On Gemini, LiteLLM turns these markers into
+  Prompt caching, for Anthropic-family models only: the $claude gate, which
+  leaves sap out, where additional_drop_params above uses $claudeDrop. On Gemini, LiteLLM turns these markers into
   Vertex explicit context caching: a cachedContents list before every call,
   and a create whenever the cached prefix is new. A create that Vertex holds
   past its request credential's life fails the whole turn (a 401 after a

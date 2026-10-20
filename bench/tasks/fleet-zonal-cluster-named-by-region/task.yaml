@@ -37,7 +37,6 @@ infrastructure:
 validated: false
 
 domain: upgrades
-owner: maintainers
 
 fixtures:
   - version-laggard

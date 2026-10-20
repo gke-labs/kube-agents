@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a request to delete a resource, which its "Deleting a resource" section answers with a stated stop, never a pull request. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
@@ -12,6 +12,7 @@ This skill equips the Platform Agent to propose declarative file updates, GKE in
 - **Declarative File Provisioning:** Triggered when new GKE manifests or configs are requested.
 - **Configuration Upgrades:** Triggered when upgrading version configurations, security patches, or network policies.
 - **Governance Policy Syncs:** Triggered when compliance playbooks or settings require updates.
+- **Deletions:** Triggered when someone asks to delete a resource. See [Deleting a resource](#deleting-a-resource) before Step 1: every case there ends in a stated stop.
 
 _Crucially, you are strictly forbidden from executing direct, manual mutations. All changes must flow through a secure PR path — this skill, or the **fleet-audit** skill for fixes of its findings (below)._
 
@@ -199,6 +200,60 @@ The rule above still holds at Step 3: a file the copy has never seen is not
 swept in for you. `submit` refuses and names it, because it cannot tell a
 manifest you generated from a log you left behind. Stage the ones that belong
 (`git add <path>`) and delete the rest.
+
+### Deleting a resource
+
+A request to delete something (a namespace, a Deployment, a ConfigMap) is
+answered with a stated stop, not a pull request, in every case below. The
+only delete a pull request can carry is the removal of a manifest the
+repository already has, and this skill does not yet propose that removal.
+Never add a file, an annotation or a label to say "delete": nothing reads one
+you invent, and a manifest you add declares its object, so merging it keeps
+the object.
+
+1. **The repository first.** Before Step 1:
+
+   ```bash
+   python3 "$HERMES_HOME"/scripts/gitops_preflight.py
+   ```
+
+   Any line other than `REGISTERED: ...` is the answer: block with that line as
+   the reason (`kanban_block(kind="needs_input")`), change nothing, and do not
+   look for another way to delete it.
+
+2. **Find the declaration.** After Step 1's `prepare`, search the `workspace`
+   for the object's name, then read each file found and keep the one whose
+   `kind`, `metadata.name` and, for a namespaced object, `metadata.namespace`
+   match. A namespace is also declared without a Namespace manifest: by
+   objects placed in it, a `kustomization.yaml` whose `namespace:` names it, a
+   Flux `HelmRelease` or `Kustomization` whose `targetNamespace:` names it, a
+   `namespaces/<name>/` directory (Config Sync's hierarchical layout), or an
+   Argo CD `Application` with `CreateNamespace=true` deploying into it. Any of
+   those counts as declared. The search matches the key anywhere on the line,
+   so JSON and flow-style manifests are found too:
+
+   ```bash
+   grep -rlE "[\"' {,]?(name|namespace|targetNamespace)[\"']?: *[\"']?<name>[\"']?([ ,}#]|$)" <workspace>
+   find <workspace> -type d -path "*/namespaces/<name>"
+   ```
+
+3. **The repository declares it.** Stop with: "`<repo>` declares
+   `<kind>/<name>` in `<files>`. Deleting it means removing those files (and
+   anything else there that would recreate it) in a pull request, which I
+   don't propose yet. Someone with write access to `<repo>` can open that pull
+   request. I have changed nothing." Block with that line as the reason, and
+   list every file step 2 found.
+
+4. **The repository does not declare it.** Stop with: "`<repo>` does not
+   declare `<kind>/<name>`, so a pull request cannot delete it: removing a
+   declaration is the only delete a pull request carries. Someone with write
+   access to `<cluster>` has to run the delete. I have changed nothing."
+   Block with that line as the reason. Do not write a manifest for it.
+
+5. **Words.** Never describe the request as an action under way or done
+   ("deleting", "deleted"), and never name a GitOps controller, or say what
+   one will do, unless you read it syncing that path: a stop changes nothing,
+   and says so.
 
 ### Step 3: Call the Secure Submit Suggestion Script
 

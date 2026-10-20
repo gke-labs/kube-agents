@@ -953,7 +953,11 @@ card, written to `/opt/data/INVENTORY.limits.json`. `select` also writes the lis
 publisher `first_report` and class `critical`, right after it claims delivery and before it posts.
 The items count as shown when the report's delivery is claimed, not when it is written, so a report
 that is never claimed leaves them new for the nudge; one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
-moment between the claim and the marks can announce the report's items as new. Marking never holds
+moment between the claim and the marks can announce the report's items as new. Under
+`spec.mode: next`, where the report goes into the conversation the user first wrote in, the marks
+follow the post instead: a claim there can be released and retried (Rule 5 in the plugin README),
+so only a kept claim marks the items (a landed post, or on the text path one that most likely
+landed), and a released one marks none. Marking never holds
 delivery back: a row the queue refuses, such as one it never registered, is skipped, a queue that
 does not answer ends the marking for that delivery, and either goes to the delivery run's stderr. An
 item whose mark failed stays unshown, and the nudge adds it as new later. A paced publisher may
@@ -965,8 +969,9 @@ of the dismissal. That finding is not marked, spends no slot and is never pendin
 
 Three things keep the hourly run from adding noise. It prints nothing on a run with nothing to say,
 which is most of them. It adds nothing until the first inventory report's delivery is claimed
-(onboarding's `.bootstrap_scan_filed` present and `.bootstrap_completed` absent), so that report
-stays the first thing the user hears; an install that never ran onboarding is not held. The hold
+(onboarding's `.bootstrap_scan_filed` present and `.bootstrap_completed` absent; under
+`spec.mode: next`, when the report goes to a recorded conversation, `.bootstrap_conversation_done`
+absent, since a claim there can be released), so that report stays the first thing the user hears; an install that never ran onboarding is not held. The hold
 ends 24 hours (`FIRST_REPORT_HOLD_HOURS`) after the sweep was filed, by the marker's `filed_at` line
 or, failing that, its mtime: a report still undelivered by then means onboarding stalled, and
 holding on would add nothing ever again. Each run that is held, or would be but for that limit, says

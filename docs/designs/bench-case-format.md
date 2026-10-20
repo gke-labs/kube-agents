@@ -102,11 +102,10 @@ say) names one role per slot it reads and grounds the objective that needs every
 `report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
 slots; the grep then still finds it when a slot's cluster is replaced.
 
-`owner` is who answers for the case when it flakes: a GitHub login written without the at
-sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
-the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to, and
-`bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
-spelled out.
+`owner` is optional: the person whose bugs the case is first, falling back to the domain's
+owner. The demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to that
+effective owner, and [`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership) states
+the rule.
 
 `expected_fail` is the eval-driven-development marker, for a case whose fix is not yours: the
 case lands red so the gap is on record, and `bench-gate` reads it inverted — failing is the
@@ -294,7 +293,10 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect. `findings_item_state` reads the findings queue through the
+grade an edit to them by its effect. A stack that runs Python in the sandbox does it as
+root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
+no `__pycache__` in the reference tree for this check to read as an edit. The check
+still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
@@ -485,8 +487,8 @@ statement of the rule; `bench/CUSTOM-TASKS.md`, `bench/CONTRIBUTING.md` and
 id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
-a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
+a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
+written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
