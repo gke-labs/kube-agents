@@ -1225,3 +1225,9 @@
 # repository, runs no helm, and changes nothing (gitops-helm-chart, #2938).
 # deployer: noop, the agent's own cluster, no fixture.
 ./tasks/helm-chart-no-reconciler-stops/task.yaml
+
+# #3090: the first onboarding report opens with what the scan checked, the
+# line `inventory_findings.py select` prints, and calls nothing healthy. The
+# bootstrap-ranking stack with a planted report that has no critical finding;
+# the onboarding lock, like bootstrap-inventory-ranking-delivery.
+./tasks/bootstrap-inventory-posture-scope/task.yaml

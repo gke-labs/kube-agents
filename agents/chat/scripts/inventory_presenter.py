@@ -71,6 +71,7 @@ that does not parse to that shape is returned unchanged.
 import re
 from typing import NamedTuple
 
+from inventory_findings import SCAN_SCOPE_LINE, SCAN_SCOPE_SENTENCES
 from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row
 
 BOLD_MARK = "**"
@@ -646,6 +647,12 @@ class _Shape:
         # Otherwise only the roll-up goes: the headline carries its count, and a
         # closing line with a count in it is still how a text reader asks.
         self.closing = [p for p in tail if p is not rollup]
+        # The posture line select prints says what the scan checked; it is kept whole, since without
+        # it the total reads as the whole fleet's: under the headline as text, under the rows on the
+        # card, whose line under the headline is clipped shorter than it.
+        posture = " ".join(posture.split())
+        self.scope = SCAN_SCOPE_LINE if SCAN_SCOPE_LINE in posture else ""
+        posture = posture.replace(SCAN_SCOPE_LINE, " ")
         clauses = [c.strip() for c in CLAUSE_END.split(posture.replace(BOLD_MARK, "")) if c.strip()]
         split = [_split_gap(c) for c in clauses]
         # A roll-up left out of both layouts has its gap join the posture's.
@@ -721,7 +728,9 @@ def _counted(count: int, nouns: tuple[str, str]) -> str:
     return f"{count} {nouns[count != 1]}"
 
 
-def card_headline(shape: _Shape, closing_gaps: bool = False, shown: int | None = None) -> tuple[str, str, str]:
+def card_headline(
+    shape: _Shape, closing_gaps: bool = False, shown: int | None = None, scope: bool = True
+) -> tuple[str, str, str]:
     """The card's ``(headline, note, detail)``.
 
     The headline says what was scanned and the total. The lead saying what to
@@ -729,7 +738,8 @@ def card_headline(shape: _Shape, closing_gaps: bool = False, shown: int | None =
     gap, follows the gap on the line under it, so it still runs into the rows.
     ``closing_gaps`` adds the gaps the closing lines name, for a layout that
     leaves them out. ``shown`` is how many rows the layout shows, every listed
-    finding when None; the lead counts those.
+    finding when None; the lead counts those. ``scope`` puts the scan's posture
+    line first in the detail, for a layout that does not show it elsewhere.
     """
     scanned = [
         _counted(count, nouns)
@@ -754,8 +764,9 @@ def card_headline(shape: _Shape, closing_gaps: bool = False, shown: int | None =
         lead = one if shown == 1 else template.format(count=COUNT_WORDS.get(shown, str(shown)))
         lead = lead[:1].upper() + lead[1:]
     gap = _gap_line(shape.gaps + (shape.closing_gaps if closing_gaps else []))
-    if gap:
-        return headline + LEADS_ON, "", " ".join(part for part in (gap, lead) if part)
+    scope_line = shape.scope if scope else ""
+    if gap or scope_line:
+        return headline + LEADS_ON, "", " ".join(part for part in (scope_line, gap, lead) if part)
     return headline + (LEADS_ON if lead else ROWS_FOLLOW), lead, ""
 
 
@@ -828,7 +839,7 @@ def _card(report: str) -> _Card | None:
     if shape is None:
         return None
     shown, folded = shape.top[:CARD_ROWS], shape.top[CARD_ROWS:]
-    headline, note, detail = card_headline(shape, closing_gaps=True, shown=len(shown))
+    headline, note, detail = card_headline(shape, closing_gaps=True, shown=len(shown), scope=False)
     choices = [FIX_FIRST if len(shape.top) > 1 else FIX_ONLY]
     if shape.total > len(shape.top):
         choices.append(SEE_ALL.format(count=shape.total))
@@ -840,5 +851,5 @@ def _card(report: str) -> _Card | None:
         _rows(folded),
         FOLD_TITLE.format(count=len(folded)) if folded else "",
         choices,
-        " ".join(shape.deferred.split()),
+        "\n".join(filter(None, [" ".join(shape.deferred.split()), *(SCAN_SCOPE_SENTENCES if shape.scope else ())])),
     )

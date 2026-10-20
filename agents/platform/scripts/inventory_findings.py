@@ -49,6 +49,47 @@ POST_TIMEOUT_SECONDS = 30
 
 SOURCE = "inventory"
 
+# What the onboarding scan checks: the slug table in
+# governance/cluster_inventory_audit_sop.md, in its order, with the words the
+# report uses for each. Everything else is a first-run audit's, so the report
+# names this closed list rather than an exclusion list it cannot keep complete.
+SCAN_CHECKS = (
+    ("probes-startup", "startup probes"),
+    ("no-resourcequota", "ResourceQuota and LimitRange"),
+    ("readonly-root-fs", "read-only root filesystems"),
+    ("shielded-nodes", "Shielded Nodes"),
+    ("datapath-provider", "Dataplane V2"),
+    ("managed-prometheus", "Managed Service for Prometheus"),
+    ("no-autoupgrade", "node auto-upgrade"),
+    ("static-sa-key", "static Google Cloud keys in pods"),
+    ("added-capabilities", "added capabilities"),
+)
+# The area each first-run audit (oobe.FIRST_RUN_AUDITS) reports on, in the
+# order the report names them.
+AUDIT_FAMILIES = {
+    "compliance-audit": "security and RBAC",
+    "obtainability-audit": "reliability",
+    "stockout-prevention": "capacity",
+    "fleet-wide-cost-analysis": "cost",
+}
+
+
+def join_words(words: list[str]) -> str:
+    """``a, b and c``."""
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
+
+
+AUDIT_FAMILY_WORDS = join_words(list(AUDIT_FAMILIES.values()))
+# The report's posture line, which `select` prints and the SOP copies verbatim.
+# It names no state of the audits (running, finished, held): this terminal
+# cannot see it, and the delivery job's note says it.
+SCAN_SCOPE_SENTENCES = (
+    f"This scan checked: {join_words([words for _, words in SCAN_CHECKS])}.",
+    f"{AUDIT_FAMILY_WORDS[:1].upper()}{AUDIT_FAMILY_WORDS[1:]} come from the first-run audits, "
+    "which post their own findings.",
+)
+SCAN_SCOPE_LINE = " ".join(SCAN_SCOPE_SENTENCES)
+
 # ```findings ... ``` -- CommonMark's leading indent and long closing fence are
 # both accepted: bootstrap_handoff.py writes a bare fence, but a raw file typed
 # by a model, as earlier sweeps did, may indent it inside a list.
@@ -505,6 +546,7 @@ def describe_selection(
         out = [f"first report: list no item; the limit is {limits.first_report_criticals}"]
     else:
         out = ["first report: list no item; there are no critical findings"]
+    out.append(f"posture: {SCAN_SCOPE_LINE}")
     for index, members in enumerate(shown, 1):
         best = members[0]
         objects = _plural(len(members), "object", "objects")

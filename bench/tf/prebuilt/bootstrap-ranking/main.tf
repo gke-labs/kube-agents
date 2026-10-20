@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # The scenario driver for bench/tasks/bootstrap-inventory-ranking-delivery:
-# plant a fixed INVENTORY.raw.md (inventory-raw.txt beside this file) on the
+# plant a fixed INVENTORY.raw.md (`raw_report`, a file beside this one) on the
 # shell sandbox's data volume, file the `bootstrap-inventory-prioritize` card
 # the onboarding gate's hand-off files once it has written that file, wait until
 # the card's worker has ended its run itself, or `run_wait` has passed, and
@@ -93,7 +93,10 @@ locals {
     "INVENTORY.shown.delivered.json",
   ] : "${local.home}/${name}"])
   # Base64, so the report crosses two shells and kubectl untouched.
-  raw_b64 = base64encode(file("${path.module}/inventory-raw.txt"))
+  raw_b64 = base64encode(file("${path.module}/${var.raw_report}"))
+  # Every report a case of this stack plants: a run that finishes a teardown an
+  # earlier run left resolves whichever case's findings that run registered.
+  planted_b64 = [for name in sort(fileset(path.module, "inventory-raw*.txt")) : base64encode(file("${path.module}/${name}"))]
   # bootstrap_scan_gate.py's PRIORITIZE_IDEMPOTENCY_KEY and SCAN_ASSIGNEE, and
   # the card agents/chat/scripts/bootstrap_handoff.py files: this plant stands
   # in for the hand-off. The body is the install's own `_prioritize_body()`,
@@ -182,7 +185,8 @@ locals {
         headers["Authorization"] = "Bearer " + token
     body = json.dumps({"outcome": "resolved", "observed": "bench teardown of a planted finding"}).encode()
     resolved, failed = 0, []
-    for item in inventory_findings.parse_block(base64.b64decode(sys.argv[1]).decode()):
+    items = [i for raw in sys.argv[1:] for i in inventory_findings.parse_block(base64.b64decode(raw).decode())]
+    for item in items:
         fid = findings_queue.derive_finding_id(
             item["check"], item["project"], item["cluster"], item.get("namespace", ""), item["object"]
         )
@@ -381,7 +385,7 @@ resource "null_resource" "ranking" {
         printf '%s' '${base64encode(local.disarm_py)}' | base64 -d | agent_py
       }
       resolve() {
-        printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py "${local.raw_b64}"
+        printf '%s' '${base64encode(local.resolve_py)}' | base64 -d | agent_py ${join(" ", local.planted_b64)}
       }
       # Writes base64 $1 to the sandbox path $2 aside and renames it, owned as
       # the data volume is: the user the card's terminal and file tools run as.

@@ -57,9 +57,10 @@ text. A failure after the request was sent may have posted, so that path can sen
 report twice; see ``_posted_as_blocks``.
 
 Every delivery closes with a short note on the first-run audits, read off the ``oobe`` stage's
-marker by ``_audits_note``: the report's scan leaves the workload checks to those audits (except
-on an install whose kept marker records an older stage's no-repository skip, where the scan ran
-them), and a short report would otherwise read as a healthy fleet. An audit the stage started or
+marker by ``_audits_note``: the report's scan leaves security and RBAC, reliability, capacity and
+cost to those audits (``inventory_findings.AUDIT_FAMILIES``; an install whose kept marker records
+an older stage's no-repository skip ran the workload checks in the scan), and a short report would
+otherwise read as a healthy fleet. An audit the stage started or
 adopted whose summary failed to deliver, as every one that finished before anyone opened the chat
 does for want of a home channel, is named (``_undelivered_audits``). The text path appends it to
 the report; the
@@ -109,6 +110,7 @@ from pathlib import Path
 
 import bootstrap_handoff  # beside this script in the pod
 import chat_notify  # beside this script in the pod
+import inventory_findings  # beside this script in the pod
 import oobe  # beside this script in the pod
 import sandbox_exec
 
@@ -214,42 +216,38 @@ AUDITS_NO_REASON = "no reason was recorded"
 LEGACY_NO_REPOSITORY_REASON = "no GitHub repository in managed_repos for the audits to publish to"
 AUDITS_COVERED_NOTE = (
     "This scan checked probes, requests and limits, autoscaling, NetworkPolicy and pod security in "
-    "their place, so this report covers them."
+    "their place, so this report covers them, but not the rest of "
+    f"{inventory_findings.AUDIT_FAMILY_WORDS}, which those audits check on their schedules."
 )
 # Every other skip leaves the audits to their schedules, and the scan did not run their checks.
 AUDITS_NOT_COVERED_NOTE = (
-    "This scan did not check probes, requests and limits, autoscaling, NetworkPolicy or pod security "
-    "either, so this report does not cover them."
+    f"Nothing has checked {inventory_findings.AUDIT_FAMILY_WORDS} yet; those audits check them on their schedules."
 )
 # A skip with the hand-off's no-coverage report (bootstrap_handoff.NO_RANKING).
 AUDITS_UNCHECKED_SCHEDULED_NOTE = (
-    "No cluster was audited either, so this report covers none of probes, requests and limits, "
-    "autoscaling, NetworkPolicy or pod security; those audits check them on their schedules."
+    "No cluster was audited either, so nothing has checked any cluster yet; those audits check "
+    f"{inventory_findings.AUDIT_FAMILY_WORDS} on their schedules."
 )
+# The audits by what they report on, which the report's posture line names the same way.
+AUDITS_FAMILIES = f"The first-run audits ({inventory_findings.AUDIT_FAMILY_WORDS})"
 # Also the note before the marker exists: the stage writes it on its first tick after the ranking
 # card finishes, which a user already in the chat can beat to this run.
 AUDITS_RUNNING_NOTE = (
-    "Workload checks (probes, requests and limits, autoscaling, NetworkPolicy, pod security) come "
-    "from the cost, security, reliability and capacity audits, which run one after another once this "
-    "scan is done. Each posts a summary to the home channel when it finds something new."
+    f"{AUDITS_FAMILIES} run one after another once this scan is done. "
+    "Each posts a summary to the home channel when it finds something new."
 )
 AUDITS_RAN_NOTE = (
-    "Workload checks (probes, requests and limits, autoscaling, NetworkPolicy, pod security) come "
-    "from the first-run audits, which have started: {audits}. Each posts a summary to the home channel "
+    f"{AUDITS_FAMILIES} have started: {{audits}}. Each posts a summary to the home channel "
     "when it finds something new."
 )
 AUDITS_NONE_RAN_NOTE = (
-    "None of the first-run audits ran, so nothing has checked probes, requests and limits, "
-    "autoscaling, NetworkPolicy or pod security yet."
+    f"None of the first-run audits ran, so nothing has checked {inventory_findings.AUDIT_FAMILY_WORDS} yet."
 )
 AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
 # Every audit the chain started has completed its run, so "have started" would be stale.
-AUDITS_FINISHED_NOTE = (
-    "Workload checks (probes, requests and limits, autoscaling, NetworkPolicy, pod security) come "
-    "from the first-run audits, which have run: {audits}."
-)
+AUDITS_FINISHED_NOTE = f"{AUDITS_FAMILIES} have run: {{audits}}."
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
 # (_undelivered_audits).
@@ -618,8 +616,6 @@ def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None
     """
     suppressed: set[str] = set()
     try:
-        import inventory_findings  # beside this script in the pod
-
         if no_ranking is None:
             sys.stderr.write("bootstrap_delivery: the hand-off marker could not be read; registering nothing\n")
             return suppressed
@@ -849,6 +845,12 @@ def _audits_note(data_dir: Path, no_coverage: bool, home: bool = True) -> str:
     return note.replace(" " + AUDITS_HOME_SENTENCE, replacement)
 
 
+def _family(audit: str) -> str:
+    """What ``audit`` reports on, as a lead before its reason, so a held audit's area is not read as covered."""
+    family = inventory_findings.AUDIT_FAMILIES.get(audit)
+    return f"{family}; " if family else ""
+
+
 def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
     """The note on the first-run audits the delivery closes with, from oobe's marker.
 
@@ -868,8 +870,8 @@ def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
     fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
     held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
     gave_up = _list(state.get(oobe.STATE_GAVE_UP))
-    not_run = [f"`{a}` ({held[a]})" for a in oobe.FIRST_RUN_AUDITS if a in held]
-    not_run += [f"`{a}` ({AUDITS_GAVE_UP_REASON})" for a in oobe.FIRST_RUN_AUDITS if a in gave_up]
+    not_run = [f"`{a}` ({_family(a)}{held[a]})" for a in oobe.FIRST_RUN_AUDITS if a in held]
+    not_run += [f"`{a}` ({_family(a)}{AUDITS_GAVE_UP_REASON})" for a in oobe.FIRST_RUN_AUDITS if a in gave_up]
     runs = _completed_runs(data_dir, fired)
     marks = state.get(oobe.STATE_MARKS) if isinstance(state.get(oobe.STATE_MARKS), dict) else {}
     # A mark that is not a number reads as no mark: this runs after the claim, and a raise here
