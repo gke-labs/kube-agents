@@ -478,6 +478,14 @@ ENTRY_MODES = frozenset({"converge", "assert"})
 GREET_EVAL_STACK = "prebuilt/first-install-hello"
 GREET_EVAL_PHRASE_MIN_LENGTH = 12
 
+# A case without a deployer runs against the install as it stands. {{CLUSTER_NAME}}
+# is the per-run task cluster hack/ci-eval-pr.sh names for the stacks that create
+# one, so a deployer-less case that names it asks the agent for a cluster that
+# never exists (stop-on-permission-refusal, four red nights in 2026-10).
+NO_DEPLOYER = "noop"
+RUN_CLUSTER_PLACEHOLDER = "{{CLUSTER_NAME}}"
+RUN_CLUSTER_PLACEHOLDER_FIELDS = ("prompt", "expected_output")
+
 
 def _populated(value: Any) -> bool:
     """Whether an assertion field actually asserts something.
@@ -1171,6 +1179,16 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 "that is not a substring of its own 'prompt:', so no turn of "
                 "this case ever gets the greeting"
             )
+    if isinstance(infrastructure, dict) and infrastructure.get("deployer") == NO_DEPLOYER:
+        for field in RUN_CLUSTER_PLACEHOLDER_FIELDS:
+            value = spec.get(field)
+            if isinstance(value, str) and RUN_CLUSTER_PLACEHOLDER in value:
+                problems.append(
+                    f"names {RUN_CLUSTER_PLACEHOLDER} in its '{field}:' with no deployer; the "
+                    "runner fills it with the per-run task cluster, which nothing creates for "
+                    "this case, so the agent is asked for a cluster that never exists (name "
+                    "the host cluster instead)"
+                )
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,

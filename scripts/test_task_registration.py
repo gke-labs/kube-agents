@@ -580,6 +580,14 @@ class TestTheRulesReject(unittest.TestCase):
         spec = self._greet_eval("I've just installed you", prompt="hi! I've just installed you")
         self.assertEqual(self._validate(**spec), [])
 
+    def test_a_deployer_less_case_may_not_name_the_run_cluster(self):
+        placeholder = "On cluster {{CLUSTER_NAME}}, list the pods"
+        self._only("never exists", infrastructure={"deployer": "noop"}, prompt=placeholder)
+        self._only("never exists", infrastructure={"deployer": "noop"}, expected_output=placeholder)
+        host = "On cluster platform-agent-host, list the pods"
+        self.assertEqual(self._validate(infrastructure={"deployer": "noop"}, prompt=host), [])
+        self.assertEqual(self._validate(infrastructure={"deployer": "tofu", "stack": "x"}, prompt=placeholder), [])
+
     def test_a_greet_eval_phrase_inside_another_cases_prompt_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             cases = {}
