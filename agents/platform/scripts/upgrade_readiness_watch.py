@@ -313,11 +313,12 @@ REMEDY_RETIRING_EXCLUDED = (
 )
 REMEDY_READ_ACCESS = INSTALL_REMEDY_PREFIX + "give the install read access to the project, " + ROSTER_REMEDY
 REMEDY_CAP = INSTALL_REMEDY_PREFIX + "raise spec.scope.maxProjects, " + ROSTER_REMEDY
-# Posted once per cause (``partial_signature`` keys a refusal on the project
-# and its cause, and the readiness hop's ungraded signature the same), so the
-# text promises a return on another outcome, never on the same one standing.
+# A remedy states no cadence: the same detail reaches the partial line (posted
+# once per cause), the all-refused line and the readiness hop's ungraded line,
+# which repeats weekly once parked. So the text says what clears the cause and
+# that another outcome is named here, never when the line returns.
 REMEDY_UNRESOLVED = (
-    "the reconcile has not resolved it yet; the next tick that does reads it; this line posts once per cause, the project stays "
+    "the reconcile has not resolved it yet; the next tick that does reads it; the project stays "
     "unread until a reconcile tick lists it, and another outcome the reconcile records for it is named here with its remedy"
 )
 # A project outside what the reconcile resolved while part of the declaration
@@ -347,11 +348,11 @@ PARTLY_UNRESOLVED_SCOPE_NOTE = (
 )
 # The reconcile's listing of the project did not finish on its last run (a
 # timeout, a network or quota error, a gcloud failure it did not classify, or
-# a carried tick): not an access failure, so no grant is asked for. Posted
-# once per cause, as ``REMEDY_UNRESOLVED`` is, and worded the same way.
+# a carried tick): not an access failure, so no grant is asked for. Worded as
+# ``REMEDY_UNRESOLVED`` is, with no cadence.
 REMEDY_LISTING_UNFINISHED = (
     "the reconcile could not list the project on its last run (a timeout, a network or quota error, or a run that carried "
-    "it without resolving it); the next reconcile tick that lists it reads it; this line posts once per cause, the project stays "
+    "it without resolving it); the next reconcile tick that lists it reads it; the project stays "
     "unread until a reconcile tick lists it, and another outcome the reconcile records for it is named here with its remedy"
 )
 # A declared project the install could not read, by the outcome the reconcile
@@ -746,10 +747,11 @@ def skill_scripts_dir() -> Path:
 
 
 def scope_args_path() -> Path:
-    """This image's copy of the collectors' ``fleet_scope_args``, beside this
-    script: the one this job parses refusals by, and the one the loader hands
-    the sandbox so the report script formats them with the same constants."""
-    return Path(__file__).resolve().parent / (SCOPE_ARGS_MODULE + PYTHON_SOURCE_SUFFIX)
+    """The ``fleet_scope_args`` this job imported, the one it parses refusals
+    by, which the loader hands the sandbox so the report script formats them
+    with the same constants: the same file by construction, wherever the
+    import resolved (beside this script in the image)."""
+    return Path(fleet_scope_args.__file__).resolve()
 
 
 def _stamped(path: Path, scripts: Path, root: str | None) -> str:
@@ -777,9 +779,9 @@ def shipped_modules(root: str | None = None) -> dict[str, tuple[str, str, bool]]
         if is_package:
             parts = parts[:-1]
         shipped[MODULE_SEPARATOR.join(parts)] = (path.read_text(encoding="utf-8"), _stamped(path, scripts, root), is_package)
-    # This image's copy of the collectors' scope module, beside this script rather than
-    # under the skill: the report imports it, and shipping the copy this job parses
-    # refusals by keeps the sandbox image's copy out of the format.
+    # The collectors' scope module this job imported, not the skill's: the report imports
+    # it, and shipping the copy this job parses refusals by keeps the sandbox image's copy
+    # out of the format.
     scope_args = scope_args_path()
     shipped[SCOPE_ARGS_MODULE] = (scope_args.read_text(encoding="utf-8"), str(scope_args) if root is None else str(Path(root) / scope_args.name), False)
     return shipped
@@ -1519,8 +1521,9 @@ def versions_by_project(
     ledger never holds a key under a number (``learn_project_id``), and when
     the roster also spells the project by its id, that spelling's run lists
     it. A table that read nothing under a key fails the tick instead of
-    announcing a partial table of nothing: every run failed is the sandbox or
-    the credential, and every run an unresolved number is the credential's
+    announcing a partial table of nothing: every run failed is the sandbox, the
+    credential or, when the report script refused each one, the install's
+    scope, and every run an unresolved number is the credential's
     missing ``resourcemanager.projects.get`` or a roster that should name the
     id, said with the remedy. The ledger's table-run stamps are set for every
     project that ran to completion or to its own cap, so the next table starts
@@ -1634,11 +1637,13 @@ def versions_by_project(
             if isinstance(chosen, ReportRefused):
                 # Every run was refused: the line names each refusal it is keyed on, the
                 # project before its reason when there is more than one, bounded as the
-                # partial line is; the marker keys on every refusal.
-                if len(failed) > 1:
-                    chosen = ReportRefused(shown_names([PARTIAL_REASON.format(project=project, message=exc) for project, exc in failed.items()], REASONS_SEPARATOR), chosen.cause)
-                # Keyed by the id learned for each spelling, so the key is the same whichever spelling ran.
-                chosen.signature = refused_tick_signature({keyed(project): exc for project, exc in failed.items()})
+                # partial line is; the marker keys on every refusal. Both are keyed by the
+                # id learned for each spelling, so one project is one refusal whichever
+                # spellings ran.
+                refusals = {keyed(project): exc for project, exc in failed.items()}
+                if len(refusals) > 1:
+                    chosen = ReportRefused(shown_names([PARTIAL_REASON.format(project=project, message=exc) for project, exc in refusals.items()], REASONS_SEPARATOR), chosen.cause)
+                chosen.signature = refused_tick_signature(refusals)
             raise chosen
         if unresolved:
             raise ProjectUnresolved(
