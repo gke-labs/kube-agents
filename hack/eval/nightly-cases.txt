@@ -873,3 +873,12 @@
 # this block too).
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
+
+# "/feedback <text>" is written up and shown for a yes before anything is
+# filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
+# carries the composed submission, the public-issue warning and a question,
+# and no card is filed before the yes. Graded on the reply, which both lanes
+# carry; the filing turn stays out of the case because it would file a public
+# issue every night. deployer: noop, no fixtures. Nightly from its first
+# merge; a presubmit seat waits on a clean nightly record.
+./tasks/chat-feedback-composes-and-asks-first/task.yaml

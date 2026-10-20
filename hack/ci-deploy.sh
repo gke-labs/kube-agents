@@ -611,6 +611,20 @@ export IMAGE_TAG="${TAG}"
 # exist; step 5 expands it into the Helm install, where an empty array
 # contributes nothing and the release is byte-for-byte the today one.
 A2A_OPERATOR_ENV_ARGS=()
+# The next lane's audits open no remediation pull request on their own: the
+# inject lane's write safeguard charges any pull request in a repetition's
+# window to the case in flight, and the fleet audits' automatic sweep (the
+# first-run chain included) writes one whenever a pool repository declares a
+# workload with a major finding (#3439). spec.deployment.env carries the
+# switch; the operator forwards it to the shell sandbox, where finish runs.
+# Empty on the today lane, so that release stays byte-for-byte the same.
+MODE_NEXT_ENV_ARGS=()
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  MODE_NEXT_ENV_ARGS=(
+    --set-string "platformAgent.deployment.env[2].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[2].value=false"
+  )
+fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
 # RC_COMMIT_SHA unset is the presubmit and everything this script did before the
@@ -1624,6 +1638,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
+    ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e

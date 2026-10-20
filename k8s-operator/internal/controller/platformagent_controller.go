@@ -190,6 +190,26 @@ const (
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
 
+	// The condition reporting that spec.deployment.availability.replicas asks
+	// for more gateway replicas than supportedGatewayReplicas and the render
+	// runs fewer. Written only while the spec asks for more, on the
+	// EventWatcher pattern above, and carried by both status writers on the
+	// VolumesDropped terms below, because the cap happens at render as the
+	// hostPath strip does. The message says what the operator runs instead,
+	// both reasons a second replica does not start, and how to clear it,
+	// because the author of a CR the webhook never saw (the chart ships it
+	// off) finds out from `kubectl describe`.
+	replicasLimitedConditionType = "ReplicasLimited"
+	replicasLimitedReason        = "HighAvailabilityNotSupported"
+	// replicasLimitedMessageFormat takes the requested count.
+	replicasLimitedMessageFormat = "spec.deployment.availability.replicas is %d, and the operator runs the gateway at " +
+		"one replica at most: high availability is not supported yet. Above one replica the gateway's platform-agent " +
+		"container runs leader_elect.py, which needs an in-cluster ServiceAccount token that container deliberately " +
+		"does not have (the Pod sets automountServiceAccountToken: false), so it exits at startup. The data volumes " +
+		"an install creates at one replica are also ReadWriteOnce, so a replica scheduled on another node cannot " +
+		"attach them. Set replicas to 1, or remove it, to clear this condition. The multi-replica redesign is " +
+		"https://github.com/gke-labs/kube-agents/issues/3016."
+
 	// The condition reporting that the A2A gateway holds a chat backend with
 	// no home channel to post to. Under next the gateway, not the agent, makes
 	// the proactive posts (alerts, drift, scheduled reports), and it arms them
@@ -247,8 +267,10 @@ const (
 	// that is running, because the template is the whole of what this
 	// controller observes. reconcileWorkload server-side-applies it and
 	// returns once the API server has accepted it; nothing waits on the
-	// rollout. With spec.deployment.availability.replicas > 1 the strategy is
-	// RollingUpdate at maxUnavailable 1, so Pods from the revision before it --
+	// rollout. The gateway runs as one replica under Recreate today
+	// (supportedGatewayReplicas), which shrinks this window to the replacement;
+	// above one replica the strategy would be RollingUpdate at maxUnavailable 1,
+	// so Pods from the revision before it --
 	// on an operator rolled out over a CR a pre-fix render gave real hostPath
 	// mounts, Pods that really do mount them -- keep running until the roll
 	// finishes, and indefinitely if it stalls. "Left out of the agent Pod"
@@ -379,6 +401,12 @@ type PlatformAgentReconciler struct {
 	// the CR is deleted. Separate from the proxy's gate: the two containers'
 	// overrides change independently.
 	agentAPIAuthWarningsLogged sync.Map
+
+	// replicasLimitedLogged records, per CR, the spec generation whose replica
+	// cap reconcileWorkload last logged, so each generation logs it once
+	// rather than on every requeue. Keyed by ObjectKey, value int64; cleared
+	// when the CR is deleted.
+	replicasLimitedLogged sync.Map
 
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
@@ -1190,6 +1218,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.forgetUsageStatus(agent)
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -2169,9 +2198,29 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	}
 	opts.heldGitHubOrg = held
 
+	// The replica cap is applied inside the render (resolveDeploymentReplicasAndStrategy);
+	// this only says so in the operator log, once per spec generation. The
+	// ReplicasLimited condition carries the same fact on the CR.
+	if gatewayReplicasCapped(agent.Spec.Deployment) {
+		renderedReplicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+		capKey := client.ObjectKeyFromObject(agent)
+		if logged, ok := r.replicasLimitedLogged.Load(capKey); !ok || logged.(int64) != agent.Generation {
+			logf.FromContext(ctx).Info("spec.deployment.availability.replicas is above the supported gateway replica count; rendering the gateway at one replica at most",
+				"name", agent.Name, "namespace", agent.Namespace,
+				"requestedReplicas", requestedGatewayReplicas(agent.Spec.Deployment),
+				"renderedReplicas", renderedReplicas,
+				"tracking", "https://github.com/gke-labs/kube-agents/issues/3016")
+			r.replicasLimitedLogged.Store(capKey, agent.Generation)
+		}
+	} else {
+		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
+	}
+
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
-	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
+	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update,
+	// with one exception: the operator upgrade that introduced supportedGatewayReplicas moves a
+	// StatefulSet gateway (replicas > 1 over RWO storage) to the Deployment on its first pass.
 	// A refused spec.deployment.agentAPIAuth.resources renders the sidecar at the
 	// operator's defaults rather than withholding the gateway, so the rest of the
 	// Pod keeps flowing and updateStatusReady reports the refusal as Degraded.
@@ -3990,6 +4039,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	hostPathDroppedMsg := hostPathDroppedMessage(agent, workloadRollIncomplete)
 	hostPathDroppedUnchanged := hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 
+	// The replica cap, the same class: present while the spec asks for more
+	// gateway replicas than the render runs, absent otherwise, and compared on
+	// its message so a changed count is one write.
+	replicasLimitedMsg := replicasLimitedMessage(agent)
+	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
+
 	// The home-channel advisory, from the spec alone, compared on its message
 	// for the same reason EventWatcher's is.
 	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
@@ -4057,6 +4112,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
 		hostPathDroppedUnchanged &&
+		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
 		a2aVerifierUnchanged &&
@@ -4131,6 +4187,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 
 	setA2AGatewayCondition(agent, a2aGatewayDark, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
@@ -4270,6 +4327,45 @@ func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string,
 		Type:               hostPathDroppedConditionType,
 		Status:             metav1.ConditionTrue,
 		Reason:             hostPathDroppedReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// replicasLimitedMessage is the ReplicasLimited condition's message, or ""
+// when the spec asks for no more gateway replicas than the render runs and the
+// condition is to be absent.
+func replicasLimitedMessage(agent *agentv1alpha1.PlatformAgent) string {
+	if !gatewayReplicasCapped(agent.Spec.Deployment) {
+		return ""
+	}
+	return fmt.Sprintf(replicasLimitedMessageFormat, requestedGatewayReplicas(agent.Spec.Deployment))
+}
+
+// replicasLimitedConditionCurrent reports whether the ReplicasLimited
+// condition on the CR already says msg, where "" means absent. Both status
+// writers gate their write on it, as they do on hostPathDroppedConditionCurrent.
+func replicasLimitedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, replicasLimitedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == replicasLimitedReason && existing.Message == msg
+}
+
+// setReplicasLimitedCondition writes the ReplicasLimited condition, or
+// removes it when msg is "". The caller does the API write.
+func setReplicasLimitedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, replicasLimitedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               replicasLimitedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             replicasLimitedReason,
 		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -4868,8 +4964,8 @@ const (
 // degradedStatusCurrent reports whether the given PlatformAgent's status matches
 // what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
-// VolumesDropped condition.
-func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg string) bool {
+// VolumesDropped and ReplicasLimited conditions.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg string) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||
 		agent.Status.Phase != "Degraded" ||
@@ -4882,7 +4978,8 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 	if !rendered {
 		return true
 	}
-	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) &&
+		replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
 }
 
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
@@ -4952,14 +5049,20 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		}
 		hostPathDroppedMsg = hostPathDroppedMessage(agent, oldPods)
 	}
-	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg) {
+	// ReplicasLimited rides along on the same terms as VolumesDropped: the cap
+	// happens at render, so only a pass that rendered writes or clears it.
+	replicasLimitedMsg := ""
+	if rendered {
+		replicasLimitedMsg = replicasLimitedMessage(agent)
+	}
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg) {
 		return nil
 	}
 
 	// If the cached agent missed the status condition due to watch event lag,
 	// check the live object before attempting an Update that would conflict (409).
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
-		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg)
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg)
 	}) {
 		return nil
 	}
@@ -4980,6 +5083,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
 	if rendered {
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 	}
 	return r.Status().Update(ctx, agent)
 }

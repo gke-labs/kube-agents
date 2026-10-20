@@ -86,10 +86,19 @@ class ConfigurationFileTest(_ConfigCase):
             {"forges": [{"provider": "TestForge", "host": "Git.Example.com", "allowedPaths": ["/acme/"]}]}
         )
         self.assertEqual(
-            [{"provider": "testforge", "host": "git.example.com", "token_path": "", "ca_file": "", "ca_source": "",
-              "allowed_paths": ("/acme/",)}],
+            [{"provider": "testforge", "host": "git.example.com", "token_path": "", "read_token_path": "",
+              "ca_file": "", "ca_source": "", "allowed_paths": ("/acme/",)}],
             registry_module.load_forge_entries(),
         )
+
+    def test_a_read_token_path_reaches_the_gitlab_forge(self):
+        self.configure({"forges": [
+            {"provider": "gitlab", "host": "gitlab.com", "tokenPath": "/t/token",
+             "readTokenPath": " /t/read-token ", "allowedPaths": []},
+        ]})
+        self.assertEqual("/t/read-token", registry_module.load_forge_entries()[0]["read_token_path"])
+        [forge] = providers.Registry().forges
+        self.assertEqual("/t/read-token", forge.read_token_path)
 
     def test_github_refuses_allowed_paths_rather_than_ignoring_them(self):
         # Review round 2: accepted and never enforced, it read as narrowing
@@ -194,6 +203,7 @@ class OperatorRenderedConfigurationTest(_ConfigCase):
         self.assertEqual(["github", "gitlab"], [forge.name for forge in registry.forges])
         forge, repo = registry.resolve("https://gitlab.com/platform/tools")
         self.assertEqual(("gitlab", "platform/tools"), (forge.name, repo))
+        self.assertEqual("/var/run/kube-agents/forge-credentials/gitlab/read-token", forge.read_token_path)
 
 
 class UnclaimedProviderTest(_ConfigCase):
