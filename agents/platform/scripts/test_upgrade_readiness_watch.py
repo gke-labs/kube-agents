@@ -1759,6 +1759,21 @@ class DeclaredScope(Base):
         self.assertIn("does not list legacy-proj", outs[0])
         self.assertEqual(outs[1], "", "the same refusal, keyed once, posts nothing the next day")
 
+    def test_an_all_refused_tick_names_a_project_once_when_both_its_spellings_ran(self) -> None:
+        """The id spelling, never run, goes first; the number, stamped by an earlier tick that did
+        not learn it, runs after it and teaches the id: the line, like its key, names one refusal."""
+        self.declare_scope(["mgmt"])
+        ledger = watch.empty_ledger()
+        ledger[watch.TABLE_RUNS_KEY] = {"123456": (NOW - timedelta(days=1)).isoformat()}
+        watch.save_ledger(self.home / watch.LEDGER_FILE_NAME, ledger)
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "123456,legacy-proj"}):
+            sandbox = FakeSandbox(envelope([]), aliases={"123456": "legacy-proj"})
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(argv[1] for kind, argv, _ in sandbox.calls if kind == "versions"), ["123456", "legacy-proj"])
+        self.assertEqual(out.count("does not list legacy-proj"), 1)
+        self.assertNotIn("123456:", out)
+
     def test_an_all_refused_ticks_marker_keys_a_number_by_the_id_it_learned(self) -> None:
         """Whichever spelling runs, the key is the project's: the number, refused naming
         legacy-proj, is keyed as legacy-proj."""
@@ -2049,10 +2064,11 @@ class DeclaredScope(Base):
         for remedy in (watch.REMEDY_RETIRING, watch.REMEDY_RETIRING_EXCLUDED):
             self.assertNotIn(roster, remedy)
         self.assertNotIn("put the project back under spec.scope", watch.REMEDY_RETIRING_EXCLUDED)
-        # A remedy's closing clause is a promise the signature keeps: a refusal posts once per cause, so neither
-        # unread remedy says the line returns while the same outcome stands.
+        # A remedy states no cadence: the same detail reaches a line posted once per cause and the ungraded line,
+        # which repeats weekly once parked, so neither unread remedy says when the line returns.
         for remedy in (watch.REMEDY_UNRESOLVED, watch.REMEDY_LISTING_UNFINISHED):
-            self.assertIn("this line posts once per cause, the project stays unread until a reconcile tick lists it", remedy)
+            self.assertIn("the project stays unread until a reconcile tick lists it", remedy)
+            self.assertNotIn("posts once", remedy)
             self.assertNotIn("if it does not", remedy)
         for detail, _ in (
             watch.refusal_detail(label + m, resolved) for m in (
@@ -2104,7 +2120,7 @@ class DeclaredScope(Base):
                 + watch.REMEDY_LISTING_UNFINISHED,
                 out,
             )
-            self.assertIn("this line posts once per cause, the project stays unread until a reconcile tick lists it", out)
+            self.assertIn("the project stays unread until a reconcile tick lists it", out)
             self.assertNotIn("if it does not", out)
             self.assertEqual([e["kind"] for e in self.ledger()["table_errors"]], ["refused by the report script: listed but unread (unreachable)"])
             for _ in range(3):
@@ -2621,6 +2637,16 @@ class Loader(unittest.TestCase):
             self.assertIn("project", body["tables"])
             leftovers = [p.name for p in Path(scratch).iterdir() if p.name.startswith(watch.SANDBOX_TMP_PREFIX)]
             self.assertEqual(leftovers, [])
+
+    def test_the_shipped_scope_module_is_the_one_this_job_imported(self) -> None:
+        """Wherever the import resolved, not beside the script: a watch staged without the module
+        beside it still ships the copy it parses refusals by."""
+        with tempfile.TemporaryDirectory() as scratch:
+            elsewhere = Path(scratch) / "fleet_scope_args.py"
+            elsewhere.write_text(Path(fleet_scope_args.__file__).read_text(encoding="utf-8"), encoding="utf-8")
+            with mock.patch.object(watch.fleet_scope_args, "__file__", str(elsewhere)):
+                self.assertEqual(watch.scope_args_path(), elsewhere.resolve())
+                self.assertEqual(watch.shipped_modules()[watch.SCOPE_ARGS_MODULE][1], str(elsewhere.resolve()))
 
     def test_the_real_report_script_on_a_scoped_sandbox_refuses_the_bare_flag_and_reads_under_the_scoped_argv(self) -> None:
         """End to end with the operator's marker set, as in the sandbox of an

@@ -190,7 +190,7 @@ class ScopeTargets:
     excluded_clusters: tuple[tuple[str, str, str], ...] = ()
     # The `exclude.projects` entries the declaration carries (a project id or
     # a glob against ids), with the explicit projects the reconcile dropped on
-    # one by number (`excludedProjects`): what `declared_scope_targets` skips
+    # one, by id or by number (`excludedProjects`): what `declared_scope_targets` skips
     # on the way into `unread`. Never in the sweep and never in the collector
     # flags; carried so a reader that meets a project with no row can say
     # whether an exclude entry matches its id (`excludes`), as the
