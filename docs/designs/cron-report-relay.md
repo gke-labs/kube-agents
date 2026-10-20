@@ -228,12 +228,14 @@ two hours, is the same run. It adds its report under the earlier one's, below a 
 and gives the record a new `run` stamp; when the earlier `finish` died before it wrote its
 report, the later one fills the entry in its place. The first `finish` of the repository in the
 run saves the previous run's finding ids on the entry before it touches the ledger, and a later
-`finish` counts its chat report against them (`run_baseline`), so its line states the whole run's
-new and resolved findings and its label says so, or says the change is unknown when the first
-`finish` had no trusted memory of the previous run; its JSON line still counts against the earlier
-`finish`. Only an entry no `finish` has filled takes the ids, so a later `finish` never counts from
-a mid-run memory. A no-forge or HELD report, or an entry without those ids, keeps a label that says
-its counts are against the report above. The earlier `finish` saves its
+`finish` counts its chat report against them (`run_baseline`): its label says the counts cover the
+whole run, and its line states the run's new and resolved findings, or says the change is unknown
+when the first `finish` had no trusted memory of the previous run. Its JSON line still counts
+against the earlier `finish`. Only an entry no `finish` has filled takes the ids, so a later
+`finish` does not save the mid-run memory it reads after an earlier one filled the entry without
+them. A no-forge or HELD report, or an entry without those
+ids, keeps a label that says its counts are against the earlier `finish`: the report above, or
+what it published. The earlier `finish` saves its
 `silent_ok` on the entry as each pull request its sweep opens is created, and again before
 it writes the report store. When that was `false` the later one is not silent either and its automatic
 sweep opens no pull request (`earlier_finish`). A `finish` with no `start` fills no entry,
