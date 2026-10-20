@@ -47,9 +47,11 @@ narrowing selects whom to grade, not whom a rule may see),
 `project_reads`, the gcloud reads the report makes once per project or location for the
 rules (PROJECT_READS: the project's backend services, compute instances and GKE operations,
 and the location's server config), each `{"data": <parsed JSON>, "error": None}` or
-`{"data": None, "error": <why>}`; a rule asks `project_read(context, name)` and files one
-`unknown` naming the reason when the read it needs failed or was not made, grading what it
-has. Tests may add `clock`, a monotonic clock for a read's time budget.
+`{"data": None, "error": <why>}`, with `read_at`, the instant the report made the read, on
+the project reads (the list is read once per project, before the members' own reads); a rule
+asks `project_read(context, name)` and files one `unknown` naming the reason when the read it
+needs failed or was not made, grading what it has, and `project_read_at(context, name)` for
+the instant. Tests may add `clock`, a monotonic clock for a read's time budget.
 
 A finding is a dict the rule shapes; the fold copies it before it stamps it, so a rule may
 return the same object twice or cache what it returns. The fold in
@@ -167,6 +169,8 @@ LOCATION_READ_SERVER_CONFIG = "server_config"
 PROJECT_READS = (PROJECT_READ_BACKEND_SERVICES, PROJECT_READ_INSTANCES, PROJECT_READ_OPERATIONS, LOCATION_READ_SERVER_CONFIG)
 PROJECT_READ_DATA_KEY = "data"
 PROJECT_READ_ERROR_KEY = "error"
+PROJECT_READ_AT_KEY = "read_at"  # the instant the report made the read, as it formats timestamps; absent on a context built by hand
+PROJECT_READ_AT_UNKNOWN = "an unrecorded time"
 # What a rule reports when the context carries no such read at all (a context built by hand,
 # or a report older than the read): the rule grades what it has and says so.
 PROJECT_READ_NOT_MADE_REASON = "the {read} read was not made, so the rule could not grade it"
@@ -465,6 +469,14 @@ def project_read(context, name: str) -> tuple:
     if error:
         return None, str(error)
     return entry.get(PROJECT_READ_DATA_KEY), None
+
+
+def project_read_at(context, name: str) -> str:
+    """When the report made one of its project reads, as the context carries it, or
+    PROJECT_READ_AT_UNKNOWN for a context that does not say."""
+    reads = context.get(CONTEXT_PROJECT_READS) if isinstance(context, dict) else None
+    entry = reads.get(name) if isinstance(reads, dict) else None
+    return str((entry or {}).get(PROJECT_READ_AT_KEY) or PROJECT_READ_AT_UNKNOWN) if isinstance(entry, dict) else PROJECT_READ_AT_UNKNOWN
 
 
 def operation_target(operation, name: str, location: str) -> tuple[bool, str | None]:

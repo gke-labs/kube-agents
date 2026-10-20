@@ -22,8 +22,8 @@ kube-public; read with two `kubectl get` per member after
 `gcloud container clusters get-credentials` into a per-target kubeconfig), a maintenance
 exclusion in effect whose scope covers the upgrade, the maintenance window's state at
 `--at`, and node-pool version skew against the target control plane; then the per-entry
-rules registered in `upgrade_readiness.EXTRA_RULES` (`readiness_rules/`, one module per
-entry of the upgrade-failure catalogue), which read the same cluster record, the objects of
+rules registered in `upgrade_readiness.EXTRA_RULES` (`readiness_rules/`, one or more modules
+per entry of the upgrade-failure catalogue), which read the same cluster record, the objects of
 the `kubectl get`s after the PDB read, one per group in LATER_READS (the namespaced kinds;
 the Pods on their own; the Nodes through a jsonpath template; StorageClasses and
 PersistentVolumes), each failing on its own, the project reads the report makes once per
@@ -776,7 +776,9 @@ class ProjectReads:
     """The gcloud reads the per-entry rules take from the project (PROJECT_READ_COMMANDS),
     made once per project the first time a member of it is graded, and the location's server
     config from the version table's cache: `for_member` hands one dict per member, keyed as
-    readiness_rules.PROJECT_READS names the reads, each entry `data` and `error`. A failed
+    readiness_rules.PROJECT_READS names the reads, each entry `data` and `error`, the project
+    reads with `read_at`, the instant the list was made, so a rule that joins a later read to
+    it can say what the list predates. A failed
     read is recorded under `errors` as an error row for the project (the server config's
     rows stay the cache's own) and handed to the rules as its error, so the rules that need
     it say `unknown` and the ones that do not grade on."""
@@ -796,7 +798,7 @@ class ProjectReads:
                     data, error = None, PROJECT_READ_NOT_A_LIST.format(cmd=" ".join(cmd))
                 if error is not None:
                     self.errors.append({"project": project, "location": None, "message": error})
-                reads[name] = {readiness_rules.PROJECT_READ_DATA_KEY: data, readiness_rules.PROJECT_READ_ERROR_KEY: error}
+                reads[name] = {readiness_rules.PROJECT_READ_DATA_KEY: data, readiness_rules.PROJECT_READ_ERROR_KEY: error, readiness_rules.PROJECT_READ_AT_KEY: format_timestamp(utc_now())}
             self._by_project[project] = reads
         return self._by_project[project]
 

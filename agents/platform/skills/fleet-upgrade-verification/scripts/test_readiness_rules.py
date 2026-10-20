@@ -842,15 +842,41 @@ class OrphanNodeObjectsRuleTest(unittest.TestCase):
         self.assertEqual((finding["node"], finding["ready"], finding["unschedulable"], finding["action"]), ("gke-seeded-b-default-pool-4176890d-ghost", "Unknown", True, "kubectl delete node gke-seeded-b-default-pool-4176890d-ghost"))
         self.assertEqual(orphan_node_objects.describe(finding), "Node gke-seeded-b-default-pool-4176890d-ghost names no instance in the project (providerID gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-ghost; Ready=Unknown; unschedulable=true): a pool upgrade waits on it; delete the Node object: `kubectl delete node gke-seeded-b-default-pool-4176890d-ghost`")
         self.assertEqual(result["notes"], ["1 orphan Node(s) (3 nodes, 19 instances in the project)"])
-        # The join is on the zone too: the same instance name in another zone is not this node's instance.
+        # The join is on the zone too: the same instance name in another zone is not this node's instance
+        # (cordoned, so it has the orphan shape rather than a newcomer's).
         moved = copy.deepcopy(recorded("nodes_seeded_b.json")[0])
         moved["spec"]["providerID"] = moved["spec"]["providerID"].replace("us-central1-a", "us-central1-b")
+        moved["spec"]["unschedulable"] = True
         result = orphan_node_objects.evaluate(record, {}, read(items=[moved]), None, context_for(record))
         self.assertEqual([f["node"] for f in result["blocking"]], [moved["metadata"]["name"]])
         # A node with no providerID is joined by its name alone, as the report's older node records are.
         bare = node("gke-seeded-b-no-surge-pool-235d7913-2jpr", "no-surge-pool")
         self.assertEqual(orphan_node_objects.evaluate(record, {}, read(items=[bare]), None, context_for(record))["blocking"], [])
-        self.assertEqual(len(orphan_node_objects.evaluate(record, {}, read(items=[node("gke-nowhere-1", "p")]), None, context_for(record))["blocking"]), 1)
+        self.assertEqual(len(orphan_node_objects.evaluate(record, {}, read(items=[node("gke-nowhere-1", "p", ready=False)]), None, context_for(record))["blocking"]), 1)
+
+    def test_a_ready_uncordoned_node_the_instance_list_predates_is_a_note_not_a_blocker(self):
+        # The instance list is read once per project before the members' node reads: a node that joined
+        # in between (a scale-up, a surge node) is Ready and uncordoned with no instance in the list.
+        record = seeded_b()
+        newcomer = copy.deepcopy(recorded("nodes_seeded_b.json")[0])
+        newcomer["metadata"]["name"] = "gke-seeded-b-default-pool-4176890d-new1"
+        newcomer["spec"]["providerID"] = "gce://haoxuw-gke-dev/us-central1-a/gke-seeded-b-default-pool-4176890d-new1"
+        reads = project_reads()
+        reads[shared.PROJECT_READ_INSTANCES][shared.PROJECT_READ_AT_KEY] = "2026-10-20T11:58:00Z"
+        result = orphan_node_objects.evaluate(record, {}, seeded_b_read([newcomer]), None, context_for(record, reads=reads))
+        self.assertEqual(result["blocking"], [])
+        self.assertEqual(result["notes"], ["0 orphan Node(s) (3 nodes, 19 instances in the project)", "1 Ready, uncordoned Node(s) not in the instance list read at 2026-10-20T11:58:00Z (gke-seeded-b-default-pool-4176890d-new1): a node that joined after the list is not an orphan; the next run grades it"])
+        # A context that does not say when the list was read says so.
+        self.assertIn("read at an unrecorded time", orphan_node_objects.evaluate(record, {}, seeded_b_read([newcomer]), None, context_for(record))["notes"][1])
+        # Cordoned, or not Ready True: the orphan shape, a blocker whatever the list's age.
+        cordoned = copy.deepcopy(newcomer)
+        cordoned["spec"]["unschedulable"] = True
+        not_ready = copy.deepcopy(newcomer)
+        not_ready["status"]["conditions"] = [{"type": "Ready", "status": "False"}]
+        for ghost in (cordoned, not_ready):
+            result = orphan_node_objects.evaluate(record, {}, seeded_b_read([ghost]), None, context_for(record, reads=reads))
+            self.assertEqual([f["node"] for f in result["blocking"]], ["gke-seeded-b-default-pool-4176890d-new1"])
+            self.assertEqual(result["notes"], ["1 orphan Node(s) (3 nodes, 19 instances in the project)"])
 
     def test_an_unread_node_list_or_instance_list_is_unknown(self):
         record = seeded_b()
