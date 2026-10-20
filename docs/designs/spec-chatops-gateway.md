@@ -1758,7 +1758,8 @@ added, the name from `users.info` (display name, real name, handle; never an id)
 typed reply in a conversation whose question is still open answers it the same way, with the
 reply's first words; a gateway command (a stop, a status ask or a short question about
 progress in the wide form, `/session`, a delegate) answers nothing. A question is answered once, and a second click on it is dropped. The open question
-is the latest message the adapter laid out with choices in the conversation, and one laid out
+is the latest message the adapter laid out with choices in the conversation, other than choices
+that are all an answer's next steps (`next`), which ask nothing, and one laid out
 with choices again is a fresh question whatever answered it before; an edit that takes its
 choices away (a card's question settled by its notify `update` key, laid out or as text) closes
 it, and keeps the answered line when one was drawn. The open question and the answered set live in

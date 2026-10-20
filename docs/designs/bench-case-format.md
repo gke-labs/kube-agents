@@ -495,8 +495,8 @@ also applies the entry vocabulary above — role, the severity pairing, the reje
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
 
-It also scans what the case brings with it: every text file under `bench/tasks/` and
-`bench/tf/prebuilt/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
+It also scans what the case brings with it: every text file under `bench/tasks/`,
+`bench/tf/prebuilt/` and `bench/tf/modules/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
 string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 `sanitizer: allow <reason>` as the per-line escape. `bench/CONTRIBUTING.md` is the home of
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
