@@ -34,7 +34,14 @@ jobs:
     permissions:
       contents: read # check out the default branch: the script
       actions: write # re-run the workflow runs
-      pull-requests: read # the pull request's head commit
+      # Write, not read: the reaction goes on a comment that belongs to a pull
+      # request. GitHub's fine-grained-token table lists that endpoint under
+      # Issues alone, but the job token with `issues: write` and
+      # `pull-requests: read` got 403 on the reaction, and nothing else, on
+      # the first two `/retest` comments after this workflow merged (runs
+      # 39443755214 and 39443830971); `auto_request_review.yml` reacts with
+      # both scopes and does not.
+      pull-requests: write # the pull request's head commit, and the reaction on its comment
       issues: write # 👀 (re-ran) or 😕 (nothing to re-run) on the comment that asked
     # The command, on a pull request, from someone with a standing in the
     # repository. `COLLABORATOR` is any invited collaborator whatever their

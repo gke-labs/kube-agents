@@ -2059,19 +2059,26 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal,
+// update, and ToolExecutionsTotal, EventsIngestedTotal, SessionsTotal,
 // RemediationsProposedTotal, RemediationsMergedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's, the event watcher's and the chat
-// plugin's metrics
+// ClustersMonitored from the broker's, the event watcher's, the chat
+// plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status. SessionsTotal and
-// RemediationsAppliedTotal are declared so that the schema names them, but
-// nothing writes them yet, and each is absent (omitempty) until a series
-// exists for it.
+// ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
+// is declared so that the schema names it, but nothing writes it yet, and it
+// is absent (omitempty) until a series exists for it.
 type AgentUsageStatus struct {
-	// SessionsTotal is the cumulative number of interactive sessions handled.
-	// Nothing writes it yet.
+	// SessionsTotal is the cumulative count of sessions the agent opened: the
+	// triage sessions the event watcher opened for events the daemon
+	// delivered (its k8s_event_watcher_triage_sessions_total; a session
+	// whose inject was filtered, suppressed or failed is not counted) plus
+	// the chat conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
+	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// chat conversation that resumes after the session store's retention
+	// window (seven days by default) counts again. Read every five minutes
+	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 

@@ -141,9 +141,12 @@ describe("gateway text mirrors", () => {
   });
 
   it("settles only the turns no gateway branch makes a task of", () => {
-    for (const t of ["stop", "/session", "/session off", "/session stop"]) {
+    for (const t of ["stop", "/session", "/session off", "/session stop", "/feedback", "/FEEDBACK  "]) {
       expect(turnFate(t)).toEqual({ kind: "settled" });
     }
+    expect(turnFate("/feedback the report posted twice")).toEqual({ kind: "task", texts: ["/feedback the report posted twice"] });
+    // Pre-flip the gateway runs a bare /feedback behind /session as the session's first turn; the page reads it that way.
+    expect(turnFate("/session /feedback")).toEqual({ kind: "task", texts: ["/feedback"] });
     expect(turnFate("is acme-prod ready?")).toEqual({ kind: "task", texts: ["is acme-prod ready?"] });
     expect(turnFate("delegate: x")).toEqual({ kind: "task", texts: ["delegate: x", "x"] });
     expect(turnFate("/session delegate: x")).toEqual({ kind: "task", texts: ["delegate: x", "x"] });
