@@ -868,7 +868,9 @@ def _default_connect(db_path=None):
     except ImportError:
         from hermes_cli.kanban_db import connect
     if db_path is not None:
-        return lambda: connect(db_path)
+        from pathlib import Path
+        p = Path(db_path).expanduser()
+        return lambda: connect(p)
     return connect
 
 

@@ -1376,7 +1376,8 @@ class CloseNoTurnChatTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"hermes_cli.kanban_db_connect": types.SimpleNamespace(connect=lambda path: opened.append(path))}):
             fn = kge._default_connect("/custom/path.db")
             fn()
-            self.assertEqual(opened, ["/custom/path.db"])
+            import pathlib
+            self.assertEqual(opened, [pathlib.Path("/custom/path.db")])
 
 
 # The applier is exercised against a miniature of the five real files, in the
