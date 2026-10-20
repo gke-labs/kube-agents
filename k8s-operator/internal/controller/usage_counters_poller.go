@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -642,10 +643,21 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
+	// One list per distinct selector, not per group: the first two groups read
+	// two different containers of the gateway pod and so share its selector.
+	// Against the cache that second lookup was free; p.reader() is the API
+	// server (a cached Pod List would start a cluster-wide Pod informer, as
+	// podReader's comment sets out), where it is a round trip for a list this
+	// poll already holds.
+	listed := map[string]*corev1.PodList{}
 	for _, group := range groups {
-		var pods corev1.PodList
-		if err := p.r.List(ctx, &pods, client.InNamespace(agent.Namespace), client.MatchingLabels(group.selector)); err != nil {
-			return nil, nil, fmt.Errorf("listing pods: %w", err)
+		pods, seen := listed[labels.Set(group.selector).String()]
+		if !seen {
+			pods = &corev1.PodList{}
+			if err := p.reader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(group.selector)); err != nil {
+				return nil, nil, fmt.Errorf("listing pods: %w", err)
+			}
+			listed[labels.Set(group.selector).String()] = pods
 		}
 		for i := range pods.Items {
 			pod := &pods.Items[i]

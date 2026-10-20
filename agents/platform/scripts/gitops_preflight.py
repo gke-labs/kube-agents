@@ -105,8 +105,9 @@ REGISTRATION_STEPS = (
 # clipped notice keeps its start, so the fact and the remedy come before the
 # worker's instruction.
 STOP = (
-    'Stop now: call kanban_block(kind="needs_input") with this line, change nothing, '
-    "and do not look for another route or check again another way."
+    "Stop now: run no further commands. Your next call is "
+    'kanban_block(kind="needs_input") with this line; change nothing, and do not '
+    "look for another route or check again another way."
 )
 
 

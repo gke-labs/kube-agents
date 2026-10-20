@@ -31,25 +31,19 @@ them on their public defaults. Takes the root context.
 {{- end }}
 
 {{/*
-The same for images this project does not build (LiteLLM, fluent-bit). Falls
-back to imageRegistry, since a single-prefix mirror is the common case and a
-chart that mirrored only its own images would render a half-mirrored install —
-the operator handing its managed pods public references after `helm install`
-reported success.
-
-This deliberately does NOT match third_party_registry_prefix in
-scripts/installer/common.sh, which requires THIRD_PARTY_REGISTRY_PREFIX
-explicitly. The asymmetry is about history, not preference: REGISTRY_PREFIX
-shipped before this inventory existed and has always meant "the registry
-holding the images this project builds", so widening it would redirect working
-installs to images their mirror was never given. global.imageRegistry is new
-here and carries no such promise, so it can take the safer default.
+The same for images this project does not build (LiteLLM, fluent-bit, the
+GitHub token minter, Hindsight, the cleanup hook). Empty leaves them on their
+upstream registries; it does NOT fall back to imageRegistry. That matches
+third_party_registry_prefix in scripts/installer/common.sh and
+local.third_party_registry in terraform/examples/full-install/main.tf, so an
+empty third-party prefix means "upstream" at every layer, and an install that
+mirrors everything sets both.
 
 Takes the root context.
 */}}
 {{- define "kube-agents.thirdPartyImageRegistry" -}}
 {{- $g := .Values.global | default dict -}}
-{{- $g.thirdPartyImageRegistry | default $g.imageRegistry | default "" | trimSuffix "/" -}}
+{{- ($g.thirdPartyImageRegistry | default "") | trimSuffix "/" -}}
 {{- end }}
 
 {{/*

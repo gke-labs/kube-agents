@@ -397,7 +397,21 @@ path is never recorded. A declined run, or `--dry-run`, leaves the file as it wa
 
 Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
 that would render GitOps off while the minter is running, and prints the lines to set with the
-live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+live values filled in. A minter that this install did not make (one made by hand, by
+`make deploy-github`, or by another Helm release: the `kube-agents` release record has
+`githubMinter.enabled` false, the Deployment carries no Helm annotations for this release, and
+the install's Terraform state holds no `module.github_minter`) is not something the apply removes, so the run does not ask for `GITHUB_APP_ID`. Over such a
+minter, the run refuses when its `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not name the
+PlatformAgent's live GitOps repository, or when it cannot read the PlatformAgent or that
+repository, because the apply would take the repository out of the PlatformAgent or point it at
+another one. It also refuses to render the chart's own minter over the other one, because Helm
+does not take over objects it does not own: remove all of the other minter's objects first
+(`make -C k8s-operator undeploy-github` with the same `GITHUB_MINTER_KSA_NAME` for the kustomize
+path, and a `github-app-credentials` Secret made by hand), or set `GITHUB_APP_ID` empty (and, with
+`install.sh`, give no `--github-app-id`). With no readable release record (a first install), these
+cases get the checks above. `KUBE_AGENTS_REMOVE_GITOPS=true` skips all of these checks; the apply
+then renders the repository that `GITOPS_ORG` and `GITOPS_REPO` name, or none when `GITOPS_ORG` is
+empty. `install.sh --generate-only` is refused too, and removes the tfvars it
 wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
 Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
 in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its

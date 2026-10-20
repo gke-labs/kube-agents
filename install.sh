@@ -6127,7 +6127,8 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
-        # A live GitHub minter this render would destroy (#3075).
+        # A live GitHub minter this render would destroy (#3075), or a GitOps
+        # repository it would drop beside a minter this install did not make.
         refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
         # The menu edits no mode key, but an install.env edited by hand since
         # the last apply reaches the cluster through this apply too, with no
@@ -7803,6 +7804,8 @@ main() {
   fi
   # A live GitHub minter this render would destroy (#3075): an install.env
   # without the GitOps keys, and a run without the flags, renders GitOps off.
+  # Over a minter this install did not make, the check guards the GitOps
+  # repository and the chart minter's names instead.
   # Refused for a run that applies and for --generate-only, which hands its
   # tfvars to lifecycle.sh apply (as the Slack check treats it); --dry-run
   # warns. The context is the one the gate above fetched where it ran; without
@@ -7810,10 +7813,10 @@ main() {
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
     if [ "$PARAM_DRY_RUN" != "true" ]; then
       if ! refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE"; then
-        # The tfvars just written render GitOps off; --generate-only would
-        # hand them to lifecycle.sh apply, so they go.
+        # The tfvars just written are the ones the check refused;
+        # --generate-only would hand them to lifecycle.sh apply, so they go.
         rm -f "$tfvars_file"
-        print_info "Removed ${tfvars_file}, which rendered GitOps off, so nothing applies it."
+        print_info "Removed ${tfvars_file}, which the check above refused, so nothing applies it."
         exit 1
       fi
     else

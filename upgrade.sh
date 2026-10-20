@@ -2256,10 +2256,11 @@ main() {
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
       # And a live GitHub minter this render would destroy: an install.env
       # that lacks the GitOps keys (install.sh's flags were not recorded
-      # before #3075) renders GitOps off. Guarded as above.
+      # before #3075) renders GitOps off. Over a minter this install did not
+      # make, the check guards the GitOps repository instead. Guarded as above.
       if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
-        # A refusal removes the tfvars the generator just wrote, which render
-        # the minter off, as install.sh does and the Slack check below does.
+        # A refusal removes the tfvars the generator just wrote, as
+        # install.sh does and the Slack check below does.
         if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then
           rm -f "$tfvars_file"
           exit 1

@@ -45,14 +45,15 @@ global:
   # name only, which is the layout `make mirror-images` writes:
   #   ghcr.io/gke-labs/kube-agents/platform-agent
   #     -> registry.example.com/kube-agents/platform-agent
-  # It also reaches the images the chart does not render itself — the agent
-  # and logging-sidecar references the operator resolves at runtime — so a
+  # It also reaches the first-party images the chart does not render itself —
+  # the agent and shell sandbox references the operator resolves at runtime — so a
   # PlatformAgent created without an explicit spec.deployment.image still
-  # pulls from the mirror.
+  # pulls from the mirror. (The fluent-bit logging sidecar follows
+  # thirdPartyImageRegistry below).
   imageRegistry: ""
   # Registry prefix for images this project does not build (LiteLLM,
-  # fluent-bit). Defaults to imageRegistry; set it only when the mirror keeps
-  # third-party images under a different path.
+  # fluent-bit, GitHub token minter, Hindsight). Empty leaves them on their
+  # upstream registries; set it only when the mirror keeps third-party images.
   thirdPartyImageRegistry: ""
   # Secrets holding credentials for a mirror that has to be authenticated to
   # (Harbor, Artifactory). Leave empty when the nodes can read it themselves —
@@ -90,9 +91,9 @@ global:
 operator:
   enabled: true
   # Extra environment variables for the controller manager. The image
-  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE,
-  # FLUENT_BIT_IMAGE) are
-  # rendered from global.imageRegistry and the image values below, so a
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE)
+  # are rendered from global.imageRegistry (and FLUENT_BIT_IMAGE from
+  # global.thirdPartyImageRegistry) and the image values below, so a
   # mirrored install does not need to hand-write them; anything set here is
   # appended afterwards and therefore still wins.
   extraEnv: []
@@ -193,13 +194,32 @@ operator:
     # not also create the CR (platformAgent.enabled=false), and after the first
     # install once the operator is serving.
     failurePolicy: Ignore
+  # Memory here is the manager's cache, and the cache holds one entry per
+  # object in the cluster, not per install: every informer it starts is
+  # cluster-wide, Owns() included (it filters events by owner, it does not
+  # scope the watch). Pods are read live instead, because they outnumber
+  # every other kind, as Secrets and the A2A bookkeeping objects already
+  # were. What stays: Deployments, StatefulSets,
+  # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
+  # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
+  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
+  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # where their CRDs are installed). Deployments, StatefulSets, Services and
+  # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
+  # carrying a whole pod template, so a cluster with thousands of them is the
+  # case to raise this for; the rest grow with its namespaces, and the
+  # operator is one pod per install.
+  #
+  # Sized from a measurement rather than the Kubebuilder scaffold it replaces:
+  # on a 3-node install the store holds 675 objects in 3.7 MiB of live heap,
+  # in a process of 22 MiB RSS. Kept in step with k8s-operator/config/manager.
   resources:
     limits:
       cpu: 500m
-      memory: 128Mi
+      memory: 512Mi
     requests:
       cpu: 10m
-      memory: 64Mi
+      memory: 128Mi
 
 telemetry:
   # Where OpenTelemetry signals go. One setting, three consumers: the PlatformAgent CR,
