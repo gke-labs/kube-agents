@@ -1584,7 +1584,7 @@ def evaluate_extra_rules(cluster: dict, member: dict, read, target, context: dic
     what it raised, or the shape, value or damage at fault, never a crash: one rule's defect
     must not hide the others' findings. So is a module whose `RULE_ID` is not
     a string, whose `ENTRY` is not a JSON value or whose `CAN_BLOCK` is not a bool, under
-    its module name: the three are checked before anything is derived from them, so the
+    its module name: the four (`HOLDS` when the module declares it) are checked before anything is derived from them, so the
     fold emits nothing it has not probed or built from checked values. A blocker from a
     rule whose `CAN_BLOCK` is False is kept as a risk, with a note. A second module
     carrying a registered id is not evaluated; it is one `unknown` counted under that id

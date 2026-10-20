@@ -99,8 +99,14 @@ ADDON_TABLE_NONE = "none"
 STALE_AGE_FORMAT = "known-issues table is stale: generated {generated}, {age} days ago, past {limit} days; regenerate it from the GKE known-issues page before trusting a clean matrix"
 WITH_ADDON_FORMAT = "with {addon} {tag}"
 NO_ADDON_TEXT = "(the page names no add-on)"
-RUNNING_FORMAT = "known issue {id} ({summary}) applies to GKE {version} {addon_text}; fixed in {fixed_in}: {url}"
-TARGET_FORMAT = "target {version} lands on known issue {id} ({summary}) {addon_text}; fixed in {fixed_in}: target a fixed patch or hold: {url}"
+# What the page gives for a fix: a version text, or one of these, which the finding says plainly.
+NO_FIX_VALUES = ("TBD", "none listed")
+FIX_TEXT_FORMAT = "fixed in {fixed_in}"
+NO_FIX_TEXT = "no fix published"
+TARGET_ADVICE = "target a fixed patch or hold"
+TARGET_ADVICE_NO_FIX = "hold"
+RUNNING_FORMAT = "known issue {id} ({summary}) applies to GKE {version} {addon_text}; {fix_text}: {url}"
+TARGET_FORMAT = "target {version} lands on known issue {id} ({summary}) {addon_text}; {fix_text}; {advice}: {url}"
 NOTE_FORMAT = "{addons} add-on(s) inventoried in {namespaces}; {matches} known issue(s) match GKE {master} or target {target} ({open} open issue(s) with no published fix noted); table generated {generated} ({issues} issue(s), newest known version {newest})"
 OPEN_NOTE_FORMAT = "{n} open known issue(s) with no published fix on GKE {version}, noted and not graded as risks: {ids}; each is on {url}"
 OPEN_IDS_SEPARATOR = ", "
@@ -284,5 +290,7 @@ def describe(finding: dict) -> str:
     if kind == KIND_STALE_AGE:
         return STALE_AGE_FORMAT.format(generated=finding["generated"], age=finding["age_days"], limit=finding["limit_days"])
     addon_text = WITH_ADDON_FORMAT.format(addon=finding["addon"], tag=finding["tag"]) if finding.get("addon") else NO_ADDON_TEXT
+    no_fix = str(finding.get("fixed_in") or "") in NO_FIX_VALUES or not finding.get("fixed_in")
+    fix_text = NO_FIX_TEXT if no_fix else FIX_TEXT_FORMAT.format(fixed_in=finding["fixed_in"])
     template = TARGET_FORMAT if kind == KIND_TARGET else RUNNING_FORMAT
-    return template.format(id=finding["issue"], summary=finding["summary"], version=finding["version"], addon_text=addon_text, fixed_in=finding["fixed_in"], url=finding["url"])
+    return template.format(id=finding["issue"], summary=finding["summary"], version=finding["version"], addon_text=addon_text, fix_text=fix_text, advice=TARGET_ADVICE_NO_FIX if no_fix else TARGET_ADVICE, url=finding["url"])

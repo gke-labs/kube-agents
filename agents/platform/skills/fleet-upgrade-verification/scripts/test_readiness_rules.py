@@ -1091,11 +1091,13 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         result = target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=unlisted))
         self.assertEqual([(f["kind"], f["version"], f["newest"]) for f in result["blocking"]], [("target", unlisted, None)])
         self.assertIn(f"target {unlisted} withdrawn", result["notes"][0])
-        # A build the node list alone carries makes its patch valid too.
-        node_only = next(v for v in config["validNodeVersions"] if v not in regular)
-        node_only_short = node_only.rsplit("-gke.", 1)[0]
-        if not any(v.startswith(node_only_short + "-gke.") for v in regular):
-            self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=node_only_short))["blocking"], [])
+        # A build the node list alone carries makes its patch valid too: a patch no channel lists, with one node build.
+        node_only_config = copy.deepcopy(config)
+        node_only_config["validNodeVersions"].insert(0, f"{minor}.998-gke.1")
+        self.assertFalse(any(v.startswith(f"{minor}.998-gke.") for c in node_only_config["channels"] for v in c["validVersions"]))
+        node_only_reads = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: node_only_config})
+        self.assertEqual(target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=f"{minor}.998", reads=node_only_reads))["blocking"], [])
+        self.assertEqual([f["version"] for f in target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text=f"{minor}.998"))["blocking"]], [f"{minor}.998"])
         self.assertTrue(target_patch_valid.version_listed("1.36.4", ["1.36.4-gke.1495002"]))
         self.assertFalse(target_patch_valid.version_listed("1.36.4", ["1.36.40-gke.1"]))
         self.assertFalse(target_patch_valid.version_listed("1.36.4-gke.2", ["1.36.4-gke.1495002"]))
@@ -1257,6 +1259,34 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
         self.assertEqual([(f["kind"], f["issue"]) for f in result["risks"]], [("running", "mixed-row")])
         self.assertEqual(result["notes"][1], f"1 open known issue(s) with no published fix on GKE 1.33.4-gke.1, noted and not graded as risks: open-row; each is on {self.PAGE}")  # the open row still matches 1.33; the mixed row is the risk
         self.assertEqual([known_issues_matrix.spec_is_open(s) for s in ("1.33.4-gke.1", {"all_versions": True}, {"from_minor": "1.34"}, {"from": "1.35.3-gke.1"}, {"from": "1.35.3-gke.1", "to": "1.36.0-gke.1"}, {"minor": "1.32", "from": "1.32.4-gke.1"}, {"minor": "1.37"}, {"through_minor": "1.34"})], [False, True, True, True, False, False, False, False])
+
+    def test_a_running_or_target_version_on_a_published_issue_is_a_risk_naming_the_fix(self):
+        record = {**seeded_b(), "currentMasterVersion": "1.32.4-gke.1236007"}
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.32.4-gke.1353003"))
+        running = {f["issue"]: f for f in result["risks"] if f["kind"] == "running"}
+        self.assertTrue({"excessive-volume-group-logging", "dangling-status-nodependingresize-1-32"} <= set(running), set(running))
+        self.assertEqual(known_issues_matrix.describe(running["excessive-volume-group-logging"]), f"known issue excessive-volume-group-logging (The PDCSI driver might log excessively) applies to GKE 1.32.4-gke.1236007 with gcp-compute-persistent-disk-csi-driver v1.23.1-gke.37; fixed in 1.32.4-gke.1353003 and later: {self.PAGE}#excessive-volume-group-logging")
+        self.assertNotIn("excessive-volume-group-logging", {f["issue"] for f in result["risks"] if f["kind"] == "target"})  # the fixed build is not a match
+
+        def targets(text):
+            return {f["issue"] for f in known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text=text))["risks"] if f["kind"] == "target"}
+
+        # A target inside the 1.33.0 range is a target risk; the range's exclusive end, the fixed build, is not.
+        self.assertIn("dangling-status-nodependingresize-1-32", targets("1.33.0-gke.1000000"))
+        self.assertNotIn("dangling-status-nodependingresize-1-32", targets("1.33.0-gke.1552000"))
+        landing = next(f for f in known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text="1.33.0-gke.1000000"))["risks"] if f["issue"] == "dangling-status-nodependingresize-1-32")
+        self.assertTrue(known_issues_matrix.describe(landing).startswith("target 1.33.0-gke.1000000 lands on known issue dangling-status-nodependingresize-1-32"))
+        self.assertTrue(known_issues_matrix.describe(landing).endswith(f"; fixed in 1.32.4-gke.1353003 and later; 1.33.0-gke.1552000 and later; target a fixed patch or hold: {self.PAGE}#dangling-status-nodependingresize-1-32"))
+        # A bounded row the page lists no fix for says so, rather than printing the placeholder.
+        tpu_build = {**seeded_b(), "currentMasterVersion": "1.32.3-gke.1927000"}
+        risks = known_issues_matrix.evaluate(tpu_build, {}, seeded_b_read(), None, context_for(tpu_build, target_text="1.32.3-gke.1785000"))["risks"]
+        oom = next(f for f in risks if f["issue"] == "gke-metadata-server-oomkilled" and f["kind"] == "running")
+        self.assertEqual(known_issues_matrix.describe(oom), f"known issue gke-metadata-server-oomkilled (gke-metadata-server is OOMKilled on TPU/GPU nodes) applies to GKE 1.32.3-gke.1927000 with gke-metadata-server gke_metadata_server_20260105.01_p0; no fix published: {self.PAGE}#gke-metadata-server-oomkilled")
+        oom_target = next(f for f in risks if f["issue"] == "gke-metadata-server-oomkilled" and f["kind"] == "target")
+        self.assertTrue(known_issues_matrix.describe(oom_target).endswith(f"; no fix published; hold: {self.PAGE}#gke-metadata-server-oomkilled"), known_issues_matrix.describe(oom_target))
+        # Without the add-on in the inventory an add-on issue does not apply.
+        without = read(items=[row for row in recorded("addons_seeded_b.json") if row["metadata"]["name"] not in ("pdcsi-node", "pdcsi-node-windows")])
+        self.assertNotIn("excessive-volume-group-logging", {f["issue"] for f in known_issues_matrix.evaluate(record, {}, without, None, context_for(record))["risks"]})
 
     def test_the_version_grammar(self):
         vm = known_issues_matrix.version_matches
