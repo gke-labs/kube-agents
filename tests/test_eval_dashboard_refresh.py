@@ -7,7 +7,7 @@ alert -- so past the dormancy and trust gates it must FAIL LOUD. These tests
 run the real script end to end: the local-target tests execute the actual
 collect -> zero-runs floor -> render -> publish pipeline against the real
 fixtures under scripts/eval_dashboard/testdata/, and nothing here ever
-touches a bucket (a stub gsutil on PATH proves the gs:// wiring instead).
+touches a bucket (a stub gcloud storage on PATH proves the gs:// wiring instead).
 """
 
 import json
@@ -281,7 +281,7 @@ class RefreshScriptTest(unittest.TestCase):
         nothing, and the floor reds the run before publish."""
         stubs = self.tmp / "stubs"
         stubs.mkdir()
-        write_stub(stubs, "gsutil", "exit 1\n")
+        write_stub(stubs, "gcloud storage", "exit 1\n")
         argv_log = self.tmp / "collect-argv.log"
         recording_python(stubs, argv_log)
         artifacts = self.tmp / "artifacts"
@@ -298,7 +298,7 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn("first armed run, or a transient read failure", proc.stdout)
         self.assertIn("refusing to publish an empty dashboard", proc.stdout)
         self.assertIn(
-            "gsutil ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
+            "gcloud storage ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
         )
         # The bucket path hands collect.py both sources, the nightly one with
         # its default prefix and the nightly's writers periodic with its own;

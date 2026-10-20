@@ -548,15 +548,15 @@ what the renderer does with them.
 ## Sources
 
 - `--pr-glob <gs glob>` (repeatable) — Prow build dirs, read with
-  `gsutil cat`. **Read-only.** How they are discovered depends on whether
+  `gcloud storage cat`. **Read-only.** How they are discovered depends on whether
   there is a watermark (below): a cold sweep lists the glob itself with
-  `gsutil ls`, a walk of every PR directory that grows with the archive and
+  `gcloud storage ls`, a walk of every PR directory that grows with the archive and
   passes the collector's per-call timeout (`GSUTIL_TIMEOUT_S`) at ~1700
   builds; an incremental scan lists the job's directory index instead.
 - `--index-prefix <gs prefix>` — Prow's per-job directory index,
   `gs://<bucket>/pr-logs/directory/<job>/`: one `<build_id>.txt` object per
   build holding the `gs://` path of that build's directory (its
-  `latest-build.txt` is ignored). One `gsutil ls` of the prefix names every
+  `latest-build.txt` is ignored). One `gcloud storage ls` of the prefix names every
   build in seconds; the ids above the watermark (plus `pending_builds`) are
   the only pointers read, and only those builds are then read,
   `READ_WORKERS` at a time. Defaults to the index derived from each
@@ -564,8 +564,8 @@ what the renderer does with them.
   listed even with a watermark. It changes how a `--pr-glob` scan finds
   builds, not whether one happens: `--merge-with` alone still recomputes
   without touching the bucket. A listing that fails or times out is a
-  `warning: gsutil ls ... failed` line and nothing new; a pointer that
-  cannot be read is a `warning: gsutil cat ... failed` line and that one
+  `warning: gcloud storage ls ... failed` line and nothing new; a pointer that
+  cannot be read is a `warning: gcloud storage cat ... failed` line and that one
   build deferred to `pending_builds`. The refresh workflow greps for either
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
@@ -604,7 +604,7 @@ what the renderer does with them.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a
-  `latest-build.txt` (ignored), no pointer objects, so one `gsutil ls`
+  `latest-build.txt` (ignored), no pointer objects, so one `gcloud storage ls`
   names every build and the watermark filter runs on it directly. Every
   build read through it is `tier: "nightly"`, `pr: null`, `job` the
   prefix's last segment (or `--nightly-job`). Given without a value it is
@@ -622,7 +622,7 @@ what the renderer does with them.
   publishing. Any other failure with no night on record (no nightly
   watermark) is the same note: the periodic may simply not exist yet. With
   a night on record, any other failure is a
-  `warning: gsutil ls failed for ...` line — the refusal line — because a
+  `warning: gcloud storage ls failed for ...` line — the refusal line — because a
   prefix that listed yesterday and not today is the bucket or the grant
   failing, and republishing would freeze the nightly record under a fresh
   `generated_at` with nothing said. A listing that hangs past
@@ -1400,7 +1400,7 @@ the setup, the judge, the `<scoring>-f<fleet>-v<verifiers>` directory and the
 | `cluster-agent-crashloop-debug` | 3/3 with `OutcomeValidity` 0.9: a pass that is not 1.0 |
 | `upgrades-fleet-version-table`  | 3/3, `OutcomeValidity` 0.8                             |
 
-`scripts/test_eval_dashboard_store.py` serves them through a fake `gsutil`
+`scripts/test_eval_dashboard_store.py` serves them through a fake `gcloud storage`
 (`ls` of the tree, `cat` of the files) and pins the parse, the window, the
 per-key cap and the incremental read; `scripts/test_eval_dashboard_trend.py`
 derives the trend from them and renders the page.
