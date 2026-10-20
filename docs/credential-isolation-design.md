@@ -259,17 +259,17 @@ than in the Pod's status.
 
 ## Credential Placement
 
-| Data                             | Sandbox                | Credential runtime          |
-| -------------------------------- | ---------------------- | --------------------------- |
+| Data                             | Sandbox                                                    | Credential runtime          |
+| -------------------------------- | ---------------------------------------------------------- | --------------------------- |
 | `spec.deployment.env`            | `KUBEAGENTS_AUDIT_AUTO_PROMOTE` only, as `true` or `false` | Yes                         |
-| Slack tokens                     | No                     | Yes, Secret-backed env      |
-| PlatformAgent external API key   | No                     | Yes, Secret-backed env      |
-| Session KV API key and HMAC salt | Yes, Secret-backed env | Yes, API key only           |
-| Automatic KSA token mount        | Disabled               | Disabled                    |
-| Explicit projected KSA token     | Broker audience only   | Read-only, one-hour token   |
-| gcloud/kubectl configuration     | No                     | Private `emptyDir`          |
-| GitHub installation token/cache  | No                     | Private `emptyDir`          |
-| Agent workspace                  | Yes                    | No, the broker owns its own |
+| Slack tokens                     | No                                                         | Yes, Secret-backed env      |
+| PlatformAgent external API key   | No                                                         | Yes, Secret-backed env      |
+| Session KV API key and HMAC salt | Yes, Secret-backed env                                     | Yes, API key only           |
+| Automatic KSA token mount        | Disabled                                                   | Disabled                    |
+| Explicit projected KSA token     | Broker audience only                                       | Read-only, one-hour token   |
+| gcloud/kubectl configuration     | No                                                         | Private `emptyDir`          |
+| GitHub installation token/cache  | No                                                         | Private `emptyDir`          |
+| Agent workspace                  | Yes                                                        | No, the broker owns its own |
 
 ### The loopback-only exception
 

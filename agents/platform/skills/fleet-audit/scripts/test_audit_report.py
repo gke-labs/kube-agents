@@ -846,10 +846,16 @@ class BaseTestCase(unittest.TestCase):
                 "FLEET_AUDIT_REPORTS_DIR": str(self.reports_dir),
                 # `sop_path` reads it; an export must not move the SOP path `start` prints.
                 "PLATFORM_AGENT_HOME": "",
+                # The sweep is on unless a test says otherwise: a host with the
+                # switch off would otherwise fail every auto-promotion test.
+                audit_report.AUTO_PROMOTE_ENV: "",
             },
         )
         env.start()
         self.addCleanup(env.stop)
+        switch = patch.object(audit_report, "AUTO_PROMOTE_FILE", str(self.tmp_path / "no-audit-auto-promote"))
+        switch.start()
+        self.addCleanup(switch.stop)
         # Many tests run `start` more than once against one scratch directory
         # and never `finish`; the in-flight note would refuse the second. The
         # tests about the note itself put the real check back.
