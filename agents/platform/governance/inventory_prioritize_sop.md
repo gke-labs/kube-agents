@@ -396,8 +396,8 @@ prints a `roll-up:` line with how many items it did not list and how many of tho
 Write the report's roll-up line from it: one line giving the count, saying how many are critical
 when any are, and where the rest lives, e.g. `Also found: 14 more items, 2 of them critical,
 tracked in the findings queue — I'll bring them to you a few a day.` When it prints a `pace:` line,
-say when the rest arrives, using the times and counts it prints, or, when it says they are not added
-in chat, that they wait in the queue until the user asks. **Omit the roll-up line entirely
+say how many arrive a day, using the count it prints, and leave out the hour; or, when it says they
+are not added in chat, that they wait in the queue until the user asks. **Omit the roll-up line entirely
 when it prints `roll-up: none`** — printing `Also found: 0 items` is noise.
 
 **A report that lists no item is a correct report.** When `select` prints `list no item; there are

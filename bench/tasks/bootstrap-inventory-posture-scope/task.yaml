@@ -76,13 +76,8 @@ verification_spec:
       posture:
         - "Scanned 1 cluster and 3 workloads."
         - >-
-          This scan checked: startup probes, ResourceQuota and LimitRange,
-          read-only root filesystems, Shielded Nodes, Dataplane V2, Managed
-          Service for Prometheus, node auto-upgrade, static Google Cloud keys
-          in pods and added capabilities. It also lists other problems it saw
-          in passing that the first-run audits do not check. Security and RBAC,
-          reliability, capacity and cost come from the first-run audits, which
-          post their own findings.
+          This scan ran 9 configuration checks; security and RBAC, reliability,
+          capacity and cost come from the first-run audits.
       # The verdicts SOP Step 6 names, and the 10-20 reports' wording.
       forbidden_patterns:
         - '\bhealthy\b'

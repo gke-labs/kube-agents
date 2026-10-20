@@ -81,12 +81,13 @@ AUDIT_FAMILY_WORDS = f"{', '.join(_FAMILY_LIST[:-1])} and {_FAMILY_LIST[-1]}"
 # It names no state of the audits (running, finished, held): this terminal
 # cannot see it, and the delivery job's note says it.
 SCAN_SCOPE_SENTENCES = (
-    f"This scan checked: {', '.join(words for _, words in SCAN_CHECKS[:-1])} and {SCAN_CHECKS[-1][1]}.",
-    "It also lists other problems it saw in passing that the first-run audits do not check.",
-    f"{AUDIT_FAMILY_WORDS[:1].upper()}{AUDIT_FAMILY_WORDS[1:]} come from the first-run audits, "
-    "which post their own findings.",
+    f"This scan ran {len(SCAN_CHECKS)} configuration checks; {AUDIT_FAMILY_WORDS} come from the first-run audits.",
 )
 SCAN_SCOPE_LINE = " ".join(SCAN_SCOPE_SENTENCES)
+# The checks by name, for the raw file the agent answers "What did the scan check?" from.
+SCAN_CHECKS_SENTENCE = (
+    f"The {len(SCAN_CHECKS)} checks: {', '.join(words for _, words in SCAN_CHECKS[:-1])} and {SCAN_CHECKS[-1][1]}."
+)
 
 # ```findings ... ``` -- CommonMark's leading indent and long closing fence are
 # both accepted: bootstrap_handoff.py writes a bare fence, but a raw file typed

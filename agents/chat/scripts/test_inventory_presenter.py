@@ -79,6 +79,79 @@ DEFERRED_ROLLUP = (
 )
 
 
+#: A report that lists no item, as SOP Step 6 writes it.
+QUIET_REPORT = """# GKE Environment Scan
+
+Scanned 5 clusters and 221 workloads.
+
+Secret inspection was skipped on `platform-agent-host` and `seeded-d`: no RBAC access to Secrets there.
+
+{line}
+
+Also found: 19 more items, none of them critical, tracked in the findings queue. I'll bring them to you, at most 3 a day.
+
+The full inventory is available on request.
+""".format(line=inventory_presenter.SCAN_SCOPE_LINE)
+
+QUIET_COUNTS = "5 clusters · 221 workloads · no critical item in this scan's 9 checks"
+QUIET_GAP = "Secret inspection was skipped on `platform-agent-host` and `seeded-d`: no RBAC access to Secrets there."
+
+
+class QuietCardTest(unittest.TestCase):
+    """A report with no item gets its own card: counts, gaps, a queue line with no hour, two buttons."""
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {"FINDINGS_NONCRITICAL_MAX": "3"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def test_the_text_layout(self):
+        self.assertEqual(
+            inventory_presenter.present(QUIET_REPORT),
+            f"**First look at your fleet: done**\n{QUIET_COUNTS}\n{QUIET_GAP}\n"
+            "19 smaller items are queued. I'll bring up to 3 a day.\n\n"
+            "The full inventory is available on request.\n",
+        )
+
+    def test_the_card_has_the_lines_and_the_two_buttons_and_no_closing_line(self):
+        blocks, _ = inventory_presenter.blocks(QUIET_REPORT)
+        text = json.dumps(blocks)
+        for line in ("First look at your fleet: done", QUIET_COUNTS, "19 smaller items are queued. I'll bring up to 3 a day."):
+            self.assertIn(json.dumps(line), text)
+        self.assertIn("Secret inspection was skipped on platform-agent-host and seeded-d", text)
+        labels = [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
+        self.assertEqual(labels, ["See all 19 findings", "What did the scan check?"])
+        self.assertNotIn("available on request", text)
+        self.assertNotIn("16:00", text)
+        message, _ = inventory_presenter.chat(QUIET_REPORT)
+        self.assertEqual(message["headline"], "First look at your fleet: done")
+        self.assertEqual(message["detail"], QUIET_COUNTS)
+        self.assertEqual([c["text"] for c in message["choices"]], ["See all 19 findings", "What did the scan check?"])
+
+    def test_a_pace_of_zero_says_to_ask(self):
+        with mock.patch.dict(os.environ, {"FINDINGS_NONCRITICAL_MAX": "0"}):
+            out = inventory_presenter.present(QUIET_REPORT)
+        self.assertIn("19 smaller items are queued. Ask me when you want them.", out)
+
+    def test_a_roll_up_that_counts_held_back_criticals_is_kept_as_written(self):
+        rollup = "Also found: 4 more items, 2 of them critical, tracked in the findings queue; the list is turned off."
+        report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4], rollup)
+        self.assertNotEqual(report, QUIET_REPORT)
+        out = inventory_presenter.present(report)
+        self.assertTrue(out.startswith("**First look at your fleet: done**"), out)
+        self.assertIn(rollup, out)
+
+    def test_nothing_queued_has_only_the_scan_button(self):
+        report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4] + "\n\n", "")
+        message, _ = inventory_presenter.chat(report)
+        self.assertEqual([c["text"] for c in message["choices"]], ["What did the scan check?"])
+
+    def test_a_report_without_the_exact_posture_line_goes_as_written(self):
+        report = QUIET_REPORT.replace(inventory_presenter.SCAN_SCOPE_LINE, "The fleet looks healthy.")
+        self.assertEqual(inventory_presenter.present(report), report)
+        self.assertIsNone(inventory_presenter.blocks(report))
+
+
 class PresentTest(unittest.TestCase):
     def test_the_card_headline_top_two_and_the_closing_line(self):
         self.assertEqual(inventory_presenter.present(REPORT), PRESENTED)

@@ -228,26 +228,27 @@ AUDITS_UNCHECKED_SCHEDULED_NOTE = (
     "No cluster was audited either, so this report covers no cluster; those audits check "
     f"{inventory_findings.AUDIT_FAMILY_WORDS} on their schedules."
 )
-# The audits by what they report on, which the report's posture line names the same way.
-AUDITS_FAMILIES = f"The first-run audits ({inventory_findings.AUDIT_FAMILY_WORDS})"
+# The audits by what each reports on, as the report's posture line names them; the job ids
+# stay out of the user's chat.
+AUDITS_AREAS = "The {areas} audits"
 # Also the note before the marker exists: the stage writes it on its first tick after the ranking
 # card finishes, which a user already in the chat can beat to this run.
 AUDITS_RUNNING_NOTE = (
-    f"{AUDITS_FAMILIES} run one after another once this scan is done. "
-    "Each posts a summary to the home channel when it finds something new."
+    f"{AUDITS_AREAS.format(areas=inventory_findings.AUDIT_FAMILY_WORDS)} run one after another once this "
+    "scan is done. Each posts a summary to the home channel when it finds something new."
 )
 AUDITS_RAN_NOTE = (
-    f"{AUDITS_FAMILIES} have started: {{audits}}. Each posts a summary to the home channel "
-    "when it finds something new."
+    f"{AUDITS_AREAS} have started. Each posts a summary to the home channel when it finds something new."
 )
 AUDITS_NONE_RAN_NOTE = (
     f"None of the first-run audits ran. This report does not cover {inventory_findings.AUDIT_FAMILY_WORDS}."
 )
 AUDITS_NOT_RUN_NOTE = "Not run: {audits}."
+AUDITS_NOT_RUN_ITEM = "the {area} audit ({reason})"
 # oobe gives up on an audit it could not start; the audit still runs on its own schedule.
 AUDITS_GAVE_UP_REASON = "it did not start, and runs on its own schedule"
 # Every audit the chain started has completed its run, so "have started" would be stale.
-AUDITS_FINISHED_NOTE = f"{AUDITS_FAMILIES} have run: {{audits}}."
+AUDITS_FINISHED_NOTE = f"{AUDITS_AREAS} have run."
 # Said of every failed delivery, whatever refused it: usually no home channel yet, which an audit
 # that ends before anyone opens the chat always meets, and the scheduler does not post it again
 # (_undelivered_audits).
@@ -845,10 +846,15 @@ def _audits_note(data_dir: Path, no_coverage: bool, home: bool = True) -> str:
     return note.replace(" " + AUDITS_HOME_SENTENCE, replacement)
 
 
-def _family(audit: str) -> str:
-    """What ``audit`` reports on, as a lead before its reason, so a held audit's area is not read as covered."""
-    family = inventory_findings.AUDIT_FAMILIES.get(audit)
-    return f"{family}; " if family else ""
+def _area(audit: str) -> str:
+    """What ``audit`` reports on, or its job id for an audit with no area."""
+    return inventory_findings.AUDIT_FAMILIES.get(audit) or f"`{audit}`"
+
+
+def _areas(audits: list[str]) -> str:
+    """``a, b and c`` of the audits' areas."""
+    words = [_area(a) for a in audits]
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
 
 
 def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
@@ -870,8 +876,12 @@ def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
     fired = [a for a in oobe.FIRST_RUN_AUDITS if a in _list(state.get(oobe.STATE_FIRED))]
     held = state.get(oobe.STATE_HELD) if isinstance(state.get(oobe.STATE_HELD), dict) else {}
     gave_up = _list(state.get(oobe.STATE_GAVE_UP))
-    not_run = [f"`{a}` ({_family(a)}{held[a]})" for a in oobe.FIRST_RUN_AUDITS if a in held]
-    not_run += [f"`{a}` ({_family(a)}{AUDITS_GAVE_UP_REASON})" for a in oobe.FIRST_RUN_AUDITS if a in gave_up]
+    not_run = [AUDITS_NOT_RUN_ITEM.format(area=_area(a), reason=held[a]) for a in oobe.FIRST_RUN_AUDITS if a in held]
+    not_run += [
+        AUDITS_NOT_RUN_ITEM.format(area=_area(a), reason=AUDITS_GAVE_UP_REASON)
+        for a in oobe.FIRST_RUN_AUDITS
+        if a in gave_up
+    ]
     runs = _completed_runs(data_dir, fired)
     marks = state.get(oobe.STATE_MARKS) if isinstance(state.get(oobe.STATE_MARKS), dict) else {}
     # A mark that is not a number reads as no mark: this runs after the claim, and a raise here
@@ -885,9 +895,9 @@ def _audits_state_note(data_dir: Path, no_coverage: bool) -> str:
     if not state.get(oobe.STATE_DONE):
         note = AUDITS_RUNNING_NOTE
     elif fired and finished == fired:
-        note = AUDITS_FINISHED_NOTE.format(audits=", ".join(f"`{a}`" for a in fired))
+        note = AUDITS_FINISHED_NOTE.format(areas=_areas(fired))
     elif fired:
-        note = AUDITS_RAN_NOTE.format(audits=", ".join(f"`{a}`" for a in fired))
+        note = AUDITS_RAN_NOTE.format(areas=_areas(fired))
     else:
         note = AUDITS_NONE_RAN_NOTE
     if not_run:

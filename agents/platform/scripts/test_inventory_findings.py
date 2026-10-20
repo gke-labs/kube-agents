@@ -595,11 +595,11 @@ class SelectCommandTests(unittest.TestCase):
                 _, out, _ = self.run_select(rows, limits)
                 self.assertIn(posture, out.splitlines())
 
-    def test_the_posture_line_names_the_scan_checks_and_no_verdict(self):
-        for _, words in inv.SCAN_CHECKS:
-            self.assertIn(words, inv.SCAN_SCOPE_LINE)
-        self.assertIn(
-            "Security and RBAC, reliability, capacity and cost come from the first-run audits", inv.SCAN_SCOPE_LINE
+    def test_the_posture_line_counts_the_scan_checks_and_judges_nothing(self):
+        self.assertEqual(
+            inv.SCAN_SCOPE_LINE,
+            f"This scan ran {len(inv.SCAN_CHECKS)} configuration checks; security and RBAC, reliability, "
+            "capacity and cost come from the first-run audits.",
         )
         for verdict in ("healthy", "clean", "no critical", "running now"):
             self.assertNotIn(verdict, inv.SCAN_SCOPE_LINE.lower())

@@ -496,7 +496,7 @@ def compose(state: dict, timed_out: bool, now: float | None = None) -> str:
     stamp = time.strftime(STAMP_FORMAT, time.gmtime(now if now is not None else time.time()))
     import inventory_findings  # beside this script in the pod
 
-    owned = inventory_findings.SCAN_SCOPE_LINE
+    owned = f"{inventory_findings.SCAN_SCOPE_LINE} {inventory_findings.SCAN_CHECKS_SENTENCE}"
     out = [
         "# GKE Environment Discovery Report — raw findings",
         "",
