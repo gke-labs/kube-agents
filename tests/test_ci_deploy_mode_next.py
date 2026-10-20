@@ -393,6 +393,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}",
         ]
+        # The card stop, armed on the lane so chat-stop-halts-delegated-remediation
+        # grades it, under the name the operator reads it by.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[8].name={go_constant(_A2A_MANIFESTS, 'a2aCardStopEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[8].value=true",
+        ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the

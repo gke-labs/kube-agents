@@ -205,6 +205,7 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-zonal-cluster-named-by-region",  # a zonal cluster named by its region, #3371
     "helm-chart-no-reconciler-stops",  # gitops-helm-chart stops where nothing renders charts, #2938
     "delete-namespace-unowned-stops",  # a delete the repository cannot carry ends in a stated stop, #3077
+    "chat-stop-halts-delegated-remediation",  # a typed stop reaches the card, next lane only, #3263
 ]
 # Taken back out of the nightly file after registering there, each with a
 # KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py that says why.
@@ -638,6 +639,55 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, eval_rosters.blocking_roster())
                 else:
                     self.assertIn(case, eval_rosters.nightly_cases())
+
+
+# The api lane's exclusions at their introduction (#3263): the cases only the
+# inject door can carry. An edit to the file edits this set.
+API_LANE_EXCLUDED = [
+    "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
+]
+# The first line that makes a prompt a stopped ask (bench/kube_agents_bench/stop_hook.py,
+# STOP_DIRECTIVE); spelled here because this suite imports nothing from bench/.
+STOP_DIRECTIVE = "[bench:stop-after-first-card]"
+
+
+class ApiLaneExclusionsTest(unittest.TestCase):
+    """hack/eval/api-lane-exclusions.txt: the inject lane's mirror, checked the same way."""
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(list(eval_rosters.api_lane_exclusions()), API_LANE_EXCLUDED)
+
+    def test_every_exclusion_names_a_registered_nightly_case(self):
+        # Not a presubmit case: the presubmit runs on the api lane, so a case
+        # excluded there would hold a seat it never fills.
+        for case in eval_rosters.api_lane_exclusions():
+            with self.subTest(case=case):
+                self.assertTrue((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").is_file(), f"{case} has no task.yaml")
+                self.assertIn(case, eval_rosters.nightly_cases())
+                self.assertNotIn(case, eval_rosters.presubmit_cases())
+                self.assertNotIn(case, eval_rosters.blocking_roster())
+
+    def test_every_exclusion_carries_a_reason_that_names_an_issue(self):
+        for case, reason in eval_rosters.api_lane_exclusions().items():
+            with self.subTest(case=case):
+                self.assertTrue(reason, f"{case}: no reason in the comment block above it")
+                self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
+
+    def test_no_case_is_excluded_on_both_lanes(self):
+        self.assertFalse(set(eval_rosters.api_lane_exclusions()) & set(eval_rosters.inject_lane_exclusions()))
+
+    def test_every_registered_stopped_ask_is_excluded(self):
+        # A stopped ask errors on the api transport, so an unlisted one would
+        # error there every repetition.
+        import yaml
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            words = str(doc.get("prompt") or "").strip().partition("\n")[0].split()
+            if words[:1] == [STOP_DIRECTIVE]:
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the

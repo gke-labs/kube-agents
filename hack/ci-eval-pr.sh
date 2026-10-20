@@ -51,6 +51,9 @@ readonly NIGHTLY_HALF_CKSUM_BIT=2
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
+# Its mirror (#3263): the cases every other lane does not run, because their
+# premise needs the inject door (a second message on the same conversation).
+readonly EVAL_API_LANE_EXCLUSIONS_FILE="eval/api-lane-exclusions.txt"
 # A sixth, applied on the same lane (#2079): the safeguards every case the
 # lane runs carries beside its own -- today the one that fails a repetition
 # on a GitHub write the case did not request. Appended to a copy of each
@@ -2156,6 +2159,37 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
     exit 1
   fi
   echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
+fi
+# The mirror (#3263): hack/eval/api-lane-exclusions.txt names the cases only
+# the inject door can carry (a stop sent as the conversation's next message,
+# bench/kube_agents_bench/stop_hook.py). Read and checked on every lane like
+# the list above; applied on every transport but inject. None of them is on
+# the blocking roster (scripts/test_eval_rosters.py), so BOOTSTRAP_ADMITTED
+# needs no drop list for them.
+API_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_API_LANE_EXCLUSIONS_FILE}"
+API_LANE_EXCLUDED="$(roster_entries "${API_LANE_EXCLUSIONS_FILE}")"
+while IFS= read -r NAME; do
+  if [ -z "${NAME}" ]; then continue; fi
+  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
+    echo "ERROR: ${API_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the api lane." >&2
+    exit 1
+  fi
+done <<< "${API_LANE_EXCLUDED}"
+if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_EXCLUDED}" ]; then
+  API_LANE_KEPT=()
+  for ENTRY in "${TASKS[@]}"; do
+    NAME="$(basename "$(dirname "${ENTRY}")")"
+    if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: ${NAME} leaves the matrix -- it runs on the inject lane only; the reason is in ${EVAL_API_LANE_EXCLUSIONS_FILE}"
+    else
+      API_LANE_KEPT+=("${ENTRY}")
+    fi
+  done
+  TASKS=(${API_LANE_KEPT[@]+"${API_LANE_KEPT[@]}"})
+  if [ "${#TASKS[@]}" -eq 0 ]; then
+    echo "ERROR: every case in the matrix is excluded on the api lane (${EVAL_API_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
+    exit 1
+  fi
 fi
 
 # ─── The inject lane's safeguards (#2079) ────────────────────────────────────
