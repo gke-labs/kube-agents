@@ -2092,6 +2092,28 @@ class ScopeGapParagraphTest(unittest.TestCase):
         self.assertLess(body.index("`locked` (denied)"), body.index("**Step 2"))
 
 
+class SelectionTest(unittest.TestCase):
+    """The short card's facts: what `select` chose, scored from the batch the registration read."""
+
+    def test_a_batch_with_no_critical_lists_nothing_and_queues_every_item(self):
+        # SCORE is major; f001 and f002 share a check on acme/prod, so they are one item.
+        selection = bootstrap_delivery._selection(EXTRACTED["items"], SCORED["scores"], set())
+        self.assertEqual(selection, {"listed": 0, "held": 0, "queued": 2})
+
+    def test_criticals_held_back_by_a_limit_of_zero_are_counted(self):
+        critical = dict(SCORE, rubric={"B": 8, "L": 6, "detect": 3, "recover": 3, "C": 1.0})
+        scores = {"f001": critical, "f002": SCORE, "f003": SCORE}
+        with mock.patch.dict(os.environ, {"FINDINGS_FIRST_REPORT_CRITICALS": "0"}):
+            selection = bootstrap_delivery._selection(EXTRACTED["items"], scores, set())
+        self.assertEqual(selection["listed"], 0)
+        self.assertEqual(selection["held"], 1)
+
+    def test_an_unread_or_bad_batch_is_unknown(self):
+        self.assertIsNone(bootstrap_delivery._selection(None, None, set()))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(bootstrap_delivery._selection(EXTRACTED["items"], {}, set()))
+
+
 class FirstRunAuditsTest(unittest.TestCase):
     """The scan leaves the first-run audits' checks to them, and the delivery says so."""
 

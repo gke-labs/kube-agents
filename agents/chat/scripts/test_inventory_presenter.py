@@ -97,8 +97,12 @@ QUIET_COUNTS = "5 clusters · 221 workloads · no critical item in this scan's 9
 QUIET_GAP = "Secret inspection was skipped on `platform-agent-host` and `seeded-d`: no RBAC access to Secrets there."
 
 
+#: What `select` chose for QUIET_REPORT's batch, as bootstrap_delivery passes it.
+QUIET_SELECTION = {"listed": 0, "held": 0, "queued": 19}
+
+
 class QuietCardTest(unittest.TestCase):
-    """A report with no item gets its own card: counts, gaps, a queue line with no hour, two buttons."""
+    """A report with no item gets its own card: counts, gaps, a queue line with no hour, the checks folded."""
 
     def setUp(self):
         env = mock.patch.dict(os.environ, {"FINDINGS_NONCRITICAL_MAX": "3"})
@@ -107,26 +111,29 @@ class QuietCardTest(unittest.TestCase):
 
     def test_the_text_layout(self):
         self.assertEqual(
-            inventory_presenter.present(QUIET_REPORT),
+            inventory_presenter.present(QUIET_REPORT, QUIET_SELECTION),
             f"**First look at your fleet: done**\n{QUIET_COUNTS}\n{QUIET_GAP}\n"
             "19 smaller items are queued. I'll bring up to 3 a day.\n\n"
             "The full inventory is available on request.\n",
         )
 
-    def test_the_card_has_the_lines_and_the_two_buttons_and_no_closing_line(self):
-        blocks, _ = inventory_presenter.blocks(QUIET_REPORT)
-        text = json.dumps(blocks)
+    def test_the_card_has_the_lines_the_fold_and_the_button_and_no_closing_line(self):
+        blocks, text = inventory_presenter.blocks(QUIET_REPORT, QUIET_SELECTION)
+        dumped = json.dumps(blocks)
         for line in ("First look at your fleet: done", QUIET_COUNTS, "19 smaller items are queued. I'll bring up to 3 a day."):
-            self.assertIn(json.dumps(line), text)
-        self.assertIn("Secret inspection was skipped on platform-agent-host and seeded-d", text)
+            self.assertIn(json.dumps(line), dumped)
+        self.assertIn("Secret inspection was skipped on platform-agent-host and seeded-d", dumped)
         labels = [e["text"]["text"] for b in blocks if b["type"] == "actions" for e in b["elements"]]
         self.assertEqual(labels, ["See all 19 findings"])
         fold = next(b for b in blocks if b.get("title", {}).get("text") == "What this scan checked")
         for _, words in inventory_presenter.SCAN_CHECKS:
             self.assertIn(json.dumps(words), json.dumps(fold))
-        self.assertNotIn("available on request", text)
-        self.assertNotIn("16:00", text)
-        message, _ = inventory_presenter.chat(QUIET_REPORT)
+        self.assertNotIn("available on request", dumped)
+        self.assertNotIn("16:00", dumped)
+        # The notification text carries the gap, so it does not read clean, and not the checks.
+        self.assertIn("Secret inspection was skipped", text)
+        self.assertNotIn("startup probes", text)
+        message, _ = inventory_presenter.chat(QUIET_REPORT, QUIET_SELECTION)
         self.assertEqual(message["headline"], "First look at your fleet: done")
         self.assertEqual(message["detail"], QUIET_COUNTS)
         self.assertEqual([c["text"] for c in message["choices"]], ["See all 19 findings"])
@@ -134,52 +141,38 @@ class QuietCardTest(unittest.TestCase):
 
     def test_a_pace_of_zero_says_to_ask(self):
         with mock.patch.dict(os.environ, {"FINDINGS_NONCRITICAL_MAX": "0"}):
-            out = inventory_presenter.present(QUIET_REPORT)
+            out = inventory_presenter.present(QUIET_REPORT, QUIET_SELECTION)
         self.assertIn("19 smaller items are queued. Ask me when you want them.", out)
 
-    def test_a_report_that_mentions_criticals_any_other_way_goes_as_written(self):
-        # The card would say "no critical item" above them.
-        rollups = (
-            "Also found: 4 more items, 2 of them critical, tracked in the findings queue.",
-            "Also found: 3 more items, 2 of which are critical, tracked in the findings queue.",
-            "Also found: 1 more item, which is critical, tracked in the findings queue.",
-        )
-        for rollup in rollups:
-            with self.subTest(rollup=rollup):
-                report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4], rollup)
-                self.assertNotEqual(report, QUIET_REPORT)
-                self.assertEqual(inventory_presenter.present(report), report)
-                self.assertIsNone(inventory_presenter.blocks(report))
-        for item in ("**Critical** quote-api is down.", "Critical — quote-api is down.", "## Critical\n\nquote-api is down."):
-            with self.subTest(item=item):
-                report = QUIET_REPORT.replace("The full inventory", f"{item}\n\nThe full inventory")
-                self.assertEqual(inventory_presenter.present(report), report)
-
-    def test_the_fallback_text_does_not_read_the_checks_as_findings(self):
-        _, text = inventory_presenter.blocks(QUIET_REPORT)
-        self.assertNotIn("startup probes", text)
+    def test_the_claim_comes_from_the_selection_not_the_prose(self):
+        # Held-back criticals, a listed item, or no selection at all: the report goes as written,
+        # whatever its roll-up says.
+        for selection in ({"listed": 0, "held": 2, "queued": 4}, {"listed": 1, "held": 0, "queued": 3}, None, {}):
+            with self.subTest(selection=selection):
+                self.assertEqual(inventory_presenter.present(QUIET_REPORT, selection), QUIET_REPORT)
+                self.assertIsNone(inventory_presenter.blocks(QUIET_REPORT, selection))
+        # The queued count is the selection's, not the roll-up's.
+        out = inventory_presenter.present(QUIET_REPORT, {"listed": 0, "held": 0, "queued": 7})
+        self.assertIn("7 smaller items are queued.", out)
 
     def test_nothing_queued_has_no_button_and_one_queued_is_singular(self):
-        report = QUIET_REPORT.replace(QUIET_REPORT.split("\n\n")[4] + "\n\n", "")
-        message, _ = inventory_presenter.chat(report)
+        message, _ = inventory_presenter.chat(QUIET_REPORT, {"listed": 0, "held": 0, "queued": 0})
         self.assertEqual(message.get("choices", []), [])
-        one = QUIET_REPORT.replace("19 more items", "1 more item")
-        message, _ = inventory_presenter.chat(one)
+        message, _ = inventory_presenter.chat(QUIET_REPORT, {"listed": 0, "held": 0, "queued": 1})
         self.assertEqual([c["text"] for c in message["choices"]], ["See the 1 finding"])
 
-    def test_a_critical_written_outside_the_numbered_list_goes_as_written(self):
-        # The card would say "no critical item" above it.
+    def test_a_list_anywhere_goes_as_written(self):
         for item in ("- **Critical: quote-api is down**", "  1. **Critical: quote-api is down**",
-                     "**1. Critical: quote-api is down**", "Critical: quote-api is down."):
+                     "**1. Critical: quote-api is down**"):
             with self.subTest(item=item):
                 report = QUIET_REPORT.replace("The full inventory", f"{item}\n\nThe full inventory")
-                self.assertEqual(inventory_presenter.present(report), report)
-                self.assertIsNone(inventory_presenter.blocks(report))
+                self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)
+                self.assertIsNone(inventory_presenter.blocks(report, QUIET_SELECTION))
 
     def test_a_report_without_the_exact_posture_line_goes_as_written(self):
         report = QUIET_REPORT.replace(inventory_presenter.SCAN_SCOPE_LINE, "The fleet looks healthy.")
-        self.assertEqual(inventory_presenter.present(report), report)
-        self.assertIsNone(inventory_presenter.blocks(report))
+        self.assertEqual(inventory_presenter.present(report, QUIET_SELECTION), report)
+        self.assertIsNone(inventory_presenter.blocks(report, QUIET_SELECTION))
 
 
 class PresentTest(unittest.TestCase):
