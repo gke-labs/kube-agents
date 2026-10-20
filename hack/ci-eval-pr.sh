@@ -2559,7 +2559,9 @@ fi
 # The matrix's size, computed (#3495). The roster files don't carry totals any
 # more, so this line is where a run's count is read; for the files themselves,
 # `python3 scripts/eval_rosters.py --summary`.
-echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(( ${#TASKS[@]} * 10#${EVAL_REPETITIONS} )) unit(s)"
+# awk reads every value the check above accepts (08, +3, " 3") as the number
+# seq does, so a log line can never stop the job.
+echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(awk -v n="${#TASKS[@]}" -v r="${EVAL_REPETITIONS}" 'BEGIN { print n * r }') unit(s)"
 
 # How far a judged mean may fall below main's before rung 6 fires. 0.5 is
 # arithmetic on the measured spread, not a preference: three repetitions of one

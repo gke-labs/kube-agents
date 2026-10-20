@@ -367,7 +367,7 @@ class NightlySortedSectionTest(unittest.TestCase):
         # an entry placed directly under it without a blank line has none.
         lines = self.tail.splitlines()
         i = 1
-        while i < len(lines) and lines[i].startswith("#"):
+        while i < len(lines) and lines[i].lstrip().startswith("#"):
             i += 1
         # The parser keys a reason by its entry, here a ./tasks/<id>/task.yaml path.
         reasons = {
