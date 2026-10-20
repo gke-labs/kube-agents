@@ -103,18 +103,19 @@ nothing periodically asked (#656).
 ``stuck_in_blocked`` is therefore reported whatever the severity floor says: a
 worker or operator block is sticky, nothing retries it until a human acts, and
 a card nobody is looking at is the one finding this check exists for. The rule
-is stateless and a card still blocked is named (directly or by task ID in the
-omitted list when long reports are bounded) once a day until someone unblocks,
+The rule is stateless and a card still blocked is named (directly, or by task ID
+in the omitted list up to the report budget) once a day until someone unblocks,
 comments on, or archives it, which is the intended nag.
 Cards are listed newest first, each with its kind, reason, and age read from the
 board, so recent outages surface at the top. Where multiple cards share a title,
 they are grouped: small groups list each card's task ID, kind, age, and reason,
 while larger groups summarize the count, kind breakdown, and oldest age,
-followed by the newest card's details and all task IDs. Long reports are bounded
+followed by the newest card's details and task IDs. Long reports are bounded
 to keep recent outage cards and the footer commands within chat limits,
-summarizing any omitted older cards with their task IDs. The operator unblock
-and archive commands appear once in a footer (noting they run on the agent pod)
-rather than repeated under every card.
+summarizing any omitted older cards by task ID up to the character budget (and
+falling back to a count and list command when omitted IDs exceed the limit). The
+operator unblock and archive commands appear once in a footer (noting they run
+on the agent pod) rather than repeated under every card.
 
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 """
@@ -159,9 +160,12 @@ AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
 MAX_STUCK_ITEMS = 15
 MAX_STUCK_CHARS = 5500
+MIN_STUCK_CHARS = 2000
 MAX_DIAGNOSTIC_ITEMS = 20
 MAX_DIAGNOSTIC_CHARS = 3500
-MAX_REPORT_CHARS = 10000
+MAX_INVARIANT_ITEMS = 20
+MAX_REPORT_CHARS = 8500
+MAX_GROUP_IDS_CHARS = 500
 GROUP_EXPAND_MAX = 3
 # Pinned to the board file this run read, the way `diagnostics_lines` pins the
 # engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
@@ -343,10 +347,53 @@ def _card_age_hours(diag: dict) -> float:
     return float("inf")
 
 
-def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_chars: int = MAX_STUCK_CHARS) -> list:
+def _format_id_list(ids: list, max_chars: int = MAX_GROUP_IDS_CHARS) -> str:
+    """Format task IDs comma-separated, truncating with ', and N more' if exceeding max_chars."""
+    if not ids:
+        return ""
+    all_str = ", ".join(ids)
+    if len(all_str) <= max_chars:
+        return all_str
+    chosen = []
+    for i, tid in enumerate(ids):
+        remaining_count = len(ids) - (i + 1)
+        suffix = f", and {remaining_count} more" if remaining_count > 0 else ""
+        candidate = (", ".join(chosen + [tid]) + suffix) if chosen else (tid + suffix)
+        if len(candidate) > max_chars:
+            if chosen:
+                break
+            return f"and {len(ids)} more"
+        chosen.append(tid)
+    remaining_count = len(ids) - len(chosen)
+    if remaining_count > 0:
+        return ", ".join(chosen) + f", and {remaining_count} more"
+    return ", ".join(chosen)
+
+
+def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=None) -> list:
+    """Take items up to max_items and max_chars (including newlines)."""
+    taken = []
+    total_chars = 0
+    for item in items:
+        if len(taken) >= max_items:
+            break
+        lines = line_fn(item) if line_fn else item
+        if isinstance(lines, str):
+            lines = [lines]
+        item_chars = sum(len(ln) + 1 for ln in lines)
+        if total_chars + item_chars > max_chars:
+            break
+        taken.append(item)
+        total_chars += item_chars
+    return taken
+
+
+def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_chars: int | None = None) -> list:
     """Render stuck cards: grouped by title when duplicated, newest first, commands once."""
     if not stuck_items:
         return []
+    if max_chars is None:
+        max_chars = MAX_STUCK_CHARS
 
     parsed = []
     for task_id, diag, entry in stuck_items:
@@ -412,8 +459,8 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
                 if newest_card["reason"]:
                     latest_sub += f' — "{newest_card["reason"]}"'
                 lines_for_group.append(latest_sub)
-                ids = [c["task_id"] for c in group]
-                lines_for_group.append(f"    ids: {', '.join(ids)}")
+                group_ids = [c["task_id"] for c in group]
+                lines_for_group.append(f"    ids: {_format_id_list(group_ids, MAX_GROUP_IDS_CHARS)}")
             renderable_items.append({
                 "age_hours": newest_age,
                 "key": title,
@@ -434,40 +481,55 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
 
     renderable_items.sort(key=lambda item: (item["age_hours"], item["key"]))
 
-    lines = [
+    tid = stuck_items[0][0] if len(stuck_items) == 1 else "<task_id>"
+    footer_lines = [
+        "  Commands to move a card (run on the agent pod):",
+        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}",
+        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}",
+    ]
+    footer_chars = sum(len(ln) + 1 for ln in footer_lines)
+
+    header = (
         "Cards blocked with no one looking (a worker or operator block is sticky: "
         "nothing retries it until a human acts):"
-    ]
+    )
+    header_chars = len(header) + 1
 
-    shown_lines = []
-    rendered_cards = 0
-    items_rendered = 0
-    total_cards = len(stuck_items)
+    budget_for_body = max(0, max_chars - header_chars - footer_chars)
+    min_omission_chars = 120
+    available_for_items = max(0, budget_for_body - min_omission_chars)
 
-    for item in renderable_items:
-        item_chars = sum(len(ln) + 1 for ln in item["lines"])
-        current_chars = sum(len(ln) + 1 for ln in shown_lines)
-        if items_rendered >= MAX_STUCK_ITEMS or (shown_lines and (current_chars + item_chars > max_chars)):
-            break
-        shown_lines.extend(item["lines"])
-        rendered_cards += item["card_count"]
-        items_rendered += 1
+    taken_items = _take_within_budget(
+        renderable_items, MAX_STUCK_ITEMS, available_for_items, line_fn=lambda it: it["lines"]
+    )
+    if len(taken_items) < len(renderable_items) and len(taken_items) < MAX_STUCK_ITEMS:
+        next_item = renderable_items[len(taken_items)]
+        next_chars = sum(len(ln) + 1 for ln in next_item["lines"])
+        current_chars = sum(sum(len(ln) + 1 for ln in it["lines"]) for it in taken_items)
+        if len(taken_items) + 1 == len(renderable_items) and (current_chars + next_chars <= budget_for_body):
+            taken_items.append(next_item)
 
-    lines.extend(shown_lines)
+    lines = [header]
+    for it in taken_items:
+        lines.extend(it["lines"])
 
-    omitted_cards = total_cards - rendered_cards
+    rendered_cards = sum(it["card_count"] for it in taken_items)
+    omitted_cards = len(stuck_items) - rendered_cards
     if omitted_cards > 0:
-        omitted_ids = [c["task_id"] for item in renderable_items[items_rendered:] for c in item["cards"]]
-        lines.append(
-            f"  ... and {omitted_cards} older stuck card{'s' if omitted_cards != 1 else ''} omitted "
-            f"(ids: {', '.join(omitted_ids)}; run hermes kanban list on the agent pod to view all)"
-        )
+        current_body_chars = sum(len(ln) + 1 for ln in lines[1:])
+        remaining_for_omission = max(0, budget_for_body - current_body_chars)
+        omitted_ids = [c["task_id"] for it in renderable_items[len(taken_items):] for c in it["cards"]]
+        prefix = f"  ... and {omitted_cards} older stuck card{'s' if omitted_cards != 1 else ''} omitted"
+        list_hint = "; run hermes kanban list on the agent pod to view all"
+        omission_overhead = len(prefix) + len(" (ids: ") + len(list_hint) + len(")\n")
+        max_ids_budget = remaining_for_omission - omission_overhead
+        if max_ids_budget >= 15:
+            formatted_ids = _format_id_list(omitted_ids, max_chars=max_ids_budget)
+            lines.append(f"{prefix} (ids: {formatted_ids}{list_hint})")
+        else:
+            lines.append(f"{prefix} (run hermes kanban list on the agent pod to view all)")
 
-    lines.append("  Commands to move a card (run on the agent pod):")
-    tid = stuck_items[0][0] if len(stuck_items) == 1 else "<task_id>"
-    lines.append(f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}")
-    lines.append(f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}")
-
+    lines.extend(footer_lines)
     return lines
 
 
@@ -526,7 +588,8 @@ def _parse_diagnostics_json(out: str):
 
 
 def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
-                      binary=None, env=None, context=None, always=ALWAYS_REPORT_KINDS) -> list:
+                      binary=None, env=None, context=None, always=ALWAYS_REPORT_KINDS,
+                      *, max_chars: int | None = None) -> list:
     """Ask the shipped rule engine. Returns rendered lines; empty when clean.
 
     ``--json`` returns before the human-table branch of ``_cmd_diagnostics``, so
@@ -596,17 +659,8 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
                 parts.append(f" - {detail}")
             diag_lines.append("".join(parts))
 
-    lines = []
-    shown_diag_lines = []
-    for dl in diag_lines:
-        current_chars = sum(len(ln) + 1 for ln in shown_diag_lines)
-        if len(shown_diag_lines) >= MAX_DIAGNOSTIC_ITEMS or (
-            shown_diag_lines and (current_chars + len(dl) + 1 > MAX_DIAGNOSTIC_CHARS)
-        ):
-            break
-        shown_diag_lines.append(dl)
-
-    lines.extend(shown_diag_lines)
+    shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, MAX_DIAGNOSTIC_CHARS)
+    lines = list(shown_diag_lines)
     omitted_diags = len(diag_lines) - len(shown_diag_lines)
     if omitted_diags > 0:
         lines.append(
@@ -614,16 +668,21 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
             f"(run hermes kanban diagnostics on the agent pod to view all)"
         )
 
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS
+
     if stuck_items:
         current_chars = sum(len(ln) + 1 for ln in lines)
-        remaining = max(2000, MAX_REPORT_CHARS - current_chars - 1000)
+        remaining = max(MIN_STUCK_CHARS, max_chars - current_chars)
         stuck_budget = min(MAX_STUCK_CHARS, remaining)
         lines.extend(render_stuck_cards(stuck_items, context or {}, home, max_chars=stuck_budget))
     return lines
 
 
-def report(home: Path, *, env=None, **kwargs) -> list:
+def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> list:
     """The whole check. Empty list means healthy, which means silent."""
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS
     db = board_path(home)
     if not db.exists():
         # No board on this profile: not a failure, nothing to say. Skipping the
@@ -636,13 +695,25 @@ def report(home: Path, *, env=None, **kwargs) -> list:
         context = blocked_context(conn)
     finally:
         conn.close()
+
+    used_chars = 40  # reserve for main() header: "kanban board health: attention required\n"
     if violations:
         lines.append(
             "Board invariant violations (a direct write to kanban.db is the usual cause):"
         )
-        lines.extend(violations)
+        shown_violations = _take_within_budget(violations, MAX_INVARIANT_ITEMS, MAX_DIAGNOSTIC_CHARS)
+        lines.extend(shown_violations)
+        omitted_violations = len(violations) - len(shown_violations)
+        if omitted_violations > 0:
+            lines.append(
+                f"  ... and {omitted_violations} other invariant violation{'s' if omitted_violations != 1 else ''} omitted"
+            )
+        used_chars += sum(len(ln) + 1 for ln in lines)
+
+    remaining_chars = max(0, max_chars - used_chars)
     diags = diagnostics_lines(
-        home, severity_floor(env), env=env, context=context, always=always_report_kinds(env), **kwargs
+        home, severity_floor(env), env=env, context=context, always=always_report_kinds(env),
+        max_chars=remaining_chars, **kwargs
     )
     if diags:
         lines.append("Active kanban diagnostics:")

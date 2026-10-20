@@ -595,7 +595,135 @@ class DiagnosticsTests(unittest.TestCase):
         # Commands footer remains intact
         self.assertIn("Commands to move a card (run on the agent pod):", text)
         # Whole report strictly respects budget well below 12,000 chars
-        self.assertLess(len(text), 10000)
+        self.assertLess(len(text), kbh.MAX_REPORT_CHARS)
+
+    def test_non_stuck_diagnostics_bounded_by_max_items_when_lines_are_short(self):
+        # 25 non-stuck error diagnostics of ~80 chars each.
+        # Total chars for 25 lines = ~2000 chars, well below MAX_DIAGNOSTIC_CHARS (3500).
+        # Therefore the item cap (MAX_DIAGNOSTIC_ITEMS = 20) MUST trip before the character cap,
+        # asserting exactly 20 items are shown and 5 are omitted.
+        cards = []
+        for i in range(25):
+            cards.append({
+                "task_id": f"t_item_{i:02d}",
+                "status": "failed",
+                "diagnostics": [{
+                    "kind": "repeated_failures",
+                    "severity": "error",
+                    "title": f"Err {i:02d}",
+                    "detail": "short detail",
+                }],
+            })
+        payload = json.dumps(cards)
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={})
+        text = "\n".join(lines)
+        self.assertIn("t_item_00", text)
+        self.assertIn("t_item_19", text)
+        self.assertNotIn("t_item_20", text)
+        self.assertIn("... and 5 other diagnostics omitted", text)
+
+    def test_stuck_budget_derived_from_remaining_report_allowance_and_floor(self):
+        # Non-stuck diagnostics sit near cap (3500 chars).
+        # Stuck cards have 10 items of ~300 chars each = ~3000 chars.
+        # When MAX_REPORT_CHARS is patched to 5000, remaining budget hits the MIN_STUCK_CHARS floor (2000).
+        # Stuck cards must be bounded by the derived 2000 budget, omitting later cards.
+        # With bare MAX_STUCK_CHARS (5500), all 3000 chars would fit without omission.
+        cards = []
+        for i in range(16):
+            cards.append({
+                "task_id": f"t_diag_{i:02d}",
+                "status": "failed",
+                "diagnostics": [{
+                    "kind": "repeated_failures",
+                    "severity": "error",
+                    "title": f"Failure {i:02d}",
+                    "detail": "x" * 150,
+                }],
+            })
+        context = {}
+        for i in range(10):
+            tid = f"t_stuck_{i:02d}"
+            cards.append({
+                "task_id": tid,
+                "status": "blocked",
+                "title": f"Stuck item {i:02d}",
+                "diagnostics": [{
+                    "kind": "stuck_in_blocked",
+                    "severity": "warning",
+                    "title": "x",
+                    "detail": "y",
+                    "data": {"age_hours": 24 + i},
+                }],
+            })
+            context[tid] = {
+                "kind": "needs_input",
+                "reason": "z" * 180,
+            }
+        payload = json.dumps(cards)
+        with unittest.mock.patch.object(kbh, "MAX_REPORT_CHARS", 5000):
+            lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                          runner=self.runner_for(0, payload)[0],
+                                          binary="/x/hermes", env={}, context=context)
+            text = "\n".join(lines)
+            # Diagnostics at cap
+            self.assertIn("t_diag_00", text)
+            # Derived budget cut stuck cards around 2000 chars
+            self.assertIn("t_stuck_00", text)
+            self.assertNotIn("Stuck item 09", text)
+            self.assertIn("older stuck cards omitted", text)
+            self.assertIn("t_stuck_06", text)
+            self.assertIn("and 2 more", text)
+            # Preserves commands footer
+            self.assertIn("Commands to move a card", text)
+            self.assertLessEqual(len(text), 5200)
+
+    def test_hundreds_of_omitted_cards_bounded_without_overflow(self):
+        # 500 stuck cards omitted: verifies omission line does not blow past limits
+        cards = []
+        for i in range(500):
+            cards.append({
+                "task_id": f"t_big_{i:04d}",
+                "status": "blocked",
+                "title": f"Outage incident {i:04d}",
+                "diagnostics": [{
+                    "kind": "stuck_in_blocked",
+                    "severity": "warning",
+                    "title": "x",
+                    "detail": "y",
+                    "data": {"age_hours": 24 + i},
+                }],
+            })
+        payload = json.dumps(cards)
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={})
+        text = "\n".join(lines)
+        self.assertLess(len(text), kbh.MAX_REPORT_CHARS)
+        self.assertIn("older stuck cards omitted", text)
+        self.assertIn("Commands to move a card (run on the agent pod):", text)
+        self.assertIn("re-run it:", text)
+        self.assertIn("drop it:", text)
+
+    def test_single_large_group_with_hundreds_of_cards_bounded(self):
+        # A large group with 500 cards sharing the same title
+        cards = [
+            {"task_id": f"t_dup_{i:04d}", "status": "blocked", "title": "Scaling issue",
+             "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning",
+                              "title": "x", "detail": "y", "data": {"age_hours": 24 + i}}]}
+            for i in range(500)
+        ]
+        payload = json.dumps(cards)
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={})
+        text = "\n".join(lines)
+        self.assertLess(len(text), kbh.MAX_REPORT_CHARS)
+        self.assertIn("Scaling issue — 500 cards", text)
+        self.assertIn("ids:", text)
+        self.assertIn("more", text)
+        self.assertIn("Commands to move a card (run on the agent pod):", text)
 
 
 
@@ -632,6 +760,16 @@ class ReportTests(unittest.TestCase):
             self.assertIn("Board invariant violations", joined)
             self.assertIn("ghost claim", joined)
             self.assertIn("Active kanban diagnostics", joined)
+
+    def test_many_invariant_violations_bounded(self):
+        with tempfile.TemporaryDirectory() as d:
+            tasks = [{"id": f"t_{i:03d}", "status": "blocked", "claim_lock": "ghost"} for i in range(50)]
+            make_board(Path(d), tasks=tasks)
+            lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={})
+            text = "\n".join(lines)
+            self.assertIn("Board invariant violations", text)
+            self.assertIn("... and 30 other invariant violations omitted", text)
+            self.assertLess(len(text), kbh.MAX_REPORT_CHARS)
 
 
 class MainOutputContractTests(unittest.TestCase):
