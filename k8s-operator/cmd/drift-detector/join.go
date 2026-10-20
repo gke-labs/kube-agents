@@ -99,7 +99,22 @@ const (
 	// same reason as injectHeldOutOfScopeMarker: the line an operator greps
 	// for has to say that this record is not getting a card of its own.
 	backlogMarker = "backlog=true"
+
+	// kubectlUserAgentPrefix starts the user agent kubectl sends. A backlog
+	// record from kubectl is carded rather than digested: an install's own
+	// writes come from Helm's Go client, so a late kubectl write is far more
+	// likely a person's edit made just before a restart. The user agent is
+	// self-declared, which is acceptable here because it can only add a card,
+	// never hide one.
+	kubectlUserAgentPrefix = "kubectl/"
 )
+
+// digestible reports whether a record goes to the daemon's digest rather than
+// a card, when the daemon takes the digest route: a backlog record not sent by
+// kubectl. See kubectlUserAgentPrefix.
+func digestible(record AuditRecord) bool {
+	return record.Backlog && !strings.HasPrefix(record.UserAgent, kubectlUserAgentPrefix)
+}
 
 // joinOutcome says what happened when the detector tried to enrich a record
 // with the live object's field ownership. Every outcome except joinEnriched is
@@ -475,7 +490,7 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 	case joinSkippedBacklog:
 		j.counts.SkippedBacklog++
 	}
-	event.Digest = j.skipBacklog && record.Backlog && !event.OutOfScope
+	event.Digest = j.skipBacklog && digestible(record) && !event.OutOfScope
 
 	j.next(ctx, event)
 }
@@ -595,7 +610,7 @@ func (j *joiner) join(ctx context.Context, record AuditRecord) DriftEvent {
 
 	// After the routing check, so a backlog record from a cluster this process
 	// cannot read is still unreachable, and still held when it is out of scope.
-	if j.skipBacklog && record.Backlog {
+	if j.skipBacklog && digestible(record) {
 		event.Outcome = joinSkippedBacklog
 		return event
 	}

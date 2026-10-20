@@ -91,6 +91,41 @@ variable "backlog_principal" {
   }
 }
 
+variable "lone_principal" {
+  description = <<-EOT
+    The principal on one late record published with the backlog burst: a
+    person whose single edit landed just before the detector restarted. The
+    daemon cards a principal with fewer than three late rows, so this record
+    must get a card, not a digest line.
+  EOT
+  type        = string
+  default     = "grace@example.com"
+  validation {
+    condition     = can(regex("^[^@[:space:]]+@[^@[:space:]]+$", var.lone_principal)) && !startswith(var.lone_principal, "system:") && !endswith(lower(var.lone_principal), ".gserviceaccount.com")
+    error_message = "lone_principal must be an address the classifier sorts as human."
+  }
+}
+
+variable "kubectl_record_count" {
+  description = "How many late records the backlog principal publishes with a kubectl user agent. The detector cards a late kubectl write, so each must get a card although the principal's burst is digested."
+  type        = number
+  default     = 3
+  validation {
+    condition     = var.kubectl_record_count >= 1 && floor(var.kubectl_record_count) == var.kubectl_record_count
+    error_message = "kubectl_record_count must be a whole number of at least 1."
+  }
+}
+
+variable "card_wait_seconds" {
+  description = "How long, after the live card, to wait for every late record that must be carded to have a card on the board."
+  type        = number
+  default     = 900
+  validation {
+    condition     = var.card_wait_seconds >= 60 && floor(var.card_wait_seconds) == var.card_wait_seconds
+    error_message = "card_wait_seconds must be a whole number of at least 60."
+  }
+}
+
 variable "backlog_record_count" {
   description = "How many records are published while the detector is stopped."
   type        = number

@@ -15,17 +15,20 @@
 # 4. Read the ledger and the board, and write the verdict ConfigMap the task's
 #    safeguard reads.
 #
-# Verdicts. ok and the four red ones are written and exit 0, so the agent's
+# Verdicts. ok and the five red ones are written and exit 0, so the agent's
 # turn still runs and the safeguard reds the repetition. Everything else is
 # the environment, exits non-zero, and the repetition is excluded:
 #   ok                  every backlog record has a row marked backlog, digested
-#                       or recorded headless, and no card; the live record has
+#                       or recorded headless, and no card; every late record
+#                       that must be carded has a card; the live record has
 #                       its card.
 #   backlog-triaged     a backlog record has a notified row, a session, or a card.
 #   backlog-not-marked  a backlog record has a row with no backlog mark (or the
 #                       ledger has no backlog column, which is main).
 #   digest-pending      a backlog row is still owed its digest after the settle.
 #   live-marked-backlog the live record was marked backlog.
+#   late-edit-not-carded a late record that must be carded (a lone principal's,
+#                       or one sent by kubectl) has no card.
 
 locals {
   kubectl = "kubectl"
@@ -235,13 +238,14 @@ resource "null_resource" "drift_backlog" {
       write_verdict() {
         echo "verdict=$1 detail=$2" >&2
         case "$1" in
-          ok | backlog-triaged | backlog-not-marked | digest-pending | live-marked-backlog) ;;
+          ok | backlog-triaged | backlog-not-marked | digest-pending | live-marked-backlog | late-edit-not-carded) ;;
           *) return 0 ;;
         esac
         ${local.kubectl} create configmap "${local.verdict_configmap}" -n "$NS" \
           --from-literal=verdict="$1" --from-literal=detail="$2" \
           --from-literal=backlog_insert_ids="$(IFS=,; echo "$${backlog_ids[*]:-}")" \
           --from-literal=live_insert_id="$${live_id:-}" \
+          --from-literal=card_insert_ids="$(IFS=,; echo "$${card_ids[*]:-}")" \
           --dry-run=client -o yaml | ${local.kubectl} apply -f - >/dev/null
         ${local.kubectl} label configmap "${local.verdict_configmap}" -n "$NS" ${local.label_args} --overwrite >/dev/null
       }
@@ -266,7 +270,20 @@ resource "null_resource" "drift_backlog" {
         publish_record "$id" "$BACKLOG_PRINCIPAL" "$NS" "eval-drift-backlog-release-$i" "Go-http-client/2.0"
         i=$(( i + 1 ))
       done
-      echo "backlog records: $${#backlog_ids[@]} published while the detector was stopped"
+      # Late records that must still be carded: one by a second principal, and
+      # kubectl writes by the backlog principal.
+      card_ids=()
+      id="$(mint_id)"
+      card_ids+=("$id")
+      publish_record "$id" "${var.lone_principal}" "$NS" "eval-drift-backlog-lone" "Go-http-client/2.0"
+      i=0
+      while [ "$i" -lt "${var.kubectl_record_count}" ]; do
+        id="$(mint_id)"
+        card_ids+=("$id")
+        publish_record "$id" "$BACKLOG_PRINCIPAL" "$NS" "eval-drift-backlog-kubectl-$i" "kubectl/v1.35.6"
+        i=$(( i + 1 ))
+      done
+      echo "backlog records: $${#backlog_ids[@]} to digest and $${#card_ids[@]} to card, published while the detector was stopped"
       # Publish time is set when the topic accepts the message, so a short
       # pause puts every backlog record clearly before the relaunched
       # process's first pull.
@@ -325,6 +342,16 @@ resource "null_resource" "drift_backlog" {
         sleep 15
         waited=$(( waited + 15 ))
       done
+      # The late records that must be carded queue on the same board as the live
+      # card; wait for each to have one.
+      waited=0
+      while :; do
+        have="$(carded_ids "$${card_ids[@]}" | grep -c . || true)"
+        [ "$have" -ge "$${#card_ids[@]}" ] && break
+        [ "$waited" -ge "${var.card_wait_seconds}" ] && break
+        sleep 15
+        waited=$(( waited + 15 ))
+      done
       sleep ${var.settle_seconds}
 
       # ---- 4. Verdict -----------------------------------------------------------
@@ -356,7 +383,17 @@ resource "null_resource" "drift_backlog" {
         echo "ERROR: the live card did not finish. This is the install, not the change. Excluding the repetition." >&2
         exit 1
       fi
-      write_verdict ok "$${#backlog_ids[@]} backlog records recorded with no card and given their digest; live card finished"
+      carded_late="$(carded_ids "$${card_ids[@]}" | tr '\n' ' ')"
+      uncarded=""
+      for id in "$${card_ids[@]}"; do
+        case " $carded_late " in *" $id "*) ;; *) uncarded="$uncarded $id" ;; esac
+      done
+      if [ -n "$${uncarded// /}" ]; then
+        write_verdict late-edit-not-carded "late records that must be carded have no card after ${var.card_wait_seconds}s:$uncarded"
+        exit 0
+      fi
+
+      write_verdict ok "$${#backlog_ids[@]} backlog records recorded with no card and given their digest; $${#card_ids[@]} late records carded; live card finished"
       echo "backlog digested: no card for $${#backlog_ids[@]} backlog records, live card for $live_id finished"
     EOT
   }

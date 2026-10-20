@@ -1174,3 +1174,27 @@ func TestJoinStillLooksUpALiveRecordWithTheDigestRouteOn(t *testing.T) {
 		t.Errorf("outcome=%s lookups=%d digest=%t, want %s, one lookup, not digested", got.Outcome, len(getter.refs), got.Digest, joinEnriched)
 	}
 }
+
+// A late record sent by kubectl is carded, not digested: it keeps its lookup
+// and is not marked Digest, so a person's edit made just before a restart
+// still gets its triage.
+func TestJoinCardsALateKubectlRecord(t *testing.T) {
+	record := joinRecord()
+	record.Backlog = true
+	record.UserAgent = "kubectl/v1.35.6 (darwin/arm64) kubernetes/abc"
+
+	getter := &stubGetter{obj: &unstructured.Unstructured{Object: map[string]any{}}}
+	var got DriftEvent
+	j := newJoiner(joinSet(getter), nil, nil, nil, func(_ context.Context, e DriftEvent) { got = e })
+	j.skipBacklog = true
+	j.Handle(context.Background(), record)
+	if got.Outcome != joinEnriched || len(getter.refs) != 1 || got.Digest {
+		t.Errorf("outcome=%s lookups=%d digest=%t, want %s, one lookup, not digested", got.Outcome, len(getter.refs), got.Digest, joinEnriched)
+	}
+
+	record.UserAgent = "Go-http-client/2.0"
+	j.Handle(context.Background(), record)
+	if !got.Digest {
+		t.Error("a late record from Helm's Go client was not digested")
+	}
+}

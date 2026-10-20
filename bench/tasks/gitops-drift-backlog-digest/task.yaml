@@ -20,6 +20,11 @@
 # which proves the pipeline was still triaging live drift after the restart.
 # The fixture's header lists the verdicts and which ones exclude a repetition.
 #
+# Published in the same stopped window: one record by a second principal and
+# three kubectl writes by the backlog principal. Each must still get a card: a
+# lone late edit and a late kubectl edit are more likely a person's change made
+# just before a restart than part of an install's burst.
+#
 # The eval installs run with the drift alert ceiling off and chat off, so the
 # digest is recorded headless there (backlog = 3); on an install with chat it
 # is posted (backlog = 2). Either is ok.
@@ -41,6 +46,8 @@ infrastructure:
     live_principal: "ada@example.com"
     backlog_principal: "installer@example.com"
     backlog_record_count: 6
+    lone_principal: "grace@example.com"
+    kubectl_record_count: 3
 validated: false
 domain: incident-triage
 owner: maintainers

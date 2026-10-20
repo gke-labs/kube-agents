@@ -120,8 +120,10 @@ What the drift branch does differently:
   pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
   route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
   starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
-  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). The
-  post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
+  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). A
+  principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
+  claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
+  `4`. The post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
   route as `features: ["drift-backlog"]` on `/healthz`; the detector's README has the rule that
   marks a record late and what it costs.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of
@@ -390,8 +392,9 @@ CREATE TABLE intercepted_events(
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform
-  principal   TEXT NOT NULL DEFAULT ''     -- written on drift backlog rows only, for the digest's count
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
+  principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
+  payload     TEXT NOT NULL DEFAULT ''     -- drift backlog rows only: the record, to card it from
 );
 ```
 
@@ -415,17 +418,17 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 ##### Which columns are migrated, and which are not
 
-`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog` and
-`principal` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
-databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog` and
-`principal` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
+`principal` and `payload` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
+`principal` and `payload` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
 introduced the table (#426), and a migration maintained for a pre-release shape no released
 install has is machinery that outlives its reason.
 
-**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id`, `backlog` and `principal` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
+**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id`, `backlog`, `principal` and `payload` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
 NOT EXISTS` is a no-op against a pre-0.2.0 table missing those three columns, so they never appear, and how badly that ends depends on
 which column is missing:
 

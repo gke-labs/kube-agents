@@ -678,7 +678,11 @@ the topic after the first pull is live. The second catches a process that starte
 pull.
 
 Against a daemon whose `/healthz` lists the `drift-backlog` feature, a backlog record skips the
-live-object join and is posted to `POST /v1/drift-backlog` with no session. The daemon records it,
+live-object join and is posted to `POST /v1/drift-backlog` with no session — unless its user agent
+starts with `kubectl/`. A late kubectl write is carded as a live one is, join included: an install's
+own writes come from Helm's Go client, so a late kubectl write is more likely a person's edit made
+just before a restart. The user agent is self-declared, which is acceptable because the rule can only
+add a card. The daemon records it,
 spends no alert quota, starts no triage turn, and posts one digest per burst that counts the records
 by principal. The `DRIFT` line carries `backlog=true` and the publish time, and the shutdown tally
 counts `skipped_backlog=` (join) and `backlog=` (inject). Against an older daemon, the startup line
@@ -690,8 +694,10 @@ and spent the day's drift budget.
 
 The cost: after every detector restart, records published before the new process's first pull are
 backlog. That includes records nacked at shutdown and changes made within the sink's export lag
-before the restart. They are recorded and named in the digest under their principal, but they get
-no triage card of their own. A Helm upgrade the old detector is still running for is not covered:
+before the restart. Two rules keep a person's edit in that window carded: the kubectl rule above,
+and the daemon's, which cards every late row of a principal with fewer than three late rows in the
+digest. What is left without a card of its own is three or more late non-kubectl changes by one
+principal, which the digest names under that principal. A Helm upgrade the old detector is still running for is not covered:
 its writes reach a running process and are triaged as live changes.
 
 ## Three things to know before changing it

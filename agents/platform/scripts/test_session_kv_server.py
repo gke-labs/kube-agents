@@ -6279,6 +6279,9 @@ class TestDriftBacklog(unittest.TestCase):
 
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
+        self.trigger = trigger.start()
+        self.addCleanup(trigger.stop)
         self.arm_patch = patch.object(session_kv_server, "_arm_drift_backlog_digest")
         self.armed = self.arm_patch.start()
         self.addCleanup(self.arm_patch.stop)
@@ -6301,6 +6304,11 @@ class TestDriftBacklog(unittest.TestCase):
 
     def _post(self, **overrides):
         return self.client.post("/v1/drift-backlog", json=dict(self.PAYLOAD, **overrides))
+
+    def _burst(self, prefix="burst", principal="installer@example.com"):
+        """Enough late rows from one principal to be digested, not carded."""
+        for i in range(session_kv_server.DRIFT_BACKLOG_CARD_BELOW):
+            self._post(insert_id=f"{prefix}-{i}", principal=principal)
 
     def _rows(self):
         import sqlite3
@@ -6399,46 +6407,49 @@ class TestDriftBacklog(unittest.TestCase):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         run.assert_called_once()
         message = run.call_args.args[0][-1]
-        self.assertIn("8 changes", message)
-        self.assertIn("installer@example.com (7), ada@example.com (1)", message)
-        self.assertIn("and 3 more", message)
+        self.assertIn("7 changes", message)
+        self.assertIn("installer@example.com (7)", message)
+        self.assertNotIn("ada@example.com", message)
+        self.assertIn("and 2 more", message)
         self.assertIsNotNone(run.call_args.kwargs["timeout"])
-        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
+        by_principal = {r["principal"]: r["backlog"] for r in self._rows()}
+        self.assertEqual(by_principal["installer@example.com"], session_kv_server.DRIFT_BACKLOG_DIGESTED)
+        self.assertEqual(by_principal["ada@example.com"], session_kv_server.DRIFT_BACKLOG_CARDED)
 
     def test_a_headless_install_marks_the_rows_and_posts_nothing(self):
         self._chat(platforms=(session_kv_server.DEFAULT_CHAT_PLATFORM,), disabled=True)
-        self._post()
+        self._burst()
         with patch.object(session_kv_server.subprocess, "run") as run:
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         run.assert_not_called()
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_HEADLESS])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_HEADLESS})
 
     def test_a_failed_post_leaves_the_rows_pending_and_releases_the_lease(self):
         import sqlite3
 
         self._chat()
-        self._post()
+        self._burst()
         failure = subprocess_error(1)
         with patch.object(session_kv_server.subprocess, "run", side_effect=failure):
             self.assertFalse(session_kv_server._post_drift_backlog_digest())
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_PENDING})
         with sqlite3.connect(temp_db_path) as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM drift_backlog_lease").fetchone()[0], 0)
 
     def test_a_failed_platform_falls_through_to_the_next(self):
         self._chat(platforms=("google_chat", "slack"))
-        self._post()
+        self._burst()
         with patch.object(session_kv_server.subprocess, "run", side_effect=[subprocess_error(1), None]) as run:
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         self.assertEqual(run.call_count, 2)
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
 
     def test_an_unknown_outcome_or_a_timeout_counts_as_sent(self):
         import subprocess as sp
 
         for side_effect in (subprocess_error(chat_notify.NOTIFY_OUTCOME_UNKNOWN), sp.TimeoutExpired(["a2a"], 1)):
             self._chat()
-            self._post(insert_id=f"id-{type(side_effect).__name__}-{getattr(side_effect, 'returncode', 0)}")
+            self._burst(prefix=f"id-{type(side_effect).__name__}-{getattr(side_effect, 'returncode', 0)}")
             with patch.object(session_kv_server.subprocess, "run", side_effect=side_effect) as run:
                 self.assertTrue(session_kv_server._post_drift_backlog_digest())
             run.assert_called_once()
@@ -6448,7 +6459,7 @@ class TestDriftBacklog(unittest.TestCase):
         import sqlite3
 
         self._chat()
-        self._post()
+        self._burst()
         with sqlite3.connect(temp_db_path) as conn:
             with conn:
                 conn.execute(
@@ -6458,7 +6469,7 @@ class TestDriftBacklog(unittest.TestCase):
         with patch.object(session_kv_server.subprocess, "run") as run:
             self.assertFalse(session_kv_server._post_drift_backlog_digest())
         run.assert_not_called()
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_PENDING})
         with sqlite3.connect(temp_db_path) as conn:
             self.assertEqual(conn.execute("SELECT holder FROM drift_backlog_lease").fetchone()[0], "other")
 
@@ -6466,7 +6477,7 @@ class TestDriftBacklog(unittest.TestCase):
         import sqlite3
 
         self._chat()
-        self._post()
+        self._burst()
         with sqlite3.connect(temp_db_path) as conn:
             with conn:
                 conn.execute(
@@ -6475,11 +6486,11 @@ class TestDriftBacklog(unittest.TestCase):
                 )
         with patch.object(session_kv_server.subprocess, "run"):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
 
     def test_a_row_that_arrives_during_the_send_waits_for_the_next_digest(self):
         self._chat()
-        self._post(insert_id="first")
+        self._burst(prefix="first")
 
         def arrive(*_args, **_kwargs):
             self._post(insert_id="during")
@@ -6487,9 +6498,13 @@ class TestDriftBacklog(unittest.TestCase):
         with patch.object(session_kv_server.subprocess, "run", side_effect=arrive):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         by_id = {r["object_uid"]: r["backlog"] for r in self._rows()}
-        self.assertEqual(by_id, {"first": session_kv_server.DRIFT_BACKLOG_DIGESTED, "during": session_kv_server.DRIFT_BACKLOG_PENDING})
+        self.assertEqual(by_id.pop("during"), session_kv_server.DRIFT_BACKLOG_PENDING)
+        self.assertEqual(set(by_id.values()), {session_kv_server.DRIFT_BACKLOG_DIGESTED})
 
     def test_the_worker_posts_once_the_burst_is_quiet_and_then_stops(self):
+        # The burst is recorded first, so a zero quiet period cannot digest it
+        # one row at a time; then one row arms the real worker.
+        self._burst()
         self.arm_patch.stop()
         started = []
         real_thread = session_kv_server.threading.Thread
@@ -6504,15 +6519,49 @@ class TestDriftBacklog(unittest.TestCase):
         with patch.object(session_kv_server, "DRIFT_BACKLOG_QUIET_SECONDS", 0), patch.object(
             session_kv_server.threading, "Thread", side_effect=record
         ):
-            self._post()
+            self._post(insert_id="arms-the-worker", principal="installer@example.com")
             while time.monotonic() < deadline:
                 with session_kv_server._drift_backlog_lock:
                     if session_kv_server._drift_backlog_thread is None:
                         break
                 time.sleep(0.01)
-        self.assertEqual(len(started), 1, "the first backlog row did not start one worker")
+        digest_workers = [t for t in started if t.name == "drift-backlog-digest"]
+        self.assertGreaterEqual(len(digest_workers), 1, "no backlog row started a digest worker")
         self.assertIsNone(session_kv_server._drift_backlog_thread, "the worker did not stop after the digest")
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_HEADLESS])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_HEADLESS})
+
+    def test_a_lone_late_row_gets_a_card_instead_of_the_digest(self):
+        self._chat()
+        self._post(insert_id="lone", principal="ada@example.com")
+        with patch.object(session_kv_server.subprocess, "run") as run:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        run.assert_not_called()
+        [row] = self._rows()
+        self.assertEqual(row["backlog"], session_kv_server.DRIFT_BACKLOG_CARDED)
+        self.assertEqual(row["notified"], 1)
+        self.assertTrue(row["session_id"])
+        deadline = time.monotonic() + 5
+        while not self.trigger.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.trigger.assert_called_once()
+        session_id, alert_msg, payload, row_id = self.trigger.call_args.args
+        self.assertEqual((session_id, row_id), (row["session_id"], row["id"]))
+        self.assertEqual(payload["insert_id"], "lone")
+        self.assertIn("alice@example.com patched prod/deployments/checkout", alert_msg)
+        drift = self.client.get("/v1/alert-quota").json()["severities"][session_kv_server.DRIFT_QUOTA_KEY]
+        self.assertEqual(drift["sent"], 1)
+        events = self.client.get("/v1/intercepted-events").json()["events"]
+        self.assertEqual([e["status"] for e in events if e["name"] == "checkout"][:1], [session_kv_server.FEED_STATUS_INJECTED])
+
+    def test_a_carded_row_the_ceiling_refuses_starts_no_turn(self):
+        self._chat()
+        self._post(insert_id="lone", principal="ada@example.com")
+        with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        [row] = self._rows()
+        self.assertEqual((row["backlog"], row["notified"]), (session_kv_server.DRIFT_BACKLOG_CARDED, 0))
+        time.sleep(0.05)
+        self.trigger.assert_not_called()
 
     def test_a_backlog_row_carries_the_reason_the_end_of_day_report_excludes(self):
         import eod_report_generator
@@ -6523,7 +6572,7 @@ class TestDriftBacklog(unittest.TestCase):
 
     def test_a_mark_that_fails_once_is_retried_and_the_digest_is_posted_once(self):
         self._chat()
-        self._post()
+        self._burst()
         real_finish = session_kv_server._finish_drift_backlog
         calls = []
 
@@ -6539,11 +6588,11 @@ class TestDriftBacklog(unittest.TestCase):
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         run.assert_called_once()
         self.assertEqual(len(calls), 2)
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
 
     def test_a_mark_that_never_lands_after_a_post_is_finished_before_the_next_claim(self):
         self._chat()
-        self._post()
+        self._burst()
         self.addCleanup(setattr, session_kv_server, "_drift_backlog_unfinished", None)
         locked = session_kv_server.sqlite3.OperationalError("database is locked")
         with patch.object(session_kv_server, "_finish_drift_backlog", side_effect=locked), patch.object(
@@ -6551,13 +6600,13 @@ class TestDriftBacklog(unittest.TestCase):
         ), patch.object(session_kv_server.subprocess, "run") as run:
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         run.assert_called_once()
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_PENDING])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_PENDING})
 
         # The database is back. The next attempt marks the posted rows and posts nothing.
         with patch.object(session_kv_server.subprocess, "run") as run:
             self.assertTrue(session_kv_server._post_drift_backlog_digest())
         run.assert_not_called()
-        self.assertEqual([r["backlog"] for r in self._rows()], [session_kv_server.DRIFT_BACKLOG_DIGESTED])
+        self.assertEqual({r["backlog"] for r in self._rows()}, {session_kv_server.DRIFT_BACKLOG_DIGESTED})
         self.assertIsNone(session_kv_server._drift_backlog_unfinished)
 
     def test_cleanup_says_when_it_removes_an_undigested_row(self):

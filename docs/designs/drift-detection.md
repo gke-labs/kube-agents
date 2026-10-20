@@ -130,7 +130,8 @@ flowchart TB
 One exception to one session per incident: a record that reached the detector late (it queued while
 no detector was pulling, or waited over 30 minutes) is backlog. It goes to `POST /v1/drift-backlog`
 with no session, and the daemon posts one digest per burst instead of a card each. An install's own
-Helm apply runs under the installer's account and arrives as exactly such a burst. The detector's
+Helm apply runs under the installer's account and arrives as exactly such a burst. A late `kubectl`
+write, and the late rows of a principal with fewer than three in the burst, are still carded. The detector's
 README, "The backlog", has the rule and its cost.
 
 ## Choosing CUJs: the test
