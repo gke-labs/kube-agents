@@ -540,12 +540,14 @@ neither, or none yet, is a first install, which gets `next`
 with `--third-party-registry-prefix`, because nothing points `next`'s NATS images at the mirror;
 `--mode=next` overrides that. The read uses a kubeconfig of its own, so `--dry-run` and
 `--generate-only` leave the current context alone. A cluster that exists but cannot be read is
-never taken for a first install: over an `install.env` with no key the run keeps `today`; with no
-`install.env`, `--dry-run` and `--generate-only` assume `today` with a warning and an applying run
-is refused until `--mode` names one. `install.sh` then records the mode it settled on in an
-`install.env` that assigns none. `upgrade.sh`, the menu and the generator read a file with no key,
-or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as an
-existing install's mode). The generator writes `platform_agent_mode` on every run, and the
+never taken for a first install: over an `install.env` with no key the run renders `today`; with
+no `install.env`, `--dry-run` and `--generate-only` render `today` with a warning and an applying
+run is refused until `--mode` names one. `install.sh` then records the mode it settled on in an
+`install.env` that assigns none, unless it was that unread guess. The Day-2 menu's Save & Apply
+settles and saves a missing key the same way. `upgrade.sh` and the generator read a file with no
+key, or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as
+an existing install's mode), and a full `upgrade.sh` refuses a switch out of a file with no key
+rather than apply one nobody chose. The generator writes `platform_agent_mode` on every run, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
 takes `--mode` and records it, or the settled mode, on a first install. Over an existing
 `install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees

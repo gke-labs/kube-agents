@@ -2295,6 +2295,17 @@ main() {
       if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
         announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
       fi
+      # A switch out of an install.env that names no mode was chosen by
+      # nobody: such a file (one copied from install.env.example onto a
+      # running install) reads as today here, and nothing asks before the
+      # apply, so a next install would move back. An older target's helpers
+      # never set the flag.
+      if [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] && [ -z "${PLATFORM_AGENT_MODE:-}" ]; then
+        rm -f "$tfvars_file"
+        print_error "Refusing to switch spec.mode when install.env names no PLATFORM_AGENT_MODE: nothing asked for the switch."
+        print_info "Set PLATFORM_AGENT_MODE in install.env to the mode the install runs, or run install.sh once, which records it, and run again. To switch, set the mode you want there."
+        exit 1
+      fi
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
       # project, so a container it cannot bind, or a policy that forbids the

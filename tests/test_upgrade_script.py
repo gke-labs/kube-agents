@@ -598,6 +598,60 @@ class UpgradeRunContractTest(unittest.TestCase):
             block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}\n"),
         )
 
+    def test_a_full_upgrade_refuses_a_switch_out_of_a_file_with_no_mode(self):
+        """A copied install.env.example names no mode and reads as today, so a
+        full upgrade over a next install would switch it back with nothing
+        asked. The full arm's notice block, lifted as written, refuses that
+        and removes the tfvars; a key that names the mode, or no switch, goes
+        on; an older target that never sets the flag goes on too."""
+        source = _UPGRADE_SH.read_text()
+        start = source.index(
+            '      if declare -F announce_platform_agent_mode_for_apply >/dev/null; then\n'
+            '        announce_platform_agent_mode_for_apply "$target_namespace" '
+            '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
+        )
+        end = source.index("      # And the container preflight:", start)
+        block = source[start:end]
+        self.assertIn('[ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ]', block)
+        for mode, announced, define, refused in (
+            ("", "true", True, True),
+            ("next", "true", True, False),
+            ("", "false", True, False),
+            ("", "true", False, False),
+        ):
+            with self.subTest(mode=mode, announced=announced, define=define):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tfvars = pathlib.Path(tmp) / "terraform.tfvars"
+                    tfvars.write_text("x = 1\n")
+                    stub = (
+                        f'announce_platform_agent_mode_for_apply() {{ PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED={announced}; }}\n'
+                        if define else ""
+                    )
+                    script = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
+print_error() {{ echo "ERROR: $*"; }}
+print_info() {{ echo "INFO: $*"; }}
+{stub}
+set -Eeuo pipefail
+unset PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
+DEFAULT_PLATFORM_AGENT_MODE=today PLATFORM_AGENT_MODE_NOTICE_UNGATED=ungated
+{"PLATFORM_AGENT_MODE=" + mode if mode else ":"}
+target_namespace=kubeagents-system tfvars_file={shlex.quote(str(tfvars))}
+{block}
+echo "went on"
+"""
+                    proc = subprocess.run(
+                        ["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env(), check=False
+                    )
+                    out = proc.stdout + proc.stderr
+                    if refused:
+                        self.assertNotEqual(proc.returncode, 0, out)
+                        self.assertIn("Refusing to switch spec.mode when install.env names no PLATFORM_AGENT_MODE", out)
+                        self.assertFalse(tfvars.exists())
+                    else:
+                        self.assertIn("went on", proc.stdout, out)
+                        self.assertTrue(tfvars.exists())
+
     def test_the_mode_calls_skip_an_older_installer_common(self):
         """installer_common.sh is the target tree's: piped, or with --image-tag
         onto a release before spec.mode support, it defines neither notice nor

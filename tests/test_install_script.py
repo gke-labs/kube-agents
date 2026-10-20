@@ -6735,6 +6735,48 @@ class PlatformAgentModeTest(unittest.TestCase):
             self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stderr)
             self.assertIn("is not writable", proc.stdout + proc.stderr)
 
+    def test_a_guessed_mode_is_never_recorded(self):
+        # A cluster that could not be read gives today as a guess; neither a
+        # keyless install.env nor a first install's new one records it, so the
+        # next run that can read the cluster settles it.
+        call = (
+            "rc=0; queue_unrecorded_platform_agent_mode || rc=$?; "
+            'echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(f"PLATFORM_AGENT_MODE_GUESSED=true PLATFORM_AGENT_MODE_FALLBACK=today; {call}", install_env=path)
+            self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stderr)
+        for guessed, expected in (("true", False), ("false", True)):
+            with self.subTest(guessed=guessed), tempfile.TemporaryDirectory() as tmp:
+                dest = self._bootstrap_with_export(
+                    tmp, f"PLATFORM_AGENT_MODE_GUESSED={guessed}; PLATFORM_AGENT_MODE_FALLBACK=today"
+                )
+                self.assertEqual("PLATFORM_AGENT_MODE=" in dest.read_text(), expected)
+
+    def test_the_menu_settles_a_missing_mode_key_before_it_renders(self):
+        # The menu's Save & Apply over a copied example would render today and
+        # switch a next install back; it settles the mode from the cluster
+        # before the Slack refusal reads it, and saves it with the rest unless
+        # it was a guess.
+        text = _INSTALL_SH.read_text()
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        end = text.index("        run_lifecycle_apply", arm)
+        block = text[arm:end]
+        settle = block.index('        if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then\n')
+        self.assertIn(
+            '            adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || return 1\n', block[settle:]
+        )
+        self.assertIn('          export PLATFORM_AGENT_MODE="$PLATFORM_AGENT_MODE_FALLBACK"\n', block[settle:])
+        self.assertLess(settle, block.index("        refuse_next_slack_gateway_settings_from_env || return 1\n"))
+        save = block.index('          save_env_var PLATFORM_AGENT_MODE "$menu_mode_to_save"\n')
+        self.assertLess(block.index('        save_env_var KMS_KEY "$kms_key"\n'), save)
+        self.assertLess(save, block.index("write_tfvars_from_state"))
+        self.assertIn(
+            '[ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] || menu_mode_to_save="$PLATFORM_AGENT_MODE_FALLBACK"',
+            block,
+        )
+
     def test_the_mode_is_settled_before_step_6_reads_it(self):
         # Step 6's prompts and Slack refusals follow the mode, so the cluster
         # and the mirror are consulted once the target is known and before it.
@@ -6747,7 +6789,8 @@ class PlatformAgentModeTest(unittest.TestCase):
         step_6 = text.index('  print_step "6. Chat & Messaging Integrations Setup"')
         self.assertLess(queue, step_6)
         self.assertNotIn("PLATFORM_AGENT_MODE_FALLBACK", text[main_start:adopt])
-        self.assertEqual(text.count("adopt_live_platform_agent_mode \""), 1)
+        # Once in main, once in the menu's Save & Apply.
+        self.assertEqual(text.count("adopt_live_platform_agent_mode \""), 2)
         self.assertEqual(text.count("  mirrored_first_install_mode \""), 1)
         self.assertEqual(text.count("  queue_unrecorded_platform_agent_mode\n"), 1)
 
