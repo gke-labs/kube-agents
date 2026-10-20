@@ -444,9 +444,9 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
 
         readme = (Path(__file__).resolve().parent / "README.md").read_text()
         counts = re.findall(
-            r"\b\d+ (?:mutations?|KILLED|NOISY|killed|noisy)\b"  # "206 mutations: 175 KILLED"
+            r"\b\d+\s+(?:mutations?|KILLED|NOISY|SURVIVED|STALE|killed|noisy|survived|stale)\b"  # "206 mutations: 175 KILLED"
             r"|\b(?:killed|noisy|survived|stale)=\d+"  # a run's result line pasted in
-            r"|\b\d+ of the \d+\b",  # "accounts for 203 of the 206"
+            r"|\b\d+\s+of\s+the\s+\d+\b",  # "accounts for 203 of the 206", wrapped or not
             readme)
         self.assertEqual(
             counts, [],
