@@ -3169,9 +3169,6 @@ def append_chat_report(
     part = None if record is None else _filled_part(record, repo)
     if part is not None and part.get(CHAT_REPORT_TEXT_KEY):
         part[CHAT_REPORT_TEXT_KEY] = f"{part[CHAT_REPORT_TEXT_KEY]}\n\n{CHAT_REPORT_REFINISH_LABEL}\n{text}"
-        # A new stamp: the relay skips a run it already posted, and a `finish`
-        # with no `start` after a posted run lands here too.
-        record[CHAT_REPORT_RUN_KEY] = now.strftime(REPORT_STAMP_FORMAT)
     elif part is not None:
         part[CHAT_REPORT_TEXT_KEY] = f"{CHAT_REPORT_RERUN_LABEL}\n{text}" if refinish else text
     else:
@@ -3181,6 +3178,11 @@ def append_chat_report(
             pending[CHAT_REPORT_TEXT_KEY] = text
         else:
             record[CHAT_REPORT_PARTS_KEY].append({CHAT_REPORT_REPO_KEY: repo, CHAT_REPORT_TEXT_KEY: text})
+    if refinish:
+        # A new stamp: the relay posts each stamp once, and the one on the
+        # record may be a run it already posted, or marked posted when an
+        # earlier `finish` died.
+        record[CHAT_REPORT_RUN_KEY] = now.strftime(REPORT_STAMP_FORMAT)
     record[CHAT_REPORT_UPDATED_KEY] = now.timestamp()
     try:
         _write_chat_record(audit_id, record)

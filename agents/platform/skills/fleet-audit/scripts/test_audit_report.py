@@ -26425,8 +26425,10 @@ class TestSecondFinishInOneRun(HarnessTestCase):
             self.assertNotEqual(self.run_finish(doc), 0)
 
         self.start()
+        run = self.chat_record()["run"]
         self.assertEqual(self.finish_again(doc), 0)
         self.assertFalse(self.stdout_json()["silent_ok"])
+        self.assertNotEqual(self.chat_record()["run"], run)
 
     def test_a_finish_with_no_start_stays_a_run_of_its_own(self):
         doc = make_doc(findings=[make_finding(fid="a", severity="major")])
