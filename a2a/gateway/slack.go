@@ -912,7 +912,7 @@ func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage)
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
 	opts, err := slackMessageOptions(m)
-	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || len(m.Chat.Choices) == 0) {
+	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || !asksQuestion(m.Chat.Choices)) {
 		// An answered question edited again without its choices (the card
 		// settling it on the notify route, laid out or as text) keeps the
 		// line that names who answered.

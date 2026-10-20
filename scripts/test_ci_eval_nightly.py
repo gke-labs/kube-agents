@@ -654,6 +654,11 @@ def part_check() -> str:
     return lifted_block(r"^# Which part of the nightly matrix this run takes.*?^esac$")
 
 
+def half_constants() -> str:
+    """The main-b list's file and the cksum bit, read by the part step."""
+    return lifted_block(r"^# The stack-bearing cases of the nightly's main part that run in main-b.*?^readonly NIGHTLY_HALF_CKSUM_BIT=[^\n]*\n")
+
+
 def part_step() -> str:
     """EVAL_NIGHTLY_PART applied to TASKS, after the lane step names the
     cases that request a pull request."""
@@ -679,6 +684,7 @@ def load_matrix_through_the_part(
             part_check(),
             exclusions_block(),
             f'INJECT_LANE_REQUESTING="{",".join(requesting)}"',
+            half_constants(),
             part_step(),
             roster_block(),
             PRINT_ARRAYS,
@@ -760,17 +766,145 @@ class NightlyPartTest(unittest.TestCase):
             with self.subTest(tier=tier):
                 result = load_matrix_through_the_part({"EVAL_TIER": tier, "EVAL_NIGHTLY_PART": "writer"})
                 self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("EVAL_NIGHTLY_PART must be 'all', 'main' or 'writers', got 'writer'", result.stderr)
+                self.assertIn("EVAL_NIGHTLY_PART must be 'all', 'main', 'main-a', 'main-b' or 'writers', got 'writer'", result.stderr)
                 self.assertNotIn("TASK ", result.stdout)
 
     def test_a_part_outside_the_nightly_is_refused(self):
-        for part in ("main", "writers"):
+        for part in ("main", "main-a", "main-b", "writers"):
             for env in ({}, {"EVAL_TIER": "presubmit"}):
                 with self.subTest(part=part, env=env):
                     result = load_matrix_through_the_part({**env, "EVAL_NIGHTLY_PART": part})
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                     self.assertIn(f"EVAL_NIGHTLY_PART={part} selects part of the nightly matrix, but EVAL_TIER=presubmit", result.stderr)
                     self.assertNotIn("TASK ", result.stdout)
+
+    def script_answers(self, names: list[str], call: str) -> dict[str, str]:
+        """Each name's answer from the script's own helpers: task_stack,
+        infra_lock_exempt, unit_state_lock and unit_cost_hint."""
+        helpers = "\n".join(
+            lifted_block(rf"^{fn}\(\) \{{.*?^\}}$")
+            for fn in ("task_stack", "infra_lock_exempt", "unit_state_lock", "unit_cost_hint")
+        )
+        body = helpers + "\n" + "\n".join(f'printf "%s\\t%s\\n" "{n}" "$({call.format(name=n)})"' for n in names)
+        result = run_bash(f'BENCH_DIR="{BENCH_DIR}"\n' + body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return dict(line.split("\t", 1) for line in result.stdout.splitlines())
+
+    def stack_cases(self, names: list[str]) -> set[str]:
+        """The cases that take lock-infra, as the script decides it."""
+        answers = self.script_answers(
+            names,
+            '[ -n "$(task_stack "${{BENCH_DIR}}/tasks/{name}/task.yaml")" ] && ! infra_lock_exempt {name} && echo stack || true',
+        )
+        return {n for n, a in answers.items() if a == "stack"}
+
+    def halves(self) -> tuple[list[str], list[str]]:
+        a = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main-a"})
+        b = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main-b"})
+        self.assertEqual(a.returncode, 0, a.stderr)
+        self.assertEqual(b.returncode, 0, b.stderr)
+        return lines_tagged(a, "TASK"), lines_tagged(b, "TASK")
+
+    @staticmethod
+    def names(entries: list[str]) -> list[str]:
+        return [pathlib.Path(e).parent.name for e in entries]
+
+    def test_the_halves_cover_main_once_in_matrix_order(self):
+        a, b = self.halves()
+        main = [e for e in self.nightly_matrix() if not self.is_writer(e)]
+        self.assertEqual(sorted(a + b), sorted(main))
+        self.assertFalse(set(a) & set(b))
+        self.assertEqual(a, [e for e in main if e in a])
+        self.assertEqual(b, [e for e in main if e in b])
+
+    def test_the_halves_balance_the_stack_chain(self):
+        # The stack units' one-at-a-time chain under lock-infra sets the main
+        # part's length (#3384). Each half's chain is its stack cases'
+        # unit_cost_hint summed; the two must stay within one case's worth.
+        a, b = self.halves()
+        stack = self.stack_cases(self.names(a + b))
+        cost = {n: int(c) for n, c in self.script_answers(sorted(stack), "unit_cost_hint {name}").items()}
+        chain_a = sum(cost[n] for n in self.names(a) if n in stack)
+        chain_b = sum(cost[n] for n in self.names(b) if n in stack)
+        self.assertGreater(chain_a, 0)
+        self.assertGreater(chain_b, 0)
+        self.assertLessEqual(
+            abs(chain_a - chain_b),
+            max(cost.values()),
+            f"main-a's stack chain is {chain_a}s and main-b's {chain_b}s; list a stack case in, or out of, hack/eval/nightly-main-b.txt",
+        )
+        # The onboarding cases all run in main-a, one at a time under their
+        # own state lock, some of them off lock-infra; that chain must not
+        # outgrow the longer stack chain, or main-a is the long half whatever
+        # the list says. The list can lift the longer stack chain only to half
+        # the stack total plus one case's worth; past that, no list edit helps.
+        onboarding = [n for n, a in self.script_answers(self.names(a), "unit_state_lock {name}").items() if a == "onboarding"]
+        chain_onboarding = sum(int(c) for c in self.script_answers(onboarding, "unit_cost_hint {name}").values())
+        reach = (chain_a + chain_b + max(cost.values())) // 2
+        self.assertLessEqual(
+            chain_onboarding,
+            max(chain_a, chain_b),
+            f"main-a's onboarding chain is {chain_onboarding}s, longer than either stack chain ({chain_a}s, {chain_b}s). "
+            f"The onboarding cases always run in main-a. If the chain is at most {reach}s, list a stack case in, or out of, "
+            "hack/eval/nightly-main-b.txt to lengthen the longer stack chain. If it is longer, no list edit can fix it: "
+            "check the onboarding cases' unit_cost_hint in hack/ci-eval-pr.sh, and if the hints are right, "
+            "raise the split's design on #3384.",
+        )
+
+    def test_the_cases_without_a_stack_split_roughly_evenly(self):
+        a, b = self.halves()
+        stack = self.stack_cases(self.names(a + b))
+        plain_a = sum(1 for n in self.names(a) if n not in stack)
+        plain_b = sum(1 for n in self.names(b) if n not in stack)
+        self.assertLessEqual(abs(plain_a - plain_b), max(6, (plain_a + plain_b) // 5), (plain_a, plain_b))
+
+    def test_every_main_b_line_names_a_stack_case_of_main(self):
+        listed = [line.split("#")[0].strip() for line in (HACK_DIR / "eval" / "nightly-main-b.txt").read_text(encoding="utf-8").splitlines()]
+        listed = [n for n in listed if n]
+        main = self.names([e for e in self.nightly_matrix() if not self.is_writer(e)])
+        stack = self.stack_cases(main)
+        self.assertTrue(listed)
+        for name in listed:
+            with self.subTest(name=name):
+                self.assertIn(name, stack, "a line here moves only a stack-bearing case of the main part")
+        _, b = self.halves()
+        self.assertEqual(sorted(set(self.names(b)) & stack), sorted(listed))
+
+    def test_the_onboarding_cases_share_main_a(self):
+        # They rewrite one install's onboarding state; only a run on one
+        # install keeps them apart.
+        a, b = self.halves()
+        locks = self.script_answers(self.names(a + b), "unit_state_lock {name}")
+        onboarding = {n for n, lock in locks.items() if lock == "onboarding"}
+        self.assertTrue(onboarding, "the nightly runs onboarding cases")
+        self.assertLessEqual(onboarding, set(self.names(a)))
+        self.assertFalse(onboarding & set(self.names(b)))
+
+    def test_a_cases_half_depends_on_its_name_alone(self):
+        # The halves are two periodics that each check out main; a case added
+        # to the matrix between their checkouts must not move any other case.
+        main = [e for e in self.nightly_matrix() if not self.is_writer(e)]
+        a, b = self.halves()
+        reordered = list(reversed(self.nightly_matrix()))
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            presubmit = set(presubmit_entries())
+            # Same cases, reversed order, in both files.
+            (hack / "eval" / "nightly-cases.txt").write_text("".join(f"{e}\n" for e in reordered if e not in presubmit), encoding="utf-8")
+            again = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main-b"}, hack_dir=hack)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(sorted(lines_tagged(again, "TASK")), sorted(b))
+        self.assertEqual(len(a) + len(b), len(main))
+
+    def test_the_halves_export_only_their_own_roster_cases(self):
+        a, b = self.halves()
+        for part, tasks in (("main-a", a), ("main-b", b)):
+            with self.subTest(part=part):
+                result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": part})
+                names = set(self.names(tasks))
+                self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in names)])
+                self.assertIn(f"Nightly part: {part} ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
 
     def test_an_empty_part_is_refused(self):
         result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"}, requesting=[])

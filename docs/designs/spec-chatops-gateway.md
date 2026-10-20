@@ -1441,7 +1441,8 @@ half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
-conversation (below) is armed by its own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
+conversation (below), and onboarding's first report into the conversation the user first wrote in,
+are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
 operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
 serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
 subscribes to and wakes its creator when a card blocks or fails, reaches the same route
@@ -1758,7 +1759,8 @@ added, the name from `users.info` (display name, real name, handle; never an id)
 typed reply in a conversation whose question is still open answers it the same way, with the
 reply's first words; a gateway command (a stop, a status ask or a short question about
 progress in the wide form, `/session`, a delegate) answers nothing. A question is answered once, and a second click on it is dropped. The open question
-is the latest message the adapter laid out with choices in the conversation, and one laid out
+is the latest message the adapter laid out with choices in the conversation, other than choices
+that are all an answer's next steps (`next`), which ask nothing, and one laid out
 with choices again is a fresh question whatever answered it before; an edit that takes its
 choices away (a card's question settled by its notify `update` key, laid out or as text) closes
 it, and keeps the answered line when one was drawn. The open question and the answered set live in
