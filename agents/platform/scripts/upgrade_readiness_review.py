@@ -333,7 +333,6 @@ BUDGET_FAILURE_PREFIXES = (CUT_SHORT_PREFIX,)
 LISTING_FAILED_DETAIL = "the project's cluster listing failed"
 EXCLUSION_SURROGATE_OBJECT = "exclusion-{digest}"  # an exclusion name with no ASCII letter or digit
 EXCLUSION_DIGEST_CHARS = 8
-LOADER_NOISE_PREFIX = "Wrote /tmp/"  # the loader's own line about a directory it has removed
 MAX_PROBLEMS_IN_LINE = 3  # of the queue's refusals quoted in the chat line; the record has them all
 MAX_NAMES_IN_LINE = 6  # projects named in the partial line
 OVERFLOW_NOTE = "and {count} more in the record"
@@ -776,11 +775,13 @@ def ordered_names(names: list[str], previous: dict | None) -> list[str]:
     (``run_projects``), else run and dropped once its report resolves it."""
     failures = (previous or {}).get("project_failures") or {}
     budget = {p for p, detail in failures.items() if str(detail) == BUDGET_EXHAUSTED_DETAIL or str(detail).startswith(BUDGET_FAILURE_PREFIXES)}
+    known_ids = learned_project_ids()
+    first = [n for n in names if n in budget or watch.canonical_project(n, known_ids) in budget]
 
     def group(selected: list[str]) -> list[str]:
         return [n for n in selected if not watch.is_project_number(n)] + [n for n in selected if watch.is_project_number(n)]
 
-    return group([n for n in names if n in budget]) + group([n for n in names if n not in budget])
+    return group(first) + group([n for n in names if n not in first])
 
 
 def learned_project_ids() -> dict[str, str]:
@@ -800,11 +801,16 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     projects that failed with why, and the ids the report resolved and read.
     `on_project(members, errors)` runs as each project returns, which is where
     registration happens, so a run the hour cuts short keeps what it
-    registered. A spelling the watch's ledger maps to an id already read this
-    run (the roster spelled one project by number and by id) is not run at
-    all; one the ledger does not map yet is run, and dropped whole once its
-    report resolves it to an id already read: no table, no errors, no
-    failure, nothing registered."""
+    registered. A project is keyed by the id the watch's ledger learned for
+    its spelling, so a project the roster spells by number and by id fails
+    once, and a table is headed by the id its report resolved, which is what
+    the rows carry. Under a declared scope a spelling is asked for by that id,
+    as the watch asks: the scope lists ids, so the report reads it with no
+    describe. A spelling whose project is already read this run is not run at
+    all, nor, under a declared scope, one whose project already failed, which
+    would be the same call; one the ledger does not map yet is run, and
+    dropped whole once its report resolves it to an id already read: no
+    table, no errors, no failure, nothing registered."""
     members: list[dict] = []
     errors: list[dict] = []
     tables: dict[str, str] = {}
@@ -813,37 +819,40 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
     known_ids = learned_project_ids()
     deadline = time.monotonic() + TOTAL_BUDGET_SECONDS
     for project in names:
-        if watch.canonical_project(project, known_ids) in read_ids:
-            # The same project, already read this run under its other spelling:
-            # this run would cost a full readiness run and leave nothing.
+        key = watch.canonical_project(project, known_ids)
+        if key in read_ids or (scope is not None and key in failures):
+            # The same project, already read this run under its other spelling
+            # (this run would cost a full readiness run and leave nothing), or
+            # already asked for by this id under a declared scope, and failed.
             continue
         remaining = deadline - time.monotonic()
         if remaining < MIN_PROJECT_RUN_SECONDS:
-            failures[project] = BUDGET_EXHAUSTED_DETAIL
+            failures[key] = BUDGET_EXHAUSTED_DETAIL
             continue
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
+        asked = key if scope is not None else project
         try:
-            envelope = watch.run_report([project], readiness=True, scope=scope, outside_stands=False, timeout=timeout)
+            envelope = watch.run_report([asked], readiness=True, scope=scope, outside_stands=False, timeout=timeout)
         except watch.SandboxTimedOut as exc:
             # The review's own budget, not the sandbox, ended a run it started
             # with less than the full timeout; said as such, so the remedy read
             # is fewer projects or a longer budget, not a sandbox fault.
-            failures[project] = CUT_SHORT_DETAIL.format(seconds=int(timeout)) if timeout < PROJECT_TIMEOUT_SECONDS else str(exc)
+            failures[key] = CUT_SHORT_DETAIL.format(seconds=int(timeout)) if timeout < PROJECT_TIMEOUT_SECONDS else str(exc)
             continue
         except (RuntimeError, ValueError) as exc:  # the watch's ReportRefused is a RuntimeError
-            failures[project] = str(exc)
+            failures[key] = str(exc)
             continue
         report = envelope.get(watch.ENVELOPE_REPORT_KEY) or {}
         found = [m for m in report.get(watch.MEMBERS_KEY) or [] if isinstance(m, dict)]
         read_errors = [e for e in report.get(watch.ERRORS_KEY) or [] if isinstance(e, dict)]
-        resolved = {str(p) for p in report.get(watch.REPORT_PROJECTS_KEY) or [project]}
+        resolved = {str(p) for p in report.get(watch.REPORT_PROJECTS_KEY) or [asked]}
         if resolved & read_ids:
             # The roster spelled one project twice, by number and by id: the
             # report resolved both to the same id, and its clusters are already
             # read and registered under the first run. The second leaves nothing.
             continue
         errors.extend(read_errors)
-        tables[project] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
+        tables[", ".join(sorted(resolved))] = str(envelope.get(watch.ENVELOPE_TABLES_KEY) or "")
         unlisted = watch.unlisted_projects(read_errors)
         if unlisted:
             # The sandbox ran but the project's cluster listing failed: the
@@ -852,16 +861,16 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
             # such row is this project's, keyed by the spelling the roster gave
             # or by the id the report resolved a number to. A project not read,
             # as the watch counts it, not a clean project with no clusters.
-            failures[project] = next(
+            failures[key] = next(
                 (str(e.get(watch.MESSAGE_KEY) or LISTING_FAILED_DETAIL) for e in read_errors if e.get(watch.MEMBER_ID_KEYS[0]) in unlisted and not e.get(watch.MEMBER_ID_KEYS[1])),
                 LISTING_FAILED_DETAIL,
             )
             continue
         read_ids |= resolved
-        # A spelling of this project that failed earlier this run (an id whose run
-        # timed out before its number read) is read now, not a project not read.
-        for spelling in [s for s in failures if s in resolved or watch.canonical_project(s, known_ids) in resolved]:
-            failures.pop(spelling)
+        # This project failed earlier this run under another spelling (an id whose
+        # run timed out before its number read): read now, not a project not read.
+        for read in resolved:
+            failures.pop(read, None)
         members.extend(found)
         if on_project is not None:
             on_project(found, read_errors)
@@ -895,8 +904,9 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
     for member in members:
         project, _location, cluster = cluster_fields(member)
         key = watch.member_key(member)
+        rows = by_member.get(key, [])
         batch = []
-        for item in by_member.get(key, []):
+        for item in rows:
             try:
                 findings_queue.validate_finding(payload(item))
             except findings_queue.FindingError as exc:
@@ -904,7 +914,9 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                 outcomes[item_id(item)] = REGISTRATION_FAILED
                 continue
             batch.append(item)
-        complete = member_complete(member, errors) and (project, cluster) not in twins
+        # A row refused here is a finding read and not sent: a claim would book its
+        # row from last week absent, so the cluster claims nothing.
+        complete = member_complete(member, errors) and (project, cluster) not in twins and len(batch) == len(rows)
         if not batch and not complete:
             continue
         # A complete read of a cluster with nothing to report is sent too: it is
@@ -1030,8 +1042,8 @@ def summary(
         "stamp": stamp,
         "generated_at": iso(now),
         # The ids the report resolved and read (what the queue's rows carry),
-        # then the spellings that failed, for the brief's paging and its line.
-        "projects": sorted(read_ids) + [p for p in names if p in failures] if read_ids is not None else names,
+        # then the projects that failed, for the brief's paging and its line.
+        "projects": sorted(read_ids) + list(failures) if read_ids is not None else names,
         "clusters": {
             REVIEWED_KEY: keys,
             watch.READINESS_BLOCKED: blocked,
@@ -1114,8 +1126,7 @@ def render_report(summary_doc: dict, findings: list[dict], tables: dict[str, str
         lines += ["## Read errors", ""] + [f"- {json.dumps(e, sort_keys=True)}" for e in errors] + [""]
     lines += ["## Report script output", ""]
     for project, text in tables.items():
-        table = "\n".join(line for line in text.splitlines() if not line.startswith(LOADER_NOISE_PREFIX))
-        lines += [f"### {project}", "", table.rstrip(), ""]
+        lines += [f"### {project}", "", watch.tables_without_the_output_line(text).rstrip(), ""]
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1249,7 +1260,7 @@ def shown(entries: list[str], limit: int, tail: str = OVERFLOW_NOTE) -> str:
 
 class ProjectsFailed(RuntimeError):
     """Every project failed: the text names each with its reason, and ``failures``
-    keys the announcement, so a project's spelling stays literal in the marker."""
+    keys the announcement, so a project's name stays literal in the marker."""
 
     def __init__(self, detail: str, failures: dict[str, str]) -> None:
         super().__init__(detail)
@@ -1258,9 +1269,9 @@ class ProjectsFailed(RuntimeError):
 
 def failure_signature(detail: str, failures: dict[str, str] | None = None) -> str:
     """The marker's key: the text with every number folded, or, for a run whose
-    every project failed, each project's spelling as written beside its folded
-    reason, so a timeout's figure re-posts nothing while a different project
-    failing the same way is a new line."""
+    every project failed, each project as ``run_projects`` keys it, digits
+    unfolded, beside its folded reason, so a timeout's figure re-posts nothing
+    while a different project failing the same way is a new line."""
     if failures:
         return json.dumps(sorted([p, FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, str(d))] for p, d in failures.items()))
     return FAILURE_DIGITS.sub(FAILURE_DIGIT_MARK, detail)
@@ -1316,7 +1327,7 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
         claimed.update(done)
 
     members, errors, tables, failures, read_ids = run_projects(ordered_names(names, previous), scope, on_project=registered)
-    if failures and len(failures) == len(set(names)):
+    if failures and not read_ids:
         raise ProjectsFailed(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN), failures)
     report_path = home / stamp / REPORT_MD_NAME
     summary_doc = summary(

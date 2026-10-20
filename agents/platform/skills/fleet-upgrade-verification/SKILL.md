@@ -91,8 +91,9 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   the block above does; read back the path the script prints on its `Wrote … to` line.
   The weekly audit's collector is the exception: it moves its own per-run file onto the fixed name
   described below.
-- `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
-  `--at` and `--kubeconfig-dir` to the readiness check, below that.
+- `--rollout-in-progress` belongs to rollout tracking, below, and `--state-dir` to its record
+  (`references/track-a-rollout.md`); `--readiness`, `--at` and `--kubeconfig-dir` to the
+  readiness check, below that.
 
 The script runs `gcloud container clusters list`, `gcloud container get-server-config` and, when neither
 `--project` nor a declared scope is passed, `gcloud config get-value project` and `gcloud projects list` (plus `gcloud projects describe` for a

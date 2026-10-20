@@ -23,6 +23,7 @@ SOP = Path(__file__).resolve().parents[1] / "governance" / "upgrade_readiness_br
 NOW = datetime(2026, 10, 18, 6, 0, tzinfo=timezone.utc)
 PROJECT = "acme-prod"
 OTHER_PROJECT = "acme-dev"
+SCOPE = watch.fleet_scope_targets.ScopeTargets(projects=(PROJECT,), unread=(), resolved_at=None, path="fleet_scope.json", excluded=(), retiring=())
 
 
 def member(cluster: str, status: str = "ready", project: str = PROJECT, **readiness) -> dict:
@@ -477,8 +478,9 @@ class Registration(unittest.TestCase):
         self.assertIn("freeze", problems[0])
         self.assertEqual(len(calls), 1)
         self.assertNotIn("freeze", [f["object"] for f in calls[0]["findings"]])
-        self.assertIn("scope", calls[0])
-        self.assertEqual(claimed, {f"{PROJECT}/us-central1-a/seeded-b"})
+        # The refused row is a finding read and not sent: a claim would book its row from last week absent.
+        self.assertNotIn("scope", calls[0])
+        self.assertEqual(claimed, set())
         self.assertEqual(sum(1 for v in outcomes.values() if v == review.REGISTRATION_FAILED), 1)
         self.assertEqual(sum(1 for v in outcomes.values() if v == "created"), len(findings) - 1)
 
@@ -571,12 +573,15 @@ class TheRecord(unittest.TestCase):
 
     def test_the_report_names_every_finding_with_its_id_and_action(self):
         doc, findings = self.summary_for([seeded_b()])
-        text = review.render_report(doc, findings, {PROJECT: "| table |"}, [])
+        # The reporter's last line names the loader's output file, gone before anyone reads the record.
+        text = review.render_report(doc, findings, {PROJECT: "| table |\n\nWrote 1 member(s) to /tmp/upgrade-readiness-watch-x/report.json\n"}, [])
         for row in doc["findings"]:
             self.assertIn(f"`{row['id']}`", text)
             self.assertIn(row["action"], text)
         self.assertIn("| acme-prod/us-central1-a/seeded-b | blocked | 1 | 3 | 1 |", text)
         self.assertIn("## Report script output", text)
+        self.assertIn("| table |", text)
+        self.assertNotIn("Wrote 1 member(s)", text)
         self.assertIn("dismiss", text)
 
     def test_the_record_is_written_pruned_and_the_latest_files_refreshed(self):
@@ -587,7 +592,7 @@ class TheRecord(unittest.TestCase):
         runs = sorted(p.name for p in home.iterdir() if p.is_dir())
         self.assertEqual(len(runs), review.KEEP_RUNS)
         self.assertEqual(runs[-1], "20261009T060000Z")
-        # The latest files are the newest run's, replaced whole, with no temporary left.
+        # The latest files are the newest run's, with no temporary left.
         self.assertEqual(json.loads((home / review.LATEST_JSON_NAME).read_text())["stamp"], "20261009T060000Z")
         self.assertEqual((home / review.LATEST_MD_NAME).read_text(), "# r 20261009T060000Z\n")
         self.assertEqual(review.load_previous(home)["stamp"], "20261009T060000Z")
@@ -687,6 +692,9 @@ class TheRecord(unittest.TestCase):
         self.assertEqual(review.ordered_names(["a", "b"], None), ["a", "b"])
         # A spelling by number runs after the ids in its group.
         self.assertEqual(review.ordered_names(["123456789012", "acme-prod"], None), ["acme-prod", "123456789012"])
+        # Last week's failure is keyed by the id the watch learned for the number the roster spells.
+        with mock.patch.object(review, "learned_project_ids", return_value={"123456789012": "acme-prod"}):
+            self.assertEqual(review.ordered_names(["acme-dev", "123456789012"], {"project_failures": {"acme-prod": cut}}), ["123456789012", "acme-dev"])
 
 
 class TheTick(unittest.TestCase):
@@ -863,7 +871,9 @@ class TheTick(unittest.TestCase):
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertIn(numbered, latest["project_failures"])
 
-    def test_a_project_spelled_by_number_and_by_id_is_read_once(self):
+    def test_a_project_spelled_by_number_and_by_id_is_registered_once(self):
+        """No ledger maps the number yet, so its run happens; the report resolves it to the id
+        already read, and that run is dropped: one set of rows, one table."""
         numbered = "123456789012"
 
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):
@@ -923,6 +933,9 @@ class TheTick(unittest.TestCase):
             code, out = self.run_main()
         self.assertEqual((code, out), (0, ""))
         self.assertEqual(calls, [numbered])
+        report = (review.weekly_home() / review.LATEST_MD_NAME).read_text()
+        self.assertIn("### acme-prod", report)  # the id the rows carry heads the table
+        self.assertNotIn(f"### {numbered}", report)
 
     def test_an_id_that_failed_beside_a_number_that_read_is_not_booked_not_read(self):
         numbered = "123456789012"
@@ -941,6 +954,87 @@ class TheTick(unittest.TestCase):
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
         self.assertNotIn(PROJECT, latest.get("project_failures") or {})
         self.assertNotIn("not read", out)
+        report = (review.weekly_home() / review.LATEST_MD_NAME).read_text()
+        self.assertIn("### acme-prod", report)
+        self.assertNotIn(f"### {numbered}", report)
+
+    def learn_ids(self, ids: dict[str, str]) -> None:
+        """The ids the daily watch has learned, in its ledger, where the review reads them."""
+        ledger = watch.empty_ledger()
+        ledger[watch.PROJECT_IDS_KEY] = ids
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps(ledger), encoding="utf-8")
+
+    def test_under_a_declared_scope_a_number_the_watch_learned_is_asked_for_by_its_id(self):
+        """The scope lists ids, so the report reads the id with no describe; asked for by the
+        number, a describe that fails on Saturday refuses the run and the project is not read."""
+        numbered = "123456789012"
+        self.learn_ids({numbered: PROJECT})
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            if names[0] == numbered:
+                raise RuntimeError(f"refused by the report script: project number {numbered} did not resolve")
+            return {"exit": 0, "tables": "| t |", "report": {"projects": [PROJECT], "members": [seeded_b(), member("seeded-c")], "errors": []}}
+
+        with mock.patch.object(watch, "declared_scope", return_value=SCOPE), mock.patch.object(watch, "projects", return_value=[numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(calls, [PROJECT])
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["projects"], [PROJECT])
+        self.assertEqual(len(latest["clusters"]["reviewed"]), 2)
+
+    def test_under_a_declared_scope_a_project_that_failed_is_not_asked_again_by_its_other_spelling(self):
+        numbered = "123456789012"
+        self.learn_ids({numbered: PROJECT})
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            raise RuntimeError("sandbox exited 255 without a report")
+
+        with mock.patch.object(watch, "declared_scope", return_value=SCOPE), mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [PROJECT])  # the number is asked for by the same id: the same call
+        self.assertIn("failed: acme-prod: sandbox exited 255", out)
+        self.assertNotIn(numbered, out)
+
+    def test_a_project_whose_two_spellings_both_fail_is_one_failure(self):
+        numbered = "123456789012"
+        self.learn_ids({numbered: PROJECT})
+        calls = []
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            calls.append(names[0])
+            raise RuntimeError("sandbox exited 255 without a report")
+
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [PROJECT, numbered])  # undeclared, the number enumerates under itself: a second call
+        self.assertIn("failed: acme-prod: sandbox exited 255", out)
+        self.assertEqual(out.count("acme-prod"), 1)
+        self.assertNotIn(numbered, out)
+
+    def test_a_project_whose_two_spellings_both_fail_is_counted_once_beside_a_project_read(self):
+        numbered = "123456789012"
+        self.learn_ids({numbered: PROJECT})
+
+        def run_report(names, readiness, *, scope, outside_stands, timeout=None):
+            if names[0] in (PROJECT, numbered):
+                raise RuntimeError("sandbox exited 255 without a report")
+            return {"exit": 0, "tables": "| t |", "report": {"projects": [OTHER_PROJECT], "members": [member("seeded-d", project=OTHER_PROJECT)], "errors": []}}
+
+        with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered, OTHER_PROJECT]), mock.patch.object(watch, "run_report", side_effect=run_report):
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("1 project(s) not read this week: acme-prod: sandbox exited 255", out)
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertEqual(latest["project_failures"], {PROJECT: "sandbox exited 255 without a report"})
+        self.assertEqual(latest["projects"], [OTHER_PROJECT, PROJECT])
 
     def test_a_different_project_failing_the_same_way_is_announced_again(self):
         def refused(names, readiness, *, scope, outside_stands, timeout=None):

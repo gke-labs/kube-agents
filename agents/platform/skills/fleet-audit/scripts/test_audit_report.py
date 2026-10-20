@@ -2479,7 +2479,8 @@ class TestAuditCatalogue(unittest.TestCase):
         this profile's session database, and `kanban-workspace-gc` reconciles
         abandoned scratch workspaces against the board database that lives
         beside it. The equality still binds every entry that does prompt a
-        model, which is the case this test exists for.
+        model except the Saturday brief, which is named below and pinned by
+        name; binding those is the case this test exists for.
 
         Excluded from one equality, pinned by another. `github-repo-watcher`
         was named in the expected set before this roster carried any other
