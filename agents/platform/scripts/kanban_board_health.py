@@ -577,11 +577,6 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
     if omitted_cards > 0:
         current_body_chars = sum(len(ln) + 1 for ln in lines[1:])
         remaining_for_omission = max(0, budget_for_body - current_body_chars)
-        omitted_ids = []
-        for it in taken_items:
-            omitted_ids.extend(it.get("dropped_ids", []))
-        for it in untaken_items:
-            omitted_ids.extend(c["task_id"] for c in it["cards"])
         shown_cards = []
         omitted_cards_list = []
         for it in taken_items:
@@ -589,6 +584,9 @@ def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_char
             omitted_cards_list.extend(it["cards"][it["card_count"]:])
         for it in untaken_items:
             omitted_cards_list.extend(it["cards"])
+
+        omitted_cards_sorted = sorted(omitted_cards_list, key=lambda c: (c["age_hours"], c["task_id"]))
+        omitted_ids = [c["task_id"] for c in omitted_cards_sorted]
 
         all_omitted_older = (
             not shown_cards

@@ -376,6 +376,7 @@ class DiagnosticsTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("Scale kube-dns on platform-agent-host — 4 cards (2 needs_input, 1 capability, 1 transient, oldest 9d)", text)
         self.assertEqual(text.count("Scale kube-dns on platform-agent-host"), 1)
+        self.assertIn("latest: [t_4] (transient, 2d)", text)
 
     def test_thirty_four_cards_scenario_fits_within_chat_limit(self):
         # Reproduce Hang's 34-card bug bash scenario (#3470)
@@ -971,6 +972,27 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertLess(pos_a, pos_b, "Promoted newest card A must render before card B")
         self.assertLess(pos_b, pos_c, "Card B must render before card C")
 
+    def test_omitted_ids_ordered_newest_first_when_omission_budget_constrained(self):
+        # When a taken repeated group has dropped_ids (old copies) and an untaken item
+        # has a newer card, omitted_ids must order the newer card first so the operator
+        # sees the recent actionable ID rather than stale group copies when max_ids_budget truncates.
+        cards = [
+            (f"t_grp_{i}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 30 + 10 * i}},
+             {"task_id": f"t_grp_{i}", "status": "blocked", "title": "Group Title"})
+            for i in range(6)
+        ]
+        cards.append(
+            ("t_newer", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 15}},
+             {"task_id": "t_newer", "status": "blocked", "title": "Distinct Untaken Card"})
+        )
+        context = {
+            "t_newer": {"reason": "r" * 150},
+        }
+        lines = kbh.render_stuck_cards(cards, context, Path("/opt/data"), max_chars=625)
+        text = "\n".join(lines)
+        self.assertIn("ids: t_newer", text)
+        self.assertIn("... and 6 other stuck cards omitted", text)
+
     def test_null_task_ids_in_group_not_suppressed_when_ids_budget_starved(self):
         # When cards with null task_id (coerced to '?') share a title and group_ids_budget
         # cannot fit IDs, position-based dropped_ids filtering removes only the shown card
@@ -1150,6 +1172,28 @@ class ReportTests(unittest.TestCase):
             self.assertIn("Board invariant violations", text)
             self.assertIn("... and 30 other invariant violations omitted", text)
             self.assertLess(len(text), kbh.MAX_REPORT_CHARS)
+
+    def test_report_viol_allowance_clamp_bounds_invariant_violations_under_tight_budget(self):
+        # When report() is called with max_chars (e.g. 1200) where viol_allowance is below
+        # MAX_DIAGNOSTIC_CHARS (3500), viol_budget clamps to viol_allowance - 120, taking only
+        # what fits and emitting the omission line.
+        with tempfile.TemporaryDirectory() as d:
+            tasks = [{"id": f"t_ghost_{i:02d}", "status": "blocked", "claim_lock": "ghost"} for i in range(20)]
+            make_board(Path(d), tasks=tasks)
+            lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={}, max_chars=1200)
+            text = "\n".join(lines)
+            self.assertIn("... and 8 other invariant violations omitted", text)
+            self.assertLessEqual(len(text) + 40, 1200)
+
+    def test_report_viol_allowance_omission_line_suppressed_when_allowance_below_reserve(self):
+        # When viol_allowance < 120 (e.g. max_chars=200 with 2 ghost claims), viol_budget is 0
+        # and the omission line is suppressed because there is no budget to render it cleanly.
+        with tempfile.TemporaryDirectory() as d:
+            tasks = [{"id": f"t_ghost_{i:02d}", "status": "blocked", "claim_lock": "ghost"} for i in range(2)]
+            make_board(Path(d), tasks=tasks)
+            lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={}, max_chars=200)
+            text = "\n".join(lines)
+            self.assertNotIn("other invariant violation", text)
 
     def test_report_level_budget_accounting_with_violations_and_stuck_cards(self):
         # Invariant violations (~1500 chars) + diagnostics at cap (~3500 chars) + stuck cards.
