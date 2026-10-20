@@ -192,7 +192,7 @@ func (g *Gateway) stopCards(ctx context.Context, rec *SessionRecord, authority A
 	g.log.Info("card stop", "correlationId", correlationID, "taskId", taskID,
 		"conversation", rec.Key, "addressee", addressee, "followUp", quiet)
 	notStarted := func(why string, err error) {
-		g.log.Error("card stop not started: "+why, "taskId", taskID, "conversation", rec.Key, "err", err)
+		g.log.Error("card stop did not start: "+why, "taskId", taskID, "conversation", rec.Key, "err", err)
 		g.logCardStopEnded(rec.Key, taskID, "", "", cardStopOutcomeNotStarted)
 	}
 
