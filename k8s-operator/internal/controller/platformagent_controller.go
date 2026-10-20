@@ -4575,14 +4575,22 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 
 	pods := make([]corev1.Pod, 0)
 	// A read that failed is not a selector that matched nothing, and since
-	// podReader goes to the API server it can now fail for a reason outside this
-	// install: an apiserver rollout, a 429. Skipping the selector is still right
-	// -- this pass reports the faults it could see, and the caller discards a
-	// "Provisioning" answer rather than writing it over a phase it already has --
-	// but a silent skip leaves an operator reading a message that went vague for
-	// no visible reason. One line per pass rather than one per selector, because
-	// the causes above take every selector down together and this function runs
-	// on a 30s requeue while an agent is not Ready.
+	// podReader goes to the API server it can fail for a reason outside this
+	// install: an apiserver rollout, a 429. Skipping the selector keeps every
+	// fault this pass could still see -- one found below wins, whichever
+	// selector it came from -- but finding none is then not evidence that none
+	// exists, and "none" is not an inert answer here. The caller's default in
+	// this arm IS this function's default (updateStatusReady: Provisioning /
+	// "Waiting for deployment replicas to be ready"), it writes it whenever the
+	// scan does not override, and the write re-enqueues the CR through an
+	// unfiltered watch -- so a scan that went blind would clear a Degraded the
+	// last pass wrote, then restore it, for every agent on the install while
+	// the control plane is away.
+	//
+	// So a pass that could not read every selector falls back to the fault the
+	// CR already carries instead of to the default. That answer equals what is
+	// stored, which is what makes it safe: the change check finds nothing
+	// moved and writes nothing at all.
 	var unread error
 	unreadSelectors := 0
 	for _, selector := range selectors {
@@ -4594,8 +4602,13 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		pods = append(pods, podList.Items...)
 	}
 	if unread != nil {
-		logf.FromContext(ctx).Error(unread, "could not list the agent's pods for the status scan; this pass names no fault found on them",
+		// One line per pass rather than one per selector: the causes above take
+		// every selector down together, and this runs on a 30s requeue.
+		logf.FromContext(ctx).Error(unread, "could not list every one of the agent's pods for the status scan; a fault this pass does not find is left as the CR last reported it",
 			"selectorsUnread", unreadSelectors, "selectorsTried", len(selectors))
+		if held := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); agent.Status.Phase == "Degraded" && held != nil {
+			phase, reason, message = agent.Status.Phase, held.Reason, held.Message
+		}
 	}
 	if len(pods) == 0 {
 		return phase, reason, message

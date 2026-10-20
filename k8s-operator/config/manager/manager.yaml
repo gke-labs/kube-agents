@@ -142,13 +142,17 @@ spec:
           # starts is cluster-wide, Owns() included (it filters events by
           # owner, it does not scope the watch). Pods are the one kind kept
           # out of it, read live instead because they outnumber the rest
-          # (podReader, #3493). What stays is every other kind the controller
-          # Owns() or Watches(): Deployments, StatefulSets, Services,
-          # ServiceAccounts, ConfigMaps, PVCs, NetworkPolicies,
-          # PodDisruptionBudgets, the four RBAC kinds and this operator's own
-          # CRDs. The first four of those grow with the cluster's workloads, a
+          # (podReader, #3493). What stays is what SetupWithManager names:
+          # Deployments, StatefulSets, Services, ServiceAccounts, ConfigMaps,
+          # PersistentVolumeClaims, NetworkPolicies and PodDisruptionBudgets;
+          # ClusterRoles, ClusterRoleBindings, Roles and RoleBindings; and the
+          # three custom resources themselves (PlatformAgent always,
+          # AgentPlugin and AgentProfile where their CRDs are installed and
+          # readable). Deployments, StatefulSets, Services and
+          # PersistentVolumeClaims grow with the cluster's workloads, a
           # Deployment carrying a whole pod template, so a cluster with
-          # thousands of them is the case to raise this for.
+          # thousands of them is the case to raise this for; the rest grow
+          # with its namespaces.
           #
           # Sized from a measurement rather than the Kubebuilder scaffold it
           # replaces: on a 3-node install the store holds 675 objects in

@@ -89,6 +89,46 @@ func TestTheStatusPodScanReadsPodsLive(t *testing.T) {
 	}
 }
 
+// A status scan that could not read the pods must not clear the fault the CR
+// carries. updateStatusReady's not-Ready arm defaults to exactly this
+// function's default and writes it whenever the scan does not override, so a
+// "Provisioning" answer from a blind pass is written over a stored
+// Degraded/ImagePullBackOff and re-enqueues the CR through an unfiltered
+// watch: the fault appears to clear for a pass, then comes back. Returning
+// what the CR already holds makes the computed status equal the stored one,
+// and the caller's change check then writes nothing at all.
+func TestAStatusScanThatReadNoPodsHoldsTheFaultTheCRCarries(t *testing.T) {
+	agent := podReadAgent()
+	agent.Status.Phase = "Degraded"
+	agent.Status.Conditions = []metav1.Condition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             "ImagePullBackOff",
+		Message:            "Container 'platform-agent' in pod test-agent-gateway-abc123 is waiting: ImagePullBackOff - back-off pulling image",
+		LastTransitionTime: metav1.Now(),
+	}}
+	scheme := setupScheme()
+	refusing := interceptor.NewClient(
+		fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).Build(),
+		interceptor.Funcs{
+			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if _, ok := list.(*corev1.PodList); ok {
+					return fmt.Errorf("the API server refused the list")
+				}
+				return c.List(ctx, list, opts...)
+			},
+		})
+	r := &PlatformAgentReconciler{Client: refusing, APIReader: refusing, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent, true)
+	if phase != "Degraded" || reason != "ImagePullBackOff" {
+		t.Errorf("a pass that read no pod reports %q/%q, want the stored Degraded/ImagePullBackOff held (message %q)", phase, reason, message)
+	}
+	if message != agent.Status.Conditions[0].Message {
+		t.Errorf("the held message is %q, want the stored %q", message, agent.Status.Conditions[0].Message)
+	}
+}
+
 // The plugin scan: the same gateway pod, read a second time on every
 // reconcile of an agent that has plugins.
 func TestThePluginFailureScanReadsPodsLive(t *testing.T) {

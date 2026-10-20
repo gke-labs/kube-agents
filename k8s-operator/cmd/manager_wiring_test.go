@@ -10,17 +10,25 @@ import (
 
 // Two lines in main() decide how much of the cluster this process holds in
 // memory, and neither can be observed from a test that does not start a
-// manager against a real API server: the cache's transform
-// (controller.ManagerCacheOptions) and the live reader the Pod reads fall back
-// off (PlatformAgentReconciler.APIReader, without which podReader returns the
-// cached client and every Pod read starts a cluster-wide informer again).
-// Delete either and every other test in the repository still passes, which is
-// what this one is for. It reads main.go rather than running it, because
-// main() dials a cluster and calls os.Exit.
-// The value matters as much as the field: Cache: cache.Options{} is a manager
-// with no transform, and APIReader: mgr.GetClient() is podReader serving every
-// Pod read from the cache again. Both would satisfy an assertion that only
-// looked for the field name.
+// manager against a real API server. It reads main.go rather than running it,
+// because main() dials a cluster and calls os.Exit.
+//
+// The value matters as much as the field, and more for one of the two than
+// the other:
+//
+//   - Cache. Nothing else sets it. Delete the line and the manager is built
+//     with controller-runtime's default options, keeping the managedFields of
+//     every object it caches; set it to a bare cache.Options{} and the same
+//     is true with the field still there. Every other test in the repository
+//     passes either way -- manager_cache_test.go exercises
+//     ManagerCacheOptions() directly and never reaches main.go.
+//   - APIReader. SetupWithManager backfills it from the manager when it is
+//     nil, so deleting the line is caught there rather than here; what the
+//     backfill cannot catch is the line pointing somewhere else, because a
+//     non-nil APIReader is left alone. mgr.GetClient() would put every Pod
+//     read back on the cache with the field set and the reconciler running.
+//     The deletion is asserted too, so the two lines are read the same way.
+
 const (
 	mainSourceFile           = "main.go"
 	managerOptionsType       = "ctrl.Options"
@@ -47,7 +55,7 @@ func TestMainHandsTheManagerItsCacheAndTheReconcilerALiveReader(t *testing.T) {
 		{managerOptionsType, managerCacheField, managerCacheValue,
 			"the manager is built with a cache that keeps the managedFields of every cached object"},
 		{reconcilerType, reconcilerAPIReaderField, reconcilerAPIReaderValue,
-			"podReader falls back to the cached client, so every Pod read starts a cluster-wide Pod informer"},
+			"podReader serves Pod reads from the cache unless SetupWithManager's nil-backfill catches it, and a non-nil wrong value it cannot"},
 	} {
 		got, set := literalField(file, tc.literal, tc.field)
 		if !set {
