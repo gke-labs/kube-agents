@@ -341,7 +341,10 @@ Four ways a workload breaks on a new version:
   `fleet-upgrade-verification/scripts/known_issues.json`, a table of the page's issues whose
   identified versions name a minor from 1.32 up (the JSON's source note states the rule and how
   each row's versions are read; a row naming no add-on matches by version alone), each with the
-  page's cells, the patch that fixes it and the page anchor; a match is a risk naming the fix. The
+  page's cells, the patch that fixes it and the page anchor; a match through a bounded version set
+  is a risk naming the fix, and a match through one with no upper bound (`All versions`, a build or
+  minor and later with no fixed build above it) is a note on the member, not a risk, since it would
+  stand on every later version until the page changes. The
   table is data with a date: when it is older than thirty days the rule files a risk that the table
   is stale rather than passing a clean matrix, and the newest version the table knows is in the
   note, not graded. The operator add-ons (cert-manager, Istio, the

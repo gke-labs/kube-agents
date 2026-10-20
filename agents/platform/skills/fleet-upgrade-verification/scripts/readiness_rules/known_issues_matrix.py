@@ -21,7 +21,11 @@ later"; `all_versions`), the add-on image it is in where the page names one the 
 carries, and the page anchor. One risk when the cluster's control-plane version is in an
 issue's versions and the add-on it names is in the inventory (at a listed tag, or at any tag
 when the issue lists none; an issue naming no add-on matches by version alone); one more when
-the member's target version would land on one. The table is data with a date: when
+the member's target version would land on one. The grade is the matched spec's: a match
+through a spec with no upper bound (`all_versions`, `from_minor`, `from` with no `to`), which
+stands on every later version until the page changes, is a note on the member naming the
+open issue, not a risk, and is not counted among the matches; a match through a bounded spec
+is the risk. The table is data with a date: when
 `generated` is more than STALE_AFTER_DAYS before the instant, the rule files a risk that the
 table is stale rather than staying silent on a clean matrix; the newest version the table
 knows is in the note and not graded. Never a blocker: `CAN_BLOCK` is False.
@@ -97,7 +101,9 @@ WITH_ADDON_FORMAT = "with {addon} {tag}"
 NO_ADDON_TEXT = "(the page names no add-on)"
 RUNNING_FORMAT = "known issue {id} ({summary}) applies to GKE {version} {addon_text}; fixed in {fixed_in}: {url}"
 TARGET_FORMAT = "target {version} lands on known issue {id} ({summary}) {addon_text}; fixed in {fixed_in}: target a fixed patch or hold: {url}"
-NOTE_FORMAT = "{addons} add-on(s) inventoried in {namespaces}; {matches} known issue(s) match GKE {master} or target {target}; table generated {generated} ({issues} issue(s), newest known version {newest})"
+NOTE_FORMAT = "{addons} add-on(s) inventoried in {namespaces}; {matches} known issue(s) match GKE {master} or target {target} ({open} open issue(s) with no published fix noted); table generated {generated} ({issues} issue(s), newest known version {newest})"
+OPEN_NOTE_FORMAT = "{n} open known issue(s) with no published fix on GKE {version}, noted and not graded as risks: {ids}; each is on {url}"
+OPEN_IDS_SEPARATOR = ", "
 DAEMONSETS_NOT_READ_REASON = "the DaemonSets were not read ({error}), so the add-on inventory lists Deployments only"
 NO_LOADER_DATA = "the module loader served no data"
 TABLE_UNREADABLE_REASON = "known-issues table {name} could not be read beside {module} ({error})"
@@ -199,6 +205,14 @@ def version_matches(version_text, spec) -> bool:
     return bounded
 
 
+def spec_is_open(spec) -> bool:
+    """Whether a version spec has no upper bound: every version, a minor and later, or a build and
+    later with no `to` and no minor to end it. A match through one is a note, not a risk."""
+    if not isinstance(spec, dict):
+        return False
+    return spec.get(ALL_VERSIONS_KEY) is True or FROM_MINOR_KEY in spec or (RANGE_FROM_KEY in spec and RANGE_TO_KEY not in spec and MINOR_KEY not in spec)
+
+
 def addon_present(issue: dict, addons: list[dict]) -> str | None:
     """The tag the inventory runs the issue's add-on at (ANY_TAG for an issue with no add-on), or None."""
     addon = issue.get(ISSUE_ADDON_KEY)
@@ -238,6 +252,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
     master = cluster.get("currentMasterVersion")
     target_text = context.get(CONTEXT_TARGET_TEXT)
     matches = 0
+    open_issues = {master: [], target_text: []}  # the note-graded matches, per version
     for issue in table.get(TABLE_ISSUES_KEY) or []:
         if not isinstance(issue, dict):
             continue
@@ -245,13 +260,22 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         if tag is None:
             continue
         specs = issue.get(ISSUE_VERSIONS_KEY) or []
-        if master and any(version_matches(master, spec) for spec in specs):
-            out["risks"].append(_issue_finding(KIND_RUNNING, issue, master, tag))
+        for kind, version in ((KIND_RUNNING, master), (KIND_TARGET, target_text)):
+            if not version or (kind == KIND_TARGET and version == master):
+                continue
+            matched = [spec for spec in specs if version_matches(version, spec)]
+            if not matched:
+                continue
+            if all(spec_is_open(spec) for spec in matched):  # a bounded spec that matches too names a fix: the risk reading stands
+                open_issues[version].append(str(issue.get(ISSUE_ID_KEY)))
+                continue
+            out["risks"].append(_issue_finding(kind, issue, version, tag))
             matches += 1
-        if target_text and target_text != master and any(version_matches(target_text, spec) for spec in specs):
-            out["risks"].append(_issue_finding(KIND_TARGET, issue, target_text, tag))
-            matches += 1
-    out["notes"].append(NOTE_FORMAT.format(addons=len(addons), namespaces=LIST_SEPARATOR.join(ADDON_NAMESPACES), matches=matches, master=master or NO_MASTER, target=target_text or NO_TARGET, generated=generated_text, issues=len(table.get(TABLE_ISSUES_KEY) or []), newest=table.get(TABLE_NEWEST_VERSION_KEY) or NO_NEWEST))
+    open_count = sum(len(ids) for ids in open_issues.values())
+    out["notes"].append(NOTE_FORMAT.format(addons=len(addons), namespaces=LIST_SEPARATOR.join(ADDON_NAMESPACES), matches=matches, open=open_count, master=master or NO_MASTER, target=target_text or NO_TARGET, generated=generated_text, issues=len(table.get(TABLE_ISSUES_KEY) or []), newest=table.get(TABLE_NEWEST_VERSION_KEY) or NO_NEWEST))
+    for version, ids in open_issues.items():
+        if ids:
+            out["notes"].append(OPEN_NOTE_FORMAT.format(n=len(ids), version=version, ids=OPEN_IDS_SEPARATOR.join(ids), url=table.get(TABLE_SOURCE_KEY)))
     return out
 
 

@@ -1131,6 +1131,11 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
         self.assertTrue(all(v.startswith("1.32.3-gke.") for v in oom["gke_versions"]))
         pdcsi = next(i for i in table["issues"] if i["id"] == "excessive-volume-group-logging")
         self.assertEqual((pdcsi["addon"], pdcsi["gke_versions"], pdcsi["fixed_in"]), ("gcp-compute-persistent-disk-csi-driver", ["1.32.4-gke.1236007", "1.32.4-gke.1353001"], "1.32.4-gke.1353003 and later"))
+        # The open specs, which a match grades as a note: the five rows with no fix and no upper bound, and tcpx-perf's 1.34-and-later spec beside its two bounded ones.
+        open_rows = sorted(i["id"] for i in table["issues"] if any(known_issues_matrix.spec_is_open(s) for s in i["gke_versions"]))
+        self.assertEqual(open_rows, ["gke-metrics-agent-ds-race-condition", "gke-ui-blocked-autorepair", "lustre-multinic-throughput", "metadata-server-connection-timeouts", "tcpx-perf", "unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane"])
+        tcpx = next(i for i in table["issues"] if i["id"] == "tcpx-perf")
+        self.assertEqual([known_issues_matrix.spec_is_open(s) for s in tcpx["gke_versions"]], [False, False, True])
 
     def test_the_recorded_cluster_matches_the_rows_the_page_lists_for_its_versions(self):
         # seeded-b as recorded: 1.34.12-gke.1011000, with gke-metadata-server, gke-metrics-agent and the PD CSI driver in its inventory.
@@ -1139,37 +1144,46 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
         self.assertEqual((result["blocking"], result["unknown"]), ([], []))
         running = {f["issue"] for f in result["risks"] if f["kind"] == "running"}
         target = {f["issue"] for f in result["risks"] if f["kind"] == "target"}
-        # "1.34 and earlier"; "All versions" with the add-on present; "All versions" with no add-on named; "1.33 and later".
-        self.assertTrue({"image-screaming-too-many-links", "gke-metrics-agent-ds-race-condition", "gke-ui-blocked-autorepair", "unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane"} <= running, running)
+        # "1.34 and earlier" with fixes in 1.35 and 1.36: a risk, add-on-less, matched by version alone.
+        self.assertIn("image-screaming-too-many-links", running)
         self.assertNotIn("excessive-volume-group-logging", running)  # 1.32.4 builds only
-        # The target: "1.35 and later" with gke-metadata-server present matches; a 1.36 range that ends at this very build (its fix) does not.
-        self.assertIn("metadata-server-connection-timeouts", target)
+        # The open specs ("All versions" with the add-on present or no add-on named, "1.33 and later", tcpx-perf's "1.34 and later", "1.35 and later" on the target): notes, not risks.
+        open_rows = {"gke-metrics-agent-ds-race-condition", "gke-ui-blocked-autorepair", "unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane", "tcpx-perf"}
+        self.assertEqual(open_rows & (running | target), set())
+        self.assertNotIn("metadata-server-connection-timeouts", target)
+        # A 1.36 range that ends at this very build (its fix) does not match the target.
         self.assertNotIn("workload-identity-post-token-bad-request", target)
         self.assertNotIn("gb300-bare-metal-workload-failures", target)
         table, _ = known_issues_matrix.load_table()
-        self.assertEqual(result["notes"], [f"{len(known_issues_matrix.inventory(seeded_b_read()))} add-on(s) inventoried in kube-system, gmp-system; {len(result['risks'])} known issue(s) match GKE 1.34.12-gke.1011000 or target 1.36.4-gke.1391002; table generated {table['generated']} ({len(table['issues'])} issue(s), newest known version {table['newest_gke_version']})"])
-        # An issue naming no add-on matches by version alone, and its text says so.
-        console = next(f for f in result["risks"] if f["issue"] == "gke-ui-blocked-autorepair")
-        self.assertEqual(known_issues_matrix.describe(console), f"known issue gke-ui-blocked-autorepair (Google Cloud console UI becomes uneditable during node auto-repair) applies to GKE 1.34.12-gke.1011000 (the page names no add-on); fixed in TBD: {self.PAGE}#gke-ui-blocked-autorepair")
+        self.assertEqual(result["notes"][0], f"{len(known_issues_matrix.inventory(seeded_b_read()))} add-on(s) inventoried in kube-system, gmp-system; {len(result['risks'])} known issue(s) match GKE 1.34.12-gke.1011000 or target 1.36.4-gke.1391002 (10 open issue(s) with no published fix noted); table generated {table['generated']} ({len(table['issues'])} issue(s), newest known version {table['newest_gke_version']})")
+        self.assertEqual(result["notes"][1], f"4 open known issue(s) with no published fix on GKE 1.34.12-gke.1011000, noted and not graded as risks: unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane, tcpx-perf, gke-ui-blocked-autorepair, gke-metrics-agent-ds-race-condition; each is on {self.PAGE}")
+        # An open row that matches both versions is noted under each, as a risk-graded row is counted under each.
+        self.assertEqual(result["notes"][2], f"6 open known issue(s) with no published fix on GKE 1.36.4-gke.1391002, noted and not graded as risks: unscheduled-pods-and-exhausted-quota-during-two-step-minor-upgrades-for-the-control-plane, lustre-multinic-throughput, metadata-server-connection-timeouts, tcpx-perf, gke-ui-blocked-autorepair, gke-metrics-agent-ds-race-condition; each is on {self.PAGE}")
+        # A risk-graded issue naming no add-on matches by version alone, and its text says so.
+        streaming = next(f for f in result["risks"] if f["issue"] == "image-screaming-too-many-links" and f["kind"] == "running")
+        self.assertEqual(known_issues_matrix.describe(streaming), f"known issue image-screaming-too-many-links (Image streaming fails because of symbolic links) applies to GKE 1.34.12-gke.1011000 (the page names no add-on); fixed in 1.35.6-gke.1005000 and later; 1.36.0-gke.2459000 and later: {self.PAGE}#image-screaming-too-many-links")
 
-    def test_a_running_or_target_version_on_a_published_issue_is_a_risk_naming_the_fix(self):
-        record = {**seeded_b(), "currentMasterVersion": "1.32.4-gke.1236007"}
-        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.32.4-gke.1353003"))
-        running = {f["issue"]: f for f in result["risks"] if f["kind"] == "running"}
-        self.assertTrue({"excessive-volume-group-logging", "dangling-status-nodependingresize-1-32"} <= set(running), set(running))
-        self.assertEqual(known_issues_matrix.describe(running["excessive-volume-group-logging"]), f"known issue excessive-volume-group-logging (The PDCSI driver might log excessively) applies to GKE 1.32.4-gke.1236007 with gcp-compute-persistent-disk-csi-driver v1.23.1-gke.37; fixed in 1.32.4-gke.1353003 and later: {self.PAGE}#excessive-volume-group-logging")
-        self.assertNotIn("excessive-volume-group-logging", {f["issue"] for f in result["risks"] if f["kind"] == "target"})  # the fixed build is not a match
-
-        def targets(text):
-            return {f["issue"] for f in known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text=text))["risks"] if f["kind"] == "target"}
-
-        # A target inside the 1.33.0 range is a target risk; the range's exclusive end, the fixed build, is not.
-        self.assertIn("dangling-status-nodependingresize-1-32", targets("1.33.0-gke.1000000"))
-        self.assertNotIn("dangling-status-nodependingresize-1-32", targets("1.33.0-gke.1552000"))
-        self.assertTrue(known_issues_matrix.describe(next(f for f in known_issues_matrix.evaluate(seeded_b(), {}, seeded_b_read(), None, context_for(seeded_b(), target_text="1.33.0-gke.1000000"))["risks"] if f["issue"] == "dangling-status-nodependingresize-1-32")).startswith("target 1.33.0-gke.1000000 lands on known issue dangling-status-nodependingresize-1-32"))
-        # Without the add-on in the inventory an add-on issue does not apply.
-        without = read(items=[row for row in recorded("addons_seeded_b.json") if row["metadata"]["name"] not in ("pdcsi-node", "pdcsi-node-windows")])
-        self.assertNotIn("excessive-volume-group-logging", {f["issue"] for f in known_issues_matrix.evaluate(record, {}, without, None, context_for(record))["risks"]})
+    def test_a_match_through_an_open_spec_is_a_note_and_through_a_bounded_spec_a_risk(self):
+        # One row of each shape, both matching the running version: the open one is noted, the bounded one is a risk.
+        table = {"generated": "2026-10-20", "source": self.PAGE, "newest_gke_version": "1.37.1-gke.1", "issues": [
+            {"id": "open-row", "summary": "an open row", "gke_versions": [{"from_minor": "1.33"}], "addon": None, "addon_versions": [], "fixed_in": "TBD", "url": self.PAGE + "#open-row"},
+            {"id": "bounded-row", "summary": "a bounded row", "gke_versions": [{"minor": "1.34", "to": "1.34.13-gke.1", "to_exclusive": True}], "addon": None, "addon_versions": [], "fixed_in": "1.34.13-gke.1 and later", "url": self.PAGE + "#bounded-row"},
+            # tcpx-perf's shape: bounded specs with fixes for two minors, an open spec for the minors after them.
+            {"id": "mixed-row", "summary": "a mixed row", "gke_versions": [{"minor": "1.33", "to": "1.33.5-gke.1", "to_exclusive": True}, {"from_minor": "1.34"}], "addon": None, "addon_versions": [], "fixed_in": "1.33.5-gke.1 and later for GKE 1.33", "url": self.PAGE + "#mixed-row"},
+        ]}
+        record = seeded_b()  # 1.34.12-gke.1011000
+        with patch.object(known_issues_matrix, "load_table", return_value=(table, None)):
+            result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record))
+        self.assertEqual([(f["kind"], f["issue"]) for f in result["risks"]], [("running", "bounded-row")])
+        self.assertIn("1 known issue(s) match GKE 1.34.12-gke.1011000 or target none (2 open issue(s) with no published fix noted)", result["notes"][0])
+        self.assertEqual(result["notes"][1], f"2 open known issue(s) with no published fix on GKE 1.34.12-gke.1011000, noted and not graded as risks: open-row, mixed-row; each is on {self.PAGE}")
+        # On a version the mixed row's bounded spec covers, the row is a risk naming its fix.
+        earlier = {**seeded_b(), "currentMasterVersion": "1.33.4-gke.1"}
+        with patch.object(known_issues_matrix, "load_table", return_value=(table, None)):
+            result = known_issues_matrix.evaluate(earlier, {}, seeded_b_read(), None, context_for(earlier))
+        self.assertEqual([(f["kind"], f["issue"]) for f in result["risks"]], [("running", "mixed-row")])
+        self.assertEqual(result["notes"][1], f"1 open known issue(s) with no published fix on GKE 1.33.4-gke.1, noted and not graded as risks: open-row; each is on {self.PAGE}")  # the open row still matches 1.33; the mixed row is the risk
+        self.assertEqual([known_issues_matrix.spec_is_open(s) for s in ("1.33.4-gke.1", {"all_versions": True}, {"from_minor": "1.34"}, {"from": "1.35.3-gke.1"}, {"from": "1.35.3-gke.1", "to": "1.36.0-gke.1"}, {"minor": "1.32", "from": "1.32.4-gke.1"}, {"minor": "1.37"}, {"through_minor": "1.34"})], [False, True, True, True, False, False, False, False])
 
     def test_the_version_grammar(self):
         vm = known_issues_matrix.version_matches
