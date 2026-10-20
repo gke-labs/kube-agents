@@ -127,13 +127,16 @@ new rule adds its entry in that order.
   `cloud.google.com/gke-container-runtime=docker` from 1.24) is `blocking` only when a pool the
   template can land on crosses the drop in this upgrade (its current minor below the drop, the
   target at or past it); a drop every such pool passed already is a note, since the pods either run
-  or are already unschedulable and the upgrade changes neither. A label no node in the template's
-  pools carries today is a `risk`, and a deprecated beta label the kubelet still sets
-  (`beta.kubernetes.io/arch`, `failure-domain.beta.kubernetes.io/zone` and their siblings) is a
-  `risk`, named with its GA replacement. The carried question is not asked on Autopilot, nor for a
-  pool that is empty today and scales from zero (a note), and it is `unknown` when the Node read
-  failed. Action: Replace the label in the selector with its GA name (`kubernetes.io/arch`,
-  `topology.kubernetes.io/zone`) before the pool crosses the drop.
+  or are already unschedulable and the upgrade changes neither. A label that no pool's
+  `config.labels` defines and no node in the template's pools carries today is a `risk`, named as
+  such; a key GKE sets from the pool's configuration (the pool, accelerator, OS and machine labels)
+  or one a pool's `config.labels` defines is a pool shape, never this rule's risk even with no node
+  today, so a GPU selector with no GPU pool is entry 18's finding; a deprecated beta label the
+  kubelet still sets (`beta.kubernetes.io/arch`, `failure-domain.beta.kubernetes.io/zone` and their
+  siblings) is a `risk`, named with its GA replacement. The carried question is not asked on
+  Autopilot, nor for a pool that is empty today and scales from zero (a note), and it is `unknown`
+  when the Node read failed. Action: Replace the label in the selector with its GA name
+  (`kubernetes.io/arch`, `topology.kubernetes.io/zone`) before the pool crosses the drop.
 - `container-runtime` (Container runtime), entry 13, risk. Reads: For each pool below the target,
   the containerd major its nodes report (`status.nodeInfo.containerRuntimeVersion`, or the table by
   the pool's minor when the nodes were not read) against the major the target's node image ships
@@ -182,10 +185,11 @@ new rule adds its entry in that order.
   `hostNetwork: true`, outside the system namespaces, that selects on a node-image label
   (`cloud.google.com/gke-os-distribution`, `cloud.google.com/gke-container-runtime`), mounts the
   kernel module tree or the network plugin's directories (`/etc/cni/net.d`, `/opt/cni/bin`,
-  `/home/kubernetes/bin`), or runs `modprobe` or `insmod`, is a `risk`; the detail names the pools
-  below the target, whose image this upgrade changes. Action: Upgrade a canary pool first and watch
-  Service routing from inside the cluster; surge with `maxUnavailable` 0; downgrade the pool while
-  the previous version is offered if the agent fails on the new image.
+  `/home/kubernetes/bin`), or runs `modprobe` or `insmod`, in its command or args or in a script
+  they hand a shell through `-c`, is a `risk`; the detail names the pools below the target, whose
+  image this upgrade changes. Action: Upgrade a canary pool first and watch Service routing from
+  inside the cluster; surge with `maxUnavailable` 0; downgrade the pool while the previous version
+  is offered if the agent fails on the new image.
 - `gpu-driver` (GPU driver mismatch), entry 18, blocker. Reads: For a template requesting
   `nvidia.com/gpu`, the CUDA version is read from the image tag or from the `CUDA_VERSION` or
   `NVIDIA_REQUIRE_CUDA` env value (no other env: a compute-capability list is not a toolkit
@@ -196,12 +200,13 @@ new rule adds its entry in that order.
   (`default` when absent), so the same table answers with no pool. A driver below the CUDA major's
   floor is `blocking`; one below the toolkit's own minimum is a `risk` (minor version
   compatibility); an image naming no CUDA version, or a Standard template whose accelerator no pool
-  carries, is a `risk`; a target the driver table does not cover (it ends at 1.33 today, as GKE's
-  GPU page does), an operator-installed driver, or a record with no install mode is `unknown`. A pin
-  the driver serves is a note, with the reminder that forward-compatibility packages inside the
-  image are not readable from the tag. Action: Match the driver to the images before the upgrade
-  (GKE's driver table at the target minor against NVIDIA's minimum-driver matrix), or recreate the
-  pool with the driver the images need; upgrade a canary GPU pool first.
+  carries, is a `risk`; a target past the driver table's last row (1.33 today, as GKE's GPU page's;
+  read 2026-10-20) is a `risk` naming the page to verify the floor against; a target below the first
+  row, an operator-installed driver, or a record with no install mode is `unknown`. A pin the driver
+  serves is a note, with the reminder that forward-compatibility packages inside the image are not
+  readable from the tag. Action: Match the driver to the images before the upgrade (GKE's driver
+  table at the target minor against NVIDIA's minimum-driver matrix), or recreate the pool with the
+  driver the images need; upgrade a canary GPU pool first.
 - `in-tree-volumes` (In-tree volumes), entry 19, blocker. Reads: Every PersistentVolume with an
   in-tree `gcePersistentDisk` source, its claim, and the pods and templates that mount the claim,
   against `addonsConfig.gcePersistentDiskCsiDriverConfig.enabled`. With the add-on off, a volume a
