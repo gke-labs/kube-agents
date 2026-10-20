@@ -482,8 +482,9 @@ class NodeImageCoupledAgentTest(unittest.TestCase):
         self.assertEqual(node_image_coupled_agent.couplings(spec), [])
         self.assertEqual(rules.shell_scripts(["sh", "-c"]), [])
         self.assertEqual(rules.shell_words(None), [])
-        # A quoted program path, a quoted variable path and a nested shell name the program too.
-        for script in ("'/sbin/modprobe' br_netfilter", 'exec "$BIN/modprobe" x', "bash -c 'modprobe x'", "sh -c \"modprobe x\""):
+        # A quoted program path, a quoted variable path, a nested shell and a backtick
+        # substitution (the older spelling of `$(…)`) name the program too.
+        for script in ("'/sbin/modprobe' br_netfilter", 'exec "$BIN/modprobe" x', "bash -c 'modprobe x'", "sh -c \"modprobe x\"", "MOD=`which modprobe`; $MOD br_netfilter", "`/sbin/modprobe` br_netfilter && exec /agent"):
             spec = {"hostNetwork": True, "containers": [{"name": "a", "image": "x", "command": ["/bin/sh", "-c", script]}]}
             self.assertEqual(node_image_coupled_agent.couplings(spec), ["runs modprobe"], script)
         # The script is read behind the shell's other options, and a shell with no `c` flag hands back none.

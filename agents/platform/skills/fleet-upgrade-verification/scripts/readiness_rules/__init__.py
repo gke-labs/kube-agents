@@ -313,12 +313,13 @@ PATH_SEPARATOR = "/"
 # the next word as their argument (`-o pipefail`, `+O extglob`, `--rcfile FILE`, and a short
 # group ending in `o` or `O`, `-eo pipefail`) are stepped over with it. A script's words, for a
 # rule that asks which programs it runs, are what is left between whitespace, the operator
-# characters and the quotes, each word's last path component, so a quoted path names its
+# characters, the quotes and the backtick (a command substitution's delimiter, which the
+# scanner below reads as a span), each word's last path component, so a quoted path names its
 # program too.
 SHELL_OPTION_PREFIXES = ("-", "+")
 SHELL_OPTIONS_WITH_ARGUMENT = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
 SHELL_OPTION_ARGUMENT_GROUP_RE = re.compile(r"^[-+][a-zA-Z]*[oO]$")
-SHELL_WORD_SPLIT_RE = re.compile("[" + re.escape(SHELL_OPERATOR_CHARS + SHELL_QUOTES) + r"\s]+")
+SHELL_WORD_SPLIT_RE = re.compile("[" + re.escape(SHELL_OPERATOR_CHARS + SHELL_QUOTES + SHELL_BACKTICK) + r"\s]+")
 
 
 # -------------------------------------------------------------------- results and reads
@@ -821,8 +822,9 @@ def shell_scripts(command: list) -> list[str]:
 
 def shell_words(script) -> list[str]:
     """The programs and arguments a `-c` script names, by last path component: the words between
-    whitespace, the shell's operator characters and its quotes, so `'/sbin/modprobe' x`,
-    `exec "$BIN/modprobe" x` and a nested `bash -c 'modprobe x'` all name `modprobe`.
+    whitespace, the shell's operator characters, its quotes and its backticks, so `'/sbin/modprobe' x`,
+    `exec "$BIN/modprobe" x`, a nested `bash -c 'modprobe x'` and ``MOD=`which modprobe` `` all
+    name `modprobe`.
     `"/sbin/modprobe br_netfilter && exec /agent"` -> `["modprobe", "br_netfilter", "exec",
     "agent"]`. Quoting is read no further: a program named inside a quoted string counts as
     named."""
