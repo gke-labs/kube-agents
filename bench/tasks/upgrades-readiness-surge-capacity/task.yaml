@@ -189,8 +189,10 @@ verification_spec:
         - '(?m)^{cluster:b}(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!["''“‘<]?(?:surge-capacity: )?pool no-surge-pool \(maxsurge 0, maxunavailable 1; [0-9]+ node\(s\), not autoscaled\) removes a node before its replacement exists; draining its node [a-z0-9.-]+ leaves )[^\n]*$'
 
   # The other three slots are on GKE's default surge settings: a report that
-  # names a pool there, or a rule or grade for one, has read a setting that is
-  # not there.
+  # names a pool there, or a grade for one, has read a setting that is not
+  # there. The rule slot reads `<id|none>`, so a line that names surge-capacity
+  # as the rule that cleared the cluster, with `graded as: none`, is a fair
+  # reading and is admitted beside `none`; any other rule's id is not.
   - name: the-other-clusters-declare-no-such-pool
     role: objective
     mode: assert
@@ -202,10 +204,11 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: pool that removes a node first: none; readiness rule: none; graded as: none; cell: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: pool that removes a node first: none; readiness rule: none; graded as: none; cell: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: pool that removes a node first: none; readiness rule: none; graded as: none; cell: none$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: pool that removes a node first: none; readiness rule: (?:surge-capacity|none); graded as: none; cell: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: pool that removes a node first: none; readiness rule: (?:surge-capacity|none); graded as: none; cell: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: pool that removes a node first: none; readiness rule: (?:surge-capacity|none); graded as: none; cell: none$)'
       forbidden_patterns:
         - '(?m)^(?:{cluster:a}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: pool that removes a node first: (?!none;)[^;\n]+; readiness rule: [^;\n]+; graded as: [^\n]+$'
         - '(?m)^(?:{cluster:a}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: [^;\n]+; graded as: (?!none;)[^;\n]+; cell: [^\n]+$'
+        - '(?m)^(?:{cluster:a}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: (?!(?:surge-capacity|none);)[^;\n]+; graded as: [^\n]+$'
         - '(?m)^(?:{cluster:a}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: pool that removes a node first: [^;\n]+; readiness rule: [^;\n]+; graded as: [^;\n]+; cell: (?!none$)[^\n]+$'
 
   - name: no-invented-cves

@@ -9815,13 +9815,13 @@ def _without_cell_slot(text: str) -> str:
     return "\n".join(line.rsplit("; cell:", 1)[0] for line in text.splitlines())
 
 
-def _surge_report(cell: str = _SURGE_CELL, grade: str = "blocker", other_cell: str = "none") -> str:
+def _surge_report(cell: str = _SURGE_CELL, grade: str = "blocker", other_cell: str = "none", other_rule: str = "none") -> str:
     lines = []
     for letter, cluster in _SLOT_NAMES.items():
         if letter == "b":
             lines.append(f"{cluster}: pool that removes a node first: no-surge-pool; readiness rule: surge-capacity; graded as: {grade}; cell: {cell}")
         else:
-            lines.append(f"{cluster}: pool that removes a node first: none; readiness rule: none; graded as: none; cell: {other_cell}")
+            lines.append(f"{cluster}: pool that removes a node first: none; readiness rule: {other_rule}; graded as: none; cell: {other_cell}")
     return "\n".join(lines)
 
 
@@ -9935,6 +9935,8 @@ def test_containerd_case_accepts_the_rules_entry_cut_at_its_first_separator(cell
         # The cell as report.json carries it, with no rule prefix: the table adds the prefix when it
         # renders, so an agent that reads the JSON copies the bare text, which the cases admit.
         (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _surge_report(_bare(_SURGE_CELL))),
+        # A no-finding cluster may name the rule that cleared it, with no grade and no cell.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="surge-capacity")),
         (_DATAPLANE_CASE, "the-declared-lines-quote-the-reports-cell", _dataplane_report(_bare(_DATAPLANE_RISK_CELL), _bare(_DATAPLANE_NOTE_LINE))),
         (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_NOTE_LINE))),
         (_CONTAINERD_CASE, "the-planted-agents-line-quotes-the-reports-text", _containerd_report(_bare(_CONTAINERD_RISK_CELL))),
@@ -9980,6 +9982,9 @@ def test_defaults_case_accepts_the_rules_other_forms_on_a_fleet_that_crosses_a_b
         (_INTREE_CASE, "the-planted-volume-is-named-with-the-addon-on-and-does-not-block", _intree_report(f'"{_INTREE_CELL}"', blocks="yes")),
         # A cluster with no such pool declares no cell either.
         (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_cell=_SURGE_CELL)),
+        # Another rule's id on a no-finding cluster is a reading of a finding the report did not make.
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="drain-blocking-pdbs")),
+        (_SURGE_CASE, "the-other-clusters-declare-no-such-pool", _surge_report(other_rule="surge-capacity", other_cell=_SURGE_CELL)),
         # A line without the cell slot is the earlier frame and fails the slots that need it.
         (_SURGE_CASE, "the-laggard-names-no-surge-pool-as-a-blocker", _without_cell_slot(_surge_report())),
         (_SURGE_CASE, "the-laggards-line-quotes-the-reports-cell", _without_cell_slot(_surge_report())),
