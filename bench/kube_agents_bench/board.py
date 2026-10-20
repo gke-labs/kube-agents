@@ -125,8 +125,12 @@ try:
         run_cols = columns(conn, "task_runs")
         has_sum = "summary" in run_cols
         has_err = "error" in run_cols
+        failure_ids = [
+            tid for tid in ids
+            if out["statuses"].get(str(tid)) in ("blocked", "triage", "failed")
+        ]
         if has_sum and has_err:
-            for tid in ids:
+            for tid in failure_ids:
                 r = conn.execute(
                     "SELECT summary, error FROM task_runs WHERE task_id = ? "
                     "ORDER BY id DESC LIMIT 1",
@@ -138,7 +142,7 @@ try:
                     if r[1] and str(tid) not in out["errors"]:
                         out["errors"][str(tid)] = str(r[1])
         elif has_sum:
-            for tid in ids:
+            for tid in failure_ids:
                 r = conn.execute(
                     "SELECT summary FROM task_runs WHERE task_id = ? "
                     "ORDER BY id DESC LIMIT 1",
@@ -147,7 +151,7 @@ try:
                 if r and r[0]:
                     out["summaries"][str(tid)] = str(r[0])
         elif has_err:
-            for tid in ids:
+            for tid in failure_ids:
                 r = conn.execute(
                     "SELECT error FROM task_runs WHERE task_id = ? "
                     "ORDER BY id DESC LIMIT 1",
@@ -354,30 +358,41 @@ if out["error"] is None:
         has_lfe = "last_failure_error" in task_cols
         has_bk = "block_kind" in task_cols
         has_res = "result" in task_cols
-        query = "SELECT id, status%s%s FROM tasks WHERE id IN (%%s)" % (
-            ", last_failure_error" if has_lfe else "",
-            ", block_kind" if has_bk else "",
-        )
+        query = "SELECT id, status FROM tasks WHERE id IN (%s)"
         for part in chunks(ids):
             for row in board.execute(query % marks(part), part):
                 tid, status = row[0], row[1]
-                card = {"status": str(status), "result": None, "summary": None, "block_kind": None, "error": None}
-                idx = 2
-                if has_lfe:
-                    if len(row) > idx and row[idx]:
-                        card["error"] = str(row[idx])
-                    idx += 1
-                if has_bk:
-                    if len(row) > idx and row[idx]:
-                        card["block_kind"] = str(row[idx])
-                out["cards"][str(tid)] = card
+                out["cards"][str(tid)] = {
+                    "status": str(status),
+                    "result": None,
+                    "summary": None,
+                    "block_kind": None,
+                    "error": None,
+                }
         wanted = [t for t in WANT if t in out["cards"]]
         if wanted:
+            cols = []
             if has_res:
-                for tid, result in board.execute(
-                    "SELECT id, result FROM tasks WHERE id IN (%s)" % marks(wanted), wanted
+                cols.append("result")
+            if has_lfe:
+                cols.append("last_failure_error")
+            if has_bk:
+                cols.append("block_kind")
+            if cols:
+                for row in board.execute(
+                    ("SELECT id, " + ", ".join(cols) + " FROM tasks WHERE id IN (%s)") % marks(wanted),
+                    wanted,
                 ):
-                    out["cards"][str(tid)]["result"] = result
+                    tid = str(row[0])
+                    for i, col in enumerate(cols, 1):
+                        val = row[i]
+                        if val is not None:
+                            if col == "result":
+                                out["cards"][tid]["result"] = val
+                            elif col == "last_failure_error":
+                                out["cards"][tid]["error"] = str(val)
+                            elif col == "block_kind":
+                                out["cards"][tid]["block_kind"] = str(val)
             if has_table(board, "task_runs"):
                 run_cols = columns(board, "task_runs")
                 has_sum = "summary" in run_cols

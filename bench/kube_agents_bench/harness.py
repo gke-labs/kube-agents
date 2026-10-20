@@ -2597,7 +2597,6 @@ class KubeAgentsHarness(AgentHarness):
                 if tid in wanted:
                     if (
                         shown.get("status") in ("blocked", "triage")
-                        and shown.get("block_kind")
                         and shown.get("block_kind") != "transient"
                     ):
                         found.pop(tid, None)
@@ -2620,7 +2619,6 @@ class KubeAgentsHarness(AgentHarness):
                         if tid in wanted:
                             if (
                                 item.get("status") in ("blocked", "triage")
-                                and item.get("block_kind")
                                 and item.get("block_kind") != "transient"
                             ):
                                 found.pop(tid, None)
@@ -3012,11 +3010,12 @@ class KubeAgentsHarness(AgentHarness):
             # that fails, or does not know every outstanding card, decides
             # nothing: the turn is made exactly as before, so the silent-turn
             # ceiling still ends a wait on a card the agent cannot see.
-            bstate = board.read_board_state(_agent_shell, outstanding, _EXEC_TIMEOUT)
+            polled_ids = list(dict.fromkeys(outstanding + list(poll_failure_messages)))
+            bstate = board.read_board_state(_agent_shell, polled_ids, _EXEC_TIMEOUT)
             if bstate is not None:
                 on_board = bstate[0]
                 latest.update(on_board)
-                for t in outstanding:
+                for t in polled_ids:
                     if on_board.get(t) not in _FAILURE_STATUSES:
                         poll_failure_messages.pop(t, None)
                     else:
