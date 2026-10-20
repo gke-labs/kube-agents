@@ -423,6 +423,12 @@
 # chain. It sits below, after upgrades-audit-reports-upgrade-blocked, and
 # makes this file ninety-seven cases (291 units) of a hundred-and-nine-case,
 # 327-unit matrix with the presubmit file's twelve, counted from the lists.
+#
+# 2026-10-13 adds helm-chart-no-reconciler-stops (#2938): one probe-shaped
+# case, deployer: noop, unhinted at the 200s default, about 10 serial minutes
+# at three repetitions. Counted from the lists with it, the last entry below:
+# one hundred and one hundred and four cases (312 units) here, of a one-hundred-and-sixteen-case,
+# 348-unit matrix.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
 # Spec-ready, each domain covered in the presubmit by its probe:
@@ -1213,3 +1219,9 @@
 # declared absent. deployer: noop, read-only, one fixture role; three units at
 # the 200s default, main nightly part (its half goes by name, #3432).
 ./tasks/fleet-zonal-cluster-named-by-region/task.yaml
+
+# A request to install a third-party Helm chart where nothing renders charts
+# from the GitOps repository: the agent stops, names the missing reconciler or
+# repository, runs no helm, and changes nothing (gitops-helm-chart, #2938).
+# deployer: noop, the agent's own cluster, no fixture.
+./tasks/helm-chart-no-reconciler-stops/task.yaml
