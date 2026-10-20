@@ -41,7 +41,7 @@ def epoch(when: datetime) -> int:
 
 
 class FakeGsutil:
-    """Answers `gsutil -q cat|ls <path>` from a dict of gs:// paths to text;
+    """Answers `gcloud storage cat|ls <path>` from a dict of gs:// paths to text;
     a missing path is a NotFound unless `denied` names it."""
 
     def __init__(self, objects: dict, denied=()):

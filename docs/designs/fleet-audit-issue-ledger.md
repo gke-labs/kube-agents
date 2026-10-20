@@ -809,7 +809,7 @@ against that cluster, as `{check, command}` — the backticked slug from the SOP
 the check, and the literal invocation that ran it. `AUDITS` carries the roster per stream as an
 `AuditSpec`, which makes four things enforceable that were not: an unknown or duplicated slug is
 rejected; an absent field is rejected outright; an entry whose `command` is missing, is a call back
-into this harness, or names none of `kubectl`/`gcloud`/`gsutil`/`bq`/`helm`/`curl` (or the upgrade audit's
+into this harness, or names none of `kubectl`/`gcloud`/`gcloud storage`/`bq`/`helm`/`curl` (or the upgrade audit's
 readiness reporter, `fleet_upgrade_report.py`) is rejected; and
 an empty list is rejected unless that cluster's `limitations` says why nothing ran, or, on a stream
 in `COLLECTOR_AUDITS` whose manifest names the target as collected, every check the target answers
