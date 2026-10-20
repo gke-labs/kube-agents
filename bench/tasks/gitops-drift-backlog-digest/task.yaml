@@ -51,7 +51,6 @@ infrastructure:
     kubectl_record_count: 3
 validated: false
 domain: incident-triage
-owner: maintainers
 fixtures: []
 prompt: |
   A change landed against a workload in the 'eval-drift-backlog' namespace of
