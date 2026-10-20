@@ -54,7 +54,6 @@ infrastructure:
   deployer: noop
 validated: false
 domain: upgrades
-owner: maintainers
 fixtures:
   - readiness-drain-blocked
   - readiness-failclosed-webhook
