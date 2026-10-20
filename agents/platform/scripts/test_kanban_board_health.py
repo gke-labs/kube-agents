@@ -923,9 +923,19 @@ class ReportTests(unittest.TestCase):
             self.assertIn("Active kanban diagnostics", text)
             # Whole report strictly respects max_chars including 40-char main() reserve
             self.assertLessEqual(len(text) + 40, 3800)
-            # Stuck cards were cut under the tight budget, hitting count-only omission fallback
-            self.assertIn("older stuck cards omitted (run hermes kanban list", text)
-            self.assertNotIn("(ids:", text)
+            # Stuck cards were cut under the tight budget, omitting later cards
+            self.assertIn("older stuck cards omitted", text)
+
+    def test_stuck_cards_omission_count_only_fallback_under_starved_budget(self):
+        # When remaining budget for omission cannot fit IDs (max_ids_budget < 15),
+        # render_stuck_cards falls back to count-only omission without '(ids:'.
+        cards = [(f"t_stuck_{i:02d}", {"kind": "stuck_in_blocked", "severity": "warning", "data": {"age_hours": 24 + i}},
+                  {"task_id": f"t_stuck_{i:02d}", "status": "blocked", "title": f"Stuck {i:02d}"})
+                 for i in range(20)]
+        lines = kbh.render_stuck_cards(cards, {}, Path("/opt/data"), max_chars=350)
+        text = "\n".join(lines)
+        self.assertIn("older stuck cards omitted (run hermes kanban list", text)
+        self.assertNotIn("(ids:", text)
 
 
 class MainOutputContractTests(unittest.TestCase):
