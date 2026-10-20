@@ -25,6 +25,7 @@ from __future__ import annotations
 import importlib
 import os
 import pkgutil
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -294,6 +295,23 @@ class TheSuiteCoversEveryInvariant(unittest.TestCase):
         self.assertEqual(set(_TEST_MODULES), discovered)
 
 
+# A mutation count written back into tests/conformance/README.md (#3553): a digit
+# count of mutations, controls or the four counted verdicts, a pasted result
+# line, or "N of the M". Backticks and asterisks are stripped first, and case
+# is ignored. Deliberately no wider: spelled-out numbers and other wrappers are
+# out of scope (the stop line in #3570).
+_README_COUNT_RE = re.compile(
+    r"\b\d+\s+(?:must_survive\s+)?(?:mutations?|controls?|killed|noisy|survived|stale)\b"  # "206 mutations: 175 KILLED, 3 controls"
+    r"|\b(?:killed|noisy|survived|stale)=\d+"  # a run's result line pasted in
+    r"|\b\d+\s+of\s+the\s+\d+\b",  # "accounts for 203 of the 206", wrapped or not
+    re.IGNORECASE,
+)
+
+
+def _readme_counts(text: str) -> list[str]:
+    return _README_COUNT_RE.findall(re.sub(r"[`*]", "", text))  # a count in `code` or **bold** is still a count
+
+
 def _load_mutation_harness():
     """hack/conformance-mutations.py loaded by path, for the tests that read its table."""
     import importlib.util
@@ -460,19 +478,24 @@ class EveryAssertionHasBeenAttacked(unittest.TestCase):
         """A count restated in the README conflicts on every pull request that
         adds a mutation and drifts anyway (#3553); --summary and a run's own
         last line carry them instead."""
-        import re
-
         readme = (Path(__file__).resolve().parent / "README.md").read_text()
-        plain = re.sub(r"[`*]", "", readme)  # a count in `code` or **bold** is still a count
-        counts = re.findall(
-            r"\b\d+\s+(?:must_survive\s+)?(?:mutations?|controls?|killed|noisy|survived|stale)\b"  # "206 mutations: 175 KILLED, 3 controls"
-            r"|\b(?:killed|noisy|survived|stale)=\d+"  # a run's result line pasted in
-            r"|\b\d+\s+of\s+the\s+\d+\b",  # "accounts for 203 of the 206", wrapped or not
-            plain, re.IGNORECASE)
+        counts = _readme_counts(readme)
         self.assertEqual(
             counts, [],
             "tests/conformance/README.md restates a mutation count; point at "
             "`hack/conformance-mutations.py --summary` or a run's result line instead")
+
+    def test_the_readme_count_guard_refuses_what_it_is_for(self) -> None:
+        """A positive control, so a pattern that compiles but matches nothing
+        can't leave the guard above passing vacuously."""
+        for text in (
+            "206 mutations: 175 KILLED, 28 NOISY, 3 controls",  # the shape #3553 removed
+            "`206`\nmutations",  # wrapped, in code
+            "killed=175 noisy=28 survived=0 stale=0",  # a pasted result line
+            "accounts for 203 of the 206",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(_readme_counts(text), "the README count guard no longer refuses this")
 
     def test_every_bucket_one_assertion_is_named_by_a_mutation(self) -> None:
         _load_every_test_module()
