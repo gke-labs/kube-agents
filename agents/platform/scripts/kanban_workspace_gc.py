@@ -65,7 +65,7 @@ named ``<something>_override``, on the agent pod and in the sandbox.  Nothing
 the product ships writes one or reads one.  They are a worker's copies of
 shipped skills or scripts, patched and run in place of the originals (#3444),
 and a later session could find them and run them too.  They go on the first
-night, whatever their age, and the log names each one.
+night, whatever their age, and the log names them (the first 40, then a count).
 """
 
 from __future__ import annotations
@@ -709,8 +709,12 @@ def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
         sweep.warnings.append(f"listing {home} in the sandbox failed: {exc}")
         return []
     if result.returncode != 0:
-        # Unlike a cron runs root, the home always exists for a profile the agent
-        # pod has, so a failed listing is a problem, not "nothing there".
+        # A home the sandbox hasn't received yet (a profile scaffolded while it
+        # was down, a recreated volume) has nothing to sweep.  Any other failure,
+        # a home the worker locked from its own shell say, is reported rather
+        # than read as "nothing there".
+        if "No such file or directory" in (result.stderr or ""):
+            return []
         sweep.warnings.append(f"listing {home} in the sandbox exited {result.returncode}, so its override trees "
                               f"were not checked: {(result.stderr or '').strip()[:STDERR_EXCERPT_CHARS]}")
         return []
@@ -722,8 +726,8 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
     """Remove every profile home's override trees, on the agent pod and in the sandbox.
 
     A symlink is unlinked, never followed.  A home that is itself a symlink is
-    left alone, and reported when it holds an override tree, as a symlinked
-    runs root is.  Returns *remote_root*, or None once the sandbox has not
+    left alone: on the agent pod it is reported when an override tree sits
+    behind it, and in the sandbox `find` doesn't follow it, so nothing is found.  Returns *remote_root*, or None once the sandbox has not
     answered, so the caller's next sandbox step can skip it.
     """
     try:
@@ -751,14 +755,17 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
             remote_root = None
             continue
         if found and not _real_dirs_remote([remote_root / "profiles", remote_home], sweep):
-            sweep.warnings.append(f"{remote_home} in the sandbox is reached through a symlink; its override trees were not removed")
+            sweep.warnings.append(f"could not confirm {remote_home} in the sandbox is a real directory (a symlink, "
+                                  f"or the check failed); its override trees were not removed")
             found = []
-        if found:
+        for entry in found:
+            # One rm per tree, so a tree the worker made unremovable doesn't hide
+            # the ones that did go from the log.
             before = len(sweep.remote_removed)
-            _remove_remote(remote_home, found, sweep)
+            _remove_remote(remote_home, [entry], sweep)
             removed = sweep.remote_removed[before:]
             del sweep.remote_removed[before:]
-            sweep.overrides_removed.extend(f"sandbox {name}/{entry}" for entry in removed)
+            sweep.overrides_removed.extend(f"sandbox {name}/{e}" for e in removed)
     return remote_root
 
 

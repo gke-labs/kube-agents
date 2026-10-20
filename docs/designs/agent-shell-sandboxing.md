@@ -2155,7 +2155,9 @@ Two shapes are removed rather than inventoried. A cron run's working directory
 directory named `<something>_override`, is removed the first night (#3551): it is a
 worker's copy of a shipped skill or script, patched to run in place of the original
 (#3444). No product code writes one, and `scripts/test_shipped_import_paths.py` keeps
-literal paths in shipped import-path calls, `PYTHONPATH` and configs off them. Both
+the literal paths it reads in shipped import-path calls, shell `PYTHONPATH` and configs
+off them. That test is a guard on the obvious forms, not a proof; the prune is the
+enforcement. Both
 prunes cover the homes the agent pod has a profile for, so a stale sandbox home is left
 to the inventory. Neither follows a symlink the model planted: the home, `cron` and
 `cron/runs` must be real directories for the runs prune, a symlinked home is left alone

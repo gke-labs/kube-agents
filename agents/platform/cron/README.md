@@ -304,7 +304,8 @@ profile for, on the agent pod and in the sandbox. Cron run directories
 seven days, logged as a count. Override trees go the first night, logged by
 name: a top-level directory named `<something>_override`, such as a worker's
 patched copy of a shipped skill in `skills_override/`. No product code writes
-one, and none is on a shipped import path or skill directory. Neither prune
+one, and a test keeps literal paths in shipped import-path calls and configs
+off them. Neither prune
 follows a symlink.
 
 Daily is deliberate rather than conservative. The first install to run this had

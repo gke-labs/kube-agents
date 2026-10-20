@@ -842,6 +842,30 @@ class OverridesTest(unittest.TestCase):
         sweep = self.sweep(Path("/sandbox-root"), fake)
         self.assertTrue(any("exited 1" in w and "Permission denied" in w for w in sweep.warnings), sweep.warnings)
 
+    def test_a_home_the_sandbox_has_not_received_says_nothing(self):
+        def fake(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "find: '/sandbox-root/profiles/platform': No such file or directory")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(sweep.warnings, [])
+
+    def test_one_unremovable_tree_does_not_hide_the_others(self):
+        rhome = Path("/sandbox-root") / "profiles" / "platform"
+
+        def fake(argv, **kwargs):
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(
+                    ("scripts_override", "1", "4096", "d"), ("skills_override", "1", "4096", "d")), "")
+            if str(rhome / "skills_override") in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "rm: cannot remove: Permission denied")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(sweep.overrides_removed, ["sandbox platform/scripts_override"])
+        self.assertTrue(any("Permission denied" in w for w in sweep.warnings), sweep.warnings)
+
     def test_a_down_sandbox_is_tried_once_across_both_sweeps(self):
         runs = self.profiles.joinpath("platform", *gc.CRON_RUNS_PARTS)
         runs.mkdir(parents=True)
@@ -881,7 +905,8 @@ class OverridesTest(unittest.TestCase):
 
         sweep = self.sweep(remote, fake)
         rms = [a for a in calls if a[0] == gc.REMOTE_RM]
-        self.assertEqual(rms, [[gc.REMOTE_RM, "-rf", "--", str(rhome / "scripts_override"), str(rhome / "skills_override")]])
+        self.assertEqual(rms, [[gc.REMOTE_RM, "-rf", "--", str(rhome / "scripts_override")],
+                               [gc.REMOTE_RM, "-rf", "--", str(rhome / "skills_override")]])
         self.assertEqual(sweep.overrides_removed, ["sandbox platform/scripts_override", "sandbox platform/skills_override"])
 
         calls.clear()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""No shipped script puts a worker's override tree on its import path (#3551).
+"""No literal path in a shipped import-path call names a worker's override tree (#3551).
 
 In #3444 an audit worker copied the fleet-audit skill and the shared scripts
 into ``skills_override/`` and ``scripts_override/`` in its profile home, patched
@@ -13,8 +13,11 @@ append, extend, slice or ``+=``, however ``sys`` was imported;
 ``runpy.run_path``; ``os.environ["PYTHONPATH"]`` and ``os.putenv``) names an
 ``_override`` tree or sits under ``/opt/data/profiles``; no shipped shell
 script puts one on ``PYTHONPATH``; and no shipped config names an override
-tree, so none can become a skill directory.  A path built from a variable or
-the environment is not seen.
+tree, so none can become a skill directory.  Not seen: a path built from a
+variable or the environment, a ``PYTHONPATH`` passed to a child in an ``env=``
+dict or ``environ.update``, the Dockerfile and operator ``PYTHONPATH``, and
+``.pth`` files.  It is a guard on the obvious forms, not a proof; the nightly
+sweep is what removes the copies.
 
 Run: python3 scripts/test_shipped_import_paths.py
 """
