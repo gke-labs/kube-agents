@@ -433,8 +433,9 @@ which column is missing:
   column in its INSERT, so every write raises `no such column: cluster` into the blanket
   `except Exception` around it, is logged once per event, and is dropped. The table stays empty for
   as long as the shape lasts.
-- **No `object_uid`** — the same, and for the same reason: it is in the INSERT, so nothing is
-  recorded.
+- **No `object_uid`** — the session server does not start. `init_db` creates the partial index
+  `idx_intercepted_events_drift_uid` on `object_uid` at import, which raises
+  `no such column: object_uid`, and the process exits.
 - **No `delivery_error`** — events are still recorded correctly and only the correction fails.
   `mark_delivery_failed` raises `no such column: delivery_error`, the same blanket `except`
   swallows it, and the row keeps `notified = 1`, so the recap counts an alert nobody received as

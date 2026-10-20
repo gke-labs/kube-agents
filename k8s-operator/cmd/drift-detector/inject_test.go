@@ -1132,7 +1132,14 @@ func backlogHandlerAgainst(t *testing.T, daemon *fakeDaemon, url string) *driftI
 	if err := inject.VerifyKindSupported(context.Background(), injectKindDrift); err != nil {
 		t.Fatalf("VerifyKindSupported: %v", err)
 	}
-	return newDriftInjectHandler(inject)
+	if !inject.Supports(featureDriftBacklog) {
+		t.Fatalf("Supports(%q) = false after a /healthz that advertises it", featureDriftBacklog)
+	}
+	handler := newDriftInjectHandler(inject)
+	if !handler.backlogRoute {
+		t.Fatal("backlogRoute = false against a daemon that advertises the digest route -- every backlog record would be carded")
+	}
+	return handler
 }
 
 func backlogEvent(insertID string) DriftEvent {

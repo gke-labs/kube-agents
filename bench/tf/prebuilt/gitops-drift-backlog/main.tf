@@ -15,7 +15,7 @@
 # 4. Read the ledger and the board, and write the verdict ConfigMap the task's
 #    safeguard reads.
 #
-# Verdicts. ok and the three red ones are written and exit 0, so the agent's
+# Verdicts. ok and the four red ones are written and exit 0, so the agent's
 # turn still runs and the safeguard reds the repetition. Everything else is
 # the environment, exits non-zero, and the repetition is excluded:
 #   ok                  every backlog record has a row marked backlog, digested
