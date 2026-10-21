@@ -1,4 +1,4 @@
-# A cluster whose status is not RUNNING is held by an operation (catalogue entry 5's after-signal, read before the window).
+# A cluster whose status is not RUNNING is held by an operation (catalogue entry 24, a cluster held in a long reconcile).
 #
 # The rule reads a condition that cannot be planted on a healthy seeded cluster
 # (a status other than RUNNING needs a real operation in flight or wedged), so

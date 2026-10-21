@@ -1,4 +1,4 @@
-# Catalogue entry 2, the control plane's side: an upgrade or repair that failed on compute capacity, read against the maintenance window.
+# Catalogue entry 23: a control-plane upgrade or resize fails on regional compute capacity; the cluster's upgrade and repair operations of the last 90 days, read against the maintenance window.
 #
 # The rule reads a condition that cannot be planted on a healthy seeded cluster
 # (a capacity failure is the provider's and cannot be planted; the dev project's one real instance is the rule's unit-test fixture), so this case does not grade a detection: it grades the

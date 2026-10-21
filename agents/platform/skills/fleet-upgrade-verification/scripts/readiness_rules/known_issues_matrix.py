@@ -1,6 +1,6 @@
 """
-Entry 10 of docs/designs/upgrade-failure-catalogue.md, at patch granularity: a GKE patch can
-carry a provider bug, published on the known-issues page with the patch that fixes it, and a
+Entry 26 of docs/designs/upgrade-failure-catalogue.md: a known issue in an add-on at the target
+version. A GKE patch can carry a provider bug, published on the known-issues page with the patch that fixes it, and a
 fleet that upgrades every cluster at once meets the bug everywhere at once. The rule has two
 halves.
 
@@ -62,7 +62,7 @@ from readiness_rules import (
 from readiness_rules.target_patch_valid import BUILD_SEPARATOR, CHANNEL_KEY, NO_CHANNEL_LABEL, NO_CHANNEL_VALUES, RELEASE_CHANNEL_KEY, channel_roster, parse_version
 
 RULE_ID = "known-issues-matrix"
-ENTRY = 10
+ENTRY = 26
 CAN_BLOCK = False
 
 # Where GKE's managed add-ons run: the system namespace and Managed Service for Prometheus's.

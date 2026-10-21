@@ -1746,7 +1746,7 @@ class UpgradeBlockedTest(unittest.TestCase):
 
     STATUS_RULE = {
         "rule": "cluster-status-age",
-        "entry": 5,
+        "entry": 24,
         "holds": ["cluster", "node-pool"],
         "text": "lag has been RECONCILING for 6d 3h on operation-1 (UPDATE_CLUSTER, RUNNING since 2026-10-14T00:00:00Z), past the 4h threshold; freeze changes",
     }
@@ -1760,8 +1760,8 @@ class UpgradeBlockedTest(unittest.TestCase):
         "reason": "gcloud compute instances list --project=acme --format=json(name,zone,status) failed (1): ERROR: (gcloud.compute.instances.list) permission denied",
         "text": "orphan-node-objects: gcloud compute instances list --project=acme --format=json(name,zone,status) failed (1): ERROR: (gcloud.compute.instances.list) permission denied",
     }
-    STATUS_UNKNOWN = {"rule": "cluster-status-age", "entry": 5, "can_block": True, "holds": ["cluster", "node-pool"], "reason": "status RECONCILING; the operations were not read (forbidden), so what holds it and for how long is unknown", "text": "cluster-status-age: status RECONCILING; the operations were not read (forbidden)"}
-    MATRIX_UNKNOWN = {"rule": "known-issues-matrix", "entry": 10, "can_block": False, "reason": "the DaemonSets were not read (forbidden), so the add-on inventory lists Deployments only", "text": "known-issues-matrix: the DaemonSets were not read (forbidden)"}
+    STATUS_UNKNOWN = {"rule": "cluster-status-age", "entry": 24, "can_block": True, "holds": ["cluster", "node-pool"], "reason": "status RECONCILING; the operations were not read (forbidden), so what holds it and for how long is unknown", "text": "cluster-status-age: status RECONCILING; the operations were not read (forbidden)"}
+    MATRIX_UNKNOWN = {"rule": "known-issues-matrix", "entry": 26, "can_block": False, "reason": "the DaemonSets were not read (forbidden), so the add-on inventory lists Deployments only", "text": "known-issues-matrix: the DaemonSets were not read (forbidden)"}
 
     def member_with_unknowns(self, name, unknowns, **kwargs):
         row = self.member(name, status=kwargs.pop("status", "unknown"), **kwargs)

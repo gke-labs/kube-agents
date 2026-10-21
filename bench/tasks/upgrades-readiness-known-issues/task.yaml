@@ -1,4 +1,4 @@
-# Catalogue entry 10 at patch granularity: the add-on inventory against the published known issues per GKE patch.
+# Catalogue entry 26: a known issue in an add-on at the target version; the add-on inventory against the published known issues per GKE patch.
 #
 # The rule reads a condition that cannot be planted on a healthy seeded cluster
 # (which issues the page publishes for the running patch is the provider's; the table carries the page's rows for every minor from 1.32, so a current cluster matches whatever the page lists for its version), so this case does not grade a detection: it grades the

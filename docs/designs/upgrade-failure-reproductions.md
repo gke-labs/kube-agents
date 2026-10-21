@@ -5,7 +5,7 @@ This is the index that joins the three documents about upgrade failures.
 which signal shows it before and after the upgrade, where to look, how to mitigate, what this
 repository reads today and what GKE's Recommender publishes.
 [`bench/upgrade-scenarios/README.md`](../../bench/upgrade-scenarios/README.md) holds the harness
-that planted each entry with a script on a throwaway cluster (21 and 22 have none) and, for all but
+that planted each entry with a script on a throwaway cluster (21 to 26 have none) and, for all but
 entry 15, upgraded it, with its
 verdicts and its evidence. This document says, per entry, which scenario script is the reproduction,
 what that run showed in one paragraph, and what the seeded fleet (`bench/tf/fleet/`) holds for the
@@ -78,6 +78,17 @@ the seeded fleet on `main` holds for it. The fleet can carry a before-state only
     reproduced; no scenario script; `readiness-lb-drain-timeout` on seeded-b.
 22. [A Node object outlives its virtual machine](#22-a-node-object-outlives-its-virtual-machine):
     not reproduced; no scenario script; nothing on the fleet.
+23. [A control-plane upgrade or resize fails on regional compute
+    capacity](#23-a-control-plane-upgrade-or-resize-fails-on-regional-compute-capacity): not
+    reproduced; no scenario script; nothing on the fleet.
+24. [A cluster held in a long reconcile](#24-a-cluster-held-in-a-long-reconcile): not reproduced;
+    no scenario script; nothing on the fleet.
+25. [The target patch is withdrawn before the
+    window](#25-the-target-patch-is-withdrawn-before-the-window): not reproduced; no scenario
+    script; `version-laggard` on seeded-b carries the running-patch half.
+26. [A known issue in an add-on at the target
+    version](#26-a-known-issue-in-an-add-on-at-the-target-version): not reproduced; no scenario
+    script; nothing on the fleet.
 
 ## The entries
 
@@ -411,3 +422,44 @@ Fleet: nothing. The rule's unit tests carry a recorded node list with the ghost 
 
 Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
 22](upgrade-failure-catalogue.md#22-a-node-object-outlives-its-virtual-machine).
+
+### 23. A control-plane upgrade or resize fails on regional compute capacity
+
+Harness: none. The entry comes from the same support history; a capacity failure is the
+provider's and cannot be planted, so no script plants it.
+
+Fleet: nothing. The rule's unit tests carry a recorded operations list with one such failure.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+23](upgrade-failure-catalogue.md#23-a-control-plane-upgrade-or-resize-fails-on-regional-compute-capacity).
+
+### 24. A cluster held in a long reconcile
+
+Harness: none. The entry comes from the same support history; a status other than `RUNNING`
+needs a real operation in flight or wedged, so no script plants it.
+
+Fleet: nothing. The rule's unit tests carry recorded operations and cluster records.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+24](upgrade-failure-catalogue.md#24-a-cluster-held-in-a-long-reconcile).
+
+### 25. The target patch is withdrawn before the window
+
+Harness: none. The entry comes from the same support history; which patches a channel lists is
+the provider's, so no script plants a withdrawn target.
+
+Fleet: `version-laggard` on seeded-b holds the control plane at a patch the REGULAR channel has
+moved past, the rule's running-patch risk; no withdrawn target.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+25](upgrade-failure-catalogue.md#25-the-target-patch-is-withdrawn-before-the-window).
+
+### 26. A known issue in an add-on at the target version
+
+Harness: none. The entry comes from the same support history; which issues the page lists for a
+current patch is the provider's, so no script plants it.
+
+Fleet: nothing. The rule's unit tests carry a recorded add-on inventory and server config.
+
+Reproduction: none. Detection, where to look, mitigation and what reads it today: [catalogue entry
+26](upgrade-failure-catalogue.md#26-a-known-issue-in-an-add-on-at-the-target-version).

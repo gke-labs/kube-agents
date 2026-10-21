@@ -400,13 +400,13 @@ RULE_NONE = "no rules"
 # this order, which is the order the table and the JSON list their findings in. One list,
 # grouped by entry number, the entry in the comment.
 EXTRA_RULES = [
-    control_plane_upgrade_history,  # entry 2: an upgrade or repair that failed on compute capacity, against the maintenance window
-    cluster_status_age,  # entry 5: a cluster held by an operation that has not ended
-    target_patch_valid,  # entry 10: the target and the running patch against the channel's valid versions
-    known_issues_matrix,  # entry 10: the add-on inventory against the published known issues per patch
     zonal_control_plane,  # entry 11
     lb_connection_draining,  # entry 21: a backend service whose connection drain outlasts the node's deregistration wait
     orphan_node_objects,  # entry 22: a Node whose instance is gone
+    control_plane_upgrade_history,  # entry 23: an upgrade or repair that failed on compute capacity, against the maintenance window
+    cluster_status_age,  # entry 24: a cluster held by an operation that has not ended
+    target_patch_valid,  # entry 25: the target and the running patch against the channel's valid versions
+    known_issues_matrix,  # entry 26: the add-on inventory against the published known issues per patch
 ]
 RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
 # What the fold stamps on a finding: the rule's id and entry on every one, the rule's own

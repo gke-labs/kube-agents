@@ -1,7 +1,8 @@
 """
-Entry 5 of docs/designs/upgrade-failure-catalogue.md, read before the window: the entry's
-after-signal is an operation still open, and a cluster whose `status` is not `RUNNING`
-(`RECONCILING`, `DEGRADED`, `ERROR`) accepts no node pool or cluster change. The rule reads
+Entry 24 of docs/designs/upgrade-failure-catalogue.md: a cluster held in a long reconcile, which
+is entry 5's after-signal, an operation still open, read before the window. A cluster whose
+`status` is not `RUNNING` (`RECONCILING`, `DEGRADED`, `ERROR`) accepts no node pool or cluster
+change, so it blocks every upgrade until the control plane settles. The rule reads
 the cluster's `status` and, from the project's operations (the report's `operations` read),
 the operations whose target is this cluster or one of its node pools: an `UPGRADE_NODES`, a
 resize or a repair names the pool (`.../clusters/<name>/nodePools/<pool>`) and holds the
@@ -57,7 +58,7 @@ from readiness_rules import (
 )
 
 RULE_ID = "cluster-status-age"
-ENTRY = 5
+ENTRY = 24
 CAN_BLOCK = True
 HOLDS = HOLDS_BOTH  # a held cluster takes no change: neither move goes through
 

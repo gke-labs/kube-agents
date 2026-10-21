@@ -936,7 +936,7 @@
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
-# Catalogue entry 2 through the readiness report's control-plane-upgrade-history
+# Catalogue entry 23 through the readiness report's control-plane-upgrade-history
 # rule: the capacity failures among each seeded cluster's upgrade and repair
 # operations, against its maintenance window (#3524). Read-only; no planted
 # fixture. Priced at 600s in unit_cost_hint as the first of the five
@@ -988,13 +988,14 @@
 # presubmit seat is a later pull request that cites its record.
 ./tasks/upgrades-exclusion-end-date-named/task.yaml
 
-# A cluster held by an operation: the cluster-status-age rule's status, newest
-# operation and age on every seeded cluster (#3524). Read-only; no planted
+# Catalogue entry 24 through the readiness report's cluster-status-age rule: the
+# status, newest operation and age on every seeded cluster (#3524). Read-only; no planted
 # fixture; three units at the 200s default.
 ./tasks/upgrades-readiness-cluster-status-age/task.yaml
 
-# The add-on inventory and the known-issues-matrix rule's table over it, one
-# declared line per seeded cluster (#3524). Read-only; no planted fixture;
+# Catalogue entry 26 through the readiness report's known-issues-matrix rule: the
+# add-on inventory and the rule's table over it, one declared line per seeded
+# cluster (#3524). Read-only; no planted fixture;
 # three units at the 200s default.
 ./tasks/upgrades-readiness-known-issues/task.yaml
 
@@ -1003,8 +1004,9 @@
 # (#3524). Read-only; no planted fixture; three units at the 200s default.
 ./tasks/upgrades-readiness-orphan-node/task.yaml
 
-# The target-patch-valid rule's re-read of the target and the running patch
-# against the channel's valid versions, on every seeded cluster (#3524).
+# Catalogue entry 25 through the readiness report's target-patch-valid rule: its
+# re-read of the target and the running patch against the channel's valid
+# versions, on every seeded cluster (#3524).
 # Read-only; no planted fixture; three units at the 200s default.
 ./tasks/upgrades-readiness-target-patch-valid/task.yaml
 

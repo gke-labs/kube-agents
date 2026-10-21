@@ -1,4 +1,4 @@
-# A target patch the channel has withdrawn, or a running patch the channel has moved past (catalogue entry 10's version side).
+# A target patch the channel has withdrawn, or a running patch the channel has moved past (catalogue entry 25).
 #
 # The rule reads a condition that cannot be planted on a healthy seeded cluster
 # (the channel default the report targets is valid by construction, and which

@@ -1,6 +1,6 @@
 """
-Entry 10 of docs/designs/upgrade-failure-catalogue.md, on the version side: what the cluster
-runs, and what it is about to run, against what its channel serves. A patch version can be
+Entry 25 of docs/designs/upgrade-failure-catalogue.md: the target patch is withdrawn before the
+window. What the cluster runs, and what it is about to run, against what its channel serves. A patch version can be
 withdrawn between the plan and the window; the withdrawn patch stays selectable, and a node
 pool upgrade to it fails on an image the provider no longer serves. The rule reads the
 location's server config (the report's `server_config` read, `gcloud container
@@ -37,7 +37,7 @@ from readiness_rules import (
 )
 
 RULE_ID = "target-patch-valid"
-ENTRY = 10
+ENTRY = 25
 CAN_BLOCK = True
 HOLDS = HOLDS_BOTH  # a withdrawn patch is no target for the control plane or a pool
 

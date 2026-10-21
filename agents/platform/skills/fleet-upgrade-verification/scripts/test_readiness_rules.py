@@ -1098,7 +1098,7 @@ class ClusterStatusAgeRuleTest(unittest.TestCase):
         # A RUNNING operation with no readable start: unknown, not a guess.
         unreadable = self.reads_with({**self.in_flight(timedelta(hours=5)), "startTime": "yesterday"})
         self.assertEqual(cluster_status_age.evaluate({**record, "status": "RECONCILING"}, {}, None, None, context_for(record, reads=unreadable))["unknown"], ["status RECONCILING; the RUNNING operation operation-in-flight carries no readable startTime ('yesterday'), so its age is unknown"])
-        self.assertEqual((cluster_status_age.RULE_ID, cluster_status_age.ENTRY, cluster_status_age.CAN_BLOCK), ("cluster-status-age", 5, True))
+        self.assertEqual((cluster_status_age.RULE_ID, cluster_status_age.ENTRY, cluster_status_age.CAN_BLOCK), ("cluster-status-age", 24, True))
 
 
 class TargetPatchValidRuleTest(unittest.TestCase):
@@ -1208,7 +1208,7 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         self.assertEqual(target_patch_valid.active_versions_above("1.35.0-gke.1", ["1.35.8-gke.1626001", "1.35.8-gke.1439001", "1.36.4-gke.1391002"]), ("1.35.8-gke.1626001", "1.35.8-gke.1439001"))
         self.assertEqual(target_patch_valid.active_versions_above("1.37.0-gke.1", ["1.36.4-gke.1391002"]), (None, None))
         self.assertEqual(target_patch_valid.action_text({"version": "1.37.0-gke.1", "channel": "REGULAR", "newest": None, "next_version": None}), "no active version at or above it on the REGULAR channel")
-        self.assertEqual((target_patch_valid.RULE_ID, target_patch_valid.ENTRY, target_patch_valid.CAN_BLOCK), ("target-patch-valid", 10, True))
+        self.assertEqual((target_patch_valid.RULE_ID, target_patch_valid.ENTRY, target_patch_valid.CAN_BLOCK), ("target-patch-valid", 25, True))
 
 
 class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
@@ -1249,7 +1249,7 @@ class ControlPlaneUpgradeHistoryRuleTest(unittest.TestCase):
         self.assertFalse(control_plane_upgrade_history.names_capacity("operation aborted by the user"))
         failed = project_reads(**{shared.PROJECT_READ_OPERATIONS: failed_read("operations list failed (1): forbidden")})
         self.assertEqual(control_plane_upgrade_history.evaluate(record, {}, None, None, context_for(record, reads=failed))["unknown"], ["the operations were not read (operations list failed (1): forbidden), so the upgrade history is unknown"])
-        self.assertEqual((control_plane_upgrade_history.RULE_ID, control_plane_upgrade_history.ENTRY, control_plane_upgrade_history.CAN_BLOCK), ("control-plane-upgrade-history", 2, False))
+        self.assertEqual((control_plane_upgrade_history.RULE_ID, control_plane_upgrade_history.ENTRY, control_plane_upgrade_history.CAN_BLOCK), ("control-plane-upgrade-history", 23, False))
 
 
 class KnownIssuesMatrixRuleTest(unittest.TestCase):
@@ -1463,7 +1463,7 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
         result = known_issues_matrix.evaluate(record, {}, read(items=recorded("addons_seeded_b.json"), read_errors={"daemonset": "forbidden"}), None, context_for(record))
         self.assertEqual(result["unknown"], ["the DaemonSets were not read (forbidden), so the add-on inventory lists Deployments only"])
         self.assertFalse(known_issues_matrix.CAN_BLOCK)
-        self.assertEqual((known_issues_matrix.RULE_ID, known_issues_matrix.ENTRY), ("known-issues-matrix", 10))
+        self.assertEqual((known_issues_matrix.RULE_ID, known_issues_matrix.ENTRY), ("known-issues-matrix", 26))
         # The table is read through the module loader, as the removal table is: a loader that serves nothing is unknown, naming the table.
         known_issues_matrix._TABLE_CACHE.clear()  # the table is read once per process; this probe needs the read
         with patch.object(known_issues_matrix.pkgutil, "get_data", return_value=None):
@@ -1473,7 +1473,7 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
 
 class RegistryOrderTest(unittest.TestCase):
     def test_the_incident_rules_are_registered_by_entry(self):
-        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix", "zonal-control-plane", "lb-connection-draining", "orphan-node-objects"])
+        self.assertEqual([m.RULE_ID for m in r.EXTRA_RULES], ["zonal-control-plane", "lb-connection-draining", "orphan-node-objects", "control-plane-upgrade-history", "cluster-status-age", "target-patch-valid", "known-issues-matrix"])
         # Every blocking rule says what its mechanism holds; the node-removal rules hold the pool move alone.
         self.assertEqual({m.RULE_ID: m.HOLDS for m in r.EXTRA_RULES if m.CAN_BLOCK}, {"cluster-status-age": shared.HOLDS_BOTH, "target-patch-valid": shared.HOLDS_BOTH, "lb-connection-draining": (shared.HOLDS_NODE_POOL,), "orphan-node-objects": (shared.HOLDS_NODE_POOL,)})
 

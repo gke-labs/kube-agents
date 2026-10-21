@@ -1,7 +1,7 @@
 """
-Entry 2 of docs/designs/upgrade-failure-catalogue.md, on the control plane's side: an
-automated control-plane upgrade, a node upgrade or a repair needs compute capacity in the
-location when it fires, the provider does not check capacity first, and the agent cannot
+Entry 23 of docs/designs/upgrade-failure-catalogue.md: a control-plane upgrade or resize fails
+on regional compute capacity. An automated control-plane upgrade, a node upgrade or a repair
+needs compute capacity in the location when it fires, the provider does not check capacity first, and the agent cannot
 read zone capacity. It can read the cluster's recent operations. The rule reads the project's
 operations (the report's `operations` read) and files one risk per `DONE` operation of type
 UPGRADE_MASTER, UPGRADE_NODES or REPAIR_CLUSTER on this cluster or on one of its node pools
@@ -32,7 +32,7 @@ from readiness_rules import (
 )
 
 RULE_ID = "control-plane-upgrade-history"
-ENTRY = 2
+ENTRY = 23
 CAN_BLOCK = False
 
 # How far back the operations are read: GKE lists a project's operations for a bounded time,

@@ -1949,9 +1949,9 @@ class ReadinessTest(unittest.TestCase):
         # on the cluster record: `none` under `other blockers`, the zonal risk under `risks`.
         row = [line for line in text.splitlines() if "| seeded-a |" in line][1]  # the readiness table's row, between the version table's and the add-ons table's
         self.assertEqual(row.count("| read failed |"), 1, row)  # the PDB cell alone; the note names the read in prose
-        # `other blockers` is `none`; the risks cell carries the known-issues rows the page lists for the fake fleet's version, then the zonal risk.
-        self.assertIn("| none | known-issues-matrix: ", row)
-        self.assertIn("zonal-control-plane: ", row)
+        # `other blockers` is `none`; the risks cell carries the zonal risk first, then the known-issues rows the page lists for the fake fleet's version (the registry's entry order).
+        self.assertIn("| none | zonal-control-plane: ", row)
+        self.assertIn("; known-issues-matrix: known issue ", row)
         # The version row is unaffected, and the rollout record does not treat the project as unread.
         self.assertEqual({m["cluster"]: m["status"] for m in data["members"]}["seeded-a"], report.STATUS_CURRENT)
         self.assertEqual(data["rollout"]["missing_members"], [])
