@@ -459,6 +459,78 @@ func TestDispatcherSweepInDryRunCallsNoDaemon(t *testing.T) {
 	}
 }
 
+// TestDispatcherSweepHearsAnObjectTheScaleUpHoldKeeps: a FailedScheduling
+// alert followed by a TriggeredScaleUp has its later sightings held, not
+// accepted; they still move the quiet clock, so a Pending pod the scheduler
+// keeps re-emitting for is not reported quiet during the hold.
+func TestDispatcherSweepHearsAnObjectTheScaleUpHoldKeeps(t *testing.T) {
+	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
+	now := t0
+	disp, _, injectCount := newScaleUpDispatcher(t, filterThresholds{failedSchedulingMinCount: 1}, &now)
+	disp.quietAfter = 15 * time.Minute
+	disp.readyAt.Store(1)
+	disp.now = func() time.Time { return now }
+	disp.dedup.now = func() time.Time { return now }
+	ctx := context.Background()
+	disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 1, now)) // the alert
+	if *injectCount != 1 {
+		t.Fatalf("alert: %d injects; want 1", *injectCount)
+	}
+	now = t0.Add(3 * time.Minute)
+	disp.Dispatch(ctx, autoscalerEvent("pod-1", "TriggeredScaleUp", now)) // the hold begins
+	for i := 1; i <= 10; i++ {
+		now = t0.Add(time.Duration(3+i) * time.Minute)
+		disp.Dispatch(ctx, failedSchedulingEvent("pod-1", 1+i, now)) // held, not accepted
+	}
+	if *injectCount != 1 {
+		t.Fatalf("held sightings fired %d injects; want 1", *injectCount)
+	}
+	now = t0.Add(16 * time.Minute) // 16m after the accepted sighting, 3m after the last held one
+	disp.Sweep(ctx)
+	if *injectCount != 1 {
+		t.Fatalf("a sweep called an object the scale-up hold still hears quiet")
+	}
+	heard := backoffEvent(1)
+	heard.Key.UID, heard.Key.Reason = "pod-heard", "Scheduled"
+	now = t0.Add(29 * time.Minute) // 16m after the last held sighting
+	disp.Dispatch(ctx, heard)      // the cluster speaks
+	if quiet := disp.dedup.QuietIncidents(now, disp.quietAfter); len(quiet) != 1 || !quiet[0].LastSeen.Equal(t0.Add(13*time.Minute)) {
+		t.Fatalf("quiet incidents = %+v; want one quiet since the last held sighting %s", quiet, t0.Add(13*time.Minute))
+	}
+	disp.Sweep(ctx)
+	if *injectCount != 2 {
+		t.Errorf("once the held sightings stopped: %d injects; want 2 (the alert and one follow-up)", *injectCount)
+	}
+}
+
+// TestSightedIgnoresAReplay: a relist re-delivers a held sighting with the
+// timestamp it had; that moves nothing, as it moves nothing in Observe.
+func TestSightedIgnoresAReplay(t *testing.T) {
+	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
+	c, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.now = func() time.Time { return t0 }
+	key := EventKey{UID: "pod-1", Reason: "FailedScheduling"}
+	c.Observe(key, "0/3 nodes are available", t0)
+	c.BindSession(key, "", "sess-1")
+	c.MarkFollowupSupported(key, "")
+	c.now = func() time.Time { return t0.Add(10 * time.Minute) }
+	c.Sighted(key, "", t0.Add(10*time.Minute))
+	c.now = func() time.Time { return t0.Add(20 * time.Minute) }
+	// The same event again (a replay), then a key with no entry: no-ops.
+	c.Sighted(key, "", t0.Add(10*time.Minute))
+	c.Sighted(EventKey{UID: "pod-9", Reason: "FailedScheduling"}, "", t0.Add(20*time.Minute))
+	if got := c.QuietIncidents(t0.Add(24*time.Minute), 15*time.Minute); len(got) != 0 {
+		t.Errorf("14m after the held sighting the incident is quiet: %+v", got)
+	}
+	got := c.QuietIncidents(t0.Add(26*time.Minute), 15*time.Minute)
+	if len(got) != 1 || !got[0].LastSeen.Equal(t0.Add(10*time.Minute)) {
+		t.Errorf("quiet incidents = %+v; want one quiet since %s (the replay moved it)", got, t0.Add(10*time.Minute))
+	}
+}
+
 // TestQuietIncidentsSurviveASnapshot: the follow-up's state rides the dedup
 // entry, so a restart in the quiet period neither loses the incident's object
 // nor sends the follow-up twice.
@@ -476,6 +548,8 @@ func TestQuietIncidentsSurviveASnapshot(t *testing.T) {
 	c.BindSession(key, msg, "sess-1")
 	c.BindObject(key, msg, "default", "Pod", "api", t0.Add(-2*time.Minute), 7)
 	c.MarkFollowupSupported(key, msg)
+	c.now = func() time.Time { return t0.Add(3 * time.Minute) }
+	c.Sighted(key, msg, t0.Add(3*time.Minute)) // a sighting a gate stopped
 	if err := c.Snapshot(); err != nil {
 		t.Fatal(err)
 	}
@@ -486,6 +560,9 @@ func TestQuietIncidentsSurviveASnapshot(t *testing.T) {
 	quiet := restored.QuietIncidents(t0.Add(20*time.Minute), 15*time.Minute)
 	if len(quiet) != 1 || quiet[0].SessionID != "sess-1" || quiet[0].Name != "api" || quiet[0].Key.Reason != "CrashLoopBackOff" {
 		t.Fatalf("restored quiet incidents = %+v; want one for sess-1 naming api", quiet)
+	}
+	if !quiet[0].LastSeen.Equal(t0.Add(3 * time.Minute)) {
+		t.Errorf("quiet incident last_seen=%s; want the gate-stopped sighting's %s", quiet[0].LastSeen, t0.Add(3*time.Minute))
 	}
 	if !quiet[0].FirstSeen.Equal(t0.Add(-2*time.Minute)) || quiet[0].Count != 7 {
 		t.Errorf("quiet incident first_seen=%s count=%d; want the alerted event's own %s and 7", quiet[0].FirstSeen, quiet[0].Count, t0.Add(-2*time.Minute))

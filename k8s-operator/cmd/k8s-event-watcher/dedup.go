@@ -68,6 +68,13 @@ type dedupEntry struct {
 	// sent (dispatcher.Sweep), and is sticky for the entry's life: one
 	// follow-up per incident, however long the window keeps the entry.
 	QuietNotified bool `json:"quiet_notified,omitempty"`
+	// LastDelivered is the watcher's clock at the last sighting the informer
+	// delivered for this key whose event timestamp advanced, whichever gate
+	// took it. LastSeen above moves only for the sightings Observe accepts,
+	// and an alerted object a hold keeps from Observe (a Pending pod under
+	// the scale-up hold) is still being sighted. Written by Sighted, read by
+	// QuietIncidents beside LastSeen.
+	LastDelivered time.Time `json:"last_delivered,omitzero"`
 }
 
 // quietIncident is an incident whose alert went out and whose object has
@@ -271,10 +278,11 @@ func (c *dedupCache) MarkFollowupSupported(key EventKey, message string) {
 // QuietIncidents lists the incidents whose alert went out (a session is
 // bound) to a daemon that posts follow-ups, that the daemon did not grade
 // Info, whose follow-up has not been sent, and whose last real sighting is
-// at least after ago. LastSeen moves
-// only on a sighting whose timestamp advanced (Observe, case 3), so an
-// informer replay after a restart does not make a quiet object look live,
-// and the clock here is the watcher's own, as the window's is.
+// at least after ago: the later of LastSeen (Observe, case 3) and
+// LastDelivered (Sighted, a sighting a gate stopped). Both move only on a
+// sighting whose timestamp advanced, so an informer replay after a restart
+// does not make a quiet object look live, and the clock is the watcher's
+// own, as the window's is.
 func (c *dedupCache) QuietIncidents(now time.Time, after time.Duration) []quietIncident {
 	if after <= 0 {
 		return nil
@@ -283,7 +291,11 @@ func (c *dedupCache) QuietIncidents(now time.Time, after time.Duration) []quietI
 	defer c.mu.Unlock()
 	var out []quietIncident
 	for key, e := range c.entries {
-		if e.SessionID == "" || !e.FollowupSupported || e.PolicyFiltered || e.QuietNotified || now.Sub(e.LastSeen) < after {
+		last := e.LastSeen
+		if e.LastDelivered.After(last) {
+			last = e.LastDelivered
+		}
+		if e.SessionID == "" || !e.FollowupSupported || e.PolicyFiltered || e.QuietNotified || now.Sub(last) < after {
 			continue
 		}
 		first, count := e.EventFirstSeen, e.EventCount
@@ -295,7 +307,7 @@ func (c *dedupCache) QuietIncidents(now time.Time, after time.Duration) []quietI
 		}
 		out = append(out, quietIncident{
 			Key: key, SessionID: e.SessionID, Namespace: e.Namespace, Kind: e.Kind, Name: e.Name,
-			FirstSeen: first, LastSeen: e.LastSeen, Count: count,
+			FirstSeen: first, LastSeen: last, Count: count,
 		})
 	}
 	return out
@@ -309,6 +321,24 @@ func (c *dedupCache) MarkQuietNotified(key EventKey) {
 	if entry, ok := c.entries[key]; ok {
 		entry.QuietNotified = true
 	}
+}
+
+// Sighted records a sighting of key that a gate stopped short of Observe:
+// the informer delivered it, so the object is not quiet. Only a sighting
+// whose timestamp advanced counts, as in Observe, so a relist's replay moves
+// nothing; the timestamp is consumed here too, so the same event is a replay
+// to Observe afterwards. No-op for a key with no entry.
+func (c *dedupCache) Sighted(key EventKey, message string, eventLastTS time.Time) {
+	key.Reason = canonicalizeReason(key.Reason, message)
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || !eventLastTS.After(entry.EventLastTS) {
+		return
+	}
+	entry.EventLastTS = eventLastTS
+	entry.LastDelivered = now
 }
 
 // MarkPolicyFiltered flags the entry for a key as being held on behalf

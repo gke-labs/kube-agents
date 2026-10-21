@@ -768,6 +768,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
 		}
+		// A sighting a gate stopped is still a sighting: an alerted object
+		// the scale-up hold keeps from Observe is not quiet.
+		d.dedup.Sighted(ev.Key, ev.Message, ev.LastSeen)
 		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
