@@ -143,20 +143,25 @@ def configure_ca(path: str | None) -> None:
     _ca_file = path or None
 
 
+_contexts: dict[str, ssl.SSLContext] = {}
+
+
 def ssl_context() -> ssl.SSLContext | None:
     """The context api() verifies with: the private CA when one is configured
     (configure_ca, else CA_FILE_ENV), otherwise None for the system store. A
     CA file that does not load is a ResetError naming it, not a traceback at
-    the first call."""
+    the first call. Built once per path; every page of every listing reuses it."""
     path = _ca_file or os.environ.get(CA_FILE_ENV) or None
     if not path:
         return None
-    context = ssl.create_default_context()
-    try:
-        context.load_verify_locations(cafile=path)
-    except (OSError, ssl.SSLError) as exc:
-        raise ResetError(f"the forge CA file {path} did not load: {exc}") from exc
-    return context
+    if path not in _contexts:
+        context = ssl.create_default_context()
+        try:
+            context.load_verify_locations(cafile=path)
+        except (OSError, ssl.SSLError) as exc:
+            raise ResetError(f"the forge CA file {path} did not load: {exc}") from exc
+        _contexts[path] = context
+    return _contexts[path]
 
 
 def api_root(host: str = DEFAULT_HOST) -> str:

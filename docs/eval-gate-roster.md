@@ -768,8 +768,8 @@ issue), since a chat probe passes the same on either forge and the GitHub run al
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
 (`EVAL_FORGE=gitlab-ce`), since the cases grade the forge and not where it is; a GitHub Enterprise
-Server run (`EVAL_FORGE=ghes`) reads `hack/eval/ghes-cases.txt` instead, which file a forge reads
-being `lane_cases_file()` in `hack/ci-eval-pr.sh`. `hack/ci-eval-pr.sh` refuses an entry in neither file,
+Server run (`EVAL_FORGE=ghes`) reads a GHES list of its own, named by `lane_cases_file()` in
+`hack/ci-eval-pr.sh` and refused while the checkout lacks it. `hack/ci-eval-pr.sh` refuses an entry in neither file,
 and `scripts/test_eval_rosters.py` pins the set and that each entry requires a positive forge check
 (not negated, not one alternative under an `any`). Today that is three merge-request cases; no
 ledger case is in the lane (consistency-drift-outlier passes on the GitHub nightlies and holds a

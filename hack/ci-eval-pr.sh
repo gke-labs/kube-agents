@@ -39,8 +39,6 @@ readonly EVAL_PRESUBMIT_CASES_FILE="eval/presubmit-cases.txt"
 readonly EVAL_BLOCKING_ROSTER_FILE="eval/blocking-roster.txt"
 readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_GITLAB_CASES_FILE="eval/gitlab-cases.txt"
-# The GHES lane's list (kube-agents#3684): the GitLab lane's merge-request
-# cases plus the case that grades the GitHub Enterprise Server host.
 readonly EVAL_GHES_CASES_FILE="eval/ghes-cases.txt"
 # The stack-bearing cases of the nightly's main part that run in main-b, when
 # EVAL_NIGHTLY_PART splits that part in two (#3384).
@@ -1175,8 +1173,9 @@ _ledger_token_mint() {
 # LEDGER_MINT_LAST_FAILURE is left holding the mint's last diagnostic line
 # either way, for the caller's record.
 mint_ledger_token() { # <label>
-  # Under gitlab the grading token is the pool's, read once at preflight by
-  # read_gitlab_tokens; it lasts a year, so there is nothing to mint per unit.
+  # Under the gitlab kind the grading token is read once at preflight by
+  # read_gitlab_tokens (the pool's pair, or the run's own on a self-managed
+  # instance); nothing is minted per unit.
   if [ "${EVAL_FORGE_KIND:-github}" = "gitlab" ] || [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     return 0
   fi
@@ -1354,6 +1353,11 @@ read_gitlab_tokens() {
       return 1
     fi
     echo "Preflight: the ${which} token in $(gitlab_token_source "${which}") authenticates as ${login}"
+    if [ "${which}" = "agent" ] && [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ] && [ "${login}" != "${GITLAB_BOT_LOGIN}" ]; then
+      # A per-run instance's bot is whatever the lane step created; the bench
+      # grades by the login, so it follows the token rather than the pool's name.
+      GITLAB_BOT_LOGIN="${login}"
+    fi
     if [ "${which}" = "agent" ] && [ "${login}" != "${GITLAB_BOT_LOGIN}" ]; then
       echo "WARNING: preflight: the agent token belongs to ${login}, not ${GITLAB_BOT_LOGIN}; the bench grades the agent's ledgers and merge requests by the latter (GITLAB_BOT_LOGIN)." >&2
     fi
@@ -1380,15 +1384,11 @@ export_github_forge_host() {
   echo "GitHub forge host: ${EVAL_FORGE_HOST} (BENCH_GITHUB_HOST; its CA ${EVAL_FORGE_CA_FILE} in BENCH_FORGE_CA_FILE); the data is read from api.github.com"
 }
 
+if [ "${EVAL_FORGE_KIND}" = "github" ] && [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+  export_github_forge_host
+fi
 if [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
   read_gitlab_tokens || exit 1
-elif [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
-  export_github_forge_host
-  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
-    echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
-  else
-    mint_ledger_token "preflight" || exit 1
-  fi
 elif [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
   echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
 else
@@ -1594,7 +1594,7 @@ probe_gitlab_ledger_path() { # <label>
     return 0
   fi
   if [ -z "${EVAL_GITLAB_AGENT_TOKEN:-}" ] || [ -z "${BENCH_GITLAB_TOKEN:-}" ]; then
-    echo "ERROR: Ledger probe (${label}): the pool's token pair is not in hand (read_gitlab_tokens at preflight); not running without the probe." >&2
+    echo "ERROR: Ledger probe (${label}): the GitLab token pair is not in hand (read_gitlab_tokens at preflight); not running without the probe." >&2
     return 1
   fi
   out="$(GITLAB_PROBE_TOKEN="${EVAL_GITLAB_AGENT_TOKEN}" GITLAB_PROBE_LEDGER_TOKEN="${BENCH_GITLAB_TOKEN}" GITLAB_CA_FILE="${EVAL_FORGE_CA_FILE}" python3 "${SCRIPT_DIR}/ci_gitlab_forge.py" probe-ledger --path "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" --host "${GITLAB_FORGE_HOST}" 2>&1)" || rc=$?
@@ -2228,10 +2228,12 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 PRESUBMIT_CASES_FILE="${SCRIPT_DIR}/${EVAL_PRESUBMIT_CASES_FILE}"
 NIGHTLY_CASES_FILE="${SCRIPT_DIR}/${EVAL_NIGHTLY_CASES_FILE}"
 BLOCKING_ROSTER_FILE="${SCRIPT_DIR}/${EVAL_BLOCKING_ROSTER_FILE}"
-GITLAB_CASES_FILE="${SCRIPT_DIR}/${EVAL_GITLAB_CASES_FILE}"
 # Which lane list a forge runs (kube-agents#3682): the GitLab list on either
 # GitLab, gitlab.com or a self-managed instance, since the cases grade the
-# forge and not where it is; the GHES list on ghes. github runs the catalogue.
+# forge and not where it is; the GHES list on ghes (eval/ghes-cases.txt, which
+# arrives with the GHES lane, kube-agents#3684). github runs the catalogue. A
+# forge whose list this checkout lacks stops here by name, not at the roster
+# reader's message for a missing file.
 lane_cases_file() { # <EVAL_FORGE> -> the list's path relative to hack/
   case "$1" in
     gitlab|gitlab-ce) echo "${EVAL_GITLAB_CASES_FILE}" ;;
@@ -2241,6 +2243,10 @@ lane_cases_file() { # <EVAL_FORGE> -> the list's path relative to hack/
 }
 LANE_CASES_REL="$(lane_cases_file "${EVAL_FORGE}" 2>/dev/null)" || LANE_CASES_REL=""
 LANE_CASES_FILE="${LANE_CASES_REL:+${SCRIPT_DIR}/${LANE_CASES_REL}}"
+if [ -n "${LANE_CASES_FILE}" ] && [ ! -f "${LANE_CASES_FILE}" ]; then
+  echo "ERROR: EVAL_FORGE=${EVAL_FORGE} runs the lane list ${LANE_CASES_REL}, which this checkout does not have; the lane that adds it is kube-agents#3684." >&2
+  exit 1
+fi
 
 # One roster file's entries, one per line: `#` to end of line is a comment,
 # blank lines are skipped, surrounding whitespace is trimmed. Called inside a
@@ -3095,7 +3101,7 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # when the part holds no roster case, and is not the lane's doing.
 if [ -z "${BLOCKING_ROSTER_ON_LANE}" ] && [ -n "${INJECT_LANE_DROPPED_ROSTER}" ] && [ -z "${BOOTSTRAP_ADMITTED+set}" ]; then
   if [ -n "${GITLAB_LANE_DROPPED:-}" ]; then
-    echo "ERROR: every blocking-roster case in ${EVAL_GITLAB_CASES_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
+    echo "ERROR: every blocking-roster case in ${LANE_CASES_REL} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Seat another roster case there, trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   else
     echo "ERROR: every case in ${BLOCKING_ROSTER_FILE} is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run with rung 4 disarmed for every case. Trim the exclusion list, or set BOOTSTRAP_ADMITTED explicitly if that is the intent." >&2
   fi
