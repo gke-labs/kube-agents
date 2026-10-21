@@ -57,7 +57,7 @@ var builtinTools = map[string][]string{
 var claudeBuiltins = []string{
 	"Bash", "BashOutput", "KillShell",
 	"Edit", "MultiEdit", "Write", "NotebookEdit",
-	"Read", "Glob", "Grep",
+	"Read", "Glob", "Grep", "LS", "NotebookRead",
 	"WebFetch", "WebSearch",
 	"Task",
 }

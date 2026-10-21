@@ -11,13 +11,13 @@ This is the persona format. The bus persona content (the session agent's
 persona and the `a2a-topics` skill) is a different thing and lives in
 [`a2a/persona`](../../persona/README.md).
 
-| Path              | What it holds                                                                                                                                                                               |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Path              | What it holds                                                                                                                                                                                                   |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `persona.yaml`    | The manifest: `apiVersion: persona.kube-agents.x-k8s.io/v1alpha1`, `name`, `description` (at most 1024 bytes), `tier`, `model` (a hint), `tools`, `parameters`, `requires.commands` (a hint), `harness` (hints) |
-| `instructions.md` | The instructions, AGENTS.md-compatible                                                                                                                                                      |
-| `skills/<name>/`  | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 bytes), optionally `license` and `metadata`, plus the skill's files                              |
-| `mcp.yaml`        | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                                |
-| `README.md`       | Optional, never rendered                                                                                                                                                                    |
+| `instructions.md` | The instructions, AGENTS.md-compatible                                                                                                                                                                          |
+| `skills/<name>/`  | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 bytes), optionally `license` and `metadata`, plus the skill's files                                                   |
+| `mcp.yaml`        | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                                                    |
+| `README.md`       | Optional, never rendered                                                                                                                                                                                        |
 
 `tools` is the allowlist. An entry is a built-in (`read_file`,
 `web_search`, `shell`), an MCP server from `mcp.yaml` (`gke`), or one of
@@ -38,8 +38,10 @@ a server reached around the broker would be outside both.
 - a `SKILL.md` frontmatter key other than `name`, `description`, `license`
   and `metadata`, because Claude Code reads keys such as `allowed-tools`
   and `hooks` from it;
-- an `@` import in `instructions.md` or a skill's markdown that leaves the
-  persona (`@/…`, `@~…`, `@../…`), outside fenced code blocks;
+- an `@` import in `instructions.md` or a skill's markdown that could leave
+  the persona. The check fails closed rather than parse imports the way the
+  harness does: any `@` token that starts with `/` or `~`, or contains `..`,
+  a backslash or a non-ASCII character, is refused, in fenced blocks too;
 - unknown and repeated keys in `persona.yaml` and `mcp.yaml`;
 - a file over 1 MiB, or a persona over 16 MiB in total.
 

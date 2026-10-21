@@ -1,6 +1,7 @@
 package persona
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -133,16 +134,16 @@ func TestLoadRefuses(t *testing.T) {
 		}, "skills/triage/SKILL.md: metadata: must be a map"},
 		{"absolute import", func(t *testing.T, d string) {
 			replaceIn(t, d, InstructionsFile, "and report", "and report. See @/var/run/secrets/token")
-		}, "instructions.md: line 3: the import \"@/var/run/secrets/token\" reads a file outside the persona"},
+		}, "instructions.md: line 3: the import \"@/var/run/secrets/token\" could read a file outside the persona"},
 		{"home import", func(t *testing.T, d string) {
 			replaceIn(t, d, InstructionsFile, "# Example", "@~/.claude/settings.json\n# Example")
 		}, "instructions.md: line 1: the import \"@~/.claude/settings.json\""},
 		{"climbing import in a skill", func(t *testing.T, d string) {
-			replaceIn(t, d, "skills/notes/SKILL.md", "Keep it short.", "Keep it short. @./../../etc/hosts")
-		}, "skills/notes/SKILL.md: line 7: the import \"@./../../etc/hosts\""},
+			replaceIn(t, d, "skills/notes/SKILL.md", "Keep it short.", "Keep it short. @./../../../etc/hosts")
+		}, "skills/notes/SKILL.md: line 7: the import \"@./../../../etc/hosts\""},
 		{"climbing import in an upper-case .MD", func(t *testing.T, d string) {
-			_ = os.WriteFile(filepath.Join(d, "skills/notes/EXTRA.MD"), []byte("see @../x\n"), 0o644)
-		}, "skills/notes/EXTRA.MD: line 1: the import \"@../x\""},
+			_ = os.WriteFile(filepath.Join(d, "skills/notes/EXTRA.MD"), []byte("see @../../../x\n"), 0o644)
+		}, "skills/notes/EXTRA.MD: line 1: the import \"@../../../x\""},
 		{"unknown top-level key in mcp.yaml", func(t *testing.T, d string) {
 			replaceIn(t, d, MCPFile, "servers:", "mcpServers: {}\nservers:")
 		}, "unknown field \"mcpServers\""},
@@ -248,11 +249,33 @@ func TestLocalPath(t *testing.T) {
 	}
 }
 
-// An import inside a fenced block is an example, not an import.
-func TestLoadAllowsAnImportInAFence(t *testing.T) {
+// Fences are no shelter: the harness's idea of a fence is not ours to mirror.
+// An import that stays inside the persona passes.
+func TestLoadImportsInsideThePersona(t *testing.T) {
 	dir := copyExample(t)
 	replaceIn(t, dir, InstructionsFile, "# Example", "```\n@/etc/hosts\n```\n\n# Example")
+	var invalid *InvalidError
+	if _, err := Load(dir); !errors.As(err, &invalid) || !strings.Contains(err.Error(), `"@/etc/hosts"`) {
+		t.Fatalf("an import in a fence: want it refused, got %v", err)
+	}
+	dir = copyExample(t)
+	replaceIn(t, dir, InstructionsFile, "# Example", "See @skills/notes/SKILL.md and mail a@b.example.\n\n# Example")
 	if _, err := Load(dir); err != nil {
-		t.Fatal(err)
+		t.Fatalf("an import inside the persona: %v", err)
+	}
+	// Each of these is refused without resolving it the harness's way: a
+	// climb after a descent, an @ after a no-break space, a backslash-escaped
+	// space, a non-ASCII character.
+	for _, line := range []string{
+		"@skills/../../outside",
+		"see\u00a0@/etc/hosts",
+		`@a\ b/x`,
+		"@skills/caf\u00e9.md",
+	} {
+		dir = copyExample(t)
+		replaceIn(t, dir, InstructionsFile, "# Example", line+"\n\n# Example")
+		if _, err := Load(dir); !errors.As(err, &invalid) {
+			t.Errorf("%q: want it refused, got %v", line, err)
+		}
 	}
 }

@@ -42,9 +42,10 @@ var (
 	paramRE   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
 	harnessRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 	commandRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
-	// escapingImportRE is a Claude Code @-import whose path leaves the
-	// config directory: absolute, home-relative, or climbing out.
-	escapingImportRE = regexp.MustCompile(`(^|\s)@(/|~|\.\./|\./\.\.)\S*`)
+	// importRE is anything a Claude Code @-import could be: an "@" anywhere,
+	// through the next ASCII whitespace. Broader than the harness's own rule
+	// on purpose (see importEscapes).
+	importRE = regexp.MustCompile(`@(\S+)`)
 )
 
 // Load reads and validates the persona directory dir. A validation failure
@@ -284,28 +285,37 @@ func (l *loader) skill(rel, name string) (Skill, bool) {
 	return s, true
 }
 
-// checkImports refuses @-imports that leave the config directory, outside
-// fenced code blocks. Claude Code expands "@path" in CLAUDE.md and its
-// imports, so such a line would read a file from the pod into the prompt.
+// checkImports refuses @-imports that could leave the config directory.
+// Claude Code expands "@path" in CLAUDE.md and its imports, so such a line
+// would read a file from the pod into the prompt. Fenced code blocks are
+// checked too: mirroring the harness's fence rule is a parser to keep in
+// step, and refusing an example costs only a rewording.
 func (l *loader) checkImports(rel string, data []byte) {
-	fence := ""
 	for i, line := range strings.Split(string(data), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if fence != "" {
-			if strings.HasPrefix(trimmed, fence) {
-				fence = ""
+		for _, m := range importRE.FindAllStringSubmatch(line, -1) {
+			if importEscapes(m[1]) {
+				l.add(rel, fmt.Sprintf("line %d", i+1),
+					"the import %q could read a file outside the persona; an import names a path inside it, with no \"..\", \"\\\\\", leading \"/\" or \"~\", or non-ASCII", "@"+m[1])
 			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
-			fence = trimmed[:3]
-			continue
-		}
-		if m := escapingImportRE.FindString(line); m != "" {
-			l.add(rel, fmt.Sprintf("line %d", i+1),
-				"the import %q reads a file outside the persona; imports must stay inside it", strings.TrimSpace(m))
 		}
 	}
+}
+
+// importEscapes fails closed rather than resolve the path the way the
+// harness does: the harness's token rules (Unicode spaces, backslash-escaped
+// spaces) are not ours to mirror, so any target that could climb, start at a
+// root, or hide a separator is refused.
+func importEscapes(target string) bool {
+	if strings.HasPrefix(target, "/") || strings.HasPrefix(target, "~") ||
+		strings.Contains(target, "..") || strings.Contains(target, "\\") {
+		return true
+	}
+	for _, r := range target {
+		if r < 0x21 || r > 0x7e {
+			return true
+		}
+	}
+	return false
 }
 
 // IsMarkdown reports whether a path names a markdown file, in any case.
