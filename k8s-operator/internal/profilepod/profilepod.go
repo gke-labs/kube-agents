@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -44,6 +45,22 @@ const (
 	toolVolumePrefix  = "tool-"
 	stagePrefix       = "stage-"
 )
+
+// stagingResources are the staging init containers' fixed requests and limits.
+// A staging run is one streaming cp, so it needs little. Setting them matters
+// anyway: a namespace quota on requests.cpu or requests.memory rejects a pod
+// with any container that lacks them, and on GKE Autopilot an unset request is
+// billed at the default.
+var stagingResources = corev1.ResourceRequirements{
+	Requests: corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("50m"),
+		corev1.ResourceMemory: resource.MustParse("64Mi"),
+	},
+	Limits: corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("500m"),
+		corev1.ResourceMemory: resource.MustParse("128Mi"),
+	},
+}
 
 // Rendered is what a pod template needs from the profile's persona and tools.
 type Rendered struct {
@@ -130,6 +147,7 @@ cp -a "$src"/. "$dst"/
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
 		Command:         []string{"/bin/sh", "-c", script},
+		Resources:       *stagingResources.DeepCopy(),
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false),
 			ReadOnlyRootFilesystem:   ptr.To(true),

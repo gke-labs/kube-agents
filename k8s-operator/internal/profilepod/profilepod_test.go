@@ -97,6 +97,14 @@ func TestWithoutImageVolumesEachImageIsStagedIntoAnEmptyDir(t *testing.T) {
 		if !m.ReadOnly || m.SubPath != "" {
 			t.Errorf("staged harness mount %+v: want read-only with no subPath (the copy already took /files)", m)
 		}
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			if _, ok := c.Resources.Requests[name]; !ok {
+				t.Errorf("init container %q has no %s request; a namespace quota on requests rejects the pod", c.Name, name)
+			}
+			if _, ok := c.Resources.Limits[name]; !ok {
+				t.Errorf("init container %q has no %s limit", c.Name, name)
+			}
+		}
 		sc := c.SecurityContext
 		if sc == nil || !ptr.Deref(sc.ReadOnlyRootFilesystem, false) || ptr.Deref(sc.AllowPrivilegeEscalation, true) {
 			t.Errorf("init container %q is not hardened: %+v", c.Name, sc)
