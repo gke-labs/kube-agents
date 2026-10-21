@@ -597,8 +597,9 @@ NEXT_WEEKLY_PHRASE = "None of the pending clusters was graded on {attempts} cons
 ERROR_KIND_UNRUN = "table not run to completion by the budget"
 ERROR_KIND_TABLE_FAILED = "table failed"
 # A refusal's kind carries its cause (``ReportRefused.cause``), so a refusal
-# whose cause, and so remedy, changed is a new line while a standing one is
-# quiet; the prefix is what the partial signature keys refusals by project on.
+# whose cause changed is a new line while a standing one is quiet (a remedy
+# that changes within one cause is not announced again); the prefix is what
+# the partial signature keys refusals by project on.
 ERROR_KIND_REFUSED_PREFIX = "refused by the report script"
 ERROR_KIND_REFUSED = ERROR_KIND_REFUSED_PREFIX + ": {cause}"
 ERROR_KIND_UNRESOLVED = "project number not resolved"
@@ -631,7 +632,8 @@ class ReportRefused(RuntimeError):
     for its cause, composed once (``refusal_detail``) so the partial line,
     the ungraded line and the tick's failure line all say the same thing and
     none relays the remedy the script wrote for an agent; ``cause`` is what
-    the announcements key it on, so a changed remedy is a new line.
+    the announcements key it on, so a changed cause is a new line, and a
+    remedy that changes within one cause is not.
     ``signature`` is set where one refusal stands for a whole tick
     (``versions_by_project``): the refused projects and their causes, the key
     the tick's failure line is announced under instead of its text."""
@@ -724,8 +726,10 @@ def roster_projects() -> set[str]:
             identity = read_cluster_identity(home)
         except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
             identity = None
-        if identity and identity.get(IDENTITY_PROJECT_KEY):
-            projects.add(identity[IDENTITY_PROJECT_KEY])
+        # Stripped as every other roster source is, so the spelling check sees one shape.
+        project = str((identity or {}).get(IDENTITY_PROJECT_KEY) or "").strip()
+        if project:
+            projects.add(project)
     return projects
 
 
@@ -945,7 +949,8 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     (``ReportRefused``), so the partial line tells it from a sandbox that
     fails. Until a reconcile tick writes a snapshot that answers (the first on
     a new install, the next on one whose snapshot predates the ``boundary``
-    key and declares nothing) the render answers: the management project is the one project read,
+    key and declares nothing) the render answers: the management project is the one project read
+    (none when the host is spelled by number, which the render cannot match to an id),
     and every project the declaration names explicitly goes as unread, so the
     report refuses another project, with that reason, until that tick. The whole set goes because nothing
     records this argv: it is one line of the loader on the sandbox command's
@@ -1240,8 +1245,8 @@ def partial_signature(read_errors: list) -> str:
     moves day to day while the condition is the same; and, for a refusal, the
     project and the cause as well, since that is a standing, per-project
     condition only the operator clears, named nowhere but this line: a second
-    refused project, or a refusal whose cause (and so remedy) changed, is a
-    new line, while the same refusal stays quiet. One pair per project, as
+    refused project, or a refusal whose cause changed, is a new line, while
+    the same refusal stays quiet, its remedy included. One pair per project, as
     the ungraded key has: both spellings of a project, run on the tick its id
     is learned, are one refusal, as the next tick that runs it once says."""
     kinds = {error_kind(error) for error in read_errors}
@@ -1814,7 +1819,7 @@ def ungraded_signature(projects: set[str], failed: list[str], unrun: list[str], 
     order. A project in no list ran and graded nothing, so its reads
     failed; the two budget shapes are one kind, as they are for the table; a
     run the report script refused is its own kind with its cause, as it is
-    for the table, so a changed remedy is a new line."""
+    for the table, so a changed cause is a new line."""
     kinds = {project: UNGRADED_KIND_READS_FAILED for project in projects}
     kinds.update({project: UNGRADED_KIND_RUN_FAILED for project in failed})
     kinds.update({project: UNGRADED_KIND_REFUSED.format(cause=cause) for project, cause in refused.items()})

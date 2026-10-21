@@ -197,8 +197,8 @@ resolved scope beside each `--project`, the `collector_args` the
 platform_control `fleet_scope` tool hands the SOPs less the cluster exclusion
 (`--scope-projects`, `--scope-unread`): the script reads a project inside the scope and refuses one
 outside it, one listed but unread, a project number it cannot resolve, and any project in a
-sandbox still marked scoped after the scope is gone, each with the reason and the install's
-remedy; the table carries each as that project's failure, and a tick whose every project is
+sandbox still marked scoped after the scope is gone, each with the reason; the watch adds the
+install's remedy, and the table carries each as that project's failure, and a tick whose every project is
 refused fails, announced once. An install that declares none keeps the bare flag, and a scope
 render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
