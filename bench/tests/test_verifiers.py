@@ -9026,6 +9026,75 @@ def test_worker_commands_required_run_succeeded_with_after_result_pattern():
     assert v.verify(5.0).status == "pass"
 
 
+def test_worker_commands_succeeded_with_after_result_pattern_withheld_call_beside_readable_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_runs=[run])
+
+    # 1 readable sibling terminal call that opens the window, 1 terminal call with withheld arguments
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj)
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the worker-trajectory capture was partial (the pod withheld a worker terminal call's arguments)" in res.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res.reason
+
+
+def test_worker_commands_succeeded_all_withheld_trajectory_is_error_without_claiming_no_capture():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+
+    # Worker trajectory where every code tool call's argument was withheld
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 1.0},
+    ]
+    # Run absent from card log
+    card_commands = [{"task": "t_1", "command": "kubectl get pods"}]
+    transcript.set("ok", traj, worker_commands=card_commands)
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "capture did not run" not in res.reason
+    assert "withheld" in res.reason
+    assert "collect.py not seen in what was read" in res.reason
+
+    # Run present in card log
+    card_commands_with_run = [{"task": "t_1", "command": "python3 collect.py compliance-audit"}]
+    transcript.set("ok", traj, worker_commands=card_commands_with_run)
+    res_card = v.verify(5.0)
+    assert not res_card.success
+    assert res_card.status == "error"
+    assert "capture did not run" not in res_card.reason
+    assert "withheld" in res_card.reason
+    assert "shows collect.py ran, but the worker trajectory did not capture the call" in res_card.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_split_card_log_reporting():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run_a = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
+    run_b = WorkerRun(script="audit_report.py", succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run_a, run_b])
+
+    # Trajectory with no tagged worker calls, card log has run_a but not run_b
+    card_commands = [{"task": "t_1", "command": "python3 collect.py compliance-audit"}]
+    transcript.set("ok", [], worker_commands=card_commands, worker_capture_gaps=["card t_1: unread session store"])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "shows collect.py ran, but the worker trajectory did not capture the call" in res.reason
+    assert "no card was delegated or the worker-trajectory capture did not run, so audit_report.py could not be verified" in res.reason
+
+
 # The readiness case for the same catalogue entry grades the readiness report's
 # own output: a fifth declared-line slot quotes the cell the report prints for
 # the finding. That cell carries a `;`, which keeps `_VALUE_WRAP` from removing

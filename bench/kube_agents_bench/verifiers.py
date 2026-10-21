@@ -2266,18 +2266,15 @@ _NO_WORKER_TERMINAL_CALLS_REASON = (
 )
 _NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON = (
     "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
-    "card was delegated, the worker-trajectory capture did not run, or the pod withheld a "
-    "call's arguments, so required run(s) requiring success could not be verified (a worker whose "
-    "tagged calls are all MCP or board calls, with an empty card log, grades as zero commands)"
+    "card was delegated or the worker-trajectory capture did not run, so required run(s) requiring "
+    "success could not be verified (a worker whose tagged calls are all MCP or board calls, with an "
+    "empty card log, grades as zero commands)"
 )
 _TRAJ_MISSING_CARD_LOG_REASON = (
     "the worker card log shows {named} ran, but the worker trajectory did not capture the call"
 )
 _TRAJ_MISSING_NO_TRAJ_REASON = (
     "no card was delegated or the worker-trajectory capture did not run, so {named} could not be verified"
-)
-_TRAJ_MISSING_WITHHELD_REASON = (
-    "the pod withheld a worker terminal call's arguments, so {named} could not be verified"
 )
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
@@ -2830,14 +2827,18 @@ def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
 
 
 def _format_traj_missing_reason(
-    runs: list[WorkerRun], argvs: list[list[str]], no_traj_for_succeeded: bool
+    runs: list[WorkerRun], argvs: list[list[str]], no_traj_for_succeeded: bool = False
 ) -> str:
-    named = ", ".join(" ".join([run.script, *run.flags]) for run in runs)
-    if any(any(_argv_runs(argv, run) for argv in argvs) for run in runs):
-        return _TRAJ_MISSING_CARD_LOG_REASON.format(named=named)
-    if no_traj_for_succeeded:
-        return _TRAJ_MISSING_NO_TRAJ_REASON.format(named=named)
-    return _TRAJ_MISSING_WITHHELD_REASON.format(named=named)
+    in_log = [r for r in runs if any(_argv_runs(argv, r) for argv in argvs)]
+    not_in_log = [r for r in runs if not any(_argv_runs(argv, r) for argv in argvs)]
+    parts = []
+    if in_log:
+        named = ", ".join(" ".join([run.script, *run.flags]) for run in in_log)
+        parts.append(_TRAJ_MISSING_CARD_LOG_REASON.format(named=named))
+    if not_in_log:
+        named = ", ".join(" ".join([run.script, *run.flags]) for run in not_in_log)
+        parts.append(_TRAJ_MISSING_NO_TRAJ_REASON.format(named=named))
+    return "; ".join(parts)
 
 
 @VERIFIERS.register("worker_commands")
@@ -3041,6 +3042,12 @@ class WorkerCommandsVerifier(BaseVerifier):
         sources = ""
         result_hits: list[tuple[str, str]] = []
         has_succeeded_runs = any(run.succeeded for run in self.required_runs)
+        withheld_calls = sum(
+            1
+            for e in (snap.trajectory or ())
+            if isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS and _args_withheld(e)
+        )
+        withheld = withheld_calls > 0
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3089,20 +3096,13 @@ class WorkerCommandsVerifier(BaseVerifier):
             windowed = typed
             traj_calls = calls
             no_traj_for_succeeded = False
-            withheld_calls = sum(
-                1
-                for e in (snap.trajectory or ())
-                if isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS and _args_withheld(e)
-            )
-            withheld = withheld_calls > 0
             if has_succeeded_runs and not traj_calls:
                 tagged = any(
                     isinstance(e, dict) and e.get("agent") for e in (snap.trajectory or ())
                 )
-                if not tagged or withheld:
+                if not tagged:
                     no_traj_for_succeeded = True
         else:
-            withheld = False
             no_traj_for_succeeded = False
             calls = _worker_terminal_calls(snap.trajectory)
             if not calls:
@@ -3212,12 +3212,12 @@ class WorkerCommandsVerifier(BaseVerifier):
         # gaps make only an uncredited succeeded: true run inconclusive (error).
         uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *traj_missing] if run.succeeded]
         gaps = list(snap.worker_capture_gaps or ())
-        if self.after_result_pattern is None and withheld:
+        if withheld:
             gaps.append("the pod withheld a worker terminal call's arguments")
         gaps_str = "; ".join(gaps)
 
         if self.after_result_pattern is not None:
-            partial = bool(snap.worker_capture_gaps)
+            partial = bool(gaps)
             conclusive = bool(hits or ran)
             failed = conclusive or bool((missing or unrun_missing or unrun_failed) and not partial)
         else:
@@ -3282,7 +3282,6 @@ class WorkerCommandsVerifier(BaseVerifier):
             )
         if partial:
             if self.after_result_pattern is not None:
-                gaps_str = "; ".join(snap.worker_capture_gaps or ())
                 unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
                 unrun_parts = []
                 if unrun_failed:
