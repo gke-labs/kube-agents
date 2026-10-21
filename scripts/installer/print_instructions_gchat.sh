@@ -146,4 +146,8 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
   echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
   echo -e "       ${C_WHITE}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
   echo -e ""
+else
+  # On stderr: a pipe still gets nothing, but a reader who expected the
+  # checklist learns which file and key decided there is none.
+  print_info "GOOGLE_CHAT_ENABLED is not on in $(install_env_file_for_state), so there is no Google Chat checklist. Set it there and run this again." >&2
 fi

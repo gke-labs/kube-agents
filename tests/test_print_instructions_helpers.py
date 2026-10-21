@@ -54,6 +54,18 @@ class ChatInstructionHelpersTest(unittest.TestCase):
                     self.assertIn("prints the checklist", proc.stdout)
                     self.assertNotIn("\x1b", proc.stdout, "usage carried a terminal escape")
 
+    def test_a_disabled_platform_names_the_file_and_key_on_stderr(self):
+        # The handoff routes print these commands for a platform the run turned
+        # on; a file that does not turn it on must not read as nothing to do.
+        for script, key in (("print_instructions_gchat.sh", "GOOGLE_CHAT_ENABLED"),
+                            ("print_instructions_slack.sh", "SLACK_ENABLED")):
+            with self.subTest(script=script):
+                proc = self._run(script, "--dry-run", term="dumb")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn(f"{key} is not on in ", proc.stderr)
+                self.assertIn("install.env, so there is no ", proc.stderr)
+
     def test_a_disabled_platform_prints_nothing_on_a_pipe(self):
         # The EXIT trap's tput writes only to a terminal: on a pipe, with the
         # platform off, the run prints nothing at all. That proves the guard

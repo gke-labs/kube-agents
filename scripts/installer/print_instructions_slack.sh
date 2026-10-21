@@ -141,4 +141,7 @@ if is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
     echo -e "       Setting ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} by re-running this step applies only while no chat message has set one; after that, use ${C_WHITE}/hermes sethome${C_RESET}."
     echo -e ""
   fi
+else
+  # As in the Google Chat printer.
+  print_info "SLACK_ENABLED is not on in $(install_env_file_for_state), so there is no Slack checklist. Set it there and run this again." >&2
 fi
