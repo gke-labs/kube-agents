@@ -1,11 +1,12 @@
-"""Inbound chat messages by platform, in the Prometheus text exposition.
+"""Inbound chat messages and new sessions by platform, in the Prometheus text exposition.
 
 Hand-rolled, like the credential broker's registry: prometheus_client is not in
-the agent image, and one counter with one label does not justify a dependency
+the agent image, and two counters with one label do not justify a dependency
 in the container that holds the chat credentials. One lock, because the
 gateway's event loop writes while a scrape thread reads. Series appear on first
 increment and render in a fixed order, so two scrapes of an idle registry are
-byte-identical.
+byte-identical. REGISTRY is the one instance: plugin.py serves it, and the
+session_store plugin counts sessions on it from its own hook.
 
 The listener serves `/metrics` and nothing else, unauthenticated: its readers,
 the managed-Prometheus collector and the operator's usage poller, hold no
@@ -35,6 +36,10 @@ logger = logging.getLogger("hermes.plugin.chat_metrics")
 # gateway's own API port (Hermes' api_server). The dashboard is not a platform
 # Hermes names on a gateway event. A name outside the map counts as other.
 CHAT_INBOUND_METRIC = "kubeagents_chat_messages_inbound_total"
+# The series the operator reads the chat half of status.usage.sessionsTotal
+# from (usage_counters_scrape.go's chatSessionsSeries): one per session the
+# session_store plugin first saw, under the same platform label.
+CHAT_SESSIONS_METRIC = "kubeagents_chat_sessions_total"
 PLATFORM_LABEL = "platform"
 LABEL_OTHER = "other"
 HERMES_PLATFORM_LABELS = {
@@ -64,20 +69,28 @@ def platform_label(hermes_platform: str) -> str:
 
 
 class ChatMetrics:
-    """One counter, by platform."""
+    """Two counters, by platform: inbound messages and new sessions."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._inbound: dict[str, int] = {}
+        self._sessions: dict[str, int] = {}
 
     def record_inbound(self, hermes_platform: str) -> None:
         label = platform_label(hermes_platform)
         with self._lock:
             self._inbound[label] = self._inbound.get(label, 0) + 1
 
+    def record_session(self, hermes_platform: str) -> None:
+        """Count one session the gateway opened, under its platform."""
+        label = platform_label(hermes_platform)
+        with self._lock:
+            self._sessions[label] = self._sessions.get(label, 0) + 1
+
     def render(self) -> str:
         with self._lock:
             inbound = sorted(self._inbound.items())
+            sessions = sorted(self._sessions.items())
         lines = [
             f"# HELP {CHAT_INBOUND_METRIC} Chat messages that reached the gateway's dispatch hook, by platform.",
             f"# TYPE {CHAT_INBOUND_METRIC} counter",
@@ -85,11 +98,22 @@ class ChatMetrics:
         for label, count in inbound:
             lines.append(f'{CHAT_INBOUND_METRIC}{{{PLATFORM_LABEL}="{label}"}} {count}')
         lines += [
+            f"# HELP {CHAT_SESSIONS_METRIC} Sessions the gateway opened for a chat conversation, by platform, counted on the first message of each.",
+            f"# TYPE {CHAT_SESSIONS_METRIC} counter",
+        ]
+        for label, count in sessions:
+            lines.append(f'{CHAT_SESSIONS_METRIC}{{{PLATFORM_LABEL}="{label}"}} {count}')
+        lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
             f"{PROCESS_START_TIME_METRIC} {PROCESS_START_TIME_SECONDS!r}",
         ]
         return "\n".join(lines) + "\n"
+
+
+# The one registry of the gateway process. The listener serves it, the hook
+# in plugin.py counts messages on it, and session_store counts sessions on it.
+REGISTRY = ChatMetrics()
 
 
 class _MetricsHandler(BaseHTTPRequestHandler):

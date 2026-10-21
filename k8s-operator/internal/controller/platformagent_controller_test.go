@@ -7366,8 +7366,10 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 		t.Errorf("heldGitHubOrg() = %q, %v with no live gateway, expected nothing", held, err)
 	}
 
-	// A storage switch renders the other workload kind while the old one still
-	// runs: the old one is what holds the value.
+	// A switch renders the other workload kind while the old one still runs:
+	// the old one is what holds the value. The switch that remains is the
+	// replica cap: a StatefulSet a pre-cap release rendered for replicas > 1
+	// over RWO storage, under a spec that now renders the Deployment.
 	switched := agentWith("https://github.com:gke-labs/infra")
 	switched.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))},
@@ -7377,11 +7379,16 @@ func TestARefusedGitHubScopeKeepsTheLiveGitHubOrg(t *testing.T) {
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 		}},
 	}
-	if !useStatefulSet(switched) {
-		t.Fatal("test setup: the switched agent does not select a StatefulSet")
+	if useStatefulSet(switched) {
+		t.Fatal("test setup: the switched agent still selects a StatefulSet past the replica cap")
 	}
-	if held, err := r.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
-		t.Errorf("heldGitHubOrg() = %q, %v across a storage switch, expected the live gke-labs", held, err)
+	liveSts := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"},
+		Spec:       appsv1.StatefulSetSpec{Template: live.Spec.Template},
+	}
+	stsOnly := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(liveSts).Build(), Scheme: scheme}
+	if held, err := stsOnly.heldGitHubOrg(ctx, switched); held != "gke-labs" || err != nil {
+		t.Errorf("heldGitHubOrg() = %q, %v across a workload-kind switch, expected the live gke-labs", held, err)
 	}
 
 	// A read that fails is returned, never taken for "nothing live": the render

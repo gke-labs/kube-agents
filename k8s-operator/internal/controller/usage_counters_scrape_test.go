@@ -293,6 +293,78 @@ func TestPodUsageSource_ReadsTheA2AGatewaysInboundFamilyAsTheChatCounter(t *test
 	}
 }
 
+// The watcher's body feeds two counters: the injected events, and the triage
+// sessions it opened whose event was delivered, summed over every cluster; its
+// session-create attempts by outcome are not read.
+func TestPodUsageSource_SumsTheWatchersTriageSessions(t *testing.T) {
+	body := strings.Join([]string{
+		"# TYPE k8s_event_watcher_events_injected_total counter",
+		`k8s_event_watcher_events_injected_total{cluster="a",location="l",namespace="n",project="p",reason="BackOff"} 7`,
+		"# TYPE k8s_event_watcher_triage_sessions_total counter",
+		`k8s_event_watcher_triage_sessions_total{cluster="a",location="l",project="p"} 2`,
+		`k8s_event_watcher_triage_sessions_total{cluster="b",location="l",project="p"} 1`,
+		"# TYPE k8s_event_watcher_session_creates_total counter",
+		`k8s_event_watcher_session_creates_total{cluster="b",location="l",outcome="ok",project="p"} 40`,
+		"# TYPE k8s_event_watcher_cluster_up gauge",
+		`k8s_event_watcher_cluster_up{cluster="a",location="l",project="p"} 1`,
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageGatewayCounters)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Samples[usageCounterEventsIngested] != 7 || reading.Samples[usageCounterSessionsTriage] != 3 {
+		t.Fatalf("samples = %v, want 7 events and 3 triage sessions (not the 40 create attempts)", reading.Samples)
+	}
+	if reading.Clusters == nil || reading.Clusters.Registered != 1 {
+		t.Fatalf("clusters = %+v, want the gauge read from the same body", reading.Clusters)
+	}
+}
+
+// The chat listener serves the session_store plugin's sessions beside the
+// plugin's messages, and the A2A gateway's body carries its own sessions
+// family in their place; both fold into the chat half of sessionsTotal,
+// summed over the platform label.
+func TestPodUsageSource_ReadsTheSessionsFamiliesIntoTheChatSessions(t *testing.T) {
+	chat := strings.Join([]string{
+		"# TYPE kubeagents_chat_messages_inbound_total counter",
+		`kubeagents_chat_messages_inbound_total{platform="googlechat"} 9`,
+		"# TYPE kubeagents_chat_sessions_total counter",
+		`kubeagents_chat_sessions_total{platform="googlechat"} 2`,
+		`kubeagents_chat_sessions_total{platform="slack"} 1`,
+		"# TYPE process_start_time_seconds gauge",
+		"process_start_time_seconds 1759400000.25",
+		"",
+	}, "\n")
+	reading, err := newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, chat), usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape of the chat listener: %v", err)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 9 || reading.Samples[usageCounterSessionsChat] != 3 {
+		t.Fatalf("chat samples = %v, want 9 messages and 3 sessions", reading.Samples)
+	}
+	a2a := strings.Join([]string{
+		"# TYPE kubeagents_a2a_gateway_messages_inbound_total counter",
+		`kubeagents_a2a_gateway_messages_inbound_total{platform="discord"} 5`,
+		"# TYPE kubeagents_a2a_gateway_sessions_total counter",
+		`kubeagents_a2a_gateway_sessions_total{platform="discord"} 4`,
+		`kubeagents_a2a_gateway_sessions_total{platform="console"} 1`,
+		`kubeagents_a2a_gateway_sessions_total{platform="other"} 0`,
+		"",
+	}, "\n")
+	reading, err = newPodUsageSource().Scrape(context.Background(), serveBody(t, http.StatusOK, a2a), usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape of the A2A gateway: %v", err)
+	}
+	if reading.Samples[usageCounterChatMessagesInbound] != 5 || reading.Samples[usageCounterSessionsChat] != 5 {
+		t.Fatalf("A2A samples = %v, want 5 messages and 5 sessions", reading.Samples)
+	}
+	if reading.Clusters != nil {
+		t.Errorf("a chat body yielded a cluster reading: %+v", reading.Clusters)
+	}
+}
+
 // The gateway's chat listener serves one family, summed over its platform
 // label, and no cluster gauge: the chat body is the platform-agent container's,
 // not the watcher's.

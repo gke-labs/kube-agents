@@ -87,9 +87,9 @@ gated on `A2A_LIVE_NATS_URL`; nothing automatic runs it.
 
 **`tests/e2e/` is not manual-only.** `rc-scheduler.yml` runs on `cron: "17 */3 * * *"` and
 dispatches `rc-release-pipeline.yml` whenever a new candidate exists, and
-`step-4-tag-validated` depends on the suite. Breaking a test there is not free — it reds the
+`step-4-tag-validated` depends on the suite, run on a `spec.mode: next` install. Breaking a test there is not free — it reds the
 release-candidate pipeline within three hours and stops the tag. The pipeline then runs the
-suite again on a `spec.mode: next` install, where a failure reds the run but gates no tag
+suite again on a `spec.mode: today` install, where a failure reds the run but gates no tag
 ([`tests/e2e/README.md`](../tests/e2e/README.md#-running-in-github-actions-ci)). Both `rc-release-pipeline.yml` and `staging-promotion-pipeline.yml`
 reach the suite through the same reusable `e2e-run.yml`; `e2e-gchat-test.yml` and
 `e2e-manual-runner.yml` are the by-hand callers. `autopush-next-e2e-gchat.yml` runs `gchat_agent_test.py` every three hours against the
@@ -127,7 +127,7 @@ When diagnosing failures or reporting incidents, name the specific job rather th
 
 `staging-promotion-pipeline.yml` is the GitHub Actions workflow that runs the full E2E matrix and promotes validated release candidates to staging.
 
-`post-kube-agents-eval-rc` grades nominated candidates against the merge-blocking presubmit matrix, the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 8); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
+`post-kube-agents-eval-rc` grades nominated candidates on a `spec.mode: next` install, the mode a new install gets (`EVAL_MODE_NEXT=1` on the job), against the merge-blocking presubmit matrix less the inject lane's exclusions (`agent-kanban-smoke` among them; [`docs/eval-gate-roster.md`](eval-gate-roster.md#the-inject-lane)), the tier the pull-request gate runs, not the full catalog the nightly runs (`hack/ci-eval-rc.sh` pins `RC_EVAL_TIER`; the reason is the 360m budget, [`docs/designs/testing-strategy.md`](designs/testing-strategy.md)), under a postsubmit trigger and lower task parallelism (4 vs 8); neither failure implies the other, and a regression only a nightly-only case would catch reaches staging and is reported by the nightly afterwards.
 
 ## Running on a pull request is not gating a merge
 
