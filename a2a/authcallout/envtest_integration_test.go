@@ -187,18 +187,16 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		t.Fatalf("the rendered nats.conf was refused: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
-	opts.Port, opts.Websocket.Port = -1, -1
+	// Every port the render pins moves to a free one, the monitor included;
+	// see startHarness.
+	opts.Port, opts.Websocket.Port, opts.HTTPPort = -1, -1, -1
 	// The render binds every interface; the test's serving certificate names
 	// the loopback address, so the server is bound there instead.
 	opts.Host = "127.0.0.1"
 	opts.StoreDir = t.TempDir()
-	srv, err := natsserver.NewServer(opts)
+	srv, err := startNatsServer(opts, 20*time.Second)
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	go srv.Start()
-	if !srv.ReadyForConnections(20 * time.Second) {
-		t.Fatal("nats-server not ready")
+		t.Fatal(err)
 	}
 	t.Cleanup(srv.Shutdown)
 

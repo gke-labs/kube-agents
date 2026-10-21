@@ -2262,5 +2262,89 @@ class TestManagedReposRegistered(unittest.TestCase):
                 self.assertTrue(self.registered(text))
 
 
+class TestGetGitopsRepo(WorkspaceTestCase):
+    """`get_gitops_repo`: the operator's `gitops_repo` key, named as `get_managed_repos` names it."""
+
+    def state(self, managed, gitops=None, github_host=None, context=None):
+        (self.tmp_path / "managed_repos").write_text(json.dumps(managed), encoding="utf-8")
+        if gitops is not None:
+            text = gitops if isinstance(gitops, str) else json.dumps(gitops)
+            (self.tmp_path / "gitops_repo").write_text(text, encoding="utf-8")
+        if github_host is not None:
+            (self.tmp_path / "github_host").write_text(github_host, encoding="utf-8")
+        if context is not None:
+            (self.tmp_path / "context_repos").write_text(json.dumps(context), encoding="utf-8")
+
+    def read(self):
+        env = {"GITOPS_STATE_PATH": str(self.tmp_path / "managed_repos")}
+        with patch.dict(os.environ, env), patch("subprocess.run") as run:
+            answer = gitops_workspace.get_gitops_repo()
+            run.assert_not_called()
+            return answer
+
+    def test_github_com_is_bare(self):
+        gitops = {"type": "github", "url": "https://github.com/acme/gitops"}
+        self.state([{"type": "github", "url": "https://github.com/acme/terraform"}, gitops], gitops)
+        self.assertEqual(self.read(), "acme/gitops")
+
+    def test_gitlab_is_host_and_path(self):
+        gitops = {"type": "gitlab", "url": "https://gitlab.example.com/platform/infra/gitops"}
+        self.state([{"type": "gitlab", "url": "https://gitlab.example.com/platform/terraform"}, gitops], gitops)
+        self.assertEqual(self.read(), "gitlab.example.com/platform/infra/gitops")
+
+    def test_github_enterprise_server_is_host_and_path(self):
+        gitops = {"type": "github", "url": "https://ghe.example.com/acme/gitops"}
+        self.state(
+            [gitops, {"type": "github", "url": "https://ghe.example.com/acme/terraform"}],
+            gitops,
+            github_host="ghe.example.com",
+        )
+        self.assertEqual(self.read(), "ghe.example.com/acme/gitops")
+
+    def test_the_name_matches_the_managed_list_when_github_is_qualified(self):
+        # A GitLab context entry with the same path qualifies the GitHub name.
+        gitops = {"type": "github", "url": "https://github.com/acme/gitops"}
+        self.state(
+            [gitops, {"type": "github", "url": "https://github.com/acme/terraform"}],
+            gitops,
+            context=[{"type": "gitlab", "url": "https://gitlab.com/acme/gitops"}],
+        )
+        answer = self.read()
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(self.tmp_path / "managed_repos")}):
+            self.assertIn(answer, gitops_workspace.get_managed_repos())
+        self.assertEqual(answer, "github.com/acme/gitops")
+
+    def test_another_spelling_of_a_registered_repository_matches(self):
+        self.state(
+            [{"type": "github", "url": "https://github.com/acme/terraform"},
+             {"type": "github", "url": "git@github.com:acme/gitops.git"}],
+            {"type": "github", "url": "https://github.com/acme/gitops"},
+        )
+        self.assertEqual(self.read(), "acme/gitops")
+
+    def test_none_without_a_usable_key(self):
+        managed = [{"type": "github", "url": "https://github.com/acme/gitops"},
+                   {"type": "github", "url": "https://github.com/acme/terraform"}]
+        for gitops in (None, "", "   ", "[not json", '["acme/gitops"]', '{"url": "https://github.com/acme/gitops"}'):
+            with self.subTest(gitops=gitops):
+                (self.tmp_path / "gitops_repo").unlink(missing_ok=True)
+                self.state(managed, gitops)
+                self.assertIsNone(self.read())
+
+    def test_none_for_a_repository_that_is_not_registered(self):
+        self.state(
+            [{"type": "github", "url": "https://github.com/acme/terraform"}],
+            {"type": "github", "url": "https://github.com/acme/removed"},
+        )
+        self.assertIsNone(self.read())
+
+    def test_none_for_a_registered_path_on_another_forge(self):
+        self.state(
+            [{"type": "github", "url": "https://github.com/acme/gitops"}],
+            {"type": "gitlab", "url": "https://gitlab.com/acme/gitops"},
+        )
+        self.assertIsNone(self.read())
+
+
 if __name__ == "__main__":
     unittest.main()

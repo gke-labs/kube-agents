@@ -636,7 +636,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
 }
 
 # ─── The cut-off report ──────────────────────────────────────────────────────
-# A Prow deadline (the nightly's 480m, the presubmit's 360m) arrives as
+# A Prow deadline (the nightly's 720m, the presubmit's 360m) arrives as
 # SIGTERM, which the trap below turns into an exit before the suite step ever
 # runs. The nights of 2026-09-18 and 09-21 (builds 2101099042170736640 and
 # 2102186223282950144) had finished 105 and 122 units when it arrived and
@@ -2056,7 +2056,7 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # in the evidence store (EVAL_BASELINE_STORE below), and earns a presubmit
 # seat on that record; measured cost, presubmit redundancy or grading
 # something outside the core journeys keep a case there for good. The budget
-# arithmetic its header used to carry (against the periodic's 480m deadline
+# arithmetic its header used to carry (against the periodic's then-480m deadline
 # at EVAL_TASK_PARALLELISM=8) is frozen in hack/eval/nightly-budget-history.txt
 # (#3495); a run's matrix is the "Eval matrix: ..." line below, and
 # `python3 scripts/eval_rosters.py --summary` counts the files. Since 2026-09-22 (#1023) the
@@ -2156,7 +2156,7 @@ esac
 # Which part of the nightly matrix this run takes, so the nightly can run as
 # two periodics on two leased projects: the cases that request a pull request
 # run one unit at a time after every other unit (unit_phase, below), and on
-# one project that phase and the infra lock's stretch did not fit the 480m
+# one project that phase and the infra lock's stretch did not fit the then-480m
 # deadline together. "all", the default, is the whole matrix; "main" leaves
 # those cases out and "writers" runs them alone. "main-a" and "main-b" split
 # "main" again, so it can run as two periodics on two more leased projects:
@@ -2396,7 +2396,11 @@ print(m.group(1).strip('\'\"') if m else '')
 # stack's cluster_name output cannot move another unit's current-context.
 infra_lock_exempt() { # <task-name>
   case "$1" in
-    oobe-first-run-audits) return 0 ;;
+    # autoops-warning-event-no-action-triage writes its own labelled namespace
+    # on the host cluster, through a kubeconfig of its own. In the install it
+    # writes one daemon session, with the ledger row and card that its event
+    # produces, which no other stack rewrites, so it needs no state lock.
+    oobe-first-run-audits | autoops-warning-event-no-action-triage) return 0 ;;
   esac
   return 1
 }
@@ -2923,6 +2927,14 @@ unit_cost_hint() {
     # The same shape again, plus a detector stop and relaunch before the live
     # card wait. Unmeasured; priced with its siblings.
     gitops-drift-backlog-digest) echo 900 ;;
+    # The two CUJ 1 halves (#2889), registered 2026-10-20. Same shape as
+    # gitops-drift-out-of-band-triage and gitops-drift-noise-filtered-triage
+    # -- infra lock, a plant, an inject and a card wait -- and the band is a
+    # ceiling rather than an expectation for them: on the recorder's nights
+    # those two ran 260-674s and 434-969s against this 900s, and these two
+    # measured 7-11 minutes a repetition on a dev install.
+    gitops-drift-deleted-policy-triage) echo 900 ;;
+    gitops-drift-load-bearing-change-triage) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev
@@ -2946,6 +2958,10 @@ unit_cost_hint() {
     # nightly of 2026-10-09; the top of the list, so it launches first in each
     # repetition round.
     oobe-first-run-audits) echo 3000 ;;
+    # Off the infra lock too (infra_lock_exempt), unmeasured: priced as
+    # autoops-warning-event-triage, the same plant-then-card shape, so it
+    # launches early in its round rather than last at the default.
+    autoops-warning-event-no-action-triage) echo 900 ;;
     # The nightly-only full audits: 600-1300s a repetition on 2026-08-26,
     # planted-pdb's 962s the one clean measurement. Priced with the 900 band
     # so a nightly run launches them first. fleet-cost-idle-pool joined the
@@ -3338,7 +3354,7 @@ release_state_lock() { # <task-name>
 # the nightly (#1491):
 #   - the serial pass ran off the critical path's end: 2217s over 41 cases on
 #     the night of 2026-09-20 (one store read per `bench-gate case`), all of
-#     it after the last unit and all of it inside the 480m budget. In the
+#     it after the last unit and all of it inside the then-480m budget. In the
 #     lanes it overlaps units that are still running.
 #   - a Prow deadline kills the fan-out before that pass. The nights of
 #     2026-09-18 and 09-21 finished 105 and 122 units and recorded nothing,

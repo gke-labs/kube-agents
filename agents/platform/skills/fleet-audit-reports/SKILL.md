@@ -12,8 +12,9 @@ owns both ends of that lifecycle.
 ## The store
 
 `/opt/data/fleet-audit/reports/<audit-id>/<owner>/<name>/`, one directory per stream and GitOps
-repository — a stream publishes one ledger per managed repository. On an install with no forge
-configured, the repository directory is `no_forge/local`:
+repository. A run publishes to the `role: gitops` repository, or to the repository a person gave
+with `--repo`, so a stream can have more than one directory. A run with no repository to publish
+to uses `no_forge/local`:
 
 - `latest.json` — the newest run's envelope.
 - `runs/<YYYYMMDDThhmmss.ffffffZ>.json` — one envelope per run, newest 14 kept. The only
@@ -27,9 +28,14 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 
 - `document` is this run's whole validated findings document — un-clipped, so it holds findings the
   issue body had no room to print.
-- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, or `NO_FORGE`. `NO_FORGE` means no forge is
-  configured: the run wrote no ledger issue, `issue_number` and `issue_url` are null, and the
-  envelope is the only record of what it found. `ledger_held_open` true means a `CLEAN` or
+- `status` is `OPENED`, `UPDATED`, `CLEAN`, `HELD`, or `NO_FORGE`. `NO_FORGE` means the run had no
+  repository to publish to: it wrote no ledger issue, `issue_number` and `issue_url` are null, and
+  the envelope is the only record of what it found. A `NO_FORGE` envelope in a repository's
+  directory carries `unreachable_repo` (`repo`, `reason`): the run could not reach that repository.
+  One under `no_forge/local` can carry `no_repository_chosen` (`reason`): several repositories are
+  managed and none is the one `role: gitops` repository. For both, the new and resolved counts are
+  unknown; say so. An envelope with neither key is from an install with no forge.
+  `ledger_held_open` true means a `CLEAN` or
   `HELD` run left the issue open (partial, or over findings it did not account for) without
   rewriting it: the issue still lists the previous run's findings, `current` counts those, and this
   run's `findings: 0` and `critical: 0` do **not** mean the ledger is clear. `streams`, `show` and

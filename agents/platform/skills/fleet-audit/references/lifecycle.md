@@ -30,6 +30,35 @@ Between `content` and `directory` everything else is identical, including where 
 and what `finish` publishes. Where the two differ, this file says which mode it is talking about.
 `none` differs throughout, and its own section says how.
 
+### Which repository
+
+The ledger issue and every remediation pull request or merge request go to one repository. `start`
+and `finish` resolve it in this order:
+
+1. `--repo`, when you pass it. It must be in the managed list.
+2. The workspace lease record, only when the `start` of this run wrote it. A lease from an earlier
+   run is ignored, so a `--repo` run does not change the repository of later runs.
+3. The repository with `role: gitops`, when more than one repository is managed. The operator
+   writes it to the `gitops_repo` key of `$GITOPS_STATE_CONFIGMAP`.
+4. The one managed repository, when there is only one.
+
+`finish` follows the repository that the `start` of this run chose. Pass `--repo` to `finish` only
+when you passed it to `start`, with the same value.
+
+A context repository is never the target: it is only read. With several managed repositories and
+none with `role: gitops`, the run takes the no-forge path: its `no_forge` note says to give one
+repository `role: gitops`, or to pass `--repo` for one run, and `finish` sends the findings to chat
+and the report store. Do not choose a repository yourself. A `--repo` that is not in the managed list
+is an error. With no managed repository, the run has no forge; see
+[No forge configured](finish.md#no-forge-configured).
+
+Before it publishes, `start` lists one open issue in the resolved repository through the broker.
+`finish` follows the result that `start` recorded, and lists one only when this run has no record.
+If the forge says that the repository does not exist, or that the install's credential cannot read
+it, or the broker does not manage it, the run does not choose another repository. It takes the
+no-forge path, and its `no_forge` note names the repository and the reason; see
+[No forge configured](finish.md#no-forge-configured). Such a run is never silent.
+
 ### Step 1 — `start`
 
 Before inspecting anything, claim the workspace:
@@ -40,9 +69,7 @@ Before inspecting anything, claim the workspace:
   [--repo "<owner>/<repo>"]
 ```
 
-This resolves the target repository (using `--repo` if specified, falling back to the single
-configured repo in `$GITOPS_STATE_CONFIGMAP`, failing if ambiguous across multiple repos, and
-running with no forge when none is registered — see [No forge configured](finish.md#no-forge-configured)), makes
+This resolves the target repository (see [Which repository](#which-repository) below), makes
 the forge credential current, establishes a clean workspace, ensures the audit's labels exist, locates
 the stream's open ledger issue, and clears any findings document a crashed run left behind. If the
 user asked for a specific repository that is not yet registered, instruct the user or cluster
