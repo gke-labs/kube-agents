@@ -10024,110 +10024,45 @@ def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
 
 
 
-# The object-line readiness case for catalogue entry 10 grades the planted
-# object's declared line on two slots: its verdict and the cell the report
-# printed for it, wording only the rule produces. The cell carries a `;`, so a
-# wrap the agent kept around it survives `_VALUE_WRAP`, and a note's entry may
-# come with the note column's other entries before it; the case's patterns
-# admit any prefix before the rule's text, and these tests hold the case to
-# that through the shipped entry and the real fold. The cell text is the
-# rule's own (scripts/test_audit_rules.py asserts it); the gap and the target
-# are the fleet's, so the case's pattern stops after the image.
-_WORKLOAD_RULE_CASES = {
-    "upgrades-readiness-client-addon-skew": (
-        "stale-kubectl-client",
-        "cronjob",
-        "client-addon-skew",
-        "client-addon-skew: kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0): "
-        "7 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver (https://kubernetes.io/releases/version-skew-policy/#kubectl)",
-    ),
-}
-_WORKLOAD_CELL_WRAPS = [
+_PER_CLUSTER_CELL_WRAPS = [
     "{cell}",
     '"{cell}"',
     "'{cell}'",
     "“{cell}”",
     "<{cell}>",
     "`{cell}`",
-    # The note column's other entries ahead of the rule's.
+    # The column's other entries ahead of the rule's.
     "cluster read failed; PDBs not graded; {cell}",
 ]
 
 
-def _workload_case_spec(case: str) -> dict:
+def _per_cluster_case_spec(case: str) -> dict:
     return yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
 
 
-def _workload_case_grades(case: str, objective: str, text: str) -> bool:
-    spec = _workload_case_spec(case)
-    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
-    v = parse_node(check)
-    _stash(text)
-    with tempfile.TemporaryDirectory(prefix="workload-fleet-") as root:
-        _write_fleet_dir(Path(root), list(spec["fixtures"]), None)
-        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
-            return v.verify(5.0).status == "pass"
-
-
-def _workload_line(name: str, kind: str, cell: str, verdict: str = "no") -> str:
-    return f"seeded-a/{name}: kind {kind}; blocks the upgrade: {verdict}; cell: {cell}"
-
-
-@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_CASES))
-@pytest.mark.parametrize("wrap", _WORKLOAD_CELL_WRAPS)
-def test_workload_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, wrap):
-    name, kind, _rule, cell = _WORKLOAD_RULE_CASES[case]
-    text = _workload_line(name, kind, wrap.format(cell=cell))
-    assert _workload_case_grades(case, f"{name}-line-does-not-block", text)
-    assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", text)
-
-
-@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_CASES))
-def test_workload_rule_case_accepts_the_bare_json_text_without_the_rule_prefix(case):
-    name, kind, _rule, cell = _WORKLOAD_RULE_CASES[case]
-    assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", _workload_line(name, kind, _bare(cell)))
-
-
-@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_CASES))
-def test_workload_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_verdict(case):
-    name, kind, rule, cell = _WORKLOAD_RULE_CASES[case]
-    verdict_objective = f"{name}-line-does-not-block"
-    cell_objective = f"{name}-line-quotes-the-reports-cell"
-    # A report whose rule is missing prints no cell: `none`, or another rule's text, wrapped or not.
-    assert not _workload_case_grades(case, cell_objective, _workload_line(name, kind, "none"))
-    assert not _workload_case_grades(case, cell_objective, _workload_line(name, kind, f"{rule}: something else"))
-    assert not _workload_case_grades(case, cell_objective, _workload_line(name, kind, f'"{rule}: something else"'))
-    # The earlier frame, without the cell slot, still carries its verdict and fails the cell slot.
-    old_frame = _workload_line(name, kind, cell).rsplit("; cell:", 1)[0]
-    assert _workload_case_grades(case, verdict_objective, old_frame)
-    assert not _workload_case_grades(case, cell_objective, old_frame)
-    # A promoted verdict fails whatever the cell says, and so does a second line that contradicts the first.
-    assert not _workload_case_grades(case, verdict_objective, _workload_line(name, kind, cell, verdict="yes"))
-    assert not _workload_case_grades(case, verdict_objective, "\n".join([_workload_line(name, kind, cell), _workload_line(name, kind, cell, verdict="yes")]))
-    # A pod of the workload may stand in for it; another object's line never does.
-    assert _workload_case_grades(case, cell_objective, _workload_line(f"{name}-7d9f8c6b5-x2k9q", kind, cell))
-    assert not _workload_case_grades(case, cell_objective, _workload_line("other-workload", kind, cell))
-
-
 # The per-cluster readiness cases for the workload rules of catalogue entries
-# 4, 12, 14, 15, 17, 18 and 20 grade one declared line per seeded cluster,
+# 4, 10, 12, 14, 15, 17, 18 and 20 grade one declared line per seeded cluster,
 # `<cluster>: <rule id>: <object kind namespace/name|none>; blocks the upgrade:
 # <yes|no|none>; cell: <the rule's text|none>`: slot a's line names the planted
 # object, reads `no` and quotes the rule's own text; the other slots read `none`
-# in every slot, since the fleet plants each shape on slot a alone. The cases
-# first graded one line per object, anchored on the object's name, and nine
+# in every slot, since the fleet plants each shape on slot a alone (the
+# client-addon-skew case also admits a kubectl client the cluster's audit log
+# names there, in the rule's own wording: `_CLIENT_CASE` below). The cases
+# first graded one line per object, anchored on the object's name, and the
 # dev-install runs passed none of them: the agent read `<cluster>/<object name>`
 # as `<project>/<cluster>`, which put the object's name after `; blocks the
-# upgrade:` where the anchor could not find it, or left a note-column object
-# out of a list it built from the risks;
+# upgrade:` where the anchor could not find it, left a note-column object out
+# of a list it built from the risks, or wrote the lines for a dozen other
+# objects and left the planted one out;
 # `test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame`
 # keeps that rendering red. The cell texts are the rules' own, as their unit
 # tests assert them (agents/platform/skills/fleet-upgrade-verification/scripts/
-# test_readiness_rules_workloads.py); the pools and the kubelet version are the
-# fleet's, so the cases' patterns stop before them. A cell carries a `;`, so a
-# wrap the agent kept around it survives `_VALUE_WRAP`, and a note's entry may
-# come with the note column's other entries before it; the cases admit any
-# prefix before the rule's text.
+# test_readiness_rules_workloads.py, and test_audit_rules.py for entry 10); the
+# pools, the kubelet version, the skew gap and the target are the fleet's, so
+# the cases' patterns stop before them. A cell carries a `;`, so a wrap the
+# agent kept around it survives `_VALUE_WRAP`, and a note's entry may come with
+# the note column's other entries before it; the cases admit any prefix before
+# the rule's text.
 _PER_CLUSTER_RULE_CASES = {
     "upgrades-fleet-readiness-node-local-state": (
         "Deployment seeded-shapes/cache-on-emptydir",
@@ -10172,17 +10107,29 @@ _PER_CLUSTER_RULE_CASES = {
         "(frozen 2023-04-03, a redirect to registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host that stopped publishing; "
         "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and are rebuilt in this upgrade",
     ),
+    "upgrades-readiness-client-addon-skew": (
+        "CronJob seeded-shapes/stale-kubectl-client",
+        "client-addon-skew",
+        "client-addon-skew: kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0): "
+        "7 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver (https://kubernetes.io/releases/version-skew-policy/#kubectl)",
+    ),
 }
-_PER_CLUSTER_OBJECTIVES = (
-    "every-seeded-cluster-has-a-declared-line",
-    "the-planted-object-is-named-and-does-not-block",
-    "the-planted-objects-line-quotes-the-reports-cell",
-    "the-other-clusters-read-none",
-)
+_CLIENT_CASE = "upgrades-readiness-client-addon-skew"
+# The other-slots objective is named for what it admits; the client case admits
+# a finding the audit log names besides `none`.
+_OTHERS_OBJECTIVE_OF = {_CLIENT_CASE: "the-other-clusters-read-none-or-the-reports-own-finding"}
 _PLANTED_OBJECTIVE = "the-planted-object-is-named-and-does-not-block"
 _CELL_OBJECTIVE = "the-planted-objects-line-quotes-the-reports-cell"
 _EVERY_SLOT_OBJECTIVE = "every-seeded-cluster-has-a-declared-line"
 _OTHERS_OBJECTIVE = "the-other-clusters-read-none"
+
+
+def _others_objective(case: str) -> str:
+    return _OTHERS_OBJECTIVE_OF.get(case, _OTHERS_OBJECTIVE)
+
+
+def _per_cluster_objectives(case: str) -> tuple[str, ...]:
+    return (_EVERY_SLOT_OBJECTIVE, _PLANTED_OBJECTIVE, _CELL_OBJECTIVE, _others_objective(case))
 # The other grades the same rules print for the same objects on another fleet
 # (a cgroup v1 pool the target migrates, a GPU pool carrying the accelerator):
 # the patterns stop before the pool-dependent tail, so these pass the cell slot too.
@@ -10227,7 +10174,7 @@ def _one_role_per_slot() -> list[str]:
 
 
 def _per_cluster_case_grades(case: str, objective: str, text: str) -> bool:
-    spec = _workload_case_spec(case)
+    spec = _per_cluster_case_spec(case)
     check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
     v = parse_node(check)
     _stash(text)
@@ -10265,11 +10212,11 @@ def _rendered(text: str, rendering: str) -> str:
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
-@pytest.mark.parametrize("wrap", _WORKLOAD_CELL_WRAPS)
+@pytest.mark.parametrize("wrap", _PER_CLUSTER_CELL_WRAPS)
 def test_per_cluster_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, wrap):
     _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
     text = _per_cluster_report(case, cell=wrap.format(cell=cell))
-    for objective in _PER_CLUSTER_OBJECTIVES:
+    for objective in _per_cluster_objectives(case):
         assert _per_cluster_case_grades(case, objective, text), objective
 
 
@@ -10288,7 +10235,7 @@ def test_per_cluster_rule_case_accepts_the_rules_other_grade_on_another_fleet(ca
 @pytest.mark.parametrize("rendering", _PER_CLUSTER_RENDERINGS)
 def test_per_cluster_rule_case_accepts_the_lines_as_the_agent_renders_them(case, rendering):
     text = _rendered(_per_cluster_report(case), rendering)
-    for objective in _PER_CLUSTER_OBJECTIVES:
+    for objective in _per_cluster_objectives(case):
         assert _per_cluster_case_grades(case, objective, text), objective
 
 
@@ -10321,7 +10268,7 @@ def test_per_cluster_rule_case_needs_a_line_for_every_slot(case):
         text = _per_cluster_report(case, slots=tuple(s for s in _SLOT_LETTERS if s != missing))
         assert not _per_cluster_case_grades(case, _EVERY_SLOT_OBJECTIVE, text), missing
         if missing != "a":
-            assert not _per_cluster_case_grades(case, _OTHERS_OBJECTIVE, text), missing
+            assert not _per_cluster_case_grades(case, _others_objective(case), text), missing
 
 
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
@@ -10336,7 +10283,7 @@ def test_per_cluster_rule_case_refuses_a_finding_on_a_cluster_without_the_shape(
             _per_cluster_line(cluster, rule, "none", "no", "none"),
             _per_cluster_line(cluster, rule, "none", "none", cell),
         ):
-            assert not _per_cluster_case_grades(case, _OTHERS_OBJECTIVE, _per_cluster_report(case, others={letter: wrong})), wrong
+            assert not _per_cluster_case_grades(case, _others_objective(case), _per_cluster_report(case, others={letter: wrong})), wrong
 
 
 def _object_line_report(case: str) -> str:
@@ -10356,5 +10303,64 @@ def _object_line_report(case: str) -> str:
 @pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
 def test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame(case):
     text = _object_line_report(case)
-    for objective in _PER_CLUSTER_OBJECTIVES:
+    for objective in _per_cluster_objectives(case):
         assert not _per_cluster_case_grades(case, objective, text), objective
+
+
+# What the client-addon-skew rule can add on a live fleet: a kubectl user agent
+# from a cluster's Admin Activity log (a human's or an agent's write in the last
+# seven days from a binary further than one minor from the target), filed on
+# any slot in the rule's own wording, and a note the rule prints for every
+# cluster, which is not a finding.
+_AUDIT_CLIENT_CELL = (
+    "client-addon-skew: kubectl v1.33 from principal operator@example.com (user agent kubectl/v1.33.2 (darwin/arm64) kubernetes/0b43ee2, "
+    "4 writes to apps/v1 deployments in 7d): 3 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver "
+    "(https://kubernetes.io/releases/version-skew-policy/#kubectl)"
+)
+_ADDON_CELL = (
+    "client-addon-skew: cert-manager v1.20 at Deployment cert-manager/cert-manager (image quay.io/jetstack/cert-manager-controller:v1.20.1): "
+    "cert-manager v1.20 supports Kubernetes 1.32 to 1.35 (https://cert-manager.io/docs/releases/, read 2026-10-09); the target 1.36 is outside it"
+)
+_GKE_ADDONS_NOTE = "client-addon-skew: GKE add-ons on: gcePersistentDiskCsiDriverConfig, httpLoadBalancing (GKE-managed; the cluster record carries no version, so not graded)"
+
+
+def test_client_addon_skew_case_keeps_one_line_per_cluster_with_the_planted_cronjob_first():
+    planted, rule, cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    both = _per_cluster_report(_CLIENT_CASE, obj=f"{planted}, principal operator@example.com", cell=f"{cell}; {_AUDIT_CLIENT_CELL}")
+    for objective in _per_cluster_objectives(_CLIENT_CASE):
+        assert _per_cluster_case_grades(_CLIENT_CASE, objective, both), objective
+    # The principal before the CronJob is outside the vocabulary (a workload before a principal).
+    swapped = _per_cluster_report(_CLIENT_CASE, obj=f"principal operator@example.com, {planted}", cell=f"{_AUDIT_CLIENT_CELL}; {cell}")
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, swapped)
+    # Two lines for slot a, one per finding, contradict the one-line frame: the second names another object first.
+    two_lines = "\n".join([_per_cluster_report(_CLIENT_CASE), _per_cluster_line(_SLOT_NAMES["a"], rule, "principal operator@example.com", "no", _AUDIT_CLIENT_CELL)])
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _PLANTED_OBJECTIVE, two_lines)
+
+
+@pytest.mark.parametrize("cell", [_AUDIT_CLIENT_CELL, _bare(_AUDIT_CLIENT_CELL), _ADDON_CELL])
+def test_client_addon_skew_case_admits_a_finding_the_report_files_on_another_cluster(cell):
+    _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    obj = "principal operator@example.com" if "principal" in cell else "Deployment cert-manager/cert-manager"
+    report = _per_cluster_report(_CLIENT_CASE, others={"b": _per_cluster_line(_SLOT_NAMES["b"], rule, obj, "no", cell)})
+    for objective in _per_cluster_objectives(_CLIENT_CASE):
+        assert _per_cluster_case_grades(_CLIENT_CASE, objective, report), objective
+
+
+@pytest.mark.parametrize(
+    "obj,verdict,cell",
+    [
+        # The rule's note is not a finding: a cluster with the note alone reads none in every slot.
+        ("none", "none", _GKE_ADDONS_NOTE),
+        ("GKE add-ons", "no", _GKE_ADDONS_NOTE),
+        # A finding in the agent's words rather than the rule's, a hedged verdict, a blocker the rule never files.
+        ("principal operator@example.com", "no", "kubectl 1.33 is too old for this cluster"),
+        ("principal operator@example.com", "none", _AUDIT_CLIENT_CELL),
+        ("principal operator@example.com", "yes", _AUDIT_CLIENT_CELL),
+        ("none", "no", "none"),
+    ],
+)
+def test_client_addon_skew_case_refuses_what_is_not_a_finding_on_another_cluster(obj, verdict, cell):
+    _planted, rule, _cell = _PER_CLUSTER_RULE_CASES[_CLIENT_CASE]
+    report = _per_cluster_report(_CLIENT_CASE, others={"c": _per_cluster_line(_SLOT_NAMES["c"], rule, obj, verdict, cell)})
+    assert not _per_cluster_case_grades(_CLIENT_CASE, _others_objective(_CLIENT_CASE), report)
+
