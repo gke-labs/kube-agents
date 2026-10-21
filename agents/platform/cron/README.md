@@ -185,8 +185,9 @@ when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
 sandbox's configured project; and with nothing at all the tick fails closed,
 because on an install that declares no scope the report script's own fallback
-is every project the credential can list. A roster spelling with a space or a semicolon is
-not a project id or number, so it fails the tick with the places to correct it. Within those projects the report script
+is every project the credential can list. A roster spelling with a space, a semicolon, or a
+comma inside one project's name is not a project id or number, so it fails the tick with the
+places to correct it. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
 Cluster Agent from is still read here. On an install that declares a scope (a
 `spec.scope` block), the report script, a fleet-audit collector, refuses a bare

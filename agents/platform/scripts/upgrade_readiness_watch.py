@@ -172,9 +172,11 @@ REFRESH_SLACK_SECONDS = 10 * 60
 # Which projects the report enumerates, resolved on this side.
 PROJECTS_ENV = "UPGRADE_READINESS_PROJECTS"
 # A project id or number is one token, as the refusal parser reads it
-# (`REFUSAL_TOKEN_PATTERN`): a hand-typed spelling with a space or a semicolon
-# is a typo, most often a list separated by spaces where commas were meant.
-ROSTER_SPELLING_REFUSED = re.compile(r"[\s;]")
+# (`REFUSAL_TOKEN_PATTERN`): a hand-typed spelling with a space, a comma or a
+# semicolon is a typo, most often a list separated by spaces where commas were
+# meant. The list variable is split on its commas first, so a comma reaches
+# this check only from a source that holds one project.
+ROSTER_SPELLING_REFUSED = re.compile(r"[\s,;]")
 ROSTER_SPELLING_DETAIL = (
     "the roster names {spellings}, which is not a project id or number; spell each project as its id, in "
     + PROJECTS_ENV

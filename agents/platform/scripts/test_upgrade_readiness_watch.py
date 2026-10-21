@@ -2475,13 +2475,16 @@ class DeclaredScope(Base):
 
     def test_a_management_project_spelling_with_a_space_fails_the_tick_before_any_sandbox_call(self) -> None:
         """Every source of the roster is held to the same grammar: spec.harness.projectId
-        reaches the pod as GCP_PROJECT_ID, and a space there is refused as one in the list is."""
-        sandbox = FakeSandbox(envelope([]))
-        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: "foo bar"}), mock.patch.object(watch, "roster_projects", return_value=set()):
-            code, out = self.run_tick(sandbox)
-        self.assertEqual(code, 0)
-        self.assertEqual(sandbox.calls, [])
-        self.assertIn("the roster names 'foo bar', which is not a project id or number", out)
+        reaches the pod as GCP_PROJECT_ID, and a space there is refused as one in the list is.
+        A comma is refused too: that source holds one project, and the parser's token stops at it."""
+        for spelling in ("foo bar", "mgmt,x"):
+            with self.subTest(spelling=spelling):
+                sandbox = FakeSandbox(envelope([]))
+                with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: spelling}), mock.patch.object(watch, "roster_projects", return_value=set()):
+                    code, out = self.run_tick(sandbox)
+                self.assertEqual(code, 0)
+                self.assertEqual(sandbox.calls, [])
+                self.assertIn(f"the roster names {spelling!r}, which is not a project id or number", out)
 
     def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
         scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
