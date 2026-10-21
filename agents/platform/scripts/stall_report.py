@@ -91,6 +91,15 @@ FINISHED_JOB_CONDITION_TYPES = frozenset({"Complete", "Failed"})
 REPLICAS_SPEC_KEY = "replicas"
 JOB_KIND = "Job"
 
+# The stall watch's opt-out annotation. An object that carries it is still
+# reported, and the table is unchanged; each of its --json rows says so in
+# EXEMPT_FIELD, and stall_watch.py leaves those rows out of its alerts.
+# stall_watch.py names the same key and value: this script runs alone in the
+# sandbox, so it imports nothing.
+EXEMPT_ANNOTATION = "kubeagents.x-k8s.io/stall-watch"
+EXEMPT_VALUE = "exempt"
+EXEMPT_FIELD = "exempt"
+
 # What counts as a repeating warning in one snapshot: at least this many
 # occurrences, spanning at least the threshold, the newest inside the last
 # threshold window. A single snapshot cannot watch a count rise; the span and
@@ -372,6 +381,11 @@ def object_label(obj: dict) -> str:
     return f"{kind}{RESOURCE_NAME_SEPARATOR}{name}"
 
 
+def is_exempt(obj: dict) -> bool:
+    annotations = (obj.get("metadata") or {}).get("annotations")
+    return isinstance(annotations, dict) and annotations.get(EXEMPT_ANNOTATION) == EXEMPT_VALUE
+
+
 def finding(obj: dict, heuristic: str, detail: str, stalled: timedelta) -> dict:
     seconds = int(stalled.total_seconds())
     return {
@@ -381,6 +395,7 @@ def finding(obj: dict, heuristic: str, detail: str, stalled: timedelta) -> dict:
         "detail": detail,
         "stalled_for": format_duration(seconds),
         "stalled_seconds": seconds,
+        EXEMPT_FIELD: is_exempt(obj),
     }
 
 

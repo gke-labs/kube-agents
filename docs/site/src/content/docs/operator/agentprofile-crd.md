@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-The `AgentProfile` custom resource describes one kind of agent pod on the A2A bus: its persona and worker images, its topic grants, the ServiceAccount it runs as, and how long one task may run. It is part of the `spec.mode: next` stack, which is an unsupported dev toggle. On a PlatformAgent running `today` (the default) an `AgentProfile` renders nothing.
+The `AgentProfile` custom resource describes one kind of agent pod on the A2A bus: its persona and worker images, its topic grants, the ServiceAccount it runs as, and how long one task may run. It is part of the `spec.mode: next` stack. On a PlatformAgent running `today` an `AgentProfile` renders nothing.
 
 An `AgentProfile` is not a Hermes profile. The platform agent's own profiles (the platform and cluster templates it scaffolds under `$HERMES_HOME/profiles`) are unrelated and unchanged.
 

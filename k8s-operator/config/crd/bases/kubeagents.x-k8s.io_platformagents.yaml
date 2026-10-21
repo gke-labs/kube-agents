@@ -9564,6 +9564,70 @@ spec:
                         Omitting it leaves every kubectl call in the sidecar pointed at
                         localhost:8080. See buildCredentialProxyEnv.
                       type: string
+                    stallWatch:
+                      description: |-
+                        StallWatch tunes the controller stall watch — the stall-watch cron job on the
+                        Platform Agent's roster that sweeps the fleet for controllers that stopped
+                        making progress and raises an alert for each new stall. Absent keeps the
+                        watch's built-in behaviour.
+                      properties:
+                        excludeNamespaces:
+                          description: |-
+                            ExcludeNamespaces names namespaces the watch never reads, on every cluster,
+                            in addition to the system namespaces it always skips. Matched exactly. An
+                            open alert in a namespace added here is closed with a note that the
+                            namespace was excluded.
+                          items:
+                            maxLength: 63
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          maxItems: 100
+                          type: array
+                          x-kubernetes-list-type: set
+                        kinds:
+                          description: |-
+                            Kinds replaces the watch's default list of resources to scan (Deployments,
+                            StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
+                            cert-manager Certificates). Each item is a kubectl resource name such as
+                            `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
+                            scans every namespaced kind the cluster serves, one read per kind per
+                            namespace, which is slow on a large fleet. Absent or empty keeps the
+                            default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+                            ControllerRevisions and Leases are refused: the scan reports nothing from
+                            them, and a Secret listing would carry every body.
+                          items:
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          maxItems: 20
+                          type: array
+                          x-kubernetes-list-type: set
+                          x-kubernetes-validations:
+                            - message: "kinds: all must be the only item"
+                              rule: "!self.exists(k, k == 'all') || self.size() == 1"
+                            - message:
+                                "kinds: secrets, configmaps, events, endpoints,
+                                endpointslices, controllerrevisions and leases are never
+                                scanned"
+                              rule:
+                                "!self.exists(k, k.split('.')[0] in ['secrets',
+                                'secret', 'configmaps', 'configmap', 'cm', 'events',
+                                'event', 'ev', 'endpoints', 'endpoint', 'ep',
+                                'endpointslices', 'endpointslice', 'controllerrevisions',
+                                'controllerrevision', 'leases', 'lease'])"
+                        minStallAgeMinutes:
+                          description: |-
+                            MinStallAgeMinutes holds a new alert until one of the namespace's stalls has
+                            lasted at least this long. The age is the longer of what stall_report.py
+                            measures on the object and how long the watch has seen it. A stall that is
+                            younger stays in the watch's ledger and is checked again on each run; an
+                            object that joins a namespace with an open alert is not held. Absent or 0
+                            alerts on the first run that sees the stall.
+                          format: int32
+                          maximum: 1440
+                          minimum: 0
+                          type: integer
+                      type: object
                     tuning:
                       description: |-
                         Tuning sets per-persona execution limits. Unset values keep the defaults

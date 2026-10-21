@@ -365,6 +365,7 @@ class RevalidationTest(unittest.TestCase):
         "JOB_TYPE",
         "PULL_REFS",
         "EVAL_SKIP_REVALIDATION",
+        "EVAL_REVALIDATION_NOT_BEFORE",
         "EVAL_LEDGER_APP_KEY_FILE",
         "EVAL_LEDGER_APP_ID",
         "EVAL_LEDGER_INSTALLATION_ID",
@@ -588,6 +589,37 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("refusing to trust the GCS record alone", proc.stdout)
+
+    def _plant_dated_green(self, *whens):
+        """Green build 200 at c3, attested by Prow events created at `whens`."""
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, [self._prow_event("success", "Job succeeded.", when, build="200") for when in whens])
+
+    def test_a_green_first_reported_before_the_cutoff_is_not_reused(self):
+        """The swap: a pre-swap green at this head graded the other mode. A
+        later copy naming the same build (the sticky re-pin's, or its expiry)
+        does not stand in for the original event."""
+        self._plant_dated_green("2026-10-15T10:00:00Z", "2026-10-21T10:00:00Z")
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("before EVAL_REVALIDATION_NOT_BEFORE (2026-10-20T20:00:00Z)", proc.stdout)
+
+    def test_a_green_reported_after_the_cutoff_is_reused(self):
+        self._plant_dated_green("2026-10-21T10:00:00Z")
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+
+    def test_an_unparsable_cutoff_is_a_full_run(self):
+        self._plant_dated_green("2026-10-21T10:00:00Z")
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "next week"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("not a UTC time", proc.stdout)
+
+    def test_an_attesting_event_with_no_time_is_a_full_run_under_a_cutoff(self):
+        self._plant_history([("200", True, self.c1, self.c3)])  # attested with no created_at
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("unreadable time", proc.stdout)
 
     def test_a_red_at_this_head_newer_than_its_green_is_overridden(self):
         """The newest GREEN wins, as for inert pushes. For the same head that is
@@ -942,6 +974,18 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "3"})
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+
+    def test_a_partial_read_is_no_earliest_under_a_cutoff(self):
+        """Under EVAL_REVALIDATION_NOT_BEFORE the original report may lie
+        past the pages read, so a green attested by later copies alone is a
+        full run; without the cutoff the same read reuses it (above)."""
+        copies = [self._prow_event("success", "Job succeeded.", "2026-10-21T10:00:00Z", build="200") for _ in range(150)]
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, copies)
+        env = {"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "2", "EVAL_REVALIDATION_NOT_BEFORE": "2026-10-20T20:00:00Z"}
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides=env)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("capped read may not reach", proc.stdout)
 
     def test_an_unparsed_link_header_ends_the_walk_and_says_so(self):
         """RFC 8288 permits an unquoted rel; GitHub quotes it. A Link value

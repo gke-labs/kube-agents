@@ -112,13 +112,16 @@ readonly EVAL_LOG_DIR
 # from the Secret the operator renders beside the door -- <agent>-a2a-inject,
 # key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
 # already waited for it). Unset, the matrix runs over the agent API exactly
-# as before. Four places read the flag: section 4 below; the baseline
+# as before. The merge-blocking presubmit runs under it: next is the mode a
+# new install gets. Five places read the flag: the today lane's step in
+# section 3 (run_rollback_lane, which refuses EVAL_ROLLBACK_LANE=1 without
+# it); section 4 below, whose door it skips on that lane; the baseline
 # recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
 # step after the fan-out); the dashboard publisher's gate, which mirrors
 # the recorder's; and the rollback round trip after the suite verdict
 # (run_rollback_roundtrip, below). A flagged run passes neither the recorder
-# nor the publisher: the next lane's periodic on
-# main runs under it with no PULL_NUMBER, the shape both otherwise write
+# nor the publisher: the next-mode nightly and the today lane's periodic on
+# main run under it with no PULL_NUMBER, the shape both otherwise write
 # from, and a next-mode sample in today's window would be indistinguishable
 # once written (VersionKey in bench/kube_agents_bench/baselines.py carries
 # no mode field), as would a dashboard that has no next lane to file it under.
@@ -132,8 +135,11 @@ readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
 # sits clear of the API range (28642 + seq) for any matrix this job runs.
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 
-# The rollback round trip under EVAL_MODE_NEXT=1 (run_rollback_roundtrip, after
-# the suite verdict is computed): hack/rollback-roundtrip.sh flips the install
+# The rollback round trip under EVAL_MODE_NEXT=1 on main (run_rollback_roundtrip,
+# after the suite verdict is computed; a pull request's run and a
+# release-candidate run skip it, for the reasons the function gives, and the
+# today lane runs it before its matrix instead, run_rollback_lane):
+# hack/rollback-roundtrip.sh flips the install
 # next -> today -> next and checks the JetStream PVC and the bus creds Secret
 # come through it (cutover condition 6, #2461). Reported beside the verdict,
 # never in it: its own log section and artifacts, no case, no effect on the
@@ -153,6 +159,17 @@ readonly EVAL_ROLLBACK_TIMEOUT_SECONDS=3600
 readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
 readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
 readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
+# The round trip after the suite verdict is for a next-mode run on main: a
+# pull request's next-mode run (the merge-blocking presubmit's, or a Tide
+# batch's) skips it, since nobody reads a report-only result there and the
+# today lane below proves the same path every six hours on main, and on
+# demand on a pull request.
+readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
+# The today lane, EVAL_ROLLBACK_LANE=1 beside EVAL_MODE_NEXT=1
+# (run_rollback_lane, in section 3): the deploy brings the install up under
+# next, the round trip runs before the matrix and ends with the install at
+# this mode, and the matrix then grades today over the agent API.
+readonly EVAL_ROLLBACK_LANE_END_MODE="today"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -230,7 +247,7 @@ readonly STATE_LOCK_RETRY_SECONDS=30
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
 # evaluation project (kube-agents-presubmits.yaml in oss-test-infra). Run
 # here too, first, so a job definition that has not yet hoisted it still
-# saves the eval matrix, and so the next-mode lane that runs this script
+# saves the eval matrix, and so the today lane's presubmit that runs this script
 # under its own JOB_NAME is covered the same way. The script's header owns
 # the rules: a green at this head, whatever main has done since (#1202),
 # or at an earlier head when everything since is inert (#1179), is reused;
@@ -468,7 +485,7 @@ EVAL_FORGE_HELPER_ARGS=()
 # reach; that split is what makes the boundary structural, exactly as
 # docs/designs/eval-scorer.md#the-two-service-accounts argues for the
 # baseline store. The recorder's fourth condition, EVAL_MODE_NEXT unset,
-# is mirrored too: the next lane's periodic reports nothing to a dashboard
+# is mirrored too: a flagged periodic reports nothing to a dashboard
 # that has no lane for it yet.
 #
 # Nothing publishes until BOTH prerequisites exist:
@@ -889,6 +906,58 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 start_agent_pod_watch
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
+
+# ─── The today lane: roll the next install back before grading ──────────────
+# EVAL_ROLLBACK_LANE=1, set beside EVAL_MODE_NEXT=1 on the today lane's jobs
+# (ci-kube-agents-eval-today and pull-kube-agents-smoke-test-today in
+# oss-test-infra). With next the mode new installs get and the merge-blocking
+# presubmit grading it, today is what a rollback lands on, and this lane proves
+# that path: the deploy brings the install up under next exactly as for the
+# next lane, this step runs hack/rollback-roundtrip.sh with ROLLBACK_END_MODE
+# set to EVAL_ROLLBACK_LANE_END_MODE (next -> today -> next -> today: the
+# rollback, the flip forward on the kept PVC and creds Secret, and the
+# rollback again), and the matrix then runs over the agent API on the
+# rolled-back install (section 4 leaves the transport alone on this lane).
+#
+# Unlike the report-only round trip after a next-mode matrix, a failure here
+# stops the job: a rollback that does not land leaves nothing for today's
+# matrix to grade, and on this lane the failure is the finding. It runs here,
+# before the ledger and repository resets and the audit pause below, so they
+# act on the pod the matrix will talk to; the pod watch above already covers
+# the pods the flips replace. Run in the background and waited on, so the
+# job's deadline TERM reaches the round trip, as in run_rollback_roundtrip.
+run_rollback_lane() {
+  if [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
+    return 0
+  fi
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    echo "ERROR: EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane rolls a next install back to today, and without the flag the deploy installed today and there is nothing to roll back." >&2
+    exit 1
+  fi
+  local artifacts="${ARTIFACTS:-/tmp/artifacts}" status=0
+  local -a bound=()
+  mkdir -p "${artifacts}"
+  profile_begin "rollback lane: next -> today -> next -> today, before the matrix"
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback lane: rolling the next install back to ${EVAL_ROLLBACK_LANE_END_MODE} before grading its matrix (EVAL_ROLLBACK_LANE=1) ==="
+  if command -v timeout >/dev/null 2>&1; then
+    bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
+  fi
+  ROLLBACK_END_MODE="${EVAL_ROLLBACK_LANE_END_MODE}" ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" \
+    ROLLBACK_RESULTS_FILE="${artifacts}/${EVAL_ROLLBACK_RESULTS}" \
+    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
+    > >(tee "${artifacts}/${EVAL_ROLLBACK_LOG}") 2>&1 &
+  EVAL_ROLLBACK_PID=$!
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  wait "${EVAL_ROLLBACK_PID}" || status=$?
+  trap 'exit 143' TERM INT
+  if [ "${status}" -ne 0 ]; then
+    echo "ERROR: the rollback lane's round trip failed (exit ${status}): the next install did not roll back to ${EVAL_ROLLBACK_LANE_END_MODE} cleanly, so its matrix is not run. The last FAIL line above names the check, or says the run was stopped at its ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound (transcript: ${artifacts}/${EVAL_ROLLBACK_LOG})." >&2
+    exit 1
+  fi
+  echo "✓ Rolled back to ${EVAL_ROLLBACK_LANE_END_MODE}; the matrix runs over the agent API on this install"
+}
+run_rollback_lane
+
 # The harness's default delegation wait (1800s) sits INSIDE the compliance
 # canary's observed completion spread: on 2026-08-27 (build
 # 2093054394793725952, kube-agents-evals-2) the audit worker finished and
@@ -1843,8 +1912,11 @@ export PLATFORM_AGENT_TOKEN
 # agent token above is still fetched: the transport switch changes how a
 # prompt reaches the agent, not what else the run reads from the install.
 # Everything about the door the harness needs beyond these two it derives
-# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
-if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above. The today lane
+# (EVAL_ROLLBACK_LANE=1) carries the flag for its deploy, but run_rollback_lane
+# has rolled the install back by now and the door is gone with the bus, so its
+# matrix stays on the agent API.
+if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
   EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
   if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
     echo "ERROR: EVAL_MODE_NEXT=1 but the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
@@ -2710,9 +2782,9 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # names every roster case would leave the export empty on the inject lane
 # with rung 4 disarmed for whatever the matrix still holds (the nightly tier
 # keeps its own cases past the every-case-excluded stop) and no banner,
-# because no name is misspelled. Stop instead: the exclusion file needs only
-# the normal approvers, and it must not be able to do what the roster file
-# is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
+# because no name is misspelled. Stop instead: an exclusion entry is not a
+# demotion, and it must not be able to do what the roster file is guarded
+# against. An explicit BOOTSTRAP_ADMITTED in the job's
 # environment, empty included, is the stated way to mean it, and wins below.
 # Read before the nightly part's drop, which empties the export by design
 # when the part holds no roster case, and is not the lane's doing.
@@ -2848,6 +2920,9 @@ unit_cost_hint() {
     # hack/eval/nightly-budget-history.txt carries the measurements and the
     # budget arithmetic.
     gitops-drift-noise-filtered-triage) echo 900 ;;
+    # The same shape again, plus a detector stop and relaunch before the live
+    # card wait. Unmeasured; priced with its siblings.
+    gitops-drift-backlog-digest) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev
@@ -3928,12 +4003,14 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
-# EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
-# lane's periodic and nightlies on main (ci-kube-agents-eval-next,
-# ci-kube-agents-eval-nightly-next-claude and
+# EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The
+# next-mode nightlies on main (ci-kube-agents-eval-nightly-next-claude and
 # ci-kube-agents-eval-nightly-gitlab-next) are also periodics with no
 # PULL_NUMBER, and the key has no mode field either, so their samples would
-# be today's the moment they landed. The deploy admits the flag on those
+# be today's the moment they landed. The today lane's periodic
+# (ci-kube-agents-eval-today) carries the flag for its deploy and grades a
+# rolled-back install, which is not the fresh today install the window
+# measures, so it stays out on the same flag. The deploy admits the flag on those
 # jobs by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what
 # keeps the admission from moving the window. Whatever the job's identity may hold
 # on the store is a grant in oss-test-infra this script cannot see, not a
@@ -4095,6 +4172,26 @@ job_started_epoch() {
 # not for a slow deploy.
 run_rollback_roundtrip() {
   if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    return 0
+  fi
+  # The today lane ran its round trip before the matrix (run_rollback_lane)
+  # and is under today now; there is no next install here to start from.
+  if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
+    return 0
+  fi
+  local skip_type
+  for skip_type in ${EVAL_ROLLBACK_SKIP_JOB_TYPES}; do
+    if [ "${skip_type}" = "${JOB_TYPE:-}" ]; then
+      echo "Rollback round trip skipped: a pull request's run (JOB_TYPE=${JOB_TYPE}); the today lane proves the rollback path on main and on demand"
+      return 0
+    fi
+  done
+  # A release-candidate run's verdict is read only once the job has finished
+  # (scripts/release/poll_rc_eval_verdict.py waits for finished.json, and
+  # gives up at 330 minutes), so an hour of report-only round trip here would
+  # be an hour off the promotion's budget for a check that cannot change it.
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    echo "Rollback round trip skipped: a release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}); its verdict waits on this job finishing, and the round trip is reported, never gated"
     return 0
   fi
   local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"

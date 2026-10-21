@@ -192,6 +192,7 @@ ADDED_AFTER_THE_MOVE = [
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
+    "cluster-agent-observation-time-read",  # an audit trail states no time it did not read, #3256
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
@@ -714,6 +715,17 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 
     def test_the_file_is_the_pinned_set(self):
         self.assertEqual(list(eval_rosters.inject_lane_exclusions()), INJECT_LANE_EXCLUDED)
+
+    def test_the_blocking_roster_cases_it_excludes_are_the_pinned_set(self):
+        # The merge-blocking presubmit runs on the inject lane, so a roster
+        # case listed here leaves what can red a pull request: hack/ci-eval-pr.sh
+        # drops it from the matrix and from BOOTSTRAP_ADMITTED there. It keeps
+        # its seat on the today lane, which grades over the api transport but
+        # gates nothing. Adding another is that decision, made here and in
+        # docs/eval-gate-roster.md ("The inject lane"), not a side effect of an
+        # exclusion entry.
+        roster = set(eval_rosters.blocking_roster())
+        self.assertEqual([case for case in eval_rosters.inject_lane_exclusions() if case in roster], ["agent-kanban-smoke"])
 
     def test_every_exclusion_names_a_registered_case(self):
         registered = set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases())

@@ -677,8 +677,9 @@ canonical walkthroughs.
 
 ### Component stack (`platformAgent.mode`)
 
-`platformAgent.mode` is the CR's `spec.mode`: `today`, or `next`, which also
-renders the NATS bus and the A2A gateway, a development stack
+`platformAgent.mode` is the CR's `spec.mode`: `next`, which puts the NATS bus
+and the A2A gateway in front of the agent and is what a first `install.sh`
+install records, or `today`, the previous stack, kept as a rollback
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md)).
 It defaults to `null`, which renders no field, and the operator reads an absent
 mode as `today`. Because Helm patches the CR from the difference between its
@@ -779,7 +780,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Five knobs need context beyond the chart:
+These knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -825,6 +826,14 @@ Five knobs need context beyond the chart:
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.
+- `harness.stallWatch` tunes the controller stall watch with
+  `excludeNamespaces`, `minStallAgeMinutes` and `kinds`. The default `{}`
+  renders no block, and the watch keeps its own defaults. The operator delivers
+  the values in the agent's managed `.env`, so a change rolls the agent pod. The
+  [`spec.harness.stallWatch` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnessstallwatch)
+  is canonical for each field and for the opt-out annotation. If a field is
+  set, the chart fails the render against an installed CRD that predates
+  `spec.harness.stallWatch`.
 
 ### Plugins & Runtime Tuning
 
