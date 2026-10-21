@@ -8586,6 +8586,25 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("sudo -r role -b python3 f.py --readiness") == [
         (["sudo", "-r", "role", "-b", "python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("sudo --user hermes --background python3 f.py --readiness") == [
+        (["sudo", "--user", "hermes", "--background", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo --user hermes -b python3 f.py --readiness") == [
+        (["sudo", "--user", "hermes", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -t sysadm_t -b python3 f.py --readiness") == [
+        (["sudo", "-t", "sysadm_t", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -ubob python3 f.py --readiness") == [
+        (["sudo", "-ubob", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -gbin python3 f.py --readiness") == [
+        (["sudo", "-gbin", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness\necho done") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "done"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
         (["sudo", "python3", "f.py", "--readiness"], True),
     ]
@@ -8728,7 +8747,7 @@ def test_worker_commands_required_run_succeeded_flag():
     res_called = v.verify(5.0)
     assert res_called.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_called.reason
 
-    # Trajectory entry where the command is joined with trailing ||, ;, |, or &, preceded by || or !,
+    # Trajectory entry where the command is joined with trailing ||, ;, |, &, or newline, preceded by || or !,
     # or backgrounded with & is not credited even if exit_code is 0.
     for joined_cmd in [
         f"python3 {_SCRIPT_PATH} --readiness || true",
@@ -8736,6 +8755,7 @@ def test_worker_commands_required_run_succeeded_flag():
         f"python3 {_SCRIPT_PATH} --readiness ; echo done",
         f"python3 {_SCRIPT_PATH} --readiness 2>&1 | tee /tmp/log",
         f"python3 {_SCRIPT_PATH} --readiness > /tmp/out &",
+        f"python3 {_SCRIPT_PATH} --readiness\necho done",
         f"test -f /tmp/m.json || python3 {_SCRIPT_PATH} --readiness",
         f"! python3 {_SCRIPT_PATH} --readiness",
         f"python3 {_SCRIPT_PATH} --readiness && echo DONE &",
@@ -8745,7 +8765,23 @@ def test_worker_commands_required_run_succeeded_flag():
         ]
         transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
         res_joined = v.verify(5.0)
-        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a background &, or a command substitution) means that exit 0 is not the command's own" in res_joined.reason
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a following newline, a background &, or a command substitution) means that exit 0 is not the command's own" in res_joined.reason
+
+    # Trajectory entry whose arguments were clipped in the pod (falling back to head regex)
+    # is inconclusive under succeeded: true (error status, not pass).
+    raw_clipped_arg = '{"command": "python3 ' + _SCRIPT_PATH + ' --readiness > out.js ...[clipped 40 chars]'
+    traj_arg_clipped = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": raw_clipped_arg}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_arg_clipped, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_arg_clipped = v.verify(5.0)
+    assert res_arg_clipped.status == "error"
+    assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_arg_clipped.reason
+
+    # The same clipped head passes under succeeded: false as it always has.
+    v_succeeded_false = WorkerCommandsVerifier(type="worker_commands", required_runs=[WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=False)])
+    res_succeeded_false = v_succeeded_false.verify(5.0)
+    assert res_succeeded_false.status == "pass"
 
     # Trajectory entry where the command is followed by && chains, preceded by commands,
     # continued with newline after &&, preceded by || then &&, or wrapped in a lone assignment IS credited when the call exited 0.
