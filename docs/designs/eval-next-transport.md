@@ -719,7 +719,8 @@ mis-set on the today nightly or another postsubmit still stops the deploy before
 next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
 so the next-mode nightly on `main` appends under a `next` key that today's window never reads, and
-rung 6 on the inject lane compares only with that history. The today lane stays out of the
+rung 6 on the inject lane compares only with next-mode history at its own key (agent model
+included, so the presubmit, on another model than that nightly, has none yet). The today lane stays out of the
 recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`, but it grades
 a rolled-back install. The dashboard's Trend page keeps a series per mode, drawing today's; the
 next-mode nightly's Prow runs are not collected onto the dashboard's run pages yet.

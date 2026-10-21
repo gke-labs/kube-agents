@@ -897,8 +897,8 @@ precisely to avoid this.
 
 ## The version key
 
-A baseline is valid for exactly one combination of five versions. Three are read off the run
-itself, so they cannot go stale:
+A baseline is valid for exactly one combination of five versions and one `spec.mode`. Three of the
+five versions are read off the run itself, so they cannot go stale:
 
 | Component         | Read from                      | Covers                                       |
 | ----------------- | ------------------------------ | -------------------------------------------- |
@@ -1030,7 +1030,7 @@ match the presubmit's `EVAL_REPETITIONS`, on the grounds that "the baseline must
 the thing compared against it is measured." That is wrong as stated, and worth correcting because it
 would forfeit the whole gain above. The store holds a pass **rate**. A rate over ten runs and a rate
 over three estimate the same quantity, the second just more noisily. What has to match is how a
-single run is produced — same task, agent, judge, and five-version key — not how many were taken.
+single run is produced — same task, agent, judge, and version key — not how many were taken.
 More repetitions on the recording side is strictly better evidence.
 
 #### The job definition

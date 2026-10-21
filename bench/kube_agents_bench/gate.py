@@ -836,7 +836,7 @@ def _record_for_case(
     # line graded on half of them would sit beside it as if comparable.
     # Skip the case, saying so. At a next key it is the window's own shape:
     # every next-mode run, on main or on a pull request, goes through the
-    # same door with the same checks set aside, so the graded repetitions
+    # same door under the same set-aside rule, so the graded repetitions
     # are recorded and a whole set-aside one counts as neither pass nor fail.
     set_aside = sum(
         1

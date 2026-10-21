@@ -119,7 +119,11 @@ no `PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
 reads as the key's `next` mode, so its lines file under a key of their own and
 never reach today's window. At a `next` key a repetition graded with a check set
 aside as not applicable on the inject transport is recorded, because every
-next-mode run sets the same checks aside; at a `today` key the case is skipped.
+next-mode run, on `main` or on a pull request, is graded under the same set-aside
+rule; at a `today` key the case is skipped. The key includes the agent model, so
+the next-mode nightly's lines are a window only for a next-mode run at its model:
+the presubmit runs another, and its next window stays empty until a next-mode
+run on `main` records at the presubmit's model.
 
 A store that will not parse is an **error**, never an empty store. Empty means
 "nothing admitted, aggregate advisory", which is a green; a corrupt file

@@ -4010,8 +4010,9 @@ profile_begin "record + final gate"
 # A next-mode run on main does record. The next-mode nightly
 # (ci-kube-agents-eval-nightly-next-claude) is a periodic with no PULL_NUMBER,
 # and its matrix runs over the inject transport, which `bench-gate` reads as
-# the version key's `next` mode: its lines file under a key of their own and
-# fill the window the inject lane's rung 6 is compared with, never today's.
+# the version key's `next` mode: its lines file under a key of their own,
+# never today's, and are the window an inject-lane run at the same agent model
+# (setupId) is compared with.
 # (ci-kube-agents-eval-nightly-gitlab-next stays out on the GitLab condition
 # above.) Whether the job's identity may append is a grant in oss-test-infra
 # this script cannot see; without it the append fails, is logged, and the
