@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-The `AgentProfile` custom resource describes one kind of agent pod on the A2A bus: its persona and worker images, its topic grants, the ServiceAccount it runs as, and how long one task may run. It is part of the `spec.mode: next` stack. On a PlatformAgent running `today` an `AgentProfile` renders nothing.
+The `AgentProfile` custom resource describes one kind of agent pod on the A2A bus: its persona, worker and tools images, its topic grants, the ServiceAccount it runs as, and how long one task may run. It is part of the `spec.mode: next` stack. On a PlatformAgent running `today` an `AgentProfile` renders nothing.
 
 An `AgentProfile` is not a Hermes profile. The platform agent's own profiles (the platform and cluster templates it scaffolds under `$HERMES_HOME/profiles`) are unrelated and unchanged.
 
@@ -33,6 +33,10 @@ spec:
     image: registry.example.com/kube-agents/agent-worker:1.0
     model: model-default
     maxTurns: 50
+  tools: # optional
+    - name: jq # at most 24 characters
+      image: registry.example.com/kube-agents/tools-jq:1.7
+      # imagePullPolicy: IfNotPresent
   bus:
     publishTopics:
       - shared.annotations
@@ -47,6 +51,8 @@ spec:
     requests: { cpu: 250m, memory: 512Mi }
     limits: { cpu: "1", memory: 2Gi }
 ```
+
+The persona image and each tools image keep their content under a `/files` directory. The persona mounts read-only at `/persona`. Each tool mounts read-only at `/opt/tools/<name>`, and its `/opt/tools/<name>/bin` goes on `PATH` in list order, so put a tool's binaries in `/files/bin`. Where the cluster can't mount image volumes (GKE Autopilot, Kubernetes below 1.35), an init container copies `/files` into an emptyDir instead, so these images also need `/bin/sh`. A tools image holds no credentials: a tool that needs them gets them from the broker, per task.
 
 Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` or `agent.{agent}.{topic}`. Nothing else is accepted. A grant only works on a topic the install provisions, and the operator does not check that, so a grant on any other topic is refused by the bus at runtime. A profile may read any agent's topics, but the only agent-scoped topics it may publish are its own (`agent.<this profile's name>.{topic}`), because an agent's topics have one writer.
 

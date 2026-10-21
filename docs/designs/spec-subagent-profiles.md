@@ -132,11 +132,14 @@ spec:
   description: >-
     One-paragraph routing description.  Feeds the agent card and the roster.
   persona:
-    image: <registry>/kube-agents/persona-platform:2026.08 # SOUL.md, AGENTS.md, skills/
+    image: <registry>/kube-agents/persona-platform:2026.08 # /files: persona.yaml, instructions.md, skills/, mcp.yaml
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08 # headless-contract runner + adapter
     model: model-default # via LiteLLM, as today
     maxTurns: 250
+  tools: # each mounted read-only at /opt/tools/<name>, bin/ on PATH
+    - name: helm
+      image: <registry>/kube-agents/tools-helm:3.17 # /files/bin/helm
   bus:
     publishTopics:
       - agent.platform.upgrade-readiness
@@ -505,7 +508,7 @@ spec:
     lifecycle and acting on cluster agents' proposed fixes.
   persona:
     image: <registry>/kube-agents/persona-platform:2026.08
-    # SOUL.md, AGENTS.md, governance SOPs, the platform skills, persona config
+    # /files: persona.yaml, instructions.md (with the governance SOPs), the platform skills, mcp.yaml
     # (toolsets: mcp-platform_control, mcp-gke, mcp-developer_knowledge, memory read-only)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
@@ -568,7 +571,7 @@ spec:
     location: us-east1
   persona:
     image: <registry>/kube-agents/persona-cluster:2026.08
-    # SOUL.md, AGENTS.md, the gke-* debugging skills, persona config
+    # /files: persona.yaml, instructions.md, the gke-* debugging skills, mcp.yaml
     # (read-only gke MCP + developer_knowledge; platform_control deliberately absent)
   harness:
     image: <registry>/kube-agents/agent-worker:2026.08
