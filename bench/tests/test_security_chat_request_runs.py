@@ -240,7 +240,8 @@ def test_collector_run_with_gaps_errors_when_uncredited():
         assert not res.success
         assert res.status == "error"
         assert "the worker-trajectory capture was partial (card_2 unread session store)" in res.reason
-        assert "collect.py not seen in what was read" in res.reason
+        assert "the worker card log shows collect.py ran, but the worker trajectory did not capture the call" in res.reason
+        assert "not seen in what was read" not in res.reason
     finally:
         transcript.clear()
 

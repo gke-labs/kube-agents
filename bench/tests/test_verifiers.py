@@ -8807,6 +8807,44 @@ def test_worker_commands_succeeded_no_trajectory_with_conclusive_card_log_failur
     res = v.verify(5.0)
     assert res.status == "fail"
     assert "forbidden pattern(s) matched worker commands" in res.reason
+    assert "fleet_upgrade_report.py" in res.reason
+    assert "the worker card log shows fleet_upgrade_report.py --readiness ran, but the worker trajectory did not capture the call" in res.reason
+
+
+def test_worker_commands_succeeded_withheld_call_beside_readable_call_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # 1 readable sibling terminal call, 1 terminal call with withheld arguments ({})
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": "kubectl get nodes"},
+            "result": '{"output": "", "exit_code": 0}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {},
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": "kubectl get nodes"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the pod withheld a worker terminal call's arguments" in res.reason
+    assert "fleet_upgrade_report.py --readiness" in res.reason
 
 
 def test_worker_commands_after_result_partial_capture_preserves_missing_in_fail_reason():

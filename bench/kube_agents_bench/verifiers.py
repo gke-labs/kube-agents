@@ -2661,14 +2661,17 @@ class WorkerCommandsVerifier(BaseVerifier):
             windowed = typed
             traj_calls = calls
             no_traj_for_succeeded = False
+            total_code_entries = sum(1 for e in (snap.trajectory or ()) if isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS)
+            dropped = total_code_entries > len(traj_calls)
             if has_succeeded_runs and not traj_calls:
                 tagged = any(isinstance(e, dict) and e.get("agent") and e.get("name") not in _CODE_TOOLS for e in (snap.trajectory or ()))
-                dropped = any(isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS for e in (snap.trajectory or ()))
                 if not tagged or dropped:
                     no_traj_for_succeeded = True
         else:
             no_traj_for_succeeded = False
             calls = _worker_terminal_calls(snap.trajectory)
+            total_code_entries = sum(1 for e in (snap.trajectory or ()) if isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS)
+            dropped = total_code_entries > len(calls)
             if not calls:
                 # Tagged MCP calls beside an empty card log mean the worker typed nothing.
                 # No tagged entry at all, a card log that was not read or that shows commands
@@ -2765,6 +2768,9 @@ class WorkerCommandsVerifier(BaseVerifier):
                         # The card log carries the command, but the trajectory capture missed it.
                         # Discrepancy between capture sources: cannot verify exit code.
                         traj_missing.append(run)
+                    elif dropped:
+                        # The pod withheld arguments for a worker code-tool call: cannot verify exit code.
+                        traj_missing.append(run)
                     else:
                         unrun_missing.append(run)
 
@@ -2803,7 +2809,17 @@ class WorkerCommandsVerifier(BaseVerifier):
                         f"{named} ran but exited non-zero (or its exit was not recorded); "
                         f"a retry may sit in the unread part ({gaps_str})"
                     )
-                filtered_unseen = [r for r in [*unrun_missing, *traj_missing] if r.succeeded]
+                if traj_missing:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
+                    if any(any(_argv_runs(argv, run) for argv in argvs) for run in traj_missing):
+                        parts.append(
+                            f"the worker card log shows {named} ran, but the worker trajectory did not capture the call"
+                        )
+                    else:
+                        parts.append(
+                            f"the pod withheld a worker terminal call's arguments, so {named} could not be verified"
+                        )
+                filtered_unseen = [r for r in unrun_missing if r.succeeded]
                 if filtered_unseen:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in filtered_unseen)
                     parts.append(f"{named} not seen in what was read")
@@ -2816,6 +2832,16 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if unrun_failed_reported:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
                     parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                if traj_missing:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
+                    if any(any(_argv_runs(argv, run) for argv in argvs) for run in traj_missing):
+                        parts.append(
+                            f"the worker card log shows {named} ran, but the worker trajectory did not capture the call"
+                        )
+                    else:
+                        parts.append(
+                            f"the pod withheld a worker terminal call's arguments, so {named} could not be verified"
+                        )
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -2840,7 +2866,15 @@ class WorkerCommandsVerifier(BaseVerifier):
             gaps_str = "; ".join(snap.worker_capture_gaps or ())
             if self.after_result_pattern is not None:
                 unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
-                reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + window
+                unrun_parts = []
+                if unrun_failed:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                    unrun_parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                if unrun_missing:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
+                    unrun_parts.append(f"required run(s) {named} not seen in what was read")
+                unrun_extra = ("; " + "; ".join(unrun_parts)) if unrun_parts else ""
+                reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + unrun_extra + window
             else:
                 details = []
                 if unrun_failed:
@@ -2849,7 +2883,17 @@ class WorkerCommandsVerifier(BaseVerifier):
                         f"{named} ran but exited non-zero (or its exit was not recorded); "
                         f"a retry may sit in the unread part ({gaps_str})"
                     )
-                unseen_succeeded = [r for r in [*unrun_missing, *traj_missing] if r.succeeded]
+                if traj_missing:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
+                    if any(any(_argv_runs(argv, run) for argv in argvs) for run in traj_missing):
+                        details.append(
+                            f"the worker card log shows {named} ran, but the worker trajectory did not capture the call"
+                        )
+                    else:
+                        details.append(
+                            f"the pod withheld a worker terminal call's arguments, so {named} could not be verified"
+                        )
+                unseen_succeeded = [r for r in unrun_missing if r.succeeded]
                 if unseen_succeeded:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unseen_succeeded)
                     details.append(f"{named} not seen in what was read")
@@ -2869,10 +2913,16 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason = _NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON
             else:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
-                reason = (
-                    f"the worker card log shows {named} ran, but the worker trajectory did not "
-                    f"capture the call, so success could not be verified"
-                )
+                if any(any(_argv_runs(argv, run) for argv in argvs) for run in traj_missing):
+                    reason = (
+                        f"the worker card log shows {named} ran, but the worker trajectory did not "
+                        f"capture the call, so success could not be verified"
+                    )
+                else:
+                    reason = (
+                        f"the pod withheld a worker terminal call's arguments, so required run(s) "
+                        f"requiring success ({named}) could not be verified"
+                    )
             return VerificationResult(
                 success=False,
                 status="error",
