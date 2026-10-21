@@ -43,6 +43,50 @@ class TestDiscovery(unittest.TestCase):
             self.assertIn("- cluster-a: Read-only cluster diagnostics.", out)
             self.assertNotIn("default", out)
 
+    def test_a_cluster_agent_shows_the_cluster_it_targets(self):
+        # #3082: the assignee id is not a name to show a person, and the cluster
+        # name cannot be read back out of it. The scaffold's cluster_identity
+        # block (yaml.safe_dump, sort_keys=False) supplies it.
+        with TemporaryDirectory() as tmp:
+            name = "cluster-my-proj-ka-today-2-northamerica-northeast1"
+            base = self._with_profiles(tmp, ["platform", name])
+            (base / name / "CAPABILITIES.md").write_text("Read-only cluster diagnostics.")
+            (base / name / "config.yaml").write_text(
+                "model: x\ncluster_identity:\n  project: my-proj\n  cluster: ka-today-2\n"
+                "  location: northamerica-northeast1\ncontext_file_max_chars: 100000\n"
+            )
+            out = agent_roster.render()
+            self.assertIn(
+                f"- {name} (the ka-today-2 cluster agent; project my-proj, location northamerica-northeast1): "
+                "Read-only cluster diagnostics.",
+                out,
+            )
+
+    def test_the_identity_note_rides_each_name_in_a_shared_role(self):
+        with TemporaryDirectory() as tmp:
+            base = self._with_profiles(tmp, ["cluster-a", "cluster-b"])
+            for n, c in (("cluster-a", "alpha"), ("cluster-b", "beta")):
+                (base / n / "CAPABILITIES.md").write_text("Shared template.")
+                (base / n / "config.yaml").write_text(f"cluster_identity:\n  cluster: {c}\n")
+            out = agent_roster.render()
+            self.assertIn("  - cluster-a (the alpha cluster agent)\n", out)
+            self.assertIn("  - cluster-b (the beta cluster agent)\n", out)
+
+    def test_no_identity_no_note(self):
+        # No config.yaml, no block, an empty cluster, or the block ending before
+        # a cluster key: the line is as before.
+        with TemporaryDirectory() as tmp:
+            base = self._with_profiles(tmp, ["p1", "p2", "p3", "p4"])
+            (base / "p2" / "config.yaml").write_text("model: x\n")
+            (base / "p3" / "config.yaml").write_text("cluster_identity:\n  cluster: ''\n")
+            (base / "p4" / "config.yaml").write_text("cluster_identity:\n  project: x\nother: y\n  cluster: nope\n")
+            for n in ("p1", "p2", "p3", "p4"):
+                (base / n / "CAPABILITIES.md").write_text(f"role {n}")
+            out = agent_roster.render()
+            for n in ("p1", "p2", "p3", "p4"):
+                self.assertIn(f"- {n}: role {n}", out)
+            self.assertNotIn("cluster agent", out)
+
     def test_empty_when_no_specialists(self):
         with TemporaryDirectory() as tmp:
             self._with_profiles(tmp, ["default"])

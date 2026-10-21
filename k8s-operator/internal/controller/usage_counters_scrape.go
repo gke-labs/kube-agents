@@ -119,8 +119,10 @@ const (
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
-	// running. blocked and busy are refusals, and abandoned cannot say
-	// whether the command had started.
+	// running. toolInvocationsRefusedStatuses are the rest, the requests the
+	// broker turned away: blocked and busy are refusals, and abandoned cannot
+	// say whether the command had started. The two sets partition the
+	// broker's vocabulary, so the two counters together are every request.
 	toolInvocationsStatusLabel = "status"
 
 	// The kinds a failed scrape is logged as: a closed vocabulary, never a
@@ -143,16 +145,20 @@ const (
 	usageScrapeKindOther = "error"
 )
 
-var toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
+var (
+	toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
+	toolInvocationsRefusedStatuses = map[string]bool{"blocked": true, "busy": true, "abandoned": true}
+)
 
 // usageLabelFilter is, per label name, the values a metric must carry to be
 // summed into a counter; a nil filter sums every label set.
 type usageLabelFilter map[string]map[string]bool
 
 // usageSeriesFor is the family each counter is read from and the label values
-// summed: the broker's tool counter over its counted statuses, the proposals
-// counter over the one verb and status that is a proposal opened, the
-// watcher's injected counter over every label set.
+// summed: the broker's tool counter over its counted statuses, the same
+// counter over its refused statuses, the proposals counter over the one verb
+// and status that is a proposal opened, the watcher's injected counter over
+// every label set.
 func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 	switch counter {
 	case usageCounterEventsIngested:
@@ -170,6 +176,8 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return triageSessionsSeries, nil
 	case usageCounterSessionsChat:
 		return chatSessionsSeries, nil
+	case usageCounterToolExecutionsBlocked:
+		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsRefusedStatuses}
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}
@@ -334,20 +342,26 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	var start *float64
 	// wanted is every family the parser is asked to name in this body: each
 	// counter's, the start-time gauge, and the watcher's cluster gauge when
-	// the body is the watcher's.
+	// the body is the watcher's. A family feeds every counter that names it,
+	// each through its own filter: the broker's tool counter is read into
+	// two, over disjoint statuses.
 	var clusters *usageClusterGauges
-	counterOf := make(map[string]string, len(counters))
+	countersOf := make(map[string][]string, len(counters))
 	filters := make(map[string]usageLabelFilter, len(counters))
 	wanted := []string{processStartTimeSeries}
+	want := func(family, counter string) {
+		countersOf[family] = append(countersOf[family], counter)
+		if !slices.Contains(wanted, family) {
+			wanted = append(wanted, family)
+		}
+	}
 	for _, counter := range counters {
 		family, filter := usageSeriesFor(counter)
-		counterOf[family] = counter
 		filters[counter] = filter
 		sums[counter] = 0
-		wanted = append(wanted, family)
+		want(family, counter)
 		for _, sibling := range usageSiblingFamiliesFor(counter) {
-			counterOf[sibling] = counter
-			wanted = append(wanted, sibling)
+			want(sibling, counter)
 		}
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
@@ -418,11 +432,11 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 						}
 						continue
 					}
-					counter := counterOf[name]
-					if !usageLabelsMatch(metric, filters[counter]) {
-						continue
+					for _, counter := range countersOf[name] {
+						if usageLabelsMatch(metric, filters[counter]) {
+							sums[counter] += value
+						}
 					}
-					sums[counter] += value
 				}
 			}
 		}

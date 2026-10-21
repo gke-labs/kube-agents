@@ -2120,8 +2120,8 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal, SessionsTotal,
-// RemediationsProposedTotal, RemediationsMergedTotal,
+// update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
+// SessionsTotal, RemediationsProposedTotal, RemediationsMergedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
 // ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
@@ -2159,7 +2159,8 @@ type AgentUsageStatus struct {
 	// it rejected or failed on before running: its success and error outcomes.
 	// Read from the broker's kubeagents_tool_invocations_total every five
 	// minutes and kept monotonic the same way; commands refused by policy,
-	// busy and abandoned are not counted.
+	// busy and abandoned are not counted here but in
+	// ToolExecutionsBlockedTotal.
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
@@ -2214,6 +2215,22 @@ type AgentUsageStatus struct {
 	// +optional
 	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
 
+	// ToolExecutionsBlockedTotal is the cumulative count of requests the
+	// credential broker did not run to an exit: its blocked outcome
+	// (a policy refusal), its busy outcome (the broker's command slots or its
+	// child memory budget held the request for the whole wait) and its
+	// abandoned outcome (the caller hung up while the request was queued or
+	// running). Read from the same kubeagents_tool_invocations_total as
+	// ToolExecutionsTotal, over the other three statuses, every five minutes
+	// and kept monotonic the same way; the two together are every request the
+	// broker's exec route took as far as its policy; a request it
+	// rejected as malformed before that reaches neither. A rising share of this against
+	// ToolExecutionsTotal says the agent keeps asking for what its mode or
+	// policy refuses, or that the broker is saturated. Moves LastActiveTime:
+	// a refused command is still the agent at work.
+	// +optional
+	ToolExecutionsBlockedTotal int64 `json:"toolExecutionsBlockedTotal,omitempty"`
+
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
 	// Agent profiles the GKE API would describe, the management cluster
@@ -2257,8 +2274,9 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, a proposal was opened or merged, a chat
-	// message reached the gateway, or an event was accepted for triage.
+	// moved: a brokered command ran or was refused, a proposal was opened or
+	// merged, a chat message reached the gateway, or an event was accepted
+	// for triage.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

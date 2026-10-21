@@ -9811,13 +9811,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         decision = watcher_policy.evaluate_k8s(self.command, rest, query)
         if not decision.allowed:
             LOGGER.warning("watcher k8s blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            # A metav1.Status, which client-go decodes into a StatusError carrying
+            # this message verbatim; any other body it reports as a bare
+            # Forbidden. The drift detector's join forwards a record it could not
+            # read with that error as its lookup error, so the rule id is what
+            # tells the agent "a policy refused this kind" from an RBAC fault.
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": decision.rule_id,
-                    "message": decision.message,
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": f"SECURITY_POLICY_BLOCKED ({decision.rule_id}): {decision.message}",
+                    "reason": "Forbidden",
+                    "details": {"causes": [{"reason": "SECURITY_POLICY_BLOCKED", "message": decision.rule_id}]},
+                    "code": HTTPStatus.FORBIDDEN.value,
                 },
             )
             return

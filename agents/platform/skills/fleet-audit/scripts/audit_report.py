@@ -1073,6 +1073,17 @@ LEDGER_STAMP_FORMAT = "%Y-%m-%d %H:%M UTC"
 # `issue_title` makes. `refresh_coverage_ledger` rewrites only a ledger with
 # such a title, so it never rewrites a body that lists findings.
 COVERAGE_TITLE_RE = re.compile(r" — coverage incomplete \(\d+ gaps?, 0 findings\)$")
+# The renderer's own brackets around the one-line rows `_render_listed`
+# writes, which `parse_finding_locations` reads back with the full blocks.
+# Comments, like the held span's: `publishable_text` escapes `<!--` in every
+# model-written field, so no title or excerpt can spell one.
+LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
+LISTED_SECTION_END = "<!-- audit-listed:end -->"
+LISTED_LINE_RE = re.compile(
+    r"^- \*\*[a-z]+\*\* — (.*) — `([^`\n]*)`(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$",
+    re.M,
+)
 # How a finding's heading line starts (`_finding_identity_lines`); the marker
 # goes on the line after it.
 FINDING_HEADING = "#### "
@@ -1239,6 +1250,12 @@ BODY_BUDGET = 60_000
 # bounded to a slice of the budget: past this a fleet keeps its findings and
 # loses the complete list.
 ALL_FINDINGS_BLOCK_CAP = 12_000
+# Reads that block back: `_finish` uses it as the last run's filed ids when the
+# report store holds no document to say what the body cut.
+ALL_FINDINGS_RE = re.compile(r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M)
+# What an id costs the hidden delta block beyond its own length: its two
+# quotes and the comma joining it to the next.
+DELTA_SLOT_CHARS = 3
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 # Rows in the ledger's `## Declared intent` table: postures a check would have
@@ -2912,8 +2929,8 @@ def report_envelope(
     when it cannot carry them, so the next run's trust check fails by design
     instead of trusting a body that is not the one on GitHub.
 
-    `current_ids` is exactly what the body's hidden block lists: the rendered
-    findings plus the held ids. `document` is this run's validated document, whole rather than
+    `current_ids` is exactly what the body's hidden block lists: the findings
+    it names, in full or on one line, plus the held ids. `document` is this run's validated document, whole rather than
     clipped to the body's budget, with the body's redaction backstop applied
     to every string. Where the body was carried forward, `ledger_document` is
     the document that body rendered: `document`
@@ -7988,11 +8005,24 @@ def parse_finding_locations(body: str | None) -> dict[str, dict[str, str]]:
     a `NEW_MARKER` line when there is one — so a later run can ask whether it looked at that object again. Only
     the harness writes these lines, in one shape, so a block whose `Where:`
     line is missing or does not parse is left out rather than guessed at.
+
+    The rows a body listed on one line (`render_listed_finding`) are read too:
+    the ledger names them, so every reader of a previous body's findings — the
+    `carried` list `start` prints, the clean-close join, the collector hold —
+    sees one set.
     """
     body = normalise_newlines(body)
     if not body:
         return {}
-    out: dict[str, dict[str, str]] = {}
+    # A listed row counts only when the delta block names its id: that block
+    # is an HTML comment model text cannot write, while a fenced excerpt can
+    # spell a listed row.
+    # Less the held ids: a held id is never a listed row, and one carried by
+    # id alone has no `Where:` line to overwrite a forged one.
+    named = set(parse_delta_block(body)) - set(parse_held_ids(body))
+    out: dict[str, dict[str, str]] = {
+        fid: where for fid, where in _listed_locations(body).items() if fid in named
+    }
     markers = list(FINDING_MARKER_RE.finditer(body))
     for index, match in enumerate(markers):
         end = markers[index + 1].start() if index + 1 < len(markers) else len(body)
@@ -9942,8 +9972,8 @@ def _fair_share_order(ordered: list[dict]) -> list[dict]:
 
     This order gives each target its first row before any target gets a second
     row. When a band has fewer slots than targets, the targets late in the
-    alphabet still lose their rows; no target loses a row to another target's
-    second one. It is not a severity judgement. The bands stay apart, so a minor
+    alphabet still lose their full rows; no target loses a row to another
+    target's second one. It is not a severity judgement. The bands stay apart, so a minor
     finding never goes before a critical one. `ordered` must be the output of
     `sort_findings`: then the order is the same on each run.
     """
@@ -10002,28 +10032,238 @@ def select_rendered_findings(
     used = 0
     fitted = 0
     for finding in candidates:
-        fid = str(finding.get("id", ""))
-        # Charged against the *rendered* text, state line included: the state
-        # and PR link are per-finding, so estimating without them would
-        # under-count by a few thousand characters across a full body.
-        rendered = render_finding(
+        cost = _full_row_cost(
             finding,
-            state=(states or {}).get(fid),
-            pr_url=(pr_urls or {}).get(fid),
-            new=fid in (new_ids or set()),
+            states=states,
+            pr_urls=pr_urls,
+            new_ids=new_ids,
             noun=noun,
-            blocked_by=(blocked_by or {}).get(fid),
+            blocked_by=blocked_by,
             file_url=file_url,
             file_ref=file_ref,
             unlinked_paths=unlinked_paths,
         )
-        cost = len("\n".join(rendered)) + 2
-        cost += len(fid) + 3  # its slot in the hidden delta block
         if fitted and used + cost > budget:
             break
         used += cost
         fitted += 1
     return sort_findings(candidates[:fitted]), sort_findings(candidates[fitted:])
+
+
+def _full_row_cost(
+    finding: dict,
+    *,
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
+    new_ids: set[str] | None = None,
+    noun: str = DEFAULT_PROPOSAL_NOUN,
+    blocked_by: dict[str, dict] | None = None,
+    file_url: str | None = None,
+    file_ref: str = DEFAULT_FILE_REF,
+    unlinked_paths: set[str] | frozenset[str] = frozenset(),
+) -> int:
+    """What one finding's full block costs the body, its delta-block slot included."""
+    fid = str(finding.get("id", ""))
+    # Charged against the *rendered* text, state line included: the state
+    # and PR link are per-finding, so estimating without them would
+    # under-count by a few thousand characters across a full body.
+    rendered = render_finding(
+        finding,
+        state=(states or {}).get(fid),
+        pr_url=(pr_urls or {}).get(fid),
+        new=fid in (new_ids or set()),
+        noun=noun,
+        blocked_by=(blocked_by or {}).get(fid),
+        file_url=file_url,
+        file_ref=file_ref,
+        unlinked_paths=unlinked_paths,
+    )
+    return len("\n".join(rendered)) + 2 + len(fid) + DELTA_SLOT_CHARS
+
+
+def render_listed_finding(
+    finding: dict, *, state: str | None = None, pr_url: str | None = None
+) -> str:
+    """One line naming a finding the body has no room to show in full.
+
+    A bullet, never a `FINDING_HEADING`: the readers that recover a finding's
+    detail from its heading (`FINDING_MARKER_RE`, the Slack card) must not
+    take a listed one for a finding whose detail is on the ledger.
+
+    A state other than open, and its pull request, follow the id: the state
+    index covers full rows only, so a listed row is the one place a reader
+    finds them.
+    """
+    fid = str(finding.get("id", ""))
+    suffix = ""
+    if state and state != STATE_OPEN:
+        suffix = f" — {STATE_LABELS.get(state, state)}" + (f" — {pr_url}" if pr_url else "")
+    namespace = _ident(str(finding.get("namespace", "")))
+    where = f"`{_ident(str(finding.get('cluster', '')))}`"
+    where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
+    return (
+        f"- **{_cell(str(finding.get('severity', '')))}** — "
+        f"{_cell(str(finding.get('title', '')))} — {where} — "
+        f"`{_ident(str(finding.get('object', '')))}` (`{fid}`){suffix}"
+    )
+
+
+def _listed_header(count: int) -> list[str]:
+    return [
+        "",
+        f"### Listed without detail ({count})",
+        "",
+        "_These findings do not fit in full inside GitHub's body limit, so each "
+        "one is listed on one line, most severe first. Their evidence and "
+        "recommendations are kept in full in this run's stored report; ask the "
+        "agent for that report to read them._",
+        "",
+        LISTED_SECTION_BEGIN,
+    ]
+
+
+def _listed_locations(body: str) -> dict[str, dict[str, str]]:
+    """{finding id: {title, cluster, namespace, object}} for the listed rows of a body.
+
+    Read only between the renderer's brackets, each alone on its line, and
+    only when the body holds exactly one of each in order: any other shape is
+    not one this renderer writes, and it carries nothing.
+    """
+    begins: list[int] = []
+    ends: list[int] = []
+    offset = 0
+    for line in body.split("\n"):
+        stripped = line.strip()
+        if stripped == LISTED_SECTION_BEGIN:
+            begins.append(offset + len(line))
+        elif stripped == LISTED_SECTION_END:
+            ends.append(offset)
+        offset += len(line) + 1
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for title, cluster, namespace, obj, fid in LISTED_LINE_RE.findall(body[begins[0] : ends[0]]):
+        out[fid] = {
+            "title": title.strip(),
+            "cluster": cluster,
+            "namespace": namespace or "",
+            "object": obj,
+        }
+    return out
+
+
+def _render_listed(
+    listed: list[dict],
+    states: dict[str, str] | None = None,
+    pr_urls: dict[str, str] | None = None,
+) -> list[str]:
+    if not listed:
+        return []
+    return _listed_header(len(listed)) + [
+        render_listed_finding(
+            finding,
+            state=(states or {}).get(str(finding.get("id", ""))),
+            pr_url=(pr_urls or {}).get(str(finding.get("id", ""))),
+        )
+        for finding in sort_findings(listed)
+    ] + [LISTED_SECTION_END]
+
+
+def split_findings_for_body(
+    findings: list[dict], budget: int, **render_args
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split the findings into (shown in full, listed on one line, omitted).
+
+    Band by band, most severe first. In the band where the full blocks stop
+    fitting, a name outranks a full block: the band shows as many full blocks
+    as still leave room to name the rest of it and every finding below it,
+    and when even that cannot fit, only its floor of full blocks. The
+    critical band reserves room for its own names only, so a critical never
+    loses its evidence to a less severe finding's name. Every band below is
+    names only, as many as fit, and a count for the rest. The first finding is always shown in full,
+    as `select_rendered_findings` guarantees. A listed finding's id rides the
+    delta block like a full one's, so every reader of that block treats it
+    as on the ledger.
+    """
+    rendered, rest = select_rendered_findings(findings, budget, **render_args)
+    if not rest:
+        return rendered, [], []
+    order = _fair_share_order(sort_findings(findings))
+    # + 1 for the newline joining each line to the one before it, and the
+    # id's slot in the hidden delta block.
+    line_costs = [
+        len(
+            render_listed_finding(
+                finding,
+                state=(render_args.get("states") or {}).get(str(finding.get("id", ""))),
+                pr_url=(render_args.get("pr_urls") or {}).get(str(finding.get("id", ""))),
+            )
+        )
+        + 1
+        + len(str(finding.get("id", "")))
+        + DELTA_SLOT_CHARS
+        for finding in order
+    ]
+    # Charged once, at its widest, when the first finding is listed.
+    header = len("\n".join(_listed_header(len(order)))) + len("\n" + LISTED_SECTION_END)
+    full_rows: list[dict] = []
+    listed: list[dict] = []
+    omitted: list[dict] = []
+    left = budget
+    start = 0
+    while start < len(order):
+        end = start
+        while end < len(order) and _severity_band(order[end]) == _severity_band(order[start]):
+            end += 1
+        band = order[start:end]
+        lines = line_costs[start:end]
+        below = sum(line_costs[end:])
+        start = end
+        if listed or omitted:
+            for finding, cost in zip(band, lines):
+                if not omitted and cost <= left:
+                    listed.append(finding)
+                    left -= cost
+                else:
+                    omitted.append(finding)
+            continue
+        full = [_full_row_cost(finding, **render_args) for finding in band]
+        tail = [0] * (len(band) + 1)
+        for index in range(len(band) - 1, -1, -1):
+            tail[index] = tail[index + 1] + lines[index]
+        floor = 0 if full_rows else 1
+        # Room kept for naming every finding below this band, when that can
+        # fit at all.
+        critical = _severity_band(band[0]) == SEVERITY_RANK["critical"]
+        reserve = 0 if critical else below
+        # Below the critical band, a name outranks a full block whether or not
+        # every name fits: when they do not, this band keeps only its floor of
+        # full blocks and the rest of the budget names as many as it can.
+        names_first = not critical and sum(full[:floor]) + header + tail[floor] + below > left
+        if not names_first and sum(full) + (header + reserve if reserve else 0) <= left:
+            full_rows += band
+            left -= sum(full)
+            continue
+        fitted = floor
+        used = sum(full[:floor])
+        # A full block costs more than the line naming the same finding, so
+        # each extra full block raises the total and the first failure is final.
+        for index in range(floor, 0 if names_first else len(band)):
+            if used + full[index] + header + tail[index + 1] + reserve > left:
+                break
+            used += full[index]
+            fitted = index + 1
+        full_rows += band[:fitted]
+        # The header is paid by the first listed row; a band its floor of full
+        # blocks used up leaves it to the next band.
+        left -= used + (header if fitted < len(band) else 0)
+        for finding, cost in zip(band[fitted:], lines[fitted:]):
+            if not omitted and cost <= left:
+                listed.append(finding)
+                left -= cost
+            else:
+                omitted.append(finding)
+    return sort_findings(full_rows), sort_findings(listed), sort_findings(omitted)
 
 
 def _dry_run_repo(audit_id: str, repo: str | None) -> str | None:
@@ -10302,8 +10542,8 @@ def _render_findings(
     file_url: str | None = None,
     file_ref: str = DEFAULT_FILE_REF,
     unlinked_paths: set[str] | frozenset[str] = frozenset(),
-) -> tuple[list[str], list[dict]]:
-    """The findings section, plus the findings that did not fit the budget."""
+) -> tuple[list[str], list[dict], list[dict]]:
+    """The findings section, plus the findings it lists on one line and those it omits."""
     out = ["", "## Findings", ""]
     if not findings:
         # "Every audited cluster is compliant" is only true if the audit
@@ -10323,7 +10563,7 @@ def _render_findings(
             out.append(
                 "No findings. Every audited cluster is compliant with this audit."
             )
-        return out, []
+        return out, [], []
 
     states = states or {}
     pr_urls = pr_urls or {}
@@ -10335,7 +10575,7 @@ def _render_findings(
 
     new_ids = new_ids or set()
     blocked_by = blocked_by or {}
-    rendered, omitted = select_rendered_findings(
+    rendered, listed, omitted = split_findings_for_body(
         findings,
         budget,
         states=states,
@@ -10388,6 +10628,7 @@ def _render_findings(
                 unlinked_paths=unlinked_paths,
             )
 
+    out += _render_listed(listed, states, pr_urls)
     if omitted:
         out += [
             "",
@@ -10397,7 +10638,7 @@ def _render_findings(
             "least severe. They are kept in full in this run's stored report; ask "
             "the agent for that report to read them._",
         ]
-    return out, omitted
+    return out, listed, omitted
 
 
 def _render_footer(
@@ -10863,11 +11104,14 @@ class RenderedIssue(NamedTuple):
     body: str
     rendered_ids: list[str]
     omitted: list[dict]
+    # Named on one line each, without detail. Their ids are in `rendered_ids`
+    # too: the ledger names them, so the delta block carries them.
+    listed: list[dict] = []
 
     @property
     def partial(self) -> bool:
-        """True when the body could not carry every finding."""
-        return bool(self.omitted)
+        """True when the body could not carry every finding in full."""
+        return bool(self.omitted or self.listed)
 
 
 def _render_check_evidence(
@@ -11034,7 +11278,8 @@ def render_issue_body(
 
     Everything but the findings renders and is measured first; whatever is left
     of BODY_BUDGET is the findings budget. The hidden delta block carries the
-    ids the body actually **rendered**, not the full finding set — otherwise the
+    ids the body actually **names**, in full or on one line, not the full
+    finding set — otherwise the
     next run would read a truncated finding as resolved and announce a fix that
     never happened.
 
@@ -11101,7 +11346,7 @@ def render_issue_body(
         # part of any single finding's charged cost.
         overhead += index_overhead(findings, states, pr_urls)
 
-    def select(extra: int) -> tuple[list[str], list[dict]]:
+    def select(extra: int) -> tuple[list[str], list[dict], list[dict]]:
         return _render_findings(
             findings,
             max(BODY_BUDGET - overhead - extra, 0),
@@ -11116,9 +11361,13 @@ def render_issue_body(
             unlinked_paths=unlinked_paths,
         )
 
-    findings_lines, omitted = select(0)
+    findings_lines, listed, omitted = select(0)
+    # Only an omitted finding is missing from the delta block; with none, the
+    # complete list would repeat that block and cost full blocks for it.
     if omitted and all_block:
-        findings_lines, omitted = select(len("\n" + all_block))
+        findings_lines, listed, omitted = select(len("\n" + all_block))
+    # A listed finding is named on the ledger, so it joins the delta block
+    # like a full one; only an omitted finding stays out of it.
     omitted_ids = {str(f.get("id", "")) for f in omitted}
     rendered_ids = [fid for fid in finding_ids(findings) if fid not in omitted_ids]
 
@@ -11191,7 +11440,7 @@ def render_issue_body(
             "this is a harness bug, not a findings error — report it rather than "
             "trimming the audit"
         )
-    return RenderedIssue(body, rendered_ids, omitted)
+    return RenderedIssue(body, rendered_ids, omitted, listed)
 
 
 def _delta_order(ids: list[str], by_id: dict[str, dict]) -> list[str]:
@@ -11216,6 +11465,7 @@ def render_delta_comment(
     generated_at: datetime,
     *,
     omitted: int = 0,
+    listed: int = 0,
     gaps: list[str] | None = None,
     noun: str = DEFAULT_PROPOSAL_NOUN,
 ) -> str | None:
@@ -11227,6 +11477,8 @@ def render_delta_comment(
     unchanged ledger stays silence. Document-authored gaps are not passed
     here; the Scope table is where those have always been read.
     """
+    # Listed findings alone say nothing new: the body names them, and the
+    # delta counts them, so an unchanged ledger stays silent.
     if not new_ids and not resolved_ids and not omitted:
         return None
 
@@ -11272,6 +11524,13 @@ def render_delta_comment(
     out.append(
         "The ledger description has been rewritten to the current state of the fleet."
     )
+    if listed:
+        out += [
+            "",
+            f"**Coverage of this description is partial:** {listed} finding(s) did "
+            "not fit GitHub's body limit in full. The description lists each of them "
+            "on one line, without evidence.",
+        ]
     if omitted:
         # Said here because the delta is computed against what the body could
         # carry. Without this line, "0 resolved" on a partial body reads as a
@@ -16662,8 +16921,10 @@ def _handle_finish_dry_run(
     )
     if rendered.partial:
         log(
-            f"WARNING: {len(rendered.omitted)} finding(s) do not fit GitHub's body "
-            "limit and would be omitted from the description."
+            f"WARNING: {len(rendered.listed) + len(rendered.omitted)} finding(s) do "
+            "not fit GitHub's body limit in full: "
+            f"{len(rendered.listed)} would be listed on one line and "
+            f"{len(rendered.omitted)} omitted from the description."
         )
     print(rendered.body)
 
@@ -18609,9 +18870,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     title = issue_title(audit_id, findings)
     # Marked before rendering, because the marker is part of the body: the
     # findings the last run filed nowhere (`report_filed`) although it ran
-    # their check on their cluster. Narrower than `compute_delta`'s `new`,
-    # which joins against the rendered block alone and so counts a finding the
-    # last body cut for space, or one nobody looked for.
+    # their check on their cluster. Narrower than the delta's `new`, which
+    # counts one nobody looked for.
     # None, marking nothing, when that is not knowable: a first run (no ledger
     # to measure against, where everything would read as new), a lost or
     # seeded memory, or a block written under another identity scheme, where
@@ -18658,9 +18918,11 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     )
     if rendered.partial:
         log(
-            f"WARNING: {len(rendered.omitted)} finding(s) did not fit GitHub's body "
-            "limit and are omitted from the description; the title counts are still "
-            "the true totals."
+            f"WARNING: {len(rendered.listed) + len(rendered.omitted)} finding(s) did "
+            "not fit GitHub's body limit in full: "
+            f"{len(rendered.listed)} are listed on one line and "
+            f"{len(rendered.omitted)} omitted from the description; the title counts "
+            "are still the true totals."
         )
 
     # Now, and not before: `new` is measured against what this body rendered,
@@ -18671,6 +18933,21 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     new_ids, resolved_ids = compute_delta(
         previous_ids, rendered.rendered_ids, current_ids
     )
+    # A finding the last run filed is not new because this body names it and
+    # that one did not: a ledger that cut findings for space, and one written
+    # before cut findings were listed, would announce them all on the first
+    # run that has room.
+    if filed is not None:
+        new_ids = [fid for fid in new_ids if fid not in filed[0]]
+    else:
+        # A seeded memory has no document, but a body that cut findings named
+        # every one it filed in its complete block.
+        complete = ALL_FINDINGS_RE.findall(normalise_newlines(previous_body))
+        try:
+            cut = set(json.loads(complete[-1])) if complete else set()
+        except (json.JSONDecodeError, TypeError):
+            cut = set()
+        new_ids = [fid for fid in new_ids if fid not in cut]
     # Held back again for the collector, on the same principle as the coverage
     # rule one source further out: a candidate the collector still emits is the
     # condition still holding, whatever this run's document did or did not say
@@ -18876,6 +19153,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 previous_titles,
                 now,
                 omitted=len(rendered.omitted),
+                listed=len(rendered.listed),
                 gaps=collector_gaps,
                 noun=noun,
             )

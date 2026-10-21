@@ -465,10 +465,12 @@ litellm:
   # the built-in credential patterns plus the rules below over messages,
   # tool-call arguments, embeddings input and completion prompts before the
   # provider sees them.
-  # Request bodies only: responses, tool results on disk and chat egress are
-  # not covered. The concepts/inference-gateway page on the site owns the
-  # model, including why a pseudonymised identifier is one the agent can no
-  # longer act on.
+  # The same switch mounts this rule file into the agent pod, where the image
+  # applies the rules to what the agent writes to its volume: agent.log, the
+  # terminal-output cache, the worker transcript, state.db and the kanban
+  # board. Responses and chat egress are not covered. The
+  # concepts/inference-gateway page on the site owns the model, including why
+  # a pseudonymised identifier is one the agent can no longer act on.
   redaction:
     enabled: false
     # IPv4 and IPv6 literals. action: pseudonym replaces each with a stable

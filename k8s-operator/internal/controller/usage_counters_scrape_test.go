@@ -225,13 +225,20 @@ func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
 }
 
 // One broker body yields every counter the broker feeds: the tool invocations
-// summed over the counted statuses, the proposals opened, which is the
-// version-control counter under verb proposal-create and status success alone,
-// and the proposals merged, read whole.
+// summed over the counted statuses, the same series summed over the refused
+// statuses (blocked, busy and abandoned) into the blocked counter, the two
+// sums distinct so that an arm handed the wrong filter cannot pass, the
+// proposals opened, which is the version-control counter under verb
+// proposal-create and status success alone, and the proposals merged, read
+// whole.
 func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	body := strings.Join([]string{
 		"# TYPE kubeagents_tool_invocations_total counter",
 		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="success"} 4`,
+		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="error"} 2`,
+		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="delete",status="blocked"} 3`,
+		`kubeagents_tool_invocations_total{tool="kubectl",subcommand="get",status="busy"} 5`,
+		`kubeagents_tool_invocations_total{tool="gcloud",subcommand="container",status="abandoned"} 1`,
 		"# TYPE kubeagents_vcs_requests_total counter",
 		`kubeagents_vcs_requests_total{verb="proposal-create",status="success"} 3`,
 		`kubeagents_vcs_requests_total{verb="proposal-create",status="error"} 2`,
@@ -249,8 +256,8 @@ func TestPodUsageSource_CountsTheBrokersProposals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Samples[usageCounterToolExecutions] != 4 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 {
-		t.Fatalf("samples = %v, want 4 tool executions, 3 proposals and 2 merged", reading.Samples)
+	if reading.Samples[usageCounterToolExecutions] != 6 || reading.Samples[usageCounterToolExecutionsBlocked] != 9 || reading.Samples[usageCounterRemediationsProposed] != 3 || reading.Samples[usageCounterRemediationsMerged] != 2 {
+		t.Fatalf("samples = %v, want 6 tool executions, 9 refused, 3 proposals and 2 merged", reading.Samples)
 	}
 	if reading.StartTime == nil || *reading.StartTime != 1759400000.25 {
 		t.Errorf("start time = %v", reading.StartTime)

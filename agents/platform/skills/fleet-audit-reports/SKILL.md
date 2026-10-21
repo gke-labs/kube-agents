@@ -43,8 +43,8 @@ An envelope carries `audit_id`, `repo`, `finished_at`, `status`, `issue_number`,
 - `silent_floor` true means an earlier `finish` in the same run reported news or opened a pull
   request, so this run's
   `silent_ok` was kept `false` and its counts may be measured against that `finish`.
-- `current_ids` is exactly what the body's hidden block published: the findings the body rendered
-  plus the ids the collector held. Derive this run's full set from `document`.
+- `current_ids` is exactly what the body's hidden block published: the findings the body named, in
+  full or on one line, plus the ids the collector held. Derive this run's full set from `document`.
 - `inspect_s`, `publish_s` and `collect_s` are seconds: from `start` to `finish`, for `finish` to
   publish, and for the collector to run. An envelope has only the ones `finish` could measure.
   `show` gives them, with null for the others; `streams` does not carry them.
@@ -154,7 +154,8 @@ python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_qu
 python3 /opt/data/profiles/platform/skills/fleet-audit-reports/scripts/report_query.py checks obtainability-audit --cluster prod-us-east
 ```
 
-The ledger drops its least-severe findings, then its evidence table whole, to stay inside GitHub's
+The ledger names findings it has no room to show in full on one line each, as far as the room left
+after the criticals' full blocks allows, then drops the least-severe ones and its evidence table whole, to stay inside GitHub's
 body limit, and says so in a notice that points here. `findings` lists every finding the run
 carried. `checks` is one row per check the run says it performed, with the command that performed
 it, plus each `checks_not_applicable` exclusion and its reason; filter by cluster or check — a

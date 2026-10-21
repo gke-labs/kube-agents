@@ -211,6 +211,12 @@ KNOWN_UNREGISTERED = {
     "fleet-audit-chat-report-is-the-report": (
         "needs a chat platform, which no CI install has; run by hand on a chat install"
     ),
+    # Same constraint, one step further in: it grades a report falling back to the
+    # home channel after its thread refused it, so an install with no chat platform
+    # has neither the thread nor the channel and the case can only fail.
+    "notification-dead-thread-falls-back": (
+        "needs a chat platform, which no CI install has; run by hand on a chat install"
+    ),
     # It grades a GitHub forge declared at a GitHub Enterprise Server host,
     # which needs the GHES proxy (hack/ghes-proxy) and an install pointed at
     # it. No eval lane deploys either, so it runs by hand with the recipe in
@@ -441,7 +447,12 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # The parsed manifest's fields and selector are the assertion; `kind` alone
     # only names what to look for.
     "report_manifest": ("fields", "selects", "excludes"),
-    "ledger_issue_contains": ("required_phrases", "forbidden_phrases", "any_of_phrases"),
+    "ledger_issue_contains": (
+        "required_phrases",
+        "forbidden_phrases",
+        "any_of_phrases",
+        "every_finding_named",
+    ),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
@@ -495,6 +506,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),
+    # This repository, agent-pod-reading. No field: whether a report its thread
+    # refused still reached the home channel is the whole assertion, and the
+    # probe's planted thread is what makes the refusal certain.
+    "notification_fell_back_to_home": (),
     # This repository, agent-pod- and sandbox-reading. No field: whether every
     # post a fired audit run produced is the report its `finish` rendered is the
     # whole assertion.
