@@ -870,6 +870,7 @@ enforces both. The image's scheduler reads it ahead of the profile's `agent.max_
 open, so the patch drops out on the tag bump that carries it). The audits carry the budget
 their by-hand per-cluster fallback needs; the profile's own value bounds the kanban workers,
 which never need that much. Required rather than optional because an absent key silently
-runs the job under the worker budget, and Hermes reads 0, a negative number, a bool or a
-non-numeric string as unlimited. `merge_cron_store` carries it to existing installs like any
+runs the job under the worker budget. Hermes reads 0, a negative number, a bool or a
+non-numeric string as unlimited; the patch ignores such a roster value and the profile's stands,
+so an entry the image does not ship cannot lift a cron run past every budget. `merge_cron_store` carries it to existing installs like any
 image-owned key. Raise an entry's number when its SOP outgrows it; do not raise the profile's.

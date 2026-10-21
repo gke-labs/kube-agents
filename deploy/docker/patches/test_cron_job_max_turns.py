@@ -65,10 +65,16 @@ UNLIMITED = 10**9
 
 
 def _resolve_turn_limit(raw, default=UNLIMITED):
-    """The shape of hermes_cli.config.resolve_turn_limit: None -> default, str -> int."""
-    if raw is None:
+    """The shape of hermes_cli.config.resolve_turn_limit: None, a bool and an
+    unparseable string give the default; a number or numeric string parses;
+    zero and below are unlimited."""
+    if raw is None or isinstance(raw, bool):
         return default
-    return int(raw)
+    try:
+        n = int(float(str(raw).strip().lower()))
+    except ValueError:
+        return UNLIMITED if str(raw).strip().lower() in {"none", "unlimited", "inf"} else default
+    return UNLIMITED if n <= 0 else n
 
 
 class CronJobMaxTurnsTest(unittest.TestCase):
@@ -88,6 +94,7 @@ class CronJobMaxTurnsTest(unittest.TestCase):
         """The (patched or not) module text, run with stubs for what it imports and calls."""
         config = types.ModuleType("hermes_cli.config")
         config.resolve_turn_limit = _resolve_turn_limit
+        config.TURN_LIMIT_UNLIMITED = UNLIMITED
         modules = {"hermes_cli": types.ModuleType("hermes_cli"), "hermes_cli.config": config}
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -133,6 +140,20 @@ class CronJobMaxTurnsTest(unittest.TestCase):
         self.apply_quietly()
         setup = self.setup_for({}, {})
         self.assertEqual(setup.max_iterations, UNLIMITED)
+
+    def test_a_job_value_that_would_lift_the_cap_is_ignored(self):
+        # 0, a negative number, a bool and a non-numeric string all resolve to
+        # unlimited in Hermes; the profile's value stands instead.
+        self.apply_quietly()
+        helper = self.namespace()[HELPER_NAME]
+        for lifting in (0, -1, True, "unlimited", "abc"):
+            with self.subTest(value=lifting):
+                self.assertEqual(helper({"max_turns": lifting}, {"agent": {"max_turns": 90}}), 90)
+
+    def test_a_profile_with_no_budget_is_still_unlimited_when_the_job_names_none(self):
+        self.apply_quietly()
+        helper = self.namespace()[HELPER_NAME]
+        self.assertEqual(helper({"max_turns": 0}, {}), UNLIMITED)
 
     def test_the_helper_resolves_a_string_from_the_roster(self):
         self.apply_quietly()

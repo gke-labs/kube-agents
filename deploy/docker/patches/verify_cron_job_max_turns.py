@@ -9,6 +9,8 @@ resolves:
 - a job carrying ``max_turns`` runs under it, whatever the profile says;
 - a job without one keeps the profile's ``agent.max_turns``;
 - a roster value written as a string still resolves, as the profile's does;
+- a roster value Hermes would read as unlimited (0, negative, bool, a
+  non-numeric string) is ignored and the profile's value stands;
 - the setup path calls the helper, so the cap reaches ``AIAgent``.
 """
 
@@ -37,6 +39,9 @@ def main(root: Path) -> None:
         problems.append("a string max_turns on the job did not resolve")
     if resolve({"max_turns": None}, PROFILE) != PROFILE_CAP:
         problems.append("a null max_turns on the job did not fall back to the profile")
+    for lifting in (0, -1, True, "unlimited", "abc"):
+        if resolve({"max_turns": lifting}, PROFILE) != PROFILE_CAP:
+            problems.append(f"a job max_turns of {lifting!r} did not fall back to the profile; it would lift the cap")
     if "_resolve_cron_max_iterations(job, _cfg)" not in inspect.getsource(
         scheduler._resolve_cron_agent_setup
     ):
@@ -46,7 +51,7 @@ def main(root: Path) -> None:
         raise SystemExit("verify_cron_job_max_turns:\n" + "\n".join(problems))
     print(
         "verify_cron_job_max_turns: ok (job cap wins, profile cap is the fallback, "
-        "string and null job values handled, setup calls the helper)"
+        "string and null job values handled, lifting values ignored, setup calls the helper)"
     )
 
 

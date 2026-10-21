@@ -3326,7 +3326,9 @@ class WorkerBudgetVerifier(BaseVerifier):
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
     A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches.
+    short tool outputs never reaches; a result the pod withheld or never
+    recorded is unreadable, and with nothing named it is ``status="error"``
+    too.
     """
 
     type: Literal["worker_budget"]
@@ -3356,12 +3358,20 @@ class WorkerBudgetVerifier(BaseVerifier):
             if match:
                 named.append((str(row.get("task") or ""), int(match["used"]), int(match["cap"]), "exhausted"))
         calls: dict[str, int] = {}
+        # A result the pod withheld (its redactor failed to load) or never
+        # recorded could have carried the notice: with nothing named, that is
+        # an unreadable cap, not evidence of a larger one.
+        unreadable = 0
         for entry in snap.trajectory:
             if not entry.get("agent"):
                 continue
             task = str(entry.get("task") or "")
             calls[task] = calls.get(task, 0) + 1
-            match = _BUDGET_NOTICE_RE.search(str(entry.get("result") or ""))
+            result = entry.get("result")
+            if result is None or result == worker_trajectory.WITHHELD:
+                unreadable += 1
+                continue
+            match = _BUDGET_NOTICE_RE.search(str(result))
             if match:
                 named.append((task, int(match["used"]), int(match["cap"]), "checkpoint"))
         seen = ", ".join(f"{task}: {n} call(s)" for task, n in sorted(calls.items())) or "no worker calls captured"
@@ -3380,15 +3390,19 @@ class WorkerBudgetVerifier(BaseVerifier):
                         f"card, so the cap in force cannot be read (runs: {outcomes or ['no run rows']}; {seen})"
                     ),
                 )
-            if snap.worker_capture_gaps:
+            if snap.worker_capture_gaps or unreadable:
+                why = (
+                    "; ".join(snap.worker_capture_gaps)
+                    if snap.worker_capture_gaps
+                    else f"{unreadable} worker result(s) have no readable text (none recorded, or withheld in the pod)"
+                )
                 return VerificationResult(
                     success=False,
                     status="error",
                     elapsed_time=time.monotonic() - start,
                     reason=(
                         f"no delegated worker reached its turn-budget checkpoint or ran out (runs: {outcomes}; {seen}), "
-                        f"but the capture was incomplete, so this check could not be evaluated: "
-                        f"{'; '.join(snap.worker_capture_gaps)}"
+                        f"but the capture was incomplete, so this check could not be evaluated: {why}"
                     ),
                 )
             return VerificationResult(

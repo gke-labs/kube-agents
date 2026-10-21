@@ -1656,6 +1656,27 @@ def test_worker_budget_ignores_a_notice_another_session_quoted_in_a_search_resul
     assert "larger than 150" in res.reason
 
 
+def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
+    # The pod's redactor failed to load, so every result is the withheld marker:
+    # the notice may have been there. Nothing named plus a completed attempt is
+    # an error here, not "the cap was larger".
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 137
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert res.status == "error"
+    assert "withheld" in res.reason
+
+
+def test_worker_budget_withheld_results_do_not_mask_an_exhaustion_row():
+    from kube_agents_bench import worker_trajectory
+    worker = [{"name": "terminal", "args": {}, "result": worker_trajectory.WITHHELD, "agent": "platform", "task": "t_1"}] * 151
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out", "error": _exhausted(150, 150)}])
+    assert _budget(150).verify(5.0).success
+
+
 def test_worker_budget_reads_both_the_notice_and_the_exhaustion():
     _stash_runs([{"task": "t_1", "profile": "platform", "status": "timed_out", "outcome": "timed_out",
                   "error": _exhausted(150, 150)}], calls=151, notice=_notice(135, 150))

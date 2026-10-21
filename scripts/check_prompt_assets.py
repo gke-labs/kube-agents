@@ -16,7 +16,7 @@ it was told to open and carries on without it. The failure is a *worse* answer,
 not an error, so it does not page anyone -- it just makes the fleet report
 slightly less true, indefinitely.
 
-Six checks, all offline and standard library only:
+Seven checks, all offline and standard library only:
 
 ``asset-path``
     Every path reference in an instruction file resolves to a real file.
@@ -34,6 +34,9 @@ Six checks, all offline and standard library only:
 ``cron-risk``
     Every cron job declares a risk tier (``low`` or ``high``) the runtime
     approval gate can key its command policy off.
+``cron-max-turns``
+    Every model-run cron job declares a positive integer ``max_turns``, and
+    no ``no_agent`` job carries one.
 
 Scope is deliberately narrow, because a lint the team switches off protects
 nothing:
