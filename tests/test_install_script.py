@@ -2569,6 +2569,21 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("Managed OpenTelemetry Scope:", out)
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS", out)
 
+    def test_a_relative_install_env_is_made_absolute_against_the_operators_directory(self):
+        """Before any cd: a run with no checkout clones one and cds into it, and
+        every later read, write and printed command must still name the
+        operator's file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp).resolve() / "work"
+            work.mkdir()
+            (work / "prod.env").write_text("PROJECT_ID=p\n")
+            body = (f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}" >/dev/null 2>&1\n'
+                    'echo "FILE=$INSTALL_ENV_FILE"\n')
+            env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": "prod.env"})
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env,
+                                  cwd=str(work), stdin=subprocess.DEVNULL, timeout=_INSTALLER_RUN_TIMEOUT_SECONDS)
+        self.assertIn(f"FILE={work}/prod.env", proc.stdout, proc.stderr)
+
     def test_print_generate_only_handoff_names_the_chat_checklist_after_the_apply(self):
         """The handoff is the last thing this route prints, and no apply it
         describes sets up the chat app."""

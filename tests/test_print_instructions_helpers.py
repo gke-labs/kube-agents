@@ -482,18 +482,13 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         self.assertIn("print_instructions_gchat", printed)
 
     def test_the_commands_name_the_run_install_env_as_a_word_a_shell_reads_back(self):
-        # A backslash survives the paste, and a relative path is made absolute.
-        for env_file, expect in ((r"/srv/a\b c/install.env", r"/srv/a\\b\ c/install.env"),
-                                 ("rel/install.env", "/rel/install.env")):
-            with self.subTest(env_file=env_file):
-                out = self._commands(env_file)
-                line = next(l for l in out.splitlines() if "KUBE_AGENTS_INSTALL_ENV=" in l)
-                word = line.split("KUBE_AGENTS_INSTALL_ENV=", 1)[1].split(" bash ", 1)[0]
-                back = subprocess.run(["bash", "-c", f"printf %s {word}"], capture_output=True, text=True).stdout
-                if env_file.startswith("/"):
-                    self.assertEqual(back, env_file)
-                else:
-                    self.assertTrue(back.endswith(expect) and back.startswith("/"), back)
+        # A backslash and a space survive the paste.
+        env_file = r"/srv/a\b c/install.env"
+        out = self._commands(env_file)
+        line = next(l for l in out.splitlines() if "KUBE_AGENTS_INSTALL_ENV=" in l)
+        word = line.split("KUBE_AGENTS_INSTALL_ENV=", 1)[1].split(" bash ", 1)[0]
+        back = subprocess.run(["bash", "-c", f"printf %s {word}"], capture_output=True, text=True).stdout
+        self.assertEqual(back, env_file)
 
     def _commands(self, env_file):
         with tempfile.TemporaryDirectory() as tmp:

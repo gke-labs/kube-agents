@@ -275,6 +275,12 @@ INSTALL_ENV_FILE="${KUBE_AGENTS_INSTALL_ENV:-}"
 INSTALL_ENV_EXPLICIT="false"
 if [ -n "$INSTALL_ENV_FILE" ]; then
   INSTALL_ENV_EXPLICIT="true"
+  # Absolute now, while the directory is the operator's: a run with no
+  # checkout clones one and cds into it before anything reads or writes this.
+  case "$INSTALL_ENV_FILE" in
+    /*) ;;
+    *) INSTALL_ENV_FILE="$(pwd)/${INSTALL_ENV_FILE}" ;;
+  esac
 else
   _install_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
   # An install.env the operator actually put beside the script, or in the

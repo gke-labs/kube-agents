@@ -1350,20 +1350,16 @@ CHAT_SETUP_CHECKLIST_PRINTED="false"
 
 # The commands that print the chat setup checklist for each chat platform that
 # is on, one per line, for a reader to paste later. They name the run's
-# install.env as an absolute path, since it need not be the checkout's and the
-# paste need not happen in the directory the run started in.
+# install.env, which need not be the checkout's; the front door has made
+# INSTALL_ENV_FILE absolute.
 print_chat_checklist_commands() {
-  local printers env_file="${INSTALL_ENV_FILE:-}"
+  local printers
   printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  case "$env_file" in
-    /*) ;;
-    *) env_file="$(pwd)/${env_file}" ;;
-  esac
   if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
-    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "$env_file" "${printers}/print_instructions_gchat.sh"
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_gchat.sh"
   fi
   if is_truthy "${SLACK_ENABLED:-}"; then
-    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "$env_file" "${printers}/print_instructions_slack.sh"
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "${INSTALL_ENV_FILE:-}" "${printers}/print_instructions_slack.sh"
   fi
   return 0
 }
