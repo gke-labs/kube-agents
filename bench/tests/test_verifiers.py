@@ -8526,6 +8526,23 @@ def test_worker_commands_required_run_succeeded_flag():
     transcript.set("ok", traj_ok, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
     assert v.verify(5.0).status == "pass"
 
+    # Trajectory entry with status="completed", exit_code 0, but a clipped non-JSON result passes via entry["exit_code"].
+    clipped_result_zero = '{"exit_code": 0, "output": "' + "x" * 2000 + ' ...[clipped 1200 chars]'
+    traj_clipped_zero = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": clipped_result_zero, "exit_code": 0, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_clipped_zero, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    assert v.verify(5.0).status == "pass"
+
+    # Trajectory entry with status="completed", exit_code 1, and a clipped non-JSON result fails via entry["exit_code"].
+    clipped_result_nonzero = '{"exit_code": 1, "output": "' + "x" * 2000 + ' ...[clipped 1200 chars]'
+    traj_clipped_nonzero = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": clipped_result_nonzero, "exit_code": 1, "status": "completed", "at": 1.0}
+    ]
+    transcript.set("ok", traj_clipped_nonzero, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_clipped_nonzero = v.verify(5.0)
+    assert res_clipped_nonzero.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_clipped_nonzero.reason
+
     # Trajectory entry with status="completed" but unrecorded exit (plain text or non-zero) fails.
     traj_unrecorded = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": "started in background", "status": "completed", "at": 1.0}
