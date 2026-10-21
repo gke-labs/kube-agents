@@ -76,5 +76,26 @@ class DeleteRequestsRouteToTheDeletionSectionTest(unittest.TestCase):
         self.assertIn("submit-suggestion", description)
 
 
+
+class InstallGuidesAreReadNotSearchedTest(unittest.TestCase):
+    """The #2935 done-when e2e (2026-10-21) went 0/3: web_extract cannot fetch
+    on an install whose web backend is search-only, so the worker built
+    Agent Substrate from search snippets (a fork chart, Autopilot, no bucket
+    or IAM). The guide is read through tools that return its text, a search
+    result is never a source, and a workload's requirements beat a template
+    default."""
+
+    def test_gitops_helm_chart_reads_the_guide_through_tools_that_fetch(self):
+        content = HELM_CHART_SKILL.read_text(encoding="utf-8")
+        self.assertIn("mcp__developer_knowledge__search_documents", content)
+        self.assertIn("inspect-repository", content)
+        self.assertIn("A search result is never a source", content)
+        self.assertNotIn("read with `web_extract`", content)
+
+    def test_gke_cluster_creation_lets_the_workload_override_the_template(self):
+        content = (REPO_ROOT / "agents/platform/skills/gke-cluster-creation/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("a template default applies only where the workload", content)
+        self.assertIn("Search-result snippets are not requirements", content)
+
 if __name__ == "__main__":
     unittest.main()
