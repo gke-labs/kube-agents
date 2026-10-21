@@ -648,6 +648,8 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             # The collectors' scope guard reads it in the session; set on the
             # container alone it never reaches them (#2840's strict pass).
             "KUBEAGENTS_SCOPE_DECLARED",
+            # The audits' auto-promotion switch, read by audit_report.py in the session.
+            "KUBEAGENTS_AUDIT_AUTO_PROMOTE",
         }
         self.assertTrue(
             required.issubset(names),
@@ -660,6 +662,14 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
         self.assertIn('SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"', content)
         self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_SCOPE_DECLARED:-false\}" >"\$SANDBOX_SCOPE_DECLARED_FILE"')
         self.assertIn('chmod 0644 "$SANDBOX_SCOPE_DECLARED_FILE"', content)
+
+    def test_the_audit_auto_promote_switch_is_written_as_a_root_owned_file_too(self) -> None:
+        """audit_report.py reads this file before the forwarded variable, so a session
+        cannot turn the automatic remediation sweep back on by exporting one word."""
+        content = _ENTRYPOINT.read_text()
+        self.assertIn('SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"', content)
+        self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true\}" >"\$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"')
+        self.assertIn('chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"', content)
 
 
 if __name__ == "__main__":

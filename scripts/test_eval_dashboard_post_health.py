@@ -2402,7 +2402,7 @@ class WatchedPeriodics(RunHarness):
 # --------------------------------------------------------------------------- #
 
 FINDING = "iam/platform-gsa/missing/roles/serviceusage.serviceUsageConsumer"
-# The one finding a leased run passes with (the verifier's LEASE_SILENT_FINDINGS).
+# A finding a leased run passes with (one of the verifier's LEASE_SILENT_FINDINGS).
 SILENT_FINDING = "gke/host-otel-scope"
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"
 FINDING_REPAIR = 'gcloud projects add-iam-policy-binding {project} --member="serviceAccount:kubeagents-platform-gsa@{project}.iam.gserviceaccount.com" --role=roles/serviceusage.serviceUsageConsumer'

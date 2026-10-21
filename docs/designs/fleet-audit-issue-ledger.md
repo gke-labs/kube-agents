@@ -151,7 +151,8 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
-   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)).
+   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)), and
+5. the install's `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is not `false` (step 7 below).
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
@@ -312,7 +313,8 @@ Accepted risk: this can close a PR a human was mid-review on. Mitigations, all t
 - The closing comment states plainly that the PR may be reopened, and says **exactly** what happens
   if the finding returns: a manifest finding graded at or above the auto-promotion floor is normally
   re-proposed automatically on this same branch, at most five per run, and anything else is listed on the ledger as awaiting
-  `/remediate <finding-id>`. The comment is not allowed to promise a fresh pull request to every
+  `/remediate <finding-id>`; on an install whose `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is off, that nothing is
+  re-proposed without a `/remediate`. The comment is not allowed to promise a fresh pull request to every
   reader, because auto-promotion does not open one for every reader — and the findings it silently
   would not re-propose are precisely the low-severity ones nobody is watching for.
 - **The branch is not deleted on close.** Branches are cheap and any human fixup pushed to the branch
@@ -557,6 +559,10 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
    five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
    authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
+   An install turns the automatic half off with `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in
+   `spec.deployment.env` (the operator forwards it to the shell sandbox, whose entrypoint writes
+   it to a root-owned file the script reads first): the ledger then lists what the sweep would have
+   opened as awaiting `/remediate`, the only way a pull request opens there. The eval's inject lane runs that way.
 8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.

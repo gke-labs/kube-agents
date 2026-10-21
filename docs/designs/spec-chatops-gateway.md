@@ -378,6 +378,13 @@ judgment, like all model output, is never an authorization signal: the gateway's
 verification runs before dispatch exactly as before, and the `authority` block is stamped at
 ingress as before (advisory today; see "Requester identity on the bus").
 
+The gateway owns a second slash command, `/feedback` (added 10/19). Bare, it answers
+deterministically with the two places a kube-agents report goes, the issue tracker and the
+public feedback form, and starts no task; with text after it, the gateway passes the message
+through as typed, and the Planning Agent composes the report and asks for a yes before the
+platform worker files it through the credential broker. The command, the persona flow and the
+broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md).
+
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
 channel its turns arrive on, naming the addressee and the task text. The gateway is the only
@@ -1434,7 +1441,7 @@ space — the canonical example above. In a DM space, top-level messages share o
 `gchat:dm/spaces/AAA`, answered top-level, and a message typed inside an existing thread is
 a side thread, its own conversation `gchat:dm/spaces/AAA/threads/BBB`, answered in that
 thread. This is the main-flow and side-thread rule of the Hermes Google Chat adapter that
-default mode runs.
+`today` runs.
 Chat attaches a thread to every DM message, the one it auto-created for a top-level message
 included, so the thread name cannot tell them apart; Chat's `message.threadReply` flag does
 (true only for a reply in a thread, per the Chat API `Message` resource; measured: the

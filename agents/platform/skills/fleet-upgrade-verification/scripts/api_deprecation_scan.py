@@ -760,7 +760,8 @@ def build_readers(args, endpoint: str, content_mode: bool) -> list[tuple[str, Ca
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Kubernetes API removals between the fleet's current version and a target, read from GitOps manifests."
+        description="Kubernetes API removals between the fleet's current version and a target, read from GitOps manifests.",
+        allow_abbrev=False,
     )
     parser.add_argument("--target-version", help="Target GKE version, e.g. 1.27.3-gke.100 or 1.27. Defaults to the --versions file's target_version.")
     parser.add_argument("--versions", help="fleet_upgrade_report.py --output JSON; the floor is its lowest control-plane minor.")

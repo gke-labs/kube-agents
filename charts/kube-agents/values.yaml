@@ -665,8 +665,9 @@ platformAgent:
   enabled: true
   name: platform-agent
   # The PlatformAgent's spec.mode: which component stack the operator renders.
-  # "today" is the current architecture; "next" also renders the NATS bus and
-  # the A2A gateway, a development stack (docs/designs/spec-mode-switch.md).
+  # "next" puts the NATS bus and the A2A gateway in front of the agent, and is
+  # what a first install.sh install records; "today" is the previous stack,
+  # kept as a rollback (docs/designs/spec-mode-switch.md).
   # null, the default, leaves the field out of the CR, which the operator reads
   # as "today", so an install that never sets it renders the CR it always did.
   # Changing it on a running install is a mode switch, not a setting: the
@@ -777,6 +778,18 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The controller stall watch, the stall-watch cron job that alerts on
+    # controllers that stopped making progress. Empty omits the block and
+    # keeps the watch's defaults. A change rolls the agent pod. The
+    # annotation kubeagents.x-k8s.io/stall-watch: exempt on a namespace or an
+    # object works without any value here.
+    stallWatch: {}
+      # Namespaces never read, on every cluster, as exact names.
+      # excludeNamespaces: ["load-test", "payments-canary"]
+      # Hold a new alert until a stall has lasted this many minutes (0-1440).
+      # minStallAgeMinutes: 30
+      # Replaces the default kind list; ["all"] scans every namespaced kind.
+      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every
@@ -843,6 +856,12 @@ platformAgent:
       pullPolicy: Always
     availability:
       # Number of agent pods. `null` omits the field; the operator defaults to 1.
+      # The operator runs the gateway as a single replica: a value above 1 is
+      # rendered as 1 and the PlatformAgent's ReplicasLimited condition says so.
+      # High availability is not supported yet: a second replica's leader
+      # election has no in-cluster token, and the data volumes are
+      # ReadWriteOnce. The chart's quota preflight still multiplies by this
+      # value, so above 1 it over-counts the agent pod.
       replicas: null
       # RuntimeClass for the agent pod. "gvisor" asks for GKE Sandbox kernel
       # isolation, and is the default because the agent executes model-authored
@@ -883,6 +902,11 @@ platformAgent:
     #
     # Prefer telemetry.otlpEndpoint when you do have a collector; this is the
     # off switch, not the way to point at one.
+    #
+    # KUBEAGENTS_AUDIT_AUTO_PROMOTE: "false" stops the fleet audits from
+    # opening remediation pull requests on their own; a `/remediate` on a
+    # ledger still opens one. The operator forwards it to the shell sandbox,
+    # where the audits run.
     env: []
     # The daily alert ceilings, one per bucket: critical, warning, info and
     # drift. Each key that you set becomes ALERT_DAILY_LIMIT_<KEY> in

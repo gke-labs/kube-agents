@@ -239,7 +239,10 @@ before any role on it is confirmed), and a slot the runner did not reach returns
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's
-lead), `tool_called` (calls in the
+lead), `report_times_in_window` (every date and time on a report line one of its
+`label_patterns` regexes matches falls between the run's start and the check, each widened by
+`max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
+the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier

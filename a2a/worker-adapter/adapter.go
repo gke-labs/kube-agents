@@ -354,6 +354,50 @@ type adapter struct {
 	// harnessSession is the session id the harness reported at init, which
 	// the next task in a reused pod resumes (Config.SessionReuse).
 	harnessSession string
+	// harnessModel is the model the harness named at init, carried onto
+	// each turn's usage part.
+	harnessModel string
+	// costSeen is the last result line's total_cost_usd, and costKnown
+	// whether one has been read: the harness reports a running total for
+	// the process, so a turn's cost is the difference from the line before
+	// (turnCost). resumedSession says this process resumed an earlier
+	// session, whose spend the first line's total also carries.
+	costSeen       float64
+	costKnown      bool
+	resumedSession bool
+}
+
+// turnCostFrom is one result line's cost from the harness's running total,
+// and the baseline to keep once the line's part is published: the
+// difference from the baseline, or the total itself on the first line of a
+// fresh process. A resumed session's first line prices against the baseline
+// the previous run in this pod handed on (turnPlan); only a resumed session
+// with no baseline is unknown, since the harness restores the session's
+// spend into the total and nothing on the line says how much is this
+// turn's. A total that went down (a harness that reset it) is unknown and
+// rebases; a total below zero is unknown and leaves the baseline alone.
+func (a *adapter) turnCostFrom(total float64) (cost, seen float64, known bool) {
+	prev, had := a.costSeen, a.costKnown
+	switch {
+	case total < 0:
+		return 0, prev, had
+	case !had && a.resumedSession:
+		return 0, total, true
+	case !had:
+		return total, total, true
+	case total < prev:
+		return 0, total, true
+	}
+	return total - prev, total, true
+}
+
+// turnCost is turnCostFrom with the baseline advanced, for a line whose part
+// is published; publishUsage advances it only then, so a refused part does
+// not consume its turn's cost.
+func (a *adapter) turnCost(total float64) float64 {
+	cost, seen, known := a.turnCostFrom(total)
+	a.costSeen, a.costKnown = seen, known
+	return cost
 }
 
 // Run executes the adapter's whole lifecycle and returns the terminal state of
@@ -492,6 +536,11 @@ func newTaskAdapter(cfg Config, b *busConns) *adapter {
 type turnPlan struct {
 	primer string
 	resume string
+	// costSeen and costKnown are the harness's running total as the
+	// previous run in this pod last read it, so a resumed session's first
+	// result line prices its own turn rather than the whole session.
+	costSeen  float64
+	costKnown bool
 }
 
 // turnOutcome is one task's run, as the session loop needs it: the terminal
@@ -504,6 +553,10 @@ type turnOutcome struct {
 	// harnessSession is the session id the harness reported at init, or ""
 	// when it reported none (it never started, or died before saying).
 	harnessSession string
+	// costSeen and costKnown are the running total as this run last read
+	// it, handed to the next run's turnPlan.
+	costSeen  float64
+	costKnown bool
 	// task is the task this outcome is for, set by the session loop.
 	task string
 	// podBroken is a turn refused after working and before its harness ran,
@@ -513,8 +566,17 @@ type turnOutcome struct {
 	podBroken bool
 }
 
-// execute runs one task from its submission to its terminal state.
+// execute runs one task from its submission to its terminal state, seeded
+// with the cost baseline the previous run in this pod left and handing its
+// own on.
 func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq uint64, plan turnPlan) turnOutcome {
+	a.costSeen, a.costKnown = plan.costSeen, plan.costKnown
+	out := a.run(ctx, origin, originSeq, plan)
+	out.costSeen, out.costKnown = a.costSeen, a.costKnown
+	return out
+}
+
+func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint64, plan turnPlan) turnOutcome {
 	cfg, log := a.cfg, a.log
 	done := func(res Result, err error) turnOutcome { return turnOutcome{res: res, err: err} }
 	broken := func(res Result, err error) turnOutcome {
@@ -619,6 +681,7 @@ func (a *adapter) execute(ctx context.Context, origin *lib.Envelope, originSeq u
 		}
 	}
 	argv = withResume(argv, plan.resume)
+	a.resumedSession = plan.resume != ""
 	env := cfg.HarnessEnv
 	if delegate && cfg.SessionReuse {
 		// A reused pod runs every turn of its conversation, and two turns
@@ -736,12 +799,21 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			switch ev.Type {
 			case "system":
 				if ev.Subtype == "init" {
-					log.Info("harness session started", "harnessSession", ev.SessionID)
 					a.harnessSession = ev.SessionID
+					var dropped bool
+					a.harnessModel, dropped = ev.model()
+					log.Info("harness session started", "harnessSession", ev.SessionID, "model", a.harnessModel)
+					if dropped {
+						log.Warn("the init line's model is not a string; the usage parts carry no model", "task", a.taskID)
+					}
 				}
 			case "assistant":
 				a.publishAssistant(ctx, ev)
 			case "result":
+				// What the turn cost goes out first, whatever the turn
+				// decided: a delegating turn, a steered one and an errored
+				// one all read tokens.
+				a.publishUsage(ctx, ev)
 				if delegated {
 					log.Info("harness result after delegation ignored", "task", a.taskID)
 					continue
@@ -914,6 +986,39 @@ func (a *adapter) completeWith(resultText string) (Result, error) {
 	}
 	state := lib.StateCompleted
 	return Result{State: state}, a.finalize(state, "", "")
+}
+
+// publishUsage publishes one result line's cost as a part on the usage
+// artifact: the model from init, the prompt tokens as input, the wall time,
+// and this turn's share of the harness's running total (turnCost). A line
+// with no figure publishes nothing, so a reader sees absence rather than
+// zeroes. Best-effort, like the other stream telemetry: the deliverable and
+// the terminal are the load-bearing publishes.
+func (a *adapter) publishUsage(ctx context.Context, ev harnessEvent) {
+	t := ev.telemetry(a.harnessModel)
+	if len(t.dropped) > 0 {
+		// One line per result line: a harness that retyped a field would
+		// otherwise zero the figure install-wide with nothing to go on.
+		a.log.Warn("usage telemetry on the result line did not decode; those figures are not on the bus",
+			"task", a.taskID, "fields", t.dropped)
+	}
+	u := t.usage
+	seen, known := a.costSeen, a.costKnown
+	if t.hasTotal {
+		u.CostUsd, seen, known = a.turnCostFrom(t.total)
+	}
+	part, err := lib.UsagePart(u)
+	if err != nil {
+		if u != (lib.Usage{Model: u.Model}) {
+			// A figure was there and the part was refused: say so, and
+			// leave the baseline where it was, so the turn's cost lands
+			// in the next line's difference rather than nowhere.
+			a.log.Warn("usage part refused; the turn's figures are not on the bus", "task", a.taskID, "err", err)
+		}
+		return
+	}
+	a.costSeen, a.costKnown = seen, known
+	a.publishArtifactChunk(ctx, lib.ArtifactUsage, part, false)
 }
 
 // publishAssistant maps one assistant message's content blocks onto the

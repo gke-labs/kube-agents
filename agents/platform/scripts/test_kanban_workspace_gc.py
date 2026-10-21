@@ -758,5 +758,246 @@ class CronRunsTest(unittest.TestCase):
         self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
 
 
+class OverridesTest(unittest.TestCase):
+    """#3551: a worker's *_override copies of shipped trees are removed from every profile home."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profiles = Path(self.tmp.name) / "profiles"
+        self.home = self.profiles / "platform"
+        (self.home / "skills" / "fleet-audit").mkdir(parents=True)
+
+    def make_override(self, name, home=None):
+        path = (home or self.home) / name
+        (path / "fleet-audit" / "scripts").mkdir(parents=True)
+        (path / "fleet-audit" / "scripts" / "audit_report.py").write_text("print('patched')\n")
+        return path
+
+    def sweep(self, remote=None, fake=None):
+        sweep = gc.Sweep()
+        with patch.object(sandbox_exec, "run", side_effect=fake or (lambda *a, **k: None)):
+            gc.sweep_overrides(self.profiles, remote, sweep)
+        return sweep
+
+    def test_override_trees_go_and_shipped_trees_stay(self):
+        skills = self.make_override("skills_override")
+        scripts = self.make_override("scripts_override")
+        underscored = self.make_override("fleet_audit_override")
+        cluster = self.make_override("skills_override", self.profiles / "cluster-a")
+        sweep = self.sweep()
+        self.assertFalse(skills.exists())
+        self.assertFalse(scripts.exists())
+        self.assertFalse(underscored.exists())
+        self.assertFalse(cluster.exists())
+        self.assertTrue((self.home / "skills" / "fleet-audit").is_dir())
+        self.assertEqual(sweep.overrides_removed,
+                         ["cluster-a/skills_override", "platform/fleet_audit_override",
+                          "platform/scripts_override", "platform/skills_override"])
+        self.assertEqual(sweep.local_removed, [], "override trees are not reported as kanban workspaces")
+
+    def test_only_the_suffix_at_the_top_of_a_home_counts(self):
+        keep = [self.home / "override", self.home / "skills_overrides", self.home / "_override",
+                self.home / "scratch" / "skills_override"]
+        for path in keep:
+            path.mkdir(parents=True)
+        note = self.home / "notes_override"
+        note.write_text("a file, not a tree")
+        self.sweep()
+        for path in keep:
+            self.assertTrue(path.exists(), path)
+        self.assertTrue(note.exists(), "a plain file is left to the inventory")
+
+    def test_a_symlinked_override_is_unlinked_not_followed(self):
+        target = Path(self.tmp.name) / "precious"
+        (target / "keep").mkdir(parents=True)
+        (self.home / "scripts_override").symlink_to(target)
+        sweep = self.sweep()
+        self.assertFalse(os.path.lexists(self.home / "scripts_override"))
+        self.assertTrue((target / "keep").is_dir())
+        self.assertEqual(sweep.overrides_removed, ["platform/scripts_override"])
+
+    def test_a_symlinked_home_is_not_swept(self):
+        target = Path(self.tmp.name) / "elsewhere"
+        self.make_override("skills_override", target)
+        (self.profiles / "cluster-b").symlink_to(target)
+        sweep = self.sweep()
+        self.assertTrue((target / "skills_override").exists())
+        self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_an_empty_symlinked_home_says_nothing(self):
+        # Nothing to remove behind the link, so nothing for chat either.
+        target = Path(self.tmp.name) / "elsewhere"
+        target.mkdir()
+        (self.profiles / "cluster-b").symlink_to(target)
+        sweep = self.sweep()
+        self.assertEqual(sweep.warnings, [])
+
+    def test_a_home_the_sandbox_cannot_list_is_reported(self):
+        def fake(argv, **kwargs):
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 1, "", "find: Permission denied")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertTrue(any("exited 1" in w and "Permission denied" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_a_home_the_sandbox_has_not_received_says_nothing(self):
+        def fake(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, "", "/usr/bin/find: '/sandbox-root/profiles/platform': No such file or directory")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(sweep.warnings, [])
+
+    def test_a_vanished_entry_mid_listing_still_reports_and_sweeps(self):
+        rhome = Path("/sandbox-root") / "profiles" / "platform"
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 1, _find_output(("skills_override", "1", "4096", "d")),
+                                                   f"find: '{rhome}/tmp': No such file or directory")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(sweep.overrides_removed, ["sandbox platform/skills_override"])
+        self.assertTrue(any("exited 1" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_thousands_of_planted_trees_cost_one_extra_rm(self):
+        names = [f"x{i:05d}_override" for i in range(gc.INVENTORY_LIMIT + 500)]
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(*[(n, "1", "4096", "d") for n in names]), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(len([a for a in calls if a[0] == gc.REMOTE_RM]), gc.INVENTORY_LIMIT + 1)
+        self.assertEqual(len(sweep.overrides_removed), len(names))
+
+    def test_one_unremovable_tree_does_not_hide_the_others(self):
+        rhome = Path("/sandbox-root") / "profiles" / "platform"
+
+        def fake(argv, **kwargs):
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(
+                    ("scripts_override", "1", "4096", "d"), ("skills_override", "1", "4096", "d")), "")
+            if str(rhome / "skills_override") in argv:
+                return subprocess.CompletedProcess(argv, 1, "", "rm: cannot remove: Permission denied")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(sweep.overrides_removed, ["sandbox platform/scripts_override"])
+        self.assertTrue(any("Permission denied" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_a_down_sandbox_is_tried_once_across_both_sweeps(self):
+        runs = self.profiles.joinpath("platform", *gc.CRON_RUNS_PARTS)
+        runs.mkdir(parents=True)
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            raise sandbox_exec.SandboxUnavailable("no route to host")
+
+        sweep = gc.Sweep()
+        with patch.object(sandbox_exec, "run", side_effect=fake):
+            remote = gc.sweep_cron_runs(self.profiles, Path("/sandbox-root"), sweep)
+            remote = gc.sweep_overrides(self.profiles, remote, sweep)
+        self.assertIsNone(remote)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len([w for w in sweep.warnings if "did not answer" in w]), 1, sweep.warnings)
+
+    def test_the_sandbox_half_removes_overrides_only_under_a_real_home(self):
+        remote = Path("/sandbox-root")
+        rhome = remote / "profiles" / "platform"
+        calls = []
+        kinds = {"real": "d\nd\n", "linked": "d\nl\n"}
+        state = {"kinds": "real"}
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, kinds[state["kinds"]], "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(
+                    ("skills_override", "1", "4096", "d"),
+                    ("scripts_override", "1", "4096", "l"),
+                    ("notes_override", "1", "10", "f"),
+                    ("skills", "1", "4096", "d"),
+                    ("..", "1", "4096", "d")), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(remote, fake)
+        rms = [a for a in calls if a[0] == gc.REMOTE_RM]
+        self.assertEqual(rms, [[gc.REMOTE_RM, "-rf", "--", str(rhome / "scripts_override")],
+                               [gc.REMOTE_RM, "-rf", "--", str(rhome / "skills_override")]])
+        self.assertEqual(sweep.overrides_removed, ["sandbox platform/scripts_override", "sandbox platform/skills_override"])
+
+        calls.clear()
+        state["kinds"] = "linked"
+        sweep = self.sweep(remote, fake)
+        self.assertEqual([a for a in calls if a[0] == gc.REMOTE_RM], [])
+        self.assertTrue(any("symlink" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_an_unreachable_sandbox_is_tried_once(self):
+        (self.profiles / "cluster-a").mkdir()
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            raise sandbox_exec.SandboxUnavailable("no route to host")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len([w for w in sweep.warnings if "sandbox" in w]), 1, sweep.warnings)
+
+    def test_the_nightly_job_removes_and_logs_them(self):
+        override = self.make_override("skills_override")
+        import io
+        home = self.profiles.parent
+        hermes_cli = type(sys)("hermes_cli")
+        hermes_cli.kanban_db = type("K", (), {"list_boards": staticmethod(lambda: [])})
+        with patch.dict(sys.modules, {"hermes_cli": hermes_cli}), \
+             patch.dict("os.environ", {"PLATFORM_AGENT_HOME": str(home)}), \
+             patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(gc.main(), 0)
+        self.assertFalse(override.exists())
+        log = (home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn("removed 1 override trees: platform/skills_override", log)
+
+    def test_a_flood_of_overrides_is_logged_by_count_past_the_limit(self):
+        import io
+        home = self.profiles.parent
+        for i in range(gc.INVENTORY_LIMIT + 3):
+            (self.home / f"a{i:03d}_override").mkdir()
+        hermes_cli = type(sys)("hermes_cli")
+        hermes_cli.kanban_db = type("K", (), {"list_boards": staticmethod(lambda: [])})
+        with patch.dict(sys.modules, {"hermes_cli": hermes_cli}), \
+             patch.dict("os.environ", {"PLATFORM_AGENT_HOME": str(home)}), \
+             patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
+             patch("sys.stdout", new_callable=io.StringIO):
+            gc.main()
+        log = (home / gc.LOGS_DIR / gc.LOG_FILE_NAME).read_text(encoding="utf-8")
+        self.assertIn(" and 3 more", log)
+
+    def test_no_expected_home_entry_carries_the_suffix(self):
+        for profile in ("platform", "cluster-a", "other"):
+            for name in gc.expected_entries(profile):
+                self.assertIsNone(gc.OVERRIDE_NAME.fullmatch(name), (profile, name))
+
+    def test_a_trailing_newline_does_not_match(self):
+        self.assertIsNone(gc.OVERRIDE_NAME.fullmatch("skills_override\n"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

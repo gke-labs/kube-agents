@@ -628,6 +628,15 @@ Mutation(
         "project, and two clean runs later its profiles are retired",
     ),
     Mutation(
+        "C3-stall-watch-exclusion-unpinned",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    STALL_WATCH_EXCLUDE_NAMESPACES=\n", ""),
+        "test_C3_the_stall_watch_knobs_cannot_come_from_the_agents_env_file",
+        "drop the empty STALL_WATCH_EXCLUDE_NAMESPACES pin because the CR does not "
+        "set it -- one line in the agent-writable PVC .env then silences the stall "
+        "watch for a namespace nobody excluded",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
@@ -645,6 +654,36 @@ Mutation(
         "drop `watch` from the refused segments as a leftover of an older API -- "
         "the server still serves watch/secrets, and the named-GET rule reads it "
         "as an object called `secrets`",
+    ),
+    Mutation(
+        "C1-watcher-kind-list-widened",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("", "configmaps"),\n',
+         '        ("", "configmaps"),\n        ("", "nodes"),\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "add nodes to the watcher's kind table so drift on a node label is "
+        "enriched -- every fleet node, its addresses and taints, becomes "
+        "readable on the broker's credential for a kind no person edits",
+    ),
+    Mutation(
+        "C1-watcher-kind-group-ignored",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if (group, match.group("resource")) not in WATCHER_NAMED_READS:\n',
+         '    if match.group("resource") not in {r for _, r in WATCHER_NAMED_READS}:\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "match the table on the plural alone to save a parse -- any CRD that "
+        "names its plural `deployments` or `roles` is then read as if it were "
+        "the built-in kind",
+    ),
+    Mutation(
+        "C1-watcher-secrets-moved-into-the-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('REFUSED_RESOURCES = frozenset({"secrets"})\n',
+         'REFUSED_RESOURCES = frozenset()\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "drop the separate Secrets refusal as redundant now that the kind table "
+        "exists -- it is the only rule that refuses a Secret under a group the "
+        "table may one day list, and the import check leans on it",
     ),
     Mutation(
         "C1-watcher-subscription-unpinned",
@@ -1257,12 +1296,13 @@ Mutation(
     ),
     Mutation(
         "C5-leader-reaches-configmaps",
-        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
-        # rule renders only above one replica, and the HA fixture is the only
-        # golden that sets it.
+        # platformagent-ha.yaml: the fixture that asks for more than one
+        # replica. Since the operator caps the gateway at one replica (#3027),
+        # its leader Role renders the leases rule only, so the mutation widens
+        # that rule.
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
-        ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
-         "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
+        ("    resources:\n      - leases\n    verbs:\n",
+         "    resources:\n      - configmaps\n      - leases\n    verbs:\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",
         "add the ConfigMap lock client-go's configmapsleases mode still "
         "supports, which turns a coordination role into a namespace read-write "

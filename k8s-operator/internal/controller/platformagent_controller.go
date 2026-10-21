@@ -190,6 +190,26 @@ const (
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
 
+	// The condition reporting that spec.deployment.availability.replicas asks
+	// for more gateway replicas than supportedGatewayReplicas and the render
+	// runs fewer. Written only while the spec asks for more, on the
+	// EventWatcher pattern above, and carried by both status writers on the
+	// VolumesDropped terms below, because the cap happens at render as the
+	// hostPath strip does. The message says what the operator runs instead,
+	// both reasons a second replica does not start, and how to clear it,
+	// because the author of a CR the webhook never saw (the chart ships it
+	// off) finds out from `kubectl describe`.
+	replicasLimitedConditionType = "ReplicasLimited"
+	replicasLimitedReason        = "HighAvailabilityNotSupported"
+	// replicasLimitedMessageFormat takes the requested count.
+	replicasLimitedMessageFormat = "spec.deployment.availability.replicas is %d, and the operator runs the gateway at " +
+		"one replica at most: high availability is not supported yet. Above one replica the gateway's platform-agent " +
+		"container runs leader_elect.py, which needs an in-cluster ServiceAccount token that container deliberately " +
+		"does not have (the Pod sets automountServiceAccountToken: false), so it exits at startup. The data volumes " +
+		"an install creates at one replica are also ReadWriteOnce, so a replica scheduled on another node cannot " +
+		"attach them. Set replicas to 1, or remove it, to clear this condition. The multi-replica redesign is " +
+		"https://github.com/gke-labs/kube-agents/issues/3016."
+
 	// The condition reporting that the A2A gateway holds a chat backend with
 	// no home channel to post to. Under next the gateway, not the agent, makes
 	// the proactive posts (alerts, drift, scheduled reports), and it arms them
@@ -247,8 +267,10 @@ const (
 	// that is running, because the template is the whole of what this
 	// controller observes. reconcileWorkload server-side-applies it and
 	// returns once the API server has accepted it; nothing waits on the
-	// rollout. With spec.deployment.availability.replicas > 1 the strategy is
-	// RollingUpdate at maxUnavailable 1, so Pods from the revision before it --
+	// rollout. The gateway runs as one replica under Recreate today
+	// (supportedGatewayReplicas), which shrinks this window to the replacement;
+	// above one replica the strategy would be RollingUpdate at maxUnavailable 1,
+	// so Pods from the revision before it --
 	// on an operator rolled out over a CR a pre-fix render gave real hostPath
 	// mounts, Pods that really do mount them -- keep running until the roll
 	// finishes, and indefinitely if it stalls. "Left out of the agent Pod"
@@ -379,6 +401,12 @@ type PlatformAgentReconciler struct {
 	// the CR is deleted. Separate from the proxy's gate: the two containers'
 	// overrides change independently.
 	agentAPIAuthWarningsLogged sync.Map
+
+	// replicasLimitedLogged records, per CR, the spec generation whose replica
+	// cap reconcileWorkload last logged, so each generation logs it once
+	// rather than on every requeue. Keyed by ObjectKey, value int64; cleared
+	// when the CR is deleted.
+	replicasLimitedLogged sync.Map
 
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
@@ -1190,6 +1218,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.forgetUsageStatus(agent)
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -1234,8 +1263,9 @@ func (r *PlatformAgentReconciler) reconcileGatewayServiceAccount(ctx context.Con
 }
 
 func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	dataClaim := buildPVC(agent)
 	pvcs := []*corev1.PersistentVolumeClaim{
-		buildPVC(agent),
+		dataClaim,
 		buildSystemPVC(agent),
 	}
 	customPVCs, err := buildCustomPVCs(agent)
@@ -1248,6 +1278,11 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 			return err
 		}
 	}
+	// The data claim follows agentDataStorageSize on an existing install too.
+	// reconcilePersistentVolumeClaim is create-only, so without this a size
+	// raised to stop the volume filling would reach new installs only, and
+	// every install that already had the problem would keep it.
+	r.growDataClaim(ctx, client.ObjectKeyFromObject(dataClaim), dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
 	return nil
 }
 
@@ -1255,7 +1290,8 @@ func (r *PlatformAgentReconciler) reconcilePersistentVolumeClaim(ctx context.Con
 	if err := ctrl.SetControllerReference(agent, pvc, r.Scheme); err != nil {
 		return err
 	}
-	// PVCs are created once and never updated, so this labels new claims only;
+	// PVCs are created once and never updated here (growDataClaim widens the
+	// data claims' size and nothing else), so this labels new claims only;
 	// claims from before this change stay unlabelled until they are recreated.
 	withCommonLabels(pvc, agent)
 
@@ -2169,9 +2205,29 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	}
 	opts.heldGitHubOrg = held
 
+	// The replica cap is applied inside the render (resolveDeploymentReplicasAndStrategy);
+	// this only says so in the operator log, once per spec generation. The
+	// ReplicasLimited condition carries the same fact on the CR.
+	if gatewayReplicasCapped(agent.Spec.Deployment) {
+		renderedReplicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+		capKey := client.ObjectKeyFromObject(agent)
+		if logged, ok := r.replicasLimitedLogged.Load(capKey); !ok || logged.(int64) != agent.Generation {
+			logf.FromContext(ctx).Info("spec.deployment.availability.replicas is above the supported gateway replica count; rendering the gateway at one replica at most",
+				"name", agent.Name, "namespace", agent.Namespace,
+				"requestedReplicas", requestedGatewayReplicas(agent.Spec.Deployment),
+				"renderedReplicas", renderedReplicas,
+				"tracking", "https://github.com/gke-labs/kube-agents/issues/3016")
+			r.replicasLimitedLogged.Store(capKey, agent.Generation)
+		}
+	} else {
+		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
+	}
+
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
-	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
+	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update,
+	// with one exception: the operator upgrade that introduced supportedGatewayReplicas moves a
+	// StatefulSet gateway (replicas > 1 over RWO storage) to the Deployment on its first pass.
 	// A refused spec.deployment.agentAPIAuth.resources renders the sidecar at the
 	// operator's defaults rather than withholding the gateway, so the rest of the
 	// Pod keeps flowing and updateStatusReady reports the refusal as Degraded.
@@ -2405,45 +2461,81 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 // growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
 //
 // A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
-// install from before agentDataStorageSize keeps the 5Gi it was given however the
-// template changes — and that claim is the destination sandbox_mirror.py copies
-// the agent's working directories into. Expansion is online; the volume stays
-// mounted and the shell keeps running.
+// install from before the current agentDataStorageSize keeps the size it was
+// given however the template changes — and that claim is the destination
+// sandbox_mirror.py copies the agent's working directories into. The mirror
+// already refuses to fill the volume it is given, so a claim this could not
+// grow means a bounded migration, not a broken one.
+func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	// The StatefulSet's template creates this claim, so no controller reference
+	// points at it; nothing else makes a claim of this name.
+	key := client.ObjectKey{Name: shellSandboxDataClaimName(agent), Namespace: agent.Namespace}
+	r.growDataClaim(ctx, key, resource.MustParse(agentDataStorageSize), nil)
+}
+
+// growDataClaim widens an existing claim to `want`. A claim that is absent is
+// a first install, where whatever creates it sizes it; a claim at or above
+// `want` is left alone, so a size an administrator raised by hand is never
+// undone. With a non-nil owner, a claim the owner does not control is left
+// alone too: reconcilePersistentVolumeClaim adopts a claim of the right name
+// whoever made it, and one an administrator made by hand, smaller on purpose,
+// stays theirs to size. Expansion is online; the volume stays mounted and its
+// pod keeps running.
 //
 // Best-effort and logged rather than returned. A StorageClass without
 // allowVolumeExpansion is how an administrator configured the cluster, and
 // failing the reconcile over it would take the whole agent down to fix a volume
-// that is merely smaller than we would like. The mirror already refuses to fill
-// the volume it is given, so the consequence is a bounded migration, not a broken
-// one.
-func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+// that is merely smaller than we would like.
+func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.ObjectKey, want resource.Quantity, owner metav1.Object) {
 	log := logf.FromContext(ctx)
-	want := resource.MustParse(agentDataStorageSize)
 
-	name := shellSandboxDataClaimName(agent)
 	pvc := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agent.Namespace}, pvc); err != nil {
-		// Not created yet on a first install: the template sizes it correctly.
+	if err := r.Get(ctx, key, pvc); err != nil {
 		if client.IgnoreNotFound(err) != nil {
-			log.Error(err, "could not read the sandbox data claim", "claim", name)
+			log.Error(err, "could not read the data claim", "claim", key.Name)
 		}
+		return
+	}
+	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
+		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
 		return
 	}
 
 	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if have.Cmp(want) >= 0 {
+		// The spec asks for enough. Whether the volume has it is a different
+		// question: the API server admits a resize on the StorageClass alone, and
+		// a failure after that (the project's disk quota, say) leaves the spec at
+		// the new size and status.capacity at the old one, with the reason on the
+		// claim's events rather than on any error this function would see.
+		if capacity, ok := pvc.Status.Capacity[corev1.ResourceStorage]; ok && capacity.Cmp(want) < 0 {
+			log.Info("the data claim's resize has not landed; the claim's events and status.capacity say why",
+				"claim", key.Name, "spec", have.String(), "capacity", capacity.String())
+		}
 		return
 	}
 
 	patched := pvc.DeepCopy()
 	patched.Spec.Resources.Requests[corev1.ResourceStorage] = want
 	if err := r.Patch(ctx, patched, client.MergeFrom(pvc)); err != nil {
-		log.Error(err, "could not grow the sandbox data claim; migration into it stays bounded by the space that is there",
-			"claim", name, "have", have.String(), "want", want.String())
+		// An admission refusal repeats identically on every reconcile until
+		// someone changes the cluster: a StorageClass without
+		// allowVolumeExpansion or a namespace quota (Forbidden), or a claim not
+		// yet bound (Invalid), which binds and then takes the next pass. State,
+		// not an error of ours; Info with the API's reason, so the line that
+		// recurs every quarter hour is not an Error with a stack trace.
+		if errors.IsForbidden(err) || errors.IsInvalid(err) {
+			log.Info("the API server refused the data claim's growth; the StorageClass, a namespace storage quota, or a claim not yet bound decides this",
+				"claim", key.Name, "have", have.String(), "want", want.String(), "reason", err.Error())
+			return
+		}
+		log.Error(err, "could not grow the data claim",
+			"claim", key.Name, "have", have.String(), "want", want.String())
 		return
 	}
-	log.Info("grew the sandbox data claim to match the agent's",
-		"claim", name, "from", have.String(), "to", want.String())
+	// Acceptance, not growth: the resize itself is the CSI driver's, and it lands
+	// when status.capacity follows the spec.
+	log.Info("requested growth of the data claim", "claim", key.Name, "from", have.String(), "to", want.String())
 }
 
 // applyShellSandboxStatefulSet applies the StatefulSet, recreating it when the
@@ -3990,6 +4082,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	hostPathDroppedMsg := hostPathDroppedMessage(agent, workloadRollIncomplete)
 	hostPathDroppedUnchanged := hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
 
+	// The replica cap, the same class: present while the spec asks for more
+	// gateway replicas than the render runs, absent otherwise, and compared on
+	// its message so a changed count is one write.
+	replicasLimitedMsg := replicasLimitedMessage(agent)
+	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
+
 	// The home-channel advisory, from the spec alone, compared on its message
 	// for the same reason EventWatcher's is.
 	homeChannelUnsetMsg := homeChannelUnsetMessage(agent)
@@ -4057,6 +4155,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
 		hostPathDroppedUnchanged &&
+		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
 		a2aVerifierUnchanged &&
@@ -4131,6 +4230,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 
 	setA2AGatewayCondition(agent, a2aGatewayDark, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
@@ -4270,6 +4370,45 @@ func setHostPathDroppedCondition(agent *agentv1alpha1.PlatformAgent, msg string,
 		Type:               hostPathDroppedConditionType,
 		Status:             metav1.ConditionTrue,
 		Reason:             hostPathDroppedReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// replicasLimitedMessage is the ReplicasLimited condition's message, or ""
+// when the spec asks for no more gateway replicas than the render runs and the
+// condition is to be absent.
+func replicasLimitedMessage(agent *agentv1alpha1.PlatformAgent) string {
+	if !gatewayReplicasCapped(agent.Spec.Deployment) {
+		return ""
+	}
+	return fmt.Sprintf(replicasLimitedMessageFormat, requestedGatewayReplicas(agent.Spec.Deployment))
+}
+
+// replicasLimitedConditionCurrent reports whether the ReplicasLimited
+// condition on the CR already says msg, where "" means absent. Both status
+// writers gate their write on it, as they do on hostPathDroppedConditionCurrent.
+func replicasLimitedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, replicasLimitedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == replicasLimitedReason && existing.Message == msg
+}
+
+// setReplicasLimitedCondition writes the ReplicasLimited condition, or
+// removes it when msg is "". The caller does the API write.
+func setReplicasLimitedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, replicasLimitedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               replicasLimitedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             replicasLimitedReason,
 		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -4868,8 +5007,8 @@ const (
 // degradedStatusCurrent reports whether the given PlatformAgent's status matches
 // what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
-// VolumesDropped condition.
-func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg string) bool {
+// VolumesDropped and ReplicasLimited conditions.
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg string) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||
 		agent.Status.Phase != "Degraded" ||
@@ -4882,7 +5021,8 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 	if !rendered {
 		return true
 	}
-	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg)
+	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) &&
+		replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
 }
 
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
@@ -4952,14 +5092,20 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		}
 		hostPathDroppedMsg = hostPathDroppedMessage(agent, oldPods)
 	}
-	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg) {
+	// ReplicasLimited rides along on the same terms as VolumesDropped: the cap
+	// happens at render, so only a pass that rendered writes or clears it.
+	replicasLimitedMsg := ""
+	if rendered {
+		replicasLimitedMsg = replicasLimitedMessage(agent)
+	}
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg) {
 		return nil
 	}
 
 	// If the cached agent missed the status condition due to watch event lag,
 	// check the live object before attempting an Update that would conflict (409).
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
-		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg)
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg)
 	}) {
 		return nil
 	}
@@ -4980,6 +5126,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
 	if rendered {
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
+		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 	}
 	return r.Status().Update(ctx, agent)
 }

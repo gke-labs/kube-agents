@@ -29,12 +29,14 @@ the teardown keeps, tell the operator that the Secrets stay, and give the comman
 leaves" on the site's uninstall page (`docs/site/src/content/docs/install/uninstall.md`), or tell
 the operator to delete the namespace. That command sources
 the install's `install.env` in a subshell, the same way the installer reads it, so renamed Secrets
-or a non-default namespace are found. Then tell the operator to revoke the token in GitLab.
+or a non-default namespace are found. Then tell the operator to revoke the token in GitLab, and the read-only token too, if the operator
+made one.
 
 The installer finds `install.env` in this order: `KUBE_AGENTS_INSTALL_ENV`, beside `install.sh`,
 in the current directory, then the source directory (`$HOME/kube-agents` under `curl … | bash`).
 
-Also tell the operator to revoke the token in GitLab.
+Also tell the operator to revoke the token in GitLab, and the read-only token too, if the operator
+made one.
 
 The engine is `lifecycle.sh destroy` in `terraform/examples/full-install`, run against the
 install's Terraform state in GCS (bucket `<project>-kube-agents-tfstate`, prefix

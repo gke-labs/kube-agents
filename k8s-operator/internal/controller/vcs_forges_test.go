@@ -103,8 +103,9 @@ func TestAGitLabForgeReachesTheBrokerAndOnlyTheBroker(t *testing.T) {
 	want := []map[string]any{
 		{"provider": "github", "host": "github.com"},
 		{"provider": "gitlab", "host": "gitlab.com",
-			"tokenPath":    forgeCredentialsDir + "/gitlab/token",
-			"allowedPaths": []any{"acme", "platform"}},
+			"tokenPath":     forgeCredentialsDir + "/gitlab/token",
+			"readTokenPath": forgeCredentialsDir + "/gitlab/read-token",
+			"allowedPaths":  []any{"acme", "platform"}},
 	}
 	if !reflect.DeepEqual(document.Forges, want) {
 		t.Errorf("forges = %v, expected %v", document.Forges, want)
@@ -118,7 +119,9 @@ func TestAGitLabForgeReachesTheBrokerAndOnlyTheBroker(t *testing.T) {
 	if value, _ := brokerEnvValue(container.Env, vcsForgesEnv); value != vcsForgesMountPath {
 		t.Errorf("%s = %q, expected %q", vcsForgesEnv, value, vcsForgesMountPath)
 	}
-	for _, path := range []string{vcsForgesMountPath, forgeCredentialsDir + "/gitlab/token"} {
+	for _, path := range []string{
+		vcsForgesMountPath, forgeCredentialsDir + "/gitlab/token", forgeCredentialsDir + "/gitlab/read-token",
+	} {
 		mount := mountCovering(&container, path)
 		if mount == nil {
 			t.Errorf("%s is supplied by no mount in the broker container", path)
@@ -137,8 +140,15 @@ func TestAGitLabForgeReachesTheBrokerAndOnlyTheBroker(t *testing.T) {
 	if secret == nil {
 		t.Fatal("the broker pod does not project the forge's Secret")
 	}
-	if len(secret.Items) != 1 || secret.Items[0].Key != "token" || secret.Optional == nil || !*secret.Optional {
-		t.Errorf("the Secret projection is %+v; expected only the token key, optional", secret)
+	// The token and the read-only token, each under its own name, and nothing
+	// else. Optional, so a Secret without the read-only token still starts
+	// the pod: kubelet skips a missing key of an optional Secret.
+	wantItems := []corev1.KeyToPath{{Key: "token", Path: "token"}, {Key: "read-token", Path: "read-token"}}
+	if !reflect.DeepEqual(secret.Items, wantItems) || secret.Optional == nil || !*secret.Optional {
+		t.Errorf("the Secret projection is %+v; expected only the token and read-token keys, optional", secret)
+	}
+	if secret.DefaultMode == nil || *secret.DefaultMode != 0o400 {
+		t.Errorf("the Secret projection mode is %v, expected 0400", secret.DefaultMode)
 	}
 
 	// And nothing else holds the Secret: not the gateway pod, not the sandbox.

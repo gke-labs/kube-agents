@@ -323,7 +323,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
+      storage: 50Gi
 status: {}
 ---
 apiVersion: v1
@@ -401,6 +401,9 @@ data:
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
+    STALL_WATCH_EXCLUDE_NAMESPACES=
+    STALL_WATCH_MIN_AGE_MINUTES=
+    STALL_WATCH_KINDS=
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
     GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
@@ -874,7 +877,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 10Gi
+            storage: 50Gi
       status: {}
     - metadata:
         name: sshd

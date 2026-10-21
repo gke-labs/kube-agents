@@ -15,7 +15,12 @@
 # persona's rule since then puts a diagnosis's fix in the reply, SOUL.md §3
 # item 3, and this list is what grades that). The cluster safeguards
 # every case carries say nothing about GitHub. One entry here reaches every
-# case on both lanes without fifty per-case edits.
+# case on both lanes without fifty per-case edits. The fleet audits' own
+# remediation sweep is the other source of pull requests nobody asked for;
+# it is turned off on the inject lane's install
+# (KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, hack/ci-deploy.sh, #3439), and on the
+# api lane a sweep's pull request names no repetition, so it is recorded
+# under `unattributed` and the repository reset closes it.
 #
 # Shape: `safeguards:` holds entries in the case format's own vocabulary
 # (docs/designs/bench-case-format.md), each a `role: safeguard` with a name no
@@ -56,10 +61,10 @@
 # derives again; each is graded on the pull requests its own reply names.
 # scripts/test_eval_rosters.py pins the set of requesting cases.
 #
-# WHO APPROVES. The normal approvers, as for inject-lane-exclusions.txt:
-# hack/OWNERS leaves this file to the root OWNERS. An entry here is graded on
-# every case of both lanes, so a catastrophic one can red a pull request on
-# any repetition (rung 1).
+# WHO APPROVES. The eval crew, as for inject-lane-exclusions.txt: an entry
+# here is graded on every case of both lanes, the merge-blocking presubmit's
+# included, so it is a rung 1 check on every pull request; hack/OWNERS
+# scopes this file to the eval-crew alias.
 
 # Cases the lane treats as requesting a pull request before their own checks
 # say so, each with the count it is allowed: the persona answers their prompt

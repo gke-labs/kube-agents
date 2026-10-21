@@ -254,8 +254,14 @@ func parseFlags(args []string) (*flags, error) {
 // to stay callable from a test that stands up neither. onDrift arrives the same
 // way and for the same reason: building it needs a validated token out of the
 // environment, which a test should not have to set to exercise the wiring.
-func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool) (*driftFilter, *joiner) {
+//
+// skipBacklog is the inject handler's backlogRoute, and an argument rather than
+// a field set afterwards: DriftEvent.Digest, which the handler routes on, is
+// derived from it, so dropping the wiring has to be a compile error rather than
+// a detector that cards every backlog record.
+func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool, skipBacklog bool) (*driftFilter, *joiner) {
 	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), newProfileScope(f.profilesDir), alreadyInjected, onDrift)
+	join.skipBacklog = skipBacklog
 	return newDriftFilter(NewClassifier(f.automationPrincipals, f.humanDomains), join.Handle, f.logDropped), join
 }
 
@@ -535,17 +541,24 @@ func realMain(argv []string) error {
 	}
 
 	injectHandler := newDriftInjectHandler(inject)
-	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected)
+	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected, injectHandler.backlogRoute)
 
-	// Said at startup, because the difference between the two modes is invisible
-	// in every later line: a run with the inject off emits exactly the DRIFT
-	// lines a run with it on does, and only the shutdown tally distinguishes
-	// them. An operator who expected escalation and did not get it should find
+	// Said at startup, because the difference between the two modes is nearly
+	// invisible in every later line: a run with the inject off emits the DRIFT
+	// lines a run with it on does, less the backlog marker and the
+	// skipped_backlog join, and only the shutdown tally distinguishes them. An operator who expected escalation and did not get it should find
 	// the reason at launch rather than after the first change goes unreported.
 	if inject == nil {
 		log.Printf("%s: no --daemon-url; %s injects are disabled and drift will be logged only, not escalated to anyone", commandName, injectKindDrift)
 	} else {
 		log.Printf("%s: %s injects enabled, posting to %s (owner=%q, token from $%s)", commandName, injectKindDrift, f.daemonURL, f.owner, f.tokenEnv)
+		// Said either way, because the two modes differ only for records that
+		// arrive late, and an install that has just come up is all late records.
+		if injectHandler.backlogRoute {
+			log.Printf("%s: backlog records (published before this process's first pull, or waiting over %s) go to %s for one digest, not a card each; a late kubectl write is carded", commandName, backlogMaxWait, driftBacklogPath)
+		} else {
+			log.Printf("%s: the daemon does not advertise %q; backlog records will be injected as a card each, as live ones are", commandName, featureDriftBacklog)
+		}
 	}
 
 	// Say which mode the join is in at startup rather than leaving it to be

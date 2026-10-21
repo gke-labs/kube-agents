@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import tempfile
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -116,6 +117,10 @@ FEED_STATUS_INJECTED = "injected"
 FEED_STATUS_FILTERED = "filtered"
 FEED_STATUS_SUPPRESSED = "suppressed"
 FEED_STATUS_UNDELIVERED = "undelivered"
+# A drift backlog row that is digested or owed a digest. Checked before the
+# others, because its `notified` is 0 and would otherwise read as suppressed. A
+# carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
+FEED_STATUS_BACKLOG = "backlog"
 # The severity the inject route filters out of chat (see `inject_message`).
 FEED_FILTERED_SEVERITY = "Info"
 # `notified` value stamped on a ledger row when the alert was admitted and
@@ -715,6 +720,70 @@ _DRIFT_UNSAFE_CHARS_RE = re.compile(r"[`\r\n]")
 # is in the inject payload for anything that needs it.
 DRIFT_MAX_RENDERED_PATHS = 12
 
+# The drift backlog: records the detector marks as having reached it late
+# (published before its process first pulled, or after waiting longer than its
+# max wait; `subscriber.backlog` in the detector). They arrive on
+# `POST /v1/drift-backlog` and write a ledger row with `backlog` set. Most spend
+# no quota, start no turn, and are posted as one digest; the late rows of a
+# principal with few of them are carded instead (DRIFT_BACKLOG_CARD_BELOW). An install queues such a
+# burst under the installer's own account, and triaging it one card at a time
+# spent the day's drift budget on kube-agents' own objects. A pod roll queues
+# whatever was published while it restarted.
+#
+# Advertised in `/healthz` `features`, so a detector reading an older daemon
+# keeps sending every record as a card.
+DRIFT_BACKLOG_FEATURE = "drift-backlog"
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE]
+# `intercepted_events.backlog`. Zero for every row that is not backlog, which
+# includes every row written before the column existed. A pending row is owed a
+# digest or a card; the other three are terminal.
+DRIFT_BACKLOG_NONE = 0
+DRIFT_BACKLOG_PENDING = 1
+DRIFT_BACKLOG_DIGESTED = 2
+DRIFT_BACKLOG_HEADLESS = 3
+# Carded instead of digested (DRIFT_BACKLOG_CARD_BELOW). Its `notified` and
+# `session_id` then say what a live drift row's would.
+DRIFT_BACKLOG_CARDED = 4
+# A principal with fewer late rows than this in one digest gets a card for each
+# instead. The burst the digest exists for is one principal's install, tens of
+# rows; one or two late rows are far more likely a person's edit made just
+# before a detector restart, which on main gets its triage.
+DRIFT_BACKLOG_CARD_BELOW = 3
+# The stored payload a carded row is rebuilt from. A backlog payload carries no
+# field ownership (the join is skipped), so it is small; one past this is
+# stored empty and its card is built from the row's columns.
+DRIFT_BACKLOG_PAYLOAD_MAX_CHARS = 16384
+# The digest waits for the burst to stop (no new pending row for the quiet
+# period) so one install is one message, but no longer than the max wait after
+# its oldest row, so a slow trickle is still reported.
+DRIFT_BACKLOG_QUIET_SECONDS = 60
+DRIFT_BACKLOG_MAX_WAIT_SECONDS = 600
+# After a failed post, the worker waits this long before it tries again.
+DRIFT_BACKLOG_RETRY_SECONDS = 300
+# The send timeout for a platform chat_notify does not route; the routed one
+# gets chat_notify's own, which is longer. Never None: the digest holds a lease
+# across the send, and a send with no timeout could hold it forever.
+DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS = 60
+# Added to the sum of the send timeouts to make the lease, so the lease cannot
+# expire under a send that is still inside its own timeout.
+DRIFT_BACKLOG_LEASE_MARGIN_SECONDS = 30
+# The one row of `drift_backlog_lease`.
+DRIFT_BACKLOG_LEASE_NAME = "digest"
+# Principals and objects the digest names before it counts the rest.
+DRIFT_BACKLOG_MAX_PRINCIPALS = 8
+DRIFT_BACKLOG_MAX_OBJECTS = 5
+DRIFT_BACKLOG_EMOJI = "🗂️"
+# How many times the digest tries to mark its rows after a post, and the pause
+# between tries. The mark is idempotent, and a mark that never lands after a
+# delivered post would let the lease lapse under pending rows and post the same
+# digest again.
+DRIFT_BACKLOG_FINISH_ATTEMPTS = 3
+DRIFT_BACKLOG_FINISH_RETRY_SECONDS = 1.0
+SECONDS_PER_DAY = 86400.0
+# The max wait as the digest words it. The detector owns the number
+# (`backlogMaxWait` in subscriber.go); this text has to change with it.
+DRIFT_BACKLOG_MAX_WAIT_TEXT = "30 minutes"
+
 # A stall's ledger row is graded Warning, on the watcher's scale, and claims no
 # alert quota: the producer's own per-tick cap is the only bound, by decision
 # (docs/designs/stall-watch-inject.md §3.4).
@@ -820,9 +889,20 @@ def init_db() -> None:
             # `ALTER TABLE` to preserve existing ledger rows (additive and
             # defaulted, so earlier rows read back with '').
             ledger_columns = {row[1] for row in conn.execute("PRAGMA table_info(intercepted_events)")}
-            if "session_id" not in ledger_columns:
+            # `backlog` and `principal` arrived with the drift backlog digest,
+            # added the same way. `principal` is written on backlog rows only,
+            # for the digest's per-principal count; a live drift row names its
+            # principal in `message`, and an event row has none.
+            for column, ddl in (
+                ("session_id", "session_id TEXT NOT NULL DEFAULT ''"),
+                ("backlog", f"backlog INTEGER NOT NULL DEFAULT {DRIFT_BACKLOG_NONE}"),
+                ("principal", "principal TEXT NOT NULL DEFAULT ''"),
+                ("payload", "payload TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column in ledger_columns:
+                    continue
                 try:
-                    conn.execute("ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+                    conn.execute(f"ALTER TABLE intercepted_events ADD COLUMN {ddl}")
                 except sqlite3.OperationalError as exc:
                     if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
                         raise
@@ -849,6 +929,34 @@ def init_db() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_created_at "
                 "ON intercepted_events (created_at)"
+            )
+            # Partial, so they cost nothing on the rows they do not cover:
+            # the first holds drift rows only, the second pending backlog rows
+            # only. The queries that use them spell the value as a literal,
+            # because SQLite matches a partial index's WHERE against the
+            # query's text and a bound parameter never matches.
+            conn.execute("DROP INDEX IF EXISTS idx_intercepted_events_backlog_uid")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_drift_uid "
+                f"ON intercepted_events (object_uid) WHERE reason = '{DRIFT_LEDGER_REASON}'"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_backlog_pending "
+                f"ON intercepted_events (id) WHERE backlog = {DRIFT_BACKLOG_PENDING}"
+            )
+            # Who holds the drift backlog digest, so two workers (a restart
+            # that overlaps the old process, or a second replica on the same
+            # volume) do not both post it. One row, claimed and released in
+            # short transactions; the send happens between them, outside any
+            # transaction, so the database is never locked across a chat post.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS drift_backlog_lease (
+                    name       TEXT PRIMARY KEY,
+                    holder     TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                )
+                """
             )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
@@ -894,6 +1002,15 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
+        # Said before the deletes, because after them nothing says it: a
+        # pending backlog row this old is one whose digest never posted.
+        undigested = conn.execute(
+            f"SELECT COUNT(*) FROM intercepted_events WHERE backlog = {DRIFT_BACKLOG_PENDING} AND "
+            "(created_at < datetime('now', ?) OR id <= (SELECT MAX(id) - ? FROM intercepted_events))",
+            (param, LEDGER_MAX_ROWS),
+        ).fetchone()[0]
+        if undigested:
+            logger.warning(f"Ledger cleanup is removing {undigested} drift backlog row(s) that were never digested")
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM intercepted_events WHERE created_at < datetime('now', ?)", (param,))
@@ -1063,8 +1180,10 @@ def healthz() -> Dict[str, Any]:
     it starts. See INJECT_KINDS_SUPPORTED for what a caller is expected to do
     with it and why the key's absence is the interesting case. It names what
     this route's dispatch understands, not what the daemon can do generally.
+    `features` names routes a producer may use beyond the inject, for the same
+    reason (DRIFT_BACKLOG_FEATURE).
     """
-    return {"status": "ok", "inject_kinds": INJECT_KINDS_SUPPORTED}
+    return {"status": "ok", "inject_kinds": INJECT_KINDS_SUPPORTED, "features": DAEMON_FEATURES}
 
 
 @app.post("/sessions", status_code=201, dependencies=[Depends(verify_api_key)])
@@ -4028,16 +4147,431 @@ def _inject_drift(
             "suppressed_today": str(suppressed_today),
         }
 
-    # Standard markdown, not Slack mrkdwn, for the reason the event path's
-    # alert gives: SlackAdapter.format_message reads a single `*...*` as italic.
-    alert_msg = (
-        f"{DRIFT_ALERT_EMOJI} **Drift:** {summary}\n"
-        f"🌱 _Checking what the cluster looks like now..._"
-    )
-
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload, event_row_id)
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, _drift_alert_message(summary), payload, event_row_id)
 
     return {"status": "injected"}
+
+
+def _drift_alert_message(summary: str) -> str:
+    """The chat line a drift card opens with.
+
+    Standard markdown, not Slack mrkdwn, for the reason the event path's alert
+    gives: SlackAdapter.format_message reads a single `*...*` as italic.
+    """
+    return f"{DRIFT_ALERT_EMOJI} **Drift:** {summary}\n🌱 _Checking what the cluster looks like now..._"
+
+@app.post("/v1/drift-backlog", dependencies=[Depends(verify_api_key)])
+def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
+    """Record one drift backlog record and owe it the next digest or a card.
+
+    The detector posts here, with no session, a record it marked as having
+    reached it late (DRIFT_BACKLOG_FEATURE). Nothing here spends quota or starts
+    a turn: the burst this exists for is an install's or a pod roll's own
+    writes, and one card each is what spent the drift budget on them.
+
+    One drift row per insert id, backlog or live. The detector retries a failed
+    post once and loses its seen set on a restart, so the same record can
+    arrive twice; and a record carded by a process that died before it acked
+    comes back to the next one as backlog. A second row would count the record
+    in the digest, once more or for the first time, though it was already sent.
+    """
+    if payload.get("kind") != INJECT_KIND_DRIFT:
+        raise HTTPException(status_code=400, detail=f"a drift backlog record needs kind {INJECT_KIND_DRIFT!r}")
+    resource = _drift_resource(payload)
+    insert_id = payload.get("insert_id") or ""
+    if not isinstance(insert_id, str):
+        raise HTTPException(status_code=400, detail="insert_id must be a string")
+    cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+    stored_payload = json.dumps(payload)
+    if len(stored_payload) > DRIFT_BACKLOG_PAYLOAD_MAX_CHARS:
+        stored_payload = ""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO intercepted_events "
+                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
+                    "occurrences, notified, session_id, backlog, principal, payload) "
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, '', ?, ?, ? "
+                    "WHERE ? = '' OR NOT EXISTS "
+                    f"(SELECT 1 FROM intercepted_events WHERE object_uid = ? AND reason = '{DRIFT_LEDGER_REASON}')",
+                    (
+                        _defang_drift_field(cluster),
+                        _defang_drift_field(resource.get("namespace")),
+                        _defang_drift_field(resource.get("name")) or DRIFT_UNKNOWN_FIELD,
+                        insert_id,
+                        _defang_drift_field(resource.get("resource")) or DRIFT_UNKNOWN_FIELD,
+                        DRIFT_LEDGER_REASON,
+                        _drift_summary(payload)[:LEDGER_MESSAGE_MAX_CHARS],
+                        DRIFT_SEVERITY_LABEL,
+                        DRIFT_BACKLOG_PENDING,
+                        _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD,
+                        stored_payload,
+                        insert_id,
+                        insert_id,
+                    ),
+                )
+    except sqlite3.Error as exc:
+        # A 5xx, so the detector retries once and then logs the record by its
+        # insert id. Unlike the inject's ledger write this one is the whole of
+        # what the route does, so it is not best-effort.
+        logger.error(f"Failed to record drift backlog record {insert_id or '(no insert id)'}: {exc}")
+        raise HTTPException(status_code=503, detail="the drift backlog record could not be written") from exc
+    _arm_drift_backlog_digest()
+    return {"status": "backlog"}
+
+
+# The digest worker. One daemon thread, started by the first pending row and
+# gone once none are left; the rows are the state, so a restart loses nothing
+# but the wait (see _arm_drift_backlog_digest_if_pending at the bottom of the
+# file). A thread rather than BackgroundTasks because the wait is minutes long,
+# and a background task that sleeps holds a thread of the pool the sync routes
+# run on.
+_drift_backlog_lock = threading.Lock()
+_drift_backlog_wake = threading.Event()
+_drift_backlog_thread: Optional[threading.Thread] = None
+
+
+def _arm_drift_backlog_digest() -> None:
+    """Wake the digest worker, starting it if it is not running."""
+    global _drift_backlog_thread
+    with _drift_backlog_lock:
+        _drift_backlog_wake.set()
+        if _drift_backlog_thread is not None and _drift_backlog_thread.is_alive():
+            return
+        _drift_backlog_thread = threading.Thread(
+            target=_drift_backlog_digest_loop, name="drift-backlog-digest", daemon=True
+        )
+        _drift_backlog_thread.start()
+
+
+def _drift_backlog_wait_seconds(oldest_age: float, newest_age: float, retry_in: float) -> float:
+    """How long the worker sleeps before it posts, given the pending rows' ages.
+
+    The quiet period runs from the newest row and the max wait from the oldest,
+    and whichever ends first ends the wait; a failed post pushes it back.
+    """
+    due_in = min(DRIFT_BACKLOG_QUIET_SECONDS - newest_age, DRIFT_BACKLOG_MAX_WAIT_SECONDS - oldest_age)
+    return max(due_in, retry_in, 0.0)
+
+
+def _drift_backlog_pending_ages() -> Optional[tuple[float, float]]:
+    """(oldest, newest) age in seconds of the pending backlog rows, or None for none."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            f"(julianday('now') - julianday(MIN(created_at))) * {SECONDS_PER_DAY}, "
+            f"(julianday('now') - julianday(MAX(created_at))) * {SECONDS_PER_DAY} "
+            f"FROM intercepted_events WHERE backlog = {DRIFT_BACKLOG_PENDING}"
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    return float(row[1]), float(row[2])
+
+
+def _drift_backlog_digest_loop() -> None:
+    global _drift_backlog_thread
+    retry_at = 0.0
+    while True:
+        _drift_backlog_wake.clear()
+        try:
+            ages = _drift_backlog_pending_ages()
+        except Exception as exc:
+            logger.error(f"Drift backlog digest could not read the ledger; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s: {exc}")
+            _drift_backlog_wake.wait(timeout=DRIFT_BACKLOG_RETRY_SECONDS)
+            continue
+        if ages is None:
+            # Exit under the lock, so a row armed between the read above and
+            # here starts a new worker rather than finding this one alive.
+            with _drift_backlog_lock:
+                if not _drift_backlog_wake.is_set():
+                    _drift_backlog_thread = None
+                    return
+            continue
+        wait = _drift_backlog_wait_seconds(ages[0], ages[1], retry_at - time.monotonic())
+        if wait > 0:
+            _drift_backlog_wake.wait(timeout=wait)
+            continue
+        try:
+            posted = _post_drift_backlog_digest()
+        except Exception as exc:
+            # The worker is the only thing that digests; an error it does not
+            # survive leaves every pending row until the next backlog record.
+            logger.error(f"Drift backlog digest failed; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s: {exc}")
+            posted = False
+        if posted:
+            retry_at = 0.0
+        else:
+            retry_at = time.monotonic() + DRIFT_BACKLOG_RETRY_SECONDS
+
+
+def _drift_backlog_send_timeout(platform: str) -> float:
+    return chat_notify.subprocess_timeout(platform, DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS) or DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS
+
+
+def _claim_drift_backlog(holder: str, lease_seconds: float) -> Optional[list[Dict[str, Any]]]:
+    """Take the digest lease and return the pending rows, or None when another
+    holder's lease is still live. A short transaction: the post happens after it."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            lease = conn.execute(
+                "SELECT expires_at FROM drift_backlog_lease WHERE name = ?", (DRIFT_BACKLOG_LEASE_NAME,)
+            ).fetchone()
+            now = time.time()
+            if lease and lease["expires_at"] > now:
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute(
+                "INSERT OR REPLACE INTO drift_backlog_lease (name, holder, expires_at) VALUES (?, ?, ?)",
+                (DRIFT_BACKLOG_LEASE_NAME, holder, now + lease_seconds),
+            )
+            rows = conn.execute(
+                "SELECT id, cluster, namespace, workload, object_kind, principal, created_at, message, payload "
+                f"FROM intercepted_events WHERE backlog = {DRIFT_BACKLOG_PENDING} ORDER BY id"
+            ).fetchall()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return [dict(row) for row in rows]
+
+
+def _finish_drift_backlog(holder: str, max_id: Optional[int], outcome: Optional[int]) -> None:
+    """Mark the claimed rows with outcome (none when the post failed) and release the lease.
+
+    `id <= max_id` is exactly the claimed set: ids only grow, so a row that
+    arrived during the send is above it and stays pending for the next digest.
+    """
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with conn:
+            if outcome is not None and max_id is not None:
+                conn.execute(
+                    f"UPDATE intercepted_events SET backlog = ? WHERE backlog = {DRIFT_BACKLOG_PENDING} AND id <= ?",
+                    (outcome, max_id),
+                )
+            conn.execute(
+                "DELETE FROM drift_backlog_lease WHERE name = ? AND holder = ?", (DRIFT_BACKLOG_LEASE_NAME, holder)
+            )
+
+
+def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
+    """The digest: how many, by whom, a few of what, and where the rest are."""
+    by_principal: Dict[str, int] = {}
+    for row in rows:
+        principal = row["principal"] or DRIFT_UNKNOWN_FIELD
+        by_principal[principal] = by_principal.get(principal, 0) + 1
+    ranked = sorted(by_principal.items(), key=lambda item: (-item[1], item[0]))
+    principals = ", ".join(f"{_defang_drift_field(p)} ({n})" for p, n in ranked[:DRIFT_BACKLOG_MAX_PRINCIPALS])
+    if len(ranked) > DRIFT_BACKLOG_MAX_PRINCIPALS:
+        principals += f", and {len(ranked) - DRIFT_BACKLOG_MAX_PRINCIPALS} more"
+    objects = ", ".join(
+        f"{_defang_drift_field('/'.join(part for part in (row['namespace'], row['object_kind'], row['workload']) if part))}"
+        f" on {_defang_drift_field(row['cluster']) or DRIFT_UNKNOWN_FIELD}"
+        for row in rows[:DRIFT_BACKLOG_MAX_OBJECTS]
+    )
+    if len(rows) > DRIFT_BACKLOG_MAX_OBJECTS:
+        objects += f", and {len(rows) - DRIFT_BACKLOG_MAX_OBJECTS} more"
+    noun = "change" if len(rows) == 1 else "changes"
+    return (
+        f"{DRIFT_BACKLOG_EMOJI} **Drift backlog:** {len(rows)} {noun} reached drift detection late "
+        f"(they queued before it started pulling, or waited over "
+        f"{DRIFT_BACKLOG_MAX_WAIT_TEXT}), so they are listed here instead of triaged one card each.\n"
+        f"By principal: {principals}\n"
+        f"Including: {objects}\n"
+        f"Recorded {rows[0]['created_at']} to {rows[-1]['created_at']} UTC. The full list is the "
+        f"`{FEED_STATUS_BACKLOG}` rows of `GET /v1/intercepted-events` on the Session KV server."
+    )
+
+
+def _refund_alert_quota(severity: str) -> None:
+    """Give back one of today's alerts for `severity`, claimed for a post that
+    never happened. Best-effort: a failed refund costs one unit of the day's
+    budget, which is what it cost before the refund existed."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE alert_quota SET sent = sent - 1 WHERE day = ? AND severity = ? AND sent > 0",
+                    (day, severity),
+                )
+    except sqlite3.Error as exc:
+        logger.error(f"Could not refund a {severity} alert claimed for a post that did not happen: {exc}")
+
+
+def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Card the rows of every principal with fewer than DRIFT_BACKLOG_CARD_BELOW
+    rows, and return the rest for the digest.
+
+    A carded row gets what a live drift record gets, less field ownership (its
+    join was skipped): a quota claim, a session, the alert and the triage turn.
+    A row the ceiling refuses stays in the digest, so the change is still named
+    in chat. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
+    crash after it cannot card it twice; a turn that fails after that is lost as
+    a live one would be. A row whose session or mark cannot be written goes to
+    the digest too, so it is named and marked with the rest rather than left
+    pending under a range mark that would stamp it digested unnamed. The turn runs on a thread of its own, so a slow
+    gateway does not hold the digest's lease.
+    """
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[row["principal"]] = counts.get(row["principal"], 0) + 1
+    digest: list[Dict[str, Any]] = []
+    for row in rows:
+        if counts[row["principal"]] >= DRIFT_BACKLOG_CARD_BELOW:
+            digest.append(row)
+            continue
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("kind") != INJECT_KIND_DRIFT:
+            payload = {"kind": INJECT_KIND_DRIFT, "summary": row["message"], "cluster": row["cluster"]}
+        allowed, suppressed_today = _claim_alert_quota(DRIFT_QUOTA_KEY)
+        if not allowed:
+            logger.warning(
+                f"Late record {row['id']} stays in the digest: daily limit of "
+                f"{ALERT_DAILY_LIMITS[DRIFT_QUOTA_KEY]} drift alerts reached, {suppressed_today} suppressed today"
+            )
+            digest.append(row)
+            continue
+        try:
+            session_id = create_session()["sessionID"]
+            with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+                with conn:
+                    conn.execute(
+                        "UPDATE intercepted_events SET backlog = ?, notified = 1, session_id = ? WHERE id = ?",
+                        (DRIFT_BACKLOG_CARDED, session_id, row["id"]),
+                    )
+        except sqlite3.Error as exc:
+            logger.error(f"Late record {row['id']} could not be carded and goes to the digest: {exc}")
+            _refund_alert_quota(DRIFT_QUOTA_KEY)
+            digest.append(row)
+            continue
+        logger.info(f"Drift backlog: carding late record {row['id']} (its principal has {counts[row['principal']]} late row(s))")
+        threading.Thread(
+            target=trigger_agent_troubleshooter,
+            args=(session_id, _drift_alert_message(_drift_summary(payload)), payload, row["id"]),
+            name=f"drift-backlog-card-{row['id']}",
+            daemon=True,
+        ).start()
+    return digest
+
+
+def _send_drift_backlog_digest(platform: str, message: str) -> bool:
+    """Post the digest to one platform. True when it was, or may have been, delivered.
+
+    A timeout and `a2a notify`'s outcome-unknown exit both count as delivered
+    here, unlike on the alert path: a second digest for the same rows is worse
+    than one the reader may not have seen, and the rows are in the ledger.
+    """
+    try:
+        subprocess.run(
+            chat_notify.command(platform, message),
+            check=True,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=_run_env(),
+            timeout=_drift_backlog_send_timeout(platform),
+        )
+        return True
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Drift backlog digest to '{platform}' timed out; treating it as sent")
+        return True
+    except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            logger.warning(f"Drift backlog digest to '{platform}' got no answer in time; treating it as sent")
+            return True
+        logger.error(f"Drift backlog digest to '{platform}' failed (exit {exc.returncode}): {exc.stderr}")
+    except Exception as exc:
+        logger.error(f"Drift backlog digest to '{platform}' failed: {exc}")
+    return False
+
+
+# A mark that did not land after a delivered post: (holder, max_id, outcome).
+# Only the worker thread reads or writes it. The next digest attempt finishes
+# this one first, so the rows it covers are never claimed and posted again.
+_drift_backlog_unfinished: Optional[tuple[str, int, int]] = None
+
+
+def _finish_drift_backlog_with_retries(holder: str, max_id: Optional[int], outcome: Optional[int]) -> bool:
+    """_finish_drift_backlog, tried DRIFT_BACKLOG_FINISH_ATTEMPTS times. True when it landed."""
+    for attempt in range(DRIFT_BACKLOG_FINISH_ATTEMPTS):
+        if attempt:
+            time.sleep(DRIFT_BACKLOG_FINISH_RETRY_SECONDS)
+        try:
+            _finish_drift_backlog(holder, max_id, outcome)
+            return True
+        except sqlite3.Error as exc:
+            logger.error(f"Drift backlog digest could not mark its rows or release its lease (try {attempt + 1}): {exc}")
+    return False
+
+
+def _post_drift_backlog_digest() -> bool:
+    """Claim the pending rows, post one digest for them, and mark them.
+
+    Returns False when the post failed or another holder has the lease, so the
+    worker waits DRIFT_BACKLOG_RETRY_SECONDS. A headless install marks the rows
+    with no post, as the alert path does for its own rows.
+    """
+    global _drift_backlog_unfinished
+    if _drift_backlog_unfinished is not None:
+        if not _finish_drift_backlog_with_retries(*_drift_backlog_unfinished):
+            return False
+        _drift_backlog_unfinished = None
+        return True
+    platforms = enabled_chat_platforms()
+    headless = platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled()
+    lease_seconds = DRIFT_BACKLOG_LEASE_MARGIN_SECONDS + sum(_drift_backlog_send_timeout(p) for p in platforms)
+    holder = uuid.uuid4().hex
+    try:
+        rows = _claim_drift_backlog(holder, lease_seconds)
+    except sqlite3.Error as exc:
+        logger.error(f"Drift backlog digest could not claim its rows: {exc}")
+        return False
+    if rows is None:
+        return False
+    max_id = rows[-1]["id"] if rows else None
+    outcome: Optional[int] = None
+    try:
+        rows = _card_drift_backlog_minorities(rows)
+        if not rows:
+            return True
+        if headless:
+            outcome = DRIFT_BACKLOG_HEADLESS
+            logger.info(f"Drift backlog: {len(rows)} record(s) recorded with no digest posted (no chat platform enabled)")
+            return True
+        message = _drift_backlog_digest_text(rows)
+        active = get_active_platform(platforms)
+        for candidate in [active] + [p for p in platforms if p != active]:
+            if _send_drift_backlog_digest(candidate, message):
+                outcome = DRIFT_BACKLOG_DIGESTED
+                logger.info(f"Drift backlog digest for {len(rows)} record(s) posted to '{candidate}'")
+                return True
+        logger.error(
+            f"Drift backlog digest for {len(rows)} record(s) was not delivered to any enabled platform "
+            f"({', '.join(platforms)}); retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s"
+        )
+        return False
+    finally:
+        if not _finish_drift_backlog_with_retries(holder, max_id, outcome) and outcome is not None and max_id is not None:
+            _drift_backlog_unfinished = (holder, max_id, outcome)
+
+
+def _arm_drift_backlog_digest_if_pending() -> None:
+    """Start the digest worker when the ledger holds pending rows, so rows a
+    previous process recorded and never digested are not left until the next
+    backlog record arrives."""
+    try:
+        pending = _drift_backlog_pending_ages()
+    except Exception as exc:
+        logger.error(f"Could not check for pending drift backlog rows at startup: {exc}")
+        return
+    if pending is not None:
+        _arm_drift_backlog_digest()
 
 
 def _inject_stall(
@@ -4591,7 +5125,7 @@ def _validate_non_negative_int64(value: int, name: str) -> int:
     return value
 
 
-def _feed_status(notified: int, severity: str, delivery_error: str) -> str:
+def _feed_status(notified: int, severity: str, delivery_error: str, backlog: int = DRIFT_BACKLOG_NONE) -> str:
     """What became of a ledger row, in the inject route's own words.
 
     Derived rather than stored, from the three columns that already decide it:
@@ -4600,7 +5134,10 @@ def _feed_status(notified: int, severity: str, delivery_error: str) -> str:
     skips chat delivery) only for an alert admitted past the severity gate and
     daily quota, an Info row is the one the severity gate filters, and
     `delivery_error` is written only when a chat post was attempted and failed.
+    A backlog row that is not carded is `backlog` whatever the other three say.
     """
+    if backlog and backlog != DRIFT_BACKLOG_CARDED:
+        return FEED_STATUS_BACKLOG
     if notified:
         return FEED_STATUS_INJECTED
     if delivery_error:
@@ -4628,7 +5165,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message"
+        "reason, severity, notified, delivery_error, message, backlog"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -4652,7 +5189,7 @@ def list_intercepted_events(
             "name": row["workload"],
             "reason": row["reason"],
             "severity": row["severity"],
-            "status": _feed_status(row["notified"], row["severity"], row["delivery_error"]),
+            "status": _feed_status(row["notified"], row["severity"], row["delivery_error"], row["backlog"]),
             "message": row["message"],
         }
         for row in rows[:limit]
@@ -4956,3 +5493,4 @@ def put_queue_publication(publisher: str, body: Dict[str, Any]) -> Dict[str, Any
 
 
 init_db()
+_arm_drift_backlog_digest_if_pending()
