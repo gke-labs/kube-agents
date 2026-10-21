@@ -302,13 +302,13 @@ func TestSettleMemoEvictsItsOldestHoldWhenFull(t *testing.T) {
 // sighted once more, then nothing. At --quiet-after the sweep sends one
 // k8s-event-followup on the alert's own session, naming the object and the
 // last sighting, and never a second one; a sighting inside the period, an
-// informer that has not synced, a cluster silent for the period, --quiet-after
-// 0 and shared mode each send none.
+// informer that has not synced or has just resumed, a cluster silent for the
+// period, --quiet-after 0 and shared mode each send none.
 func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	disp, m, injectCount, injected := newCountingDispatcher(t, filterThresholds{backoffMinCount: 1, settle: -1})
 	disp.quietAfter = 15 * time.Minute
 	disp.cluster = targetCluster{Name: "test-cluster", ProjectID: "p", Location: "us-central1"}
-	disp.ready.Store(true)
+	disp.readyAt.Store(1) // delivering since long before the fixture's clock
 	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
 	now := t0
 	disp.now = func() time.Time { return now }
@@ -338,12 +338,19 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	heard := backoffEvent(1)
 	heard.Key.UID, heard.Key.Reason = "pod-heard", "Scheduled" // the cluster speaks inside the quiet period; not a reason on the list, so no alert
 	disp.Dispatch(ctx, heard)
-	disp.ready.Store(false)
+	disp.readyAt.Store(0)
 	disp.Sweep(ctx)
 	if *injectCount != 1 {
 		t.Fatalf("a sweep before the informer synced sent a follow-up")
 	}
-	disp.ready.Store(true)
+	// A watch that has just returned re-delivers the live entries' events in
+	// its relist; the sweep waits followupResumeGrace behind it.
+	disp.readyAt.Store(now.UnixNano())
+	disp.Sweep(ctx)
+	if *injectCount != 1 {
+		t.Fatalf("a sweep inside the resume grace sent a follow-up")
+	}
+	disp.readyAt.Store(1) // delivering since long before the fixture's clock
 	disp.Sweep(ctx)
 	if *injectCount != 2 {
 		t.Fatalf("at quiet-after: %d injects; want 2 (the alert and one follow-up)", *injectCount)
@@ -513,7 +520,7 @@ func TestDispatcherSweepCountsAnUnroutedFollowUp(t *testing.T) {
 		cluster: targetCluster{Name: "test-cluster"},
 	}
 	disp.dedup.now = func() time.Time { return now }
-	disp.ready.Store(true)
+	disp.readyAt.Store(1) // delivering since long before the fixture's clock
 	disp.Dispatch(context.Background(), backoffEvent(3))
 	now = t0.Add(time.Hour)
 	speaks := backoffEvent(1)
@@ -574,7 +581,7 @@ func TestDispatcherSweepSendsNoFollowUpToAnOlderDaemon(t *testing.T) {
 		mode: "per-incident", quietAfter: 15 * time.Minute, now: func() time.Time { return now },
 	}
 	disp.dedup.now = func() time.Time { return now }
-	disp.ready.Store(true)
+	disp.readyAt.Store(1) // delivering since long before the fixture's clock
 	disp.Dispatch(context.Background(), backoffEvent(3))
 	now = t0.Add(16 * time.Minute)
 	speaks := backoffEvent(1)
@@ -641,7 +648,7 @@ func TestDispatcherSweepRetriesAFailedFollowUp(t *testing.T) {
 		cluster: targetCluster{Name: "test-cluster"},
 	}
 	disp.dedup.now = func() time.Time { return now }
-	disp.ready.Store(true)
+	disp.readyAt.Store(1)                                // delivering since long before the fixture's clock
 	disp.Dispatch(context.Background(), backoffEvent(3)) // inject 1: the alert
 	now = t0.Add(16 * time.Minute)
 	speaks := backoffEvent(1)

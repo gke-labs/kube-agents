@@ -78,6 +78,11 @@ const (
 	// settleClearedFloor is the least time a cleared key's tombstone is kept
 	// (settleClearedTTL): the API server's default event TTL.
 	settleClearedFloor = time.Hour
+	// followupResumeGrace is how long after the informer becomes delivering
+	// the sweep waits before sending follow-ups: the relist that follows a
+	// returned watch re-delivers every event still inside the API server's
+	// TTL within seconds, and the grace puts the sweep behind it.
+	followupResumeGrace = 2 * time.Minute
 	// followupMessage is the Message of a k8s-event-followup payload: what
 	// the watcher knows, and no more.
 	followupMessage = "no new events for this object since the last sighting"
@@ -540,12 +545,17 @@ type dispatcher struct {
 	cluster    targetCluster
 	// now is the sweep's clock, overridable in tests.
 	now func() time.Time
-	// ready is set while the cluster's informer is delivering (main's
-	// onWatching: set once the first list has completed, cleared while a 403
-	// holds the watch). While it is not, the sweep sends no follow-up: an
-	// entry's LastSeen moves only on a sighting the informer delivers, so a
-	// watcher that is not listening would call every open incident quiet.
-	ready atomic.Bool
+	// readyAt is the watcher's clock at which the cluster's informer last
+	// became delivering (main's onWatching: set once the first list has
+	// completed and again when a watch returns after a failure, zero while a
+	// 403 holds the watch or any other list or watch error stands). While it
+	// is zero, and for followupResumeGrace after it is set, the sweep sends
+	// no follow-up: an entry's LastSeen moves only on a sighting the informer
+	// delivers, so a watcher that is not listening would call every open
+	// incident quiet, and a watch that has just returned re-delivers every
+	// live entry's events in the relist that follows, which the grace lets
+	// land first.
+	readyAt atomic.Int64
 	// lastDelivery is the watcher's clock at the last event the informer
 	// delivered to this dispatcher, any event, admitted or not. The 403 hold
 	// is the one outage the watcher reports; a control-plane outage, a bad
@@ -915,7 +925,11 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 	for _, h := range d.settles.Expire(now, quiet) {
 		d.metrics.settleOutcomes.WithLabelValues(h.Cluster, h.Project, h.Location, h.Reason, settleOutcomeSelfResolved).Inc()
 	}
-	if d.quietAfter <= 0 || d.mode != "per-incident" || !d.ready.Load() {
+	if d.quietAfter <= 0 || d.mode != "per-incident" {
+		return
+	}
+	readyAt := d.readyAt.Load()
+	if readyAt == 0 || now.Sub(time.Unix(0, readyAt)) < followupResumeGrace {
 		return
 	}
 	// The cluster has to have spoken inside the quiet period: a watch down
@@ -1216,12 +1230,12 @@ func realMain(argv []string) error {
 				if !watching {
 					m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 					// Blind again: nothing it does not see can be called quiet.
-					disp.ready.Store(false)
-					log.Printf("k8s-event-watcher: [%s] events forbidden, no longer watching until the next successful attempt", tc.Name)
+					disp.readyAt.Store(0)
+					log.Printf("k8s-event-watcher: [%s] events are not being delivered (the watch was refused or failed), no longer watching until the next successful attempt", tc.Name)
 					return
 				}
 				m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
-				disp.ready.Store(true)
+				disp.readyAt.Store(disp.clock().UnixNano())
 				if !counted.Swap(true) {
 					synced.Add(1)
 					log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
