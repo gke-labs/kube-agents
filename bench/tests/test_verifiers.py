@@ -8813,13 +8813,88 @@ def test_worker_commands_succeeded_no_trajectory_with_conclusive_card_log_failur
 
 def test_worker_commands_succeeded_withheld_call_beside_readable_call_is_error():
     from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
 
     run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
     v = WorkerCommandsVerifier(
         type="worker_commands",
         required_runs=[run],
     )
-    # 1 readable sibling terminal call, 1 terminal call with withheld arguments ({})
+    # 1 readable sibling terminal call, 1 terminal call with withheld arguments
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": "kubectl get nodes"},
+            "result": '{"output": "", "exit_code": 0}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": worker_trajectory.WITHHELD,
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": "kubectl get nodes"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the pod withheld a worker terminal call's arguments" in res.reason
+    assert "fleet_upgrade_report.py --readiness" in res.reason
+
+
+def test_worker_commands_succeeded_withheld_call_beside_failed_run_is_error():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # 1 readable terminal call that exited 1, 1 terminal call with withheld arguments
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"},
+            "result": '{"output": "failed", "exit_code": 1}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": worker_trajectory.WITHHELD,
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the worker-trajectory capture was partial (the pod withheld a worker terminal call's arguments)" in res.reason
+    assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res.reason
+    assert "a retry may sit in the unread part (the pod withheld a worker terminal call's arguments)" in res.reason
+
+
+def test_worker_commands_succeeded_empty_args_beside_readable_call_fails():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # 1 readable sibling terminal call, 1 terminal call with empty args {} (agent miss, not withheld by pod)
     traj = [
         {
             "agent": "worker",
@@ -8842,9 +8917,59 @@ def test_worker_commands_succeeded_withheld_call_beside_readable_call_is_error()
     transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": "kubectl get nodes"}])
     res = v.verify(5.0)
     assert not res.success
+    assert res.status == "fail"
+    assert "withheld" not in res.reason
+    assert "no worker command ran fleet_upgrade_report.py --readiness" in res.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_with_forbidden_failure_does_not_say_withheld():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        forbidden_patterns=[r"kubectl delete"],
+        required_runs=[run],
+    )
+    # Card log has forbidden pattern, trajectory is empty (capture did not run), required run not in card log.
+    # Must fail conclusively and report no trajectory rather than claiming withheld arguments.
+    transcript.set(
+        "ok",
+        [],
+        worker_commands=[
+            {"task": "t_1", "command": "kubectl delete pod x"},
+        ],
+    )
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "fail"
+    assert "forbidden pattern(s) matched worker commands" in res.reason
+    assert "withheld" not in res.reason
+    assert "no card was delegated or the worker-trajectory capture did not run, so fleet_upgrade_report.py --readiness could not be verified" in res.reason
+
+
+def test_worker_commands_succeeded_no_trajectory_with_gaps_does_not_say_withheld():
+    from kube_agents_bench.verifiers import WorkerRun
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(
+        type="worker_commands",
+        required_runs=[run],
+    )
+    # Trajectory is empty, gaps present, required run not in card log.
+    # Partial error must cite the gap and no-trajectory clause, without saying withheld.
+    transcript.set(
+        "ok",
+        [],
+        worker_commands=[{"task": "t_1", "command": "kubectl get pods"}],
+        worker_capture_gaps=["card t_1: unread session store"],
+    )
+    res = v.verify(5.0)
+    assert not res.success
     assert res.status == "error"
-    assert "the pod withheld a worker terminal call's arguments" in res.reason
-    assert "fleet_upgrade_report.py --readiness" in res.reason
+    assert "card t_1: unread session store" in res.reason
+    assert "withheld" not in res.reason
+    assert "no card was delegated or the worker-trajectory capture did not run, so fleet_upgrade_report.py --readiness could not be verified" in res.reason
 
 
 def test_worker_commands_after_result_partial_capture_preserves_missing_in_fail_reason():
