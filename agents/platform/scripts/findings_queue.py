@@ -218,6 +218,7 @@ PROVIDER_NAMESPACE_RE = re.compile(r"^(?:gke|gmp)-")
 MAX_LABEL_CHARS = 500
 MAX_TEXT_CHARS = 4000
 MAX_BATCH = 500
+MAX_LIST_LIMIT = 1000  # the most rows one list_findings call returns
 
 # Rejected values are quoted back so the caller can see what it sent, but the
 # rejection happens before any length cap, and the message ends up verbatim in
@@ -658,7 +659,7 @@ def list_findings(
     # Sorted before the limit, not after: slicing an unordered result makes
     # which rows come back a property of insertion order.
     ordered = sorted((_row_to_finding(row) for row in rows), key=ranked_sort_key)
-    return ordered[: max(1, min(int(limit), 1000))]
+    return ordered[: max(1, min(int(limit), MAX_LIST_LIMIT))]
 
 
 def get_finding(conn: sqlite3.Connection, finding_id: str) -> dict | None:

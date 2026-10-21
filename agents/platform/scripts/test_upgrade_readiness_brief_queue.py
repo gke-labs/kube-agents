@@ -12,7 +12,6 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -21,24 +20,22 @@ import upgrade_readiness_review as review  # noqa: E402
 import upgrade_readiness_watch as watch  # noqa: E402
 
 ROSTER = Path(__file__).resolve().parents[1] / "cron" / "jobs.json"
-PLATFORM_CONFIG = Path(__file__).resolve().parents[1] / "config.yaml"
-SHARED_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "defaults" / "config.yaml"
 PROJECT = "acme-prod"
 OTHER_PROJECT = "acme-dev"
 
 
-def row(fid, check="upgrade-pdb", state="queued", project=PROJECT, **extra) -> dict:
+def row(fid, check="upgrade-pdb", state="queued", project=PROJECT, severity="critical", **extra) -> dict:
     return {
         "id": fid,
         "check": check,
         "state": state,
-        "severity": "critical",
+        "severity": severity,
         "project": project,
         "cluster": "seeded-b",
         "namespace": "seeded-upgrade",
         "object": "pinned-batch-runner",
         "title": "Budget pinned-batch-runner refuses eviction of its only pod",
-        "recommendation": "Raise maxUnavailable or add a replica.",
+        "recommendation": {"action": "Raise maxUnavailable or add a replica.", "rationale": "the drain evicts the only pod", "risk": "an outage"},
         "detail": "the rule's full text",
         "rubric": {"impact": 3},
         **extra,
@@ -86,17 +83,20 @@ class TheQueueView(unittest.TestCase):
 
     def test_only_upgrade_rows_reach_the_turn_with_the_fields_it_composes_from(self):
         queue = FakeQueue(
-            [row("upgrade-pdb:a"), row("cost:b", check="cost-idle-node"), row("upgrade-webhook:c", check="upgrade-webhook", state="accepted")],
+            [row("upgrade-pdb:a"), row("cost:b", check="cost-idle-node"), row("upgrade-webhook:c", check="upgrade-webhook", severity="major")],
             {("dismissed", PROJECT): [row("upgrade-pdb:d", state="dismissed"), row("cost:e", check="cost-idle-node", state="dismissed")]},
         )
         code, view = self.run_main(queue)
         self.assertEqual(code, 0)
         self.assertEqual([r["id"] for r in view["open"]], ["upgrade-pdb:a", "upgrade-webhook:c"])
-        self.assertEqual(set(view["open"][0]), set(brief_queue.OPEN_FIELDS))
+        # An open critical may become a Decide-now line from the queue alone: it carries what the line names.
+        self.assertEqual(set(view["open"][0]), set(brief_queue.DETAIL_FIELDS) | {"action"})
+        self.assertEqual(view["open"][0]["action"], "Raise maxUnavailable or add a replica.")
+        # Every other row is there for its state, without the text a line would quote.
+        self.assertEqual(set(view["open"][1]), {"id", "state", "severity", "check", "project", "cluster"})
         self.assertEqual([r["id"] for r in view["dismissed"]], ["upgrade-pdb:d"])
-        self.assertEqual(set(view["dismissed"][0]), {"id", "severity", "project", "cluster"})
-        self.assertEqual(view["snoozed"], [])
-        self.assertEqual(view["cut"], [])
+        self.assertEqual(set(view["dismissed"][0]), {"id", "state", "severity", "check", "project", "cluster"})
+        self.assertEqual((view["snoozed"], view["cut"], view["unread"]), ([], [], []))
 
     def test_each_project_the_summary_or_the_backlog_names_is_read_by_state(self):
         self.write_summary([OTHER_PROJECT])
@@ -108,7 +108,7 @@ class TheQueueView(unittest.TestCase):
         self.assertEqual(view["projects"], [OTHER_PROJECT, PROJECT])
         asked = sorted((q["state"], q["project"]) for q in (dict(urllib.parse.parse_qsl(urllib.parse.urlparse(p).query)) for p in queue.paths[1:]))
         self.assertEqual(asked, [("dismissed", OTHER_PROJECT), ("dismissed", PROJECT), ("snoozed", OTHER_PROJECT), ("snoozed", PROJECT)])
-        self.assertEqual(view["snoozed"], [{"id": "upgrade-pdb:s", "severity": "critical", "project": OTHER_PROJECT, "cluster": "seeded-b", "snoozed_until": "2026-11-01T00:00:00Z"}])
+        self.assertEqual(view["snoozed"], [{"id": "upgrade-pdb:s", "state": "snoozed", "severity": "critical", "check": "upgrade-pdb", "project": OTHER_PROJECT, "cluster": "seeded-b", "snoozed_until": "2026-11-01T00:00:00Z"}])
 
     def test_a_full_page_is_named_cut(self):
         full = [row(f"cost:{n}", check="cost-idle-node", state="dismissed") for n in range(brief_queue.PAGE_LIMIT)]
@@ -123,6 +123,21 @@ class TheQueueView(unittest.TestCase):
         code, view = self.run_main(refuse)
         self.assertEqual(code, 0)
         self.assertEqual(view, {"error": brief_queue.ERROR_PREFIX + "HTTP 503 Service Unavailable"})
+
+    def test_a_decided_page_it_cannot_read_costs_only_that_count(self):
+        queue = FakeQueue([row("upgrade-pdb:a")])
+        answer = queue.__call__
+
+        def flaky(path, body=None):
+            if "state=dismissed" in path:
+                raise OSError("HTTP 503 Service Unavailable")
+            return answer(path, body)
+
+        code, view = self.run_main(flaky)
+        self.assertEqual(code, 0)
+        self.assertNotIn("error", view)
+        self.assertEqual([r["id"] for r in view["open"]], ["upgrade-pdb:a"])
+        self.assertEqual(view["unread"], [{"state": "dismissed", "project": PROJECT, "error": "HTTP 503 Service Unavailable"}])
 
     def test_an_answer_without_a_findings_list_is_a_failed_read(self):
         code, view = self.run_main(lambda path, body=None: {"detail": "not found"})
@@ -150,21 +165,17 @@ class TheQueueView(unittest.TestCase):
 
 
 class TheBriefEntry(unittest.TestCase):
-    def test_the_brief_turn_holds_no_mcp_server_and_reads_the_queue_before_it(self):
+    def test_the_brief_turn_holds_the_terminal_alone_and_reads_the_queue_before_it(self):
         jobs = {job["id"]: job for job in json.loads(ROSTER.read_text())["jobs"]}
         brief = jobs[review.BRIEF_JOB_ID]
         self.assertEqual(brief["script"], Path(brief_queue.__file__).name)
-        toolsets = brief["enabled_toolsets"]
-        # The sentinel drops every MCP server the profile enables; a server named
-        # beside it is kept, and platform_control would bring update_finding.
+        toolsets = set(brief["enabled_toolsets"])
+        # The sentinel drops every MCP server, platform_control and its update_finding among them.
+        # Anything beside the terminal widens the turn: a named server survives the sentinel, "all"
+        # brings the MCP toolsets back, kanban files a card that asks for a decision, and the file
+        # toolset's writes are not held to the risk: high command policy.
         self.assertIn("no_mcp", toolsets)
-        servers = set()
-        for config in (PLATFORM_CONFIG, SHARED_CONFIG):
-            servers |= set((yaml.safe_load(config.read_text()) or {}).get("mcp_servers") or {})
-        self.assertIn("platform_control", servers)
-        self.assertEqual({t.removeprefix("mcp-") for t in toolsets} & servers, set())
-        self.assertNotIn("hermes-cli", toolsets, "the composite toolset carries delegate_task and the kanban tools")
-        self.assertNotIn("file", toolsets, "write_file and patch are not held to the risk: high command policy")
+        self.assertLessEqual(toolsets, {"terminal", "no_mcp"})
 
 
 if __name__ == "__main__":

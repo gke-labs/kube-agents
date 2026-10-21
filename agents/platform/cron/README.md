@@ -358,7 +358,8 @@ it the terminal tool alone and no MCP server (`no_mcp`), so nothing a name says 
 register or decide a finding through `platform_control`, or write a file the command policy would
 refuse. The queue reads are made before the turn by the entry's
 pre-run `script`, `upgrade_readiness_brief_queue.py`, whose JSON the scheduler puts above the
-prompt; a queue it cannot read is said there, and the brief says so in its headline. The `deliver: "chat"` relay posts it as written and stores it against the
+prompt. An open backlog it cannot read is said there and in the brief's headline; a page of
+decided rows it cannot read leaves out only the brief's **Decided earlier** line. The `deliver: "chat"` relay posts it as written and stores it against the
 thread, so a reply with an id and `dismiss`, `snooze until <date>` or `accept` reaches the agent
 with the brief attached.
 

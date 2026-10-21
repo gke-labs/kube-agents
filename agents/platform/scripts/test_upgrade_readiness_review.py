@@ -603,12 +603,15 @@ class TheRecord(unittest.TestCase):
         self.assertEqual(doc3["no_longer_reported_ids"], [])
         doc4, _ = self.summary_for([seeded_b(), partial], previous={"findings": [gone, unread, half_read, kept]}, claimed={f"{PROJECT}/us-central1-a/seeded-b"})
         self.assertEqual(doc4["no_longer_reported_ids"], [gone["id"]])
-        # A twin-folded row is judged by any of its members, as the queue reaches it from any of them:
-        # its first twin is gone, and the other, read in full this week, no longer reports it.
+        # A row is judged by its project and cluster, as the queue lowers it: the us-east1 twin is gone,
+        # and the cluster of that name read in full this week no longer reports the row the two shared,
+        # nor the one only the gone twin wrote.
         folded = {"id": "upgrade-drain-blocking-budget.acme-prod.seeded-b.ns.web", "project": PROJECT, "cluster": "seeded-b",
                   "member": f"{PROJECT}/us-east1/seeded-b", "members": [f"{PROJECT}/us-east1/seeded-b", f"{PROJECT}/us-central1-a/seeded-b"]}
-        doc5, _ = self.summary_for([seeded_b()], previous={"findings": [folded]}, claimed={f"{PROJECT}/us-central1-a/seeded-b"})
-        self.assertEqual(doc5["no_longer_reported_ids"], [folded["id"]])
+        lone = {"id": "upgrade-drain-blocking-budget.acme-prod.seeded-b.ns.east-only", "project": PROJECT, "cluster": "seeded-b",
+                "member": f"{PROJECT}/us-east1/seeded-b", "members": [f"{PROJECT}/us-east1/seeded-b"]}
+        doc5, _ = self.summary_for([seeded_b()], previous={"findings": [folded, lone]}, claimed={f"{PROJECT}/us-central1-a/seeded-b"})
+        self.assertEqual(doc5["no_longer_reported_ids"], [folded["id"], lone["id"]])
 
     def test_the_report_names_every_finding_with_its_id_and_action(self):
         doc, findings = self.summary_for([seeded_b()])

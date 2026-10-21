@@ -74,11 +74,14 @@ registers carries that prefix; `source` is `upgrade-readiness`).
 On the Saturday run the reads are already made. The job's pre-run script
 (`upgrade_readiness_brief_queue.py`) reads the queue before your turn starts, and its JSON is above
 the prompt under **Script Output**: `open` is the open backlog, `snoozed` and `dismissed` are the
-decided rows of each project in `projects`, all of them `upgrade-` rows, and `cut` names each page
-that came back full. This turn holds no `platform_control` tool, so it cannot read the queue
-again. When the output carries `error`, or the scheduler reports a script error, say in the
-headline that the queue was not read, and compose from the summary alone, without **Decided
-earlier**.
+decided rows of each project in `projects`, all of them `upgrade-` rows. An open critical row
+carries its `namespace`, `object`, `title` and `action`, for a line composed from the queue alone;
+every other row carries its state. `cut` names each page that came back full, and `unread` each
+page the script could not read: with any `unread` page, leave **Decided earlier** out, since its
+counts are not whole. This turn holds no `platform_control` tool, so it cannot read the queue
+again. When the output carries `error` (the open backlog itself was not read), or the scheduler
+reports a script error, say in the headline that the queue was not read, and compose from the
+summary alone, without **Decided earlier**.
 
 On request, make the reads yourself with two `platform_control` tools: `get_ranked_findings` for
 the open backlog, and `get_findings` with `state=snoozed`, then with `state=dismissed`, each with

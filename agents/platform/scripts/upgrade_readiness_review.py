@@ -1066,19 +1066,14 @@ def summary(
     reviewed_keys = {watch.member_key(m) for m in members if member_complete(m, errors)}
     if claimed is not None:
         reviewed_keys &= claimed
-    # A record written before rows carried their member names only project and
-    # cluster; such a row is judged by the pair, as the first review did.
+    # The queue lowers an absent row by its project and cluster, whichever member
+    # wrote it (findings_queue._downgrade_absent), so last week's row is judged by
+    # its pair too. Twins claim nothing, so a claimed pair names one cluster.
     reviewed_pairs = {tuple(key.split(watch.MEMBER_KEY_SEPARATOR)[:: len(watch.MEMBER_ID_KEYS) - 1]) for key in reviewed_keys}
     previous_ids = [
         r.get("id")
         for r in (previous or {}).get("findings") or []
-        if r.get("id")
-        and (
-            # Any member a folded row stands for, as the queue reaches the row from any of them.
-            any(m in reviewed_keys for m in (r.get(ROW_MEMBERS_KEY) or [r[ROW_MEMBER_KEY]]))
-            if r.get(ROW_MEMBER_KEY)
-            else (str(r.get("project") or ""), str(r.get("cluster") or "")) in reviewed_pairs
-        )
+        if r.get("id") and (str(r.get("project") or ""), str(r.get("cluster") or "")) in reviewed_pairs
     ]
     return {
         "version": SUMMARY_VERSION,

@@ -4,8 +4,8 @@ reads it, read before the brief's model turn starts.
 
 ``upgrade-readiness-weekly-brief`` is a model turn over names a tenant can
 write: budget, webhook and workload names reach it in the review's summary and
-in the queue's rows. Its roster entry therefore gives it no MCP server
-(``enabled_toolsets`` carries ``no_mcp``), so the turn holds no
+in the queue's rows. Its roster entry therefore gives it the terminal tool and
+no MCP server (``enabled_toolsets`` carries ``no_mcp``), so the turn holds no
 ``platform_control`` tool, and nothing it reads can make it register, verify
 or decide a finding. The queue reads step 2 of its SOP needs are made here
 instead: the scheduler runs this script before the turn (the entry's
@@ -15,11 +15,15 @@ instead: the scheduler runs this script before the turn (the entry's
 - ``snoozed`` and ``dismissed``: ``GET /v1/findings`` by state, at the queue's
   page limit, for each project in ``projects`` (the ones the review's summary
   names, and any other the open backlog holds).
-- ``cut``: each of those pages that came back full, so its count is a floor.
+- ``cut``: each of those pages that came back full, so its count is a floor;
+  ``unread``: each one the script could not read.
 
-Each list keeps only the rows whose check starts with ``upgrade-``, with the
-fields the brief composes from. A read that fails prints ``error`` alone and
-exits 0: the turn still runs, and its SOP has it say the queue was not read.
+Each list keeps only the rows whose check starts with ``upgrade-``. An open
+critical row carries what a Decide-now line names, since the brief may compose
+that line from the queue alone; every other row carries its state alone, which
+keeps the prompt small on a large fleet. A backlog that cannot be read prints
+``error`` alone and exits 0: the turn still runs, and its SOP has it say the
+queue was not read. A decided page that cannot be read costs only its count.
 """
 
 from __future__ import annotations
@@ -30,13 +34,17 @@ import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import findings_queue  # noqa: E402
 import upgrade_readiness_review as review  # noqa: E402
 
 RANKED_PATH = review.KV_FINDINGS_PATH + "/ranked"
 DECIDED_STATES = ("snoozed", "dismissed")
-PAGE_LIMIT = 1000  # the most rows one GET /v1/findings returns (findings_queue.list_findings)
-OPEN_FIELDS = ("id", "state", "severity", "check", "project", "cluster", "namespace", "object", "title", "recommendation")
-DECIDED_FIELDS = ("id", "severity", "project", "cluster", "snoozed_until")
+PAGE_LIMIT = findings_queue.MAX_LIST_LIMIT
+DETAILED_SEVERITY = "critical"
+DETAIL_FIELDS = ("id", "state", "severity", "check", "project", "cluster", "namespace", "object", "title")
+STATE_FIELDS = ("id", "state", "severity", "check", "project", "cluster", "snoozed_until")
+RECOMMENDATION_KEY = "recommendation"
+ACTION_KEY = "action"
 ERROR_PREFIX = "the findings queue could not be read: "
 
 
@@ -47,9 +55,18 @@ def page_rows(answer: dict) -> list:
     return rows
 
 
-def upgrade_rows(rows: list, fields: tuple[str, ...]) -> list[dict]:
+def brief_row(row: dict, detailed: bool) -> dict:
+    fields = DETAIL_FIELDS if detailed else STATE_FIELDS
+    kept = {key: row[key] for key in fields if row.get(key) not in (None, "")}
+    recommendation = row.get(RECOMMENDATION_KEY)
+    if detailed and isinstance(recommendation, dict) and recommendation.get(ACTION_KEY):
+        kept[ACTION_KEY] = recommendation[ACTION_KEY]
+    return kept
+
+
+def upgrade_rows(rows: list, open_backlog: bool) -> list[dict]:
     return [
-        {key: row[key] for key in fields if row.get(key) not in (None, "")}
+        brief_row(row, open_backlog and row.get("severity") == DETAILED_SEVERITY)
         for row in rows
         if isinstance(row, dict) and str(row.get("check") or "").startswith(review.CHECK_PREFIX)
     ]
@@ -66,18 +83,25 @@ def summary_projects() -> list[str]:
 
 
 def queue_view() -> dict:
-    open_rows = upgrade_rows(page_rows(review.kv_request(RANKED_PATH)), OPEN_FIELDS)
+    open_rows = upgrade_rows(page_rows(review.kv_request(RANKED_PATH)), open_backlog=True)
     projects = sorted(set(summary_projects()) | {r["project"] for r in open_rows if r.get("project")})
     decided: dict[str, list[dict]] = {state: [] for state in DECIDED_STATES}
-    cut = []
+    cut, unread = [], []
     for state in DECIDED_STATES:
         for project in projects:
-            query = urllib.parse.urlencode({"state": state, "project": project, "limit": PAGE_LIMIT})
-            rows = page_rows(review.kv_request(f"{review.KV_FINDINGS_PATH}?{query}"))
+            page = {"state": state, "project": project}
+            query = urllib.parse.urlencode({**page, "limit": PAGE_LIMIT})
+            try:
+                rows = page_rows(review.kv_request(f"{review.KV_FINDINGS_PATH}?{query}"))
+            except (OSError, ValueError) as exc:
+                # The backlog already read still says which rows nobody has decided;
+                # only this page's count is lost.
+                unread.append({**page, "error": str(exc)})
+                continue
             if len(rows) >= PAGE_LIMIT:
-                cut.append({"state": state, "project": project})
-            decided[state] += upgrade_rows(rows, DECIDED_FIELDS)
-    return {"projects": projects, "open": open_rows, **decided, "cut": cut}
+                cut.append(page)
+            decided[state] += upgrade_rows(rows, open_backlog=False)
+    return {"projects": projects, "open": open_rows, **decided, "cut": cut, "unread": unread}
 
 
 def main() -> int:
