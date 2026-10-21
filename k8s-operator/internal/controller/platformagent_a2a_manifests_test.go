@@ -6714,13 +6714,18 @@ func TestUserAuthoredContainersCannotMountTheBusTokenByName(t *testing.T) {
 			"is the retired `worker` credential rebuilt", a2aBusTokenVolume, slices.Sorted(maps.Keys(holders)))
 	}
 
-	// The sidecar keeps everything it is entitled to.
+	// The sidecar keeps everything it is entitled to, plus the bus CA bundle
+	// the operator adds to every declared sidecar.
 	for _, c := range spec.Containers {
 		if c.Name != "hermes-bridge" {
 			continue
 		}
-		if len(c.VolumeMounts) != 1 || c.VolumeMounts[0].Name != "agent-data" {
-			t.Errorf("the strip took a mount it has no claim on: %+v", c.VolumeMounts)
+		var names []string
+		for _, m := range c.VolumeMounts {
+			names = append(names, m.Name)
+		}
+		if !slices.Equal(names, []string{"agent-data", a2aNATSCABundleVolumeName}) {
+			t.Errorf("the strip took a mount it has no claim on, or kept one: %+v", c.VolumeMounts)
 		}
 	}
 

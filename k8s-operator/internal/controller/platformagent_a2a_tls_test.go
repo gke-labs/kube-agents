@@ -373,8 +373,9 @@ func TestTheCardPublishersTrustIsReadFromTheBundleOnEachHandshake(t *testing.T) 
 }
 
 // A Secret that carries the CA's name but that this PlatformAgent does not
-// control is not signed with: it is replaced and taken over, so whoever could
-// create a Secret in the namespace first cannot choose the bus's CA.
+// control is not signed with: it is replaced and taken over. This pins the
+// collision case; a planted Secret carrying a forged controller reference is
+// still trusted (see ensureA2ANATSCA).
 func TestEnsureA2ANATSTLSTakesOverAnUnownedCASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	scheme := setupScheme()
