@@ -844,7 +844,7 @@ class OverridesTest(unittest.TestCase):
 
     def test_a_home_the_sandbox_has_not_received_says_nothing(self):
         def fake(argv, **kwargs):
-            return subprocess.CompletedProcess(argv, 1, "", "find: '/sandbox-root/profiles/platform': No such file or directory")
+            return subprocess.CompletedProcess(argv, 1, "", "/usr/bin/find: '/sandbox-root/profiles/platform': No such file or directory")
 
         sweep = self.sweep(Path("/sandbox-root"), fake)
         self.assertEqual(sweep.warnings, [])
@@ -865,6 +865,22 @@ class OverridesTest(unittest.TestCase):
         sweep = self.sweep(Path("/sandbox-root"), fake)
         self.assertEqual(sweep.overrides_removed, ["sandbox platform/skills_override"])
         self.assertTrue(any("exited 1" in w for w in sweep.warnings), sweep.warnings)
+
+    def test_thousands_of_planted_trees_cost_one_extra_rm(self):
+        names = [f"x{i:05d}_override" for i in range(gc.INVENTORY_LIMIT + 500)]
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if argv[1] == "-P":
+                return subprocess.CompletedProcess(argv, 0, "d\nd\n", "")
+            if argv[0] == gc.REMOTE_FIND:
+                return subprocess.CompletedProcess(argv, 0, _find_output(*[(n, "1", "4096", "d") for n in names]), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        sweep = self.sweep(Path("/sandbox-root"), fake)
+        self.assertEqual(len([a for a in calls if a[0] == gc.REMOTE_RM]), gc.INVENTORY_LIMIT + 1)
+        self.assertEqual(len(sweep.overrides_removed), len(names))
 
     def test_one_unremovable_tree_does_not_hide_the_others(self):
         rhome = Path("/sandbox-root") / "profiles" / "platform"

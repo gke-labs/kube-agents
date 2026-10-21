@@ -35,6 +35,9 @@ SHIPPED_ROOTS = ("agents", "deploy")
 # or anything under a profile home, which is the worker's to write.
 FORBIDDEN = re.compile(r"_override\b|/opt/data/profiles\b")
 PYTHONPATH_LINE = re.compile(r"PYTHONPATH\+?=\S*")
+# An override tree as a path in a config (a skill directory, say), not a key
+# that merely ends in the suffix.
+CONFIG_OVERRIDE_PATH = re.compile(r"[\w./-]*(?:/[\w.-]*_override\b|_override/)[\w./-]*")
 
 
 def shipped(suffix: str) -> list[Path]:
@@ -180,6 +183,11 @@ class ShippedImportPathsTest(unittest.TestCase):
             self.assertGreaterEqual(count, 1, source)
             self.assertTrue([s for s in strings if FORBIDDEN.search(s)], source)
 
+    def test_the_config_check_wants_a_path_not_a_key(self):
+        self.assertIsNone(CONFIG_OVERRIDE_PATH.search("image_override: true"))
+        self.assertTrue(CONFIG_OVERRIDE_PATH.search("external_dirs: [/opt/data/profiles/platform/skills_override]"))
+        self.assertTrue(CONFIG_OVERRIDE_PATH.search("dir: skills_override/fleet-audit"))
+
     def test_pythonpath_append_in_shell_is_read(self):
         self.assertTrue(FORBIDDEN.search(PYTHONPATH_LINE.search("PYTHONPATH+=:/opt/data/profiles/platform/x").group(0)))
 
@@ -191,7 +199,7 @@ class ShippedImportPathsTest(unittest.TestCase):
             for path in shipped(suffix):
                 text = path.read_text(encoding="utf-8", errors="replace")
                 offenders.extend(f"{path.relative_to(REPO)}: {m.group(0)}"
-                                 for m in re.finditer(r"[\w./-]*_override\b[\w./-]*", text))
+                                 for m in CONFIG_OVERRIDE_PATH.finditer(text))
         self.assertEqual(offenders, [])
 
     def test_the_walk_catches_a_built_path(self):

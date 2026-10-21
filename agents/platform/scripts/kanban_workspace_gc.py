@@ -717,7 +717,8 @@ def _remote_overrides(home: Path, sweep: Sweep) -> list[str]:
         # worker locked from its own shell or an entry that vanished mid-listing,
         # is reported, and whatever the listing did return is still swept.
         stderr = (result.stderr or "").strip()
-        if not found and stderr == f"{REMOTE_FIND.rsplit('/', 1)[-1]}: '{home}': No such file or directory":
+        # GNU find prefixes the message with argv[0], which is the full path here.
+        if not found and "\n" not in stderr and stderr.endswith(f": '{home}': No such file or directory"):
             return []
         sweep.warnings.append(f"listing {home} in the sandbox exited {result.returncode}; override trees it "
                               f"didn't list were not checked: {stderr[:STDERR_EXCERPT_CHARS]}")
@@ -760,11 +761,15 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
             sweep.warnings.append(f"could not confirm {remote_home} in the sandbox is a real directory (a symlink, "
                                   f"or the check failed); its override trees were not removed")
             found = []
-        for entry in found:
-            # One rm per tree, so a tree the worker made unremovable doesn't hide
-            # the ones that did go from the log.
+        # One rm per tree, so a tree the worker made unremovable doesn't hide the
+        # ones that did go from the log.  Past INVENTORY_LIMIT the rest go in one
+        # call, so a worker that planted thousands costs one more exec, not one each.
+        batches = [[entry] for entry in found[:INVENTORY_LIMIT]]
+        if found[INVENTORY_LIMIT:]:
+            batches.append(found[INVENTORY_LIMIT:])
+        for batch in batches:
             before = len(sweep.remote_removed)
-            _remove_remote(remote_home, [entry], sweep)
+            _remove_remote(remote_home, batch, sweep)
             removed = sweep.remote_removed[before:]
             del sweep.remote_removed[before:]
             sweep.overrides_removed.extend(f"sandbox {name}/{e}" for e in removed)
