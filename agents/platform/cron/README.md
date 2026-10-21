@@ -313,7 +313,9 @@ webhook, a pool past or at the skew ceiling, a covering exclusion, and each read
 once the report carries rules) into a finding on the findings queue, through the Session KV
 server's `POST /v1/findings` route, reached at the endpoint and with the key `findings_nudge.py`
 uses. Each project is registered as soon as its run returns, so a run the hour cuts short keeps
-what it registered. The queue's identity rule makes next Saturday's run an update of the same row;
+what it registered. The sends have ten minutes of their own past the reads, each waiting no longer
+than what is left, and a batch with no time left is booked as not sent, so a queue that hangs
+cannot hold the run past the hour before it writes its record. The queue's identity rule makes next Saturday's run an update of the same row;
 its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
 webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
 and a webhook refusing only what it matches today are major; a covering exclusion is minor; a

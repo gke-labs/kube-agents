@@ -55,7 +55,10 @@ class FakeQueue:
             return {"findings": self.ranked}
         query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(path).query))
         self.assertLimit(query)
-        return {"findings": self.decided.get((query["state"], query["project"]), [])}
+        if "project" in query:
+            return {"findings": self.decided.get((query["state"], query["project"]), [])}
+        # A page across every project, as the queue lists one with no project filter.
+        return {"findings": [r for (state, _), rows in self.decided.items() if state == query["state"] for r in rows]}
 
     @staticmethod
     def assertLimit(query):
@@ -110,7 +113,24 @@ class TheQueueView(unittest.TestCase):
         self.assertEqual(asked, [("dismissed", OTHER_PROJECT), ("dismissed", PROJECT), ("snoozed", OTHER_PROJECT), ("snoozed", PROJECT)])
         self.assertEqual(view["snoozed"], [{"id": "upgrade-pdb:s", "state": "snoozed", "severity": "critical", "check": "upgrade-pdb", "project": OTHER_PROJECT, "cluster": "seeded-b", "snoozed_until": "2026-11-01T00:00:00Z"}])
 
+    def test_without_the_summary_each_state_is_read_across_every_project(self):
+        # Nothing but the summary names a project whose rows are all decided: without it the
+        # read does not ask per project, so that project's dismissed rows are still counted.
+        queue = FakeQueue([row("upgrade-pdb:a")], {("dismissed", OTHER_PROJECT): [row("upgrade-pdb:d", state="dismissed", project=OTHER_PROJECT)]})
+        code, view = self.run_main(queue)
+        self.assertEqual(code, 0)
+        asked = [dict(urllib.parse.parse_qsl(urllib.parse.urlparse(p).query)) for p in queue.paths[1:]]
+        self.assertEqual(sorted(q["state"] for q in asked), ["dismissed", "snoozed"])
+        self.assertTrue(all("project" not in q for q in asked))
+        self.assertEqual([r["id"] for r in view["dismissed"]], ["upgrade-pdb:d"])
+        self.assertEqual(view["projects"], [OTHER_PROJECT, PROJECT])
+
+    def test_an_accepted_critical_carries_its_state_alone(self):
+        code, view = self.run_main(FakeQueue([row("upgrade-pdb:a", state="accepted")]))
+        self.assertEqual(set(view["open"][0]), {"id", "state", "severity", "check", "project", "cluster"})
+
     def test_a_full_page_is_named_cut(self):
+        self.write_summary([PROJECT])
         full = [row(f"cost:{n}", check="cost-idle-node", state="dismissed") for n in range(brief_queue.PAGE_LIMIT)]
         code, view = self.run_main(FakeQueue([row("upgrade-pdb:a")], {("dismissed", PROJECT): full}))
         self.assertEqual(view["cut"], [{"state": "dismissed", "project": PROJECT}])
@@ -125,6 +145,7 @@ class TheQueueView(unittest.TestCase):
         self.assertEqual(view, {"error": brief_queue.ERROR_PREFIX + "HTTP 503 Service Unavailable"})
 
     def test_a_decided_page_it_cannot_read_costs_only_that_count(self):
+        self.write_summary([PROJECT])
         queue = FakeQueue([row("upgrade-pdb:a")])
         answer = queue.__call__
 

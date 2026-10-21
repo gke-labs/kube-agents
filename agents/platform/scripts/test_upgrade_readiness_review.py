@@ -250,7 +250,7 @@ class Registration(unittest.TestCase):
     def test_batches_per_cluster_with_scope_only_when_complete(self):
         calls = []
 
-        def fake_request(path, body):
+        def fake_request(path, body, timeout=None):
             calls.append((path, body))
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
@@ -268,10 +268,29 @@ class Registration(unittest.TestCase):
         self.assertEqual(set(outcomes.values()), {"created"})
         self.assertEqual(len(outcomes), len(findings))
 
+    def test_the_sends_wait_only_what_is_left_and_a_batch_past_the_stop_is_booked_not_sent(self):
+        timeouts = []
+
+        def fake_request(path, body, timeout=None):
+            timeouts.append(timeout)
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
+
+        findings = review.member_findings(seeded_b())
+        with mock.patch.object(review, "kv_request", fake_request), mock.patch.object(review.time, "monotonic", return_value=1000.0):
+            # Ten seconds left: the send waits ten, not the full timeout.
+            review.register([seeded_b()], [], findings, stop=1010.0)
+            self.assertEqual(timeouts, [10.0])
+            # Nothing left: no send, every row booked as not sent, and the claim counted as lost.
+            outcomes, problems, claimed = review.register([seeded_b()], [], findings, stop=1000.0)
+        self.assertEqual(timeouts, [10.0])
+        self.assertEqual(set(outcomes.values()), {review.REGISTRATION_FAILED})
+        self.assertEqual(claimed, set())
+        self.assertEqual(problems, [f"{PROJECT}/seeded-b: {review.CLAIM_FAILED_MARK}: {review.REGISTRATION_OUT_OF_TIME_DETAIL}"])
+
     def test_a_complete_cluster_with_nothing_to_report_sends_an_empty_scoped_batch(self):
         calls = []
 
-        def fake_request(path, body):
+        def fake_request(path, body, timeout=None):
             calls.append(body)
             return {"results": [], "downgraded": 0}
 
@@ -290,7 +309,7 @@ class Registration(unittest.TestCase):
     def test_an_answer_that_does_not_acknowledge_the_batch_registers_nothing_and_lands_no_claim(self):
         # A redirected POST that urllib turned into a GET answers the findings list: a dict,
         # status 200, no results. Neither its rows nor its claim count as registered.
-        def listing_answer(path, body):
+        def listing_answer(path, body, timeout=None):
             return {"findings": []}
 
         members = [seeded_b(), member("seeded-c")]
@@ -303,10 +322,10 @@ class Registration(unittest.TestCase):
         self.assertTrue(all(review.CLAIM_FAILED_MARK in p and "no list of results" in p and "no count of the rows" in p for p in problems), problems)
 
         # Results for some rows only, or a claim answered without the count it lowered, are refused too.
-        def partial_answer(path, body):
+        def partial_answer(path, body, timeout=None):
             return {"results": [{"id": review.item_id(item), "outcome": "created"} for item in findings[:1]], "downgraded": 0}
 
-        def no_count(path, body):
+        def no_count(path, body, timeout=None):
             return {"results": [{"id": fq.validate_finding(f)["id"], "outcome": "created"} for f in body["findings"]]}
 
         with mock.patch.object(review, "kv_request", partial_answer):
@@ -327,7 +346,7 @@ class Registration(unittest.TestCase):
         self.assertTrue(all("no count of the rows the claim lowered" in p and "without a result" not in p for p in problems), problems)
 
         # A result for an id the batch never sent is not this batch's answer, whatever else it holds.
-        def extra_id(path, body):
+        def extra_id(path, body, timeout=None):
             results = [{"id": fq.validate_finding(f)["id"], "outcome": "created"} for f in body["findings"]]
             return {"results": results + [{"id": "upgrade-pool-skew.elsewhere.other._.pool", "outcome": "created"}], "downgraded": 0}
 
@@ -340,7 +359,7 @@ class Registration(unittest.TestCase):
     def test_a_cluster_past_the_batch_limit_is_sent_in_pieces_without_a_claim(self):
         calls = []
 
-        def fake_request(path, body):
+        def fake_request(path, body, timeout=None):
             calls.append(body)
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
@@ -357,7 +376,7 @@ class Registration(unittest.TestCase):
     def test_a_cluster_sent_in_pieces_anyway_counts_no_withheld_claim_for_a_refused_row(self):
         """A refused row withholds a claim only where one would have been sent: a cluster
         past the batch limit claims nothing either way, so no lost claim is counted."""
-        def fake_request(path, body):
+        def fake_request(path, body, timeout=None):
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
         big = member("seeded-z", "blocked", pdbs={"blocking": [budget(name=f"b{i}") for i in range(3)]})
@@ -386,7 +405,7 @@ class Registration(unittest.TestCase):
         self.addCleanup(conn.close)
         calls = []
 
-        def through_the_queue(path, body):
+        def through_the_queue(path, body, timeout=None):
             calls.append(body)
             return fq.register_findings(conn, body["findings"], body.get("scope"))
 
@@ -412,7 +431,7 @@ class Registration(unittest.TestCase):
     def test_twins_whose_objects_coincide_share_one_finding(self):
         calls = []
 
-        def fake_request(path, body):
+        def fake_request(path, body, timeout=None):
             calls.append(body)
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
@@ -495,7 +514,7 @@ class Registration(unittest.TestCase):
     def test_a_row_the_queue_would_refuse_fails_alone(self):
         calls = []
 
-        def fake_request(path, body):
+        def fake_request(path, body, timeout=None):
             calls.append(body)
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
@@ -560,7 +579,7 @@ class Registration(unittest.TestCase):
         self.assertIn("object is required", str(caught.exception))
 
     def test_a_failed_batch_is_reported_and_marks_its_rows(self):
-        def failing(path, body):
+        def failing(path, body, timeout=None):
             raise OSError("connection refused")
 
         members = [seeded_b()]
@@ -774,7 +793,7 @@ class TheTick(unittest.TestCase):
         self.asked = (names, readiness, scope, timeout)
         return self.envelope
 
-    def fake_kv(self, path, body):
+    def fake_kv(self, path, body, timeout=None):
         self.registered.append(body)
         return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 
@@ -1170,7 +1189,7 @@ class TheTick(unittest.TestCase):
             events.append(("run", names[0]))
             return self.envelope
 
-        def kv(path, body):
+        def kv(path, body, timeout=None):
             events.append(("kv", body["scope"]["cluster"] if "scope" in body else body["findings"][0]["cluster"]))
             return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
 

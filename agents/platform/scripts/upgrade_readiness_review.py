@@ -191,13 +191,17 @@ TEXT_KEY = "text"
 SUMMARY_KEY = "summary"
 
 # The per-run budget: the watch's readiness timeout per project, the watch's
-# whole-tick budget for the run (Hermes kills a no_agent script at an hour, as
+# whole-tick budget for the reads (Hermes kills a no_agent script at an hour, as
 # the watch records), and a floor under which a project is not started. Each
 # project is registered as soon as it returns, so a run the hour cuts short
-# keeps what it registered; the record is written at the end.
+# keeps what it registered. Registration has its own share past the reads, and
+# a batch it cannot send by then is booked as not sent, so a queue that hangs
+# cannot hold the run past the hour before the record is written at the end.
 PROJECT_TIMEOUT_SECONDS = watch.READINESS_TIMEOUT_SECONDS
 MIN_PROJECT_RUN_SECONDS = 120
 TOTAL_BUDGET_SECONDS = watch.TICK_BUDGET_SECONDS
+REGISTRATION_GRACE_SECONDS = 600
+REGISTRATION_OUT_OF_TIME_DETAIL = "not sent: the run's time for the queue ran out"
 
 # The rubric (findings_queue §4.2: B, L, detect, recover, C percent), by kind.
 # Severity falls out of it: `critical` at 150 and above or at the L>=10, B>=3
@@ -397,7 +401,7 @@ def kv_endpoint() -> str:
     return (os.environ.get(KV_ENDPOINT_ENV) or DEFAULT_KV_ENDPOINT).rstrip("/")
 
 
-def kv_request(path: str, body: dict | None = None) -> dict:
+def kv_request(path: str, body: dict | None = None, timeout: float = KV_TIMEOUT_SECONDS) -> dict:
     """POST ``body`` to the queue, or GET ``path`` when there is no body."""
     data = None if body is None else json.dumps(body).encode("utf-8")
     headers = {} if body is None else {"Content-Type": "application/json"}
@@ -407,7 +411,7 @@ def kv_request(path: str, body: dict | None = None) -> dict:
     method = "GET" if body is None else "POST"
     req = urllib.request.Request(f"{kv_endpoint()}{path}", data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=KV_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             answer = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         # The queue says which row or field it refused, or that it is busy, in
@@ -910,7 +914,7 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
 # --- registering ------------------------------------------------------------------
 
 
-def register(members: list[dict], errors: list[dict], findings: list[dict]) -> tuple[dict[str, str], list[str], set[str]]:
+def register(members: list[dict], errors: list[dict], findings: list[dict], stop: float | None = None) -> tuple[dict[str, str], list[str], set[str]]:
     """Register the findings member by member, each batch with its scope when
     the cluster was read in full (a complete cluster with nothing to report
     sends an empty batch with the scope). Returns the outcome per id, the
@@ -924,7 +928,9 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
     here before it is sent, so one the queue would refuse fails alone instead
     of its whole batch; its cluster then sends no claim, which would book that
     finding's row absent, and the claim is counted as one that did not reach
-    the queue."""
+    the queue. ``stop`` (a ``time.monotonic`` instant) bounds the sends: each
+    waits at most what is left, and a batch with nothing left is booked as not
+    sent, its claim with it."""
     outcomes: dict[str, str] = {}
     problems: list[str] = []
     claimed: set[str] = set()
@@ -971,8 +977,11 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                 # the rows this job wrote in its family, never the `upgrade-` rows the audit
                 # streams or the retrospective write under their own sources.
                 body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX, "source": SOURCE}
+            left = KV_TIMEOUT_SECONDS if stop is None else min(KV_TIMEOUT_SECONDS, stop - time.monotonic())
             try:
-                answer = kv_request(KV_FINDINGS_PATH, body)
+                if left <= 0:
+                    raise OSError(REGISTRATION_OUT_OF_TIME_DETAIL)
+                answer = kv_request(KV_FINDINGS_PATH, body, timeout=left)
                 sent = {item_id(item) for item in chunk}
                 results = answer.get(ANSWER_RESULTS_KEY)
                 acknowledged = {str(r["id"]) for r in results if isinstance(r, dict) and r.get("id")} if isinstance(results, list) else set()
@@ -1362,12 +1371,15 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     problems: list[str] = []
     claimed: set[str] = set()
 
+    # The reads end at the budget; the sends have their own share after it.
+    stop = time.monotonic() + TOTAL_BUDGET_SECONDS + REGISTRATION_GRACE_SECONDS
+
     def registered(found: list[dict], read_errors: list[dict]) -> None:
         items = fold_shared_ids([item for member in found for item in member_findings(member)])
         findings.extend(items)
         if dry_run:
             return
-        got, bad, done = register(found, read_errors, items)
+        got, bad, done = register(found, read_errors, items, stop)
         outcomes.update(got)
         problems.extend(bad)
         claimed.update(done)
