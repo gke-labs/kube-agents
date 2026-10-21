@@ -28,9 +28,10 @@ Ready and tainted, slot b's control plane is still one minor behind its
 channel -- and reports the roles whose fixture is there but not in the shape
 the cases depend on. One role asserts the room the others schedule into:
 `default-pool-headroom` reads seeded-a's default-pool nodes and every pod
-bound to them and fails when the busier node has less CPU unrequested than
-the next fixture needs (#3607: a 10m DaemonSet pod stranded for three days
-and read as drift on its own role, which a re-apply cannot fix).
+bound to them and fails when the busier node drops below the headroom margin
+the scan keeps for the next fixtures, ten of them at 10m (#3607: a 10m
+DaemonSet pod stranded for three days and read as drift on its own role,
+which a re-apply cannot fix).
 
 It runs in two places. `scripts/verify_ci_pool_project.py` runs it after the
 presence pass and fails a project whose fixtures have drifted. The CI health
@@ -85,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -525,12 +527,15 @@ def _millicores(quantity) -> float:
     text = str(quantity if quantity is not None else "").strip()
     if not text:
         return 0.0
+    # float() admits "inf", "NaN" and an overflowing exponent, none of which
+    # the API server serialises; they count as nothing rather than taking the
+    # pass down when the difference is converted to an integer.
     for suffix, factor in CPU_SUFFIX_MILLICORES.items():
         if text.endswith(suffix):
             n = _number(text[: -len(suffix)])
-            return n * factor if n is not None else 0.0
+            return n * factor if n is not None and math.isfinite(n) else 0.0
     n = _number(text)
-    return n * MILLICORES_PER_CORE if n is not None else 0.0
+    return n * MILLICORES_PER_CORE if n is not None and math.isfinite(n) else 0.0
 
 
 def _pod_cpu_request(pod: dict) -> float:

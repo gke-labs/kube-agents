@@ -566,9 +566,17 @@ ADVICE_FIXTURE_DRIFT = (
 # the same split for the Chat message and the tracking issue.
 CAPACITY_ROLES = frozenset({"default-pool-headroom"})
 ADVICE_FIXTURE_CAPACITY = (
-    "A red on a case that needs a pod placed on seeded-a's default pool from a run that leased {projects} is the pool being full, not your change;"
-    " {roles} reads capacity, a re-apply changes nothing, and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is the fix:"
-    " if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands."
+    "A red on a case that needs a pod placed on seeded-a's default pool from a run that leased {projects} is the pool running out of room, not your change;"
+    " {roles} reads capacity: the pool is below the headroom margin the scan keeps for the next fixtures, a re-apply changes nothing,"
+    " and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is the fix: if a size change has just merged, the postsubmit reconcile"
+    " is rolling it project by project and the scans clear as it lands."
+)
+# Appended to the re-apply advice when a capacity role drifts beside planted
+# ones, the usual shape: a pool that fills strands a fixture whose own role
+# then drifts too.
+ADVICE_FIXTURE_CAPACITY_MIXED = (
+    " {roles} beside them reads capacity: seeded-a's default pool is below the headroom margin the scan keeps for the next fixtures,"
+    " a re-apply changes nothing for it, and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is its fix."
 )
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
@@ -1978,11 +1986,15 @@ def advice_for(
     if condition == FIXTURE_DRIFT:
         incident = incident or {}
         roles = list(incident.get("roles") or [])
-        template = ADVICE_FIXTURE_CAPACITY if roles and set(roles) <= CAPACITY_ROLES else ADVICE_FIXTURE_DRIFT
-        return template.format(
-            roles=", ".join(incident.get("roles") or []) or "the drifted fixture roles",
+        capacity = [role for role in roles if role in CAPACITY_ROLES]
+        template = ADVICE_FIXTURE_CAPACITY if roles and len(capacity) == len(roles) else ADVICE_FIXTURE_DRIFT
+        advice = template.format(
+            roles=", ".join(roles) or "the drifted fixture roles",
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
+        if capacity and len(capacity) < len(roles):
+            advice += ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=", ".join(capacity))
+        return advice
     if condition == POOL_DRIFT:
         return _pool_drift_advice(incident or {})
     return ADVICE_SETUP

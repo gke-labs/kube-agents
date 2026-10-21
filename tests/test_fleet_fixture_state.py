@@ -598,6 +598,15 @@ class EvaluateTest(unittest.TestCase):
         problem = ffs.evaluate(entry, [node], pods_by_node=lambda: {"n1": [sidecar, overhead]})
         assert problem is not None and '"n1": 80' in problem, problem
 
+    def test_a_cpu_quantity_that_is_not_finite_counts_as_nothing_rather_than_crashing(self):
+        # float() admits "inf", "Infinity", "NaN" and "1e400"; the API server never serialises them,
+        # but a value that is not a quantity must not take the whole pass down with an OverflowError.
+        for bad in ("inf", "Infinity", "NaN", "1e400", "-inf"):
+            assert ffs._millicores(bad) == 0.0, bad
+        entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
+        node = {"metadata": {"name": "n1"}, "status": {"allocatable": {"cpu": "inf"}}}
+        assert ffs.evaluate(entry, [node], pods_by_node=lambda: {"n1": [_bound_pod("n1", "1e400")]}) is not None
+
     def test_a_node_still_registering_leaves_the_role_not_checked(self):
         entry = self._entry("node_cpu_spare_ge", 100, path=None, subject="node?cloud.google.com/gke-nodepool=default-pool")
         fresh = {"metadata": {"name": "surge"}, "status": {}}

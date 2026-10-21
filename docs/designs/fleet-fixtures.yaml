@@ -317,7 +317,7 @@ fixtures:
     objects:
       - nodepool/default-pool
     defect: >-
-      Not a defect: seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is full and a re-apply changes nothing
+      Not a defect: seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each so the next planted fixture can place; the one role whose drift means the pool is within ten fixtures of full and a re-apply changes nothing
 
   - role: intree-pd-volume
     slot: a

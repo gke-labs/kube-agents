@@ -630,7 +630,7 @@
           "path": null,
           "op": "node_cpu_spare_ge",
           "value": 100,
-          "why": "a 10m fixture pod places only on a node with that much CPU unrequested; below ten fixtures' worth on the busier node the next fixture strands a pod and its own role reads drifted. A re-apply changes nothing when the pool is full: the pool's machine_type or node_count in bench/tf/fleet/main.tf (seeded_a_default) is the fix"
+          "why": "a 10m fixture pod places only on a node with that much CPU unrequested, and 100m is ten fixtures' worth of warning: below it on the busier node the pool is a few fixtures from stranding one, which then reads as drift on its own role. A re-apply changes nothing for this role: the pool's machine_type or node_count in bench/tf/fleet/main.tf (seeded_a_default) is the fix"
         }
       ]
     },

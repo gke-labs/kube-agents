@@ -904,11 +904,12 @@ window, the evidence, and the reconcile — the daily run re-applies
 (`bench/tf/fleet/README.md`, "State and reconcile"; for `stalled-controller`
 drift where an in-cluster heal started the container, hand-delete the pod in `seeded-stall`
 and replace the Deployment if the condition persists; for `default-pool-headroom`, the role
-that asserts seeded-a's default pool has CPU unrequested for the next fixture, the Chat
-message and the health box's advice say instead that the pool is full and its size in
+that asserts seeded-a's default pool keeps 100m unrequested for the next fixtures, the Chat
+message and the health box's advice say that the pool is below that margin and its size in
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
-merged, and the issue carries that exception beside the re-apply paragraph, since a re-apply
-of a stack that is already applied changes nothing) — and the
+merged, beside the re-apply line when a planted role drifts too, and the issue carries the
+same exception beside the re-apply paragraph, since a re-apply of a stack that is already
+applied changes nothing) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies
 the stack in the projects named, and the bot comments here when a scan reads
 them healthy; the bot will not close it." An open

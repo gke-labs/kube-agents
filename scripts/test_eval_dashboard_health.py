@@ -2756,10 +2756,12 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
         self.assertEqual(result["advice"], health.ADVICE_FIXTURE_CAPACITY.format(roles=role, projects=project(1)))
         self.assertNotIn("re-applied", result["advice"])
-        # Mixed with a planted role, the re-apply advice stands; the Chat line carries both hints.
+        # Mixed with a planted role (the usual shape: a full pool strands a fixture, whose own role
+        # drifts too), the advice carries the re-apply line for the planted role and the capacity line.
         mixed = self.judge(with_capacity_role(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [role, DRIFT_ROLE]}), {project(1)}))
         self.assertEqual(mixed["condition"], "fixture_drift")
         self.assertIn("re-applied", mixed["advice"])
+        self.assertIn(health.ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=role), mixed["advice"])
 
     def test_the_same_role_on_the_same_project_two_scans_running_degrades(self):
         result = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [DRIFT_ROLE]}))
