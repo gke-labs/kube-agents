@@ -15,8 +15,8 @@ audit sweeps the projects read `ok` or `api-disabled` and the management
 project whatever its row read (the collectors read it themselves), names the
 ones the scope declares but the reconcile could not read, so the run accounts
 for them rather than reading as a full sweep, and lists nothing. It also
-hands over the clusters `spec.scope.exclude.clusters` names, which every fleet
-read leaves out (#3081): the scope is otherwise per project, so without them an
+hands over the clusters `spec.scope.exclude.clusters` names, which the collectors
+that list clusters leave out (#3081): the scope is otherwise per project, so without them an
 excluded cluster in a swept project is read like any other. An install that declares no scope has drawn
 no boundary; the answer is None there, and the audit keeps the listing it had.
 With no snapshot yet, or one that does not parse, the operator's render answers
@@ -232,8 +232,9 @@ class ScopeTargets:
         """The arguments that hand this scope to a collector, as an argument
         list (each flag and its value one token each) for a caller that builds
         the collector's argv itself, as the upgrade-readiness watch does:
-        `--scope-projects` with the sweep, and `--scope-unread` naming each
-        declared project the install could not read, as `project=outcome`.
+        `--scope-projects` with the sweep, `--scope-unread` naming each
+        declared project the install could not read, as `project=outcome`, and
+        `--scope-exclude-clusters` with the excluded clusters.
         With nothing readable the unread flag goes alone, so a collector handed
         it still knows a scope was declared and reports that rather than
         listing. Never empty: a declared scope with no row at all hands the
