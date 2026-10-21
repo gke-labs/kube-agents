@@ -25,8 +25,8 @@ the Slack path the install uses: the A2A gateway under PLATFORM_AGENT_MODE=next
 without Google Chat, the Hermes listener otherwise. It reads
 the install.env at the root of the checkout it sits in ($KUBE_AGENTS_INSTALL_ENV
 instead, when set) and scripts/installer/vars.sh, and prints the checklist
-only when SLACK_ENABLED=true there. install.sh runs it at the end of an install
-with Slack enabled; run it again at any time. It changes nothing on the
+only when SLACK_ENABLED=true there. install.sh runs it after every apply that
+leaves Slack on, --menu's Save & Apply included; run it again at any time. It changes nothing on the
 cluster, but like every installer step it records REGISTRY_PREFIX in
 vars.sh (not under --dry-run), asking for it first on a terminal when
 nothing sets it.
