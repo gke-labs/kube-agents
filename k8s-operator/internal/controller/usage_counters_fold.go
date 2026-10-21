@@ -15,7 +15,6 @@
 package controller
 
 import (
-	"math"
 	"slices"
 	"sort"
 	"time"
@@ -42,11 +41,15 @@ const (
 	// interval's count once, and a body that is not the listener's can raise
 	// a total by at most this much per poll.
 	usageDeltaCeiling int64 = 10000
-	// usageTotalCeiling is the read-back bound on a stored total: below the
-	// int64 headroom the status field has, so that a document a namespace
-	// editor raised can neither overflow the status patch nor wrap on the next
-	// add. A document past it is treated as absent.
-	usageTotalCeiling int64 = math.MaxInt64 / 2
+	// usageTotalCeiling is the read-back bound on a stored total: the largest
+	// integer a float64 holds exactly. The operator keeps a total as an int64
+	// end to end, but a reader that decodes the CR's JSON untyped, a dynamic
+	// client, jq, a collector in another language, gets a float64, and under
+	// this bound the number it reads is the number written. It is far below
+	// the int64 headroom the status field has, so a document a namespace
+	// editor raised can neither overflow the status patch nor wrap on the
+	// next add. A document past it is treated as absent.
+	usageTotalCeiling int64 = 1 << 53
 	// usageDocumentVersion is the document's layout. A later layout changes
 	// it, so that an older document is migrated where the layout allows
 	// (migrateUsageDocument) and re-seeded rather than read wrong otherwise.
@@ -74,7 +77,8 @@ const (
 	// counters project to, and the name the Warning for a failed listener
 	// carries. The field is in status.usage's first schema, so it has no
 	// pruning record of its own.
-	usageStatusFieldSessions = "sessionsTotal"
+	usageStatusFieldSessions          = "sessionsTotal"
+	usageCounterToolExecutionsBlocked = "toolExecutionsBlockedTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.
 	usagePodEntryKeySeparator = "/"
@@ -86,9 +90,9 @@ var (
 	// samples out.
 	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
 	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat}
-	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 )

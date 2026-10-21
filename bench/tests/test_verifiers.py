@@ -3863,6 +3863,90 @@ def test_finding_ids_scope_fails_on_a_malformed_delta_payload(token, github):
     assert _ledger_check(scope="finding_ids", required_phrases=["x"]).verify(5.0).status == "fail"
 
 
+_NAMED_SHOWN = "rbac-overgrant.seeded-a._.debug-binding"
+_NAMED_CUT = "service-selects-nothing.seeded-c.ns.orders"
+
+
+def _cut_body(listed: str = "") -> str:
+    """A body that shows one finding in full and cut the other for space."""
+    body = _ledger_body(
+        findings=f"#### debug-binding grants cluster-admin <!-- finding:{_NAMED_SHOWN} -->\n{listed}",
+        finding_ids=[_NAMED_SHOWN],
+    )
+    payload = json.dumps(sorted([_NAMED_SHOWN, _NAMED_CUT]), separators=(",", ":"))
+    return body + f"<!-- audit-findings-all: {payload} -->\n"
+
+
+def test_every_finding_named_fails_on_an_id_only_the_hidden_blocks_carry(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_cut_body()))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert _NAMED_CUT in res.reason
+    assert _NAMED_SHOWN not in res.reason
+
+
+def test_every_finding_named_passes_when_the_cut_finding_is_listed(token, github):
+    _stash_report()
+    listed = f"\n### Listed without detail (1)\n\n- **minor** — Service selects nothing (`{_NAMED_CUT}`)\n"
+    github.routes[_api()] = (200, _issue(_cut_body(listed)))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "pass", res.reason
+    assert "visible name for every filed finding" in res.reason
+
+
+def test_every_finding_named_passes_on_an_untruncated_body(token, github):
+    _stash_report()
+    body = _ledger_body(findings=f"#### debug-binding <!-- finding:{_NAMED_SHOWN} -->\n")
+    github.routes[_api()] = (200, _issue(body))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
+def test_every_finding_named_does_not_take_a_longer_id_for_a_cut_one(token, github):
+    _stash_report()
+    listed = f"\n- **minor** — Service selects nothing (`{_NAMED_CUT}-api`)\n"
+    github.routes[_api()] = (200, _issue(_cut_body(listed)))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert _NAMED_CUT in res.reason
+
+
+def test_every_finding_named_ignores_an_id_inside_an_html_comment(token, github):
+    _stash_report()
+    hidden = f"\n<!-- `{_NAMED_CUT}` -->\n"
+    github.routes[_api()] = (200, _issue(_cut_body(hidden)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "fail"
+
+
+def test_every_finding_named_does_not_grade_a_collector_held_id(token, github):
+    _stash_report()
+    held = f'\n<!-- audit-held:begin -->\n<!-- audit-held-ids: ["{_NAMED_CUT}"] -->\n<!-- audit-held:end -->\n'
+    github.routes[_api()] = (200, _issue(_cut_body(held)))
+    assert _ledger_check(every_finding_named=True).verify(5.0).status == "pass"
+
+
+def test_every_finding_named_fails_on_an_omission_notice_without_a_complete_block(token, github):
+    _stash_report()
+    body = _ledger_body(
+        findings=f"#### debug-binding <!-- finding:{_NAMED_SHOWN} -->\n\n"
+        "_3 further finding(s) are omitted from this description to stay inside GitHub's body limit._\n",
+        finding_ids=[_NAMED_SHOWN],
+    )
+    github.routes[_api()] = (200, _issue(body))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert "says 3 further finding(s) are omitted" in res.reason
+    assert "hidden id blocks" not in res.reason
+
+
+def test_every_finding_named_fails_without_a_delta_block(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=None)))
+    res = _ledger_check(every_finding_named=True).verify(5.0)
+    assert res.status == "fail"
+    assert "delta block" in res.reason
+
+
 def test_an_empty_finding_id_list_is_an_honest_empty_surface(token, github):
     _stash_report()
     github.routes[_api()] = (200, _issue(_ledger_body(finding_ids=[])))

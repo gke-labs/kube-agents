@@ -294,8 +294,11 @@ def status_node(context, state, description=""):
 PUSHED = "2026-10-13T10:00:00Z"
 
 
-def removal(actor="octocat", at="2026-10-13T11:00:00Z"):
-    return {"createdAt": at, "actor": {"login": actor}}
+def removal(actor="octocat", at="2026-10-13T11:00:00Z", reason=None):
+    event = {"createdAt": at, "actor": {"login": actor}}
+    if reason is not None:
+        event["reason"] = reason
+    return event
 
 
 def node(number, labels, auto_merge=False, queue_entry=None, contexts=(), timeline=(), pushed=PUSHED):
@@ -362,6 +365,37 @@ class SweepTest(unittest.TestCase):
         lines, failures = gate.sweep(api)
         self.assertEqual((failures, api.mutations), (0, []))
         self.assertTrue(any("left out" in line for line in lines))
+
+    def test_a_left_out_line_carries_the_reason_and_the_re_add_command(self):
+        api = FakeAPI(nodes=[node(7, APPROVED, timeline=[removal("github-merge-queue", reason="failed_checks")])])
+        lines, _ = gate.sweep(api)
+        self.assertIn(
+            "#7: left out, removed 2026-10-13T11:00:00Z by github-merge-queue (reason: failed_checks). "
+            "To re-add (a write user): gh api graphql -f query='mutation { enablePullRequestAutoMerge("
+            'input: {pullRequestId: "PR_7"}) { clientMutationId } }\', '
+            "or push a fix (a push drops lgtm unless the author is in gke-labs/Googlers).",
+            lines,
+        )
+
+    def test_a_left_out_line_names_whatever_reason_the_queue_gave(self):
+        for reason, shown in (("failed_checks", "failed_checks"), ("manual", "manual"), (None, "unknown"), ("", "unknown")):
+            with self.subTest(reason=reason):
+                pull = {"number": 7, "id": "PR_7", "removal": removal("octocat", reason=reason)}
+                self.assertIn(f"(reason: {shown})", gate.left_out_line(pull))
+
+    def test_a_left_out_line_survives_a_removal_with_no_actor(self):
+        pull = {"number": 7, "id": "PR_7", "removal": {"createdAt": "2026-10-13T11:00:00Z", "actor": None}}
+        line = gate.left_out_line(pull)
+        self.assertIn("by unknown (reason: unknown)", line)
+        self.assertIn('pullRequestId: "PR_7"', line)
+
+    def test_the_printed_re_add_is_the_sweeps_own_enable_call(self):
+        # The pasted command must make the same call the sweep makes, on the same pull request.
+        # No single quote inside, so the shell's single quotes around it hold.
+        query = gate.ENABLE_COMMAND_QUERY.format(id="PR_7")
+        self.assertIn("enablePullRequestAutoMerge(input: {pullRequestId: $id})", gate.ENABLE_MUTATION)
+        self.assertIn('enablePullRequestAutoMerge(input: {pullRequestId: "PR_7"})', query)
+        self.assertNotIn("'", query)
 
     def test_a_dry_run_changes_nothing(self):
         api = FakeAPI(nodes=[node(1, APPROVED)])
