@@ -62,6 +62,10 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame, anchored
   # at both ends, with the line's decoration folded first.
   # The frame every cluster must satisfy, all three counts included.
+  # The verifier's decoration fold strips a closing parenthesis at the end of a line (a
+  # trailing closer), so the rule's `(<n> nodes, <n> instances in the project)` tail is
+  # matched with its `)` optional: the two green runs of 2026-10-21 wrote the line exactly
+  # as the rule prints it and failed only on that character.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     mode: assert
@@ -74,7 +78,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: orphan-node-objects: \d+ orphan node\(s\) \(\d+ nodes, \d+ instances in the project\)?$)'
   # Zero orphans, and at least one node and one instance: a zero node count is a node read
   # that failed, which the rule reports as unknown rather than as a count.
   - name: the-declared-lines-count-zero-orphans-against-the-nodes-and-instances-read
@@ -89,9 +93,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: orphan-node-objects: 0 orphan node\(s\) \([1-9]\d* nodes, [1-9]\d* instances in the project\)$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: orphan-node-objects: 0 orphan node\(s\) \([1-9]\d* nodes, [1-9]\d* instances in the project\)?$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: orphan-node-objects: (?!0 orphan node\(s\) \([1-9]\d* nodes, [1-9]\d* instances in the project\)$)[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: orphan-node-objects: (?!0 orphan node\(s\) \([1-9]\d* nodes, [1-9]\d* instances in the project\)?$)[^\n]*$'
 
   - name: no-invented-cves
     role: objective
