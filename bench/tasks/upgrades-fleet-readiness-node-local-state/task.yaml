@@ -20,31 +20,46 @@
 # Deployment.
 #
 # What the deterministic checks read, and what they leave to the judge. The
-# prompt asks for one fixed-form line per object the report names, and the
-# checks read two slots from any line naming the planted object: the verdict,
-# `blocks the upgrade: <yes|no>`, and the cell, the entry the report printed
-# for the object, copied as printed. Nothing else on the line is graded, not
-# the cluster prefix and not the kind field: the declared-line form's earlier
-# cases found that anchoring on the rendering graded the agent's formatting
-# rather than its judgement. The verdict token is one word from a closed set,
-# so there is no room for a hedge on the graded part. The cell slot is what
-# proves the report ran: its pattern is wording only the rule's own text
+# prompt asks for one fixed-form line per seeded cluster, "<cluster>:
+# data-on-the-node: <object kind namespace/name|none>; blocks the upgrade:
+# <yes|no|none>; cell: <the rule's text for that cluster|none>", the shape the
+# per-cluster readiness cases use (upgrades-readiness-surge-capacity), and the
+# checks read those lines and nothing else; the prose, the reason the rule
+# gives, and the recommended remedy are the judge's, against
+# `expected_output`. The case first asked for one line per object the report
+# names ("<cluster>/<object name>: kind ...; blocks the upgrade: ...; cell:
+# ..."), anchored on the object's name, and nine runs on the dev install
+# passed none of them: the agent read "<cluster>/<object name>" as
+# "<project>/<cluster>" and wrote the object's name after "; blocks the
+# upgrade:", where the anchor could not find it, or left a note-column object
+# out of a list it built from the risks. A line per cluster, anchored on the
+# cluster's name with the object as one slot of the line, has no such reading.
+# Slot a's line must name the planted Deployment and read `blocks the upgrade:
+# no`, and its cell slot must carry the rule's own text, wording only the rule
 # produces (`data-on-the-node: Deployment seeded-shapes/cache-on-emptydir
 # keeps scratch on the node in queue (emptyDir; the name suggests state)`),
 # which the skill paraphrases and a hand kubectl survey cannot supply; a
 # report whose rule is missing prints no such entry, so the slot reads `none`
 # or another rule's text and the line fails there whatever the verdict says.
-# The cell carries a `;`, which keeps the verifier's value-wrap fold from
-# removing a quote or angle bracket the agent kept around it, so the patterns
-# admit any prefix before the rule's text, a note column's other entries
-# included. A pod of the workload may stand in for it on the line (the name
-# plus one or two hash suffixes), as the agent sometimes renders it. Each
-# accept is `<name> ... blocks the upgrade: no` on one line, read after the
-# harness's trail fold (`fold_decoration`); the forbid is the same name with
-# any other value, so a second line about the object that contradicts the
-# first fails whatever the right line says. The prose, the reason the rule
-# gives, and the recommended remedy are the judge's, against
-# `expected_output`.
+# The other three slots read `none` in every slot: the fleet's only emptyDir
+# is cache-on-emptydir's, its hostPaths are on DaemonSets the rule does not
+# read, and its claims are on no local StorageClass
+# (bench/tf/fleet/defects-*.tf), so the rule prints nothing for them and a
+# line naming an object, a verdict or a cell there is a wrong read. The cell
+# carries a `;`, which keeps the verifier's value-wrap fold from removing a
+# quote or angle bracket the agent kept around it, so the cell patterns admit
+# any prefix before the rule's text, a note column's other entries included; a
+# pod of the workload may stand in for it in the object slot (the name plus
+# one or two hash suffixes), as the agent sometimes renders it. Every pattern
+# is read after the harness's trail fold (`fold_decoration`) and matches the
+# whole line, anchored at both ends; each forbid is the same frame with any
+# other value, so a second line about a slot that contradicts the first fails
+# whatever the right line says. The patterns name the slots through
+# `{cluster:<slot>}`, which the verifier expands to the cluster the runner
+# recorded for the slot, so a fleet applied with another prefix is graded on
+# its own names; a slot the runner did not reach is an `error` about the
+# environment, never a `fail` charged to the agent, so the case adds no role
+# per slot to `fixtures:`.
 #
 # Planted defect required: on slot a, the Deployment cache-on-emptydir in
 # seeded-shapes, one replica, whose queue directory is an emptyDir (role
@@ -65,15 +80,17 @@ prompt: >-
   Check every cluster in this project for its readiness to upgrade to its
   release channel's default version. For each cluster, report what blocks the
   upgrade and what is at risk. Read only: do not change, upgrade or remove
-  anything. End your answer with one line per object that the readiness report
-  names as a blocker, as a risk, or as a shape it checked and cleared, in
-  exactly this form and with no other words on the line: "<cluster>/<object
-  name>: kind <deployment|statefulset|daemonset|cronjob|pdb|exclusion>; blocks
-  the upgrade: <yes|no>; cell: <the entry the report prints for that object in
-  its other blockers, risks or note column, copied as printed|none>". Write
-  each name exactly as the API shows it, with no brackets, quotes or
-  parentheses around it. When a column holds several entries separated by ";
-  ", copy the one naming the object. Put any aside on a line of its own.
+  anything. End your answer with one line per seeded cluster in exactly this
+  form, no other words on the line: "<cluster>: data-on-the-node: <object kind
+  namespace/name|none>; blocks the upgrade: <yes|no|none>; cell: <the rule's
+  text for that cluster copied as printed|none>". The cell is the
+  data-on-the-node rule's text for that cluster, copied from the readiness
+  report's note column (or, for a risk or a blocker, its risks or other
+  blockers column) or from the member's row in the report's JSON
+  (readiness.notes, readiness.risks), as printed and not paraphrased; a
+  cluster the rule prints nothing for reads none in every slot. Write the
+  object as the report names it, with no brackets, quotes or parentheses
+  around it, and put any aside on a line of its own.
 expected_output: >-
   A per-cluster readiness report read during this run. For seeded-a it names
   the Deployment cache-on-emptydir in seeded-shapes in its note column: its
@@ -84,12 +101,15 @@ expected_output: >-
   reschedule, so the loss is the application's design, not the upgrade's. The
   remedy is an operator decision: move the queue to a PersistentVolumeClaim,
   or accept the loss. Other clusters' blockers and risks come from the same
-  run. It ends with one declared line per object; the line for
-  cache-on-emptydir reads "blocks the upgrade: no" and its cell is the
-  report's note for it, beginning "data-on-the-node: Deployment
+  run. It ends with one declared line per seeded cluster: for seeded-a
+  "seeded-a: data-on-the-node: Deployment seeded-shapes/cache-on-emptydir;
+  blocks the upgrade: no; cell: data-on-the-node: Deployment
   seeded-shapes/cache-on-emptydir keeps scratch on the node in queue
-  (emptyDir; the name suggests state)". It cites no CVE identifiers and
-  changes nothing.
+  (emptyDir; the name suggests state); not a risk: a Deployment's emptyDir is
+  emptied by every reschedule and a read-only or memory-backed mount holds
+  nothing of the workload's", the cell copied from the report's note column,
+  and for seeded-b, seeded-c and seeded-d "data-on-the-node: none; blocks the
+  upgrade: none; cell: none". It cites no CVE identifiers and changes nothing.
 infrastructure:
   deployer: noop
 validated: false
@@ -106,9 +126,12 @@ fixtures:
   - node-local-state
 
 verification_spec:
-  # The verdict this case exists for: a line naming cache-on-emptydir whose verdict
-  # is no; the forbid is the same name with any other verdict.
-  - name: cache-on-emptydir-line-does-not-block
+  # One line per seeded cluster, fixed vocabulary, the cluster named at the
+  # start of the line; every pattern matches the whole declared frame,
+  # anchored at both ends, with the line's decoration folded first
+  # (`fold_decoration: true`); a parenthetical after the cluster's name is
+  # allowed.
+  - name: every-seeded-cluster-has-a-declared-line
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
@@ -119,21 +142,37 @@ verification_spec:
       fixture_roles:
         - node-local-state
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: no(?:\s*;|\s*$)'
-      forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: (?!no(?:\s*;|\s*$))'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: data-on-the-node: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: data-on-the-node: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: data-on-the-node: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]+$)'
 
-  # The report's own wording: the entry the note column carries for the object is the
-  # rule's text, which the skill paraphrases and a cluster listing cannot
-  # supply. A report whose rule is missing prints no such entry, so the slot
-  # reads `none` or something else and the line fails here, whatever the
+  # The verdict this case exists for: slot a's line names cache-on-emptydir
+  # and reads no; the forbid is the same frame with any other object or
+  # verdict, so a line that promotes it, leaves it out or reads none fails
+  # here whatever the prose says. A pod of the workload may stand in for it
+  # (the name plus one or two hash suffixes).
+  - name: the-planted-object-is-named-and-does-not-block
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-local-state
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: deployment seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: [^\n]+$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: (?!deployment seeded-shapes/cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}; blocks the upgrade: no; cell: )[^\n]*$'
+
+  # The report's own wording: the entry the note column carries for the object
+  # is the rule's text, which the skill paraphrases and a cluster listing
+  # cannot supply. A report whose rule is missing prints no such entry, so the
+  # slot reads `none` or something else and the line fails here, whatever the
   # verdict says. Any prefix is admitted before the rule's text: a quote or
   # angle bracket the agent kept around the cell (the `;` inside it keeps the
-  # value-wrap fold from removing one), or a note column's other entries.
-  # The required text stops before the cell's first `; ` (inside `(emptyDir;
-  # the name suggests state)`), which the prompt tells the agent to split a
-  # column on: an agent that cuts there still carries the rule's wording.
-  - name: cache-on-emptydir-line-quotes-the-reports-cell
+  # value-wrap fold from removing one), or a note column's other entries. The
+  # required text stops before the cell's first `; ` (inside `(emptyDir; the
+  # name suggests state)`): an agent that cuts the entry there still carries
+  # the rule's wording.
+  - name: the-planted-objects-line-quotes-the-reports-cell
     role: objective
     mode: assert
     check:
@@ -143,9 +182,28 @@ verification_spec:
         - node-local-state
       # The `data-on-the-node: ` prefix is the table's; report.json carries the bare text, so it is optional.
       any_of_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: [^;\n]+; blocks the upgrade: [^;\n]+; cell: [^\n]*?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir[^\n]*$'
       forbidden_patterns:
-        - '(?m)^[^\n]*(?<![a-z0-9-])cache-on-emptydir(?:-[a-z0-9]{5,10}){0,2}(?![a-z0-9-])[^\n]*; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir)[^\n]*$'
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?: data-on-the-node: [^;\n]+; blocks the upgrade: [^;\n]+; cell: (?![^\n]*?(?:data-on-the-node: )?deployment seeded-shapes/cache-on-emptydir:? keeps (?:scratch|data) on the node in queue \(emptydir)[^\n]*$'
+
+  # The fleet's only emptyDir is cache-on-emptydir's, its hostPaths are on
+  # DaemonSets the rule does not read, and its claims are on no local
+  # StorageClass, so the rule prints nothing for slots b, c and d and each
+  # reads none in every slot; a line naming an object, a verdict or a cell
+  # there is a wrong read, the planted finding copied onto another cluster
+  # included.
+  - name: the-other-clusters-read-none
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - node-local-state
+      any_of_patterns:
+        - '(?ms)\A(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: data-on-the-node: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: data-on-the-node: none; blocks the upgrade: none; cell: none$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: data-on-the-node: none; blocks the upgrade: none; cell: none$)'
+      forbidden_patterns:
+        - '(?m)^(?:{cluster:b}|{cluster:c}|{cluster:d})(?:\s*\([^)\n]*\))?: data-on-the-node: (?!none; blocks the upgrade: none; cell: none$)[^\n]*$'
 
   # The prompt's "read only", grounded: the planted object is as the fixture
   # declares it after the run.

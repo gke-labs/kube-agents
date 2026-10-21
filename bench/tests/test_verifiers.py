@@ -10024,94 +10024,22 @@ def test_rule_cases_refuse_a_missing_or_foreign_cell(case, objective, text):
 
 
 
-# The workload-rule cases for catalogue entries 4, 10, 12, 14, 15, 17, 18 and 20
-# grade the planted object's declared line on two slots: its verdict and the
-# cell the report printed for it, wording only the rule produces. The cell
-# carries a `;`, so a wrap the agent kept around it survives `_VALUE_WRAP`, and
-# a note's entry may come with the note column's other entries before it; the
-# cases' patterns admit any prefix before the rule's text, and these tests hold
-# each case to that through the shipped entry and the real fold. The cell texts
-# are the rules' own, as their unit tests assert them
-# (agents/platform/skills/fleet-upgrade-verification/scripts/test_readiness_rules_workloads.py).
+# The object-line readiness case for catalogue entry 10 grades the planted
+# object's declared line on two slots: its verdict and the cell the report
+# printed for it, wording only the rule produces. The cell carries a `;`, so a
+# wrap the agent kept around it survives `_VALUE_WRAP`, and a note's entry may
+# come with the note column's other entries before it; the case's patterns
+# admit any prefix before the rule's text, and these tests hold the case to
+# that through the shipped entry and the real fold. The cell text is the
+# rule's own (scripts/test_audit_rules.py asserts it); the gap and the target
+# are the fleet's, so the case's pattern stops after the image.
 _WORKLOAD_RULE_CASES = {
-    "upgrades-fleet-readiness-node-local-state": (
-        "cache-on-emptydir",
-        "deployment",
-        "data-on-the-node",
-        "data-on-the-node: Deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue (emptyDir; the name suggests state); "
-        "not a risk: a Deployment's emptyDir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload's",
-    ),
-    "upgrades-fleet-readiness-deprecated-node-label": (
-        "arch-pinned-worker",
-        "deployment",
-        "removed-node-label",
-        "removed-node-label: Deployment seeded-shapes/arch-pinned-worker: selects on beta.kubernetes.io/arch=amd64 (nodeSelector), deprecated since 1.14 "
-        "in favour of kubernetes.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods",
-    ),
-    "upgrades-fleet-readiness-cgroup-blind-runtime": (
-        "cgroup-blind-jvm",
-        "deployment",
-        "cgroup-v2-runtime",
-        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
-        "(JDK 8u302, below 8u372) on pool default-pool, already on cgroup v2; not an upgrade risk",
-    ),
-    "upgrades-fleet-readiness-multi-process-container": (
-        "multi-process-worker",
-        "deployment",
-        "group-oom-kill",
-        "group-oom-kill: Deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job "
-        "on pool default-pool, on cgroup v2 with a kubelet at 1.33.4-gke.1000, which already group-kills; not an upgrade risk",
-    ),
-    "upgrades-fleet-readiness-node-image-coupled-agent": (
-        "cni-shaped-agent",
-        "daemonset",
-        "node-image-coupled-agent",
-        "node-image-coupled-agent: DaemonSet seeded-shapes/cni-shaped-agent: on the node's network and coupled to the node image: "
-        "mounts /etc/cni/net.d from the node; pool(s) default-pool are below the target and get a new node image in this upgrade",
-    ),
-    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
-        "cuda-pinned-trainer",
-        "cronjob",
-        "gpu-driver",
-        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries "
-        "that accelerator; the target driver cannot be read, and the pin image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked",
-    ),
-    "upgrades-fleet-readiness-retired-registry-image": (
-        "legacy-registry-pull",
-        "deployment",
-        "retired-registry",
-        "retired-registry: Deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s.gcr.io/pause:3.9 from k8s.gcr.io "
-        "(frozen 2023-04-03, a redirect to registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host that stopped publishing; "
-        "pool(s) default-pool are below the target and are rebuilt in this upgrade",
-    ),
-    # Entry 10 through the same frame (scripts/test_audit_rules.py asserts the cell); the gap and
-    # the target are the fleet's, so the case's pattern stops after the image.
     "upgrades-readiness-client-addon-skew": (
         "stale-kubectl-client",
         "cronjob",
         "client-addon-skew",
         "client-addon-skew: kubectl v1.29 from CronJob seeded-shapes/stale-kubectl-client (image registry.k8s.io/kubectl:v1.29.0): "
         "7 minors behind the target 1.36; kubectl is supported within 1 minor of kube-apiserver (https://kubernetes.io/releases/version-skew-policy/#kubectl)",
-    ),
-}
-# The other grades the same rules print for the same objects on another fleet
-# (a cgroup v1 pool the target migrates, a GPU pool carrying the accelerator):
-# the patterns stop before the pool-dependent tail, so these pass the cell slot too.
-_WORKLOAD_RULE_OTHER_CELLS = {
-    "upgrades-fleet-readiness-cgroup-blind-runtime": (
-        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm: container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
-        "(JDK 8u302, below 8u372) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 at the target; "
-        "the heap is then sized from the node and the container is OOM-killed"
-    ),
-    "upgrades-fleet-readiness-multi-process-container": (
-        "group-oom-kill: Deployment seeded-shapes/multi-process-worker: container supervisor runs a shell script that forks a background job "
-        "(heuristic: the process count is not readable from the API) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 "
-        "at the target; a kubelet at 1.34 then sets memory.oom.group and an OOM kill takes every process in the container"
-    ),
-    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
-        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer requests nvidia.com/gpu with image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 "
-        "on pool gpu-pool; the target 1.33 node image ships driver R535 (gpuDriverVersion DEFAULT), which serves CUDA 12.2; "
-        "forward-compatibility packages inside the image are not readable from the tag"
     ),
 }
 _WORKLOAD_CELL_WRAPS = [
@@ -10160,13 +10088,6 @@ def test_workload_rule_case_accepts_the_bare_json_text_without_the_rule_prefix(c
     assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", _workload_line(name, kind, _bare(cell)))
 
 
-@pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_OTHER_CELLS))
-def test_workload_rule_case_accepts_the_rules_other_grade_on_another_fleet(case):
-    name, kind, _rule, _cell = _WORKLOAD_RULE_CASES[case]
-    text = _workload_line(name, kind, _WORKLOAD_RULE_OTHER_CELLS[case])
-    assert _workload_case_grades(case, f"{name}-line-quotes-the-reports-cell", text)
-
-
 @pytest.mark.parametrize("case", sorted(_WORKLOAD_RULE_CASES))
 def test_workload_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_verdict(case):
     name, kind, rule, cell = _WORKLOAD_RULE_CASES[case]
@@ -10186,3 +10107,254 @@ def test_workload_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_ver
     # A pod of the workload may stand in for it; another object's line never does.
     assert _workload_case_grades(case, cell_objective, _workload_line(f"{name}-7d9f8c6b5-x2k9q", kind, cell))
     assert not _workload_case_grades(case, cell_objective, _workload_line("other-workload", kind, cell))
+
+
+# The per-cluster readiness cases for the workload rules of catalogue entries
+# 4, 12, 14, 15, 17, 18 and 20 grade one declared line per seeded cluster,
+# `<cluster>: <rule id>: <object kind namespace/name|none>; blocks the upgrade:
+# <yes|no|none>; cell: <the rule's text|none>`: slot a's line names the planted
+# object, reads `no` and quotes the rule's own text; the other slots read `none`
+# in every slot, since the fleet plants each shape on slot a alone. The cases
+# first graded one line per object, anchored on the object's name, and nine
+# dev-install runs passed none of them: the agent read `<cluster>/<object name>`
+# as `<project>/<cluster>`, which put the object's name after `; blocks the
+# upgrade:` where the anchor could not find it, or left a note-column object
+# out of a list it built from the risks;
+# `test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame`
+# keeps that rendering red. The cell texts are the rules' own, as their unit
+# tests assert them (agents/platform/skills/fleet-upgrade-verification/scripts/
+# test_readiness_rules_workloads.py); the pools and the kubelet version are the
+# fleet's, so the cases' patterns stop before them. A cell carries a `;`, so a
+# wrap the agent kept around it survives `_VALUE_WRAP`, and a note's entry may
+# come with the note column's other entries before it; the cases admit any
+# prefix before the rule's text.
+_PER_CLUSTER_RULE_CASES = {
+    "upgrades-fleet-readiness-node-local-state": (
+        "Deployment seeded-shapes/cache-on-emptydir",
+        "data-on-the-node",
+        "data-on-the-node: Deployment seeded-shapes/cache-on-emptydir keeps scratch on the node in queue (emptyDir; the name suggests state); "
+        "not a risk: a Deployment's emptyDir is emptied by every reschedule and a read-only or memory-backed mount holds nothing of the workload's",
+    ),
+    "upgrades-fleet-readiness-deprecated-node-label": (
+        "Deployment seeded-shapes/arch-pinned-worker",
+        "removed-node-label",
+        "removed-node-label: Deployment seeded-shapes/arch-pinned-worker: selects on beta.kubernetes.io/arch=amd64 (nodeSelector), deprecated since 1.14 "
+        "in favour of kubernetes.io/arch; the kubelet still sets it today, and a node image that stops setting it strands the pods",
+    ),
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "Deployment seeded-shapes/cgroup-blind-jvm",
+        "cgroup-v2-runtime",
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, already on cgroup v2; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "Deployment seeded-shapes/multi-process-worker",
+        "group-oom-kill",
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker container supervisor runs a shell script that forks a background job "
+        "on pool default-pool, on cgroup v2 with a kubelet at 1.33.4-gke.1000, which already group-kills; not an upgrade risk",
+    ),
+    "upgrades-fleet-readiness-node-image-coupled-agent": (
+        "DaemonSet seeded-shapes/cni-shaped-agent",
+        "node-image-coupled-agent",
+        "node-image-coupled-agent: DaemonSet seeded-shapes/cni-shaped-agent: on the node's network and coupled to the node image: "
+        "mounts /etc/cni/net.d from the node; pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and get a new node image in this upgrade",
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "CronJob seeded-shapes/cuda-pinned-trainer",
+        "gpu-driver",
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer: requests nvidia.com/gpu on accelerator nvidia-l4 and no pool in the cluster carries "
+        "that accelerator; the target driver cannot be read, and the pin image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 stays unchecked",
+    ),
+    "upgrades-fleet-readiness-retired-registry-image": (
+        "Deployment seeded-shapes/legacy-registry-pull",
+        "retired-registry",
+        "retired-registry: Deployment seeded-shapes/legacy-registry-pull: container pause pulls k8s.gcr.io/pause:3.9 from k8s.gcr.io "
+        "(frozen 2023-04-03, a redirect to registry.k8s.io since 2023-03-20); a rebuilt node pulls it again from a host that stopped publishing; "
+        "pool(s) default-pool, idle-batch-pool, pinned-inference-pool are below the target and are rebuilt in this upgrade",
+    ),
+}
+_PER_CLUSTER_OBJECTIVES = (
+    "every-seeded-cluster-has-a-declared-line",
+    "the-planted-object-is-named-and-does-not-block",
+    "the-planted-objects-line-quotes-the-reports-cell",
+    "the-other-clusters-read-none",
+)
+_PLANTED_OBJECTIVE = "the-planted-object-is-named-and-does-not-block"
+_CELL_OBJECTIVE = "the-planted-objects-line-quotes-the-reports-cell"
+_EVERY_SLOT_OBJECTIVE = "every-seeded-cluster-has-a-declared-line"
+_OTHERS_OBJECTIVE = "the-other-clusters-read-none"
+# The other grades the same rules print for the same objects on another fleet
+# (a cgroup v1 pool the target migrates, a GPU pool carrying the accelerator):
+# the patterns stop before the pool-dependent tail, so these pass the cell slot too.
+_PER_CLUSTER_OTHER_CELLS = {
+    "upgrades-fleet-readiness-cgroup-blind-runtime": (
+        "cgroup-v2-runtime: Deployment seeded-shapes/cgroup-blind-jvm: container jvm runs docker.io/library/eclipse-temurin:8u302-b08-jre "
+        "(JDK 8u302, below 8u372) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 at the target; "
+        "the heap is then sized from the node and the container is OOM-killed"
+    ),
+    "upgrades-fleet-readiness-multi-process-container": (
+        "group-oom-kill: Deployment seeded-shapes/multi-process-worker: container supervisor runs a shell script that forks a background job "
+        "(heuristic: the process count is not readable from the API) on pool default-pool, which GKE migrates cgroup v1 pools to v2 from 1.33 "
+        "at the target; a kubelet at 1.34 then sets memory.oom.group and an OOM kill takes every process in the container"
+    ),
+    "upgrades-fleet-readiness-cuda-pinned-gpu-job": (
+        "gpu-driver: CronJob seeded-shapes/cuda-pinned-trainer requests nvidia.com/gpu with image docker.io/nvidia/cuda:12.2.0-base-ubuntu22.04 "
+        "on pool gpu-pool; the target 1.33 node image ships driver R535 (gpuDriverVersion DEFAULT), which serves CUDA 12.2; "
+        "forward-compatibility packages inside the image are not readable from the tag"
+    ),
+}
+# How the dev install's runs rendered a declared line: the project before the
+# cluster, the location after it, a bullet, emphasis, code, a stop.
+_PER_CLUSTER_RENDERINGS = (
+    "some-project/{line}",
+    "{cluster} (us-central1-a): {rest}",
+    "- {line}",
+    "**{cluster}**: {rest}",
+    "`{cluster}`: {rest}",
+    "{line}.",
+)
+
+
+def _one_role_per_slot() -> list[str]:
+    """One catalogue role per cluster slot. The runner records every seeded
+    cluster it reached whatever roles a case names, and `{cluster:<slot>}`
+    expands from that record, so the test directory reaches every slot as the
+    runner does; the cases themselves name the planted role alone."""
+    by_slot: dict[str, str] = {}
+    for role, spec in sorted(_catalog_roles().items()):
+        by_slot.setdefault(spec["cluster_slot"], role)
+    return [by_slot[slot] for slot in sorted(by_slot)]
+
+
+def _per_cluster_case_grades(case: str, objective: str, text: str) -> bool:
+    spec = _workload_case_spec(case)
+    check = next(entry["check"] for entry in spec["verification_spec"] if entry["name"] == objective)
+    v = parse_node(check)
+    _stash(text)
+    with tempfile.TemporaryDirectory(prefix="per-cluster-fleet-") as root:
+        _write_fleet_dir(Path(root), list(spec["fixtures"]) + _one_role_per_slot(), None)
+        with mock.patch.dict(os.environ, {fleet.FLEET_KUBECONFIG_DIR_ENV: root}):
+            return v.verify(5.0).status == "pass"
+
+
+def _per_cluster_line(cluster: str, rule: str, obj: str = "none", verdict: str = "none", cell: str = "none") -> str:
+    return f"{cluster}: {rule}: {obj}; blocks the upgrade: {verdict}; cell: {cell}"
+
+
+def _per_cluster_report(case: str, cell: str | None = None, obj: str | None = None, verdict: str = "no", others: dict[str, str] | None = None, slots=_SLOT_LETTERS) -> str:
+    """The declared lines: slot a's names the planted object (or `obj`) with
+    `verdict` and the shipped cell (or `cell`); every other slot reads `none` in
+    every slot unless `others` gives its line."""
+    planted, rule, shipped = _PER_CLUSTER_RULE_CASES[case]
+    lines = []
+    for letter in slots:
+        cluster = _SLOT_NAMES[letter]
+        if letter == "a":
+            lines.append(_per_cluster_line(cluster, rule, planted if obj is None else obj, verdict, shipped if cell is None else cell))
+        else:
+            lines.append((others or {}).get(letter) or _per_cluster_line(cluster, rule))
+    return "\n".join(lines)
+
+
+def _rendered(text: str, rendering: str) -> str:
+    out = []
+    for line in text.splitlines():
+        cluster, rest = line.split(": ", 1)
+        out.append(rendering.format(line=line, cluster=cluster, rest=rest))
+    return "\n".join(out)
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+@pytest.mark.parametrize("wrap", _WORKLOAD_CELL_WRAPS)
+def test_per_cluster_rule_case_accepts_the_cell_however_the_agent_wrapped_it(case, wrap):
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    text = _per_cluster_report(case, cell=wrap.format(cell=cell))
+    for objective in _PER_CLUSTER_OBJECTIVES:
+        assert _per_cluster_case_grades(case, objective, text), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_the_bare_json_text_without_the_rule_prefix(case):
+    _planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_bare(cell)))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_OTHER_CELLS))
+def test_per_cluster_rule_case_accepts_the_rules_other_grade_on_another_fleet(case):
+    assert _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=_PER_CLUSTER_OTHER_CELLS[case]))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+@pytest.mark.parametrize("rendering", _PER_CLUSTER_RENDERINGS)
+def test_per_cluster_rule_case_accepts_the_lines_as_the_agent_renders_them(case, rendering):
+    text = _rendered(_per_cluster_report(case), rendering)
+    for objective in _PER_CLUSTER_OBJECTIVES:
+        assert _per_cluster_case_grades(case, objective, text), objective
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_accepts_a_wrapped_object_and_a_pod_standing_in(case):
+    planted, _rule, _cell = _PER_CLUSTER_RULE_CASES[case]
+    for obj in (f'"{planted}"', f"<{planted}>", planted.lower(), f"{planted}-7d9f8c6b5-x2k9q", f"{planted}-x2k9q"):
+        assert _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=obj)), obj
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_a_missing_or_foreign_cell_and_a_promoted_verdict(case):
+    planted, rule, _cell = _PER_CLUSTER_RULE_CASES[case]
+    # A report whose rule is missing prints no cell: `none`, or another text under the rule's id, wrapped or not.
+    for foreign in ("none", f"{rule}: something else", f'"{rule}: something else"'):
+        assert not _per_cluster_case_grades(case, _CELL_OBJECTIVE, _per_cluster_report(case, cell=foreign)), foreign
+    # A promoted verdict fails whatever the cell says, and so does a second slot-a line that contradicts the first.
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, verdict="yes"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, "\n".join([_per_cluster_report(case), _per_cluster_report(case, verdict="yes", slots="a")]))
+    # Slot a reading `none` in every slot, naming another object, or naming the object without its
+    # kind and namespace, is outside the vocabulary whatever the cell says.
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="none", verdict="none", cell="none"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj="Deployment seeded-shapes/other-workload"))
+    assert not _per_cluster_case_grades(case, _PLANTED_OBJECTIVE, _per_cluster_report(case, obj=planted.rsplit("/", 1)[1]))
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_needs_a_line_for_every_slot(case):
+    for missing in _SLOT_LETTERS:
+        text = _per_cluster_report(case, slots=tuple(s for s in _SLOT_LETTERS if s != missing))
+        assert not _per_cluster_case_grades(case, _EVERY_SLOT_OBJECTIVE, text), missing
+        if missing != "a":
+            assert not _per_cluster_case_grades(case, _OTHERS_OBJECTIVE, text), missing
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_refuses_a_finding_on_a_cluster_without_the_shape(case):
+    planted, rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    for letter in _SLOT_LETTERS[1:]:
+        cluster = _SLOT_NAMES[letter]
+        for wrong in (
+            # The planted finding copied onto another cluster.
+            _per_cluster_line(cluster, rule, planted, "no", cell),
+            # A verdict, or a cell, where the rule printed nothing.
+            _per_cluster_line(cluster, rule, "none", "no", "none"),
+            _per_cluster_line(cluster, rule, "none", "none", cell),
+        ):
+            assert not _per_cluster_case_grades(case, _OTHERS_OBJECTIVE, _per_cluster_report(case, others={letter: wrong})), wrong
+
+
+def _object_line_report(case: str) -> str:
+    """The rendering the dev install's runs produced under the earlier per-object
+    prompt: the project and the cluster where the frame asked for the cluster and
+    the object, the kind as its own slot, the object's name inside the cell."""
+    planted, _rule, cell = _PER_CLUSTER_RULE_CASES[case]
+    kind = planted.split(" ", 1)[0].lower()
+    return "\n".join(
+        [
+            f"some-project/{_SLOT_NAMES['b']}: kind pdb; blocks the upgrade: yes; cell: seeded-upgrade/pinned-batch-runner (maxUnavailable: 0) over Deployment seeded-upgrade/pinned-batch-runner (1)",
+            f"some-project/{_SLOT_NAMES['a']}: kind {kind}; blocks the upgrade: no; cell: {_bare(cell)}",
+        ]
+    )
+
+
+@pytest.mark.parametrize("case", sorted(_PER_CLUSTER_RULE_CASES))
+def test_per_cluster_rule_case_fails_every_objective_on_the_object_line_frame(case):
+    text = _object_line_report(case)
+    for objective in _PER_CLUSTER_OBJECTIVES:
+        assert not _per_cluster_case_grades(case, objective, text), objective
