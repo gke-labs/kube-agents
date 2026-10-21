@@ -3932,24 +3932,10 @@ print_generate_only_handoff() {
   fi
   if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
     echo -e "${C_BOLD}${step}. After the apply, the chat app's setup checklist (settings no apply can make):${C_RESET}"
-    print_chat_checklist_commands "$repo_dir"
+    print_chat_checklist_commands
   fi
 }
 
-# The commands that print the chat setup checklist for each chat platform
-# install.env turns on, for a route that ends before the apply: $1 repo_dir.
-# They name this run's install.env, which need not be the checkout's.
-print_chat_checklist_commands() {
-  local env_file
-  env_file="$(printf '%q' "$INSTALL_ENV_FILE")"
-  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
-    echo -e "    KUBE_AGENTS_INSTALL_ENV=${env_file} bash ${1}/scripts/installer/print_instructions_gchat.sh"
-  fi
-  if is_truthy "${SLACK_ENABLED:-}"; then
-    echo -e "    KUBE_AGENTS_INSTALL_ENV=${env_file} bash ${1}/scripts/installer/print_instructions_slack.sh"
-  fi
-  return 0
-}
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
 # install coordinates from the environment (load install.env first).
@@ -6443,13 +6429,25 @@ run_menu_system() {
         if is_truthy "$google_chat_enabled"; then
           project_number="$(gcloud projects describe "$project_id" --format="value(projectNumber)" 2>/dev/null || echo "")"
         fi
-        PROJECT_NUMBER="$project_number" \
-          print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+        local menu_mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
+        PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
         if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
-          # Unlike main(), this apply does not wait for the agent's rollout,
-          # and the menu redrawn below would push the checklist off screen.
+          # Unlike main(), this apply does not wait for a rollout, and the menu
+          # redrawn below would push the checklist off screen. Under next the
+          # A2A gateway answers the platform it holds; the agent, the rest.
+          local menu_listeners="" menu_deployment
+          if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
+            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
+            menu_listeners="$PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT"
+          fi
+          if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled"; } ||
+            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; }; then
+            menu_listeners="${menu_listeners} ${PLATFORM_AGENT_DEPLOYMENT}"
+          fi
           echo ""
-          print_info "The agent restarts after an apply. Before the first chat message, wait for: kubectl rollout status deployment/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} --context $(gke_context_name)"
+          for menu_deployment in $menu_listeners; do
+            print_info "Before the first chat message, wait for the rollout: kubectl rollout status deployment/${menu_deployment} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} --context $(gke_context_name)"
+          done
           # shellcheck disable=SC2034  # the answer is not read
           local menu_ack=""
           prompt_read "Press Enter to return to the control panel" menu_ack "" || true
@@ -8408,7 +8406,7 @@ main() {
         # from install.env, which this route leaves as it found it.
         if is_truthy "${GOOGLE_CHAT_ENABLED:-}" || is_truthy "${SLACK_ENABLED:-}"; then
           print_info "After the apply, set up the chat app with the checklist these print:"
-          print_chat_checklist_commands "$repo_dir"
+          print_chat_checklist_commands
         fi
         write_json_report "PAUSED"
         print_next_home_channel_unset_summary flags

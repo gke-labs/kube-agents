@@ -2577,8 +2577,9 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         base = (f'{_SOURCE_INSTALLER_COMMON}\nPROJECT_ID="test-proj"\nCLUSTER_NAME="test-cluster"\n'
                 'INSTALL_ENV_FILE="/tmp/test/install.env"\n')
         ghes = 'GITOPS_HOST=ghe.example.com GITOPS_CA_SECRET=ghe-ca\n'
-        gchat = "KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash /tmp/test-repo/scripts/installer/print_instructions_gchat.sh"
-        slack = "KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash /tmp/test-repo/scripts/installer/print_instructions_slack.sh"
+        printers = _INSTALLER_COMMON.parent
+        gchat = f"KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash {printers}/print_instructions_gchat.sh"
+        slack = f"KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash {printers}/print_instructions_slack.sh"
         for keys, step, shown in (
             ("GOOGLE_CHAT_ENABLED=yes SLACK_ENABLED=false\n", "4.", (gchat,)),
             ("GOOGLE_CHAT_ENABLED=true SLACK_ENABLED=true\n" + ghes, "5.", (gchat, slack)),
@@ -7701,8 +7702,29 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         applied = out.index("APPLIED terraform")
         checklist = out.index("CHECKLIST mode=today number=[123456789012]")
         self.assertLess(applied, checklist)
-        self.assertLess(checklist, out.index("kubectl rollout status deployment/platform-agent-gateway"))
+        self.assertLess(checklist, out.index("kubectl rollout status deployment/platform-agent-gateway "))
+        self.assertNotIn("platform-agent-a2a-gateway", out)
         self.assertLess(checklist, out.index("PROMPTED Press Enter to return to the control panel"))
+
+    def test_the_menu_names_the_deployment_that_answers_each_platform(self):
+        for setup, waits, skips in (
+            # Under next Google Chat holds the A2A gateway, and Slack beside it stays on the agent.
+            ("google_chat_enabled=true slack_enabled=false PLATFORM_AGENT_MODE_AFTER_APPLY=next",
+             ("deployment/platform-agent-a2a-gateway ",), ("deployment/platform-agent-gateway ",)),
+            ("google_chat_enabled=true slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=next",
+             ("deployment/platform-agent-a2a-gateway ", "deployment/platform-agent-gateway "), ()),
+            ("google_chat_enabled=false slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=next",
+             ("deployment/platform-agent-a2a-gateway ",), ("deployment/platform-agent-gateway ",)),
+            ("google_chat_enabled=false slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=today",
+             ("deployment/platform-agent-gateway ",), ("deployment/platform-agent-a2a-gateway ",)),
+        ):
+            with self.subTest(setup=setup):
+                out = self._menu_checklist(setup)
+                self.assertIn("rc=0", out)
+                for deployment in waits:
+                    self.assertIn(f"kubectl rollout status {deployment}", out)
+                for deployment in skips:
+                    self.assertNotIn(f"kubectl rollout status {deployment}", out)
 
     def test_the_menu_reads_the_project_number_instead_of_inheriting_it(self):
         out = self._menu_checklist('google_chat_enabled=true\nexport PROJECT_NUMBER=999\n'
@@ -8957,7 +8979,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                     proc = self._run(
                         f"{stubs}parse_args {flags}; check_flags_against_install_env || exit 1\n"
                         "export SLACK_ENABLED=true SLACK_ALLOWED_USERS=U1 SLACK_BOT_TOKEN=xoxb-typed SLACK_APP_TOKEN=xapp-typed\n"
-                        f'repo_dir=/the/repo ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
+                        f'ANSWER="{answer}" SCOPE_RC={scope_rc} _confirm; echo "went on"',
                         path,
                     )
                     out = proc.stdout + proc.stderr
@@ -8992,7 +9014,8 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
                         self.assertLess(warning, out.index("Provisioning paused by user"))
                         # After the lines to add: the printer reads them.
                         self.assertLess(out.index("first add these lines"),
-                                        out.index("bash /the/repo/scripts/installer/print_instructions_slack.sh"))
+                                        out.index(f"KUBE_AGENTS_INSTALL_ENV={path} bash "))
+                        self.assertIn("/scripts/installer/print_instructions_slack.sh", out)
                         self.assertNotIn("print_instructions_gchat.sh", out)
                         # The file is as it was, so nothing says it was saved.
                         self.assertNotIn("saved", out)

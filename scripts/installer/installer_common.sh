@@ -1348,6 +1348,26 @@ print_next_home_channel_unset_summary() {
 # Set by print_chat_setup_checklists: "true" when it printed a checklist.
 CHAT_SETUP_CHECKLIST_PRINTED="false"
 
+# The commands that print the chat setup checklist for each chat platform that
+# is on, one per line, for a reader to paste later. They name the run's
+# install.env as an absolute path, since it need not be the checkout's and the
+# paste need not happen in the directory the run started in.
+print_chat_checklist_commands() {
+  local printers env_file="${INSTALL_ENV_FILE:-}"
+  printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  case "$env_file" in
+    /*) ;;
+    *) env_file="$(pwd)/${env_file}" ;;
+  esac
+  if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "$env_file" "${printers}/print_instructions_gchat.sh"
+  fi
+  if is_truthy "${SLACK_ENABLED:-}"; then
+    printf '    KUBE_AGENTS_INSTALL_ENV=%q bash %q\n' "$env_file" "${printers}/print_instructions_slack.sh"
+  fi
+  return 0
+}
+
 # The chat setup checklists after an apply, and the closing summary's key: $1
 # the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
 # and INSTALL_ENV_FILE are read from the environment the apply rendered from,
@@ -1356,7 +1376,7 @@ CHAT_SETUP_CHECKLIST_PRINTED="false"
 # front doors call it bare under set -e.
 # shellcheck disable=SC2034  # both globals are read by install.sh
 print_chat_setup_checklists() {
-  local mode="${1:-}" printers
+  local mode="${1:-}" printers failed="false"
   printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   CHAT_SETUP_CHECKLIST_PRINTED="false"
   NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
@@ -1374,8 +1394,7 @@ print_chat_setup_checklists() {
       GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
       GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
       GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
-      bash "${printers}/print_instructions_gchat.sh" --dry-run ||
-      print_warning "The Google Chat checklist did not print in full. Show it again: bash ${printers}/print_instructions_gchat.sh"
+      bash "${printers}/print_instructions_gchat.sh" --dry-run || failed="true"
     CHAT_SETUP_CHECKLIST_PRINTED="true"
   fi
   if is_truthy "${SLACK_ENABLED:-}"; then
@@ -1386,9 +1405,12 @@ print_chat_setup_checklists() {
       SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
       SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
       SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
-      bash "${printers}/print_instructions_slack.sh" --dry-run ||
-      print_warning "The Slack checklist did not print in full. Show it again: bash ${printers}/print_instructions_slack.sh"
+      bash "${printers}/print_instructions_slack.sh" --dry-run || failed="true"
     CHAT_SETUP_CHECKLIST_PRINTED="true"
+  fi
+  if [ "$failed" = "true" ]; then
+    print_warning "A chat setup checklist did not print in full. Show it again with:"
+    print_chat_checklist_commands
   fi
   return 0
 }

@@ -481,6 +481,37 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         self.assertIn("printed=true", out)
         self.assertIn("print_instructions_gchat", printed)
 
+    def test_the_commands_name_the_run_install_env_as_a_word_a_shell_reads_back(self):
+        # A backslash survives the paste, and a relative path is made absolute.
+        for env_file, expect in ((r"/srv/a\b c/install.env", r"/srv/a\\b\ c/install.env"),
+                                 ("rel/install.env", "/rel/install.env")):
+            with self.subTest(env_file=env_file):
+                out = self._commands(env_file)
+                line = next(l for l in out.splitlines() if "KUBE_AGENTS_INSTALL_ENV=" in l)
+                word = line.split("KUBE_AGENTS_INSTALL_ENV=", 1)[1].split(" bash ", 1)[0]
+                back = subprocess.run(["bash", "-c", f"printf %s {word}"], capture_output=True, text=True).stdout
+                if env_file.startswith("/"):
+                    self.assertEqual(back, env_file)
+                else:
+                    self.assertTrue(back.endswith(expect) and back.startswith("/"), back)
+
+    def _commands(self, env_file):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            installer = root / "scripts" / "installer"
+            installer.mkdir(parents=True)
+            for name in ("installer_common.sh", "gke_dns_endpoint.sh"):
+                shutil.copy(_REPO_ROOT / "scripts" / "installer" / name, installer / name)
+            shutil.copy(_REPO_ROOT / "install.defaults.env", root / "install.defaults.env")
+            body = (
+                "set -Eeuo pipefail\n"
+                "print_info() { :; }\nprint_warning() { :; }\nprint_error() { :; }\n"
+                f'source "{installer / "installer_common.sh"}"\n'
+                f"INSTALL_ENV_FILE='{env_file}' GOOGLE_CHAT_ENABLED=true print_chat_checklist_commands\n"
+            )
+            return subprocess.run(["bash", "-c", body], capture_output=True, text=True, cwd=tmp,
+                                  env={"PATH": os.environ["PATH"], "HOME": tmp}, timeout=60).stdout
+
     def test_no_chat_platform_returns_zero_under_the_err_trap(self):
         # install.sh's default: neither platform on. A non-zero return here
         # would fire on_error and turn a finished install into a failed one.
@@ -493,7 +524,9 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         out, _ = self._run(self._CHAT, stub_exit="1")
         self.assertIn("rc=0 printed=true", out)
         self.assertNotIn("ERR_TRAP_FIRED", out)
-        self.assertIn("WARN The Google Chat checklist did not print in full. Show it again: bash ", out)
+        warning = out.index("WARN A chat setup checklist did not print in full. Show it again with:")
+        self.assertLess(warning, out.index("KUBE_AGENTS_INSTALL_ENV=/the/run/install.env bash "))
+        self.assertIn("/scripts/installer/print_instructions_gchat.sh", out[warning:])
 
 
 class PrintersAskNothingUnderDryRunTest(unittest.TestCase):
