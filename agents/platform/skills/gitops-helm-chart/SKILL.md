@@ -126,7 +126,9 @@ source and destination match counts even when it is failing: a `RootSync` or
 status is `Unknown` or health `Degraded`, a Kustomization with `Ready=False`.
 Use its form. Quote its error in the PR body's **After merge** line and in
 your reply: it installs nothing until it syncs again, and fixing it is the
-repository owner's step, not part of this request.
+repository owner's step, not part of this request. That is not the partial
+install Step 4 warns about: the declaration is complete, and the failing sync
+is disclosed, not hidden.
 
 | What you found                                                                                                            | Form                   |
 | ------------------------------------------------------------------------------------------------------------------------- | ---------------------- |

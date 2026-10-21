@@ -56,6 +56,15 @@ def test_a_range_latest_or_empty_version_fails():
         assert _content_failures({PATH: ROOTSYNC.format(version=version)}), version
 
 
+def test_a_mirror_or_a_rootsync_outside_config_management_system_fails():
+    mirror = ROOTSYNC.format(version="2.17.3").replace(
+        "https://bitnami-labs.github.io/sealed-secrets", "oci://registry-1.docker.io/bitnamicharts"
+    )
+    assert _content_failures({PATH: mirror})
+    elsewhere = ROOTSYNC.format(version="2.17.3").replace("namespace: config-management-system", "namespace: default")
+    assert _content_failures({PATH: elsewhere})
+
+
 def test_another_chart_fails():
     text = ROOTSYNC.format(version="2.17.3").replace("chart: sealed-secrets", "chart: sealed-secrets-web")
     assert _content_failures({PATH: text})
@@ -77,3 +86,6 @@ def test_the_reply_check_needs_the_error_named():
         "for that directory but fails to fetch the repository (KNV2004), so nothing installs until it can."
     )
     assert not passes("Opened PR #9 adding a Helm RootSync for sealed-secrets; Config Sync installs it after merge.")
+    # A failure that is not the reconciler's, beside a promised install.
+    assert not passes("I can't reach the chart repository; Config Sync installs it after merge.")
+    assert not passes("If anything fails, Config Sync will retry the sync. It installs after merge.")

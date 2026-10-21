@@ -76,7 +76,6 @@ class DeleteRequestsRouteToTheDeletionSectionTest(unittest.TestCase):
         self.assertIn("submit-suggestion", description)
 
 
-
 class AFailingReconcilerStillCountsTest(unittest.TestCase):
     """The GitOps lane's RootSync is configured for its path but cannot fetch
     the repository (#2938). Presence follows the spec, so the chart is still
@@ -88,6 +87,7 @@ class AFailingReconcilerStillCountsTest(unittest.TestCase):
         self.assertIn("Presence is decided by the spec, not the status.", content)
         self.assertIn("status.source.errors", content)
         self.assertIn("installs nothing until it syncs again", content)
+
 
 if __name__ == "__main__":
     unittest.main()
