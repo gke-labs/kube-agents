@@ -1072,7 +1072,8 @@ def summary(
         for r in (previous or {}).get("findings") or []
         if r.get("id")
         and (
-            r.get(ROW_MEMBER_KEY) in reviewed_keys
+            # Any member a folded row stands for, as the queue reaches the row from any of them.
+            any(m in reviewed_keys for m in (r.get(ROW_MEMBERS_KEY) or [r[ROW_MEMBER_KEY]]))
             if r.get(ROW_MEMBER_KEY)
             else (str(r.get("project") or ""), str(r.get("cluster") or "")) in reviewed_pairs
         )
