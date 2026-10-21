@@ -2642,36 +2642,54 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
     for idx, word in enumerate(seg):
         base = os.path.basename(word)
         if base == "setsid":
+            saw_f = False
             for w in seg[idx + 1:]:
                 if w == "--":
                     break
-                if w in ("-f", "--fork") or (
-                    w.startswith("-") and not w.startswith("--") and "f" in w[1:] and all(c in _SETSID_VAL_LESS_FLAGS for c in w[1:])
-                ):
-                    return True
+                if w in ("-w", "--wait"):
+                    saw_f = False
+                    break
+                if w in ("-f", "--fork"):
+                    saw_f = True
+                elif w.startswith("-") and not w.startswith("--") and len(w) > 1:
+                    if all(c in _SETSID_VAL_LESS_FLAGS for c in w[1:]):
+                        if "w" in w[1:]:
+                            saw_f = False
+                            break
+                        if "f" in w[1:]:
+                            saw_f = True
                 if not w.startswith("-") and not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
                     break
+            if saw_f:
+                return True
         elif base == "sudo":
             prev_opt_takes_val = False
             for w in seg[idx + 1:]:
                 if w == "--":
                     break
-                if w in ("-b", "--background") or (
-                    w.startswith("-") and not w.startswith("--") and "b" in w[1:]
-                    and all(c in _SUDO_VAL_LESS_FLAGS for c in w[1:-1])
-                    and (w[-1] in _SUDO_VAL_LESS_FLAGS or "-" + w[-1] in _SUDO_VAL_OPTS)
-                ):
+                if w in ("-b", "--background"):
                     return True
+                if w.startswith("-") and not w.startswith("--") and len(w) > 1:
+                    saw_b = False
+                    val_opt_end = False
+                    for ci, c in enumerate(w[1:]):
+                        if c == "b":
+                            saw_b = True
+                        if c in _SUDO_VAL_LESS_FLAGS:
+                            continue
+                        if "-" + c in _SUDO_VAL_OPTS:
+                            val_opt_end = True
+                            rest = w[1 + ci + 1:]
+                            if not rest:
+                                prev_opt_takes_val = True
+                            break
+                        break
+                    if saw_b:
+                        return True
+                    if val_opt_end:
+                        continue
                 if w.startswith("-"):
-                    prev_opt_takes_val = (
-                        w in _SUDO_VAL_OPTS
-                        or (
-                            not w.startswith("--")
-                            and len(w) > 1
-                            and "-" + w[-1] in _SUDO_VAL_OPTS
-                            and all(c in _SUDO_VAL_LESS_FLAGS for c in w[1:-1])
-                        )
-                    )
+                    prev_opt_takes_val = w in _SUDO_VAL_OPTS
                     continue
                 if not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
                     if prev_opt_takes_val:

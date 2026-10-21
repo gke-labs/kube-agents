@@ -8623,6 +8623,24 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("sudo -bC 3 python3 f.py --readiness") == [
         (["sudo", "-bC", "3", "python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("sudo -bC3 python3 f.py --readiness") == [
+        (["sudo", "-bC3", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -buhermes python3 f.py --readiness") == [
+        (["sudo", "-buhermes", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Hbuhermes python3 f.py --readiness") == [
+        (["sudo", "-Hbuhermes", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -bgbin python3 f.py --readiness") == [
+        (["sudo", "-bgbin", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -fw python3 f.py --readiness") == [
+        (["setsid", "-fw", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -wf python3 f.py --readiness") == [
+        (["setsid", "-wf", "python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("sudo -ubob python3 f.py --readiness") == [
         (["sudo", "-ubob", "python3", "f.py", "--readiness"], True),
     ]
