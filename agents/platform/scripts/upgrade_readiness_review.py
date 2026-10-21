@@ -124,6 +124,11 @@ KV_AUTH_VARIABLE = "SESSION_KV_API_KEY"  # the name of the variable the bearer t
 DEFAULT_KV_ENDPOINT = "http://127.0.0.1:8699"
 KV_FINDINGS_PATH = "/v1/findings"
 KV_TIMEOUT_SECONDS = 30
+# The queue answers 503 only when it wrote nothing (its lock wait ran out, or its
+# transaction rolled back), and says the same body may be sent again: once, after
+# this pause, while the run's time allows it.
+HTTP_BUSY = 503
+BUSY_RETRY_SECONDS = 5
 KV_ERROR_EXCERPT_CHARS = 300  # of the queue's refusal body, kept in the problem line
 KV_BATCH_LIMIT = findings_queue.MAX_BATCH  # one POST /v1/findings holds this many rows
 
@@ -399,6 +404,10 @@ def failure_marker() -> Path:
 # --- the findings queue --------------------------------------------------------
 
 
+class QueueBusy(OSError):
+    """The queue's 503: nothing was written, so the batch may be sent again."""
+
+
 def kv_endpoint() -> str:
     return (os.environ.get(KV_ENDPOINT_ENV) or DEFAULT_KV_ENDPOINT).rstrip("/")
 
@@ -422,7 +431,8 @@ def kv_request(path: str, body: dict | None = None, timeout: float = KV_TIMEOUT_
             body = " ".join(exc.read().decode("utf-8", "replace").split())[:KV_ERROR_EXCERPT_CHARS]
         except (OSError, http.client.HTTPException):  # the error body itself cut short
             body = ""
-        raise OSError(f"HTTP {exc.code} {exc.reason}: {body}" if body else f"HTTP {exc.code} {exc.reason}") from None
+        error = QueueBusy if exc.code == HTTP_BUSY else OSError
+        raise error(f"HTTP {exc.code} {exc.reason}: {body}" if body else f"HTTP {exc.code} {exc.reason}") from None
     except http.client.HTTPException as exc:
         # A response cut short or malformed is a transport failure of this
         # batch, as the nudge treats it, not the end of the run.
@@ -979,11 +989,19 @@ def register(members: list[dict], errors: list[dict], findings: list[dict], stop
                 # the rows this job wrote in its family, never the `upgrade-` rows the audit
                 # streams or the retrospective write under their own sources.
                 body["scope"] = {"project": project, "cluster": cluster, "complete": True, "check_prefix": CHECK_PREFIX, "source": SOURCE}
-            left = KV_TIMEOUT_SECONDS if stop is None else min(KV_TIMEOUT_SECONDS, stop - time.monotonic())
+            def time_left() -> float:
+                return KV_TIMEOUT_SECONDS if stop is None else min(KV_TIMEOUT_SECONDS, stop - time.monotonic())
+
             try:
-                if left <= 0:
+                if time_left() <= 0:
                     raise OSError(REGISTRATION_OUT_OF_TIME_DETAIL)
-                answer = kv_request(KV_FINDINGS_PATH, body, timeout=left)
+                try:
+                    answer = kv_request(KV_FINDINGS_PATH, body, timeout=time_left())
+                except QueueBusy:
+                    if time_left() <= BUSY_RETRY_SECONDS:
+                        raise
+                    time.sleep(BUSY_RETRY_SECONDS)
+                    answer = kv_request(KV_FINDINGS_PATH, body, timeout=time_left())
                 sent = {item_id(item) for item in chunk}
                 results = answer.get(ANSWER_RESULTS_KEY)
                 acknowledged = {str(r["id"]) for r in results if isinstance(r, dict) and r.get("id")} if isinstance(results, list) else set()

@@ -640,10 +640,14 @@ def list_findings(
 ) -> list[dict]:
     clauses, params = [], []
     if check_prefix:
-        # A family of checks, as a claim's check_prefix names one, compared as
-        # a plain prefix: LIKE would read `_` in a check as a wildcard.
-        clauses.append("substr(check_slug, 1, ?) = ?")
-        params.extend([len(check_prefix), check_prefix])
+        # A family of checks in the claim's grammar (`in_check_family`), folded
+        # as the claim folds it, so a listing and a claim name the same rows; a
+        # plain prefix, since LIKE would read `_` as a wildcard.
+        family = check_prefix.lower()
+        if not CHECK_FAMILY_RE.fullmatch(family):
+            raise FindingError(f"check_prefix is {_brief(family)}; a check family is one segment and its separator, as 'upgrade-' is")
+        clauses.append("(substr(check_slug, 1, ?) = ? OR check_slug = ?)")
+        params.extend([len(family), family, family[: -len(CHECK_FAMILY_SEPARATOR)]])
     if project:
         clauses.append("project = ?")
         params.append(project)

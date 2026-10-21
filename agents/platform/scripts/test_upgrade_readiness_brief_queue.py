@@ -103,7 +103,6 @@ class TheQueueView(unittest.TestCase):
         code, view = self.run_main(queue)
         self.assertEqual(code, 0)
         self.assertEqual(queue.queries, [{"state": s, "check_prefix": review.CHECK_PREFIX, "limit": str(brief_queue.PAGE_LIMIT)} for s in brief_queue.DECIDED_STATES])
-        self.assertEqual(view["projects"], [OTHER_PROJECT, PROJECT])
         self.assertEqual(view["snoozed"], [{"id": "upgrade-pdb:s", "state": "snoozed", "severity": "critical", "check": "upgrade-pdb", "project": OTHER_PROJECT, "cluster": "seeded-b", "snoozed_until": "2026-11-01T00:00:00Z"}])
 
     def test_an_accepted_critical_carries_its_state_alone(self):
@@ -175,6 +174,7 @@ class TheBriefEntry(unittest.TestCase):
         # brings the MCP toolsets back, kanban files a card that asks for a decision, and the file
         # toolset's writes are not held to the risk: high command policy.
         self.assertIn("no_mcp", toolsets)
+        self.assertIn("terminal", toolsets, "the turn reads the SOP and the summary with cat")
         self.assertLessEqual(toolsets, {"terminal", "no_mcp"})
 
 

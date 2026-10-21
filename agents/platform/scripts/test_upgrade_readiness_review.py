@@ -287,6 +287,35 @@ class Registration(unittest.TestCase):
         self.assertEqual(claimed, set())
         self.assertEqual(problems, [f"{PROJECT}/seeded-b: {review.CLAIM_FAILED_MARK}: {review.REGISTRATION_OUT_OF_TIME_DETAIL}"])
 
+    def test_a_busy_queue_gets_the_same_batch_once_more_after_a_pause(self):
+        calls = []
+
+        def busy_once(path, body, timeout=None):
+            calls.append(body)
+            if len(calls) == 1:
+                raise review.QueueBusy("HTTP 503 Service Unavailable: the findings queue is busy")
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
+
+        findings = review.member_findings(seeded_b())
+        with mock.patch.object(review, "kv_request", busy_once), mock.patch.object(review.time, "sleep") as slept:
+            outcomes, problems, claimed = review.register([seeded_b()], [], findings)
+        self.assertEqual((problems, claimed), ([], {f"{PROJECT}/us-central1-a/seeded-b"}))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        slept.assert_called_once_with(review.BUSY_RETRY_SECONDS)
+        # Busy again: one retry only, then the batch and its claim are booked as not sent.
+        calls.clear()
+
+        def always_busy(path, body, timeout=None):
+            calls.append(body)
+            raise review.QueueBusy("HTTP 503 Service Unavailable: the findings queue is busy")
+
+        with mock.patch.object(review, "kv_request", always_busy), mock.patch.object(review.time, "sleep"):
+            outcomes, problems, claimed = review.register([seeded_b()], [], findings)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((set(outcomes.values()), claimed), ({review.REGISTRATION_FAILED}, set()))
+        self.assertIn(review.CLAIM_FAILED_MARK, problems[0])
+
     def test_a_complete_cluster_with_nothing_to_report_sends_an_empty_scoped_batch(self):
         calls = []
 
@@ -483,6 +512,16 @@ class Registration(unittest.TestCase):
             with self.assertRaises(OSError) as caught:
                 review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
         self.assertEqual(str(caught.exception), "HTTP 503 Service Unavailable")
+        # The one answer that wrote nothing is told apart, so it may be sent again.
+        self.assertIsInstance(caught.exception, review.QueueBusy)
+
+        def bad_request(req, timeout):
+            raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, CutShort())
+
+        with mock.patch.object(review.urllib.request, "urlopen", bad_request):
+            with self.assertRaises(OSError) as caught:
+                review.kv_request(review.KV_FINDINGS_PATH, {"findings": []})
+        self.assertNotIsInstance(caught.exception, review.QueueBusy)
 
     def test_an_answer_that_is_not_an_object_is_this_batchs_failure(self):
         import io

@@ -17,7 +17,6 @@ instead: the scheduler runs this script before the turn (the entry's
   (``check_prefix=upgrade-``), at the queue's page limit; no project list is
   needed, so a project whose rows are all decided, or one the summary spells by
   number, is counted all the same.
-- ``projects``: every project those rows name.
 - ``cut``: each page that came back full, so its count is a floor, and
   ``unread``: each one the script could not read.
 
@@ -72,7 +71,7 @@ def upgrade_rows(rows: list, open_backlog: bool) -> list[dict]:
     return [
         brief_row(row, open_backlog and row.get("severity") == DETAILED_SEVERITY and row.get("state") in UNDECIDED_STATES)
         for row in rows
-        if isinstance(row, dict) and str(row.get("check") or "").startswith(review.CHECK_PREFIX)
+        if isinstance(row, dict) and findings_queue.in_check_family(str(row.get("check") or ""), review.CHECK_PREFIX)
     ]
 
 
@@ -92,8 +91,7 @@ def queue_view() -> dict:
         if len(rows) >= PAGE_LIMIT:
             cut.append(page)
         decided[page["state"]] += upgrade_rows(rows, open_backlog=False)
-    projects = sorted({r["project"] for rows in (open_rows, *decided.values()) for r in rows if r.get("project")})
-    return {"projects": projects, "open": open_rows, **decided, "cut": cut, "unread": unread}
+    return {"open": open_rows, **decided, "cut": cut, "unread": unread}
 
 
 def main() -> int:

@@ -953,11 +953,15 @@ class TestListing(QueueTestCase):
         self.register(sample(check="upgrade-drain-blocking-budget", object="PodDisruptionBudget/pinned"))
         self.assertEqual({f["check"] for f in fq.list_findings(self.conn, check_prefix="probes-")}, {"probes-readiness"})
         self.assertEqual([f["check"] for f in fq.list_findings(self.conn, check_prefix="upgrade-")], ["upgrade-drain-blocking-budget"])
-        # A plain prefix: `_` is not a wildcard, as it would be under LIKE.
-        self.assertEqual(fq.list_findings(self.conn, check_prefix="probes_"), [])
         # The family is selected before the page is cut, so a page of one holds a row of it,
         # whatever the other families' rank.
         self.assertEqual([f["check"] for f in fq.list_findings(self.conn, check_prefix="upgrade-", limit=1)], ["upgrade-drain-blocking-budget"])
+        # The claim's grammar: folded, the bare family name included, and a malformed family refused.
+        self.assertEqual([f["check"] for f in fq.list_findings(self.conn, check_prefix="Upgrade-")], ["upgrade-drain-blocking-budget"])
+        self.register(sample(check="upgrade-", object="PodDisruptionBudget/bare"))
+        self.assertEqual(sorted(f["check"] for f in fq.list_findings(self.conn, check_prefix="upgrade-")), ["upgrade", "upgrade-drain-blocking-budget"])
+        with self.assertRaises(fq.FindingError):
+            fq.list_findings(self.conn, check_prefix="probes_")
 
     def test_bad_filters_are_refused(self):
         with self.assertRaises(fq.FindingError):
