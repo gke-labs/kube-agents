@@ -5,7 +5,6 @@ import io
 import json
 import os
 import sys
-import tempfile
 import unittest
 import urllib.parse
 from contextlib import redirect_stdout
@@ -17,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import upgrade_readiness_brief_queue as brief_queue  # noqa: E402
 import upgrade_readiness_review as review  # noqa: E402
-import upgrade_readiness_watch as watch  # noqa: E402
 
 ROSTER = Path(__file__).resolve().parents[1] / "cron" / "jobs.json"
 PROJECT = "acme-prod"
@@ -63,13 +61,6 @@ class FakeQueue:
 
 
 class TheQueueView(unittest.TestCase):
-    def setUp(self):
-        self.home = tempfile.TemporaryDirectory()
-        self.addCleanup(self.home.cleanup)
-        patcher = mock.patch.dict(os.environ, {watch.HOME_ENV: self.home.name})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def run_main(self, queue):
         out = io.StringIO()
         with mock.patch.object(review, "kv_request", queue), redirect_stdout(out):

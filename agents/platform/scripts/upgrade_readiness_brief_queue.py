@@ -20,8 +20,8 @@ instead: the scheduler runs this script before the turn (the entry's
 - ``cut``: each page that came back full, so its count is a floor, and
   ``unread``: each one the script could not read.
 
-Each list keeps only the rows whose check starts with ``upgrade-``. An
-undecided critical row carries what a Decide-now line names, since the brief
+Each list keeps only the rows of the review's family (``in_check_family``, as
+the queue's claim names it). An undecided critical row carries what a Decide-now line names, since the brief
 may compose that line from the queue alone; every other row carries its state alone, which
 keeps the prompt small on a large fleet. A backlog that cannot be read prints
 ``error`` alone and exits 0: the turn still runs, and its SOP has it say the
