@@ -8196,12 +8196,6 @@ main() {
   # that and how to keep the previous stack instead.
   if [ "$platform_agent_mode" = "next" ]; then
     echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway in front of the agent; --mode=today on a first install, or PLATFORM_AGENT_MODE=today in install.env, installs the previous stack)"
-    # The known gap the default flip shipped with: the A2A gateway does not
-    # yet draw the board's plan layout that KAGE_SLACK_UX draws under today
-    # (docs/site concepts/chatops.md, "Slack").
-    if slack_moves_to_a2a_gateway "$platform_agent_mode" "$slack_enabled" "$google_chat_enabled"; then
-      echo -e "    ${C_YELLOW}Slack under next does not yet draw the board's plan card: each card update posts as a plain-text message of its own. Today's stack keeps the plan card.${C_RESET}"
-    fi
   else
     echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}"
   fi

@@ -12,8 +12,10 @@ one thing about what the simulated operator does and checks the run stops on
 the assertion that names it.
 
 The wiring in hack/ci-eval-pr.sh is pinned at the end: it runs only under
-EVAL_MODE_NEXT=1, after the suite verdict is computed and before it is
-announced, and nothing it does reaches the exit status.
+EVAL_MODE_NEXT=1 on a run that is not a pull request's, after the suite
+verdict is computed and before it is announced, and nothing it does reaches
+the exit status; and the today lane (EVAL_ROLLBACK_LANE=1) runs it before the
+matrix with ROLLBACK_END_MODE=today, where a failure stops the job.
 """
 
 import base64
@@ -135,6 +137,22 @@ _PASSING_ORDER = [
     "leg2.bus-task",
     "leg2.nothing-stuck",
     "leg2.not-degraded",
+]
+
+# What ROLLBACK_END_MODE=today adds to a run on an install with no declared
+# sidecars: the preflight read, and leg 3, leg 1's flip and checks again.
+_END_TODAY_PREFLIGHT = "pre.end-mode-today"
+_LEG3_ORDER = [
+    "leg3.mode-today.patched",
+    "leg3.mode-today.reconciled",
+    "leg3.mode-today.agent-rolled",
+    "leg3.mode-today.ready",
+    "leg3.a2a-torn-down",
+    "leg3.pvc-kept",
+    "leg3.creds-kept",
+    "leg3.nothing-stuck",
+    "leg3.not-degraded",
+    "leg3.today-turn",
 ]
 
 # The simulated operator. State is one JSON file; every kubectl call is one
@@ -763,6 +781,70 @@ class KeptRoundTripTest(RoundTripTest):
         self.assertIn("SKIP leg2.sidecars-restored:", result.stdout)
         self.assertIn("PASS leg2.bus-task", result.stdout)
         self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}])
+
+    def test_ending_at_today_adds_a_third_leg_and_leaves_the_install_rolled_back(self) -> None:
+        # The today lane's shape: the operator renders the bridge, so the CR
+        # declares no sidecars, and the run ends under today.
+        round_trip, _, _ = self.run_sim(healthy_next_state(sidecars=[]))
+        result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE="today")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected = list(passed(round_trip))
+        expected.insert(expected.index("pre.mode-next") + 1, _END_TODAY_PREFLIGHT)
+        self.assertEqual(passed(result), expected + _LEG3_ORDER)
+        self.assertEqual(failed(result), [])
+        self.assertEqual(state["patches"], [{"spec": {"mode": "today"}}, {"spec": {"mode": "next"}}, {"spec": {"mode": "today"}}])
+        self.assertEqual(state["cr"]["spec"]["mode"], "today")
+        last = result.stdout.strip().splitlines()[-1]
+        self.assertTrue(last.startswith("ROLLBACK ROUND TRIP PASSED: next -> today -> next -> today on platformagent/platform-agent"), last)
+        self.assertIn("uid pvc-1", last)
+
+    def test_the_default_end_is_next(self) -> None:
+        for value in (None, "next"):
+            with self.subTest(ROLLBACK_END_MODE=value):
+                extra = {} if value is None else {"ROLLBACK_END_MODE": value}
+                result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), **extra)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertNotIn(_END_TODAY_PREFLIGHT, passed(result))
+                self.assertFalse([name for name in passed(result) if name.startswith("leg3.")])
+                self.assertEqual(state["cr"]["spec"]["mode"], "next")
+                self.assertIn("ROLLBACK ROUND TRIP PASSED: next -> today -> next on", result.stdout)
+
+    def test_ending_at_today_refuses_declared_sidecars_before_anything_changes(self) -> None:
+        result, state, _ = self.run_sim(healthy_next_state(), ROLLBACK_END_MODE="today")
+        self.assert_fails_at(result, _END_TODAY_PREFLIGHT, "the CR declares spec.deployment.sidecars (hermes-bridge)")
+        self.assertEqual(state["patches"], [])
+        self.assertEqual(state["cr"]["spec"]["mode"], "next")
+
+    def test_an_end_mode_that_is_neither_fails_before_anything_is_read(self) -> None:
+        for value in ("Today", "rollback", "next "):
+            with self.subTest(ROLLBACK_END_MODE=value):
+                result, state, _ = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE=value)
+                self.assert_fails_at(result, "pre.end-mode", f"ROLLBACK_END_MODE is '{value}'")
+                self.assertEqual(state["patches"], [])
+
+    def test_a_today_turn_that_fails_on_the_third_leg_fails_there(self) -> None:
+        # The door's today turn is the same request on every leg; failing it
+        # once leg 2 has passed shows leg 3 asserts it rather than inheriting
+        # leg 1's pass.
+        state = healthy_next_state(sidecars=[])
+        sim = Sim(state)
+        self.addCleanup(sim.close)
+        proc = subprocess.Popen(
+            ["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=sim.env(ROLLBACK_END_MODE="today")
+        )
+        out_lines = []
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out_lines.append(line)
+            if line.startswith("PASS leg2.not-degraded"):
+                current = sim.state()
+                current["scenario"]["today_turn_fails"] = True
+                sim.state_path.write_text(json.dumps(current))
+        proc.wait(timeout=180)
+        out = "".join(out_lines)
+        self.assertEqual(proc.returncode, 1, out)
+        self.assertEqual(re.findall(r"^FAIL (\S+):", out, re.MULTILINE), ["leg3.today-turn"], out)
+        self.assertIn("PASS leg1.today-turn", out)
 
     def test_every_kubectl_call_is_pinned_to_the_context(self) -> None:
         _, state, _ = self.run_sim(healthy_next_state())
@@ -1418,11 +1500,104 @@ def snowflake(epoch_seconds: int) -> int:
     return (epoch_seconds * 1000 - 1288834974657) << 22
 
 
+class CiEvalRollbackLaneTest(unittest.TestCase):
+    """run_rollback_lane in hack/ci-eval-pr.sh, lifted and run: the today
+    lane's round trip, before the matrix, ending under today."""
+
+    def run_lane(self, *, rollback_lane: str | None, mode_next: str | None, script_status: int = 0) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        artifacts = root / "artifacts"
+        (root / "rollback-roundtrip.sh").write_text(
+            'echo "stub ran: $* end=${ROLLBACK_END_MODE:-} context=${ROLLBACK_KUBE_CONTEXT}"\n'
+            "echo 'PASS pre.mode-next: x' >> \"${ROLLBACK_RESULTS_FILE}\"\n"
+            f"exit {script_status}\n"
+        )
+        flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
+        lane = "unset EVAL_ROLLBACK_LANE" if rollback_lane is None else f"export EVAL_ROLLBACK_LANE={rollback_lane}"
+        script = textwrap.dedent(
+            f"""\
+            set -euo pipefail
+            {ci_eval_constants()}
+            SCRIPT_DIR={root}
+            export ARTIFACTS={artifacts}
+            TARGET_NAMESPACE=kubeagents-system
+            AGENT_SERVICE_NAME=platform-agent
+            AGENT_CLUSTER_CONTEXT=gke_p_r_c
+            {flag}
+            {lane}
+            profile_begin() {{ echo "PROFILE $*"; }}
+            {ci_eval_function("run_rollback_lane")}
+            run_rollback_lane
+            echo "MATRIX NEXT"
+            """
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60, check=False, env=minimal_env())
+        return result, artifacts
+
+    def test_nothing_happens_off_the_lane(self) -> None:
+        for lane in (None, "", "0", "true"):
+            for flag in (None, "1"):
+                with self.subTest(lane=lane, flag=flag):
+                    result, artifacts = self.run_lane(rollback_lane=lane, mode_next=flag)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "MATRIX NEXT\n")
+                    self.assertFalse(artifacts.exists())
+
+    def test_the_lane_without_the_flag_stops_the_job(self) -> None:
+        for flag in (None, "", "0"):
+            with self.subTest(flag=flag):
+                result, _ = self.run_lane(rollback_lane="1", mode_next=flag)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1", result.stderr)
+                self.assertNotIn("stub ran", result.stdout)
+                self.assertNotIn("MATRIX NEXT", result.stdout)
+
+    def test_a_passing_rollback_ends_at_today_and_the_matrix_follows(self) -> None:
+        result, artifacts = self.run_lane(rollback_lane="1", mode_next="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stub ran: kubeagents-system platform-agent end=today context=gke_p_r_c", result.stdout)
+        self.assertIn("Rolled back to today; the matrix runs over the agent API", result.stdout)
+        self.assertLess(result.stdout.index("Rolled back to today"), result.stdout.index("MATRIX NEXT"), result.stdout)
+        self.assertIn("stub ran", (artifacts / "rollback-roundtrip.log").read_text())
+        self.assertEqual((artifacts / "rollback-roundtrip.txt").read_text().splitlines(), ["PASS pre.mode-next: x"])
+
+    def test_a_failed_rollback_stops_the_job_before_the_matrix(self) -> None:
+        result, _ = self.run_lane(rollback_lane="1", mode_next="1", script_status=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the rollback lane's round trip failed (exit 1)", result.stderr)
+        self.assertNotIn("MATRIX NEXT", result.stdout)
+
+    def test_it_runs_before_the_resets_and_the_audit_pause(self) -> None:
+        lines = _CI_EVAL.read_text().splitlines()
+        call = [i for i, line in enumerate(lines) if line == "run_rollback_lane"]
+        self.assertEqual(len(call), 1, "one call site")
+        watch = lines.index("start_agent_pod_watch")
+        pause = next(i for i, line in enumerate(lines) if line.startswith("scheduled_audits pause"))
+        ledgers = next(i for i, line in enumerate(lines) if line.startswith("# ─── Empty ledgers"))
+        token = next(i for i, line in enumerate(lines) if line.startswith("# 4. Token & Model Configuration"))
+        self.assertLess(watch, call[0])
+        self.assertLess(call[0], ledgers)
+        self.assertLess(call[0], pause)
+        self.assertLess(call[0], token)
+
+
 class CiEvalWiringTest(unittest.TestCase):
     """run_rollback_roundtrip in hack/ci-eval-pr.sh, lifted and run."""
 
     def run_wiring(
-        self, *, mode_next: str | None, script_status: int = 0, elapsed: int = 0, job_age: int | None = None, build_id: str | None = None, timeout_on_path: bool = False, rc_commit_sha: str | None = None
+        self,
+        *,
+        mode_next: str | None,
+        script_status: int = 0,
+        elapsed: int = 0,
+        job_age: int | None = None,
+        build_id: str | None = None,
+        timeout_on_path: bool = False,
+        job_type: str | None = None,
+        rollback_lane: str | None = None,
+        rc_commit_sha: str | None = None,
     ) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
         """`elapsed` is the eval's age (START_TIME), `job_age` this script's
         (EVAL_SCRIPT_STARTED_EPOCH, defaulting to the eval's), `build_id` the
@@ -1439,6 +1614,8 @@ class CiEvalWiringTest(unittest.TestCase):
         )
         flag = "unset EVAL_MODE_NEXT" if mode_next is None else f"export EVAL_MODE_NEXT={mode_next}"
         build = "unset BUILD_ID" if build_id is None else f"export BUILD_ID={build_id}"
+        kind = "unset JOB_TYPE" if job_type is None else f"export JOB_TYPE={job_type}"
+        lane = "unset EVAL_ROLLBACK_LANE" if rollback_lane is None else f"export EVAL_ROLLBACK_LANE={rollback_lane}"
         rc = "unset RC_COMMIT_SHA" if rc_commit_sha is None else f"export RC_COMMIT_SHA={rc_commit_sha}"
         age = elapsed if job_age is None else job_age
         script = textwrap.dedent(
@@ -1454,6 +1631,8 @@ class CiEvalWiringTest(unittest.TestCase):
             EVAL_SCRIPT_STARTED_EPOCH=$(($(date +%s) - {age}))
             {flag}
             {build}
+            {kind}
+            {lane}
             {rc}
             profile_begin() {{ echo "PROFILE $*"; }}
             collect_gateway_log() {{ echo COLLECT_GATEWAY; }}
@@ -1486,6 +1665,32 @@ class CiEvalWiringTest(unittest.TestCase):
                 self.assertNotIn("PROFILE", result.stdout)
                 self.assertNotIn("Rollback round trip", result.stdout)
                 self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_skipped_on_a_pull_requests_run(self) -> None:
+        # The merge-blocking presubmit grades next, and a Tide batch runs it
+        # too; neither reads a report-only round trip, and the today lane
+        # proves the path on main.
+        for job_type in ("presubmit", "batch"):
+            with self.subTest(job_type=job_type):
+                result, artifacts = self.run_wiring(mode_next="1", job_type=job_type)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("stub ran", result.stdout)
+                self.assertNotIn("PROFILE", result.stdout)
+                self.assertIn(f"Rollback round trip skipped: a pull request's run (JOB_TYPE={job_type})", result.stdout)
+                self.assertEqual(list(artifacts.iterdir()), [])
+
+    def test_it_runs_on_main_and_off_prow(self) -> None:
+        for job_type in ("periodic", "postsubmit", None):
+            with self.subTest(job_type=job_type):
+                result, _ = self.run_wiring(mode_next="1", job_type=job_type)
+                self.assertIn("stub ran", result.stdout)
+
+    def test_skipped_on_the_today_lane_which_ran_it_before_the_matrix(self) -> None:
+        result, artifacts = self.run_wiring(mode_next="1", job_type="periodic", rollback_lane="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("stub ran", result.stdout)
+        self.assertNotIn("Rollback round trip", result.stdout)
+        self.assertEqual(list(artifacts.iterdir()), [])
 
     def test_skipped_on_a_release_candidate_run(self) -> None:
         """The RC eval's verdict is read only after its job finishes, inside the

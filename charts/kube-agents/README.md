@@ -263,7 +263,10 @@ before it reaches the provider: the ConfigMap gains the shared redactor module,
 the redaction pre-call hook and a `redaction.yaml` rule file, all mounted beside
 `/app/config.yaml`, and the gateway container gets `KUBE_AGENTS_REDACTION_CONFIG`
 plus an optional `SESSION_KV_SALT` from the credentials Secret to salt the
-pseudonyms. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
+pseudonyms. The PlatformAgent CR gains a read-only projection of `redaction.yaml` from
+that ConfigMap at `/etc/kube-agents-redaction/redaction.yaml`, the fixed path
+the agent image looks for, so the image applies the rules to what it writes to
+its volume as well. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
 because YAML reads the bare word as a boolean and the render refuses it) and
 `litellm.redaction.ip.allowCidrs` govern IP literals; `litellm.redaction.rules`
 adds named `literal` or `pattern` rules with a `mask` or `pseudonym` action, and
@@ -780,7 +783,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Five knobs need context beyond the chart:
+These knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -826,6 +829,14 @@ Five knobs need context beyond the chart:
   the detector: enabled without a subscription to read, it comes up and retries
   a pull that cannot succeed for the life of the pod, never exits, and leaves
   the pod Ready. That is why it defaults to off.
+- `harness.stallWatch` tunes the controller stall watch with
+  `excludeNamespaces`, `minStallAgeMinutes` and `kinds`. The default `{}`
+  renders no block, and the watch keeps its own defaults. The operator delivers
+  the values in the agent's managed `.env`, so a change rolls the agent pod. The
+  [`spec.harness.stallWatch` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnessstallwatch)
+  is canonical for each field and for the opt-out annotation. If a field is
+  set, the chart fails the render against an installed CRD that predates
+  `spec.harness.stallWatch`.
 
 ### Plugins & Runtime Tuning
 

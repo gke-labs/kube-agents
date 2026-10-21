@@ -2047,6 +2047,18 @@ _ALL_FINDINGS_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
 
+# What `every_finding_named` counts as a name: audit_report's finding heading
+# (`FINDING_MARKER_RE`'s shape) and inline code outside HTML comments.
+_HEADING_ID_RE = re.compile(r"^####[ \t].*?<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# The notice audit_report's `_render_findings` writes when it omits findings.
+_OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
+# Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
+_HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+# Ids quoted in an `every_finding_named` failure; the count is always exact.
+_MAX_UNNAMED_IN_REASON = 5
+
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
 # candidates to shotgun the API with.
@@ -3611,6 +3623,15 @@ def _finding_ids(body: str) -> tuple[list[str], str] | None:
     return [i for i in ids if isinstance(i, str)], source
 
 
+def _json_str_list(payload: str) -> list[str]:
+    """The strings of a JSON list, or [] when it does not parse as one."""
+    try:
+        value = json.loads(payload)
+    except (ValueError, TypeError):
+        return []
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
 @VERIFIERS.register("ledger_issue_contains")
 class LedgerIssueContainsVerifier(BaseVerifier):
     """Phrase checks against the GitHub ledger issue this run published.
@@ -3725,6 +3746,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids"] = "body"
+    # Every id the ledger files must be readable in its body, outside the two
+    # hidden id blocks: a finding cut for space and named only in
+    # `audit-findings-all` is filed but invisible to the person reading it.
+    every_finding_named: bool = False
     # Tolerance on the ledger stamp vs. the harness's run-start clock, which
     # are two different machines (the Prow runner and the agent pod). Small on
     # purpose: every second of it is a second of a previous run's ledger that
@@ -4029,6 +4054,33 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
 
+        unnamed: list[str] = []
+        omitted_unlisted: re.Match | None = None
+        if self.every_finding_named:
+            filed = _finding_ids(ledger["body"])
+            if filed is None:
+                return done(
+                    False,
+                    f"{ledger['slug']} carries no readable "
+                    "<!-- audit-findings: [...] --> delta block, so whether it "
+                    "names every finding it filed cannot be read off it",
+                )
+            # Named means a heading a reader sees, or the id whole in a code
+            # span outside any HTML comment: a bare substring would let `x.orders`
+            # pass on a visible `x.orders-api`.
+            body = ledger["body"]
+            named = set(_HEADING_ID_RE.findall(body))
+            named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
+            # Collector-held ids are the collector's, rendered in what the
+            # findings leave; this check grades the findings the run filed.
+            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
+            # Past its cap the complete-id block is left out and `filed` is the
+            # delta block, which lacks the omitted ids; the renderer's omission
+            # notice still says they exist.
+            if filed[1] == "audit-findings":
+                omitted_unlisted = _OMITTED_NOTICE_RE.search(_HTML_COMMENT_RE.sub("", body))
+
         missing = [p for p in self.required_phrases if p.lower() not in text]
         present = [p for p in self.forbidden_phrases if p.lower() in text]
         any_of_miss = bool(self.any_of_phrases) and not any(
@@ -4039,8 +4091,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
         }
-        if missing or present or any_of_miss:
+        if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []
+            if omitted_unlisted:
+                parts.append(
+                    f"{ledger['slug']} says {omitted_unlisted.group(1)} further finding(s) are "
+                    "omitted from its description and carries no audit-findings-all block "
+                    "to name them, so they are filed but named nowhere"
+                )
+            if unnamed:
+                parts.append(
+                    f"{len(unnamed)} filed finding id(s) appear only in the hidden id "
+                    f"blocks of {ledger['slug']}, not in its visible body: "
+                    f"{unnamed[:_MAX_UNNAMED_IN_REASON]}"
+                )
             if missing:
                 parts.append(f"required phrases absent from {surface}: {missing}")
             if present:
@@ -4062,6 +4126,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
             )
+        if self.every_finding_named:
+            satisfied.append("a visible name for every filed finding")
         return done(
             True,
             f"{surface}, generated at {generated_at.isoformat()} by this run, "

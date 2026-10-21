@@ -160,6 +160,9 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
+    "chat-sample-report-is-not-cluster-state",  # nothing filed on a sample report's say-so, #3080
+    "chat-sample-report-is-not-cluster-state-labelled",  # the same, with the patched adapter's label
+    "chat-real-report-fix-files-confirm-first",  # a real report still files at once, confirm-first
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session
@@ -715,6 +718,17 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 
     def test_the_file_is_the_pinned_set(self):
         self.assertEqual(list(eval_rosters.inject_lane_exclusions()), INJECT_LANE_EXCLUDED)
+
+    def test_the_blocking_roster_cases_it_excludes_are_the_pinned_set(self):
+        # The merge-blocking presubmit runs on the inject lane, so a roster
+        # case listed here leaves what can red a pull request: hack/ci-eval-pr.sh
+        # drops it from the matrix and from BOOTSTRAP_ADMITTED there. It keeps
+        # its seat on the today lane, which grades over the api transport but
+        # gates nothing. Adding another is that decision, made here and in
+        # docs/eval-gate-roster.md ("The inject lane"), not a side effect of an
+        # exclusion entry.
+        roster = set(eval_rosters.blocking_roster())
+        self.assertEqual([case for case in eval_rosters.inject_lane_exclusions() if case in roster], ["agent-kanban-smoke"])
 
     def test_every_exclusion_names_a_registered_case(self):
         registered = set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases())

@@ -1191,7 +1191,10 @@ class SlowGate(unittest.TestCase):
         # above, today) is not. A literal floor of 15 would never see a full
         # run and the rule would go silent; a literal of any size would need
         # an edit here on every admission or demotion.
-        n = len(health.eval_rosters.presubmit_cases())
+        # The presubmit grades next on the inject lane, so the cases it runs
+        # are the file's less that lane's exclusions.
+        excluded = health.eval_rosters.inject_lane_exclusions()
+        n = len([case for case in health.eval_rosters.presubmit_cases() if case not in excluded])
         self.assertGreaterEqual(n, 3)
         full = [task(f"case-{k}", "ppp") for k in range(n)]
         self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=full), T0)["slow"])
