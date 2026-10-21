@@ -512,16 +512,16 @@ silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design
 decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.
 
-Rough standing cost: about $290 per month — the GKE management fee (three zonal
+Rough standing cost: about $340 per month — the GKE management fee (three zonal
 clusters) is most of it, the six nodes (20 GB disks), two 10 GB orphan disks and the
 `startup-fail` e2-micro the rest. The no-surge pool on `seeded-b` adds a seventh node, a fifth e2-small, and
 seeded-d adds a fourth management fee, an e2-small and an e2-standard-2, so a project carrying
-the whole stack costs roughly $440 per month — the fee, not the nodes, is the larger
+the whole stack costs roughly $490 per month — the fee, not the nodes, is the larger
 part of the increase. No separate rollout stands between a merge and that cost: a new
 cluster or pool plans as a create, which `hack/fleet_reconcile.py` applies, so the
 postsubmit on that merge creates both in every pool project within hours
-([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). Four of the first six nodes are e2-small; `seeded-a`'s default pool is two e2-mediums
-since #1278 (roughly $25 per month more than the one it ran on), because a single
-e2-medium's 940m allocatable CPU is fully claimed by GKE system pods and the planted
-`payments-api` / `checkout-gateway` fixtures went Pending — the comment on
-`seeded_a_default` in `main.tf` has the numbers.
+([`docs/ci-pool-projects.md`](../../../docs/ci-pool-projects.md) §6.2). Four of the first six nodes are e2-small; `seeded-a`'s default pool is two e2-standard-2s
+(roughly $49 per month more than the two e2-mediums it ran on), because GKE's system pods
+claim 700-860m of an e2-medium's 940m allocatable CPU and the planted fixtures' pods went
+Pending, first on a single node and then, as fixtures accrued, on the busier of two — the
+comment on `seeded_a_default` in `main.tf` has the numbers.

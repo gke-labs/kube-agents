@@ -87,7 +87,8 @@ catalogue entry. No dollar cost beyond the objects themselves — but two of the
 effort, because the condition they plant is already true of `seeded-a` and has to be closed
 elsewhere before the planted one means anything. Note also that `seeded-a`'s headroom is finite:
 `main.tf` records that a single `e2-medium`'s allocatable CPU was fully claimed by system pods and
-every fixture went Pending, which is why its pool is two nodes with roughly 600m to spare.
+every fixture went Pending, which is why its pool is two dedicated-core nodes (`e2-standard-2`)
+with about a core to spare on each.
 
 ### Tier 2 — on `seeded-d` (built)
 
