@@ -2077,6 +2077,177 @@ class TestAlertDailyQuota(unittest.TestCase):
             self.assertIsNotNone(conn.execute("SELECT 1 FROM alert_quota WHERE day = ?", (fresh_day,)).fetchone())
 
 
+class TestWorkloadIncidentFold(unittest.TestCase):
+    """INCIDENT_WORKLOAD_DEDUP_SECONDS: one broken workload is one incident, not one per pod and reason."""
+
+    WINDOW = 900
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+        # Uncapped, so the ceiling cannot be what keeps a sibling quiet; the
+        # tests about the ceiling patch it back.
+        patcher = patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 0, "Critical": 0})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
+        self.trigger = trigger.start()
+        self.addCleanup(trigger.stop)
+
+    def tearDown(self):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _inject(self, pod, reason="BackOff", namespace="fold-ns", kind="Pod", cluster="c1", event_type="Warning"):
+        payload = {
+            "reason": reason,
+            "namespace": namespace,
+            "kind_of_object": kind,
+            "name": pod,
+            "uid": f"uid-{pod}-{reason}",
+            "message": "Back-off restarting failed container",
+            "type": event_type,
+            "cluster": cluster,
+        }
+        resp = self.client.post(
+            f"/sessions/sess-{pod}-{reason}/inject",
+            json={"message": json.dumps(payload)},
+            headers={"X-Watcher-Features": "policy-filtered"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return resp.json()
+
+    def _rows(self, workload):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT id, reason, notified, duplicate_of FROM intercepted_events WHERE workload = ? ORDER BY id",
+                (workload,),
+            ).fetchall()
+
+    def _age(self, row_id, seconds):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE id = ?",
+                    (f"-{seconds} seconds", row_id),
+                )
+
+    def test_off_by_default(self):
+        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)
+        for pod in ("off-api-6cfdb6b98b-aaaaa", "off-api-6cfdb6b98b-bbbbb"):
+            self.assertEqual(self._inject(pod)["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+        self.assertEqual([r[3] for r in self._rows("off-api")], [None, None])
+
+    def test_a_burst_across_replicas_and_reasons_is_one_incident(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            first = self._inject("burst-api-6cfdb6b98b-aaaaa", reason="Unhealthy")
+            later = [
+                self._inject("burst-api-6cfdb6b98b-bbbbb", reason="Unhealthy"),
+                self._inject("burst-api-6cfdb6b98b-ccccc", reason="Unhealthy"),
+                # A cascade's next reason, and a Critical one, folds too.
+                self._inject("burst-api-6cfdb6b98b-aaaaa", reason="CrashLoopBackOff"),
+            ]
+
+        self.assertEqual(first["status"], "injected")
+        rows = self._rows("burst-api")
+        anchor_id = rows[0][0]
+        self.assertEqual([r["status"] for r in later], ["folded"] * 3)
+        self.assertEqual({r["duplicate_of"] for r in later}, {str(anchor_id)})
+        self.assertEqual(self.trigger.call_count, 1)
+        self.assertEqual([(r[2], r[3]) for r in rows], [(1, None)] + [(0, anchor_id)] * 3)
+
+    def test_a_folded_event_spends_no_alert_budget(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.dict(session_kv_server.ALERT_DAILY_LIMITS, {"Warning": 1}):
+            self._inject("budget-api-6cfdb6b98b-aaaaa")
+            self.assertEqual(self._inject("budget-api-6cfdb6b98b-bbbbb")["status"], "folded")
+            warning = self.client.get("/v1/alert-quota").json()["severities"]["Warning"]
+        self.assertEqual((warning["sent"], warning["suppressed"]), (1, 0))
+
+    def test_an_anchor_whose_chat_post_failed_still_folds_its_siblings(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("undelivered-api-6cfdb6b98b-aaaaa")
+            anchor_id = self._rows("undelivered-api")[0][0]
+            session_kv_server.mark_delivery_failed(anchor_id, "no chat route")
+            sibling = self._inject("undelivered-api-6cfdb6b98b-bbbbb")
+
+        self.assertEqual(sibling["status"], "folded")
+        self.assertEqual(sibling["duplicate_of"], str(anchor_id))
+        self.assertEqual(self.trigger.call_count, 1)
+
+    def test_a_headless_anchor_folds_its_siblings(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("headless-api-6cfdb6b98b-aaaaa")
+            session_kv_server.mark_delivery_headless(self._rows("headless-api")[0][0])
+            self.assertEqual(self._inject("headless-api-6cfdb6b98b-bbbbb")["status"], "folded")
+
+    def test_a_refused_event_never_anchors(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            # Filtered by the Info gate.
+            self.assertEqual(self._inject("refused-api-6cfdb6b98b-aaaaa", event_type="Normal")["status"], "filtered")
+            # Dropped by the ceiling.
+            with patch.object(session_kv_server, "_claim_alert_quota", return_value=(False, 1)):
+                self.assertEqual(self._inject("refused-api-6cfdb6b98b-bbbbb")["status"], "suppressed")
+            self.assertEqual(self._inject("refused-api-6cfdb6b98b-ccccc")["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 1)
+
+    def test_a_folded_event_never_anchors(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("chain-api-6cfdb6b98b-aaaaa")
+            self._inject("chain-api-6cfdb6b98b-bbbbb")
+            anchor_id, dup_id = (r[0] for r in self._rows("chain-api"))
+            # The anchor has aged out; the duplicate written inside its window has not.
+            self._age(anchor_id, self.WINDOW + 1)
+            self.assertEqual(self._inject("chain-api-6cfdb6b98b-ccccc")["status"], "injected")
+        self.assertEqual(self.trigger.call_count, 2)
+
+    def test_the_window_runs_from_the_anchor(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("expiry-api-6cfdb6b98b-aaaaa")
+            anchor_id = self._rows("expiry-api")[0][0]
+            self._age(anchor_id, self.WINDOW - 60)
+            self.assertEqual(self._inject("expiry-api-6cfdb6b98b-bbbbb")["status"], "folded")
+            self._age(anchor_id, self.WINDOW + 1)
+            self.assertEqual(self._inject("expiry-api-6cfdb6b98b-ccccc")["status"], "injected")
+
+    def test_a_different_cluster_namespace_or_kind_is_its_own_incident(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            statuses = [
+                self._inject("scope-api-6cfdb6b98b-aaaaa")["status"],
+                self._inject("scope-api-6cfdb6b98b-bbbbb", cluster="c2")["status"],
+                self._inject("scope-api-6cfdb6b98b-ccccc", namespace="fold-ns-2")["status"],
+                self._inject("scope-api", kind="Deployment", reason="ProgressDeadlineExceeded")["status"],
+            ]
+        self.assertEqual(statuses, ["injected"] * 4)
+
+    def test_a_drift_row_for_the_same_object_does_not_anchor(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            session_kv_server.record_intercepted_event(
+                cluster="c1", namespace="fold-ns", workload="drifted-api", object_uid="insert-1",
+                object_kind="Deployment", reason=session_kv_server.DRIFT_LEDGER_REASON,
+                message="m", severity="Warning", occurrences=1, notified=True,
+            )
+            status = self._inject("drifted-api", kind="Deployment", reason="ProgressDeadlineExceeded")["status"]
+        self.assertEqual(status, "injected")
+
+    def test_the_feed_lists_a_folded_row_as_folded(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("feed-api-6cfdb6b98b-aaaaa")
+            self._inject("feed-api-6cfdb6b98b-bbbbb")
+        events = self.client.get("/v1/intercepted-events", params={"limit": 200}).json()["events"]
+        self.assertEqual(
+            [e["status"] for e in events if e["name"] == "feed-api"], ["folded", "injected"]
+        )
+
+
 class TestSessionKvServerQueryBuilding(unittest.TestCase):
 
     @patch.dict(os.environ, {"GCP_PROJECT_ID": "test-project-id"})

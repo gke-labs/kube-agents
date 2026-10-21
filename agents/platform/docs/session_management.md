@@ -45,6 +45,12 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
+#### Folding a workload's repeat events
+
+The watcher deduplicates on the involved object's UID and the reason, so one broken Deployment reaches `inject_message` once per replica, once per replacement pod, and once per reason in a cascade (`Unhealthy`, then `BackOff`). With `INCIDENT_WORKLOAD_DEDUP_SECONDS` above `0` (default `0`, off; capped at `86400`), a Warning-or-worse event for a `(cluster, namespace, object kind, workload)` that already has an admitted row younger than the window is written with `duplicate_of` set to that row. It claims no allowance, posts nothing and starts no turn, and the route answers `folded`. The watcher reads a status it does not know as delivered, so it keeps its dedup entry and does not re-offer that pod's event; `filtered` would let the next Warning sighting reopen it. The window runs from the anchor, so once it passes, the next new pod or reason from a workload that is still failing is announced again.
+
+An admitted row is one with `notified` non-zero or a `delivery_error`. A failed chat post resets `notified` to `0` within seconds while its triage keeps running, so anchoring on `notified` alone would let every sibling open its own triage on an install whose chat route is broken. A row the gate filtered, the ceiling dropped, or that was itself folded never anchors a window. The daily recap does not count a folded row as withheld by the ceiling, and `GET /v1/intercepted-events` lists it as `folded`.
+
 A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest. A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
@@ -395,7 +401,8 @@ CREATE TABLE intercepted_events(
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
-  payload     TEXT NOT NULL DEFAULT ''     -- drift backlog rows only: the record, to card it from
+  payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
+  duplicate_of INTEGER                     -- the admitted row this event was folded into; NULL otherwise
 );
 ```
 
@@ -422,9 +429,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### Which columns are migrated, and which are not
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
-`principal` and `payload` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+`principal`, `payload` and `duplicate_of` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
 databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
-`principal` and `payload` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`principal`, `payload` and `duplicate_of` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that

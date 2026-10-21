@@ -237,6 +237,9 @@ def load_intercepted_events(
                 # checked, and the recap keeps working against a ledger written
                 # by an older session server mid-rollout.
                 delivery_col = "delivery_error" if "delivery_error" in columns else "''"
+                # Absent on a ledger the session server has not migrated yet,
+                # where no row can have been folded.
+                duplicate_col = "duplicate_of" if "duplicate_of" in columns else "NULL"
                 # `intercepted_events` has had a second writer since the drift
                 # detector landed: session_kv_server.py records every
                 # out-of-band-change inject in it too, under
@@ -256,7 +259,7 @@ def load_intercepted_events(
                 # reads these rows next.
                 cursor.execute(
                     "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, "
-                    f"severity, occurrences, notified, created_at, {delivery_col} "
+                    f"severity, occurrences, notified, created_at, {delivery_col}, {duplicate_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
                     "AND reason NOT IN (?, ?) "
@@ -294,6 +297,7 @@ def load_intercepted_events(
                 "notified": 2 if r[9] == 2 else bool(r[9]),
                 "created_at": r[10],
                 "delivery_error": r[11] or "",
+                "duplicate_of": r[12],
             }
             for r in rows
         ]
@@ -463,6 +467,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         elif severity == "Info":
             if not excluded:
                 suppressed_info += count
+        elif event.get("duplicate_of") is not None:
+            # Folded into an earlier alert for the same workload
+            # (INCIDENT_WORKLOAD_DEDUP_SECONDS in session_kv_server.py): that
+            # alert went to chat, and the ceiling withheld nothing.
+            pass
         else:
             cap_dropped += 1
             cap_row = True

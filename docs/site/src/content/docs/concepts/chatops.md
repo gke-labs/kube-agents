@@ -333,6 +333,22 @@ The counter is fleet-wide, so the demand on it increases with the number of clus
 3. Set the bucket to that demand multiplied by the number of clusters that you will run. Do not set it higher than the number of alerts each day that the on-call can act on.
 4. If the demand is higher than that number, reduce the inflow: fix the workloads that alert most. Do not raise the bucket.
 
+### One incident per workload
+
+By default, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. Set `INCIDENT_WORKLOAD_DEDUP_SECONDS` to fold them into one. Within that many seconds of an alert, a later Warning or Critical event for the same workload (same cluster, namespace, kind and name, with the pod's replica suffix removed) posts nothing, starts no triage turn and spends no budget. The feed `GET /v1/intercepted-events` lists it with the status `folded`. The value is a whole number of seconds from `0` (off, the default) to `86400`.
+
+Set it as an entry in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages:
+
+```yaml
+platformAgent:
+  deployment:
+    env:
+      - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+        value: "900"
+```
+
+[`session_management.md`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/docs/session_management.md#folding-a-workloads-repeat-events) describes which earlier alert a later event is folded into.
+
 ## First-run onboarding
 
 On a fresh install the first chat interaction gets a guided onboarding instead of a cold start. One `no_agent` cron job on the Planning Agent profile (`agents/chat/defaults/cron/jobs.json`), `oobe`, drives it. Every minute it runs three stages: delivery first, then the scan, then the first-run audits. The old `bootstrap-inventory-scan` and `bootstrap-inventory-delivery` entries ship disabled.
