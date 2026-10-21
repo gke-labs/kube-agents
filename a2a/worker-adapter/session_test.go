@@ -195,6 +195,9 @@ if [ "$n" = 2 ]; then echo "$$" > "$dir/pid.2"; exec sleep 60; fi`)
 	publishIn(t, c, session, "task-s-1", "")
 	submit(t, c, session, "task-s-2", "second")
 	waitState(t, c, session, "task-s-2", lib.StateWorking)
+	// Run 2 has counted itself once its argv record exists; a cancel
+	// landing earlier would leave task-s-3 to run as the stub's second.
+	waitRun(t, dir, "argv", 2)
 
 	// A stop aimed at the ended task leaves this one running.
 	publishIn(t, c, session, "task-s-1", "")
