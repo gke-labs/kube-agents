@@ -2456,6 +2456,16 @@ class DeclaredScope(Base):
         self.assertEqual(sandbox.calls, [])
         self.assertIn("the operator's scope render could not be read", out)
 
+    def test_a_roster_spelling_with_a_space_fails_the_tick_before_any_sandbox_call(self) -> None:
+        """A project id or number is one token, as the refusal parser reads it: a hand-typed
+        list separated by spaces is refused with its remedy, not run as one project."""
+        sandbox = FakeSandbox(envelope([]))
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1 p2"}):
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.calls, [])
+        self.assertIn("UPGRADE_READINESS_PROJECTS names 'p1 p2', which is not a project id or number; separate projects with commas", out)
+
     def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
         scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
         handed = ["--scope-projects", "p1,p2", "--scope-unread", "p3=denied"]
