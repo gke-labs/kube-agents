@@ -86,8 +86,10 @@ const (
 	// followupMessage is the Message of a k8s-event-followup payload: what
 	// the watcher knows, and no more.
 	followupMessage = "no new events for this object since the last sighting"
-	// The outcomes of k8s_event_watcher_followups_total: the daemon posted
-	// the line, it had no thread to post into, or the inject failed.
+	// The outcomes of k8s_event_watcher_followups_total: the daemon accepted
+	// the line for the session's thread (it posts after answering, so a chat
+	// failure past that point is invisible here, as for the alert), it had
+	// no thread to post into, or the inject failed.
 	followupOutcomeSent     = "sent"
 	followupOutcomeUnrouted = "unrouted"
 	followupOutcomeError    = "error"
@@ -257,6 +259,9 @@ func (f *flags) validate() error {
 	case "shared":
 		if f.targetSession == "" {
 			return errors.New("--target-session is required in shared mode")
+		}
+		if !sessionIDPattern.MatchString(f.targetSession) {
+			return fmt.Errorf("--target-session %q is not a session id the daemon issues (%s)", f.targetSession, sessionIDPattern)
 		}
 	default:
 		return fmt.Errorf("--mode must be per-incident or shared (got %q)", f.mode)
@@ -750,7 +755,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		// has to remember too: one that clears at two sightings and repeats
 		// inside the event's TTL would otherwise arrive at count three with
 		// the object's old first sighting and no tombstone to measure from.
-		if gate == gateBackoffMinCount && d.filter.cfg.settle > 0 && settleApplies(canonical) {
+		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical) {
 			d.settles.Hold(ev, canonical, d.clock())
 		}
 		if gate == gateScaleUpMark {

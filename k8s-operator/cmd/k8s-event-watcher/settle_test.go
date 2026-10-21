@@ -257,21 +257,31 @@ func TestDispatcherSettleForwardsALastingFailureWithItsContext(t *testing.T) {
 // at two sightings leaves memo state too, so its repeat inside the event's
 // TTL is measured from its own start rather than forwarded at count three.
 func TestDispatcherSettleRemembersACountGatedBlip(t *testing.T) {
-	disp, _, injectCount, _ := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, settle: 2 * time.Minute})
-	disp.settles = newSettleMemo(0, 0)
-	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
-	now := t0
-	disp.now = func() time.Time { return now }
-	ctx := context.Background()
-	disp.Dispatch(ctx, settleBackoff(t0, 0, 1))
-	now = t0.Add(10 * time.Second)
-	disp.Dispatch(ctx, settleBackoff(t0, 10*time.Second, 2))
-	now = t0.Add(30 * time.Minute)
-	disp.Sweep(ctx) // cleared: a tombstone stands
-	now = t0.Add(40 * time.Minute)
-	disp.Dispatch(ctx, settleBackoff(t0, 40*time.Minute, 3))
-	if *injectCount != 0 {
-		t.Errorf("a repeat of a count-gated blip fired %d injects on its first sighting; want 0", *injectCount)
+	// Both of the family's count gates: BackOff's and Unhealthy's.
+	for _, reason := range []string{"BackOff", "Unhealthy"} {
+		t.Run(reason, func(t *testing.T) {
+			disp, _, injectCount, _ := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, unhealthyMinCount: 3, settle: 2 * time.Minute})
+			disp.settles = newSettleMemo(0, 0)
+			t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
+			now := t0
+			disp.now = func() time.Time { return now }
+			ctx := context.Background()
+			sighting := func(lasted time.Duration, count int) TriageEvent {
+				ev := settleBackoff(t0, lasted, count)
+				ev.Key.Reason = reason
+				return ev
+			}
+			disp.Dispatch(ctx, sighting(0, 1))
+			now = t0.Add(10 * time.Second)
+			disp.Dispatch(ctx, sighting(10*time.Second, 2))
+			now = t0.Add(30 * time.Minute)
+			disp.Sweep(ctx) // cleared: a tombstone stands
+			now = t0.Add(40 * time.Minute)
+			disp.Dispatch(ctx, sighting(40*time.Minute, 3))
+			if *injectCount != 0 {
+				t.Errorf("a repeat of a count-gated %s blip fired %d injects on its first sighting; want 0", reason, *injectCount)
+			}
+		})
 	}
 }
 
@@ -414,6 +424,38 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	disp.Sweep(ctx)
 	if *injectCount != 5 {
 		t.Errorf("in shared mode the sweep sent a follow-up (%d injects)", *injectCount)
+	}
+}
+
+// TestDispatcherSweepInDryRunCallsNoDaemon: a quiet incident restored from a
+// live run's snapshot reaches a dry run's sweep, which has no injector; it
+// prints the follow-up, marks the entry and asks the daemon nothing.
+func TestDispatcherSweepInDryRunCallsNoDaemon(t *testing.T) {
+	disp, _, injectCount, _ := newCountingDispatcher(t, filterThresholds{backoffMinCount: 1, settle: -1})
+	disp.quietAfter = 15 * time.Minute
+	disp.readyAt.Store(1)
+	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
+	now := t0
+	disp.now = func() time.Time { return now }
+	disp.dedup.now = func() time.Time { return now }
+	ctx := context.Background()
+	alert := backoffEvent(3)
+	alert.FirstSeen, alert.LastSeen = t0, t0
+	disp.Dispatch(ctx, alert) // live: the session is bound, follow-ups supported
+	if *injectCount != 1 {
+		t.Fatalf("alert: %d injects; want 1", *injectCount)
+	}
+	disp.dryRun, disp.injector = true, nil
+	now = t0.Add(16 * time.Minute)
+	heard := backoffEvent(1)
+	heard.Key.UID, heard.Key.Reason = "pod-heard", "Scheduled"
+	disp.Dispatch(ctx, heard) // the cluster speaks
+	disp.Sweep(ctx)           // must not dereference the nil injector
+	if got := disp.dedup.QuietIncidents(now, disp.quietAfter); len(got) != 0 {
+		t.Errorf("after a dry-run sweep %d incidents are still quiet candidates; want 0 (marked)", len(got))
+	}
+	if *injectCount != 1 {
+		t.Errorf("a dry-run sweep reached the daemon (%d injects)", *injectCount)
 	}
 }
 

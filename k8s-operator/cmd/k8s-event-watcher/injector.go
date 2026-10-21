@@ -268,16 +268,13 @@ const injectFeaturesHeader = "X-Watcher-Features"
 // injectStatusFiltered. Matched against by the daemon's `_watcher_features`.
 const injectFeaturePolicyFiltered = "policy-filtered"
 
-// Inject posts the triage event details to the specified session's queue.
-//
-// Returns the daemon's status string alongside the error, because a 2xx does
-// not by itself mean anyone was told — see injectStatusSuppressed and
-// injectStatusFiltered. An empty or unparseable body reads as delivered: a
-// daemon predating this field is one that always delivers, and guessing
-// "dropped" would reopen every incident on every sighting.
 // InjectDetailed POSTs the payload to the session's inject route and returns
 // the daemon's whole answer: the status Dispatch reads and the features the
-// sweep's handshake reads.
+// sweep's handshake reads. The status rides beside the error because a 2xx
+// does not by itself mean anyone was told — see injectStatusSuppressed and
+// injectStatusFiltered. An empty or unparseable body reads as delivered: a
+// daemon predating the field is one that always delivers, and guessing
+// "dropped" would reopen every incident on every sighting.
 func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload InjectPayload) (injectResponse, error) {
 	var none injectResponse
 	if sessionID == "" {

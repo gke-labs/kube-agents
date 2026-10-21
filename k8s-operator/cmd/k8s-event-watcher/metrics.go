@@ -171,11 +171,11 @@ func newMetrics() *metrics {
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		settleOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_settle_outcomes_total",
-			Help: "Keys the settle gate held, by what became of them: forwarded once the failure had lasted the settle period, or self_resolved once it went unsighted for the period plus the slack. Held sightings themselves are events_filtered_total{gate=\"settle\"}.",
+			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_followups_total",
-			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon posted the line), unrouted (it had no thread for the session and posted nothing), error (the inject failed).",
+			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon accepted it for the session's thread; it posts after answering, so a chat failure past that is invisible here), unrouted (it had no thread for the session and posted nothing), error (the inject failed).",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
