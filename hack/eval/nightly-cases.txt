@@ -910,16 +910,18 @@
 # declares is the right answer. Its stack plants the policy under the GitOps
 # field manager, deletes it, and asserts the namespace holds none; the record
 # carries `join: no_object` and no `owners` key, which is what the detector
-# emits for a delete. Holds the infra lock; 900s, the drift band every gitops-drift case
-# siblings carry.
+# emits for a delete. Holds the infra lock; 900s, the drift band every
+# gitops-drift case carries.
 #
 # Both halves waited on room in that chain. The recorder periodic's ceiling
 # went 480m to 720m on 2026-10-20 and its first night at the new one ran 401
 # minutes, graded its part whole, and measured a 16-case infra-lock chain --
 # where 10-14, 10-16 and 10-19 had each stopped at 484-485m with a partial
 # verdict, which is 480m plus the grace. Six new units at the band add ~90
-# minutes, or ~45 at the rate the sibling drift cases actually run. One
-# night of margin, so this pair is the first to drop if the ceiling returns.
+# minutes, or ~45 at the rate the sibling drift cases actually run, and
+# gitops-drift-backlog-digest joined the same chain after that night with as
+# much again: 491-581 minutes against 720 on the 401-minute night. One night
+# of margin, so this pair is the first to drop if the ceiling returns.
 ./tasks/gitops-drift-deleted-policy-triage/task.yaml
 
 # The codify half of CUJ 1 (#2889), and the discriminating one: a hardening
