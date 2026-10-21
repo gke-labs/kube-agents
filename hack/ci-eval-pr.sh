@@ -2201,7 +2201,7 @@ esac
 # export below leaves them out too -- a roster name the suite never grades
 # would otherwise trip bench-gate's misspelled-roster banner on every run
 # of the lane. A check the transport blinds (tool_called, worker_commands,
-# worker_agents) is the scorer's to set aside, not this file's:
+# worker_agents, worker_budget) is the scorer's to set aside, not this file's:
 # docs/designs/eval-scorer.md, "The inject lane".
 INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
 INJECT_LANE_EXCLUDED="$(roster_entries "${INJECT_LANE_EXCLUSIONS_FILE}")"

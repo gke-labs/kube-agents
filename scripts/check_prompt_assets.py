@@ -324,9 +324,10 @@ FRONTMATTER_DESCRIPTION = re.compile(
 ALLOWED_CRON_RISK = frozenset({"low", "high"})
 # The smallest iteration budget a model-run cron job may declare. Hermes'
 # `resolve_turn_limit` reads 0, a negative number, a bool and a non-numeric
-# string as unlimited, the one value a declared budget must never resolve to;
-# a numeric string would parse, and is refused here only to keep the roster
-# one type.
+# string as unlimited; the image's scheduler patch ignores such a roster value
+# and runs the job at the profile's budget instead, so a roster that carried
+# one would say one thing and run another. A numeric string would parse, and
+# is refused here only to keep the roster one type.
 CRON_MAX_TURNS_MIN = 1
 
 
@@ -976,8 +977,9 @@ def check_cron_max_turns() -> list[Finding]:
     so the fleet audits can carry the budget they need while the profile default
     bounds the kanban workers. An entry without one silently runs under the
     worker budget; one with 0, a negative number, a bool or a non-numeric string
-    resolves to unlimited, and a numeric string is refused only to keep the
-    roster one type. A ``no_agent`` job runs no model turn and must not carry one,
+    is a value Hermes would read as unlimited and the image's patch therefore
+    ignores, so the entry would run at the profile's budget while saying
+    otherwise; a numeric string is refused only to keep the roster one type. A ``no_agent`` job runs no model turn and must not carry one,
     or the roster reads as if the key bounded the script.
     """
     findings = []
@@ -1010,7 +1012,8 @@ def check_cron_max_turns() -> list[Finding]:
                         f"job {job['id']!r} has max_turns={value!r}; a model-run job must "
                         f"declare an integer of at least {CRON_MAX_TURNS_MIN} — an absent key "
                         "runs the job under the profile's worker budget, and 0, a negative "
-                        "number, a bool or a non-numeric string is read as unlimited",
+                        "number, a bool or a non-numeric string is ignored by the scheduler "
+                        "patch and runs it there too, while reading as something else",
                     )
                 )
     return findings
