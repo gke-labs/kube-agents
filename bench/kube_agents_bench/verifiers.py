@@ -2379,8 +2379,9 @@ class WorkerRun(BaseModel):
     to ensure the call's exit status faithfully reflects the command, the command segment must be
     the last segment on the line or every segment following it must be ``&&``-joined; a following
     ``||``, ``;``, ``|``, or ``&`` hands the line's exit to another command and is not credited as
-    succeeded; a preceding ``&&`` or ``;`` is accepted; a required run with ``succeeded: true`` and
-    no worker trajectory to read is not credited)."""
+    succeeded; a preceding ``&&`` or ``;`` is accepted; preceding ``||``, inverting ``!``, non-lone
+    command substitutions, or a trailing background ``&`` do not credit exit; a required run with
+    ``succeeded: true`` and no worker trajectory to read is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2603,8 +2604,10 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
     """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
     shell line's final exit code faithfully reflects this segment's success or failure.
     A segment's failure is preserved (short-circuiting subsequent execution) if and only if
-    it is the last segment on the line or every control operator following it is ``&&``.
-    A following ``||``, ``;``, or ``|`` hands the exit status to another command and may mask failure."""
+    it is the last segment on the line or every control operator following it is ``&&``,
+    is not backgrounded with ``&``, is not preceded by ``||`` or ``|`` on the same pipeline,
+    and is not negated with ``!``. A following ``||``, ``;``, ``|``, or ``&`` hands the exit status
+    to another command and may mask failure."""
     words, spans = _shell_words_and_spans(command)
     segments: list[list[str]] = []
     ops_after: list[list[str]] = []
@@ -2630,15 +2633,40 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
 
     results: list[tuple[list[str], bool]] = []
     trailing_bg = any(op == "&" for op in current_ops)
+    handled_spans: list[str] = []
+
     for i, seg in enumerate(segments):
-        carries_exit = not trailing_bg if i == len(segments) - 1 else True
-        if i < len(segments) - 1:
-            for ops in ops_after[i:]:
-                connective_ops = [op for op in ops if op not in ("(", ")")]
-                if connective_ops and connective_ops != ["&&"]:
+        carries_exit = not trailing_bg
+        if seg and seg[0] == "!":
+            carries_exit = False
+
+        if carries_exit and i > 0:
+            for prev_ops in reversed(ops_after[:i]):
+                prev_connectives = [op for op in prev_ops if op not in ("(", ")")]
+                if any(op in (";", _SHELL_LINE_END, "&") for op in prev_connectives):
+                    break
+                if any(op == "||" for op in prev_connectives):
                     carries_exit = False
                     break
+
+        if carries_exit and i < len(segments) - 1:
+            for ops in ops_after[i:]:
+                connective_ops = [op for op in ops if op not in ("(", ")")]
+                if connective_ops:
+                    if connective_ops[0] == "&&" and all(op in ("&&", _SHELL_LINE_END) for op in connective_ops):
+                        continue
+                    carries_exit = False
+                    break
+
         results.append((seg, carries_exit))
+
+        if len(seg) == 1 and _SHELL_ASSIGNMENT_RE.match(seg[0]):
+            _, _, val = seg[0].partition("=")
+            inner = _substitution_commands(val)
+            if inner is not None:
+                handled_spans.append(val)
+                for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(inner):
+                    results.append((inner_argv, carries_exit and inner_carries))
 
         index = _command_word_index(seg)
         if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
@@ -2650,10 +2678,14 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
                         results.append((inner_argv, carries_exit and inner_carries))
                     break
 
-    for span in spans:
+    remaining_spans = list(spans)
+    for val in handled_spans:
+        if val in remaining_spans:
+            remaining_spans.remove(val)
+    for span in remaining_spans:
         inner = _substitution_commands(span)
         if inner is not None:
-            for inner_argv in _shell_argvs(inner):
+            for inner_argv, _ in _shell_argvs_with_exit_propagation(inner):
                 results.append((inner_argv, False))
 
     return results
@@ -3205,13 +3237,14 @@ class WorkerCommandsVerifier(BaseVerifier):
 
         traj_eligible = [(cmd, succ) for _, _, cmd, _, succ in traj_calls if self._without_exempt_text(cmd) == cmd]
         traj_argv_entries = [
-            (argv, call_succeeded and carries_exit)
+            (argv, call_succeeded, carries_exit)
             for cmd_text, call_succeeded in traj_eligible
             for argv, carries_exit in _shell_argvs_with_exit_propagation(cmd_text)
         ]
 
         unrun_missing: list[WorkerRun] = []
         unrun_failed: list[WorkerRun] = []
+        unrun_masked: list[WorkerRun] = []
         traj_missing: list[WorkerRun] = []
         for run in self.required_runs:
             if not run.succeeded:
@@ -3224,16 +3257,22 @@ class WorkerCommandsVerifier(BaseVerifier):
                     traj_missing.append(run)
                     continue
                 matched_any = False
+                matched_masked = False
                 succeeded = False
-                for argv, call_succeeded in traj_argv_entries:
+                for argv, call_succeeded, carries_exit in traj_argv_entries:
                     if _argv_runs(argv, run):
                         matched_any = True
-                        if call_succeeded:
+                        if call_succeeded and carries_exit:
                             succeeded = True
                             break
+                        elif call_succeeded and not carries_exit:
+                            matched_masked = True
                 if not succeeded:
                     if matched_any:
-                        unrun_failed.append(run)
+                        if matched_masked:
+                            unrun_masked.append(run)
+                        else:
+                            unrun_failed.append(run)
                     elif self.after_result_pattern is None and any(_argv_runs(argv, run) for argv in argvs):
                         # The card log carries the command, but the trajectory capture missed it.
                         # Discrepancy between capture sources: cannot verify exit code.
@@ -3247,20 +3286,21 @@ class WorkerCommandsVerifier(BaseVerifier):
         # patterns or missing required items inconclusive; on the standard path,
         # card-log misses are conclusive (fail), credited runs pass, and capture
         # gaps make only an uncredited succeeded: true run inconclusive (error).
-        uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *traj_missing] if run.succeeded]
+        has_succeeded_runs = any(r.succeeded for r in self.required_runs)
+        uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *unrun_masked, *traj_missing] if run.succeeded]
         gaps = list(snap.worker_capture_gaps or ())
-        if withheld:
+        if withheld and has_succeeded_runs:
             gaps.append("the pod withheld a worker terminal call's arguments")
         gaps_str = "; ".join(gaps)
 
         if self.after_result_pattern is not None:
             partial = bool(gaps)
             conclusive = bool(hits or ran)
-            failed = conclusive or bool((missing or unrun_missing or unrun_failed) and not partial)
+            failed = conclusive or bool((missing or unrun_missing or unrun_failed or unrun_masked) and not partial)
         else:
             partial = bool(gaps) and bool(uncredited_succeeded)
             conclusive = bool(hits or ran or missing or any(not r.succeeded for r in unrun_missing))
-            failed = conclusive or bool((unrun_missing or unrun_failed) and not partial)
+            failed = conclusive or bool((unrun_missing or unrun_failed or unrun_masked) and not partial)
 
         if failed:
             parts = []
@@ -3280,6 +3320,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                         f"{named} ran but exited non-zero (or its exit was not recorded); "
                         f"a retry may sit in the unread part ({gaps_str})"
                     )
+                if unrun_masked:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                    parts.append(
+                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it; "
+                        f"a clean run may sit in the unread part ({gaps_str})"
+                    )
                 if traj_missing:
                     parts.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))
                 filtered_unseen = [r for r in unrun_missing if r.succeeded]
@@ -3295,6 +3341,11 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if unrun_failed_reported:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
                     parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                if unrun_masked:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                    parts.append(
+                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it"
+                    )
                 if traj_missing:
                     parts.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))
             if hits:
@@ -3324,6 +3375,11 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if unrun_failed:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
                     unrun_parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                if unrun_masked:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                    unrun_parts.append(
+                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it"
+                    )
                 if unrun_missing:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
                     unrun_parts.append(f"required run(s) {named} not seen in what was read")
@@ -3339,6 +3395,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                     details.append(
                         f"{named} ran but exited non-zero (or its exit was not recorded); "
                         f"a retry may sit in the unread part ({gaps_str})"
+                    )
+                if unrun_masked:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                    details.append(
+                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it; "
+                        f"a clean run may sit in the unread part ({gaps_str})"
                     )
                 if traj_missing:
                     details.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))

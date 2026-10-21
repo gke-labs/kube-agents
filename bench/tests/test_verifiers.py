@@ -8457,7 +8457,7 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness || echo failed") == [
         (["python3", "f.py", "--readiness"], False),
-        (["echo", "failed"], True),
+        (["echo", "failed"], False),
     ]
     assert _shell_argvs_with_exit_propagation("python3 f.py --readiness ; echo done") == [
         (["python3", "f.py", "--readiness"], False),
@@ -8473,7 +8473,34 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation('bash -c "python3 f.py --readiness || true"') == [
         (["bash", "-c", "python3 f.py --readiness || true"], True),
         (["python3", "f.py", "--readiness"], False),
-        (["true"], True),
+        (["true"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("test -f /opt/data/scratch/m.json || python3 f.py --readiness") == [
+        (["test", "-f", "/opt/data/scratch/m.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! python3 f.py --readiness") == [
+        (["!", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness && echo DONE &") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("(python3 f.py --readiness && echo DONE) &") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &&\necho DONE") == [
+        (["python3", "f.py", "--readiness"], True),
+        (["echo", "DONE"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("OUT=$(python3 f.py --readiness)") == [
+        (["OUT=$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("echo $(python3 f.py --readiness)") == [
+        (["echo", "$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], False),
     ]
     # a script is a bare name and a flag one word, refused at case load otherwise
     for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
@@ -8607,26 +8634,33 @@ def test_worker_commands_required_run_succeeded_flag():
     res_called = v.verify(5.0)
     assert res_called.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_called.reason
 
-    # Trajectory entry where the command is joined with trailing ||, ;, |, or & is not credited even if exit_code is 0.
+    # Trajectory entry where the command is joined with trailing ||, ;, |, or &, preceded by || or !,
+    # or backgrounded with & is not credited even if exit_code is 0.
     for joined_cmd in [
         f"python3 {_SCRIPT_PATH} --readiness || true",
         f'python3 {_SCRIPT_PATH} --readiness || echo "failed"',
         f"python3 {_SCRIPT_PATH} --readiness ; echo done",
         f"python3 {_SCRIPT_PATH} --readiness 2>&1 | tee /tmp/log",
         f"python3 {_SCRIPT_PATH} --readiness > /tmp/out &",
+        f"test -f /tmp/m.json || python3 {_SCRIPT_PATH} --readiness",
+        f"! python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness && echo DONE &",
     ]:
         traj_joined = [
             {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": joined_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
         ]
         transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
         res_joined = v.verify(5.0)
-        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_joined.reason
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it" in res_joined.reason
 
-    # Trajectory entry where the command is followed by && chains or preceded by commands IS credited when the call exited 0.
+    # Trajectory entry where the command is followed by && chains, preceded by commands,
+    # continued with newline after &&, or wrapped in a lone assignment IS credited when the call exited 0.
     for valid_cmd in [
         f'python3 {_SCRIPT_PATH} --readiness && echo "DONE"',
         f"mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
         f"cd /tmp ; python3 {_SCRIPT_PATH} --readiness",
+        f"python3 {_SCRIPT_PATH} --readiness &&\necho DONE",
+        f"OUT=$(python3 {_SCRIPT_PATH} --readiness)",
     ]:
         traj_valid = [
             {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": valid_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
@@ -9103,6 +9137,21 @@ def test_worker_commands_succeeded_with_after_result_pattern_withheld_call_besid
     assert res.status == "error"
     assert "the worker-trajectory capture was partial (the pod withheld a worker terminal call's arguments)" in res.reason
     assert "fleet_upgrade_report.py --readiness not seen in what was read" in res.reason
+
+
+def test_worker_commands_after_result_pattern_withheld_call_beside_readable_passes_when_no_succeeded_run():
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    # When no required run specifies succeeded: true, a withheld call beside a readable call is skipped per docstring.
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_patterns=[r"^echo OPEN$"])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj)
+    res = v.verify(5.0)
+    assert res.success
+    assert res.status == "pass"
 
 
 def test_worker_commands_succeeded_all_withheld_trajectory_is_error_without_claiming_no_capture():
