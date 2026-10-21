@@ -677,8 +677,9 @@ canonical walkthroughs.
 
 ### Component stack (`platformAgent.mode`)
 
-`platformAgent.mode` is the CR's `spec.mode`: `today`, or `next`, which also
-renders the NATS bus and the A2A gateway, a development stack
+`platformAgent.mode` is the CR's `spec.mode`: `next`, which puts the NATS bus
+and the A2A gateway in front of the agent and is what a first `install.sh`
+install records, or `today`, the previous stack, kept as a rollback
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md)).
 It defaults to `null`, which renders no field, and the operator reads an absent
 mode as `today`. Because Helm patches the CR from the difference between its

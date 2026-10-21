@@ -665,8 +665,9 @@ platformAgent:
   enabled: true
   name: platform-agent
   # The PlatformAgent's spec.mode: which component stack the operator renders.
-  # "today" is the current architecture; "next" also renders the NATS bus and
-  # the A2A gateway, a development stack (docs/designs/spec-mode-switch.md).
+  # "next" puts the NATS bus and the A2A gateway in front of the agent, and is
+  # what a first install.sh install records; "today" is the previous stack,
+  # kept as a rollback (docs/designs/spec-mode-switch.md).
   # null, the default, leaves the field out of the CR, which the operator reads
   # as "today", so an install that never sets it renders the CR it always did.
   # Changing it on a running install is a mode switch, not a setting: the
