@@ -349,13 +349,28 @@ def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_S
     return report
 
 
+def canonical_cluster_name(cr: dict[str, Any]) -> str:
+    """Return `<project>/<location>/<cluster>` from `cr['source']` when present, else `cr['cluster']`."""
+    raw_source = str(cr.get("source") or "").strip()
+    if raw_source.startswith("gke:"):
+        triple = raw_source[len("gke:") :].strip()
+        if triple.count(CLUSTER_KEY_SEPARATOR) == 2:
+            return triple
+    return str(cr.get("cluster") or "").strip()
+
+
 def merge_reports(reports: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
     """Combine per-project `leeway.report/v1alpha1` documents into one."""
     clusters_by_name: dict[str, dict[str, Any]] = {}
     for rep in reports:
         for cr in rep.get("clusters", []):
-            if isinstance(cr, dict) and cr.get("cluster"):
-                clusters_by_name[str(cr["cluster"])] = cr
+            if not isinstance(cr, dict):
+                continue
+            cname = canonical_cluster_name(cr)
+            if cname:
+                normalized_cr = dict(cr)
+                normalized_cr["cluster"] = cname
+                clusters_by_name[cname] = normalized_cr
     merged_clusters = [clusters_by_name[k] for k in sorted(clusters_by_name)]
     succeeded = 0
     failed = 0
@@ -528,7 +543,7 @@ def extract_findings(report: dict[str, Any]) -> tuple[dict[str, dict[str, Any]],
     for cr in report.get("clusters", []):
         if not isinstance(cr, dict):
             continue
-        cluster = str(cr.get("cluster") or "").strip()
+        cluster = canonical_cluster_name(cr)
         if not cluster:
             continue
         if cr.get("status") == STATUS_OK:
@@ -982,6 +997,19 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             if reason is not None
             else (str(prior.get(LAST_REPORT_KEY)) if prior and prior.get(LAST_REPORT_KEY) else iso(moment))
         )
+        # Preserve the last reported severity and suspected_cause baseline on quiet
+        # de-escalation ticks so a warning <-> critical oscillation does not re-page
+        # inside the 7-day suppression window.
+        baseline_severity = (
+            item["severity"]
+            if reason is not None or not prior
+            else str(prior.get("severity") or item["severity"])
+        )
+        baseline_cause = (
+            item["suspected_cause"]
+            if reason is not None or not prior
+            else str(prior.get("suspected_cause") or item["suspected_cause"])
+        )
         next_findings[key] = {
             "cluster": item["cluster"],
             "kind": item["kind"],
@@ -990,8 +1018,8 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             "subject_name": item["subject_name"],
             "topology_key": item["topology_key"],
             "tier": item["tier"],
-            "severity": item["severity"],
-            "suspected_cause": item["suspected_cause"],
+            "severity": baseline_severity,
+            "suspected_cause": baseline_cause,
             "observed_skew": item["observed_skew"],
             "max_domain_share": item["max_domain_share"],
             FIRST_SEEN_KEY: first_seen,
@@ -1039,13 +1067,12 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
 
     try:
         if retired_labels:
-            lines.append(
-                RETIRED_LINE.format(
-                    prefix=LINE_PREFIX,
-                    count=len(retired_labels),
-                    names=format_name_list(retired_labels),
-                )
+            retired_line = RETIRED_LINE.format(
+                prefix=LINE_PREFIX,
+                count=len(retired_labels),
+                names=format_name_list(retired_labels),
             )
+            lines.append(retired_line)
         if due_reasons:
             markdown = render_markdown_report(report, active_findings, due_reasons, all_errors, moment, days)
             md_path = write_report_files(home, report, markdown, moment)
@@ -1067,6 +1094,10 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             )
             lines.append(report_line)
             publish_blackboard_topic(report_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
+        elif retired_labels and not all_errors:
+            markdown = render_markdown_report(report, active_findings, due_reasons, all_errors, moment, days)
+            md_path = write_report_files(home, report, markdown, moment)
+            publish_blackboard_topic(retired_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
 
         updated_ledger: dict[str, Any] = {
             LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION,

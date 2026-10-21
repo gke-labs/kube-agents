@@ -182,6 +182,15 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertEqual(code3, 0)
         self.assertIn("1 cause/severity change", out3)
 
+        # Day 3, severity drops back to warning -> quiet tick, and baseline severity in ledger stays critical
+        # so bouncing back to critical on Day 4 does NOT re-page inside the 7-day suppression window.
+        t3 = T0 + timedelta(days=3)
+        self.run_tick(lambda *a, **kw: completed_json(make_report([c2], t3)), now=t3)
+        t4 = T0 + timedelta(days=4)
+        code4, out4 = self.run_tick(lambda *a, **kw: completed_json(make_report([c3], t4)), now=t4)
+        self.assertEqual(code4, 0)
+        self.assertEqual(out4, "")
+
     def test_scheduled_refresh_fires_after_seven_days_with_slack(self) -> None:
         c1 = {
             "cluster": "p1/us-central1/seeded-d",
@@ -293,7 +302,8 @@ class GateAndReportingTests(unittest.TestCase):
 
     def test_publishes_to_blackboard_topic_when_nats_url_and_a2a_are_present(self) -> None:
         c_skewed = {
-            "cluster": "p1/us-central1/seeded-d",
+            "cluster": "seeded-d",
+            "source": "gke:p1/us-central1/seeded-d",
             "status": "ok",
             "topology_findings": [make_topology_finding()],
         }
@@ -308,12 +318,29 @@ class GateAndReportingTests(unittest.TestCase):
             watch.shutil, "which", return_value="/usr/local/bin/a2a"
         ), mock.patch.object(watch.subprocess, "run", side_effect=fake_subprocess_run):
             code, _ = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(a2a_calls), 1)
+            self.assertEqual(a2a_calls[0][:4], ["a2a", "topics", "write", "topology-skew"])
+            self.assertIn("--text", a2a_calls[0])
+            self.assertIn("--data", a2a_calls[0])
 
-        self.assertEqual(code, 0)
-        self.assertEqual(len(a2a_calls), 1)
-        self.assertEqual(a2a_calls[0][:4], ["a2a", "topics", "write", "topology-skew"])
-        self.assertIn("--text", a2a_calls[0])
-        self.assertIn("--data", a2a_calls[0])
+            # When all findings resolve on a clean scan, latest.{md,json} and the blackboard topic
+            # are refreshed so readers do not see stale active findings.
+            t1 = T0 + timedelta(days=1)
+            c_clean = {
+                "cluster": "seeded-d",
+                "source": "gke:p1/us-central1/seeded-d",
+                "status": "ok",
+                "topology_findings": [],
+            }
+            rep_clean = make_report([c_clean], t1)
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_clean), now=t1)
+            self.assertEqual(code2, 0)
+            self.assertIn("retired from the watch", out2)
+            self.assertEqual(len(a2a_calls), 2)
+            latest_json = json.loads((self.home / "reports" / "latest.json").read_text(encoding="utf-8"))
+            self.assertEqual(latest_json["summary"]["topology_findings"], 0)
+            self.assertEqual(latest_json["clusters"][0]["cluster"], "p1/us-central1/seeded-d")
 
     def test_corrupt_ledger_refuses_to_overwrite_and_announces_failure_once(self) -> None:
         self.home.mkdir(parents=True, exist_ok=True)
