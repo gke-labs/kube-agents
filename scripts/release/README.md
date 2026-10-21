@@ -98,9 +98,9 @@ The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatc
 
 ## What Happens to the RC Cluster
 
-The pipeline builds a full GKE cluster per candidate and destroys it twice over: step 2 removes whatever was there before it installs, and step 5 removes what the run itself built (step 8 for the `next` leg below). A run that passes therefore leaves nothing behind and nothing billing.
+The pipeline builds a full GKE cluster per candidate and destroys it twice over: step 2 removes whatever was there before it installs, and step 5 removes what the run itself built (step 8 for the `today` leg below). A run that passes therefore leaves nothing behind and nothing billing.
 
-A run whose today leg passes then builds the environment a second time with `spec.mode: next` (steps 6 to 8: deploy, the same E2E suites, teardown), so the cluster bills for both legs back to back. That leg starts only after step 5, so it never rebuilds a today install that failed, and nothing waits on it: step 4 has already tagged the candidate validated, so a failure that only reproduces on `next` reds the run without holding back that release. It follows the same teardown rule, step 8 standing in for step 5, so a failed `next` install stays up until the next run's step 2. It does hold back the next candidate: the pipeline runs one at a time, so a dispatch made while the leg runs waits for it, and the leg roughly doubles a run's wall-clock (about 40 to 160 minutes for the today leg alone).
+Steps 2 and 3 install and test `spec.mode: next`, the mode a new install gets, and that leg is the one step 4 waits on. A run whose next leg passes then builds the environment a second time with `spec.mode: today` (steps 6 to 8: deploy, the same E2E suites, teardown), so the mode existing installs keep, and the one a rollback from `next` lands on, stays exercised; the cluster bills for both legs back to back. That leg starts only after step 5, so it never rebuilds a next install that failed, and nothing waits on it: step 4 has already tagged the candidate validated, so a failure that only reproduces on `today` reds the run without holding back that release. It follows the same teardown rule, step 8 standing in for step 5, so a failed `today` install stays up until the next run's step 2. It does hold back the next candidate: the pipeline runs one at a time, so a dispatch made while the leg runs waits for it, and the leg roughly doubles a run's wall-clock (about 40 to 160 minutes for a today leg; a next leg adds up to 30 in each of its deploy and E2E jobs for its readiness gate).
 
 A run that fails anywhere does leave its environment standing, deliberately — step 5 hangs off the success of every earlier job (in the staging promotion pipeline, step 7, of the deploy and the matrix; there a deploy that did not succeed is torn down in the same run, and only a failed matrix keeps the cluster, as its section says), and the E2E failures worth diagnosing are the ones that only reproduce on the cluster that produced them. Two consequences to know about:
 
@@ -142,7 +142,7 @@ gcloud kms keys versions list --key=github-token-minter-key \
 ## The nightly environment
 
 `staging-promotion-pipeline.yml` resolves the newest `rc_*_validated` candidate on `main`, builds a whole environment
-at that commit, and runs the `nightly` matrix on it. A green matrix no longer promotes the
+at that commit under `spec.mode: next`, and runs the `nightly` matrix on it. A green matrix no longer promotes the
 candidate; it nominates it, by creating and pushing `evalcand_<ts>_<sha>`. That tag starts the
 release-candidate eval in Prow, `poll_rc_eval_verdict.py` waits for its verdict, and only a green
 one produces `staging_<ts>_<sha>`. The nightly environment is destroyed as soon as the matrix
@@ -170,7 +170,7 @@ contention.
 the canonical page for that whole path.
 
 After the matrix, and before the teardown, step 3b runs the rollback runbook
-([`rollback.md`](../../docs/site/src/content/docs/deploy/rollback.md)) on the same cluster:
+([`rollback.md`](../../docs/site/src/content/docs/deploy/rollback.md)) on the same cluster, so from the `spec.mode: next` install the matrix ran on:
 `rollback_environment.sh` checks out the newest GA tag, runs its `upgrade.sh --upgrade-mode=operator`
 and `--upgrade-mode=harness` back to that GA, checks that both images carry the GA tag, that the
 `PlatformAgent` reports `Ready`, and that the gateway rollout is complete, then runs the same pair

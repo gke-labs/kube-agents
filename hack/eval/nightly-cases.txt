@@ -884,6 +884,21 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# gitops-drift-backlog-digest (#3387): records that queue while the drift
+# detector is not pulling are digested, not triaged one card each. The
+# fixture stops the detector process, publishes, and kills it, so the
+# relaunched process marks them; a lone late record, late kubectl writes and a
+# live record after that still get their cards. Graded on the fixture's read
+# of the ledger and the board. Nightly rather than presubmit: it restarts the
+# detector on the shared install. Each repetition spends five drift alerts
+# (three kubectl cards, one lone-principal card, the live card): fifteen for
+# three, which with the other two drift cases' six is over the default
+# ALERT_DAILY_LIMIT_DRIFT of 20, so on a dev install carrying the default the
+# last repetition can lose a card to the ceiling and red as
+# late-edit-not-carded. The eval install runs uncapped. Priced at the drift
+# band (900s) until the nightly record measures it.
+./tasks/gitops-drift-backlog-digest/task.yaml
+
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.

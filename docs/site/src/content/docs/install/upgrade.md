@@ -440,8 +440,11 @@ checks.
 
 ## Switching `spec.mode`
 
-`PLATFORM_AGENT_MODE` in `install.env` sets the install's `spec.mode`: `today`, or `next`, an
-unsupported development stack. A file with no such line means `today`. Of `upgrade.sh`'s modes only
+`PLATFORM_AGENT_MODE` in `install.env` sets the install's `spec.mode`: `next`, which a first install
+gets, or `today`, the previous stack, kept as a rollback. A file with no such line means `today` in
+`upgrade.sh`, so upgrading an install made before `next` became the default leaves it on `today`;
+`install.sh` keeps the mode the cluster runs and records it there, and a full `upgrade.sh` over such
+a file is refused when the install may run `next`. Of `upgrade.sh`'s modes only
 full applies the key; a re-run of `install.sh` applies it too. Only the `install.sh` and
 `upgrade.sh` of releases after 0.9.0 read it, so upgrade to such a release first.
 [`scripts/installer/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/installer/README.md)
@@ -777,7 +780,7 @@ change of the new release.
 
 ## What stops during an upgrade
 
-This section describes `spec.mode: today`, the default.
+This section describes `spec.mode: today`, which an install made before `next` became the first-install default keeps.
 
 At the default of one replica, the agent gateway and the credential broker each run one pod with
 the `Recreate` strategy. Kubernetes stops the old pod before it starts the new one, so chat stops

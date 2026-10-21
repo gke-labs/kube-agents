@@ -687,7 +687,9 @@ afterwards. It is reported, not gated: its own section of the log and two artifa
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
 on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
 inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
-the eval script's own start plus an allowance for the deploy in front of it. The eval's gateway
+the eval script's own start plus an allowance for the deploy in front of it. It is also skipped
+on a release-candidate run (`RC_COMMIT_SHA` set): the promotion waits on that job finishing, so
+an hour of report-only round trip would come out of the verdict poller's 330 minutes. The eval's gateway
 log and pod diagnostics are collected before it starts, because the flip replaces the pods
 they come from.
 
@@ -697,12 +699,14 @@ The next stack still has holes independent of any case (images in a private regi
 whatever the first runs through the door find), and a default-on flip would red every pull
 request for reasons none of them caused. And the record that earns `next` a place in what every pull request measures is built by
 running it: a scheduled lane on `main` under the flag, with a record of its own, not the
-presubmit. The flag admits that lane by name and nothing else without a pull request: section 2b
+presubmit. The flag admits that lane's jobs, and the release-candidate eval, by name, and nothing else
+without a pull request: section 2b
 of the deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME`
 is one of the next lane's jobs (`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`, the on-demand
 presubmit, the periodic on main, the full-catalog nightly that runs beside a today-mode nightly
-on the same agent model, and the GitLab lane's nightly under next), and refuses it on any other Prow run, so the flag mis-set on the today
-nightly or a postsubmit still stops the deploy before anything is built. The record of its
+on the same agent model, the GitLab lane's nightly under next, and the release-candidate eval's
+postsubmit, which grades a candidate in the mode a new install gets), and refuses it on any other Prow run, so the flag mis-set on the today
+nightly or another postsubmit still stops the deploy before anything is built. The record of its
 own does not exist yet: the baseline key has no mode field, so a next-mode sample appended to the
 store would be today's once written, and the dashboard has no next lane to file a run under. Until
 both exist, `hack/ci-eval-pr.sh` keeps every flagged run out of the baseline recorder and the
