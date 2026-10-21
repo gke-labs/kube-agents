@@ -573,7 +573,7 @@ job and withhold it from the other, so the split was unimplementable until the n
 dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
 why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a
 follow-up, and why the change that armed the store named it on the periodic in the same diff.
-Different accounts in `kube-agents-prow`, the same twelve roles in every pool project: the nightly
+Different accounts in `kube-agents-prow`, the same thirteen roles in every pool project: the nightly
 runs the same `hack/ci-eval-pr.sh` against a leased project, so
 [`docs/ci-pool-projects.md`](../ci-pool-projects.md) section 3 grants and verifies its account
 beside the presubmit's, after the second nightly died at `get-credentials` on a project that
