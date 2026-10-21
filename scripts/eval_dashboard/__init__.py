@@ -19,9 +19,12 @@ computed from data.json alone -- the optional extra inputs are
 adjudicator's `health.json` / `health-history.jsonl` when published;
 render.py's docstring owns the details.
 
-Two more readers of the same data.json live here: `health.py` decides
+More readers of the same data.json live here: `health.py` decides
 whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why, and
 `post_health.py` tells a Google Chat space when that changes, with one line
-on last night's nightly run in its daily digest.
-docs/ci-health.md is the page for both.
+on last night's nightly run in its daily digest. `nightly_bugs.py` files an
+issue for a case the nightly fails on every run three nights in a row, and
+(`nightly_infra.py`) one for the infra owner when the nightly or a case is
+kept from running.
+docs/ci-health.md is the page for all three.
 """

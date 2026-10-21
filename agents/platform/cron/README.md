@@ -145,11 +145,16 @@ working directory, off the module path, so a `json.py` the model dropped there i
 not the code that runs. The per-cluster kubeconfigs stay in
 `/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
 prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
-cluster to what `kubectl api-resources` says it serves, and is not
-operator-configurable on this release: `STALL_WATCH_KINDS` replaces it for a run
-started by hand in the pod (`all` hands `stall_report.py` its every-kind
-default), but the operator's env allowlist does not carry it, so a value on the
-CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
+cluster to what `kubectl api-resources` says it serves. The CR's
+`spec.harness.stallWatch` sets three knobs, which the operator pins in the
+managed `.env` on every install (empty when unset, which is the default):
+`STALL_WATCH_EXCLUDE_NAMESPACES` names namespaces never read,
+`STALL_WATCH_MIN_AGE_MINUTES` holds a new alert until a stall in the namespace
+has lasted that long, and `STALL_WATCH_KINDS` replaces the kind list (`all`
+hands `stall_report.py` its every-kind default). The annotation
+`kubeagents.x-k8s.io/stall-watch: exempt` leaves a namespace unread, or an
+object's rows out of the alerts; `stall_report.py` marks such a row `exempt`
+in its `--json` output and its table is unchanged. The k8s-event-watcher and
 this job split the work by signal: a Warning whose reason is on the watcher's
 list is the watcher's within seconds; a condition, a reference or an event the
 list never names is this job's within the half hour. It declares `risk: high`
@@ -179,10 +184,23 @@ Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS
 when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
 sandbox's configured project; and with nothing at all the tick fails closed,
-because the report script's own fallback is every project the credential can
-list. Within those projects the report script
+because on an install that declares no scope the report script's own fallback
+is every project the credential can list. A roster spelling with a space, a semicolon, or a
+comma inside one project's name is not a project id or number, so it fails the tick with the
+places to correct it. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+Cluster Agent from is still read here. On an install that declares a scope (a
+`spec.scope` block), the report script, a fleet-audit collector, refuses a bare
+`--project` in the sandbox, so the job reads the declared scope on the agent
+pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
+resolved scope beside each `--project`, the `collector_args` the
+platform_control `fleet_scope` tool hands the SOPs less the cluster exclusion
+(`--scope-projects`, `--scope-unread`): the script reads a project inside the scope and refuses one
+outside it, one listed but unread, a project number it cannot resolve, and any project in a
+sandbox still marked scoped after the scope is gone, each with the reason; the watch adds the
+install's remedy, and the table carries each as that project's failure, and a tick whose every project is
+refused fails, announced once. An install that declares none keeps the bare flag, and a scope
+render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: one `get-credentials` and six `kubectl get`s
 per cluster (budgets, Deployments and StatefulSets; webhook configurations
@@ -212,7 +230,9 @@ It runs the skill the way `stall-watch` runs `stall_report.py`: every module
 under the skill's `scripts/` except its tests, with the data files beside them,
 is read from the agent image's `/opt/platform-template/skills/` copy and handed
 to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
-serving the shipped set) before running `fleet_upgrade_report.main`. The
+serving the shipped set, the agent image's `fleet_scope_args` among them so the
+script formats a refusal with the constants the job parses it by) before
+running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
 the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
@@ -240,7 +260,8 @@ runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
 line names each project with a read error and its reason (the budget, the
-sandbox's error, a failed listing, an unresolved project number), the
+sandbox's error, a failed listing, an unresolved project number, a refusal under the
+declared scope with the install's remedy), the
 ledger's `table_errors` keeps the last tick's, and a version's own line names
 the project whose readiness run was not started or was cut short (a version
 none of whose projects ran is not recorded and is retried tomorrow),
@@ -257,11 +278,16 @@ chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
-kinds of read error for a partial table; each project and how it went
-ungraded for a version, never the error text, which an outage rewords from
-one run to the next), a
-failed tick (which writes nothing to the ledger) keeps its line in
-`last-failure.txt` beside it, and the next line is the recovery. A version
+kinds of read error for a partial table, and for a refusal the project and
+its cause; each project and how it went ungraded for a version, never the
+error text, which an outage rewords from one run to the next), a
+failed tick (which writes nothing to the ledger but its record of the projects
+the hops refused as outside the declared scope and the ids it learned for
+numbered spellings, kept at whichever step the tick failed unless the ledger
+itself cannot be written or re-read, so the next tick files them under the same cause)
+keeps its key in
+`last-failure.txt` beside it (its line, or, for a tick whose every run was refused, the
+refused projects and their causes), and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
 project one readiness sweep a week rather than one a day; a `blocked` verdict
@@ -272,6 +298,48 @@ at the gateway's home. The three
 environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.
+
+## `sa-role-watch` says when the agent's account holds more than `read-only`
+
+The install grants the agent's Google service account the `read-only`
+permission set, and the installer warns about an admin role in a `custom` set,
+but only when the set is chosen. A role granted afterwards, by hand or by
+another tool, is what the Google-hosted GKE MCP server acts with when the agent
+container calls it on that account's credentials, and nothing in the product
+said so. `sa_role_watch.py` is that check.
+
+Each tick reads, through the shell sandbox and so through the credential
+broker, the `PlatformAgent` in the agent's namespace and the ServiceAccount it
+runs the agent and broker pods as. The ServiceAccount's
+`iam.gke.io/gcp-service-account` annotation is the account the agent
+container's own credentials resolve to; the CR's
+`spec.security.workloadIdentityFederation`, when both its fields are set, is the
+one the broker impersonates instead, and both are checked. With federation
+armed, an absent annotation is said once, since the agent container then has no
+Google credential of its own; with neither, there is no account to check and the
+job reports a check failure, once. A role bound to the ServiceAccount's own
+Workload Identity principal is not checked (#3450). Then `gcloud projects get-iam-policy` runs for the management project and
+each project in the resolved `spec.scope` (`fleet_scope_targets`), four at a
+time, and every role bound to one of those accounts that is not in the script's
+`READ_ONLY_ROLES` is a finding. `tests/test_agent_iam_ceiling.py` holds that
+list equal to `read_only_roles` in the full-install composition.
+
+It keeps a ledger at `profiles/platform/cron/sa_role_watch.json`, the way
+`stall-watch` does, so chat hears a role on the tick it first appears and again
+when it goes. A role still held is said again once a day, on the first tick from
+12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats: a
+grant said once in a busy channel can be missed, and nothing else would raise it
+again. Any other tick on an unchanged account prints nothing. That is why it can run
+hourly: a fresh install or a new grant is named within the hour, and a quiet
+hour costs one `kubectl` pair and one policy read per project, no model turn. A
+project whose policy cannot be read keeps its last answer and its failure is
+said once. So does a project missing from a scope the tick could read only in part (the
+render unreadable, or members the reconcile has not resolved), and the partial
+scope is said once. Losing the shell sandbox mid-tick is one failure line, not
+one per project. It reads project-level bindings only: a role granted on a folder,
+the organisation or a group is not in that answer, and reading those needs
+verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
+is reported like any other grant, and repeated daily like one.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
@@ -294,9 +362,26 @@ script; see `feedback-prompt` below.)
 The same log gets an inventory of the sandbox's profile homes, so that loose
 files a worker leaves there can be seen without exec'ing into the sandbox: each
 home's top-level entries that the product doesn't create, and any home the agent
-pod no longer has a profile for, such as a cluster dropped from scope. That's an
-inventory only: nothing is moved or deleted, and a failure to take it is logged
-there too rather than posted.
+pod no longer has a profile for. The inventory itself moves and deletes nothing;
+what the job removes is below. A
+`cluster-*` home the agent pod has no profile for is removed: a cluster dropped
+from scope or deleted loses its home on the agent pod, and the sandbox's copy,
+kubeconfig included, had nothing else to remove it. The agent pod's profile
+list is the authority, read after the sandbox is listed, and the job removes
+no stale home when that list lacks the platform profile. A stale home whose
+`rm` fails reaches chat, as the two guards do when they hold: one bullet
+naming it, each night until it goes. A failure to take the inventory is logged there too
+rather than posted.
+
+Inside a home the agent pod does have a profile for, two things are removed,
+on the agent pod and in the sandbox. Cron run directories
+(`cron/runs/<job>_<execution>`, each cron run's working directory) go after
+seven days, logged as a count. Override trees go the first night, logged by
+name: a top-level directory named `<something>_override`, such as a worker's
+patched copy of a shipped skill in `skills_override/`. No product code writes
+one, and a test keeps literal paths in shipped import-path calls and configs
+off them. Neither prune
+follows a symlink.
 
 Daily is deliberate rather than conservative. The first install to run this had
 accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
@@ -313,13 +398,18 @@ engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
 with no comment or unblock since. A worker's or operator's block is sticky by
 design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked. Each such line carries the card's
-kind, reason and age, read from the board, and the `hermes kanban unblock` and
-`archive` commands, because the engine's JSON has neither the kind nor the
-reason and a line that names a stuck card without saying how to move it is a
-line the room learns to skip.
+weeks because nothing periodically asked. Cards are listed newest first, with
+their kind, reason, and age read from the board; where multiple cards share a
+title, they are grouped to keep the report readable, with task IDs and reasons
+retained. The `hermes kanban unblock` and `archive` commands appear once in a
+footer (using `<task_id>` when multiple cards are stuck) rather than repeated
+under every card, so the room knows how to move a card while long reports stay
+bounded within chat limits, summarizing any omitted cards by task ID up to
+the character budget (and falling back to a count and list command when omitted IDs
+exceed the limit).
 
 Daily, and it repeats: the rule is stateless, so a card still blocked is named
+(directly, or by task ID in the omitted list up to the budget)
 every morning until someone unblocks, comments on, or archives it. That is the
 intended nag, the same rule `findings-morning-nudge` keeps for the top
 criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a
@@ -415,12 +505,13 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
+values (`"chat"` alone for a fleet-audit job, see below), with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
 scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
-on the same leg.
+on the same leg, and the relay posts that line as written for a fleet-audit job
+too.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
@@ -455,18 +546,26 @@ child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
 `deliver: "chat"` hands the run's report to the relay instead, which posts it as
-written (on Slack, a fleet-audit report is replaced by a headline linking its
-ledger issue) and stores the full report against its thread, so the user's reply there reaches the
-Chat Agent with the report attached. It is a delivery mode, not a
+written and stores the full report against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. A fleet-audit job the image ships is the
+exception: its scheduled delivery posts the report the run's `finish` rendered,
+not the final message,
+which holds whatever else the model wrote in its last turn. A run over several
+repositories posts each finished repository's report, then a line naming any it
+did not finish. A failed run posts the scheduler's failure line, which says why,
+and a run that finished no repository without failing posts a one-line notice
+that it did not finish. On Slack the report is then replaced by a headline linking its
+ledger issue when the run covered one repository; a message with that line, or
+with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
 dual-platform install whose cron child can address both, a job left on `"all"`
-is heard twice on _each_ of them rather than twice in one place. Two entries here name `"all"`
-(`gcp-networking-fabric-audit` and `gce-compute-fleet-audit`) and accept that;
-the rest name `"chat"`.
+is heard twice on _each_ of them rather than twice in one place. Under `"all"`
+the scheduler also posts the final message itself, past the relay's choice of
+report, so every entry here names `"chat"`.
 
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
@@ -481,7 +580,7 @@ instruction, and what the plugin route costs — is
 
 ## Moving the roster onto `"chat"` needed no migration
 
-Every report-producing job here names `"chat"` or `"all"`, and getting there was an edit to this file alone
+Every report-producing job here names `"chat"`, and getting there was an edit to this file alone
 — no script, no one-off Job, nothing run against a live volume. `deliver` is an
 image-owned key on this profile: `merge_cron_store` gives the image every key it
 ships and leaves the volume only the keys it does not, so the next pod start

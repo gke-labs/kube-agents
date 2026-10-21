@@ -13,6 +13,28 @@ these names:
     does not wait for it.
   - `Merge labels`: Tide's query for this repository, read from the labels.
 
+A smoke green from before the blocking job changed what it grades does not
+pass. While the repository variable SMOKE_PIN_NOT_BEFORE holds a UTC time, the
+same cutoff `pin_smoke_status.py` applies to its re-pins, `Smoke gate` stays
+pending on a green whose build first reported before that time, until a run
+from after it replaces it. The time is the earliest success status on the
+commit naming the same build, as that script reads it: a re-pin is a fresh copy
+with its own creation time. A green with no build link counts from the earliest
+success with none. That is one more read per green while the variable is set,
+skipped when the head `Smoke gate` is already green.
+An `/override` links its own comment, so it counts from when it was posted. A
+green that `pin_smoke_status.py` expired carries its note and stays pending
+even after the variable is cleared. A green from before the cutoff that the
+script did not expire, because Tide already saw it as stale, has no note. So
+leave the variable set: clearing it lets such a green pass again. An
+unparsable value decides nothing and exits non-zero on every path that reads
+it. `Merge labels` does not read it, but on the queue the `Smoke gate` leg
+fails each group, so check the value before you set it. Only greens are posted on
+a head, so a head `Smoke gate` posted green before the cutoff stays green: the
+pull request enters the queue, fails its group there, and like any pull request
+the queue removed, stays out until its head moves. So the pending text asks for
+a push, not a `/test`.
+
 Tide also holds a merge on any other posted context that is not green, required
 or not, because no `context_options` entry for this repository says otherwise.
 These two checks do not restate that rule. The CLA needs no gate:
@@ -69,6 +91,14 @@ SMOKE_CONTEXT = "pull-kube-agents-smoke-test"
 SMOKE_GATE = "Smoke gate"
 LABELS_GATE = "Merge labels"
 GATES = (SMOKE_GATE, LABELS_GATE)
+#: The repository variable that holds the smoke cutoff (module docstring), read as
+#: `pin_smoke_status.py` reads it.
+NOT_BEFORE_ENV = "SMOKE_PIN_NOT_BEFORE"
+#: What `Smoke gate` says while it waits on a green from before the cutoff.
+SMOKE_PREDATES = f"smoke predates {NOT_BEFORE_ENV}; push a new commit to rerun {SMOKE_CONTEXT}"
+#: The note `pin_smoke_status.py` (EXPIRED_NOTE) adds to a pre-cutoff green that Tide still
+#: credited. It holds that green with or without the variable, as it does for Tide.
+SMOKE_EXPIRED_NOTE = f"(predates {NOT_BEFORE_ENV}: retest)"
 #: Tide's query for this repository (`prow/oss/config.yaml` in oss-test-infra) wants both.
 REQUIRED_LABELS = ("approved", "lgtm")
 #: The four labels Tide's query for this repository excludes. Any other `do-not-merge/` label
@@ -104,6 +134,8 @@ FAILURE = "failure"
 ENABLE = "enable"
 DISABLE = "disable"
 LEFT_OUT = "left out"
+#: What a left-out line says when the removal event carries no reason or actor.
+UNKNOWN_REMOVAL_FIELD = "unknown"
 #: The sweep's own login when `--actor` names no App: `GITHUB_TOKEN`'s, which makes no queue
 #: call. A write run always passes the App's slug, whose own dequeue of a held pull request does
 #: not keep it out; a dry run has no App token, so it may report that dequeue as a removal.
@@ -128,7 +160,7 @@ query($owner: String!, $name: String!, $base: String!, $after: String) {
         autoMergeRequest { enabledAt }
         mergeQueueEntry { id }
         timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-          nodes { ... on RemovedFromMergeQueueEvent { createdAt actor { login } } }
+          nodes { ... on RemovedFromMergeQueueEvent { createdAt reason actor { login } } }
         }
         commits(last: 1) { nodes { commit {
           checkSuites(first: %d) { nodes { createdAt } }
@@ -142,6 +174,8 @@ query($owner: String!, $name: String!, $base: String!, $after: String) {
 }
 """
 ENABLE_MUTATION = "mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"
+#: The enable call with the pull request's node id written in, for a write user to paste.
+ENABLE_COMMAND_QUERY = 'mutation {{ enablePullRequestAutoMerge(input: {{pullRequestId: "{id}"}}) {{ clientMutationId }} }}'
 DISABLE_MUTATION = "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"
 DEQUEUE_MUTATION = "mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }"
 #: The GraphQL type name of a commit status in a rollup.
@@ -181,12 +215,14 @@ def smoke_required(files):
     return any(not SMOKE_SKIP_RE.search(path) for path in files)
 
 
-def verdicts(pull, files):
+def verdicts(pull, files, not_before=None, first_reported=None):
     """{gate: (state, description)} for one pull request. `files` is called only if it is needed.
 
     `pull` has `labels` (a set of names) and `statuses` ({context: (state,
-    description)}, the latest per context on the head). Pure apart from
-    `files`, so the tests can drive it.
+    description)}, the latest per context on the head). `first_reported` is
+    called only for a green smoke while `not_before` is set: when its build
+    first reported green, None when that is unknown. Pure apart from the two
+    callables, so the tests can drive it.
     """
     smoke = pull["statuses"].get(SMOKE_CONTEXT)
     # A posted smoke status decides, even on skipped paths: a hand-run `/test`
@@ -196,6 +232,12 @@ def verdicts(pull, files):
         smoke_gate = SUCCESS, "smoke not required: only paths it skips changed"
     else:
         smoke_gate = status_verdict(smoke, SMOKE_CONTEXT)
+        if smoke_gate[0] == SUCCESS and SMOKE_EXPIRED_NOTE in smoke[1]:
+            smoke_gate = PENDING, SMOKE_PREDATES
+        elif smoke_gate[0] == SUCCESS and not_before is not None:
+            reported = first_reported()
+            if reported is None or reported < not_before:
+                smoke_gate = PENDING, SMOKE_PREDATES
     return {
         SMOKE_GATE: smoke_gate,
         LABELS_GATE: labels_verdict(pull["labels"]),
@@ -217,6 +259,38 @@ def latest_statuses(api, sha):
     """{context: (state, description)}: the latest status per context on a commit."""
     combined = api.get(f"/repos/{api.repo}/commits/{sha}/status?per_page={PER_PAGE}") or {}
     return {s["context"]: (s["state"], s.get("description") or "") for s in combined.get("statuses") or []}
+
+
+def smoke_first_reported(api, sha):
+    """When the build behind the latest smoke status on `sha` first reported green; None when unknown.
+
+    The earliest success status naming the same build (its target URL); for a
+    status with no link, the earliest success with none, because each re-pin
+    copies it with a new creation time. None
+    when the latest smoke status is not green or a creation time is unreadable
+    or zoneless, which the cutoff counts as before it.
+    """
+    smoke = [s for s in api.get_all(f"/repos/{api.repo}/commits/{sha}/statuses") if s.get("context") == SMOKE_CONTEXT]
+    if not smoke or smoke[0].get("state") != SUCCESS:
+        return None
+    url = smoke[0].get("target_url") or ""
+    copies = [s for s in smoke if s.get("state") == SUCCESS and (s.get("target_url") or "") == url]
+    try:
+        times = [parse_time(s.get("created_at") or "") for s in copies]
+    except ValueError:
+        return None
+    return None if any(t.tzinfo is None for t in times) else min(times)
+
+
+def not_before_from_env(environ=os.environ):
+    """The cutoff from NOT_BEFORE_ENV, None when unset or empty; ValueError when unparsable or zoneless."""
+    raw = (environ.get(NOT_BEFORE_ENV) or "").strip()
+    if not raw:
+        return None
+    parsed = parse_time(raw)
+    if parsed.tzinfo is None:
+        raise ValueError(f"{raw!r} carries no time zone")
+    return parsed
 
 
 def changed_files(api, number):
@@ -269,35 +343,42 @@ def post_verdicts(api, pull, results, dry_run=False):
     return lines
 
 
-def gate_pull(api, pull, dry_run=False):
+def gate_pull(api, pull, dry_run=False, not_before=None):
     """Decide and post the two statuses for one pull request on `main`."""
     if pull["base"] not in BASES:
         return [f"#{pull['number']}: targets {pull['base']}, not {BASE}; left to Tide"]
-    results = verdicts(pull, lambda: changed_files(api, pull["number"]))
+    # Only greens are posted, so a head `Smoke gate` that is green stays green whatever the
+    # cutoff says. Do not read the build history for it on each sweep.
+    if (pull["statuses"].get(SMOKE_GATE) or (None,))[0] == SUCCESS:
+        not_before = None
+    results = verdicts(
+        pull, lambda: changed_files(api, pull["number"]), not_before, lambda: smoke_first_reported(api, pull["sha"])
+    )
     return post_verdicts(api, pull, results, dry_run=dry_run)
 
 
-def cmd_pull(api, number, dry_run=False):
-    return gate_pull(api, rest_pull(api, api.get(f"/repos/{api.repo}/pulls/{number}")), dry_run=dry_run)
+def cmd_pull(api, number, dry_run=False, not_before=None):
+    return gate_pull(api, rest_pull(api, api.get(f"/repos/{api.repo}/pulls/{number}")), dry_run=dry_run, not_before=not_before)
 
 
-def cmd_status(api, sha, dry_run=False):
+def cmd_status(api, sha, dry_run=False, not_before=None):
     """Gate every open pull request whose head is `sha`. Listed, not searched: search lags."""
     lines = []
     for raw in api.get_all(f"/repos/{api.repo}/pulls?state=open"):
         if raw["head"]["sha"] == sha and raw["base"]["ref"] in BASES:
-            lines += gate_pull(api, rest_pull(api, raw), dry_run=dry_run)
+            lines += gate_pull(api, rest_pull(api, raw), dry_run=dry_run, not_before=not_before)
     return lines or [f"{sha[:SHORT_SHA]}: not the head of an open pull request on {BASE}"]
 
 
-def cmd_group(api, ref, gate):
+def cmd_group(api, ref, gate, not_before=None):
     """(passed, line) for one gate on a queue commit, judged on the pull request it names."""
     match = QUEUE_REF_RE.match(ref or "")
     if not match:
         return False, f"{ref!r} is not a merge queue branch"
     number = int(match.group(1))
     pull = rest_pull(api, api.get(f"/repos/{api.repo}/pulls/{number}"))
-    state, description = verdicts(pull, lambda: changed_files(api, number))[gate]
+    results = verdicts(pull, lambda: changed_files(api, number), not_before, lambda: smoke_first_reported(api, pull["sha"]))
+    state, description = results[gate]
     return state == SUCCESS, f"#{number} {gate}: {state}: {description}"
 
 
@@ -335,6 +416,32 @@ def removed_since_push(node, actor=SWEEP_ACTOR):
     return parse_time(removals[-1]["createdAt"]) - min(pushed) > PUSH_REMOVAL_WINDOW
 
 
+def last_removal(node):
+    """The last queue removal on a pull request's timeline, or None."""
+    removals = ((node.get("timelineItems") or {}).get("nodes")) or []
+    return removals[-1] if removals else None
+
+
+def left_out_line(pull):
+    """The sweep's line for a pull request it leaves out: why, and the command that puts it back.
+
+    The command is the sweep's own enable call, run on a write user's token: a
+    write user pastes it to turn auto-merge on, which with the queue means
+    "enqueue once the required checks pass". Once auto-merge is on, the next
+    sweep leaves the pull request alone.
+    """
+    removal = pull.get("removal") or {}
+    when = removal.get("createdAt") or UNKNOWN_REMOVAL_FIELD
+    who = ((removal.get("actor")) or {}).get("login") or UNKNOWN_REMOVAL_FIELD
+    why = removal.get("reason") or UNKNOWN_REMOVAL_FIELD
+    enable = ENABLE_COMMAND_QUERY.format(id=pull["id"])
+    return (
+        f"#{pull['number']}: left out, removed {when} by {who} (reason: {why}). "
+        f"To re-add (a write user): gh api graphql -f query='{enable}', "
+        "or push a fix (a push drops lgtm unless the author is in gke-labs/Googlers)."
+    )
+
+
 def parse_time(stamp):
     """A GitHub timestamp, `2026-10-13T20:13:25Z`, as an aware datetime."""
     return datetime.fromisoformat(stamp)
@@ -361,6 +468,7 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
                 "auto_merge": node["autoMergeRequest"] is not None,
                 "queue_entry": (node["mergeQueueEntry"] or {}).get("id"),
                 "removed_since_push": removed_since_push(node, actor),
+                "removal": last_removal(node),
                 "statuses": rollup_statuses(((rollup or {}).get("contexts") or {}).get("nodes") or []),
             })
         if not page["pageInfo"]["hasNextPage"]:
@@ -368,7 +476,7 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
         after = page["pageInfo"]["endCursor"]
 
 
-def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False):
+def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False, not_before=None):
     """Re-post head statuses and reconcile auto-merge for every pull request. (lines, failures).
 
     `api` reads and posts statuses; `enqueuer`, the App token, makes the
@@ -385,7 +493,7 @@ def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False):
     for pull in graphql_pulls(api, base, actor):
         try:
             if not pull["draft"] and labels_verdict(pull["labels"])[0] == SUCCESS:
-                lines += gate_pull(api, pull, dry_run=dry_run)
+                lines += gate_pull(api, pull, dry_run=dry_run, not_before=not_before)
             action = enqueue_action(pull)
             if action == ENABLE and not dry_run:
                 enqueuer.graphql(ENABLE_MUTATION, {"id": pull["id"]})
@@ -396,7 +504,7 @@ def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False):
                     enqueuer.graphql(DISABLE_MUTATION, {"id": pull["id"]})
             if action:
                 if action == LEFT_OUT:
-                    lines.append(f"#{pull['number']}: left out, removed from the queue since its last push")
+                    lines.append(left_out_line(pull))
                 else:
                     verb = {ENABLE: "auto-merge on", DISABLE: "auto-merge off and out of the queue"}[action]
                     lines.append(f"#{pull['number']}: {'would turn ' if dry_run else ''}{verb}")
@@ -430,14 +538,22 @@ def main(argv=None):
     if not args.repo or not token:
         print("GITHUB_REPOSITORY (or --repo) and GITHUB_TOKEN are required", file=sys.stderr)
         return 2
+    not_before = None
+    # `Merge labels` never reads the cutoff, so a bad value must not fail it on the queue too.
+    if not (args.command == "group" and args.gate == LABELS_GATE):
+        try:
+            not_before = not_before_from_env()
+        except ValueError as error:
+            print(f"{NOT_BEFORE_ENV} is not a UTC time: {error}", file=sys.stderr)
+            return 2
     api = GitHubAPI(args.repo, token, user_agent=USER_AGENT)
     failures = 0
     if args.command == "pull":
-        lines = cmd_pull(api, args.number, dry_run=args.dry_run)
+        lines = cmd_pull(api, args.number, dry_run=args.dry_run, not_before=not_before)
     elif args.command == "status":
-        lines = cmd_status(api, args.sha, dry_run=args.dry_run)
+        lines = cmd_status(api, args.sha, dry_run=args.dry_run, not_before=not_before)
     elif args.command == "group":
-        passed, line = cmd_group(api, args.ref, args.gate)
+        passed, line = cmd_group(api, args.ref, args.gate, not_before=not_before)
         lines, failures = [line], 0 if passed else 1
     else:
         enqueue_token = os.environ.get("ENQUEUE_TOKEN")
@@ -445,7 +561,7 @@ def main(argv=None):
             print("ENQUEUE_TOKEN is required unless --dry-run", file=sys.stderr)
             return 2
         enqueuer = GitHubAPI(args.repo, enqueue_token, user_agent=USER_AGENT) if enqueue_token else None
-        lines, failures = sweep(api, args.base, enqueuer, args.actor, dry_run=args.dry_run)
+        lines, failures = sweep(api, args.base, enqueuer, args.actor, dry_run=args.dry_run, not_before=not_before)
     for line in lines:
         log(line)
     return 1 if failures else 0

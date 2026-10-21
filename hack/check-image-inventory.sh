@@ -516,7 +516,7 @@ check_mirror_prefix() {
     [ -n "$image" ] || continue
     case "$image" in
     "$MIRROR"/*) ;;
-    *) fail "$label: with global.imageRegistry set, the chart still renders '$image' outside the mirror." ;;
+    *) fail "$label: with global.imageRegistry and global.thirdPartyImageRegistry set, the chart still renders '$image' outside the mirror." ;;
     esac
   done <<<"$images"
 }
@@ -544,7 +544,7 @@ check_mirror_names() {
     split_ref "$image"
     segment="${ref_repo##*/}"
     grep -qxF "$segment" <<<"$inventory_names" ||
-      fail "$label: with global.imageRegistry set, the chart renders '$image', but no $INVENTORY entry is named '${segment}' — 'make mirror-images' pushes each image to <prefix>/<name>, so nothing ever pushed there. Either rename the entry or pass the real name to kube-agents.thirdPartyImage."
+      fail "$label: with global.imageRegistry and global.thirdPartyImageRegistry set, the chart renders '$image', but no $INVENTORY entry is named '${segment}' — 'make mirror-images' pushes each image to <prefix>/<name>, so nothing ever pushed there. Either rename the entry or pass the real name to kube-agents.thirdPartyImage."
   done <<<"$images"
 }
 
@@ -578,7 +578,7 @@ check_toggle() {
   shift
   local rendered mirrored_rendered added mirrored_added
   rendered="$(render_chart "$@")" || exit 1
-  mirrored_rendered="$(render_chart "$@" --set "global.imageRegistry=$MIRROR")" || exit 1
+  mirrored_rendered="$(render_chart "$@" --set "global.imageRegistry=$MIRROR,global.thirdPartyImageRegistry=$MIRROR")" || exit 1
   added="$(added_images "$(image_refs <<<"$rendered")" "$default_images")"
   mirrored_added="$(added_images "$(image_refs <<<"$mirrored_rendered")" "$mirrored_images")"
   [ -n "$added" ] || {
@@ -591,7 +591,7 @@ check_toggle() {
 }
 
 default_render="$(render_chart)" || exit 1
-mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR")" || exit 1
+mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR,global.thirdPartyImageRegistry=$MIRROR")" || exit 1
 default_images="$(image_refs <<<"$default_render")"
 mirrored_images="$(image_refs <<<"$mirrored_render")"
 

@@ -21,6 +21,12 @@ umask 0002
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
 readonly OTEL_FLAG_DISABLED="--disabled"
+# The pinned tirith the image puts on PATH (deploy/docker/Dockerfile, a2a-tools).
+# Step 4.4 removes the per-home copies Hermes downloaded before it was there.
+readonly IMAGE_TIRITH=/usr/local/bin/tirith
+# The first four bytes of an ELF executable, in hex: step 4.4's check that a file
+# named tirith is a binary before it removes it.
+readonly ELF_MAGIC_HEX=7f454c46
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -1042,8 +1048,9 @@ fi
 # Writing jobs.json serializes under Hermes' `<cron_dir>/.jobs.lock` advisory lock to
 # coordinate with any concurrent in-pod Hermes cron mutations (`hermes cron pause|resume|add`).
 #
-# At availability.replicas > 1 — where the operator gives the replicas ONE ReadWriteMany PVC
-# rather than a volume each — every replica's gateway is an owner and several of them run
+# At availability.replicas > 1 — where the operator would give the replicas ONE ReadWriteMany PVC
+# rather than a volume each, a shape it does not render while it caps the gateway at one
+# replica — every replica's gateway is an owner and several of them run
 # this against the same file, with a rolling update overlapping new pods and old. While
 # .jobs.lock serializes writers on filesystems supporting advisory locking, eliminating
 # cross-pod scheduler races on shared volumes requires running the reconcile once per volume,
@@ -1321,8 +1328,9 @@ sync_profile_skills() {
     [ -d "$_src" ] || return 0
 
     # The staging paths are per POD, and that is load-bearing rather than tidy.
-    # $_dst lives on the PVC, and at availability.replicas > 1 the operator hands
-    # every replica the SAME PVC (ReadWriteMany; see step 2c-bis and cron_jobs_sync.py's
+    # $_dst lives on the PVC, and at availability.replicas > 1 the operator handed
+    # every replica the SAME PVC (ReadWriteMany; the operator now caps the gateway at
+    # one replica, but this stays for when that lifts; see step 2c-bis and cron_jobs_sync.py's
     # Concurrency section), so fixed siblings named `skills.new` and `skills.old`
     # are shared names on a shared volume. The unconditional `rm -rf` below then
     # reaches into another pod's swap: pod A completes `mv skills skills.old`, so
@@ -1517,6 +1525,15 @@ fi
 # repairs. Kept after 2.6a only because it is the caller — everything here belongs to
 # 2.6's force-sync, not to it.
 CLUSTER_TEMPLATE="/opt/cluster-template"
+# The plugin code a cluster profile copies once, at scaffold time, from the shared
+# plugins tree (cluster_agent_profile.py), and that no later step refreshes. These two
+# hold no per-profile state, unlike hermes_otel, whose config.yaml carries the
+# profile's pinned collector endpoint. The template enables tool_call_audit, and the
+# back-fill below turns it on for a profile already on the volume, so the loop has to
+# give that profile the image's code too: a copy scaffolded before the plugin wrote
+# logs/audit.jsonl logs its records where the sidecar does not ship them.
+CLUSTER_SHARED_PLUGINS="/opt/defaults/plugins"
+CLUSTER_IMAGE_PLUGINS="tool_call_audit common"
 if [ -d "$CLUSTER_TEMPLATE" ]; then
     CLUSTER_PROFILE_SCRIPT="/opt/defaults/scripts/cluster_agent_profile.py"
     [ -f "$CLUSTER_PROFILE_SCRIPT" ] || CLUSTER_PROFILE_SCRIPT="$TARGET_DIR/scripts/cluster_agent_profile.py"
@@ -1535,6 +1552,27 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
                 || echo "WARN: failed to stamp cluster identity into $d/SOUL.md" >&2
         fi
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
+        # Refresh the image-owned plugin code (see CLUSTER_IMAGE_PLUGINS). Each file is
+        # copied to a temporary name beside its target and renamed over it, so a copy
+        # that fails part-way leaves the old file whole, never a truncated module that
+        # stops the plugin loading. The temporary name carries the pod name, because
+        # replicas share this volume. A symlink is an operator-mounted plugin volume
+        # (step 2.65) and is left alone.
+        # shellcheck disable=SC3028 # falls back to $$ where HOSTNAME is unset
+        _refresh_tag="${HOSTNAME:-$$}"
+        for _plugin in $CLUSTER_IMAGE_PLUGINS; do
+            _src="$CLUSTER_SHARED_PLUGINS/$_plugin"
+            _dst="$d/plugins/$_plugin"
+            [ -d "$_src" ] || continue
+            [ -L "$_dst" ] && continue
+            if ! (cd "$_src" && find . -type f) | while IFS= read -r _file; do
+                _tmp="$_dst/$_file.refresh.$_refresh_tag"
+                { mkdir -p "$(dirname "$_dst/$_file")" && cp -p "$_src/$_file" "$_tmp" && mv -f "$_tmp" "$_dst/$_file"; } 2>/dev/null \
+                    || { rm -f "$_tmp" 2>/dev/null; exit 1; }
+            done; then
+                echo "WARN: could not refresh the $_plugin plugin in $d; each file not yet replaced keeps the copy it was scaffolded with" >&2
+            fi
+        done
         # Targeted self-heal: drop `memory.provider` from cluster configs already
         # on the PVC. The template no longer sets it (per-user memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
@@ -1861,6 +1899,26 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TERMINAL_ENV_PIN_SCRIPT" ]; then
         echo "ERROR: a profile's scheduled runs would not use the managed ssh terminal, or the managed block is unusable (see the lines above); refusing to start" >&2
         exit 1
     fi
+fi
+
+# 4.4 Reclaim the tirith copies Hermes downloaded into each home before the
+# image carried one on PATH. Hermes' tools/tirith_security looks on PATH first,
+# so with the image's copy there a home's bin/tirith is dead cache, never used
+# again, and it was 38 MiB per scaffolded profile: 6.5 GiB of a 10 GiB data
+# volume at 209 clusters (gke-labs#3325). Removed only when PATH resolves the
+# image's copy, and only a regular file named exactly tirith in $TARGET_DIR/bin
+# or a profile's bin/ that starts with the ELF magic. The file is never run: it
+# sits on a volume workers can write, and this is the bootstrap container. Each
+# removal is logged with its size, so an operator can see where the space went.
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then
+    for stale_tirith in "$TARGET_DIR/bin/tirith" "$TARGET_DIR"/profiles/*/bin/tirith; do
+        [ -f "$stale_tirith" ] && [ ! -L "$stale_tirith" ] || continue
+        [ "$(od -An -tx1 -N4 "$stale_tirith" 2>/dev/null | tr -d ' \n')" = "$ELF_MAGIC_HEX" ] || continue
+        stale_bytes="$(stat -c %s "$stale_tirith" 2>/dev/null || echo unknown)"
+        if rm -f "$stale_tirith"; then
+            echo "Reclaimed a per-profile tirith copy: $stale_tirith ($stale_bytes bytes); the image's $IMAGE_TIRITH is on PATH"
+        fi
+    done
 fi
 
 # Everything that writes shared volume state is done; release the bootstrap lock

@@ -68,6 +68,16 @@ export KUBE_AGENTS_INSTALL_ENV=/path/to/your/install/install.env
 Read `N`'s release notes before you go. Everything they list is something `N-1` does not know
 about, and the next two sections say what happens to each kind of thing.
 
+On an install running `spec.mode: next`, switch it to `today` first ([Upgrade → Switching back to
+`today`](/kube-agents/install/upgrade/#switching-back-to-today)) and check that Slack answers. No
+chart up to 0.9.0 declares `platformAgent.mode`, so a rollback to one cannot keep the mode: the
+recorded key is a value `N-1` does not declare, refused, dropped or ignored as [The
+rollback](#the-rollback) and [When a rollback is refused](#when-a-rollback-is-refused) say, and
+without it the install is back on `today` with nothing in the run to say so. Switching first moves
+Slack back to the credential broker, and the Slack app back to its `today` settings, with the checks
+that section gives, instead of leaving you to find the app without its slash commands after the
+rollback.
+
 ## The rollback
 
 From the `N-1` checkout, a dry run, then operator and harness back to back:
@@ -82,6 +92,14 @@ Where `N-1` is a release after `0.7.0`, add `--drop-undeclared-values` to the op
 commands. Without it, their script stops before any of `N-1` is applied when the release records a
 value `N-1`'s chart does not declare, and names each one; with it, the script drops and names them.
 The scripts of `0.7.0` and earlier do not take the flag.
+
+Where `N-1`'s script takes `--allow-breaking-downgrade`, it reads the commits between the tag the
+install runs and `N-1`, and stops when one of them is marked as a breaking change: a `type!:`
+subject or a `BREAKING CHANGE:` footer. Each mode reads the tag of what it moves: the operator mode
+the operator's, the harness mode the agent's, and the full mode both. It names each such commit. Read what each one changed, then
+add the flag to the operator and harness commands, or to a full-mode run, to roll back anyway. The
+check is in the script that runs, which in a rollback is `N-1`'s, so a release from before the flag
+rolls back without it.
 
 `--dry-run` prints the target and the image references the step would apply, from the
 configuration alone, and contacts nothing. It refuses a checkout at the wrong commit, as the real
@@ -288,7 +306,7 @@ that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the cha
 
 ## When a rollback is refused
 
-The first two refusals happen before anything on the cluster moves, and the third before any of
+The first three refusals happen before anything on the cluster moves, and the fourth before any of
 `N-1` is applied. The last two land in the operator step after `N-1`'s CRDs are applied, except
 that from the first release after `0.7.0` the script makes the schema check itself, before the CRD
 apply. Helm checks before it renders or applies anything, so the release itself keeps its last
@@ -302,6 +320,12 @@ revision.
   `$HOME/kube-agents` — or `KUBE_AGENTS_INSTALL_ENV` names a file that is not there, which is
   reported by that path rather than searched past. Supply the install's own file; a fresh one
   written from memory re-renders the `PlatformAgent` with whatever it forgets.
+- **A commit between `N` and `N-1` is marked as a breaking change.** The script names each one, as
+  a short SHA and its subject, after `kubectl` has been pointed at the cluster and before the
+  Secret backfills. It reads the history from the checkout when that is a full (not shallow) clone
+  with both commits, and otherwise from GitHub; when a rollback between two release tags cannot
+  read it, the run also stops. Read the named commits, then re-run with
+  `--allow-breaking-downgrade`. `--plan` reports the same commits as a warning and does not stop.
 - **The memory store cannot be checked and the configuration does not name one.** A rollback runs
   `upgrade.sh`, and its `terraform.tfvars` is regenerated in every mode, so an `install.env` with
   no `MEMORY` line makes the run ask the cluster whether it is running Hindsight rather than

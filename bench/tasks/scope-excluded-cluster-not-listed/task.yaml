@@ -36,9 +36,6 @@ validated: false
 # Slug per docs/designs/domains.yaml: the front door's routing journey.
 domain: chat-and-routing
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
-
 verification_spec:
   - name: the-in-scope-clusters-are-named
     role: objective

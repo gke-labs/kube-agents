@@ -185,7 +185,7 @@ same session instead of starting a new one.
 
 This is what makes follow-up work: an engineer replies _"apply Option B"_ hours later, and the agent still
 knows what Option B was. Three paths write it: the cron report relay, in-process; `send_notification`, when
-a Platform Agent posts into a thread; and the kanban notifier, when it delivers a card whose result carries
+the session row names a thread, whether or not the report was posted into it; and the kanban notifier, when it delivers a card whose result carries
 a fix a reply could authorise into one. Only the last of those is on the event-triage path, and it is the only one
 that gates on the report's shape rather than on where the write came from — the notifier cannot tell an
 event-triage card from an ordinary one by the time it runs, so the artifact is the test.
@@ -321,7 +321,7 @@ diagnostic procedure — e.g. `gke-workload-troubleshooting` walks pod status �
 container logs → service and NetworkPolicy checks → propose a GitOps correction. The persona that runs
 the triage requires the agent to query the catalog and load the matching domain skill before diagnosing
 (Cluster Agent `SOUL.md` §3) and to pass a pre-report self-audit demanding quoted command output,
-resource names, and UTC timestamps (§4). The communication policy on the result — the three-part layout
+resource names, and only the timestamps a command printed (§4). The communication policy on the result — the three-part layout
 and a jargon translation table (`OOMKilled` → "the application ran out of allocated memory") — is
 Platform Agent `SOUL.md` §7, which the prompt template above mirrors.
 

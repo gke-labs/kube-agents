@@ -42,6 +42,8 @@ from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
+import credential_shapes
+import feedback_broker
 import mcp_policy
 import providers
 import repo_ref
@@ -83,6 +85,9 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
 )
 
 LOGGER = logging.getLogger("credential-proxy")
+# The optional key, in the Secret a forge's credentialsRef names, that holds
+# its read-only token. Named in the log when a context clone presents none.
+FORGE_READ_TOKEN_KEY = "read-token"
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
@@ -535,6 +540,55 @@ VCS_VERB_LABEL = "verb"
 # (vcs_broker.VcsBroker._count_merges); the series the operator reads
 # `status.usage.remediationsMergedTotal` from. No labels.
 VCS_MERGED_METRIC = "kubeagents_vcs_proposals_merged_total"
+# The broker's own failures, by kind: work it took on and could not carry out
+# for a reason that is its own or its upstream's, never the command's exit
+# code and never a refusal. A second count beside the tool counter rather
+# than a new status in it, so toolExecutionsTotal keeps its meaning across
+# versions; the operator folds the whole family into
+# status.usage.brokerFailuresTotal.
+BROKER_FAILURES_METRIC = "kubeagents_broker_execution_failures_total"
+BROKER_FAILURE_KIND_LABEL = "kind"
+# A brokered command that ran past its deadline (exit 124), recorded where
+# the command completes.
+BROKER_FAILURE_EXEC_TIMEOUT = "exec_timeout"
+# Everything else is read off the response, keyed by its route family
+# (BROKER_FAILURE_KIND_BY_ROUTE). On the broker's own routes a 500, 502 or
+# 504 is one and a 503 is not: that 503 is the broker's busy, contention
+# rather than failure, and the exec route's busy is already an outcome of the
+# tool counter. The one 503 of the broker's that is a fault, the
+# version-control route's unreadable managed-repository list, is recorded at
+# its site. On the relays the upstream's status passes through, so any 5xx is
+# one, a 503 included: there it is the upstream saying unavailable.
+BROKER_FAILURE_EXEC_FAILED = "exec_failed"
+BROKER_FAILURE_VCS_FAILED = "vcs_failed"
+BROKER_FAILURE_FORGE_REFRESH_FAILED = "forge_refresh_failed"
+BROKER_FAILURE_API_RELAY_FAILED = "api_relay_failed"
+# The broker's own chat event pull failing: its Pub/Sub subscription or its
+# credential to it, recorded at the three pull sites, since the chat families
+# are otherwise excluded from the response hook (their 502 is the caller's).
+BROKER_FAILURE_CHAT_PULL_FAILED = "chat_pull_failed"
+BROKER_FAILURE_OTHER_FAILED = "other_failed"
+BROKER_FAILURE_KINDS = frozenset({
+    BROKER_FAILURE_EXEC_TIMEOUT,
+    BROKER_FAILURE_EXEC_FAILED,
+    BROKER_FAILURE_VCS_FAILED,
+    BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    BROKER_FAILURE_API_RELAY_FAILED,
+    BROKER_FAILURE_CHAT_PULL_FAILED,
+    BROKER_FAILURE_OTHER_FAILED,
+})
+# The methods the broker serves. The base class answers any other with a 501
+# of its own before authentication, which is no relay's failure.
+BROKER_FAILURE_COUNTED_METHODS = frozenset({"GET", "POST"})
+BROKER_FAILURE_STATUS_CODES = frozenset({
+    str(int(HTTPStatus.INTERNAL_SERVER_ERROR)),
+    str(int(HTTPStatus.BAD_GATEWAY)),
+    str(int(HTTPStatus.GATEWAY_TIMEOUT)),
+})
+# The relays' bound is the whole 5xx class, since the upstream's status passes
+# through: a 501 or 507 from a Cloud API counts as the 503 does.
+BROKER_FAILURE_RELAY_STATUS_FLOOR = int(HTTPStatus.INTERNAL_SERVER_ERROR)
+BROKER_FAILURE_RELAY_STATUS_CEILING = BROKER_FAILURE_RELAY_STATUS_FLOOR + 100
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -555,6 +609,12 @@ TOOL_STATUS_ABANDONED = "abandoned"
 # under saturation "never started" and "failed" are the two numbers an
 # operator needs apart.
 TOOL_STATUS_BUSY = "busy"
+# The tool counter's whole outcome vocabulary, declared once so the operator's
+# side can be held to it: tests/test_usage_counters_series_names.py reads this
+# set and asserts the statuses the poller sums plus the ones it leaves out are
+# exactly these, so a status added here and nowhere else fails the suite
+# rather than landing silently outside every status counter.
+TOOL_STATUSES = frozenset({TOOL_STATUS_SUCCESS, TOOL_STATUS_ERROR, TOOL_STATUS_BLOCKED, TOOL_STATUS_ABANDONED, TOOL_STATUS_BUSY})
 # What a label reads when the request named nothing in its vocabulary: an
 # executable the broker does not serve, a verb no policy table lists, a path
 # no route claims, an argv whose verb cannot be read past an unknown flag.
@@ -625,6 +685,12 @@ AUDIT_STATUS_BLOCKED = "blocked"
 AUDIT_STATUS_REJECTED = "rejected"
 AUDIT_STATUS_FAILED = "failed"
 AUDIT_STATUS_ABANDONED = "abandoned"
+# The feedback verb's audit vocabulary: a closed pair, like every tool and
+# subcommand label here, never the route or the report's text.
+FEEDBACK_AUDIT_TOOL = "feedback"
+FEEDBACK_AUDIT_SUBCOMMAND = "submit"
+FEEDBACK_REASON_LOG_LENGTH = 200
+FEEDBACK_REASON_FAULT = "the broker could not complete the filing ({error}); nothing was sent"
 AUDIT_STATUS_BUSY = "busy"
 # Rule ids for the refusals the exec route decides itself rather than by a
 # policy rule. The response body and the audit record name the same constant,
@@ -661,16 +727,6 @@ def is_valid_repository(repository: Any) -> bool:
     return repo_ref.is_github_slug(repository)
 
 
-# Two shapes, because two are what the GitHub refresh helper handles: the
-# installation token Minty returns, and the Google OIDC identity token sent to
-# authenticate the request to it.
-_CREDENTIAL_SHAPES = re.compile(
-    r"gh[pousr]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
-)
-
-
 def redact_credentials(text: str) -> str:
     """Blank out token-shaped substrings so a subprocess's output can be logged.
 
@@ -685,12 +741,11 @@ def redact_credentials(text: str) -> str:
     header back in a 4xx would put a credential in a string we are about to log.
     Match on shape so that stops being an argument about someone else's service.
 
-    Deliberately not a general-purpose redactor. Two others already exist
-    (`AuditRedactor`, and `redact_secrets` in the fleet-audit skill) and both
-    cover more shapes; neither belongs in this container, which must not import
-    from the Hermes plugin tree. Consolidating the three is separate work.
+    The shapes are credential_shapes.py's, the list the feedback gate refuses
+    to publish: one copy for both, seeded from `AuditRedactor` in the chart,
+    which this container must not import from the Hermes plugin tree.
     """
-    return _CREDENTIAL_SHAPES.sub("[REDACTED]", text)
+    return credential_shapes.redact(text)
 
 
 def _redacted_fields(exc) -> dict:
@@ -1007,6 +1062,10 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION)),
+    # The feedback form verb: the sandbox's one way to file a report about
+    # kube-agents itself (feedback_broker.py). The shell alone: a session pod
+    # files nothing on anyone's behalf.
+    ("/v1/feedback/", (CALLER_ROLE_SHELL,)),
     ("/v1/forge/", (CALLER_ROLE_SHELL,)),
     # The constant, not a literal: required_roles() answers () on a miss and
     # _role_permits then admits every role, so a prefix spelled twice is a
@@ -1025,6 +1084,53 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/vcs/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
+
+# The failure kind a 5xx on a route family counts under, keyed by the family
+# label _endpoint_label reads off ROUTE_ROLES (the prefix without its trailing
+# slash). None is a family whose 5xx is not the broker's failure: the chat and
+# Slack relays answer 502 for the caller's own channel, scope and space errors
+# (channel_not_found, not_in_channel, missing_scope), which the request
+# counter still shows; their event pulls, which fail on the broker's own
+# subscription, are recorded at their sites as chat_pull_failed. A family not
+# listed counts as other_failed.
+BROKER_FAILURE_KIND_BY_ROUTE: dict[str, str | None] = {
+    "/v1/exec": BROKER_FAILURE_EXEC_FAILED,
+    "/v1/vcs": BROKER_FAILURE_VCS_FAILED,
+    "/v1/forge": BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    # The legacy name of the forge refresh route, served for one release of
+    # skew: the same mint, the same kind.
+    "/v1/github": BROKER_FAILURE_FORGE_REFRESH_FAILED,
+    API_RELAY_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    mcp_policy.MCP_RELAY_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    watcher_policy.WATCHER_GCP_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    watcher_policy.WATCHER_K8S_PREFIX.rstrip("/"): BROKER_FAILURE_API_RELAY_FAILED,
+    "/v1/chat/a2a": None,
+    "/v1/chat/api": None,
+    "/v1/chat": None,
+}
+
+
+def _route_failure_kind(path: str) -> str:
+    """The failure kind a fault on ``path`` counts under, for a site that knows
+    it answered a fault whatever the status: the route family's kind, or
+    other_failed for a family that has none."""
+    return BROKER_FAILURE_KIND_BY_ROUTE.get(_endpoint_label(path)) or BROKER_FAILURE_OTHER_FAILED
+
+
+def _broker_failure_kind(family: str, status_code: str) -> str | None:
+    """The failure kind a response counts under, or None for one that is not a
+    failure of the broker's: a status under 500, the broker's own 503 on a
+    route of its own, or any status on a family whose 5xx is the caller's."""
+    kind = BROKER_FAILURE_KIND_BY_ROUTE.get(family, BROKER_FAILURE_OTHER_FAILED)
+    if kind is None:
+        return None
+    if kind == BROKER_FAILURE_API_RELAY_FAILED:
+        try:
+            status = int(status_code)
+        except ValueError:
+            return None
+        return kind if BROKER_FAILURE_RELAY_STATUS_FLOOR <= status < BROKER_FAILURE_RELAY_STATUS_CEILING else None
+    return kind if status_code in BROKER_FAILURE_STATUS_CODES else None
 
 
 def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
@@ -1302,7 +1408,8 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
       (GitLab), that token, through the forge's helper; on GitHub, nothing --
       the clone and push ride the ambient write credential the CLI installed,
       as they always have;
-    - context: the forge's read-only credential, and never the write token; a
+    - context: the forge's read-only credential, and never the write token
+      (on GitLab, the optional `read-token` key beside the write token); a
       forge that offers none clones with no credential;
     - unregistered: no credential at all, a public upstream read.
 
@@ -1343,16 +1450,31 @@ def read_credential_for(registry: providers.Registry, repository: str) -> provid
     if role != ROLE_CONTEXT:
         return providers.NoCredential()
     # A context repository gets the forge's read-only credential, and never
-    # the write token: a forge that offers none -- GitLab's stored token has
-    # no read-only variant here -- clones it with no credential, which reads a
-    # public repository and refuses a private one at the clone.
+    # the write token: a forge that offers none -- GitLab without a
+    # `read-token` key in its credentials Secret -- clones it with no
+    # credential, which reads a public repository and refuses a private one
+    # at the clone.
     credential = forge.read_credential(repo)
     if isinstance(credential, providers.NoCredential) and _holds_stored_token(forge):
+        if not getattr(forge, "read_token_path", ""):
+            # The forge was given no read-token path: the forges file came
+            # from an operator older than the read token, so no change to the
+            # Secret can help until the operator is upgraded.
+            LOGGER.warning(
+                "content workspace open repo=%s role=context: the broker's "
+                "config names no readTokenPath for the %s forge (an operator "
+                "older than the read-only token rendered it), so the clone "
+                "presents none; a private repository will refuse it",
+                repository, forge.name,
+            )
+            return credential
         LOGGER.warning(
-            "content workspace open repo=%s role=context: the %s forge offers no "
-            "read-only credential and its stored token can write, so the clone "
-            "presents none; a private repository will refuse it",
-            repository, forge.name,
+            "content workspace open repo=%s role=context: the %s forge has no "
+            "usable read-only token (key %s in its credentials Secret: missing, "
+            "unreadable, empty, or not one line of printable ASCII) and its stored "
+            "token can write, so the clone presents none; a private repository "
+            "will refuse it",
+            repository, forge.name, FORGE_READ_TOKEN_KEY,
         )
     return credential
 
@@ -8138,6 +8260,7 @@ class ProxyMetrics:
         self._requests: dict[tuple[str, str], int] = {}
         self._vcs: dict[tuple[str, str], int] = {}
         self._merged = 0
+        self._failures: dict[str, int] = {}
         # Per tool: cumulative bucket counts (one per TOOL_DURATION_BUCKETS
         # bound, the +Inf bucket being the count), the sum, and the count.
         self._duration_buckets: dict[str, list[int]] = {}
@@ -8231,12 +8354,18 @@ class ProxyMetrics:
         with self._lock:
             self._merged += count
 
+    def record_failure(self, kind: str) -> None:
+        kind = kind if kind in BROKER_FAILURE_KINDS else BROKER_FAILURE_OTHER_FAILED
+        with self._lock:
+            self._failures[kind] = self._failures.get(kind, 0) + 1
+
     def render(self) -> str:
         with self._lock:
             invocations = sorted(self._tool_invocations.items())
             requests = sorted(self._requests.items())
             vcs = sorted(self._vcs.items())
             merged = self._merged
+            failures = sorted(self._failures.items())
             durations = {
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
@@ -8315,6 +8444,12 @@ class ProxyMetrics:
             f"# TYPE {VCS_MERGED_METRIC} counter",
             f"{VCS_MERGED_METRIC} {merged}",
         ]
+        lines += [
+            f"# HELP {BROKER_FAILURES_METRIC} Brokered work the broker could not carry out, by kind: a command past its deadline, a broker fault, a git failure, a failed token mint or an upstream relay error.",
+            f"# TYPE {BROKER_FAILURES_METRIC} counter",
+        ]
+        for kind, count in failures:
+            lines.append(f'{BROKER_FAILURES_METRIC}{{{BROKER_FAILURE_KIND_LABEL}="{_escape_label_value(kind)}"}} {count}')
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -8596,6 +8731,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 type(exc).__name__,
             )
             self.repository_refusal_status = HTTPStatus.SERVICE_UNAVAILABLE
+            # A fault, not a refusal, answered with the status the response
+            # hook reads as busy: counted here, where the difference is known,
+            # under the kind of the route that asked (the version-control
+            # route or a forge refresh).
+            self.metrics.record_failure(_route_failure_kind(getattr(self, "path", "")))
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
@@ -8653,6 +8793,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"event": self.slack_relay.pull()})
             except Exception as exc:
                 LOGGER.warning("Slack event pull failed: %s", type(exc).__name__)
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack event pull failed"}
                 )
@@ -8668,6 +8809,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 event = self.a2a_chat_relay.pull()
                 self._json(HTTPStatus.OK, {"event": event, "subscription": subscription})
             except Exception as exc:
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 fields = _log_chat_pull_failure("a2a chat", self.a2a_chat_relay, exc)
                 pubsub = {key: fields[key] for key in ("type", "code") if key in fields}
                 self._json(
@@ -8688,6 +8830,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"event": event})
             except Exception as exc:
                 _log_chat_pull_failure("chat", self.chat_relay, exc)
+                self.metrics.record_failure(BROKER_FAILURE_CHAT_PULL_FAILED)
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat event pull failed"})
             return
         if self.path != HEALTHZ_PATH:
@@ -8737,6 +8880,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/v1/vcs/"):
             self._handle_vcs_post()
+            return
+        if self.path == feedback_broker.ROUTE:
+            self._handle_feedback_post()
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -9063,6 +9209,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     subcommand_label,
                     TOOL_STATUS_SUCCESS if result.exit_code == 0 else TOOL_STATUS_ERROR,
                 )
+                if result.timed_out:
+                    self.metrics.record_failure(BROKER_FAILURE_EXEC_TIMEOUT)
                 self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
                 response = {
                     "status": "completed",
@@ -9788,13 +9936,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         decision = watcher_policy.evaluate_k8s(self.command, rest, query)
         if not decision.allowed:
             LOGGER.warning("watcher k8s blocked request_id=%s rule=%s", request_id, decision.rule_id)
+            # A metav1.Status, which client-go decodes into a StatusError carrying
+            # this message verbatim; any other body it reports as a bare
+            # Forbidden. The drift detector's join forwards a record it could not
+            # read with that error as its lookup error, so the rule id is what
+            # tells the agent "a policy refused this kind" from an RBAC fault.
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": decision.rule_id,
-                    "message": decision.message,
+                    "kind": "Status",
+                    "apiVersion": "v1",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": f"SECURITY_POLICY_BLOCKED ({decision.rule_id}): {decision.message}",
+                    "reason": "Forbidden",
+                    "details": {"causes": [{"reason": "SECURITY_POLICY_BLOCKED", "message": decision.rule_id}]},
+                    "code": HTTPStatus.FORBIDDEN.value,
                 },
             )
             return
@@ -10167,6 +10324,82 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, {"status": "refreshed", "forge": forge.name})
 
+    def _handle_feedback_post(self) -> None:
+        """`POST /v1/feedback/submit`: file a confirmed kube-agents report once.
+
+        feedback_broker owns the payload rules and the wire path; this route
+        reads the body, holds a request slot around the outbound calls as the
+        forge verbs do, and maps the outcome: the broker's status object on
+        200, a `BLOCKED` object on 400 when nothing was sent (a refused
+        payload, a form that cannot be reached), and the audit line carries
+        the title and the status, never the report's text.
+        """
+        request_id = str(uuid.uuid4())
+        principal = getattr(self, "principal", None)
+        principal_label = _sanitize_for_logging(
+            principal.describe() if principal is not None else "", max_length=PRINCIPAL_LOG_LENGTH
+        )
+
+        def audit(status: str) -> dict[str, Any]:
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                )
+            }
+
+        try:
+            payload = self._read_json_body()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        # Redacted before it is sanitized: the gate inside feedback_broker has
+        # not run yet, and a person's title can carry a token.
+        title = _sanitize_for_logging(redact_credentials(str(payload.get("title", ""))))
+        LOGGER.info(
+            "feedback submit request_id=%s principal=%s title=%s",
+            request_id, principal_label, title, extra=audit(AUDIT_STATUS_STARTED),
+        )
+        try:
+            with self._request_slot():
+                answer = feedback_broker.submit(payload)
+        except feedback_broker.Blocked as exc:
+            LOGGER.info(
+                "feedback submit blocked request_id=%s: %s",
+                request_id, _sanitize_for_logging(redact_credentials(exc.reason), max_length=FEEDBACK_REASON_LOG_LENGTH),
+                extra=audit(AUDIT_STATUS_BLOCKED),
+            )
+            self._json(HTTPStatus.BAD_REQUEST, feedback_broker.blocked_answer(exc.reason))
+            return
+        except CallerHungUp as exc:
+            LOGGER.info("feedback submit abandoned request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_ABANDONED))
+            return
+        except CommandSlotUnavailable as exc:
+            # A full broker is a 503 the client reads as "nothing was sent",
+            # like the exec and forge routes; a dropped connection would read
+            # as a lost answer and strand the caller's marker.
+            LOGGER.warning("feedback submit busy request_id=%s: %s", request_id, exc, extra=audit(AUDIT_STATUS_BUSY))
+            self._busy(exc)
+            return
+        except Exception as exc:  # noqa: BLE001 -- every outcome here must be an answer
+            # feedback_broker converts the wire's failures into Blocked or
+            # UNCONFIRMED itself; what reaches this arm is a fault in reading
+            # a page the form served. The POST has not happened before the
+            # page is read, so this is a BLOCKED, not a lost answer.
+            LOGGER.warning(
+                "feedback submit failed request_id=%s type=%s", request_id, type(exc).__name__,
+                extra=audit(AUDIT_STATUS_FAILED),
+            )
+            self._json(
+                HTTPStatus.BAD_REQUEST,
+                feedback_broker.blocked_answer(FEEDBACK_REASON_FAULT.format(error=type(exc).__name__)),
+            )
+            return
+        LOGGER.info(
+            "feedback submit %s request_id=%s title=%s",
+            answer.get("status"), request_id, title, extra=audit(AUDIT_STATUS_COMPLETED),
+        )
+        self._json(HTTPStatus.OK, answer)
+
     def _handle_vcs_post(self) -> None:
         """The version-control routes: `POST /v1/vcs/<verb>`.
 
@@ -10522,7 +10755,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # request line itself could not be parsed, and that response counts
         # under LABEL_OTHER like any other unclaimed one.
         status_code = str(int(code)) if isinstance(code, int) else str(code)
-        self.metrics.record_request(_endpoint_label(getattr(self, "path", "")), status_code)
+        family = _endpoint_label(getattr(self, "path", ""))
+        self.metrics.record_request(family, status_code)
+        # The same hook counts the broker's failures, by the route's family
+        # and the status (_broker_failure_kind).
+        kind = _broker_failure_kind(family, status_code)
+        if kind is not None and getattr(self, "command", "") in BROKER_FAILURE_COUNTED_METHODS:
+            self.metrics.record_failure(kind)
         super().log_request(code, size)
 
     def log_message(self, message: str, *args: Any) -> None:

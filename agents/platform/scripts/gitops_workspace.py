@@ -804,6 +804,14 @@ def qualify(repo: str, managed: list[str] | None = None) -> str:
     spelling the list uses, so every gate can compare it with the list as
     written. A repository on another forge is returned unchanged.
 
+    On a GitHub Enterprise Server install the list names each GitHub
+    repository `<host>/owner/name`. A bare `owner/name` then resolves to the
+    entry on the install's GitHub host, as the install has one GitHub forge.
+    The name stays bare when an entry of another forge has the same path,
+    because the name does not tell which forge it is on: the caller's gate
+    then refuses it, and the caller must name the host. A
+    `github.com/owner/name` is never moved to the install's host.
+
     `managed` is the list when the caller has read it already; otherwise it is
     read here, and a list that cannot be read leaves the name as it was for the
     caller's own read to fail on.
@@ -822,10 +830,35 @@ def qualify(repo: str, managed: list[str] | None = None) -> str:
             managed = get_managed_repos()
         except Exception:
             return repo
+    if not host:
+        install_host = github_host()
+        if install_host != repo_ref.GITHUB_CANONICAL_HOST:
+            return _qualify_on_enterprise_host(bare, managed, install_host)
     qualified = f"{repo_ref.GITHUB_CANONICAL_HOST}/{bare}"
     if any(isinstance(name, str) and name.lower() == qualified.lower() for name in managed):
         return qualified
     return bare
+
+
+def _qualify_on_enterprise_host(bare: str, managed: list[str], install_host: str) -> str:
+    """The managed entry that a bare `owner/name` names on a GitHub Enterprise Server install.
+
+    The entry as the list spells it, so the caller's gate finds it. `bare`
+    when the list has no such entry, or when an entry on another host has the
+    same path.
+    """
+    want = bare.lower()
+    match = None
+    for name in managed:
+        if not isinstance(name, str):
+            continue
+        host, path = split_host(name)
+        if path.lower() != want:
+            continue
+        if host.lower() != install_host:
+            return bare
+        match = name
+    return match or bare
 
 
 def split_host(repo: str) -> tuple[str, str]:

@@ -68,7 +68,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Literal
 
 import yaml
@@ -95,6 +95,7 @@ from kube_agents_bench import (
     transcript,
     worker_trajectory,
 )
+from kube_agents_bench.parsing import DELEGATION_TOOL
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -131,6 +132,17 @@ _NO_TRANSCRIPT_REASON = (
     "no transcript stashed for this run: the harness did not complete an "
     "agent execution (kube_agents_bench.transcript is empty), so this check "
     "could not be evaluated"
+)
+_NO_TIME_WINDOW_REASON = (
+    "the run's transcript carries no start time (TranscriptSnapshot.started_at "
+    "is unset), so this check has no window to read the report's times against "
+    "and refuses to grade it"
+)
+# report_times_in_window, when a stated time matches no output it could read.
+_NO_WORKER_CAPTURE_GAP = "the delegated workers' tool calls were not captured"
+_UNSOURCED_WITH_GAPS_REASON = (
+    "observation time(s) {times} match no tool output this check could read, but the read "
+    "was not whole ({gaps}), so the output that shows them may be in the part it missed"
 )
 # A fence line read by ``report_manifest``, after any blockquote prefix: an
 # optional indent (a block inside a list item), a run of three or more
@@ -736,6 +748,402 @@ class ReportContainsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason="report contains " + ", ".join(satisfied),
+        )
+
+
+# report_times_in_window: a time the report says it observed something at.
+# A clock time: hours and minutes, seconds and a fraction of any length
+# optional (kubectl prints nanoseconds), then an optional AM or PM.
+_CLOCK = (
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})(?::(?P<second>\d{2})(?:\.(?P<fraction>\d+))?)?"
+    r"(?:\s*(?P<meridiem>[AaPp]\.?[Mm]\.?)(?![A-Za-z]))?"
+)
+# A date and a clock time, `T` or a space between, then an optional UTC or
+# numeric zone: 2026-10-15 21:38:00 UTC, 2026-10-15T21:38:00Z,
+# 2026-10-15 21:38 +00:00. There is no named-zone alternative: an all-caps
+# word after a time ("GKE", "INFO") is not a zone, and a dated time with no
+# zone is read as UTC, which the agent's pods and persona both use. A colon
+# may follow ("Observed at 2026-10-15 21:38:00: 2 pods running").
+_STATED_DATETIME = re.compile(
+    r"(?<![\d-])(?P<date>\d{4}-\d{2}-\d{2})[T ]" + _CLOCK
+    + r"(?:\s*(?P<zone>Z|UTC|GMT|[+-]\d{2}:?\d{2})\b)?(?!\d)"
+)
+# A clock time with no date counts only with an explicit UTC zone ("as of
+# 21:38 UTC"); a bare "21:38" is as likely a duration or a log offset.
+_STATED_CLOCK = re.compile(r"(?<![\d:.-])" + _CLOCK + r"\s*(?P<zone>Z|UTC|GMT)\b(?!\d)")
+# The zones read as UTC.
+_UTC_ZONES = frozenset({"", "Z", "UTC", "GMT"})
+_NUMERIC_ZONE = re.compile(r"(?P<sign>[+-])(?P<hours>\d{2}):?(?P<minutes>\d{2})")
+_DATE_FORMAT = "%Y-%m-%d"
+# datetime keeps microseconds: a longer fraction is cut to six digits.
+_MICROSECOND_DIGITS = 6
+_HOURS_PER_HALF_DAY = 12
+_PM_PREFIX = "p"
+
+
+def _zone_offset(zone: str) -> timedelta | None:
+    """The zone's offset from UTC, or ``None`` for one this check does not read."""
+    if zone in _UTC_ZONES:
+        return timedelta(0)
+    numeric = _NUMERIC_ZONE.fullmatch(zone)
+    if numeric is None:
+        return None
+    offset = timedelta(hours=int(numeric["hours"]), minutes=int(numeric["minutes"]))
+    return -offset if numeric["sign"] == "-" else offset
+
+
+def _clock_of(match: re.Match) -> dt_time | None:
+    """The match's clock time, or ``None`` when it is not a valid one."""
+    hour = int(match["hour"])
+    meridiem = match["meridiem"]
+    if meridiem:
+        if not 1 <= hour <= _HOURS_PER_HALF_DAY:
+            return None
+        hour %= _HOURS_PER_HALF_DAY
+        if meridiem[0].lower() == _PM_PREFIX:
+            hour += _HOURS_PER_HALF_DAY
+    fraction = (match["fraction"] or "")[:_MICROSECOND_DIGITS].ljust(_MICROSECOND_DIGITS, "0")
+    try:
+        return dt_time(hour, int(match["minute"]), int(match["second"] or 0), int(fraction))
+    except ValueError:
+        return None
+
+
+def _stated_times(line: str, dates: list[str]) -> tuple[list[tuple[str, list[datetime]]], list[str]]:
+    """Every time ``line`` states, each with the UTC instants it can mean, and
+    the ones it could not read.
+
+    A dated time means one instant. A clock time with no date means one per
+    entry of ``dates`` (the run's start and end days), so a run that crosses
+    midnight can be read either way. A dated time with no zone is read as
+    UTC. Not read: a date or clock time that does not exist (2026-02-30,
+    25:00).
+    """
+    found: list[tuple[str, list[datetime]]] = []
+    unreadable: list[str] = []
+    dated_spans = []
+    for match in _STATED_DATETIME.finditer(line):
+        dated_spans.append(match.span())
+        text = match.group(0).strip()
+        offset = _zone_offset(match["zone"] or "")
+        clock = _clock_of(match)
+        try:
+            day = datetime.strptime(match["date"], _DATE_FORMAT)
+        except ValueError:
+            day = None
+        if offset is None or clock is None or day is None:
+            unreadable.append(text)
+            continue
+        local = datetime.combine(day.date(), clock)
+        found.append((text, [(local - offset).replace(tzinfo=timezone.utc)]))
+    for match in _STATED_CLOCK.finditer(line):
+        if any(start <= match.start() < end for start, end in dated_spans):
+            continue
+        clock = _clock_of(match)
+        if clock is None:
+            unreadable.append(match.group(0).strip())
+            continue
+        instants = [
+            datetime.combine(datetime.strptime(d, _DATE_FORMAT).date(), clock).replace(tzinfo=timezone.utc)
+            for d in dates
+        ]
+        found.append((match.group(0).strip(), instants))
+    return found, unreadable
+
+
+# The times a tool output in the run shows, for report_times_in_window's
+# provenance half. Beside the ISO forms _STATED_DATETIME reads: `date` and
+# `date -u` with no format ("Thu Oct 15 21:26:03 UTC 2026"), `date -R`
+# ("Thu, 15 Oct 2026 21:26:03 +0000"), and epoch seconds or milliseconds
+# (`date +%s`, a card's created_at). A ten-digit run is any instant from 2001
+# to 2286, so an id that happens to be ten digits can only widen what counts
+# as read, never narrow it.
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+_DATE_DEFAULT_OUTPUT = re.compile(
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(?P<month>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+(?P<zone>UTC|GMT|Z)\s+(?P<year>\d{4})\b"
+)
+_DATE_RFC_2822 = re.compile(
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+(?P<day>\d{1,2})\s+(?P<month>[A-Z][a-z]{2})\s+(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})\s+(?P<zone>[+-]\d{4}|UTC|GMT)\b"
+)
+_EPOCH_SECONDS = re.compile(r"(?<![\d.])(?P<seconds>\d{10})(?:\.\d+)?(?![\d])")
+_EPOCH_MILLISECONDS = re.compile(r"(?<![\d.])(?P<millis>\d{13})(?![\d.])")
+_MILLIS_PER_SECOND = 1000
+# A bare clock time in an output (`date -u +%T`, a log line), with seconds,
+# so a ratio or a port pair ("8080:80") is not read as one.
+_BARE_CLOCK = re.compile(
+    r"(?<![\d:.-])(?P<hour>\d{1,2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:\.(?P<fraction>\d+))?"
+    r"(?:\s*(?P<meridiem>[AaPp]\.?[Mm]\.?)(?![A-Za-z]))?(?![\d:])"
+)
+_HALF_MINUTE = timedelta(seconds=30)
+# Kanban tools return cards, and a card's result is a worker's own words.
+_KANBAN_TOOL_PREFIX = "kanban_"
+# What worker_trajectory's in-pod script puts in place of a result when the
+# pod's redactor will not load (its WITHHELD), and the marker its clip ends a
+# cut result with. Both live inside that script's source, so they are
+# spelled again here; test_report_times_in_window.py pins them to it.
+_WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
+_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+
+
+def _minute(instant: datetime) -> datetime:
+    return instant.replace(second=0, microsecond=0)
+
+
+def _minutes_of(instant: datetime) -> set[datetime]:
+    """The minutes a report may write a read instant as: its own, or the next
+    when the seconds round up (21:25:59 reported as 21:26)."""
+    return {_minute(instant), _minute(instant + _HALF_MINUTE)}
+
+
+def _named_month_instant(match: re.Match) -> datetime | None:
+    month = match["month"].lower()
+    if month not in _MONTHS:
+        return None
+    offset = _zone_offset(match["zone"])
+    if offset is None:
+        return None
+    try:
+        local = datetime(
+            int(match["year"]), _MONTHS.index(month) + 1, int(match["day"]),
+            int(match["hour"]), int(match["minute"]), int(match["second"]),
+        )
+    except ValueError:
+        return None
+    return (local - offset).replace(tzinfo=timezone.utc)
+
+
+def _output_minutes(text: str, dates: list[str]) -> set[datetime]:
+    """Every UTC minute a tool output's text shows a time in. A clock time
+    with no date (`date -u +%T`, a log line's time) is read on each of
+    ``dates``, the run's start and end days, as a stated one is."""
+    found, _ = _stated_times(text, dates)
+    instants = [instant for _, candidates in found for instant in candidates]
+    dated = [span for m in _STATED_DATETIME.finditer(text) for span in [m.span()]]
+    for match in _BARE_CLOCK.finditer(text):
+        if any(start <= match.start() < end for start, end in dated):
+            continue
+        clock = _clock_of(match)
+        if clock is not None:
+            instants.extend(
+                datetime.combine(datetime.strptime(d, _DATE_FORMAT).date(), clock).replace(tzinfo=timezone.utc)
+                for d in dates
+            )
+    for pattern in (_DATE_DEFAULT_OUTPUT, _DATE_RFC_2822):
+        for match in pattern.finditer(text):
+            instant = _named_month_instant(match)
+            if instant is not None:
+                instants.append(instant)
+    instants.extend(datetime.fromtimestamp(int(m["seconds"]), tz=timezone.utc) for m in _EPOCH_SECONDS.finditer(text))
+    instants.extend(
+        datetime.fromtimestamp(int(m["millis"]) // _MILLIS_PER_SECOND, tz=timezone.utc)
+        for m in _EPOCH_MILLISECONDS.finditer(text)
+    )
+    return {minute for instant in instants for minute in _minutes_of(instant)}
+
+
+def _compiled_labels(patterns: list[str]) -> list[re.Pattern]:
+    return [re.compile(p, re.IGNORECASE) for p in patterns if p.strip()]
+
+
+def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[set[datetime], list[str], int]:
+    """The UTC minutes the run's tool outputs show, what kept the read from
+    being whole (a result the pod withheld), and how many results it clipped.
+
+    Every entry's ``result`` counts, the front door's and each delegated
+    worker's (``worker_trajectory`` adds those, a worker-filed card's
+    included), since any of them is a time the agent read, except a kanban
+    tool's: a card's result is what a worker wrote, so a guessed time a worker
+    put on its card would otherwise come back as read. A clipped result
+    still counts for what it kept; the cut is noted, not treated as a gap,
+    because nearly every long `kubectl` output is clipped while a `date -u`
+    never is.
+    """
+    minutes: set[datetime] = set()
+    withheld: list[str] = []
+    clipped = 0
+    for entry in trajectory:
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        name = str(entry.get("name") or "")
+        if not isinstance(result, str) or name.startswith(_KANBAN_TOOL_PREFIX):
+            continue
+        if result == _WITHHELD_RESULT:
+            withheld.append(f"a {name or 'tool'} result was withheld")
+            continue
+        if _CLIPPED_RESULT.search(result):
+            clipped += 1
+        minutes |= _output_minutes(result, dates)
+    return minutes, withheld, clipped
+
+
+def _delegated_without_capture(snap: transcript.TranscriptSnapshot) -> bool:
+    """Whether the run delegated but its workers were not read: the front
+    door called ``kanban_create`` and the capture did not run. A run that
+    delegated nothing also has no capture, and is graded on what it has."""
+    if snap.worker_capture_gaps is not None:
+        return False
+    return any(
+        isinstance(e, dict) and e.get("name") == DELEGATION_TOOL and not e.get("agent") for e in snap.trajectory
+    )
+
+
+@VERIFIERS.register("report_times_in_window")
+class ReportTimesInWindowVerifier(BaseVerifier):
+    """Every observation time the report states falls inside the run and was read.
+
+    A report that says when it looked ("Timestamp of Observation: 2026-10-15
+    21:38:00 UTC") can only have looked while the run was going, so the time
+    must fall between the run's start (``TranscriptSnapshot.started_at``) and
+    the moment this check runs, which is after the report was delivered, each
+    widened by ``max_clock_skew_sec``. A report that states no such time
+    passes: leaving the time out is the right answer when nothing produced
+    one. Written for #3256, where a Cluster Agent's audit trail stated an
+    observation time five minutes after its own post.
+
+    Which times are observation times is the case's to say, in
+    ``label_patterns``: regexes searched, case-insensitively, in each line of
+    the report. A time on a matching line is checked. A time on any other
+    line is not, including one on the line after a label, so an event timestamp quoted from command output, which may be
+    days old, or a certificate's expiry, which is in the future, does not
+    fail a report. The window's end is the moment the check runs, not the
+    moment the report was delivered, which this check cannot see; the gap
+    between the two is part of the slack.
+
+    Every checked time must also have been read: its minute (UTC, seconds
+    dropped, so a time read as 21:26:03 may be reported as 21:26) must be a
+    minute some tool output in the run's trajectory shows. The outputs are
+    every entry's ``result``, the front door's and each delegated worker's,
+    a worker-filed card's included, but not a kanban tool's, whose card
+    result is a worker's own words. A worker's own words echoed back through
+    another tool (an ``echo``, a drafted file it cats) do count as read; an
+    exclusion by label was tried and removed, because a captured worker
+    result arrives as one JSON line, so a label word anywhere in it dropped
+    the whole result. The forms read are ISO 8601, the output
+    of ``date``, ``date -u`` and ``date -R``, a bare clock time with seconds
+    (on the run's days), and epoch seconds or milliseconds, so a
+    ``date +%s`` matches its UTC rendering; a read time also matches the
+    next minute when its seconds round up. A time no output shows fails,
+    even inside the window: that is the guess #3256 found. When the unread
+    time could sit in a part of the run that was not read (the run delegated
+    and its workers were not captured, the capture has gaps, or a result
+    was withheld), the check is ``status: error`` naming what was missing,
+    not a fail. A clipped result is read as far as it goes and noted.
+
+    Only a time on a label's own line is graded, with a date or an explicit
+    UTC zone; a value on the line after a label is not read, and a dated
+    time with no zone is read as UTC (#3266 cut the next-line and named-zone
+    rules after they kept growing).
+
+    What it cannot catch: a time on the line after its label; a time stated
+    in another zone, which is read as UTC; a date or clock time that does
+    not exist, which is named in the reason and not graded; and a guess
+    whose minute happens to match some other time the run read, which on a
+    run of a few minutes that printed event or creation times inside it is
+    not rare.
+    """
+
+    type: Literal["report_times_in_window"]
+    label_patterns: list[str]
+    max_clock_skew_sec: float = Field(default=120.0, ge=0)
+    scope: Literal["final", "full"] = "final"
+
+    @field_validator("label_patterns")
+    @classmethod
+    def _label_patterns_compile(cls, patterns: list[str]) -> list[str]:
+        if not [p for p in patterns if p.strip()]:
+            raise ValueError("label_patterns needs at least one non-blank pattern, or the check can only pass")
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as err:
+                raise ValueError(f"label pattern {pattern!r} does not compile: {err}") from err
+        return patterns
+
+    def _labelled_lines(self, raw: str) -> list[str]:
+        """The lines whose times are observation times: a label's own line,
+        and nothing else. A value on the line after a label is not read; the
+        rules for lending a line were the part of this check that kept
+        growing (#3266's review rounds), and a nightly guard can give it up.
+        The labels are searched on the line with its Markdown emphasis
+        stripped, as ``report_contains`` searches, since `\\b` finds no
+        boundary between `_` and a word ("_Observed at_")."""
+        labels = _compiled_labels(self.label_patterns)
+        return [line for line in raw.splitlines() if any(label.search(_normalize(line)) for label in labels)]
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=_NO_TRANSCRIPT_REASON
+            )
+        if not snap.started_at:
+            return VerificationResult(
+                success=False, status="error", elapsed_time=time.monotonic() - start, reason=_NO_TIME_WINDOW_REASON
+            )
+        skew = timedelta(seconds=self.max_clock_skew_sec)
+        run_start = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
+        run_end = datetime.now(tz=timezone.utc)
+        earliest, latest = run_start - skew, run_end + skew
+        dates = sorted({run_start.strftime(_DATE_FORMAT), run_end.strftime(_DATE_FORMAT)})
+        raw = snap.final_message if self.scope == "final" else snap.output
+        checked, outside, unreadable = [], [], []
+        stated: list[tuple[str, list[datetime]]] = []
+        for line in self._labelled_lines(raw):
+            found, skipped = _stated_times(line, dates)
+            unreadable.extend(skipped)
+            for text, instants in found:
+                checked.append(text)
+                stated.append((text, instants))
+                if not any(earliest <= instant <= latest for instant in instants):
+                    outside.append(text)
+        window = f"{earliest.isoformat(timespec='seconds')} to {latest.isoformat(timespec='seconds')}"
+        not_read = (
+            f"; not read (not a real date and time): {unreadable}" if unreadable else ""
+        )
+        if outside:
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=f"observation time(s) outside the run's window ({window}): {outside}{not_read}",
+            )
+        if not checked:
+            return VerificationResult(
+                success=True,
+                elapsed_time=time.monotonic() - start,
+                reason=f"the report states no observation time this check reads{not_read}",
+            )
+        read, withheld, clipped = _read_minutes(snap.trajectory, dates)
+        unsourced = [
+            text for text, instants in stated if not any(_minute(i) in read for i in instants)
+        ]
+        if unsourced:
+            gaps = withheld + list(snap.worker_capture_gaps or [])
+            if _delegated_without_capture(snap):
+                gaps.append(_NO_WORKER_CAPTURE_GAP)
+            if gaps:
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=_UNSOURCED_WITH_GAPS_REASON.format(times=unsourced, gaps="; ".join(gaps)),
+                )
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason=(
+                    f"observation time(s) no tool output in the run shows, to the minute: {unsourced}"
+                    + (f" ({clipped} result(s) were clipped and read as far as they went)" if clipped else "")
+                    + not_read
+                ),
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=f"{len(checked)} observation time(s) inside the run's window ({window}) and read from a tool output{not_read}",
         )
 
 
@@ -1639,6 +2047,18 @@ _ALL_FINDINGS_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-findings-all:[ \t]*(\[[^\n]*?\])[ \t]*-->[ \t]*$", re.M
 )
 
+# What `every_finding_named` counts as a name: audit_report's finding heading
+# (`FINDING_MARKER_RE`'s shape) and inline code outside HTML comments.
+_HEADING_ID_RE = re.compile(r"^####[ \t].*?<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M)
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# The notice audit_report's `_render_findings` writes when it omits findings.
+_OMITTED_NOTICE_RE = re.compile(r"(\d+) further finding\(s\) are omitted from this description")
+# Mirrors audit_report's `HELD_IDS_RE`: the held ids its held span records.
+_HELD_IDS_RE = re.compile(r"<!--[ \t]*audit-held-ids:[ \t]*(\[.*?\])[ \t]*-->", re.S)
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+# Ids quoted in an `every_finding_named` failure; the count is always exact.
+_MAX_UNNAMED_IN_REASON = 5
+
 # Bound on issue URLs fetched from one report. An audit reply names its ledger
 # once; anything past a handful is a report to look at by hand, not a set of
 # candidates to shotgun the API with.
@@ -2385,23 +2805,35 @@ class WorkerCommandsVerifier(BaseVerifier):
     Sees the ROUTE a worker took rather than the answer it gave, through the
     terminal commands it typed; ``tool_called`` under ``scope: workers`` is
     the companion for the MCP tool calls it made (see its docstring).
-    Without ``after_result_pattern`` the harness reads each delegated card's
-    worker log before purging it and stashes every ``💻 $`` line as a command
-    (``transcript.worker_commands``); this verifier matches Python regular
-    expressions against those strings, ``re.search`` on each command verbatim.
-    That line is hermes's one-line rendering of the command
-    (``summarize_shell_command`` in its ``agent/display.py``), not the text as
-    typed: a newline becomes a space, a chain joined by ``;``, ``&&`` or ``||``
-    arrives as its first command (a leading ``cd``, ``export``, ``set``,
-    ``source``, ``true`` or ``false`` skipped) plus `` + N command(s)``, a
-    redirection is dropped, and a pipe, a substitution and a backtick stay. A
-    pattern reads the rendering, so a command chained behind another is not on
-    any line it sees. The command as typed is on the trajectory already, tagged
-    with the worker's profile (:mod:`kube_agents_bench.worker_trajectory` reads
-    each worker session's tool calls after the log scrape; ``tool_called``
-    grades them); ``after_result_pattern`` (below) reads the ``terminal`` calls
-    from there instead of the card log, and without it this verifier still
-    reads the rendering.
+    Without ``after_result_pattern`` the harness reads the worker log of each
+    card the front agent filed before purging it and stashes every ``💻 $``
+    line as a command (``transcript.worker_commands``); the cards those
+    workers filed in turn (a Cluster Agent's card under the platform
+    worker's, and its own children) have no log read, so their commands come
+    from their tagged ``terminal`` and ``execute_code`` calls in the
+    trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
+    a log line is graded on its log lines, whether or not its calls reached
+    the trajectory, and any other card on its calls. This verifier matches
+    Python regular expressions against the union, ``re.search`` on each
+    command verbatim, and an exemption reads a tagged call as it reads a log
+    line. The two halves are not spelled alike. A log line is hermes's
+    one-line rendering of the command (``summarize_shell_command`` in its
+    ``agent/display.py``), not the text as typed: a newline becomes a space, a
+    chain joined by ``;``, ``&&`` or ``||`` arrives as its first command (a
+    leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
+    skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe, a
+    substitution and a backtick stay. A pattern reads the rendering there, so a
+    command chained behind another on a log line is not on any line it sees. A
+    tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
+    reads each worker session's tool calls after the log scrape; ``tool_called``
+    grades them), so a pattern, forbidden or exempt, reads a worker-filed
+    card's call as one string with its newlines and operators intact and a
+    front-filed card's as rendered: a ``^``-anchored pattern written against
+    the rendering can miss a worker-filed card's command behind a ``cd ... &&``
+    or on a second line, and a capture gap on such a card does not change the
+    result (#3406).
+    ``after_result_pattern`` (below) reads the tagged calls alone, as typed,
+    for every card.
 
     ``required_patterns``: each must match at least one command.
     ``forbidden_patterns``: none may match any command.
@@ -2452,50 +2884,55 @@ class WorkerCommandsVerifier(BaseVerifier):
     JSON-escaped, so a pattern spanning a line break writes ``(?:\\n|\\\\n)``.
 
     Limits, stated so a case is not written against them: only terminal
-    commands and ``execute_code`` text are visible, not MCP tool calls; only
-    delegated workers' logs or calls are read, never the router's; a command
-    the shell resolved through an alias appears as typed; and a pattern reads
-    the characters on the line, so a word the command splits with an empty
-    quote or a backslash inside it (``compute''Metadata``) is one word to the
-    shell and none to the pattern -- the call text as typed under
-    ``after_result_pattern`` closes the chain gap, and the split stays.
-    ``required_runs`` reads each flag as the exact word, so a script a case
-    names this way is built with ``allow_abbrev=False`` (argparse's default
-    lets ``--readi`` run ``--readiness``), as ``fleet_upgrade_report.py`` is;
-    and a line bash refuses (an unclosed quote) yields no words, so no run is
-    credited from it (``forbidden_patterns`` read the text and still match it);
-    and no shell expansion is resolved, so a run spelled through a variable
-    that holds the whole path (``python3 "$SCRIPT" ...``) is not read as one --
-    the dictated command spells the path in full; a ``$(...)``, ``<(...)``,
-    ``>(...)`` or backtick span is kept inside its word, as the shell keeps it,
-    and the commands inside it are read as commands of their own, as the shell
-    runs them, quoted or not (``$((...))`` runs none); a bare operator is one
-    outside quotes only, so a quoted ``">"`` or ``';'`` is text; and a reserved
-    word (``if``, ``do``, ``!``) stands ahead of the command word; so may an
-    exec wrapper (``timeout``, ``sudo``, ``env``, ``xargs``, ``flock``) with its
-    own words -- a flag, the word after a flag, a count, an unresolved
-    expansion, ``--``, the one positional ``flock`` and ``chroot`` take, and a
-    redirect with its target -- and a program behind one that is not the
-    script, a shell or an interpreter (``sudo ls``, ``nohup echo``) is a command
-    of its own, not a run; which flags take a value is not tabled, so the word
-    after a bare flag is read as its value (``sudo -n ls <script> --readiness``
-    is still credited); and a run made through a script file or a shell's
-    standard input (``bash run.sh``, ``nohup bash /tmp/run.sh &``,
-    ``echo "<command>" | bash``, ``bash -s < run.sh``) is not read as one, since
-    the argv names the file or the shell and not what was written to it, which
-    no reading of the argv recovers -- a case names a run this way where the
-    persona dictates one typed command, and a worker that runs it through a
-    file is not credited. Under ``after_result_pattern``: a refused command
-    whose output the call discarded prints nothing into its result; a result is
-    clipped in the pod at ``worker_trajectory.MAX_RESULT_CHARS``; a read whose
-    output quotes the refusal text opens the window; the command patterns read
-    a call's text as typed, so a route behind a shell variable or an alias is
-    not read; no tagged worker call at all, or no readable one (every code-tool
-    call's argument withheld), is ``status="error"``, a withheld argument beside
-    a readable call is skipped, a worker whose tagged calls are all MCP calls
-    grades as zero commands, and a capture with gaps that found no forbidden
-    command is ``status="error"``. Fails closed like its siblings -- a run with
-    no captured worker commands is ``status="error"``, not a pass.
+    commands and ``execute_code`` text are visible, not MCP tool calls (and,
+    without ``after_result_pattern``, ``execute_code`` text only for a card
+    graded on its calls: a filed card's log shows no program text); only
+    delegated workers' logs or calls are read, never the router's, and a
+    worker-filed card is read only as far as the trajectory capture reached
+    it (``worker_capture_gaps`` makes a clean read an error only under
+    ``after_result_pattern``); and a
+    command the shell resolved through an alias appears as typed; and a
+    pattern reads the characters on the line, so a word the command splits
+    with an empty quote or a backslash inside it (``compute''Metadata``) is
+    one word to the shell and none to the pattern -- the call text as typed
+    closes the chain gap, and the split stays. ``required_runs``
+    reads each flag as the exact word, so a script a case names this way is
+    built with ``allow_abbrev=False`` (argparse's default lets ``--readi`` run
+    ``--readiness``), as ``fleet_upgrade_report.py`` is; and a line bash refuses
+    (an unclosed quote) yields no words, so no run is credited from it
+    (``forbidden_patterns`` read the text and still match it); and no shell
+    expansion is resolved, so a run spelled through a variable that holds the
+    whole path (``python3 "$SCRIPT" ...``) is not read as one -- the dictated
+    command spells the path in full; a ``$(...)``, ``<(...)``, ``>(...)`` or
+    backtick span is kept inside its word, as the shell keeps it, and the
+    commands inside it are read as commands of their own, as the shell runs
+    them, quoted or not (``$((...))`` runs none); a bare operator is one outside
+    quotes only, so a quoted ``">"`` or ``';'`` is text; and a reserved word
+    (``if``, ``do``, ``!``) stands ahead of the command word; so may an exec
+    wrapper (``timeout``, ``sudo``, ``env``, ``xargs``, ``flock``) with its own
+    words -- a flag, the word after a flag, a count, an unresolved expansion,
+    ``--``, the one positional ``flock`` and ``chroot`` take, and a redirect with
+    its target -- and a program behind one that is not the script, a shell or an
+    interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a run;
+    which flags take a value is not tabled, so the word after a bare flag is
+    read as its value (``sudo -n ls <script> --readiness`` is still credited);
+    and a run made through a script file or a shell's standard input
+    (``bash run.sh``, ``nohup bash /tmp/run.sh &``, ``echo "<command>" | bash``,
+    ``bash -s < run.sh``) is not read as one, since the argv names the file or
+    the shell and not what was written to it, which no reading of the argv
+    recovers -- a case names a run this way where the persona dictates one typed
+    command, and a worker that runs it through a file is not credited. Under
+    ``after_result_pattern``: a refused command whose output the call discarded
+    prints nothing into its result; a result is clipped in the pod at
+    ``worker_trajectory.MAX_RESULT_CHARS``; a read whose output quotes the
+    refusal text opens the window; the command patterns read a call's text as
+    typed, so a route behind a shell variable or an alias is not read; no tagged
+    worker call at all, or no readable one (every code-tool call's argument
+    withheld), is ``status="error"``, a withheld argument beside a readable call
+    is skipped, a worker whose tagged calls are all MCP calls grades as zero
+    commands, and a capture with gaps that found no forbidden command is
+    ``status="error"``. Fails closed like its siblings -- a run with no captured
+    worker commands is ``status="error"``, not a pass.
     """
 
     type: Literal["worker_commands"]
@@ -2543,8 +2980,13 @@ class WorkerCommandsVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         window = ""
+        sources = ""
         result_hits: list[tuple[str, str]] = []
         if self.after_result_pattern is None:
+            # ``None`` stays an error even when the trajectory carries tagged calls: it
+            # means a filed card's log could not be read (or nothing was filed), and
+            # grading only the cards whose calls did arrive would pass a forbidden
+            # check on the unread card's commands -- the no-capture case is unchanged.
             if snap.worker_commands is None:
                 return VerificationResult(
                     success=False,
@@ -2552,7 +2994,39 @@ class WorkerCommandsVerifier(BaseVerifier):
                     elapsed_time=time.monotonic() - start,
                     reason=_NO_WORKER_COMMANDS_REASON,
                 )
-            typed = [row.get("command", "") for row in snap.worker_commands]
+            logged_commands = [row.get("command", "") for row in snap.worker_commands]
+            # The logs are read for the cards the front agent filed only; a card a worker
+            # filed (a Cluster Agent's card under the platform worker's) reaches the run
+            # through its tagged calls in the trajectory alone. Neither source is complete:
+            # the trajectory can be the narrower one too (two #2959 runs had a ``helm list``
+            # in the log and no tagged terminal call), so every log line is kept whatever
+            # the trajectory holds, and the trajectory's calls join the
+            # graded set by card, not by string: a card with a log line contributes its
+            # log lines and none of its calls, so a command a filed card typed is counted
+            # once (its log line and its call need not be spelled alike) and a command
+            # typed twice is counted twice. A card with no log line -- a worker filed it,
+            # or its log showed no shell command -- contributes its tagged calls, which
+            # for a filed card can only add ``execute_code`` text the log never shows (a
+            # behaviour change for a filed card that ran only code: its program text is
+            # now graded, where it used to read as zero commands). A row with no card
+            # (a record stashed before rows carried one) cannot be joined, so such a
+            # capture grades the plain union, every tagged call beside every log line:
+            # each check here is an existence check, so a command counted twice can only
+            # inflate the count, while dropping the calls could hide a filed card's write.
+            logged = {str(row.get("task") or "") for row in snap.worker_commands}
+            calls = _worker_terminal_calls(snap.trajectory)
+            if "" in logged:
+                children = [command for _, _, command, _, _ in calls]
+                if children:
+                    sources = (
+                        f" ({len(logged_commands)} from the filed cards' logs and {len(children)} tagged calls,"
+                        " unjoined because a log row names no card, so a command may be counted twice)"
+                    )
+            else:
+                children = [command for card, _, command, _, _ in calls if card not in logged]
+                if children:
+                    sources = f" ({len(logged_commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
+            typed = logged_commands + children
             windowed = typed
         else:
             calls = _worker_terminal_calls(snap.trajectory)
@@ -2626,11 +3100,11 @@ class WorkerCommandsVerifier(BaseVerifier):
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
-                    f"across {len(commands)} command(s){exempted}"
+                    f"across {len(commands)} command(s){exempted}{sources}"
                 )
             if unrun:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s)")
+                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -2663,7 +3137,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             success=True,
             elapsed_time=time.monotonic() - start,
             reason=(
-                f"{len(commands)} worker command(s){exempted}: all {len(self.required_patterns)} "
+                f"{len(commands)} worker command(s){exempted}{sources}: all {len(self.required_patterns)} "
                 f"required pattern(s) matched, all {len(self.required_runs)} required run(s) made, "
                 f"none of {len(self.forbidden_patterns) + len(self.forbidden_result_patterns)} forbidden pattern(s) matched, "
                 f"none of {len(self.forbidden_runs)} forbidden run(s) made"
@@ -3149,6 +3623,15 @@ def _finding_ids(body: str) -> tuple[list[str], str] | None:
     return [i for i in ids if isinstance(i, str)], source
 
 
+def _json_str_list(payload: str) -> list[str]:
+    """The strings of a JSON list, or [] when it does not parse as one."""
+    try:
+        value = json.loads(payload)
+    except (ValueError, TypeError):
+        return []
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
 @VERIFIERS.register("ledger_issue_contains")
 class LedgerIssueContainsVerifier(BaseVerifier):
     """Phrase checks against the GitHub ledger issue this run published.
@@ -3263,6 +3746,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
     scope: Literal["body", "finding_ids"] = "body"
+    # Every id the ledger files must be readable in its body, outside the two
+    # hidden id blocks: a finding cut for space and named only in
+    # `audit-findings-all` is filed but invisible to the person reading it.
+    every_finding_named: bool = False
     # Tolerance on the ledger stamp vs. the harness's run-start clock, which
     # are two different machines (the Prow runner and the agent pod). Small on
     # purpose: every second of it is a second of a previous run's ledger that
@@ -3567,6 +4054,33 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
 
+        unnamed: list[str] = []
+        omitted_unlisted: re.Match | None = None
+        if self.every_finding_named:
+            filed = _finding_ids(ledger["body"])
+            if filed is None:
+                return done(
+                    False,
+                    f"{ledger['slug']} carries no readable "
+                    "<!-- audit-findings: [...] --> delta block, so whether it "
+                    "names every finding it filed cannot be read off it",
+                )
+            # Named means a heading a reader sees, or the id whole in a code
+            # span outside any HTML comment: a bare substring would let `x.orders`
+            # pass on a visible `x.orders-api`.
+            body = ledger["body"]
+            named = set(_HEADING_ID_RE.findall(body))
+            named |= set(_CODE_SPAN_RE.findall(_HTML_COMMENT_RE.sub("", body)))
+            # Collector-held ids are the collector's, rendered in what the
+            # findings leave; this check grades the findings the run filed.
+            held = {fid for match in _HELD_IDS_RE.findall(body) for fid in _json_str_list(match)}
+            unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
+            # Past its cap the complete-id block is left out and `filed` is the
+            # delta block, which lacks the omitted ids; the renderer's omission
+            # notice still says they exist.
+            if filed[1] == "audit-findings":
+                omitted_unlisted = _OMITTED_NOTICE_RE.search(_HTML_COMMENT_RE.sub("", body))
+
         missing = [p for p in self.required_phrases if p.lower() not in text]
         present = [p for p in self.forbidden_phrases if p.lower() in text]
         any_of_miss = bool(self.any_of_phrases) and not any(
@@ -3577,8 +4091,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
         }
-        if missing or present or any_of_miss:
+        if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []
+            if omitted_unlisted:
+                parts.append(
+                    f"{ledger['slug']} says {omitted_unlisted.group(1)} further finding(s) are "
+                    "omitted from its description and carries no audit-findings-all block "
+                    "to name them, so they are filed but named nowhere"
+                )
+            if unnamed:
+                parts.append(
+                    f"{len(unnamed)} filed finding id(s) appear only in the hidden id "
+                    f"blocks of {ledger['slug']}, not in its visible body: "
+                    f"{unnamed[:_MAX_UNNAMED_IN_REASON]}"
+                )
             if missing:
                 parts.append(f"required phrases absent from {surface}: {missing}")
             if present:
@@ -3600,6 +4126,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             satisfied.append(
                 f"at least one of {len(self.any_of_phrases)} alternative phrasing(s)"
             )
+        if self.every_finding_named:
+            satisfied.append("a visible name for every filed finding")
         return done(
             True,
             f"{surface}, generated at {generated_at.isoformat()} by this run, "

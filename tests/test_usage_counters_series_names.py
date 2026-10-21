@@ -2,12 +2,14 @@
 
 The operator sums the credential broker's tool-invocation counter over its
 success and error outcomes (the commands it ran and the requests it rejected or
-failed on before running) and the event watcher's injected-event counter, and
+failed on before running), and the same counter over blocked, busy and abandoned
+into toolExecutionsBlockedTotal, and the event watcher's injected-event counter, and
 reads process_start_time_seconds from all four, and counts the watcher's per-cluster
 up gauge into the two cluster gauges, and sums the broker's version-control
 counter under one verb and status into remediationsProposedTotal, and its
 merged-proposals counter whole into remediationsMergedTotal, and the chat plugin's inbound-message
-counter over its platform label into chatMessagesInboundTotal. Each series name, the status label
+counter over its platform label into chatMessagesInboundTotal, and into sessionsTotal the watcher's
+triage-sessions counter, the chat plugin's sessions counter and the A2A gateway's. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
 value is a constant on the producer's side and a second copy on the operator's,
 and a rename on either side would freeze a status counter silently: the scrape
@@ -82,6 +84,16 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         for gateway_const, operator_const in (("platformGoogleChat", "interfaceGoogleChat"), ("platformSlack", "interfaceSlack")):
             self.assertEqual(_go_const(_A2A_METRICS_GO, gateway_const), _go_const(helpers, operator_const))
 
+    def test_the_sessions_families_are_the_ones_the_poller_sums(self):
+        """sessionsTotal is read from three families: the watcher's triage sessions
+        (opened and delivered, not its create attempts), the chat plugin's sessions
+        counter on its listener, and the A2A gateway's on a next-mode install."""
+        self.assertEqual(_watcher_family("triageSessions"), _go_const(_SCRAPE_GO, "triageSessionsSeries"))
+        self.assertNotEqual(_watcher_family("sessionCreates"), _go_const(_SCRAPE_GO, "triageSessionsSeries"))
+        self.assertEqual(_py_const("CHAT_SESSIONS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatSessionsSeries"))
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "sessionsName"))
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aSessionsSeries"))
+
     def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
         plugin = _CHAT_METRICS_PY.read_text()
         self.assertEqual(_py_const("CHAT_INBOUND_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatInboundSeries"))
@@ -116,8 +128,46 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertIsNotNone(match, "toolInvocationsCountedStatuses not found")
         counted = set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
         self.assertEqual({_py_const("TOOL_STATUS_SUCCESS"), _py_const("TOOL_STATUS_ERROR")}, counted)
-        for excluded in ("TOOL_STATUS_BLOCKED", "TOOL_STATUS_BUSY", "TOOL_STATUS_ABANDONED"):
-            self.assertNotIn(_py_const(excluded), counted)
+        excluded = {_py_const(name) for name in ("TOOL_STATUS_BLOCKED", "TOOL_STATUS_BUSY", "TOOL_STATUS_ABANDONED")}
+        self.assertFalse(counted & excluded)
+        # The broker declares its whole vocabulary once; the summed and the
+        # left-out statuses together must be exactly it, so a status the
+        # broker adds and this test does not know fails here rather than
+        # landing silently outside every status counter.
+        match = re.search(r"^TOOL_STATUSES\s*=\s*frozenset\(\{([^}]*)\}\)", _BROKER_PY.read_text(), re.M)
+        self.assertIsNotNone(match, "TOOL_STATUSES not found")
+        vocabulary = {_py_const(name.strip()) for name in match.group(1).split(",") if name.strip()}
+        self.assertEqual(vocabulary, counted | excluded)
+
+    def test_the_brokers_failure_family_is_the_one_the_poller_sums_into_broker_failures(self):
+        self.assertEqual(_py_const("BROKER_FAILURES_METRIC"), _go_const(_SCRAPE_GO, "brokerFailuresSeries"))
+
+    def test_the_refused_outcomes_are_the_brokers_blocked_busy_and_abandoned(self):
+        source = _SCRAPE_GO.read_text()
+        match = re.search(r"toolInvocationsRefusedStatuses\s*=\s*map\[string\]bool\{([^}]*)\}", source)
+        self.assertIsNotNone(match, "toolInvocationsRefusedStatuses not found")
+        refused = set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+        self.assertEqual(
+            {_py_const("TOOL_STATUS_BLOCKED"), _py_const("TOOL_STATUS_BUSY"), _py_const("TOOL_STATUS_ABANDONED")},
+            refused,
+        )
+        for excluded in ("TOOL_STATUS_SUCCESS", "TOOL_STATUS_ERROR"):
+            self.assertNotIn(_py_const(excluded), refused)
+
+    def test_the_two_status_sets_are_the_brokers_whole_vocabulary(self):
+        """A status the broker adds and neither set names would land in neither counter."""
+        source = _SCRAPE_GO.read_text()
+        sets = set()
+        for name in ("toolInvocationsCountedStatuses", "toolInvocationsRefusedStatuses"):
+            match = re.search(rf"{name}\s*=\s*map\[string\]bool\{{([^}}]*)\}}", source)
+            self.assertIsNotNone(match, f"{name} not found")
+            sets |= set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
+        # Any module-level declaration shape: a bare name or an annotated one
+        # (NAME: Final = ...), either quote style, so a constant written in a
+        # shape this test did not foresee is still read rather than skipped.
+        vocabulary = set(re.findall(r'^TOOL_STATUS_(?!LABEL\b)\w+(?:\s*:[^=\n]+)?\s*=\s*["\']([^"\']+)["\']', _BROKER_PY.read_text(), re.M))
+        self.assertTrue(vocabulary, "no TOOL_STATUS_* constants found in the broker")
+        self.assertEqual(vocabulary, sets)
 
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))

@@ -113,7 +113,15 @@ const (
 	// budget to decide. Sized apart, the sandbox was 5Gi against the agent's
 	// 10Gi and the mirror needed a cap that silently truncated the migration on
 	// any install whose working directories were larger than the guess.
-	agentDataStorageSize = "10Gi"
+	//
+	// 50Gi holds a scope of a few hundred clusters at today's per-profile cost.
+	// Every cluster in scope gets a scaffolded profile under /opt/data/profiles,
+	// and at 10Gi a 209-cluster scope filled the volume in under two hours; the
+	// board's SQLite then failed every write while the CR stayed Ready. On an
+	// existing install growDataClaim widens both claims to this size, online,
+	// where the StorageClass allows expansion. A spec field and a full-volume
+	// condition are the lasting fix.
+	agentDataStorageSize = "50Gi"
 	credentialProxyPort  = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription
@@ -634,7 +642,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and one of the five pins here that are not about chat. Every chat key
+	// UNCONDITIONAL, and one of the pins here that are not about chat. Every chat key
 	// below exists because the agent could otherwise write a competing value into the PVC
 	// .env; this one exists because something already does, on every boot, without being
 	// asked.
@@ -693,13 +701,45 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
 
 	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
-	// ahead of the metadata server, and since the scope prune exists a management
-	// identity that changes retires the old project's profiles. Unpinned, one line in
-	// the PVC .env would re-point it, and two clean runs later every profile of the
-	// real management project would be gone. Nothing in the operator or the chart sets
-	// it, so pinning it empty costs no install anything; the script treats an empty
-	// value as unset and asks the metadata server.
+	// first, and since the scope prune exists a management identity that changes
+	// retires the old project's profiles. Unpinned, one line in the PVC .env would
+	// re-point it, and two clean runs later every profile of the real management
+	// project would be gone. Nothing in the operator or the chart sets it, so pinning it
+	// empty costs no install anything; the script treats an empty value as unset and
+	// reads GKE_PROJECT_ID next.
 	add(reconcileProjectEnvKey, "")
+
+	// GKE_PROJECT_ID, pinned to the harness's own value, for the same reason. The
+	// reconcile reads it as the management project once RECONCILE_PROJECT is empty: the
+	// gateway reaches no metadata server, so this is now the answer. The container env
+	// carries it too, but the PVC .env beats the container env, so without this pin one
+	// line there would re-point the management project exactly as above.
+	// Not on kind, where the container env deliberately carries no GKE_PROJECT_ID
+	// (buildPodTemplateSpec): pinning `kind` here would hand every reader in the
+	// gateway a project that does not exist.
+	if harness := agent.Spec.Harness; harness != nil && !harnessOnKind(harness) {
+		add(gkeProjectEnvKey, harness.ProjectID)
+	}
+
+	// The stall watch's three knobs (spec.harness.stallWatch), pinned on every install and
+	// empty when the CR does not set them; stall_watch.py reads an empty value as its
+	// default. The watch is a cron script that inherits the gateway's environment after
+	// the PVC .env is applied, and each knob changes what it reads or when it alerts. Unpinned, one
+	// `STALL_WATCH_EXCLUDE_NAMESPACES=payments` line written by the agent would silence
+	// the alerts for a namespace nobody excluded; pinned, save_env_value refuses the keys
+	// and the CR stays the only answer. Not in the container env: one delivery path means
+	// one answer, as for the mode key.
+	var stallWatch agentv1alpha1.StallWatchSpec
+	if harness := agent.Spec.Harness; harness != nil && harness.StallWatch != nil {
+		stallWatch = *harness.StallWatch
+	}
+	stallWatchMinAge := ""
+	if stallWatch.MinStallAgeMinutes != nil {
+		stallWatchMinAge = strconv.FormatInt(int64(*stallWatch.MinStallAgeMinutes), 10)
+	}
+	add(stallWatchExcludeNamespacesEnvKey, strings.Join(stallWatch.ExcludeNamespaces, stallWatchListSeparator))
+	add(stallWatchMinAgeEnvKey, stallWatchMinAge)
+	add(stallWatchKindsEnvKey, strings.Join(stallWatch.Kinds, stallWatchListSeparator))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -964,13 +1004,26 @@ const (
 	scopeFileName   = "scope.json"
 
 	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is, and
-	// the platform MCP server's fleet_scope tool (fleet_scope_targets.py), which reads
-	// it when no reconcile snapshot answers that a boundary is in force. Two readers,
-	// by design; a third code site naming this key is a review comment.
+	// fleet_scope_targets.py, which reads it when no reconcile snapshot answers that a
+	// boundary is in force, for the platform MCP server's fleet_scope tool, the
+	// upgrade-readiness-watch and sa-role-watch jobs and the onboarding inventory
+	// scan (bootstrap_scan_gate.py). Two modules spell the key, by design; other code
+	// reads it only through their constants, and a third spelling is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
 	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
 	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
 	reconcileProjectEnvKey = "RECONCILE_PROJECT"
+	// gkeProjectEnvKey is the management project the reconcile reads, rendered on the
+	// container and pinned in the managed .env (see renderManagedEnv).
+	gkeProjectEnvKey = "GKE_PROJECT_ID"
+	// stallWatchExcludeNamespacesEnvKey, stallWatchMinAgeEnvKey and stallWatchKindsEnvKey
+	// carry spec.harness.stallWatch to stall_watch.py. They are pinned in the managed .env
+	// only (see renderManagedEnv), and the script names the same keys.
+	stallWatchExcludeNamespacesEnvKey = "STALL_WATCH_EXCLUDE_NAMESPACES"
+	stallWatchMinAgeEnvKey            = "STALL_WATCH_MIN_AGE_MINUTES"
+	stallWatchKindsEnvKey             = "STALL_WATCH_KINDS"
+	// stallWatchListSeparator joins a list field into one env value; the script splits on it.
+	stallWatchListSeparator = ","
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.
@@ -2530,7 +2583,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 
-	saName := agentServiceAccountName(agent)
+	// The gateway's own ServiceAccount, not the broker's: see
+	// gatewayServiceAccountName.
+	saName := gatewayServiceAccountName(agent)
 
 	image := resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage())
 	pullPolicy := corev1.PullAlways
@@ -3175,18 +3230,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		envVars = append(envVars, corev1.EnvVar{Name: "SLACK_HOME_CHANNEL", Value: a2aSlackHomeChannel(agent)})
 	}
 	// A kanban card's report back to the gateway conversation it was filed
-	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
+	// in, and onboarding's first report into the conversation the user first
+	// wrote in, ride the same route whenever the gateway arms it, home channel
+	// or not. The kanban notifier and onboarding route by this; the cron relay
+	// only names it when it refuses a report for want of a home channel.
 	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	} else if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformSlack})
-	}
-	// A kanban card's report back to the gateway conversation it was filed
-	// in rides the same route whenever the gateway arms it, home channel or
-	// not; only the kanban notifier reads this.
-	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
@@ -3834,8 +3885,10 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 //
 // The harness triple is part of the condition rather than a validation reported
 // elsewhere. The detector requires --project; --cluster-name requires
-// --cluster-location; and it checks that name against the cluster its credentials
-// actually reach, exiting on a mismatch. An install that asks for the detector
+// --cluster-location; and, where its in-cluster probe can reach the metadata server
+// (not inside the gateway, where the probe times out and the triple is taken on
+// trust), it checks that name against the cluster its credentials actually reach,
+// exiting on a mismatch. An install that asks for the detector
 // without naming its cluster would therefore get a restart loop for as long as the
 // pod lives, so the operator reports it as off and leaves the pod quiet.
 //
@@ -5595,6 +5648,37 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 				Resources: []string{"customresourcedefinitions"},
 				Verbs:     []string{"get", "list", "watch"},
 			},
+			// The GitOps reconcilers' sync objects: which repository and directory
+			// syncs a cluster is often recorded only here, applied once by hand or
+			// by an installer. The gitops-helm-chart skill reads it to decide how to
+			// declare a chart; this grant merges after that skill, so the reader is in
+			// the tree before the read is. Only the kinds that name a sync's source and
+			// destination; HelmReleases, ApplicationSets, AppProjects and
+			// HelmRepositories are not needed for that and stay out, as do Argo
+			// CD's cluster and repository Secrets. An Application can still carry
+			// inline Helm values and a Kustomization substitutions, which this
+			// grant makes readable: the same exposure as the ConfigMap read above,
+			// accepted for now. Inert where the CRDs are absent.
+			{
+				APIGroups: []string{"argoproj.io"},
+				Resources: []string{"applications"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"kustomize.toolkit.fluxcd.io"},
+				Resources: []string{"kustomizations"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"source.toolkit.fluxcd.io"},
+				Resources: []string{"gitrepositories", "ocirepositories"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"configsync.gke.io"},
+				Resources: []string{"rootsyncs", "reposyncs"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
 		},
 	}
 }
@@ -5897,6 +5981,25 @@ func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptio
 
 // buildPlatformLeaderRole generates the Role manifest for leader election leases in the agent namespace
 func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
+	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	return &rbacv1.Role{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "rbac.authorization.k8s.io/v1",
+			Kind:       "Role",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name),
+			Namespace: agent.Namespace,
+		},
+		Rules: leaderRoleRules(replicas),
+	}
+}
+
+// leaderRoleRules is the leader Role's rule set for a gateway rendered at
+// replicas. Split from buildPlatformLeaderRole so the multi-replica rule set
+// stays testable while supportedGatewayReplicas keeps every render at one
+// (TestLeaderRolePodsRuleVerbsAboveOneReplica).
+func leaderRoleRules(replicas int32) []rbacv1.PolicyRule {
 	rules := []rbacv1.PolicyRule{
 		{
 			APIGroups: []string{"coordination.k8s.io"},
@@ -5930,34 +6033,21 @@ func buildPlatformLeaderRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 	// the two policies in config/admission/agent-rbac-policy.yaml govern the
 	// content of a Role and the subject of a RoleBinding, not the objects a
 	// bound identity may then reach.
-	if replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment); replicas > 1 {
+	if replicas > 1 {
 		rules = append(rules, rbacv1.PolicyRule{
 			APIGroups: []string{""},
 			Resources: []string{"pods"},
 			Verbs:     []string{"get", "patch"},
 		})
 	}
-
-	return &rbacv1.Role{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "rbac.authorization.k8s.io/v1",
-			Kind:       "Role",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name),
-			Namespace: agent.Namespace,
-		},
-		Rules: rules,
-	}
+	return rules
 }
 
-// buildLeaderRoleBinding generates the RoleBinding manifest for leader election in the agent namespace
+// buildLeaderRoleBinding binds the leader Role to the gateway's own
+// ServiceAccount alone. Leader election runs in the gateway (leader_elect.py);
+// nothing in the credential broker's Pod touches a Lease or patches a pod, so
+// the broker, which used to share this subject, holds none of it.
 func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, roleName string) *rbacv1.RoleBinding {
-	saName := agent.Name
-	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
-		saName = agent.Spec.Security.ServiceAccountName
-	}
-
 	return &rbacv1.RoleBinding{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -5967,13 +6057,7 @@ func buildLeaderRoleBinding(agent *agentv1alpha1.PlatformAgent, bindingName, rol
 			Name:      bindingName,
 			Namespace: agent.Namespace,
 		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      saName,
-				Namespace: agent.Namespace,
-			},
-		},
+		Subjects: []rbacv1.Subject{gatewaySubject(agent)},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "Role",
@@ -6331,11 +6415,6 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		apiPeers = formatCIDRPeers([]string{"10.96.0.1"}, true)
 	}
 
-	// The link-local address a workload actually connects to. Dataplane V2 (eBPF)
-	// evaluates policy pre-NAT, so this peer matches there on the pre-DNAT ports;
-	// Dataplane V1 DNATs first, so its token fetches are matched by rule 3 instead.
-	linkLocalPeers := formatCIDRPeers([]string{metadataLinkLocalIP}, true)
-
 	ingressRules := []networkingv1.NetworkPolicyIngressRule{
 		{
 			From: []networkingv1.NetworkPolicyPeer{
@@ -6420,47 +6499,14 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 			To: dnsPeers,
 		},
-		// 2. GCP Metadata Server (pre-NAT link-local address). Workloads dial 169.254.169.254
-		//    on port 80 for HTTP metadata / OAuth2 token fetches. On Dataplane V2 (eBPF),
-		//    policy evaluates pre-NAT and this rule admits token fetches directly. Port 8080,
-		//    the pre-NAT ALTS handshaker port, is deliberately absent — rule 3 says why.
-		{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(80))},
-			},
-			To: linkLocalPeers,
-		},
-	}
-
-	// 3. GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
-	//    the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy is
-	//    evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
-	//    policy is evaluated pre-NAT at the socket layer and matched by rule 2. If
-	//    profile.MetadataDaemonIP == "", rule 3 is suppressed.
-	//
-	//    Google network policy guidance recommends allowing ports 988/987 (iptables) and
-	//    80/8080 (eBPF). Ports 987 and 8080 (ALTS DirectPath) are deliberately omitted here
-	//    because kube-agents components use standard OAuth2/REST token fetches and no client
-	//    takes the gRPC DirectPath / ALTS route. Omitting both ports enforces least-privilege
-	//    sandbox egress symmetrically across Dataplane V1 and Dataplane V2.
-	//
-	//    That is a deviation from the guidance, which warns that workloads omitting these
-	//    ports "might experience disruptions during auto-upgrades". If a token fetch starts
-	//    failing during a node auto-upgrade, this narrowed allowlist is the first thing to
-	//    check: capture the drop's destination port and reopen 987/8080 here if it is one
-	//    of them.
-	if profile.MetadataDaemonIP != "" {
-		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
-		port := profile.MetadataDaemonPort
-		if port == 0 {
-			port = metadataDaemonDefaultPort
-		}
-		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(port))},
-			},
-			To: metadataDaemonPeers,
-		})
+		// No metadata-server rule. The gateway pod holds no Google identity (its
+		// ServiceAccount carries no Workload Identity annotation; the broker's does),
+		// and everything in it that called Google -- the remote MCP servers, the
+		// event watcher and the drift detector -- goes through the broker. The two
+		// rules that used to sit here admitted the link-local token fetch (port 80
+		// pre-NAT, the WI daemon port post-NAT); without them a token request from
+		// any container in the pod is dropped, which is what the conformance suite's
+		// metadata assertion checks.
 	}
 
 	egressRules = append(egressRules,
