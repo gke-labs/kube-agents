@@ -85,8 +85,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # allow_external_dns_traffic = true
 
 # The PlatformAgent's spec.mode: "today" (the default, which renders no mode
-# field) or "next", which also renders the NATS bus and the A2A gateway, a
-# development stack. Changing it later is a mode switch; see variables.tf.
+# field) or "next", which puts the NATS bus and the A2A gateway in front of
+# the agent, and is what install.sh records on a first install. Changing it
+# later is a mode switch; see variables.tf.
 # platform_agent_mode = "today"
 
 # Optional Google Chat backend (Pub/Sub topic + subscription, Chat APIs);
