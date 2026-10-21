@@ -175,7 +175,11 @@ PROJECTS_ENV = "UPGRADE_READINESS_PROJECTS"
 # (`REFUSAL_TOKEN_PATTERN`): a hand-typed spelling with a space or a semicolon
 # is a typo, most often a list separated by spaces where commas were meant.
 ROSTER_SPELLING_REFUSED = re.compile(r"[\s;]")
-ROSTER_SPELLING_DETAIL = PROJECTS_ENV + " names {spellings}, which is not a project id or number; separate projects with commas"
+ROSTER_SPELLING_DETAIL = (
+    "the roster names {spellings}, which is not a project id or number; spell each project as its id, in "
+    + PROJECTS_ENV
+    + " separated by commas, in spec.harness.projectId, or in its Cluster Agent profile"
+)
 PROJECTS_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
 PROFILES_DIR = "profiles"
@@ -343,6 +347,13 @@ REMEDY_OUTSIDE_UNRESOLVED = (
 )
 REMEDY_ID = INSTALL_REMEDY_PREFIX + "spell the project by its id (spec.harness.projectId, or UPGRADE_READINESS_PROJECTS for a hand run), or grant the agent's identity resourcemanager.projects.get on it so the reporter can resolve the number"
 REMEDY_SANDBOX_RESTART = "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again"
+# The same refusal from a run that reads no declaration at all: the sandbox is
+# right, and the fix is the run's environment, not a restart.
+REMEDY_SCOPE_UNSEEN = (
+    "this run reads no scope declaration ("
+    + fleet_scope_targets.SCOPE_FILE_ENV
+    + " is unset), so it handed the report none; run the watch with the gateway pod's own environment"
+)
 # The unresolved note for a declaration the reconcile did resolve in part: a
 # container or selector lookup did not finish on its last run, so the set it
 # wrote is short, as against ``fleet_scope_args.UNRESOLVED_SCOPE_NOTE``, which
@@ -717,10 +728,18 @@ def roster_projects() -> set[str]:
 
 
 def projects() -> list[str]:
-    explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(PROJECTS_SEPARATOR) if p.strip()]
-    refused = [p for p in explicit if ROSTER_SPELLING_REFUSED.search(p)]
+    """The roster, every source of it held to the grammar the refusal parser
+    reads (``ROSTER_SPELLING_REFUSED``): a spelling that cannot be a project
+    fails the tick with its remedy before the report is asked for it."""
+    names = roster_names()
+    refused = [p for p in names if ROSTER_SPELLING_REFUSED.search(p)]
     if refused:
         raise RuntimeError(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
+    return names
+
+
+def roster_names() -> list[str]:
+    explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(PROJECTS_SEPARATOR) if p.strip()]
     if explicit:
         return sorted(set(explicit))
     found = roster_projects()
@@ -1065,6 +1084,8 @@ def refusal_remedy(cause: str, fields: dict[str, str], scope: fleet_scope_target
         return UNREAD_REMEDIES.get(fields[REFUSAL_OUTCOME_FIELD], REMEDY_READ_ACCESS)
     if cause == REFUSAL_NUMBER:
         return REMEDY_ID
+    if not os.environ.get(fleet_scope_targets.SCOPE_FILE_ENV):
+        return REMEDY_SCOPE_UNSEEN
     return REMEDY_SANDBOX_RESTART
 
 

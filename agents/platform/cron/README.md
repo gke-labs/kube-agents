@@ -279,7 +279,7 @@ error text, which an outage rewords from one run to the next), a
 failed tick (which writes nothing to the ledger but its record of the projects
 the hops refused as outside the declared scope and the ids it learned for
 numbered spellings, kept at whichever step the tick failed unless the ledger
-itself cannot be written, so the next tick files them under the same cause)
+itself cannot be written or re-read, so the next tick files them under the same cause)
 keeps its line in
 `last-failure.txt` beside it, and the next line is the recovery. A version
 none of whose clusters can be read is retried

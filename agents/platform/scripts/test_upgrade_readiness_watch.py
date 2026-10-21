@@ -1988,15 +1988,22 @@ class DeclaredScope(Base):
                 "project number unresolved",
             ),
         )
-        # The sandbox froze the marker at its start; this pod reads the declaration live.
-        self.assertEqual(
-            watch.refusal_detail(label + fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR, resolved),
-            (
-                "refused by the report script: the sandbox says the install declares a scope, but this pod reads no declaration; "
-                "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again",
-                "sandbox marker stale",
-            ),
-        )
+        # The sandbox froze the marker at its start; this pod reads the declaration live and finds
+        # none, so it handed no flags (the tick that meets this refusal has no scope in hand).
+        with mock.patch.dict(os.environ, {fleet_scope_targets.SCOPE_FILE_ENV: "/etc/kube-agents/scope.json"}):
+            self.assertEqual(
+                watch.refusal_detail(label + fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR, None),
+                (
+                    "refused by the report script: the sandbox says the install declares a scope, but this pod reads no declaration; "
+                    "the sandbox started under a spec.scope block this pod no longer reads; nothing to do: the sandbox restarts under the new declaration and the next tick runs again",
+                    "sandbox marker stale",
+                ),
+            )
+        # A run that cannot see a declaration at all hands no flags for another reason: the fix is its environment.
+        with mock.patch.dict(os.environ, {fleet_scope_targets.SCOPE_FILE_ENV: ""}):
+            detail, _cause = watch.refusal_detail(label + fleet_scope_args.DECLARED_SCOPE_ARGS_MISSING_ERROR, None)
+        self.assertIn("this run reads no scope declaration (KUBEAGENTS_SCOPE_FILE is unset)", detail)
+        self.assertNotIn("nothing to do", detail)
         # The remedy and the cause follow what the message captured, not the message: one unread message covers a
         # project over the cap, one an hour from being resolved, and one the install cannot reach.
         detail, cause = watch.refusal_detail(label + unread.format(project="p2", outcome="over-cap"), resolved)
@@ -2464,7 +2471,17 @@ class DeclaredScope(Base):
             code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertEqual(sandbox.calls, [])
-        self.assertIn("UPGRADE_READINESS_PROJECTS names 'p1 p2', which is not a project id or number; separate projects with commas", out)
+        self.assertIn("the roster names 'p1 p2', which is not a project id or number; spell each project as its id, in UPGRADE_READINESS_PROJECTS separated by commas", out)
+
+    def test_a_management_project_spelling_with_a_space_fails_the_tick_before_any_sandbox_call(self) -> None:
+        """Every source of the roster is held to the same grammar: spec.harness.projectId
+        reaches the pod as GCP_PROJECT_ID, and a space there is refused as one in the list is."""
+        sandbox = FakeSandbox(envelope([]))
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: "foo bar"}), mock.patch.object(watch, "roster_projects", return_value=set()):
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.calls, [])
+        self.assertIn("the roster names 'foo bar', which is not a project id or number", out)
 
     def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
         scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
