@@ -314,15 +314,25 @@ class C1IsolationIsStructural(unittest.TestCase):
         same kinds (#2987). Two modules, so no single test compiles both: a
         kind added to either side alone either relays an object the agent was
         never granted or leaves a granted kind unenriched. Every custom-resource
-        kind (a group that is not core or *.k8s.io) in the rendered minimal
+        kind (a group not on the built-in list below) in the rendered minimal
         role, on every fixture, is a reconciler kind the join may read, and the
         reverse, each with get.
         """
         expected = set(h.watcher_policy.RECONCILER_NAMED_READS)
         self.assertTrue(expected, "the reconciler table is empty")
 
+        # Built-in groups by name, not by suffix: a CRD can live under
+        # *.k8s.io too (gateway.networking.k8s.io, snapshot.storage.k8s.io),
+        # and a suffix rule would wave it through on both sides. A built-in
+        # group new to the role or the table fails loudly here, and the fix
+        # is to add it to this list.
+        builtin = frozenset({
+            "", "admissionregistration.k8s.io", "apiextensions.k8s.io", "apps", "autoscaling",
+            "batch", "metrics.k8s.io", "networking.k8s.io", "policy", "rbac.authorization.k8s.io",
+        })
+
         def custom(group: str) -> bool:
-            return "." in group and not group.endswith(".k8s.io")
+            return group not in builtin
 
         # The broker enforces WATCHER_NAMED_READS; the reconciler table is the
         # only custom-resource part of it, and that is what keeps the two in
@@ -354,8 +364,8 @@ class C1IsolationIsStructural(unittest.TestCase):
                     expected,
                     granted,
                     "the agent's custom-resource reads and the drift join's reconciler kinds differ. "
-                    "If the role gained a kind that is not a GitOps sync object, narrow custom() here "
-                    "rather than widening RECONCILER_NAMED_READS, which widens what the broker relays",
+                    "If the role gained a built-in group, add it to builtin here; otherwise, unless the kind is a GitOps sync object, "
+                    "do not widen RECONCILER_NAMED_READS, which widens what the broker relays",
                 )
 
     def test_C1_the_operator_pins_the_drift_detectors_own_default_subscription(self) -> None:

@@ -657,6 +657,16 @@ Mutation(
         "and the agent's role never hear about it",
     ),
     Mutation(
+        "C1-watcher-relays-a-crd-under-a-k8s-io-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("rbac.authorization.k8s.io", "roles"),\n',
+         '        ("rbac.authorization.k8s.io", "roles"),\n        ("gateway.networking.k8s.io", "httproutes"),\n'),
+        "test_C1_the_watcher_reads_by_name_only_the_reconciler_kinds_the_agent_can_read",
+        "add Gateway API HTTPRoutes to the watcher table, which look built-in by "
+        "their .k8s.io suffix -- the broker relays a CRD the agent's role was "
+        "never granted, and a suffix rule waves it through",
+    ),
+    Mutation(
         "C1-agent-role-drops-a-reconciler-kind",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("      - rootsyncs\n      - reposyncs\n",
