@@ -181,8 +181,10 @@ The skew is an ordinary deployment window rather than a hypothetical: this scrip
 shared PVC from the agent image while the Go producers ship in their own, so the two roll
 independently. The event watcher negotiates the same class of problem in the other direction with
 `X-Watcher-Features`, and the daemon answers in kind: its `injected` reply to an event lists what it
-does with the session beyond posting the alert (`features`, today `followup`), which is how the
-watcher knows a `k8s-event-followup` will reach the thread rather than open a second alert.
+does with the session beyond posting the alert (`features`, today `followup`), and `/healthz` lists
+the same under `features`, which the watcher's sweep reads again before each tick's
+follow-ups; together they are how the watcher knows a `k8s-event-followup` will reach the thread
+rather than open a second alert, whichever way the two images have rolled.
 
 It is on the unauthenticated `/healthz` so the probe is a precondition of starting rather than
 something a producer discovers only once it holds credentials, and the key's _absence_ is the
@@ -232,9 +234,11 @@ is a reply rather than an edit of the alert: the gateway edits by update key onl
 conversation request, and the alert was a home-channel post whose key was never bound.
 
 An alert whose investigation never starts gets the same thread's line from `_triage_watchdog`,
-armed by `trigger_agent_troubleshooter` once the turn is started (`TRIAGE_WATCHDOG_SECONDS`, 3600):
-if an hour on the session has filed no card and no report has been stored for the thread, it says
-so there. An in-process timer, so a daemon restart inside the hour drops it for the alerts before it.
+armed by `trigger_agent_troubleshooter` as soon as the alert is routed to its thread and before the
+gateway is contacted (`TRIAGE_WATCHDOG_SECONDS`, 3600, read like the ceilings so a bad value falls
+back): if an hour on the session has filed no card and no report has been stored for the thread, it
+says so there, stating those two facts and no cause. A board it cannot read is unknown and keeps it
+quiet. An in-process timer, so a daemon restart inside the hour drops it for the alerts before it.
 
 ---
 

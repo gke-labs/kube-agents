@@ -132,12 +132,7 @@ const injectFeatureFollowup = "followup"
 
 // Supports reports whether the daemon listed feature on this response.
 func (r injectResponse) Supports(feature string) bool {
-	for _, f := range r.Features {
-		if f == feature {
-			return true
-		}
-	}
-	return false
+	return hasFeature(r.Features, feature)
 }
 
 // injectStatusSuppressed is the daemon's word for "accepted, and then dropped
@@ -195,6 +190,55 @@ const injectStatusFolded = "folded"
 // retry (session_kv_server, _inject_followup).
 const injectStatusUnrouted = "unrouted"
 
+// healthzPath is the daemon's unauthenticated health route, which lists the
+// inject kinds it dispatches and, under injectFeaturesKey, the features it
+// serves (the drift detector reads the same list for its own feature);
+// healthzBodyMax bounds the read.
+const (
+	healthzPath       = "/healthz"
+	injectFeaturesKey = "features"
+	healthzBodyMax    = 64 * 1024
+)
+
+// Features asks the daemon, now, which inject features it serves. The
+// per-session answer recorded at alert time says what the daemon of that
+// moment promised; this is what the daemon of this moment does, and the
+// sweep asks before each tick's follow-ups so an agent image rolled back to
+// a build without the follow-up branch is never sent one (it would take the
+// kind down the event path and post a second alert).
+func (i *injector) Features(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, i.cfg.daemonURL+healthzPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("injector: build GET healthz: %w", err)
+	}
+	resp, err := i.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("injector: GET healthz: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, healthzBodyMax))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("injector: GET healthz: status %d", resp.StatusCode)
+	}
+	var parsed struct {
+		Features []string `json:"features"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("injector: healthz body: %w", err)
+	}
+	return parsed.Features, nil
+}
+
+// hasFeature reports whether feature is in the list.
+func hasFeature(features []string, feature string) bool {
+	for _, f := range features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
 // injectFeaturesHeader lists the response behaviours this watcher understands,
 // so the daemon can answer an older one the way that older one expects.
 //
@@ -222,13 +266,9 @@ const injectFeaturePolicyFiltered = "policy-filtered"
 // injectStatusFiltered. An empty or unparseable body reads as delivered: a
 // daemon predating this field is one that always delivers, and guessing
 // "dropped" would reopen every incident on every sighting.
-func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) (string, error) {
-	resp, err := i.InjectDetailed(ctx, sessionID, payload)
-	return resp.Status, err
-}
-
-// InjectDetailed is Inject returning the daemon's whole answer, for the one
-// caller that reads its features.
+// InjectDetailed POSTs the payload to the session's inject route and returns
+// the daemon's whole answer: the status Dispatch reads and the features the
+// sweep's handshake reads.
 func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload InjectPayload) (injectResponse, error) {
 	var none injectResponse
 	if sessionID == "" {

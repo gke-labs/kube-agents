@@ -175,7 +175,7 @@ func newMetrics() *metrics {
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_followups_total",
-			Help: "Quiet follow-ups sent to the daemon for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome (sent or error).",
+			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon posted the line), unrouted (it had no thread for the session and posted nothing), error (the inject failed).",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",

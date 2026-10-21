@@ -46,13 +46,19 @@ type dedupEntry struct {
 	// window, and is deliberately not cleared when it does. It bounds the
 	// escape hatch at one extra session per window per key.
 	Reopened bool `json:"reopened,omitempty"`
-	// Namespace, Kind and Name describe the involved object, written by
-	// BindObject once the alert has gone out, so the quiet follow-up can name
-	// the object without an event in hand. Empty on an entry no alert was sent
-	// for, and on one restored from a snapshot an older binary wrote.
-	Namespace string `json:"namespace,omitempty"`
-	Kind      string `json:"kind,omitempty"`
-	Name      string `json:"name,omitempty"`
+	// Namespace, Kind and Name describe the involved object, and
+	// EventFirstSeen and EventCount the alerted event's own first sighting
+	// and kubelet count, written by BindObject once the alert has gone out,
+	// so the quiet follow-up can describe the incident as the alert did
+	// without an event in hand (FirstSeen above is the watcher's clock at the
+	// forwarding sighting, after the gates, and Count the window's). Empty on
+	// an entry no alert was sent for, and on one restored from a snapshot an
+	// older binary wrote.
+	Namespace      string    `json:"namespace,omitempty"`
+	Kind           string    `json:"kind,omitempty"`
+	Name           string    `json:"name,omitempty"`
+	EventFirstSeen time.Time `json:"event_first_seen,omitzero"`
+	EventCount     int       `json:"event_count,omitempty"`
 	// FollowupSupported records that the daemon answered this incident's
 	// inject listing the followup feature (injectResponse.Features), so a
 	// k8s-event-followup on its session lands in the alert's thread rather
@@ -66,7 +72,9 @@ type dedupEntry struct {
 
 // quietIncident is an incident whose alert went out and whose object has
 // not been sighted for the quiet period: what dispatcher.Sweep sends the
-// follow-up for. Key carries the canonical reason.
+// follow-up for. Key carries the canonical reason; FirstSeen and Count are
+// the alerted event's own (BindObject), LastSeen the watcher's clock at the
+// last real sighting.
 type quietIncident struct {
 	Key       EventKey
 	SessionID string
@@ -104,7 +112,11 @@ const (
 // of memory, the cache is limited to a maximum of 10,000 active incidents. If this limit
 // is reached, the oldest (least recently seen) incidents are automatically evicted to make room.
 type dedupCache struct {
-	mu          sync.Mutex
+	mu sync.Mutex
+	// writeMu serialises Snapshot's encode-write-rename: the snapshot loop and
+	// the dispatcher's sweep both call it, and two writers on one .tmp path
+	// would interleave into a file neither wrote.
+	writeMu     sync.Mutex
 	entries     map[EventKey]*dedupEntry
 	window      time.Duration
 	max         int
@@ -229,16 +241,18 @@ func (c *dedupCache) BindSession(key EventKey, message string, sessionID string)
 	}
 }
 
-// BindObject records the involved object on the entry created by the
-// preceding Observe, so a quiet follow-up sent long after the event has gone
-// can still name it. Canonicalizes the reason as BindSession does. No-op if
-// the entry has since been evicted.
-func (c *dedupCache) BindObject(key EventKey, message, namespace, kind, name string) {
+// BindObject records the involved object, and the alerted event's own first
+// sighting and count, on the entry created by the preceding Observe, so a
+// quiet follow-up sent long after the event has gone can describe the
+// incident as the alert did. Canonicalizes the reason as BindSession does.
+// No-op if the entry has since been evicted.
+func (c *dedupCache) BindObject(key EventKey, message, namespace, kind, name string, firstSeen time.Time, count int) {
 	key.Reason = canonicalizeReason(key.Reason, message)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if entry, ok := c.entries[key]; ok {
 		entry.Namespace, entry.Kind, entry.Name = namespace, kind, name
+		entry.EventFirstSeen, entry.EventCount = firstSeen, count
 	}
 }
 
@@ -272,9 +286,16 @@ func (c *dedupCache) QuietIncidents(now time.Time, after time.Duration) []quietI
 		if e.SessionID == "" || !e.FollowupSupported || e.PolicyFiltered || e.QuietNotified || now.Sub(e.LastSeen) < after {
 			continue
 		}
+		first, count := e.EventFirstSeen, e.EventCount
+		if first.IsZero() {
+			first = e.FirstSeen // an entry an older binary wrote
+		}
+		if count == 0 {
+			count = e.Count
+		}
 		out = append(out, quietIncident{
 			Key: key, SessionID: e.SessionID, Namespace: e.Namespace, Kind: e.Kind, Name: e.Name,
-			FirstSeen: e.FirstSeen, LastSeen: e.LastSeen, Count: e.Count,
+			FirstSeen: first, LastSeen: e.LastSeen, Count: count,
 		})
 	}
 	return out
@@ -452,6 +473,8 @@ func (c *dedupCache) Snapshot() error {
 	if c.persistPath == "" {
 		return nil
 	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	c.mu.Lock()
 	// Copy values under lock; encode outside so we don't hold the mutex during I/O.
 	snapshot := make(map[string]dedupEntry, len(c.entries))

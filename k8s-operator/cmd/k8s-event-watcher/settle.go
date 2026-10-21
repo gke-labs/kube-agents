@@ -122,7 +122,12 @@ func (m *settleMemo) Hold(ev TriageEvent, reason string, now time.Time) {
 		delete(m.entries, oldestKey)
 	}
 	start := prev.Start
-	if c, ok := m.cleared[key]; ok {
+	// A tombstone is taken over only once BlipStart has recorded a
+	// reappearance on it. A replay of the cleared blip is held too (its span
+	// is the old short one), and must leave the tombstone where it is, or the
+	// live sighting that follows would measure from the object's first
+	// sighting and be forwarded at once.
+	if c, ok := m.cleared[key]; ok && !c.Reappeared.IsZero() {
 		start = c.Reappeared
 		delete(m.cleared, key)
 	}
@@ -144,9 +149,11 @@ func (m *settleMemo) BlipStart(ev TriageEvent, reason string, now time.Time) (ti
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := settleKey(ev, reason)
-	if h, ok := m.entries[key]; ok {
-		return h.Start, !h.Start.IsZero()
+	if h, ok := m.entries[key]; ok && !h.Start.IsZero() {
+		return h.Start, true
 	}
+	// No hold, or a hold a replay opened with no start of its own: the
+	// tombstone, if one stands, says where this blip begins.
 	c, ok := m.cleared[key]
 	if !ok {
 		return time.Time{}, false
@@ -161,6 +168,11 @@ func (m *settleMemo) BlipStart(ev TriageEvent, reason string, now time.Time) (ti
 	if c.Reappeared.IsZero() {
 		c.Reappeared = ev.LastSeen
 		m.cleared[key] = c
+	}
+	if h, ok := m.entries[key]; ok {
+		h.Start = c.Reappeared
+		m.entries[key] = h
+		delete(m.cleared, key)
 	}
 	return c.Reappeared, true
 }

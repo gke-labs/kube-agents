@@ -190,6 +190,19 @@ func TestDispatcherSettleHoldsAndCountsASelfResolvedBlip(t *testing.T) {
 	if *count2 != 0 {
 		t.Errorf("a replayed cleared blip fired %d injects; want 0", *count2)
 	}
+	// The replay left the tombstone standing, so the live blip that follows
+	// is measured from its own first sighting and held, not forwarded on the
+	// object's hour-old span.
+	now = t0.Add(time.Hour + 30*time.Second)
+	fresh.Dispatch(ctx, settleBackoff(t0, time.Hour+30*time.Second, 4))
+	if *count2 != 0 {
+		t.Errorf("a live blip after a replay fired %d injects; want 0 (held from its own start)", *count2)
+	}
+	now = t0.Add(time.Hour + 30*time.Second + 2*time.Minute)
+	fresh.Dispatch(ctx, settleBackoff(t0, time.Hour+30*time.Second+2*time.Minute, 6))
+	if *count2 != 1 {
+		t.Errorf("a live blip lasting the period fired %d injects; want 1", *count2)
+	}
 }
 
 // TestDispatcherSettleForwardsALastingFailureWithItsContext: the same pod
@@ -302,6 +315,9 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	}
 	disp.ready.Store(true)
 	now = t0.Add(time.Minute + 15*time.Minute)
+	heard := backoffEvent(1)
+	heard.Key.UID, heard.Key.Reason = "pod-heard", "Scheduled" // the cluster speaks inside the quiet period; not a reason on the list, so no alert
+	disp.Dispatch(ctx, heard)
 	disp.Sweep(ctx)
 	if *injectCount != 2 {
 		t.Fatalf("at quiet-after: %d injects; want 2 (the alert and one follow-up)", *injectCount)
@@ -310,8 +326,10 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	if fu.Kind != injectKindFollowup || fu.Reason != "CrashLoopBackOff" || fu.Namespace != "default" || fu.Name != "api" || fu.KindOfObject != "Pod" {
 		t.Errorf("follow-up payload = %+v; want kind %s naming default/Pod/api on CrashLoopBackOff", fu, injectKindFollowup)
 	}
-	if !fu.LastSeen.Equal(t0.Add(time.Minute)) || !fu.FirstSeen.Equal(t0) || fu.Count != 2 {
-		t.Errorf("follow-up first_seen=%s last_seen=%s count=%d; want %s, %s, 2", fu.FirstSeen, fu.LastSeen, fu.Count, t0, t0.Add(time.Minute))
+	// first_seen and count are the alerted event's own (kubelet's 3), as the
+	// alert carried them; last_seen is the last real sighting.
+	if !fu.LastSeen.Equal(t0.Add(time.Minute)) || !fu.FirstSeen.Equal(t0) || fu.Count != 3 {
+		t.Errorf("follow-up first_seen=%s last_seen=%s count=%d; want %s, %s, 3", fu.FirstSeen, fu.LastSeen, fu.Count, t0, t0.Add(time.Minute))
 	}
 	if fu.Cluster != "test-cluster" || fu.Project != "p" || fu.Location != "us-central1" {
 		t.Errorf("follow-up cluster labels = %s/%s/%s; want the dispatcher's", fu.Cluster, fu.Project, fu.Location)
@@ -320,9 +338,27 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 		t.Errorf("followups_total{outcome=sent} = %v; want 1", got)
 	}
 	now = t0.Add(2 * time.Hour)
+	disp.Dispatch(ctx, heard) // the cluster speaks, so the sweep may judge
 	disp.Sweep(ctx)
 	if *injectCount != 2 {
 		t.Errorf("a second sweep sent another follow-up (%d injects)", *injectCount)
+	}
+	// A cluster that has said nothing for the quiet period is not judged:
+	// the watch may be down for a reason the watcher does not report.
+	silent := backoffEvent(3)
+	silent.Key.UID = "pod-3"
+	now = t0.Add(3 * time.Hour)
+	disp.Dispatch(ctx, silent) // alert: injects 3
+	now = t0.Add(4 * time.Hour)
+	disp.Sweep(ctx)
+	if *injectCount != 3 {
+		t.Errorf("a sweep on a cluster silent for an hour sent a follow-up (%d injects)", *injectCount)
+	}
+	now = t0.Add(4*time.Hour + time.Minute)
+	disp.Dispatch(ctx, heard) // a delivery, no alert
+	disp.Sweep(ctx)
+	if *injectCount != 4 {
+		t.Errorf("once the cluster spoke again the quiet incident got no follow-up (%d injects)", *injectCount)
 	}
 
 	// Off at zero, and never in shared mode.
@@ -330,12 +366,21 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	disp.dedup.MarkQuietNotified(EventKey{}) // no-op on an unknown key
 	fresh := backoffEvent(3)
 	fresh.Key.UID = "pod-2"
-	now = t0.Add(3 * time.Hour)
-	disp.Dispatch(ctx, fresh)
-	now = t0.Add(4 * time.Hour)
+	now = t0.Add(5 * time.Hour)
+	disp.Dispatch(ctx, fresh) // alert: injects 5
+	now = t0.Add(5*time.Hour + time.Minute)
+	disp.Dispatch(ctx, heard)
 	disp.Sweep(ctx)
-	if *injectCount != 3 {
+	if *injectCount != 5 {
 		t.Errorf("with quiet-after=0 the sweep sent a follow-up (%d injects)", *injectCount)
+	}
+	disp.quietAfter = 15 * time.Minute
+	disp.mode = "shared"
+	now = t0.Add(5*time.Hour + 16*time.Minute)
+	disp.Dispatch(ctx, heard)
+	disp.Sweep(ctx)
+	if *injectCount != 5 {
+		t.Errorf("in shared mode the sweep sent a follow-up (%d injects)", *injectCount)
 	}
 }
 
@@ -354,7 +399,7 @@ func TestQuietIncidentsSurviveASnapshot(t *testing.T) {
 	msg := "Back-off restarting failed container app in pod api"
 	c.Observe(key, msg, t0)
 	c.BindSession(key, msg, "sess-1")
-	c.BindObject(key, msg, "default", "Pod", "api")
+	c.BindObject(key, msg, "default", "Pod", "api", t0.Add(-2*time.Minute), 7)
 	c.MarkFollowupSupported(key, msg)
 	if err := c.Snapshot(); err != nil {
 		t.Fatal(err)
@@ -366,6 +411,9 @@ func TestQuietIncidentsSurviveASnapshot(t *testing.T) {
 	quiet := restored.QuietIncidents(t0.Add(20*time.Minute), 15*time.Minute)
 	if len(quiet) != 1 || quiet[0].SessionID != "sess-1" || quiet[0].Name != "api" || quiet[0].Key.Reason != "CrashLoopBackOff" {
 		t.Fatalf("restored quiet incidents = %+v; want one for sess-1 naming api", quiet)
+	}
+	if !quiet[0].FirstSeen.Equal(t0.Add(-2*time.Minute)) || quiet[0].Count != 7 {
+		t.Errorf("quiet incident first_seen=%s count=%d; want the alerted event's own %s and 7", quiet[0].FirstSeen, quiet[0].Count, t0.Add(-2*time.Minute))
 	}
 	restored.MarkQuietNotified(quiet[0].Key)
 	if err := restored.Snapshot(); err != nil {
@@ -379,7 +427,9 @@ func TestQuietIncidentsSurviveASnapshot(t *testing.T) {
 		t.Errorf("a notified incident came back as quiet after a restart: %+v", got)
 	}
 	// An entry with no session (the alert never went out) and one the daemon
-	// policy-filtered are not incidents anyone was told about.
+	// policy-filtered are not incidents anyone was told about. On the same
+	// clock as the sweep, so the flags and not the wall clock decide.
+	again.now = func() time.Time { return t0 }
 	none := EventKey{UID: "pod-2", Reason: "BackOff"}
 	again.Observe(none, msg, t0)
 	filtered := EventKey{UID: "pod-3", Reason: "BackOff"}
@@ -401,6 +451,10 @@ func TestQuietIncidentsSurviveASnapshot(t *testing.T) {
 func TestDispatcherSweepCountsAnUnroutedFollowUp(t *testing.T) {
 	injects := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == healthzPath {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", injectFeaturesKey: []string{injectFeatureFollowup}})
+			return
+		}
 		if r.URL.Path == "/sessions" {
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "sess-u"})
@@ -436,8 +490,12 @@ func TestDispatcherSweepCountsAnUnroutedFollowUp(t *testing.T) {
 	disp.ready.Store(true)
 	disp.Dispatch(context.Background(), backoffEvent(3))
 	now = t0.Add(time.Hour)
+	speaks := backoffEvent(1)
+	speaks.Key.UID = "pod-other"
+	disp.Dispatch(context.Background(), speaks) // the cluster speaks: a second alert, injects 2
 	disp.Sweep(context.Background())
 	disp.Sweep(context.Background())
+	injects-- // the second alert is not what this test counts
 	if injects != 2 {
 		t.Errorf("%d injects; want the alert and one follow-up", injects)
 	}
@@ -455,6 +513,10 @@ func TestDispatcherSweepCountsAnUnroutedFollowUp(t *testing.T) {
 func TestDispatcherSweepSendsNoFollowUpToAnOlderDaemon(t *testing.T) {
 	injectCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == healthzPath {
+			_, _ = w.Write([]byte(`{"status": "ok", "inject_kinds": ["k8s-event", "k8s-event-followup"]}`)) // an older daemon: the kind, no feature
+			return
+		}
 		if r.URL.Path == "/sessions" {
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "sess-old"})
@@ -480,11 +542,23 @@ func TestDispatcherSweepSendsNoFollowUpToAnOlderDaemon(t *testing.T) {
 		dedup:  dedup, pullClasses: newPullClassMemo(0, 0), injector: inj, metrics: newMetrics(),
 		mode: "per-incident", quietAfter: 15 * time.Minute, now: func() time.Time { return now },
 	}
+	disp.dedup.now = func() time.Time { return now }
+	disp.ready.Store(true)
 	disp.Dispatch(context.Background(), backoffEvent(3))
-	now = t0.Add(time.Hour)
+	now = t0.Add(16 * time.Minute)
+	speaks := backoffEvent(1)
+	speaks.Key.UID = "pod-other"
+	disp.Dispatch(context.Background(), speaks) // the cluster speaks (a second alert); the first incident is 16m quiet
 	disp.Sweep(context.Background())
-	if injectCount != 1 {
-		t.Errorf("%d injects; want the alert alone", injectCount)
+	if injectCount != 2 {
+		t.Errorf("%d injects; want the two alerts alone (the alerts' answers listed no features)", injectCount)
+	}
+	// The session-level promise is not enough on its own: a daemon rolled
+	// back since the alert lists no feature on /healthz and gets none either.
+	disp.dedup.MarkFollowupSupported(backoffEvent(3).Key, backoffEvent(3).Message)
+	disp.Sweep(context.Background())
+	if injectCount != 2 {
+		t.Errorf("%d injects; a daemon whose /healthz lists no follow-up feature was sent one", injectCount)
 	}
 }
 

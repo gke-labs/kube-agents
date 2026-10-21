@@ -529,6 +529,16 @@ type dispatcher struct {
 	// entry's LastSeen moves only on a sighting the informer delivers, so a
 	// watcher that is not listening would call every open incident quiet.
 	ready atomic.Bool
+	// lastDelivery is the watcher's clock at the last event the informer
+	// delivered to this dispatcher, any event, admitted or not. The 403 hold
+	// is the one outage the watcher reports; a control-plane outage, a bad
+	// credential or a partition keeps the reflector in its own backoff and
+	// says nothing, so the sweep also wants to have seen the cluster speak
+	// inside the quiet period before it calls anything on it quiet.
+	lastDelivery atomic.Int64
+	// noFollowupLogged keeps the "daemon serves no follow-ups" line to one
+	// per change of answer.
+	noFollowupLogged atomic.Bool
 }
 
 func (d *dispatcher) clock() time.Time {
@@ -657,6 +667,7 @@ func (d *dispatcher) reopenPolicyFiltered(ev TriageEvent, replay bool) (dedupRes
 // mark is filed under the event's own namespace with the UID, so it is found
 // only by a FailedScheduling on a pod in that namespace (scaleup.go).
 func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
+	d.lastDelivery.Store(d.clock().UnixNano())
 	if d.filter.Decide(ev) != gateScaleUpMark {
 		return false
 	}
@@ -667,6 +678,7 @@ func (d *dispatcher) RecordScaleUpMark(ev TriageEvent) bool {
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
+	d.lastDelivery.Store(d.clock().UnixNano())
 	// Resolved before the filter, deliberately. kubelet splits an image-pull
 	// incident across four events and only one of them names the cause; that one is
 	// reason=Failed, which the shipped default --reason list does not carry. The
@@ -762,7 +774,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		opened = true
 		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
-		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name)
+		d.dedup.BindObject(ev.Key, ev.Message, ev.Namespace, ev.KindOfObject, ev.Name, ev.FirstSeen, ev.Count)
 	}
 	payload := InjectPayload{
 		Kind:         injectKindEvent,
@@ -882,7 +894,32 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 	if d.quietAfter <= 0 || d.mode != "per-incident" || !d.ready.Load() {
 		return
 	}
-	for _, q := range d.dedup.QuietIncidents(now, d.quietAfter) {
+	// The cluster has to have spoken inside the quiet period: a watch down
+	// for any reason the watcher does not report keeps LastSeen from moving
+	// just as a quiet object does, and the two cannot be told apart.
+	if last := d.lastDelivery.Load(); last == 0 || now.Sub(time.Unix(0, last)) >= d.quietAfter {
+		return
+	}
+	candidates := d.dedup.QuietIncidents(now, d.quietAfter)
+	if len(candidates) == 0 {
+		return
+	}
+	// The daemon of this moment, not the one that answered the alert: an
+	// agent image rolled back to a build without the follow-up branch would
+	// take the kind down the event path and post a second alert.
+	features, err := d.injector.Features(ctx)
+	if err != nil {
+		log.Printf("dispatcher: follow-ups held, daemon health unreadable: %v", err)
+		return
+	}
+	if !hasFeature(features, injectFeatureFollowup) {
+		if !d.noFollowupLogged.Swap(true) {
+			log.Printf("dispatcher: follow-ups held, the daemon lists no %q under %s (an older session server); they go out once it does", injectFeatureFollowup, injectFeaturesKey)
+		}
+		return
+	}
+	d.noFollowupLogged.Store(false)
+	for _, q := range candidates {
 		payload := InjectPayload{
 			Kind:         injectKindFollowup,
 			Reason:       q.Key.Reason,

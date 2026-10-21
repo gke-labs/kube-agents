@@ -649,13 +649,15 @@ INJECT_KIND_STALL = "controller-stall"
 # the alert's own session, which is how `_inject_followup` finds the thread.
 INJECT_KIND_FOLLOWUP = "k8s-event-followup"
 INJECT_KINDS_SUPPORTED = ["k8s-event", INJECT_KIND_FOLLOWUP, INJECT_KIND_DRIFT, INJECT_KIND_STALL]
-# What an `injected` answer to an event advertises this daemon does with the
-# session beyond posting the alert. The watcher reads `followup` off the
-# alert's own answer and sends a k8s-event-followup only to a daemon that
-# listed it (injectResponse.Features in injector.go); a daemon that did not
-# would take that kind down the event path and post a second alert. Listed on
-# the inject answer rather than on /healthz because the watcher reads that
-# answer already and the promise is per session.
+# What this daemon does with an event's session beyond posting the alert,
+# advertised twice: on the event path's `injected` answer, which the watcher
+# records per session (injectResponse.Features in injector.go), and under
+# `features` on /healthz beside the drift backlog's (DAEMON_FEATURES below),
+# which the watcher's sweep reads again before each tick's follow-ups, so an
+# agent image rolled back to a build without the follow-up branch is never
+# sent one (it would take the kind down the event path and post a second
+# alert). `inject_kinds` cannot carry the promise: it listed
+# `k8s-event-followup` before this branch existed.
 INJECT_FEATURE_FOLLOWUP = "followup"
 INJECT_RESPONSE_FEATURES = [INJECT_FEATURE_FOLLOWUP]
 # The quiet follow-up's line, and the watchdog's.
@@ -826,7 +828,7 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # Advertised in `/healthz` `features`, so a detector reading an older daemon
 # keeps sending every record as a card.
 DRIFT_BACKLOG_FEATURE = "drift-backlog"
-DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE]
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP]
 # `intercepted_events.backlog`. Zero for every row that is not backlog, which
 # includes every row written before the column existed. A pending row is owed a
 # digest or a card; the other three are terminal.
@@ -5215,9 +5217,10 @@ BOARD_UNREADABLE = "unreadable"
 
 def _card_for_alert_session(session_id: str) -> Optional[str]:
     """The card the alert's session filed, read off the board the way the stall
-    watch reads it; None when the board says there is none; BOARD_UNREADABLE
-    when the board cannot say (locked past its busy timeout, or missing), which
-    a caller must treat as unknown rather than as absence."""
+    watch reads it; None when the board has none for the session (a board file
+    not yet created counts as that, as `card_for_session` reads it);
+    BOARD_UNREADABLE when the board cannot say (locked past its busy timeout,
+    unreadable), which a caller must treat as unknown rather than as absence."""
     try:
         from stall_watch import card_for_session  # lazy: the board path is the gateway's
 

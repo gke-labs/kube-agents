@@ -15,6 +15,8 @@ this file needs none of its own.
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import unittest
 from contextlib import closing
 from datetime import datetime, timezone
@@ -63,6 +65,12 @@ class FollowupInjectTest(unittest.TestCase):
         self.assertEqual(resp.json(), {"status": "injected", "features": ["followup"]})
         self.assertIn("followup", session_kv_server.INJECT_RESPONSE_FEATURES)
         self.assertIn("k8s-event-followup", session_kv_server.INJECT_KINDS_SUPPORTED)
+        # /healthz advertises the same list, unauthenticated: what the watcher's
+        # sweep asks before each tick's follow-ups.
+        from fastapi.testclient import TestClient
+
+        health = TestClient(session_kv_server.app).get("/healthz").json()
+        self.assertIn("followup", health["features"])
 
     def test_a_followup_lands_in_the_alerts_thread_and_on_its_card(self):
         self._route("k8s-evt-quiet")
@@ -190,10 +198,22 @@ class TriageWatchdogTest(unittest.TestCase):
             self.assertEqual(turn.call_count, 1 if session_created else 0)
 
     def test_a_non_integer_watchdog_knob_falls_back_instead_of_failing_the_import(self):
-        with patch.dict(os.environ, {"TRIAGE_WATCHDOG_SECONDS": "1h"}):
-            self.assertEqual(session_kv_server._alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", 3600), 3600)
-        with patch.dict(os.environ, {"TRIAGE_WATCHDOG_SECONDS": "0"}):
-            self.assertEqual(session_kv_server._alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", 3600), 0)
+        # The module is imported afresh in a child with the bad value set: the
+        # constant is read at import, so only an import shows whether a bad
+        # value fails it. A child that cannot import the module for another
+        # reason (no mcp distribution) is this environment's limit, not a
+        # verdict.
+        env = dict(os.environ, TRIAGE_WATCHDOG_SECONDS="1h", SESSION_KV_DB_PATH=session_kv_server.SESSION_KV_DB_PATH,
+                   PYTHONPATH=os.path.dirname(session_kv_server.__file__))
+        probe = subprocess.run(
+            [sys.executable, "-c", "import session_kv_server as s; print(s.TRIAGE_WATCHDOG_SECONDS)"],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+        if probe.returncode != 0 and "mcp" in probe.stderr:
+            self.skipTest("the child could not import the mcp distribution")
+        self.assertEqual(probe.returncode, 0, probe.stderr[-800:])
+        self.assertEqual(probe.stdout.strip(), str(session_kv_server.DEFAULT_TRIAGE_WATCHDOG_SECONDS))
+        self.assertIn("is not an integer; falling back to", probe.stderr)
 
 
 class TriagePromptStampTest(unittest.TestCase):

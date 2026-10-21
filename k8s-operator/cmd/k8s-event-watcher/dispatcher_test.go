@@ -1028,6 +1028,10 @@ func newCountingDispatcher(t *testing.T, th filterThresholds) (*dispatcher, *met
 	injectCount := 0
 	var injected []InjectPayload
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == healthzPath {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", injectFeaturesKey: []string{injectFeatureFollowup}})
+			return
+		}
 		if r.URL.Path == "/sessions" {
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: sessionID})
