@@ -1,7 +1,6 @@
 # NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt, not the
 # presubmit file: a new case lands in the nightly
-# (docs/designs/bench-case-format.md, "Registration"). It carries
-# `expected_fail: true`: see "Red on main" below.
+# (docs/designs/bench-case-format.md, "Registration").
 #
 # What this case grades (#2386): a plain chat request to find the clusters
 # that do not match their peers, one that names no SOP and no cluster, gets
@@ -14,17 +13,12 @@
 # reads every cluster in scope at once, builds the cohorts and votes the
 # baseline from the live fleet.
 #
-# Red on main. No row in the audit-stream table in agents/platform/SOUL.md
-# routes this question to fleet_drift.py, so on main the collector check
-# fails. The case is marked `expected_fail: true`, so the nightly records
-# it as EXPECTED_FAIL, not FAILED. Each repetition's results.json also
-# records whether the outlier and facet reply checks pass on the CI cohort.
-# The row is held back because a dev green does not show it works: the dev
-# fleet has no seeded-c, and the collector's baseline ladder and outlier
-# checks need the 4-cluster cohort that only the CI pool projects carry. The
-# follow-up that adds the drift row removes the marker in the same diff. If
-# the case passes every repetition before then, bench-gate fails the job
-# until the marker comes off (.agents/rules/eval_driven_development.md).
+# Green since the drift row (#3398): the audit-stream table in
+# agents/platform/SOUL.md routes this question to fleet_drift.py. Until then
+# the case ran marked `expected_fail: true` (#3135); the greens that took the
+# marker off came from a dev fleet carrying the full seeded fleet, seeded-c
+# included, because the collector's baseline ladder and outlier checks need
+# the 4-cluster cohort.
 #
 # Domain: consistency (docs/designs/domains.yaml). Its journey row is the
 # targeted probe (one named cluster against its live peers); this case is the
@@ -58,10 +52,10 @@
 #
 # Not this route, and left to their own cases: a request that names the SOP
 # (consistency-drift-outlier, consistency-no-environment-label), which runs
-# the full audit and publishes its ledger; one named cluster compared with
-# its peers (consistency-authorized-networks-probe), answered from live
-# reads. The prompt says neither "drift" (GitOps drift is another route) nor
-# a cluster name.
+# the full audit and publishes its ledger. One named cluster compared with
+# its peers (consistency-authorized-networks-probe) takes the same row since
+# #3398; that case grades the reply, not the route. The prompt says neither
+# "drift" (GitOps drift is another route) nor a cluster name.
 #
 # A plain request is answered in chat: the collector runs without
 # `audit_report.py start` or `finish`, so no ledger issue is written and no
@@ -90,9 +84,6 @@ expected_output: >-
 infrastructure:
   deployer: noop
 validated: false
-
-# Red on main until the drift row lands; see "Red on main" above.
-expected_fail: true
 
 # Slug per docs/designs/domains.yaml.
 domain: consistency
