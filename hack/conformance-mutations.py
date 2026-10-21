@@ -628,6 +628,15 @@ Mutation(
         "project, and two clean runs later its profiles are retired",
     ),
     Mutation(
+        "C3-stall-watch-exclusion-unpinned",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    STALL_WATCH_EXCLUDE_NAMESPACES=\n", ""),
+        "test_C3_the_stall_watch_knobs_cannot_come_from_the_agents_env_file",
+        "drop the empty STALL_WATCH_EXCLUDE_NAMESPACES pin because the CR does not "
+        "set it -- one line in the agent-writable PVC .env then silences the stall "
+        "watch for a namespace nobody excluded",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',

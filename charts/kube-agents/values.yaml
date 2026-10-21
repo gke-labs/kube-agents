@@ -665,8 +665,9 @@ platformAgent:
   enabled: true
   name: platform-agent
   # The PlatformAgent's spec.mode: which component stack the operator renders.
-  # "today" is the current architecture; "next" also renders the NATS bus and
-  # the A2A gateway, a development stack (docs/designs/spec-mode-switch.md).
+  # "next" puts the NATS bus and the A2A gateway in front of the agent, and is
+  # what a first install.sh install records; "today" is the previous stack,
+  # kept as a rollback (docs/designs/spec-mode-switch.md).
   # null, the default, leaves the field out of the CR, which the operator reads
   # as "today", so an install that never sets it renders the CR it always did.
   # Changing it on a running install is a mode switch, not a setting: the
@@ -777,6 +778,18 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The controller stall watch, the stall-watch cron job that alerts on
+    # controllers that stopped making progress. Empty omits the block and
+    # keeps the watch's defaults. A change rolls the agent pod. The
+    # annotation kubeagents.x-k8s.io/stall-watch: exempt on a namespace or an
+    # object works without any value here.
+    stallWatch: {}
+      # Namespaces never read, on every cluster, as exact names.
+      # excludeNamespaces: ["load-test", "payments-canary"]
+      # Hold a new alert until a stall has lasted this many minutes (0-1440).
+      # minStallAgeMinutes: 30
+      # Replaces the default kind list; ["all"] scans every namespaced kind.
+      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every

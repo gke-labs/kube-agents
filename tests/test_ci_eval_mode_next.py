@@ -3,8 +3,8 @@
 `hack/ci-eval-pr.sh` exports `AGENT_TRANSPORT=inject` and the door's bearer
 token, read from the Secret the operator renders beside the door, when the
 deploy ran under the flag; unset, section 4 fetches the agent token as it
-always has and exports neither. Every pull request runs the unset path, so
-that is the half pinned first, with five spellings of "not 1". The set half
+always has and exports neither. The today lane and every non-next job run
+the unset path, so that is the half pinned first, with five spellings of "not 1". The set half
 is run against a stubbed `kubectl` and checked for the exact Secret and key
 the operator writes and the harness reads -- three sources that have to agree
 on two strings, held together here rather than in three places by hand.
@@ -100,6 +100,14 @@ def publisher_gate() -> str:
     return match.group(0)
 
 
+def rollback_lane_function() -> str:
+    """run_rollback_lane(), as written."""
+    match = re.search(r"^run_rollback_lane\(\) \{\n.*?^\}$", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
+    if match is None:
+        raise AssertionError(f"run_rollback_lane() not found in {_CI_EVAL}")
+    return match.group(0)
+
+
 def rollback_function() -> str:
     """run_rollback_roundtrip(), as written."""
     match = re.search(r"^run_rollback_roundtrip\(\) \{\n.*?^\}$", text(_CI_EVAL), re.DOTALL | re.MULTILINE)
@@ -137,7 +145,7 @@ def go_constant(name: str) -> str:
     return match.group(1)
 
 
-def run_section(mode_next: str | None, secret_missing: bool = False) -> subprocess.CompletedProcess:
+def run_section(mode_next: str | None, secret_missing: bool = False, rollback_lane: str | None = None) -> subprocess.CompletedProcess:
     script = "\n".join(
         [
             "set -euo pipefail",
@@ -145,11 +153,12 @@ def run_section(mode_next: str | None, secret_missing: bool = False) -> subproce
             # shell running the tests happens to export: the flag, and the two
             # variables the flag-set path exports, which a developer who drove
             # the door by hand has in their shell.
-            "unset EVAL_MODE_NEXT AGENT_TRANSPORT AGENT_INJECT_TOKEN",
+            "unset EVAL_MODE_NEXT EVAL_ROLLBACK_LANE AGENT_TRANSPORT AGENT_INJECT_TOKEN",
             f'export TARGET_NAMESPACE="{_NAMESPACE}"',
             'export AGENT_SERVICE_NAME="platform-agent"',
             "" if mode_next is None else f'export EVAL_MODE_NEXT="{mode_next}"',
             'export INJECT_SECRET_MISSING="1"' if secret_missing else "",
+            "" if rollback_lane is None else f'export EVAL_ROLLBACK_LANE="{rollback_lane}"',
             _KUBECTL_STUB,
             constants_block(),
             section(),
@@ -184,13 +193,14 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
                 self.assertIn("secret platform-agent-secrets", calls[0])
 
     def test_the_flag_is_read_in_section_4_the_recorder_the_publisher_and_the_rollback_and_nowhere_else(self) -> None:
-        """The header promises four places: section 4, the baseline recorder
-        (its decision and the log line at the record step), the dashboard
-        publisher's gate and the rollback round trip. Another reader is another
-        behaviour under the flag that this test suite does not cover. The
-        publisher's gate is run in scripts/test_eval_dashboard_publish.py, the
-        rollback round trip in tests/test_rollback_roundtrip.py; the others
-        here."""
+        """The header promises five places: the today lane's step
+        (run_rollback_lane, which refuses the lane without the flag), section
+        4, the baseline recorder (its decision and the log line at the record
+        step), the dashboard publisher's gate and the rollback round trip.
+        Another reader is another behaviour under the flag that this test
+        suite does not cover. The publisher's gate is run in
+        scripts/test_eval_dashboard_publish.py, the rollback lane and round
+        trip in tests/test_rollback_roundtrip.py; the others here."""
         script = text(_CI_EVAL)
         # Any spelling of an expansion (`${EVAL_MODE_NEXT...}` or bare `$EVAL_MODE_NEXT`),
         # on a line that is not a comment; the log lines that name the flag as
@@ -199,17 +209,38 @@ class FlagUnsetIsTodayTest(unittest.TestCase):
             m.start()
             for m in re.finditer(r"^[^#\n]*\$\{?EVAL_MODE_NEXT\b", script, re.MULTILINE)
         ]
-        self.assertEqual(len(reads), 5, "EVAL_MODE_NEXT is read at a site in hack/ci-eval-pr.sh this suite does not cover")
+        self.assertEqual(len(reads), 6, "EVAL_MODE_NEXT is read at a site in hack/ci-eval-pr.sh this suite does not cover")
         publisher = script.index(publisher_gate())
         self.assertTrue(publisher <= reads[0] < publisher + len(publisher_gate()))
+        lane = script.index(rollback_lane_function())
+        self.assertTrue(lane <= reads[1] < lane + len(rollback_lane_function()))
         start = script.index(section())
-        self.assertTrue(start <= reads[1] < start + len(section()))
+        self.assertTrue(start <= reads[2] < start + len(section()))
         decision = script.index(recorder_decision())
-        self.assertTrue(decision <= reads[2] < decision + len(recorder_decision()))
+        self.assertTrue(decision <= reads[3] < decision + len(recorder_decision()))
         step = script.index(recorder_step_message())
-        self.assertTrue(step <= reads[3] < step + len(recorder_step_message()))
+        self.assertTrue(step <= reads[4] < step + len(recorder_step_message()))
         rollback = script.index(rollback_function())
-        self.assertTrue(rollback <= reads[4] < rollback + len(rollback_function()))
+        self.assertTrue(rollback <= reads[5] < rollback + len(rollback_function()))
+
+
+class RollbackLaneStaysOnTheApiTest(unittest.TestCase):
+    def test_the_today_lane_grades_over_the_agent_api_with_the_flag_set(self) -> None:
+        """The today lane carries EVAL_MODE_NEXT=1 for its deploy and has
+        rolled the install back before section 4 (run_rollback_lane), so the
+        door is gone: the section reads the agent token alone and exports no
+        transport. Any other value of EVAL_ROLLBACK_LANE leaves the flag's
+        inject path as it was."""
+        result = run_section("1", rollback_lane="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = exported(result)
+        self.assertEqual(out["TOKEN"], _AGENT_TOKEN)
+        self.assertEqual(out["TRANSPORT"], "<unset>")
+        self.assertEqual(out["INJECT_TOKEN"], "<unset>")
+        self.assertEqual(len(kubectl_calls(result)), 1)
+        for other in ("", "0", "true"):
+            with self.subTest(EVAL_ROLLBACK_LANE=other):
+                self.assertEqual(exported(run_section("1", rollback_lane=other))["TRANSPORT"], "inject")
 
 
 class FlagSetIsInjectTest(unittest.TestCase):
