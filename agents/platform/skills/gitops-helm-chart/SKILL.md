@@ -93,11 +93,17 @@ grep -rlE "^kind: (RootSync|RepoSync)$" <workspace>
 grep -rl "^helmCharts:" <workspace>
 ```
 
-Then read the reconciler objects on the cluster, or on the hub that deploys
-to it, when your kubeconfig reaches one. A `NotFound` for the resource type
-means that reconciler is not installed there:
+Then read the reconciler objects on the target cluster, or on the hub that
+deploys to it, when your kubeconfig reaches one. Your default context is the
+cluster this agent runs on, not the target: pin a per-target `KUBECONFIG` and
+fetch the target's credentials first (**gke-basics**, "Cluster
+Credentials"), and read there. A `NotFound` for the resource type means that
+reconciler is not installed on the context you read; on this agent's own
+cluster it says nothing about the target:
 
 ```bash
+export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
+gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
 kubectl get applications.argoproj.io -A -o yaml
 kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o yaml
 kubectl get rootsyncs.configsync.gke.io -A -o yaml
