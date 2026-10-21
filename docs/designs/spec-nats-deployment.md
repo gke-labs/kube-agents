@@ -405,7 +405,7 @@ Layout:
   inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
-  with an `allowed_origins` allow-list (transport encryption is below).
+  rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -924,8 +924,8 @@ Every connection to the client listener on 4222 is TLS. nats.conf carries a top-
 clear; a client that dials `nats://` is told to upgrade, and one that cannot verify the
 certificate is refused. Every client the operator renders is handed `tls://` on the NATS
 Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
-health and stats, not payloads or tokens. The websocket listener on 9222 serves the same
-certificate from the same files.
+health and stats, not payloads or tokens. The websocket listener on 9222, the console's
+door, is still rendered plain (`no_tls: true`).
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
@@ -959,10 +959,18 @@ does change what the server presents, and nats-server reads its certificate only
 or on a reload signal, so the serving certificate's fingerprint rides the StatefulSet's
 config hash: a renewal restarts the bus once a year, the same window any config change
 costs. A reloader that sends the reload signal instead would remove that restart; it
-needs another pinned image and a shared process namespace, and is not rendered yet. A CA
-change, the rare manual case, goes in three steps so no client distrusts the bus in
-between: add the new CA to the bundle beside the old one, reissue the serving
-certificate under it, then drop the old CA.
+needs another pinned image and a shared process namespace, and is not rendered yet.
+
+A new CA happens only when the CA Secret is gone, unreadable or within 30 days of its
+tenth year. It is a one-step swap, not an overlap: the operator writes the new CA into the
+bundle and reissues the serving certificate under it in the same pass, and the bus
+restarts on the new pair. Clients read the bundle on each handshake, so a client whose
+kubelet has not yet synced the new bundle fails its reconnects until it has, usually
+within a minute. The bundle always holds exactly the CA the operator signs with, so a CA
+added by hand is overwritten on the next reconcile; carrying two CAs across a planned
+rotation is a change this render does not make yet. For the same reason the two Secrets
+are operator-owned today: a serving certificate from another issuer, such as
+cert-manager, is replaced, because it does not verify against the operator's CA.
 
 **The flip on an existing install.** The release that adds the `tls { }` block also moves
 every client the operator renders to `tls://`, in the same reconcile, so the bus restarts

@@ -673,6 +673,13 @@ func FromEnv() (*Config, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
+	// The CA and the ConfigMap it came from arm the session pods' trust
+	// together. With the file alone the gateway itself connects, while every
+	// session pod it spawns gets the tls:// URL and no CA, and fails
+	// verification on its first connect.
+	if (cfg.NATSCAFile != "") != (cfg.NATSCAConfigMap != "") {
+		return nil, fmt.Errorf("%s and %s arm the session pods' bus trust together; only one is set", lib.EnvNATSCAFile, EnvNATSCAConfigMap)
+	}
 	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
 	// choice, so it refuses rather than silently running another backend.
 	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {

@@ -80,7 +80,7 @@ func A2ACalloutKeysSecretName(agentName string) string {
 }
 
 // A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
-// and key, which the NATS pod mounts for its client and websocket listeners.
+// and key, which the NATS pod mounts for its client listener.
 func A2ANATSTLSSecretName(agentName string) string {
 	return A2ANATSName(agentName) + a2aNATSTLSSuffix
 }

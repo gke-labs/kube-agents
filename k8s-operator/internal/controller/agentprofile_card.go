@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"crypto/rand"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -74,6 +73,9 @@ const (
 
 	// cardBusTimeout bounds one directory read or publish.
 	cardBusTimeout = 10 * time.Second
+	// cardBundleReadTimeout bounds the read of the bus CA bundle each TLS
+	// handshake makes (busTLS).
+	cardBundleReadTimeout = 5 * time.Second
 
 	// operatorBusAuthFileEnvVar overrides where the manager reads its own
 	// projected bus token; the default is the path every bus client uses.
@@ -197,18 +199,25 @@ func newNATSCardPublisher(reader client.Reader) *natsCardPublisher {
 }
 
 // busTLS is the operator's trust in this agent's bus: the CA bundle the
-// operator itself renders, read when a connection is built, so a connection
-// rebuilt after a CA change trusts the new one.
-func (n *natsCardPublisher) busTLS(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (nats.Option, error) {
-	bundle := &corev1.ConfigMap{}
-	if err := n.reader.Get(ctx, types.NamespacedName{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}, bundle); err != nil {
-		return nil, fmt.Errorf("reading the bus CA bundle: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM([]byte(bundle.Data[a2aNATSCACertKey])) {
-		return nil, fmt.Errorf("the bus CA bundle %s holds no certificate", bundle.Name)
-	}
-	return nats.Secure(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}), nil
+// operator itself renders, read on every TLS handshake rather than once. A
+// connection here is never closed (MaxReconnects(-1)), so a pool fixed at
+// connect would keep trusting a CA the reconcile has since replaced, and every
+// reconnect after the bus restarted on the new one would fail.
+func (n *natsCardPublisher) busTLS(agent *agentv1alpha1.PlatformAgent) nats.Option {
+	key := types.NamespacedName{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}
+	return nats.ClientTLSConfig(nil, func() (*x509.CertPool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), cardBundleReadTimeout)
+		defer cancel()
+		bundle := &corev1.ConfigMap{}
+		if err := n.reader.Get(ctx, key, bundle); err != nil {
+			return nil, fmt.Errorf("reading the bus CA bundle: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM([]byte(bundle.Data[a2aNATSCACertKey])) {
+			return nil, fmt.Errorf("the bus CA bundle %s holds no certificate", bundle.Name)
+		}
+		return pool, nil
+	})
 }
 
 func operatorBusAuthFile() string {
@@ -218,7 +227,7 @@ func operatorBusAuthFile() string {
 	return filepath.Join(a2aBusTokenPath, a2aBusTokenFile)
 }
 
-func (n *natsCardPublisher) conn(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
+func (n *natsCardPublisher) conn(agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
 	key := agent.Namespace + "/" + agent.Name
 	url := a2aNATSClientURL(agent)
 	n.mu.Lock()
@@ -233,11 +242,7 @@ func (n *natsCardPublisher) conn(ctx context.Context, agent *agentv1alpha1.Platf
 		delete(n.conns, key)
 	}
 	tokenFile := operatorBusAuthFile()
-	trust, err := n.busTLS(ctx, agent)
-	if err != nil {
-		return nil, err
-	}
-	nc, err := nats.Connect(url, trust,
+	nc, err := nats.Connect(url, n.busTLS(agent),
 		nats.Name("kubeagents-operator"),
 		nats.TokenHandler(func() string {
 			b, err := os.ReadFile(tokenFile) // #nosec G304 -- the manager's own projected token path
@@ -273,7 +278,7 @@ func (n *natsCardPublisher) forget(namespace string) {
 // subject: the one read the operator's grant allows, and it needs no stream
 // handle (STREAM.INFO), which the operator does not hold.
 func (n *natsCardPublisher) Read(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string) (directoryEntry, error) {
-	nc, err := n.conn(ctx, agent)
+	nc, err := n.conn(agent)
 	if err != nil {
 		return directoryEntry{}, err
 	}
@@ -313,7 +318,7 @@ func parseDirectoryEntry(data []byte) (directoryEntry, error) {
 // Publish writes through JetStream with the envelope id as the dedup key, as
 // every other emitter does, and waits for the ack.
 func (n *natsCardPublisher) Publish(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, card *a2aAgentCard) error {
-	nc, err := n.conn(ctx, agent)
+	nc, err := n.conn(agent)
 	if err != nil {
 		return err
 	}

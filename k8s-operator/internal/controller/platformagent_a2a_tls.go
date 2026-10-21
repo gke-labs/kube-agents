@@ -46,8 +46,11 @@ import (
 // NATS Service and keeps them in two Secrets; the NATS pod mounts the serving
 // pair, and every client trusts the CA through a ConfigMap that carries only
 // its public half. Nothing here depends on cert-manager, which the chart does
-// not install: an install that has it, or that wants to bring its own
-// certificate, can later fill the same two Secrets without any client changing.
+// not install. The two Secrets are the operator's alone today: a serving
+// certificate another issuer wrote does not verify against this CA, so it is
+// replaced on the next pass. Letting cert-manager or a bring-your-own Secret
+// fill them is a later change, and keeping the names fixed is what lets it
+// land without any client changing.
 //
 // The CA is long-lived and the serving certificate is not, so a renewal never
 // changes what clients trust. A renewal does change what the server must
