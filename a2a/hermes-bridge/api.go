@@ -216,7 +216,9 @@ type apiChatMessage struct {
 }
 
 // apiChatResponse is the subset of the chat-completions response the bridge
-// reads: the first choice's text, and the server's own verdict on the turn.
+// reads: the first choice's text, the server's own verdict on the turn, and
+// what the turn cost (Model and Usage, each optional; a server that sends
+// neither leaves the usage artifact with the turn's wall time alone).
 // A turn that failed with no text comes back as an OpenAI error envelope
 // with a non-2xx status, read as text; one that failed with text (a
 // provider error, a rate limit the retries did not outlast, the failure
@@ -231,6 +233,88 @@ type apiChatResponse struct {
 		Failed bool   `json:"failed"`
 		Error  string `json:"error"`
 	} `json:"hermes"`
+	// Raw, decoded on their own by apiTurnUsage: telemetry must not fail
+	// the decode that carries the answer, so a model or usage in a shape
+	// the bridge does not expect is dropped, never the turn.
+	Model json.RawMessage `json:"model"`
+	Usage json.RawMessage `json:"usage"`
+}
+
+// apiUsage is a response's token counts, in either spelling the server may
+// use: the chat-completions one (prompt_tokens, completion_tokens) or the
+// responses one (input_tokens, output_tokens). Hermes's prompt_tokens is
+// every token the model read, cached reads included, which is what the
+// usage artifact's inputTokens means. The counts are float64 so a count
+// written as 1200.0 still decodes; the part carries whole tokens.
+type apiUsage struct {
+	PromptTokens     float64 `json:"prompt_tokens"`
+	CompletionTokens float64 `json:"completion_tokens"`
+	InputTokens      float64 `json:"input_tokens"`
+	OutputTokens     float64 `json:"output_tokens"`
+}
+
+// apiTurnUsage is one answered turn's usage part: the server's model name
+// when it sent one (the alias the request named otherwise), its token
+// counts when it sent them in a shape the bridge reads, and the turn's wall
+// time as the bridge measured it from the request to the body read. No
+// cost: Hermes behind the gateway prices nothing
+// (docs/site/src/content/docs/deploy/telemetry.md), and the artifact
+// carries no figure the producer invented. A field that is present but does
+// not decode is left out and named in dropped, for the one warning the
+// caller logs per turn; it never fails the turn.
+func apiTurnUsage(out *apiChatResponse, requested string, took time.Duration) (u lib.Usage, dropped []string) {
+	u = lib.Usage{DurationMs: turnMillis(took)}
+	switch {
+	case len(out.Model) == 0:
+	case json.Unmarshal(out.Model, &u.Model) != nil:
+		dropped = append(dropped, "model")
+	}
+	if u.Model == "" {
+		u.Model = requested
+	}
+	var counts apiUsage
+	switch {
+	case len(out.Usage) == 0:
+	case json.Unmarshal(out.Usage, &counts) != nil:
+		dropped = append(dropped, "usage")
+	default:
+		// A count that is negative or past what the part carries is that
+		// field dropped, named, so the part keeps its time and model.
+		var ok bool
+		if u.InputTokens, ok = lib.UsageFigure(max(counts.PromptTokens, counts.InputTokens)); !ok {
+			dropped = append(dropped, "usage.prompt_tokens")
+		}
+		if u.OutputTokens, ok = lib.UsageFigure(max(counts.CompletionTokens, counts.OutputTokens)); !ok {
+			dropped = append(dropped, "usage.completion_tokens")
+		}
+	}
+	return u, dropped
+}
+
+// publishTurnUsage publishes an answered or failed API turn's usage under
+// run.mu, and logs the fields the response carried in a shape the bridge
+// does not read, once per turn.
+func (b *Bridge) publishTurnUsage(run *taskRun, out *apiChatResponse, took time.Duration) {
+	u, dropped := apiTurnUsage(out, b.cfg.APIModel, took)
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	run.mu.Lock()
+	if run.state == stateRunning {
+		b.publishUsageLocked(run, u)
+	}
+	run.mu.Unlock()
+}
+
+// turnMillis is a turn's wall time for the usage part: whole milliseconds,
+// and at least one for a turn that took any time at all, so a fast turn is
+// a figure rather than the zero the part omits.
+func turnMillis(took time.Duration) int64 {
+	if took <= 0 {
+		return 0
+	}
+	return max(1, took.Milliseconds())
 }
 
 // apiTurnFailed reports whether the server marked the turn failed, the case
@@ -426,7 +510,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		run.mu.Unlock()
 	}
 
-	resp, err := b.sendAPI(taskCtx, req, body)
+	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
 		return "", false
@@ -436,6 +520,10 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// its headers before the body, and a cancel or shutdown in between must
 	// still end the request.
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
+	// The turn's wall time: from the connection the server answered on to
+	// the end of the body, before any lock below adds to it, and without
+	// the refused dials sendAPI retried first.
+	took := time.Since(connectedAt)
 	if err != nil && taskCtx.Err() != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
 		return "", false
@@ -454,6 +542,13 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			// (the key, the session headers, the profile, the body); a
 			// turn that ran and failed answers 5xx.
 			reason = "hermes-api-refused"
+		}
+		if resp.StatusCode >= http.StatusInternalServerError {
+			// A turn that ran and failed with no answer: the server's error
+			// envelope carries no counts the bridge reads, so its usage is
+			// the wall time, as the CLI executor's is for a run that failed
+			// on its own. A 4xx ran nothing and publishes nothing.
+			b.publishTurnUsage(run, &apiChatResponse{}, took)
 		}
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d; session: %s%s; body tail: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
@@ -479,6 +574,9 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		if apiRateLimitedReasons[resp.Header.Get(apiFailureReasonHeader)] {
 			reason = "hermes-rate-limited"
 		}
+		// A turn that ran and failed still read tokens: its usage goes out
+		// ahead of the failed terminal, as the worker adapter's does.
+		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
 		return "", false
@@ -491,6 +589,14 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// Held until it is on the stream: shutdownTasks leaves the run to this
 	// worker from here (answerHeld).
 	run.answerHeld = true
+	// What the turn cost, ahead of its answer and under the same lock a
+	// finalizer takes, so the usage part never follows the terminal.
+	u, dropped := apiTurnUsage(&out, b.cfg.APIModel, took)
+	if len(dropped) > 0 {
+		b.cfg.Logger.Warn("usage telemetry on the API response did not decode; those figures are not on the bus",
+			"task", run.origin.TaskID, "fields", dropped)
+	}
+	b.publishUsageLocked(run, u)
 	return out.Choices[0].Message.Content, true
 }
 
@@ -499,14 +605,17 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 // A response of any status is returned as it is; an error is wrapped in
 // errNeverConnected when no attempt got a connection, so no request was
 // sent.
-func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, error) {
-	var connected atomic.Bool
+func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*http.Response, time.Time, error) {
+	// connectedAt is when the attempt that got a connection got it, as
+	// UnixNano, so the turn's clock starts at the request the server
+	// received rather than at the first refused dial.
+	var connectedAt atomic.Int64
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+		GotConn: func(httptrace.GotConnInfo) { connectedAt.Store(time.Now().UnixNano()) },
 	})
 	req = req.WithContext(ctx)
 	neverConnected := func(err error) error {
-		if connected.Load() {
+		if connectedAt.Load() != 0 {
 			return err
 		}
 		return fmt.Errorf("%w: %w", errNeverConnected, err)
@@ -515,14 +624,14 @@ func (b *Bridge) sendAPI(ctx context.Context, req *http.Request, body []byte) (*
 	for {
 		resp, err := b.apiClient.Do(req)
 		if err == nil {
-			return resp, nil
+			return resp, time.Unix(0, connectedAt.Load()), nil
 		}
 		if !errors.Is(err, syscall.ECONNREFUSED) || time.Now().After(giveUp) {
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		}
 		select {
 		case <-ctx.Done():
-			return nil, neverConnected(err)
+			return nil, time.Time{}, neverConnected(err)
 		case <-time.After(apiConnectRetryInterval):
 		}
 		req = req.Clone(ctx)

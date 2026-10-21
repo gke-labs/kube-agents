@@ -11,8 +11,9 @@
 # behaves differently from the day this line was added.
 #
 # Setting EVAL_MODE_NEXT=1 flips the installed agent to `spec.mode: next` after
-# the today-mode install has proven itself (sections 2a and 2b refuse the flag
-# where it cannot work, step 4 builds the A2A images and the bridge sidecar,
+# the today-mode install has proven itself (section 2b refuses the flag
+# where it cannot work, step 4 builds the A2A images and the bridge sidecar
+# or, on the release-candidate path, names the candidate's published ones,
 # step 5 hands the operator their references, the bridge's settings and the
 # inject door, step 6b flips and gates; the constants block below says what
 # each does). Unset, nothing behaves differently either.
@@ -226,10 +227,9 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 # script behaves exactly as it did before the flag existed.
 #
 # What the flag has to do, and where:
-#   - section 2a refuses it on the release-candidate path (that path hands
-#     the operator none of the settings step 4 does) and section 2b refuses it on a Prow
+#   - section 2b refuses it on a Prow
 #     run that is neither a pull request's nor one of the next-lane jobs
-#     named below (a mis-set variable on the nightly or a postsubmit would
+#     named below (a mis-set variable on the nightly or another postsubmit would
 #     otherwise run that job in next mode, recording and publishing nothing,
 #     so main's window and dashboard would silently miss it), and refuses a
 #     fan-out the bridge cannot be given as its concurrency, before anything
@@ -239,7 +239,9 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     way the four images above are; the operator would derive these same
 #     references from its own image, and step 5 names them anyway so the
 #     deploy's inputs are explicit) and the Hermes bridge sidecar image, FROM
-#     the platform-agent image of the same build;
+#     the platform-agent image of the same build; on the release-candidate
+#     path it builds nothing and names the candidate's published images of
+#     the same six instead;
 #   - step 5 passes those references to the operator through the chart's
 #     operator.extraEnv, which the operator reads as its image overrides,
 #     with the bridge's concurrency beside them, and arms
@@ -281,18 +283,20 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # on main, its daily full-catalog nightly on main (the agent on Claude,
 # compared with a today-mode nightly on the same model), and the GitLab
 # lane's nightly under next (EVAL_FORGE=gitlab, hack/eval/gitlab-cases.txt,
-# beside the today-mode GitLab nightly). Section 2b admits
+# beside the today-mode GitLab nightly), and the release-candidate eval's
+# postsubmit, which grades a candidate in the mode a new install gets (#2007,
+# "The cutover itself"; hack/ci-eval-rc.sh). Section 2b admits
 # the flag on a run whose JOB_NAME is one of these (space-separated, matched
 # whole) or that carries a PULL_NUMBER -- the presubmit is admitted by the
-# second on a pull request and by the first on a Tide batch, the periodic and
-# the nightlies only by the first -- and refuses it on any other Prow run, so
-# the flag leaking into the today nightly's or a postsubmit's environment
+# second on a pull request and by the first on a Tide batch, the periodic, the
+# nightlies and the RC postsubmit only by the first -- and refuses it on any
+# other Prow run, so the flag leaking into the today nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. hack/ci-eval-pr.sh keeps such a run out of the baseline
 # recorder on the flag alone, so admitting a job here never lets it write
 # main's window.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The first change: the mode, and the maxSessions section 2b sizes for the
@@ -648,19 +652,11 @@ fi
 # without being named here. Both plugin images default to enabled=false and are
 # not rendered on either path.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
-  # The release pipeline publishes the A2A images and the bridge beside the
-  # others, and the operator derives the references it renders, but this
-  # path hands the operator none of the settings step 4 puts
-  # in A2A_OPERATOR_ENV_ARGS: no inject door, so the eval's transport has no
-  # Service to reach, and no bridge concurrency, so the bridge would not be
-  # sized to the matrix's fan-out. Refuse the pair here rather than forty
-  # minutes in.
-  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "ERROR: EVAL_MODE_NEXT=1 is set together with RC_COMMIT_SHA. The mode-next flip needs" >&2
-    echo "       the pull-request build path, which hands the operator the inject door and the" >&2
-    echo "       Hermes bridge's settings; this path does not yet set them for the release." >&2
-    exit 1
-  fi
+  # EVAL_MODE_NEXT=1 is accepted here: the release pipeline publishes the A2A
+  # images and the bridge beside the others (REQUIRED_RELEASE_IMAGES, which
+  # the image check below requires), and step 4 hands the operator their
+  # published references with the inject door and the bridge's concurrency,
+  # as it does the pull request's builds.
 
   # Sourced inside the branch, deliberately. The presubmit path must not acquire
   # a second file's exports and functions just because this one exists.
@@ -901,12 +897,12 @@ else
 fi
 
 # The mode flip exists for the next lane's runs: a pull request's, or one of
-# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightlies on main).
+# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightlies on main, and the release-candidate eval).
 # A flagged run appends nothing to main's baseline and publishes no dashboard
 # (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
 # separately refuses a pull request's sample, bench/baselines/README.md), so
 # what the flag mis-set on a job that is not the lane's -- the today nightly,
-# a postsubmit -- would do is run that job in next mode and leave main's
+# another postsubmit -- would do is run that job in next mode and leave main's
 # window and dashboard silently missing it, its verdict measuring the wrong
 # stack. Keyed on the job's name rather than on PULL_NUMBER, so the lane's
 # scheduled jobs are admitted by being named and every other Prow run without
@@ -1319,6 +1315,63 @@ gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --p
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
+# The next stack's references, under EVAL_MODE_NEXT=1 only. On the pull
+# request's path they are this build's (the `a2a` and `a2a-bridge` steps
+# below build them into AR_REPO); on the release-candidate path they are the
+# candidate's published images, under the same names in RC_REGISTRY_PREFIX
+# (section 2a) at its commit, beside the operator image that path installs.
+# The references go to the operator through operator.extraEnv
+# in step 5: the operator reads its A2A image overrides from its own
+# environment; without them it would derive the same five A2A references
+# from its own image and the bridge's from the agent's (on either path the
+# same repository and tag), so the overrides are belt and braces that keep the
+# deploy's inputs explicit and byte-pinned by the tests. The same
+# value list arms the gateway's inject door, which the operator likewise
+# reads from its own environment and never from the CR (a2aInjectBackendEnvVar
+# says why): without it there is no Service for the eval's transport to
+# reach. The bridge's reference goes to the operator the same way, with its
+# concurrency: the operator renders the bridge sidecar into the agent pod
+# under next and reads both from its environment. Its executor is left to
+# the bridge's default (BRIDGE_EXECUTOR_EXPECTED).
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    A2A_IMAGE_PREFIX="${RC_REGISTRY_PREFIX}"
+  else
+    A2A_IMAGE_PREFIX="${AR_REPO}"
+  fi
+  A2A_GATEWAY_URI="${A2A_IMAGE_PREFIX}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
+  A2A_CALLOUT_URI="${A2A_IMAGE_PREFIX}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
+  A2A_WORKER_URI="${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
+  A2A_VERIFIER_URI="${A2A_IMAGE_PREFIX}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
+  A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
+  A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
+  A2A_OPERATOR_ENV_ARGS=(
+    --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
+    --set-string "operator.extraEnv[1].name=${A2A_CALLOUT_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
+    --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
+    # The verifier is on the request path: unoverridden it stays on a
+    # private dev registry a leased eval project cannot pull, the Deployment
+    # never comes up, and every executor refuses every task -- an eval that
+    # reads as a broken product rather than a missing override.
+    --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
+    --set-string "operator.extraEnv[4].name=${A2A_CONSOLE_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[4].value=${A2A_CONSOLE_URI}"
+    --set-string "operator.extraEnv[5].name=${A2A_INJECT_BACKEND_ENV_VAR}"
+    --set-string "operator.extraEnv[5].value=${A2A_INJECT_BACKEND_ON}"
+    # The rendered bridge: its image and the concurrency section 2b admitted
+    # (the TASKS budget reads the same value). No executor: the lane runs
+    # the bridge's default, api.
+    --set-string "operator.extraEnv[6].name=${A2A_BRIDGE_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
+    --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
+    --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
+  )
+fi
+
 # Skipped whole on the release-candidate path: the candidate's images are what
 # is being evaluated, and a rebuild from the same source is a different artefact
 # — different base-image digests, different build timestamps, and a different
@@ -1326,6 +1379,9 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # a rebuild would not be grading the thing the release ships.
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
+  if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+  fi
 else
   STEP_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, sandbox, operator) ==="
@@ -1343,56 +1399,13 @@ else
   export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
   # Under EVAL_MODE_NEXT=1 the same build also produces the four first-party
   # A2A images and the Hermes bridge sidecar, in its `a2a` and `a2a-bridge`
-  # steps; with the
+  # steps, at the references named at the top of this step; with the
   # substitutions absent that step is a no-op and the build is the four-image
   # one above. Empty otherwise, so the command below is byte-for-byte what it
-  # was. The references go to the operator through operator.extraEnv
-  # in step 5: the operator reads its A2A image overrides from its own
-  # environment; without them it would derive the same five A2A references
-  # from its own image and the bridge's from the agent's (both are this
-  # build's, under the same repository and tag), so the overrides are belt and braces that keep the
-  # deploy's inputs explicit and byte-pinned by the tests. The same
-  # value list arms the gateway's inject door, which the operator likewise
-  # reads from its own environment and never from the CR (a2aInjectBackendEnvVar
-  # says why): without it there is no Service for the eval's transport to
-  # reach. The bridge's reference goes to the operator the same way, with its
-  # concurrency: the operator renders the bridge sidecar into the agent pod
-  # under next and reads both from its environment. Its executor is left to
-  # the bridge's default (BRIDGE_EXECUTOR_EXPECTED).
+  # was.
   A2A_BUILD_SUBSTITUTIONS=""
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_GATEWAY_URI="${AR_REPO}/${A2A_GATEWAY_IMAGE_NAME}:${TAG}"
-    A2A_CALLOUT_URI="${AR_REPO}/${A2A_CALLOUT_IMAGE_NAME}:${TAG}"
-    A2A_WORKER_URI="${AR_REPO}/${A2A_WORKER_IMAGE_NAME}:${TAG}"
-    A2A_VERIFIER_URI="${AR_REPO}/${A2A_VERIFIER_IMAGE_NAME}:${TAG}"
-    A2A_CONSOLE_URI="${AR_REPO}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
-    A2A_BRIDGE_URI="${AR_REPO}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
     A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI}"
-    A2A_OPERATOR_ENV_ARGS=(
-      --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
-      --set-string "operator.extraEnv[1].name=${A2A_CALLOUT_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[1].value=${A2A_CALLOUT_URI}"
-      --set-string "operator.extraEnv[2].name=${A2A_WORKER_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[2].value=${A2A_WORKER_URI}"
-      # The verifier is on the request path: unoverridden it stays on a
-      # private dev registry a leased eval project cannot pull, the Deployment
-      # never comes up, and every executor refuses every task -- an eval that
-      # reads as a broken product rather than a missing override.
-      --set-string "operator.extraEnv[3].name=${A2A_VERIFIER_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[3].value=${A2A_VERIFIER_URI}"
-      --set-string "operator.extraEnv[4].name=${A2A_CONSOLE_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[4].value=${A2A_CONSOLE_URI}"
-      --set-string "operator.extraEnv[5].name=${A2A_INJECT_BACKEND_ENV_VAR}"
-      --set-string "operator.extraEnv[5].value=${A2A_INJECT_BACKEND_ON}"
-      # The rendered bridge: its image and the concurrency section 2b admitted
-      # (the TASKS budget reads the same value). No executor: the lane runs
-      # the bridge's default, api.
-      --set-string "operator.extraEnv[6].name=${A2A_BRIDGE_IMAGE_ENV_VAR}"
-      --set-string "operator.extraEnv[6].value=${A2A_BRIDGE_URI}"
-      --set-string "operator.extraEnv[7].name=${A2A_BRIDGE_CONCURRENCY_ENV_VAR}"
-      --set-string "operator.extraEnv[7].value=${MODE_NEXT_BRIDGE_CONCURRENCY}"
-    )
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier and console images and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without

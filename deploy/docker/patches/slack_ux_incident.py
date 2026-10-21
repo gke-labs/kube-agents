@@ -18,7 +18,9 @@ edited into the report's "What's wrong" sentence, one button per option, the
 links on the report's 🔗 line as link buttons, and the report, up to its
 first divider, in a collapsed fold, rendered by the Slack plugin's own ``block_kit.render_blocks``,
 the renderer the threaded reply goes through when the adapter sends rich
-blocks. The message's ``text`` is the headline, the choices and then the
+blocks. A declared next step (the report's last ``[next: ...]`` line,
+``slack_moments.visible_text``) is left out of all of it: the options are the
+alert's buttons. The message's ``text`` is the headline, the choices and then the
 whole report, because the adapter reads a thread back from ``text`` and
 top-level blocks, never a fold's. That holds on a cold read of the thread
 only: a session already open on it fetches at most the newer replies, which
@@ -87,6 +89,10 @@ try:
     import slack_presenter as _presenter
 except ImportError:  # the scripts directory is not on PYTHONPATH
     _presenter = None
+try:
+    import slack_moments as _moments
+except ImportError:  # the scripts directory is not on PYTHONPATH
+    _moments = None
 try:
     import chat_message as _chat
 except ImportError:  # the scripts directory is not on PYTHONPATH, or predates it
@@ -571,7 +577,12 @@ def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) ->
         result = getattr(task, "result", None)
         if not actionable_report(result):
             return adapter
-        report = clip_handoff(str(result).strip(), RESULT_LIMIT)
+        report = str(result).strip()
+        if _moments is not None:
+            # A declared next step is never shown; the alert's options are its buttons. Taken off
+            # before the clip, which could otherwise leave a cut fragment of the line.
+            report = _moments.visible_text(report) or report
+        report = clip_handoff(report, RESULT_LIMIT)
         if len(report) > FOLD_TEXT_MAX:
             return adapter
         chat_id = str(sub.get("chat_id") or "").strip()

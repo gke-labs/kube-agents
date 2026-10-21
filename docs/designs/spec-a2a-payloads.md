@@ -412,7 +412,7 @@ calls and become properties of the stream:
 ### Reserved artifact names
 
 Added 8/24, ratified with the subagent framework. `artifact-update` payloads name their
-artifact, and eight names are reserved so renderers and audit tooling can rely on them:
+artifact, and nine names are reserved so renderers and audit tooling can rely on them:
 
 | Name       | Content                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -424,9 +424,30 @@ artifact, and eight names are reserved so renderers and audit tooling can rely o
 | `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                                                                                                                                      |
 | `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                                                                                                                               |
 | `handoff`  | The task handed work to kanban cards, which report into its conversation themselves: one TextPart, `cards`. The Hermes bridge's API executor publishes it ahead of the terminal of such a task whenever the conversation route was recorded (Slack or Google Chat). Never rendered; a delegated child's wake reads it as the cards-pending signal beside the terminal's mark, which the bridge sets only on Slack with `KAGE_SLACK_UX` on (#3258). Reserved 10/16 |
+| `usage`    | What the task's turns cost: one `data` part per finished turn, published by the executor before the turn's answer settles and never after the terminal. The object carries `model`, `inputTokens`, `outputTokens`, `costUsd` and `durationMs`, every one optional (below). Readers tolerate its absence and sum a task's parts; a reserved-name validator takes a part only when it is a usage object. Reserved 10/20                                             |
 
 Artifact names are data, so the set can grow without touching the envelope; only these
-eight carry reserved semantics. An `activity` entry is one `data` part whose object carries
+nine carry reserved semantics. A `usage` part is one turn's figures as its producer had them:
+`model` is the model the executor asked for or was told it ran; `inputTokens` is every token the
+model read for the turn, cached reads included, and `outputTokens` every token it wrote;
+`durationMs` is the turn's wall time as the producer measured it. `costUsd` is the producer's
+own estimate for that turn alone and is carried only when the producer had a figure it did not
+invent: a harness that prices its own turns, never Hermes behind the inference gateway, which
+records no price for a turn (`docs/site/src/content/docs/deploy/telemetry.md`), so the
+hermes-bridge omits it and a cost reader turns to the gateway's `litellm_spend_metric_total`. The
+worker adapter's harness reports a running total (`total_cost_usd`) across every result line of
+the process, a resumed session's earlier spend included, so the adapter publishes the difference
+between consecutive lines. A reused pod carries the total its previous run last read into the
+next run, so a resumed session's first line prices its own turn; only a resumed session the pod
+holds no baseline for omits the cost on its first line, where nothing says how much of the total
+is this turn's. A zero is "not known" and is omitted, so a reader never mistakes unknown for
+free, and a part with no figure at all is not published; the bridge's CLI executor, which sees
+no token counts, publishes the wall time alone. A turn that ran and failed still publishes what
+it read: the adapter on an errored result line, the bridge on a turn the API server answered as
+failed (a 200 with Hermes's failure verdict, with its counts, or a 5xx, with the wall time alone)
+or a CLI run that exited on its own; a request the server refused before a turn ran (a 4xx), or a
+turn killed by a cancel, the deadline or a shutdown, has no figure and publishes none. Telemetry
+a producer cannot read is dropped field by field with one log line per turn, never the turn. An `activity` entry is one `data` part whose object carries
 `tool`, `input` when the call had one, and may carry `callId`, `status` (`completed`, `error`,
 `interrupted` for a call still open at the terminal, or `truncated` on the one entry an executor
 publishes in place of the calls missing from the trace: past its budget, failed to publish,

@@ -18825,6 +18825,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
                 held=carried,
                 held_overflow=held_overflow,
                 held_carried=carried_without_manifest,
+                new_ids=new_marked,
                 blocked_by=blocked_by,
                 file_url=file_url,
                 file_ref=file_ref,

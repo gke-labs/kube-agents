@@ -100,7 +100,7 @@ _LARGEST_SURGING_REQUEST_MILLIS = 100
 _OPERATOR_REQUEST_MILLIS = 10
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
-_OPERATOR_STORAGE_BYTES = 22 * 1024**3
+_OPERATOR_STORAGE_BYTES = 102 * 1024**3
 # hindsight.postgresql.storage, the volumeClaimTemplate the StatefulSet renders.
 _HINDSIGHT_STORAGE_BYTES = 8 * 1024**3
 # A memory quota written in decimal SI. 1G is 1,000,000,000 bytes, which is a whole number
@@ -118,7 +118,7 @@ _EPHEMERAL_SET_GIB = 3
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
 # next install, to be reused by name rather than created again.
 _RETAINED_PVC_COUNT = 2
-_RETAINED_STORAGE_GIB = 11
+_RETAINED_STORAGE_GIB = 51
 _MILLICORES_PER_CORE = 1000
 # The credential proxy's footprint.yaml entry (the operator's defaults), and an override
 # of the one key an install raises (#2324). The preflight merges the override over the
@@ -1157,7 +1157,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small storage shorthand quota must fail")
         self.assertIn("  - storage:", res.stderr)
-        self.assertIn('"storage":"22Gi"', res.stderr)
+        self.assertIn('"storage":"102Gi"', res.stderr)
 
     def test_the_install_patch_for_claims_does_not_double_count_retained_used(self) -> None:
         """Retained claims sitting in `used` on install must not double the suggested patch."""
