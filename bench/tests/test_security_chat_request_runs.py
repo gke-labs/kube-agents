@@ -240,6 +240,33 @@ def test_collector_run_with_gaps_errors_when_uncredited():
         assert not res.success
         assert res.status == "error"
         assert "the worker-trajectory capture was partial (card_2 unread session store)" in res.reason
-        assert "collect.py" in res.reason
+        assert "collect.py not seen in what was read" in res.reason
+    finally:
+        transcript.clear()
+
+
+def test_collector_run_with_gaps_errors_when_run_failed():
+    cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
+    traj_failed = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": cmd},
+            "result": '{"output": "failed", "exit_code": 1}',
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj_failed, worker_commands=[{"task": "t_1", "command": cmd}], worker_capture_gaps=["card_2 unread session store"])
+    try:
+        res = WorkerCommandsVerifier(**_check(COLLECTOR_CHECK)).verify(5.0)
+        assert not res.success
+        assert res.status == "error"
+        assert "the worker-trajectory capture was partial (card_2 unread session store)" in res.reason
+        assert (
+            "collect.py ran but exited non-zero (or its exit was not recorded); "
+            "a retry may sit in the unread part (card_2 unread session store)"
+        ) in res.reason
     finally:
         transcript.clear()

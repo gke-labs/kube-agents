@@ -2792,17 +2792,30 @@ class WorkerCommandsVerifier(BaseVerifier):
                     f"across {len(commands)} command(s){exempted}{sources}"
                 )
             if self.after_result_pattern is None and partial:
+                gaps_str = "; ".join(snap.worker_capture_gaps or ())
                 unrun_missing_reported = [r for r in unrun_missing if not r.succeeded]
-                unrun_failed_reported = []
+                if unrun_missing_reported:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
+                    parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                if unrun_failed:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                    parts.append(
+                        f"{named} ran but exited non-zero (or its exit was not recorded); "
+                        f"a retry may sit in the unread part ({gaps_str})"
+                    )
+                filtered_unseen = [r for r in [*unrun_missing, *traj_missing] if r.succeeded]
+                if filtered_unseen:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in filtered_unseen)
+                    parts.append(f"{named} not seen in what was read")
             else:
                 unrun_missing_reported = unrun_missing
                 unrun_failed_reported = unrun_failed
-            if unrun_missing_reported:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
-            if unrun_failed_reported:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
-                parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                if unrun_missing_reported:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
+                    parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                if unrun_failed_reported:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
+                    parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -2829,10 +2842,21 @@ class WorkerCommandsVerifier(BaseVerifier):
                 unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
                 reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + window
             else:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in uncredited_succeeded)
+                details = []
+                if unrun_failed:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                    details.append(
+                        f"{named} ran but exited non-zero (or its exit was not recorded); "
+                        f"a retry may sit in the unread part ({gaps_str})"
+                    )
+                unseen_succeeded = [r for r in [*unrun_missing, *traj_missing] if r.succeeded]
+                if unseen_succeeded:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unseen_succeeded)
+                    details.append(f"{named} not seen in what was read")
                 reason = (
                     f"the worker-trajectory capture was partial ({gaps_str}), "
-                    f"so required run(s) requiring success ({named}) could not be verified"
+                    f"so required run(s) requiring success could not be verified: "
+                    + "; ".join(details)
                 )
             return VerificationResult(
                 success=False,

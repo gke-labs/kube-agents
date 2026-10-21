@@ -8617,6 +8617,35 @@ def test_worker_commands_required_run_succeeded_flag():
     assert "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_unrun_missing.reason
     assert "could not be verified" in res_gap_unrun_missing.reason
     assert "fleet_upgrade_report.py --readiness" in res_gap_unrun_missing.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_unrun_missing.reason
+
+    # Run in unrun_failed (trajectory captured non-zero exit) beside capture gaps yields status="error"
+    # and names that it ran but exited non-zero and that a retry may sit in the unread part.
+    traj_failed = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"},
+            "result": '{"output": "boom", "exit_code": 1}',
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set(
+        "ok",
+        traj_failed,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_unrun_failed = v.verify(5.0)
+    assert res_gap_unrun_failed.status == "error"
+    assert "the worker-trajectory capture was partial (card_1 unread session store)" in res_gap_unrun_failed.reason
+    assert "could not be verified" in res_gap_unrun_failed.reason
+    assert (
+        "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded); "
+        "a retry may sit in the unread part (card_1 unread session store)"
+    ) in res_gap_unrun_failed.reason
 
     # Card-log required pattern miss beside capture gaps yields conclusive failure (status="fail").
     v_with_pattern = WorkerCommandsVerifier(
@@ -8644,6 +8673,7 @@ def test_worker_commands_required_run_succeeded_flag():
     res_gap_uncredited_card_miss = v_with_pattern.verify(5.0)
     assert res_gap_uncredited_card_miss.status == "fail"
     assert "no worker command matched required pattern(s)" in res_gap_uncredited_card_miss.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_uncredited_card_miss.reason
 
     # Conclusive card-log unrun required_run (succeeded: false) miss beside an uncredited succeeded: true run and capture gaps yields conclusive failure (status="fail").
     v_with_unrun_fail = WorkerCommandsVerifier(
@@ -8653,6 +8683,23 @@ def test_worker_commands_required_run_succeeded_flag():
     res_gap_uncredited_unrun_fail = v_with_unrun_fail.verify(5.0)
     assert res_gap_uncredited_unrun_fail.status == "fail"
     assert "no worker command ran other_missing.py across 1 command(s)" in res_gap_uncredited_unrun_fail.reason
+    assert "fleet_upgrade_report.py --readiness not seen in what was read" in res_gap_uncredited_unrun_fail.reason
+
+    # Conclusive pattern miss beside an unrun_failed succeeded: true run and capture gaps yields conclusive failure (status="fail")
+    # and qualifies the failed run rather than dropping it silently.
+    transcript.set(
+        "ok",
+        traj_failed,
+        worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}],
+        worker_capture_gaps=["card_1 unread session store"],
+    )
+    res_gap_failed_card_miss = v_with_pattern.verify(5.0)
+    assert res_gap_failed_card_miss.status == "fail"
+    assert "no worker command matched required pattern(s)" in res_gap_failed_card_miss.reason
+    assert (
+        "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded); "
+        "a retry may sit in the unread part (card_1 unread session store)"
+    ) in res_gap_failed_card_miss.reason
 
     # Without succeeded=True (default False), card log alone is credited.
     run_any = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"])
