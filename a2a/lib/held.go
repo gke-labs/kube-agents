@@ -174,8 +174,14 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 	if len(cfg.Subjects) > 0 {
 		return nil, fmt.Errorf("SubscribeHeld binds one intake subject; set Subject, not Subjects")
 	}
-	if addressee := intakeAddressee(cfg.Subject); addressee != "" && addressee != "*" && cfg.Session != addressee {
-		return nil, fmt.Errorf("SubscribeHeld: Session %q is not the intake's addressee %q; the session filter would drop every task", cfg.Session, addressee)
+	// A held durable is one profile's intake, `a2a.tasks.<profile>.*.in`, and
+	// the session filter acks away anything addressed elsewhere. On a durable
+	// every worker shares, that ack consumes the task for all of them, so the
+	// addressee must be a literal equal to Session: no wildcard, no `>`.
+	if addressee := intakeAddressee(cfg.Subject); addressee == "" || strings.ContainsAny(addressee, "*>") {
+		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.*.in)", cfg.Subject)
+	} else if cfg.Session != addressee {
+		return nil, fmt.Errorf("SubscribeHeld: Session %q is not the intake's addressee %q; the session filter would ack every task away", cfg.Session, addressee)
 	}
 	hctx, cancel := context.WithCancel(context.Background())
 	h := &heldState{c: c, handler: handler, ctx: hctx, cancel: cancel,
@@ -203,7 +209,7 @@ type heldSubscription struct {
 }
 
 func (hs *heldSubscription) Stop()                          { hs.s.Stop() }
-func (hs *heldSubscription) StopIntake()                    { hs.s.stopIntake(); hs.s.unregister() }
+func (hs *heldSubscription) StopIntake()                    { hs.s.stopIntake() } // still registered, so Close can cancel a straggler
 func (hs *heldSubscription) Wait(ctx context.Context) error { return hs.h.wait(ctx) }
 
 // heldState is a durableSub's held-mode half. nil on an auto-ack sub.
@@ -268,16 +274,19 @@ func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
 		seq, delivered, received = md.Sequence.Stream, md.NumDelivered, md.Timestamp
 	}
 	h.mu.Lock()
-	if h.closed {
-		h.mu.Unlock()
-		_ = msg.Nak()
-		return
-	}
-	if d, ok := h.live[seq]; ok && seq != 0 {
+	// A redelivery of a message this process still holds is adopted, even
+	// while draining: the handler is running and will dispose of it. One whose
+	// holder Nak'd it is a new delivery, since this process let it go.
+	if d, ok := h.live[seq]; ok && seq != 0 && !d.released() {
 		// Release h.mu first: adopt takes d.mu, and a heartbeat holding d.mu
 		// can be waiting on the client lock behind Close, which waits on h.mu.
 		h.mu.Unlock()
 		d.adopt(msg.Reply(), delivered)
+		return
+	}
+	if h.closed {
+		h.mu.Unlock()
+		_ = msg.Nak()
 		return
 	}
 	d := &heldDelivery{c: h.c, subject: msg.Subject(), reply: msg.Reply(), env: env,
@@ -289,7 +298,7 @@ func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
 	h.mu.Unlock()
 
 	go func() {
-		defer h.done(seq)
+		defer h.done(seq, d)
 		stopBeat := d.heartbeat(h.beat)
 		defer stopBeat()
 		h.handler(h.ctx, d)
@@ -301,10 +310,12 @@ func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
 	}()
 }
 
-func (h *heldState) done(seq uint64) {
+func (h *heldState) done(seq uint64, d *heldDelivery) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if seq != 0 {
+	// Only if it is still this delivery's: after a Nak a redelivery of the
+	// same sequence may have started a new handler under that key.
+	if seq != 0 && h.live[seq] == d {
 		delete(h.live, seq)
 	}
 	h.running--
@@ -347,7 +358,16 @@ type heldDelivery struct {
 	reply     string // the latest delivery's ack subject
 	delivered uint64
 	disposed  bool   // a disposition reached the connection
-	last      []byte // that disposition, re-sent if the message comes back
+	last      []byte // that disposition, re-sent if an Ack or Term is lost
+	nakd      bool   // the disposition was a Nak: this process let it go
+}
+
+// released reports whether the holder gave the message back with a Nak, so
+// a redelivery of it is a new delivery rather than one to adopt.
+func (d *heldDelivery) released() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.nakd
 }
 
 func (d *heldDelivery) Envelope() *Envelope { return d.env }
@@ -377,8 +397,8 @@ func (d *heldDelivery) adopt(reply string, delivered uint64) {
 	defer d.mu.Unlock()
 	d.reply = reply
 	d.delivered = delivered
-	if d.disposed && d.last != nil {
-		_ = d.publish(nc, d.last)
+	if d.disposed && d.last != nil && !d.nakd {
+		_ = d.publish(nc, d.last) // an Ack or Term the server never got
 	}
 }
 
@@ -397,6 +417,7 @@ func (d *heldDelivery) dispose(body []byte) error {
 		return err
 	}
 	d.disposed, d.last = true, body
+	d.nakd = strings.HasPrefix(string(body), "-NAK")
 	return nil
 }
 

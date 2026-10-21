@@ -279,33 +279,17 @@ func TestHeldDeliveryCarriesTheIngestTime(t *testing.T) {
 	}
 }
 
-// The session filter still applies: an envelope addressed to another session
-// is not handed to the handler.
-func TestHeldDeliveryKeepsTheSessionFilter(t *testing.T) {
+// A held durable is one profile's intake. A wildcard or `>` addressee is
+// refused: the session filter would ack other addressees' tasks off the
+// durable every worker shares, consuming them for all.
+func TestSubscribeHeldRefusesAnIntakeThatIsNotOneProfiles(t *testing.T) {
 	h, worker := newHeldHarness(t, "mine")
-	var got atomic.Int32
-	cfg := h.cfg()
-	cfg.Subject = "a2a.tasks.*.*.in"
-	if err := h.req.EnsureHeldConsumer(h.ctx, HeldConsumerConfig{
-		Stream: cfg.Stream, Durable: cfg.Durable, FilterSubject: cfg.Subject, MaxAckPending: 2,
-	}); err != nil {
-		t.Fatalf("EnsureHeldConsumer: %v", err)
-	}
-	sub, err := worker.SubscribeHeld(h.ctx, cfg, func(_ context.Context, d Delivery) {
-		got.Add(1)
-		_ = d.Ack()
-	})
-	if err != nil {
-		t.Fatalf("SubscribeHeld: %v", err)
-	}
-	defer sub.Stop()
-	h.submit("task-mine")
-	other := &heldHarness{t: t, ctx: h.ctx, req: h.req, profile: "theirs"}
-	other.submit("task-theirs")
-	waitFor(t, 5e9, "the addressed task delivered", func() bool { return got.Load() >= 1 })
-	time.Sleep(500 * time.Millisecond)
-	if n := got.Load(); n != 1 {
-		t.Errorf("handler ran %d times, want 1 (the other session's envelope must be filtered)", n)
+	for _, subject := range []string{"a2a.tasks.*.*.in", "a2a.tasks.mine.>", "a2a.tasks.>", "a2a.tasks.mine.task.events"} {
+		cfg := h.cfg()
+		cfg.Subject = subject
+		if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil {
+			t.Errorf("SubscribeHeld accepted %q, which is not one profile's intake", subject)
+		}
 	}
 }
 
@@ -755,5 +739,130 @@ func TestSubscribeHeldRefusesAServerDefaultDurable(t *testing.T) {
 	if _, err := worker.SubscribeHeld(short, c, func(context.Context, Delivery) {}); err == nil ||
 		!strings.Contains(err.Error(), "EnsureHeldConsumer") {
 		t.Errorf("bound a server-default durable: %v", err)
+	}
+}
+
+// StopIntake leaves the subscription registered, so Close still cancels a
+// handler that outlives the drain's Wait.
+func TestCloseCancelsAStragglerAfterStopIntake(t *testing.T) {
+	h, worker := newHeldHarness(t, "straggler")
+	h.ensure(1, 0)
+	started := make(chan struct{})
+	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		close(started)
+		<-ctx.Done()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	h.submit("task-straggler")
+	<-started
+	sub.StopIntake()
+	short, cancel := context.WithTimeout(h.ctx, 200*time.Millisecond)
+	defer cancel()
+	if err := sub.Wait(short); err == nil {
+		t.Fatal("Wait returned with a handler still blocked")
+	}
+	worker.Close()
+	wctx, wcancel := context.WithTimeout(h.ctx, 5*time.Second)
+	defer wcancel()
+	if err := sub.Wait(wctx); err != nil {
+		t.Errorf("after StopIntake and Close the straggler was not cancelled: %v", err)
+	}
+}
+
+// fakeMsg is a jetstream.Msg with a chosen stream sequence, for driving
+// dispatch directly; it records what the lib did with it.
+type fakeMsg struct {
+	seq, delivered uint64
+	reply          string
+	naks           atomic.Int32
+}
+
+func (m *fakeMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return &jetstream.MsgMetadata{Sequence: jetstream.SequencePair{Stream: m.seq}, NumDelivered: m.delivered}, nil
+}
+func (m *fakeMsg) Data() []byte                     { return nil }
+func (m *fakeMsg) Headers() nats.Header             { return nil }
+func (m *fakeMsg) Subject() string                  { return "a2a.tasks.p.t.in" }
+func (m *fakeMsg) Reply() string                    { return m.reply }
+func (m *fakeMsg) Ack() error                       { return nil }
+func (m *fakeMsg) DoubleAck(context.Context) error  { return nil }
+func (m *fakeMsg) Nak() error                       { m.naks.Add(1); return nil }
+func (m *fakeMsg) NakWithDelay(time.Duration) error { m.naks.Add(1); return nil }
+func (m *fakeMsg) InProgress() error                { return nil }
+func (m *fakeMsg) Term() error                      { return nil }
+func (m *fakeMsg) TermWithReason(string) error      { return nil }
+
+func newBareHeld(t *testing.T, handler func(context.Context, Delivery)) *heldState {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return &heldState{c: &Client{}, handler: handler, ctx: ctx, cancel: cancel,
+		live: map[uint64]*heldDelivery{}, changed: make(chan struct{}), ackWait: time.Minute}
+}
+
+// A redelivery of a message a handler is still running is adopted even after
+// intake stops: the drain's handler will dispose of it, so giving it back
+// would let another worker fail a task this one completes.
+func TestARedeliveryDuringTheDrainIsAdoptedNotGivenBack(t *testing.T) {
+	var starts atomic.Int32
+	release := make(chan struct{})
+	h := newBareHeld(t, func(_ context.Context, _ Delivery) { starts.Add(1); <-release })
+	defer close(release)
+	h.dispatch(&fakeMsg{seq: 7, delivered: 1, reply: "r1"}, &Envelope{})
+	waitFor(t, 2e9, "the handler running", func() bool { return starts.Load() == 1 })
+	h.stopIntake()
+	redelivery := &fakeMsg{seq: 7, delivered: 2, reply: "r2"}
+	h.dispatch(redelivery, &Envelope{})
+	if n := redelivery.naks.Load(); n != 0 {
+		t.Fatalf("the redelivery of a running task was Nak'd during the drain (%d)", n)
+	}
+	h.mu.Lock()
+	d := h.live[7]
+	h.mu.Unlock()
+	if d == nil || d.reply != "r2" || d.NumDelivered() != 2 {
+		t.Errorf("the redelivery was not adopted by the running handler")
+	}
+	if n := starts.Load(); n != 1 {
+		t.Errorf("%d handlers started, want 1", n)
+	}
+}
+
+// After a holder Naks its message, a redelivery of it is a new delivery: it
+// starts a handler, and the first handler's exit doesn't clear the new one's
+// entry. (Nak publishes on the client's connection, so this needs a real one.)
+func TestARedeliveryAfterANakStartsAHandler(t *testing.T) {
+	s := startServer(t)
+	c, err := Connect(testCtx(t), clientURL(s))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(c.Close)
+	var starts atomic.Int32
+	nakd := make(chan struct{})
+	release := make(chan struct{})
+	h := newBareHeld(t, func(_ context.Context, d Delivery) {
+		if starts.Add(1) == 1 {
+			_ = d.Nak(0)
+			close(nakd)
+			<-release // still running after its Nak
+		}
+	})
+	h.c = c
+	h.dispatch(&fakeMsg{seq: 9, delivered: 1, reply: "r1"}, &Envelope{})
+	<-nakd
+	h.dispatch(&fakeMsg{seq: 9, delivered: 2, reply: "r2"}, &Envelope{})
+	waitFor(t, 2e9, "a second handler after the Nak", func() bool { return starts.Load() == 2 })
+	close(release)
+	waitFor(t, 2e9, "both handlers gone", func() bool {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.running == 0
+	})
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.live) != 0 {
+		t.Errorf("%d live entries left after both handlers returned", len(h.live))
 	}
 }
