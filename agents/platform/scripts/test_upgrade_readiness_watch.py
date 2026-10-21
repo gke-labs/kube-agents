@@ -1925,6 +1925,39 @@ class DeclaredScope(Base):
                     code, out = self.run_tick(FakeSandbox(versions, readiness))
                     self.assertEqual((code, out.strip()), (0, ""))
 
+    def test_a_ledger_the_failed_tick_cannot_reread_does_not_replace_its_failure(self) -> None:
+        """The report write fails after the table filed p2 as outside; the ledger the
+        failure handler re-reads is one this process rejects. The write failure, with
+        its own exit, is what the tick reports."""
+        versions = envelope([member("a", "lagging")])
+        readiness = envelope([member("a", "lagging", readiness="ready")])
+        resolved = {"id": "folders/123456789012", "outcome": "ok", "projects": 0}
+        real_load = watch.load_ledger
+        reads = []
+
+        def load(path):
+            reads.append(path)
+            if len(reads) > 1:
+                raise RuntimeError("the ledger is not valid JSON; refusing to overwrite it")
+            return real_load(path)
+
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}):
+            self.declare_scope(["p1"], containers=[resolved])
+            with mock.patch.object(watch, "write_report", side_effect=OSError("disk full")), mock.patch.object(watch, "load_ledger", side_effect=load):
+                code, out = self.run_tick(FakeSandbox(versions, readiness))
+        self.assertEqual(len(reads), 2, "the tick's read, then the handler's")
+        self.assertEqual((code, out.strip()), (watch.WRITE_FAILED_EXIT, "upgrade readiness watch: writing the ledger or the report failed: disk full"))
+
+    def test_a_refusal_after_another_refusal_on_stderr_names_its_own_project(self) -> None:
+        """One line per refused id, a number's ahead of an id's: the project is the
+        id the second line names, never a span running across the first."""
+        label = "(declared scope: fleet_scope): "
+        stderr = (
+            label + fleet_scope_args.PROJECT_NUMBER_UNRESOLVED_ERROR.format(number="123456789012") + "\n"
+            + label + fleet_scope_args.DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project="acme-prod", projects="mgmt") + "\n"
+        )
+        self.assertEqual(watch.refused_project(stderr), "acme-prod")
+
     def test_each_refusal_is_re_said_from_the_script_s_own_message_with_the_remedy_and_cause_it_has(self) -> None:
         label = "(declared scope: fleet_scope): "
         roster = "or take it out of the roster (its Cluster Agent profile, or UPGRADE_READINESS_PROJECTS)"
