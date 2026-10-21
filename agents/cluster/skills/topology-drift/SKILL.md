@@ -15,14 +15,14 @@ Noticing that replicas sit in one zone is only the first half of the diagnosis. 
 
 ## Step 1: Run `leeway report`
 
-Your `KUBECONFIG` is pre-pinned to your assigned cluster at profile creation (`AGENTS.md`). Run `leeway report` in JSON mode directly against that kubeconfig:
+Your `KUBECONFIG` is pre-pinned to your assigned cluster at profile creation (`AGENTS.md`). Run `leeway report --topology-tier-c-signals` directly against that kubeconfig (`leeway report` always outputs JSON (`leeway.report/v1alpha1`), and `--topology-tier-c-signals` includes unconstrained Tier C workloads alongside Tier A/B findings):
 
 ```bash
 # Scan a specific namespace:
-leeway report --namespace <namespace> --format json
+leeway report --topology-tier-c-signals --namespace <namespace>
 
-# Scan all non-system namespaces on the cluster:
-leeway report --format json
+# Scan all namespaces on the cluster:
+leeway report --topology-tier-c-signals
 ```
 
 If `leeway` is not installed in the current sandbox image (`! command -v leeway >/dev/null 2>&1`), collect the equivalent node-zone, pod-placement, controller-constraint, PVC, and scheduler-event evidence directly with read-only `kubectl` commands:
@@ -36,35 +36,39 @@ kubectl get storageclass -o yaml
 kubectl get events -n <namespace> --field-selector reason=FailedScheduling
 ```
 
-### Key Fields in `leeway report --format json`
+### Key Fields in `leeway report` (`leeway.report/v1alpha1`)
 
-- `zoneCount` and `nodeCount`: number of availability zones and nodes in the cluster (`nodes[]` lists each node's `zone`).
-- `zoneSkewScore` and `hostSkewScore`: cluster-wide topology health scores (`0`–`100`).
-- `workloads[]`: per-workload distribution for controllers with `replicas > 1`:
-  - `kind`, `namespace`, `name`, `replicas`, `readyReplicas`, `runningPods`, `pendingPods`
-  - `zoneCounts`: running pod count per `topology.kubernetes.io/zone`
-  - `zoneSkew`: difference between the most-populated and least-populated cluster zone (including `0` for cluster zones with no running pods of the workload)
-  - `zoneShares` and `maxZoneShare`: fraction of running pods in each zone (`maxZoneShare: 1.0` means `100%` of running replicas are lost if that single zone fails)
-  - `constraints`:
-    - `topologySpreadConstraints[]`: `topologyKey`, `maxSkew`, `whenUnsatisfiable`
-    - `hasNodeSelector`, `nodeSelector`
-    - `hasNodeAffinity`, `requiredZoneAffinityValues`, `preferredZoneAffinityValues`
-    - `volumeClaimStorageClasses`: `StorageClass` names referenced by `volumeClaimTemplates` or volumes
+Each `clusters[]` entry in the JSON report contains:
+
+- `cluster`, `source` (`gke:<project>/<location>/<cluster>`), and `status` (`ok` or `error`).
+- `domains["topology.kubernetes.io/zone"]`: map of cluster availability zones to `{nodes, ready, usable, allocatable_cpu_milli, allocatable_mem_bytes}`.
+- `topology_findings[]`: per-workload placement and skew findings (`subjects[]` is also populated when `--all` or `--min-drift` is passed):
+  - `kind` (`leeway.contract_violated`, `leeway.placement_drift`, `leeway.baseline_breach`, `leeway.domain_unavailable`), `tier` (`A`, `B`, `C`), and `severity` (`critical`, `warning`, `info`)
+  - `subject`: `{kind, namespace, name, replicas}`
+  - `topologyKey`: e.g. `topology.kubernetes.io/zone` or `kubernetes.io/hostname`
+  - `score`:
+    - `drift`: normalized placement drift score (`0.0`–`1.0`)
+    - `observedSkew`, `minAchievableSkew`, `excessSkew`, `relocationDistance`
+    - `maxDomainShare`: fraction of running pods concentrated in a single domain (`maxDomainShare: 1.0` means `100%` of running replicas are lost if that single zone fails)
+  - `domains[]`: per-zone breakdown with `domain`, `actual` (running pods), `expected`, `delta`, `readyNodes`, and `note`
+  - `intent`: `{source, confidence, weighting, maxSkew, evidence[]}` extracted from `topologySpreadConstraints`, pod anti-affinity, or cluster defaults
+  - `suspectedCause` (`schedule_anyway_soft`, `affinity_conflict`, `taint_blocked`, `resource_starvation`, `volume_topology_locked`, `node_count_asymmetry`, `daemonset_bound`, `unknown`) and `contributingFactors[]`
+  - `remediation`: `{kind, summary, yaml}` distinguishing `manifest_patch` from `storage_migration` and `capacity_action`
 
 ## Step 2: Attribute the Root Cause
 
-For every skewed workload (`zoneSkew > 1` or `maxZoneShare >= 0.8` on a multi-zone cluster), classify the root cause using `leeway report` and confirming `kubectl` reads:
+For every skewed workload (`score.observedSkew > 1` or `score.maxDomainShare >= 0.8` on a multi-zone cluster), classify the root cause using `leeway report` and confirming `kubectl` reads:
 
 1. **Scheduling Misconfiguration (e.g., `zone-pinned-api`):**
-   - `pendingPods == 0`, `runningPods == replicas`, `maxZoneShare == 1.0`.
-   - `constraints` shows `whenUnsatisfiable: "ScheduleAnyway"` and/or `requiredZoneAffinityValues` restricting placement to one zone.
+   - All replicas are `Running` in a single zone (`score.maxDomainShare == 1.0`, zero `Pending` pods).
+   - `suspectedCause` is `schedule_anyway_soft` or `affinity_conflict`, or the pod spec shows `whenUnsatisfiable: ScheduleAnyway` alongside a single-zone `nodeAffinity` / `nodeSelector`.
    - Recommend removing or widening the single-zone `nodeAffinity` / `nodeSelector` and tightening `whenUnsatisfiable` to `DoNotSchedule` when strict spread is required.
 2. **Zone-Pinned Storage (Volume) (e.g., `zone-bound-store`):**
-   - `StatefulSet` or PVC-backed workload with `volumeClaimStorageClasses` populated (e.g., `seeded-zonal-pd`), `pendingPods == 0`, and all pods in one zone.
+   - `StatefulSet` or PVC-backed workload with `suspectedCause: "volume_topology_locked"` (or `volumeClaimTemplates` referencing a zonal `StorageClass` such as `seeded-zonal-pd`), zero `Pending` pods, and all pods in one zone.
    - Confirm with `kubectl get pvc -n <namespace>` and `kubectl get storageclass <storage_class_name> -o yaml` whether `allowedTopologies` or zonal persistent disks bind the replicas to one zone.
    - Recommend storage migration or a regional `StorageClass` (not a pod-template spread constraint edit).
 3. **Node Capacity Starvation (e.g., `capacity-starved-worker`):**
-   - `pendingPods > 0` and `runningPods >= 1`, with running pods concentrated in the zone that still has headroom.
+   - `suspectedCause: "resource_starvation"` (or `Pending` pods coexist with `Running` pods concentrated in the zone that still has headroom).
    - Confirm with `kubectl describe pod <pending_pod_name> -n <namespace>` that `Pending` pods fail scheduling on `Insufficient cpu` or `Insufficient memory` in the starved zone.
    - Recommend adding capacity in the starved zone, rebalancing competing workloads, or right-sizing CPU/memory requests (not editing `topologySpreadConstraints`).
 

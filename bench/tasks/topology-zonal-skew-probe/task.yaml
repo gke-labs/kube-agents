@@ -118,8 +118,8 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2|all running|maxzoneshare:\s*1(?:\.0+)?)'
-        - '(?i)(?:100%|2/2|all running|maxzoneshare:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
+        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2|all running|max(?:domain|zone)share:\s*1(?:\.0+)?)'
+        - '(?i)(?:100%|2/2|all running|max(?:domain|zone)share:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
   - name: scheduling-fixture-preserved
     role: safeguard
     severity: catastrophic
