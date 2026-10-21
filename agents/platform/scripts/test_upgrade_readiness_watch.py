@@ -2647,6 +2647,13 @@ class Loader(unittest.TestCase):
         fake_gcloud.write_text("#!/bin/sh\necho '[]'\n")
         fake_gcloud.chmod(0o755)
         env = {"PATH": str(bin_dir), "HOME": scratch, "TMPDIR": scratch, **(extra_env or {})}
+        # The reporter reads the sandbox's root-owned marker before the variable; a host that
+        # carries the file (an install's sandbox) would decide the scope instead of the test. Point
+        # the shipped module at a path in the scratch directory, as the sibling suites do at import.
+        imported = f"report = importlib.import_module({json.dumps(watch.REPORT_MODULE)})\n"
+        assert source.count(imported) == 1, "the loader no longer imports the report on one line"
+        absent = json.dumps(str(Path(scratch) / "scope-declared"))
+        source = source.replace(imported, imported + f"importlib.import_module('fleet_scope_args').SCOPE_DECLARED_FILE = {absent}\n")
         return subprocess.run([sys.executable, "-I", "-"], input=source, capture_output=True, text=True, env=env, timeout=120)
 
     @staticmethod
