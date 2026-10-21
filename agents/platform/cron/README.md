@@ -370,13 +370,18 @@ engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
 with no comment or unblock since. A worker's or operator's block is sticky by
 design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked. Each such line carries the card's
-kind, reason and age, read from the board, and the `hermes kanban unblock` and
-`archive` commands, because the engine's JSON has neither the kind nor the
-reason and a line that names a stuck card without saying how to move it is a
-line the room learns to skip.
+weeks because nothing periodically asked. Cards are listed newest first, with
+their kind, reason, and age read from the board; where multiple cards share a
+title, they are grouped to keep the report readable, with task IDs and reasons
+retained. The `hermes kanban unblock` and `archive` commands appear once in a
+footer (using `<task_id>` when multiple cards are stuck) rather than repeated
+under every card, so the room knows how to move a card while long reports stay
+bounded within chat limits, summarizing any omitted cards by task ID up to
+the character budget (and falling back to a count and list command when omitted IDs
+exceed the limit).
 
 Daily, and it repeats: the rule is stateless, so a card still blocked is named
+(directly, or by task ID in the omitted list up to the budget)
 every morning until someone unblocks, comments on, or archives it. That is the
 intended nag, the same rule `findings-morning-nudge` keeps for the top
 criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a

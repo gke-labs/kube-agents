@@ -160,6 +160,9 @@ ADDED_AFTER_THE_MOVE = [
     "fleet-audit-reports-past-run",  # the report store's reader, PR #2115
     "platform-worker-refuses-shipped-skill-edit",  # skill governance, #1848
     "chat-voice-ack-names-target",  # the front door's delegation ack
+    "chat-sample-report-is-not-cluster-state",  # nothing filed on a sample report's say-so, #3080
+    "chat-sample-report-is-not-cluster-state-labelled",  # the same, with the patched adapter's label
+    "chat-real-report-fix-files-confirm-first",  # a real report still files at once, confirm-first
     "bootstrap-inventory-ranking-delivery",  # the onboarding prioritization stage, #2143
     "chat-question-wake-stays-silent",  # SOUL §2 step 5's already-posted rule
     "chat-question-typed-answer-fresh-session",  # a typed answer from a new thread session

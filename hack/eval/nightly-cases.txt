@@ -496,6 +496,17 @@
 # the card round trip.
 ./tasks/chat-voice-ack-names-target/task.yaml
 
+# The front door files nothing for a workload named only in a sample report the
+# bot once posted in the thread (#3080; agents/chat/SOUL.md §2, step 3).
+# deployer: noop, transcript-only, a single front-door turn and no card.
+./tasks/chat-sample-report-is-not-cluster-state/task.yaml
+# Its labelled twin: the same turn as the patched Slack adapter delivers it,
+# with the bot's own root marked "posted by you earlier" (#3080).
+./tasks/chat-sample-report-is-not-cluster-state-labelled/task.yaml
+# And the ordinary path the same rule must keep: a real report the bot posted,
+# "fix the first one", a card filed at once with a confirm-first criterion.
+./tasks/chat-real-report-fix-files-confirm-first/task.yaml
+
 # The onboarding prioritization stage (#2143): plants a fixed raw inventory
 # report on the install under test's shell sandbox, files the
 # bootstrap-inventory-prioritize card, and grades the findings its worker

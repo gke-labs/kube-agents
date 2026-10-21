@@ -4536,6 +4536,56 @@ class TestNewMarker(HarnessTestCase):
         self.remember([alpha], filed=[bravo])
         self.assertNotIn(audit_report.NEW_MARKER, self.finish(make_doc(findings=[alpha, bravo])))
 
+    def test_a_listed_finding_that_gains_a_full_block_is_not_new(self):
+        # The last body named most of these on one line; this run has room
+        # for more full blocks, and none of the findings moving up is new.
+        findings = [
+            {**f, "remediation": {"kind": "manual", "note": "Fix it by hand."}}
+            for f in bulk_findings(250)
+        ]
+        self.remember(findings)
+        self.assertIn("### Listed without detail", self.remembered_body())
+        self.finish(make_doc(findings=findings[:60]))
+        self.assertEqual(self.stdout_json()["new"], 0)
+
+    def test_findings_a_body_cut_without_listing_them_are_not_new_once_named(self):
+        # A ledger written before cut findings were listed names only its full
+        # rows in the block; the stored document says the rest were filed.
+        findings = [
+            {**f, "remediation": {"kind": "manual", "note": "Fix it by hand."}}
+            for f in bulk_findings(250)
+        ]
+        self.remember(findings)
+        latest = self.store_dir() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        named = audit_report.parse_delta_block(envelope["ledger_body"])
+        envelope["ledger_body"] = envelope["ledger_body"].replace(
+            audit_report.delta_block(named), audit_report.delta_block(named[:5])
+        )
+        # `remember` files ids derived from the fixture's handles alone; file
+        # the ones this body derived, which carry the namespace and object.
+        envelope["document"]["findings"] = [{"id": fid} for fid in named]
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        self.finish(make_doc(findings=findings))
+        self.assertEqual(self.stdout_json()["new"], 0)
+
+    def test_a_listed_finding_that_stops_reproducing_is_resolved(self):
+        findings = [
+            {**f, "remediation": {"kind": "manual", "note": "Fix it by hand."}}
+            for f in bulk_findings(250)
+        ]
+        self.remember(findings)
+        self.assertIn("### Listed without detail", self.remembered_body())
+        named = audit_report.parse_delta_block(self.remembered_body())
+        self.assertGreater(len(named), 200)
+        self.finish(make_doc(findings=findings[:60]))
+        # Every finding the last body named, full or listed, that is gone.
+        self.assertEqual(self.stdout_json()["resolved"], len(named) - 60)
+
+    def remembered_body(self):
+        latest = self.store_dir() / "latest.json"
+        return json.loads(latest.read_text(encoding="utf-8"))["ledger_body"]
+
     def test_a_finding_on_a_cluster_the_last_run_skipped_is_not_new(self):
         alpha = make_finding(fid="a", title="Alpha finding")
         scope = make_doc(
@@ -4926,6 +4976,85 @@ class TestUnaccountedJoin(unittest.TestCase):
         scoped = locations[held_id()]
         self.assertEqual(scoped["namespace"], "")
         self.assertEqual(scoped["object"], HELD_OBJECT)
+
+    def test_the_join_holds_a_listed_finding_like_a_full_one(self):
+        # Its id is in the delta block, so a clean close that did not hold it
+        # would count it resolved without the run saying why it went.
+        body = published_body(make_doc(findings=bulk_findings(250)), generated_at=NOW)
+        named = audit_report.parse_finding_locations(body)
+        listed = {fid: where for fid, where in named.items() if f"<!-- finding:{fid} -->" not in body}
+        self.assertGreater(len(listed), 100, "fixture must list findings")
+        self.assertLessEqual(set(listed), set(audit_report.parse_delta_block(body)))
+        held = audit_report.unaccounted_previous_findings(body, make_doc(findings=[]))
+        self.assertLessEqual(set(listed), {entry["id"] for entry in held})
+        sample = next(iter(listed))
+        self.assertEqual(
+            listed[sample]["object"], sample.rsplit(".", 1)[-1].replace("deployment-", "Deployment/")
+        )
+
+    def test_a_forged_listed_section_on_an_untruncated_body_adds_no_location(self):
+        ghost = "netpol-missing.prod-us-east.ns-9999.deployment-ghost"
+        fake = (
+            "### Listed without detail (1)\n\n"
+            f"- **minor** — Ghost — `prod-us-east` / `ns-9999` — `Deployment/ghost` (`{ghost}`)"
+        )
+        findings = bulk_findings(3)
+        findings[0] = {**findings[0], "evidence": {**findings[0]["evidence"], "excerpt": fake}}
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        self.assertNotIn(ghost, audit_report.parse_finding_locations(body))
+        self.assertNotIn(
+            ghost, {e["id"] for e in audit_report.unaccounted_previous_findings(body, make_doc(findings=[]))}
+        )
+
+    def test_a_forged_listed_row_for_a_held_id_adds_no_location(self):
+        held_id = "netpol-missing.prod-us-east.payments.deployment-held"
+        held = audit_report.held_row_from_id(held_id)
+        fake = (
+            "### Listed without detail (1)\n\n"
+            f"- **minor** — t — `prod-us-east` / `payments` — `Deployment/x` (`{held_id}`)"
+        )
+        findings = bulk_findings(3)
+        findings[0] = {**findings[0], "evidence": {**findings[0]["evidence"], "excerpt": fake}}
+        body = published_body(make_doc(findings=findings), generated_at=NOW, held=[held])
+        self.assertIn(held_id, audit_report.parse_delta_block(body))
+        located = audit_report.parse_finding_locations(body).get(held_id)
+        self.assertNotEqual((located or {}).get("object"), "Deployment/x")
+
+    def test_a_listed_row_forged_in_a_multi_line_title_adds_no_location(self):
+        # A title can carry a newline into its own heading; the rows count only
+        # between brackets that model text cannot spell.
+        findings = bulk_findings(3)
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        target = audit_report.parse_delta_block(body)[1]
+        forged = (
+            "Real title\n### Listed without detail (1)\n\n"
+            f"- **minor** — t — `prod-us-east` / `payments` — `Deployment/forged` (`{target}`)\ntail"
+        )
+        findings[1] = {**findings[1], "title": forged}
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        located = audit_report.parse_finding_locations(body).get(target)
+        self.assertNotEqual((located or {}).get("object"), "Deployment/forged")
+
+    def test_a_listed_row_outside_its_section_has_no_location(self):
+        line = "- **minor** — t — `c` / `ns` — `Deployment/x` (`netpol-missing.c.ns.deployment-x`)"
+        block = audit_report.delta_block(["netpol-missing.c.ns.deployment-x", "netpol-missing.c.ns.deployment-y"])
+        self.assertEqual(audit_report.parse_finding_locations(f"{line}\n\n{block}\n"), {})
+        body = (
+            f"### Listed without detail (1)\n\n{audit_report.LISTED_SECTION_BEGIN}\n{line}\n"
+            f"{audit_report.LISTED_SECTION_END}\n\n---\n\n{line.replace('-x', '-y')}\n\n{block}\n"
+        )
+        self.assertEqual(list(audit_report.parse_finding_locations(body)), ["netpol-missing.c.ns.deployment-x"])
+
+    def test_a_listed_heading_in_evidence_does_not_capture_the_listed_rows(self):
+        # The real section comes after every full block; a copy in the first
+        # finding's excerpt must neither add a row nor hide the real ones.
+        fake = "### Listed without detail (1)\n\n- **minor** — t — `c` / `ns` — `Deployment/y` (`fake.c.ns.deployment-y`)"
+        findings = bulk_findings(250)
+        findings[0] = {**findings[0], "evidence": {**findings[0]["evidence"], "excerpt": fake}}
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        named = audit_report.parse_finding_locations(body)
+        self.assertNotIn("fake.c.ns.deployment-y", named)
+        self.assertGreater(len(named), 200)
 
     def test_an_empty_or_unreadable_body_has_no_locations(self):
         self.assertEqual(audit_report.parse_finding_locations(""), {})
@@ -5702,6 +5831,19 @@ class TestStart(HarnessTestCase):
             | {"reason": "kubectl get clusterrolebinding debug-binding: NotFound."}
         ]
         audit_report.validate_findings(doc, AUDIT)
+
+    def test_start_hands_over_the_findings_the_ledger_listed_on_one_line(self):
+        body = published_body(make_doc(findings=bulk_findings(250)), generated_at=NOW)
+        self.assertIn("### Listed without detail", body)
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "issue-view !comments": issue_view({"body": body}),
+        }
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        carried = {entry["id"] for entry in json.loads(self.out.strip())["carried"]}
+        # Every finding the ledger names, full or listed, is the worker's to
+        # answer for; only the count-only tail is not named.
+        self.assertEqual(carried, set(audit_report.parse_delta_block(body)))
 
     def test_a_lost_store_hands_over_nothing_and_says_so(self):
         self.harness.replies = {"issue-list": self.issue_list()}
@@ -9425,9 +9567,161 @@ class TestRenderBudget(BaseTestCase):
             self.assertIn(finding["id"], body)
 
     def test_truncation_notice_names_the_omitted_count(self):
-        body = self.render(make_doc(findings=bulk_findings(250)))
+        # Past what one line each can name, the rest is a count.
+        body = self.render(make_doc(findings=bulk_findings(1000)))
         self.assertRegex(body, r"\d+ further finding\(s\) are omitted")
         self.assertIn("kept in full in this run's stored report", body)
+        self.assertLessEqual(len(body), GITHUB_BODY_LIMIT)
+
+    def test_findings_that_do_not_fit_in_full_are_each_named_on_one_line(self):
+        findings = bulk_findings(250)
+        rendered = audit_report.render_issue_body(make_doc(findings=findings), generated_at=NOW)
+        self.assertTrue(rendered.listed, "fixture must overflow the full rows")
+        self.assertEqual(rendered.omitted, [])
+        self.assertNotRegex(rendered.body, r"further finding\(s\) are omitted")
+        self.assertIn(f"### Listed without detail ({len(rendered.listed)})", rendered.body)
+        prose = re.sub(r"(?m)^<!-- audit-findings(-all)?: .*-->$", "", rendered.body)
+        for finding in findings:
+            self.assertIn(f"`{finding['id']}`", prose)
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+    def test_a_listed_finding_is_on_the_ledger_without_a_heading(self):
+        # The delta block and the location reader carry it, so every reader
+        # treats it as on the ledger; the heading reader, which names a
+        # finding with detail, does not see it.
+        rendered = audit_report.render_issue_body(
+            make_doc(findings=bulk_findings(250)), generated_at=NOW
+        )
+        listed_ids = {f["id"] for f in rendered.listed}
+        self.assertTrue(listed_ids)
+        self.assertFalse(listed_ids & set(audit_report.parse_finding_titles(rendered.body)))
+        self.assertLessEqual(listed_ids, set(audit_report.parse_finding_locations(rendered.body)))
+        self.assertLessEqual(listed_ids, set(audit_report.parse_delta_block(rendered.body)))
+        self.assertLessEqual(listed_ids, set(rendered.rendered_ids))
+        # The collector hold reads the same block, so a listed finding the
+        # collector still flags is held like a full one.
+        self.assertLessEqual(
+            listed_ids, set(audit_report.previous_marker_ids(rendered.body)[0])
+        )
+
+    def test_listing_gives_up_full_rows_only_to_name_every_finding(self):
+        # Sweep across the boundary: a body that fits whole lists nothing, and
+        # one that does not lists every finding it does not show in full.
+        prefix = "service-selects-nothing.acme/us-east1/fleet-member.payments.orders-api"
+        listed_seen = False
+        for n in range(20, 80, 3):
+            findings = bulk_findings(n, prefix=prefix)
+            rendered = audit_report.render_issue_body(make_doc(findings=findings), generated_at=NOW)
+            self.assertEqual(rendered.omitted, [], n)
+            self.assertEqual(len(rendered.rendered_ids), n, n)
+            self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT, n)
+            listed_seen = listed_seen or bool(rendered.listed)
+        self.assertTrue(listed_seen, "the sweep never reached a listed body")
+
+    def test_criticals_keep_their_full_blocks_over_names_of_minors(self):
+        criticals = bulk_findings(20, severity="critical", prefix="c")
+        minors = bulk_findings(380, prefix="m")
+        rendered = audit_report.render_issue_body(
+            make_doc(findings=criticals + minors), generated_at=NOW
+        )
+        for finding in criticals:
+            self.assertIn(finding["id"], rendered.rendered_ids)
+        self.assertTrue(rendered.listed)
+        self.assertEqual({f["severity"] for f in rendered.listed + rendered.omitted}, {"minor"})
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+    def test_majors_give_up_full_blocks_so_every_minor_is_named(self):
+        # The live shape that left 49 minors as a count: the major band's full
+        # blocks used the room the minors' names needed.
+        findings = (
+            bulk_findings(2, severity="critical", prefix="c")
+            + bulk_findings(40, severity="major", prefix="j")
+            + bulk_findings(80, prefix="m")
+        )
+        rendered = audit_report.render_issue_body(make_doc(findings=findings), generated_at=NOW)
+        self.assertEqual(rendered.omitted, [])
+        self.assertEqual(len(rendered.rendered_ids), len(findings))
+        listed = {f["id"] for f in rendered.listed}
+        for finding in findings[:2]:
+            self.assertNotIn(finding["id"], listed)
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+    def test_a_listed_finding_keeps_its_state_and_pull_request(self):
+        # The state index shows full rows only, so a listed row carries both.
+        findings = bulk_findings(250)
+        states = {f["id"]: audit_report.STATE_PR_OPEN for f in findings}
+        pr_urls = {f["id"]: f"https://github.com/acme/fleet/pull/{i}" for i, f in enumerate(findings)}
+        rendered = audit_report.render_issue_body(
+            make_doc(findings=findings), generated_at=NOW, states=states, pr_urls=pr_urls
+        )
+        self.assertTrue(rendered.listed)
+        sample = rendered.listed[0]["id"]
+        line = next(l for l in rendered.body.splitlines() if l.startswith("- **") and f"(`{sample}`)" in l)
+        self.assertTrue(line.endswith(f"— fix proposed — {pr_urls[sample]}"), line)
+        self.assertIn(sample, audit_report.parse_finding_locations(rendered.body))
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+    def test_no_name_that_fits_is_omitted(self):
+        # Whatever leads the body, the first omitted finding's line must not
+        # fit in what the split left: a header charged twice would leave room.
+        for head in ([], bulk_findings(1, severity="major", prefix="j"),
+                     bulk_findings(1, severity="critical", prefix="c")):
+            findings = head + bulk_findings(700, prefix="m")
+            budget = 40_000
+            full, listed, omitted = audit_report.split_findings_for_body(findings, budget)
+            self.assertTrue(omitted, len(head))
+            spent = sum(audit_report._full_row_cost(f) for f in full)
+            spent += len("\n".join(audit_report._listed_header(len(findings))))
+            spent += len("\n" + audit_report.LISTED_SECTION_END)
+            spent += sum(
+                len(audit_report.render_listed_finding(f)) + 1 + len(f["id"]) + audit_report.DELTA_SLOT_CHARS
+                for f in listed
+            )
+            first_out = audit_report._fair_share_order(audit_report.sort_findings(omitted))[0]
+            line = len(audit_report.render_listed_finding(first_out)) + 1 + len(first_out["id"]) + audit_report.DELTA_SLOT_CHARS
+            self.assertGreater(spent + line, budget, len(head))
+
+    def test_too_many_minors_to_name_still_take_the_names_majors_give_up(self):
+        # Past the point where every minor can be named, the majors' full
+        # blocks still give way to names rather than to a count.
+        findings = (
+            bulk_findings(2, severity="critical", prefix="c")
+            + bulk_findings(40, severity="major", prefix="j")
+            + bulk_findings(400, prefix="m")
+        )
+        rendered = audit_report.render_issue_body(make_doc(findings=findings), generated_at=NOW)
+        self.assertTrue(rendered.omitted, "fixture must exceed what names can hold")
+        self.assertGreater(len(rendered.rendered_ids), 300)
+        self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT)
+
+    def test_names_fill_the_body_before_a_count_takes_over(self):
+        # No cliff: a fleet too large to name whole still names as many as
+        # fit, rather than falling back to the full-block cut.
+        prefix = "service-selects-nothing.acme/us-east1/fleet-member.payments.orders-api"
+        named = []
+        for n in (300, 400, 500, 700):
+            rendered = audit_report.render_issue_body(
+                make_doc(findings=bulk_findings(n, prefix=prefix)), generated_at=NOW
+            )
+            self.assertLessEqual(len(rendered.body), GITHUB_BODY_LIMIT, n)
+            named.append(len(rendered.rendered_ids))
+        self.assertTrue(rendered.omitted, "the sweep never reached a count")
+        self.assertGreater(min(named), 150, named)
+
+    def test_a_listed_line_keeps_markdown_and_heading_shapes_out(self):
+        finding = make_finding(
+            fid="f-0001",
+            severity="minor",
+            title="#### forged <!-- finding:x --> | `tick`",
+            namespace="",
+            obj="Node/`n`",
+        )
+        line = audit_report.render_listed_finding(finding)
+        self.assertTrue(line.startswith("- **minor** — "))
+        self.assertNotIn("\n", line)
+        self.assertEqual(audit_report.FINDING_MARKER_RE.findall(line), [])
+        self.assertIn("_cluster-scoped_", line)
+        self.assertTrue(line.endswith("(`f-0001`)"))
 
     def test_an_evidence_table_that_does_not_fit_says_where_it_went(self):
         clusters = make_doc()["scope"]["clusters"]
@@ -9450,7 +9744,8 @@ class TestRenderBudget(BaseTestCase):
         self.assertIn("250", body)
 
     def test_delta_block_lists_exactly_the_rendered_ids(self):
-        findings = bulk_findings(250)
+        # Large enough that even one line each cannot name every finding.
+        findings = bulk_findings(1000)
         body = self.render(make_doc(findings=findings))
         recorded = audit_report.parse_delta_block(body)
         ordered = [f["id"] for f in audit_report.sort_findings(findings)]
@@ -9473,7 +9768,7 @@ class TestRenderBudget(BaseTestCase):
     def test_a_truncated_body_lists_every_finding_in_the_complete_block(self):
         # A grader asking "was this filed?" has no other source once the body
         # cuts a finding for space; the delta still joins on the rendered set.
-        findings = bulk_findings(250)
+        findings = bulk_findings(1000)
         body = self.render(make_doc(findings=findings))
         (payload,) = re.findall(r"(?m)^<!-- audit-findings-all: (\[.*\]) -->$", body)
         self.assertEqual(sorted(json.loads(payload)), sorted(f["id"] for f in findings))
@@ -9496,6 +9791,10 @@ class TestRenderBudget(BaseTestCase):
             doc = make_doc(findings=bulk_findings(n, prefix=prefix))
             with patch.object(audit_report, "all_findings_block", return_value=""):
                 without = self.render(doc)
+            # A listed body is past the boundary too, and the block must still
+            # stay off it: nothing was omitted, so the delta block is complete.
+            if "### Listed without detail" in without:
+                crossed = True
             if len(audit_report.parse_delta_block(without)) < n:
                 crossed = True
                 continue
@@ -9506,7 +9805,7 @@ class TestRenderBudget(BaseTestCase):
         # A grader reads it in place of the delta block, which carries them.
         held = audit_report.held_row_from_id("service-selects-nothing.seeded-c.ns.orders")
         body = audit_report.render_issue_body(
-            make_doc(findings=bulk_findings(250)), generated_at=NOW, audit_id=AUDIT, held=[held]
+            make_doc(findings=bulk_findings(1000)), generated_at=NOW, audit_id=AUDIT, held=[held]
         ).body
         (payload,) = re.findall(r"(?m)^<!-- audit-findings-all: (\[.*\]) -->$", body)
         self.assertIn(held["id"], json.loads(payload))
@@ -15581,6 +15880,16 @@ class TestRenderedIssue(unittest.TestCase):
         self.assertIsNotNone(comment)
         self.assertIn("partial", comment)
         self.assertIn("12", comment)
+
+    def test_the_delta_comment_says_listed_findings_are_named_without_detail(self):
+        self.assertIsNone(audit_report.render_delta_comment(AUDIT, [], [], [], {}, NOW, listed=7))
+        comment = audit_report.render_delta_comment(
+            AUDIT, ["f-1"], [], [make_finding(fid="f-1")], {}, NOW, listed=7
+        )
+        self.assertIsNotNone(comment)
+        self.assertIn("7 finding(s) did not fit", comment)
+        self.assertIn("on one line", comment)
+        self.assertNotIn("not listed above", comment)
 
 
 # --------------------------------------------------------------------------- #
@@ -25243,6 +25552,30 @@ class TestReportStore(HarnessTestCase):
         self.assertEqual(self.harness.forge_calls("issue-close"), [])
         self.assertEqual(self.stdout_json()["status"], "HELD")
         self.assertNotIn("could not be read to seed one", self.err)
+
+    def test_a_seeded_memory_does_not_announce_findings_the_old_body_cut_as_new(self):
+        # A body from before cut findings were listed names only its full rows
+        # in the delta block and every filed id in the complete block; with no
+        # stored document to read, the complete block is what says they were
+        # filed.
+        findings = [
+            {**f, "remediation": {"kind": "manual", "note": "Fix it by hand."}}
+            for f in bulk_findings(150)
+        ]
+        body = published_body(make_doc(findings=findings), generated_at=NOW)
+        named = audit_report.parse_delta_block(body)
+        full = sorted(audit_report.parse_finding_titles(body))
+        self.assertTrue(audit_report.all_findings_block(named), "ids must fit the block's cap")
+        self.assertLess(len(full), len(named), "fixture must list findings")
+        old = body.replace(audit_report.delta_block(named), audit_report.delta_block(full))
+        old = old.replace(
+            audit_report.delta_block(full),
+            audit_report.delta_block(full) + "\n" + audit_report.all_findings_block(named),
+        )
+        self.harness.replies = {"issue-list": self.listing(old)}
+        shutil.rmtree(self.reports_dir, ignore_errors=True)
+        self.assertEqual(self.run_finish_unseeded(make_doc(findings=findings)), 0, self.err)
+        self.assertEqual(self.stdout_json()["new"], 0)
 
     def test_start_seeds_from_the_listing_without_a_second_read(self):
         previous = published_body(make_doc(), generated_at=NOW)

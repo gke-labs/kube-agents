@@ -942,6 +942,22 @@ func TestFoldUsage_TwoNewReplicasInOnePollDoNotDoubleCount(t *testing.T) {
 	}
 }
 
+// A reader that decodes the CR untyped gets a float64, so the ceiling is the
+// largest integer that representation keeps exact: it survives the round trip
+// itself, and the next integer does not.
+func TestUsageTotalCeiling_IsExactAsAFloat64(t *testing.T) {
+	const exact = int64(1) << 53
+	if usageTotalCeiling != exact {
+		t.Fatalf("usageTotalCeiling = %d, want %d", usageTotalCeiling, exact)
+	}
+	if back := int64(float64(usageTotalCeiling)); back != usageTotalCeiling {
+		t.Fatalf("the ceiling does not survive a float64 round trip: %d", back)
+	}
+	if float64(usageTotalCeiling+1) != float64(usageTotalCeiling) {
+		t.Fatalf("the ceiling is not the largest exact integer: %d is exact too", usageTotalCeiling+1)
+	}
+}
+
 func TestAddUsageTotal_RefusesPastTheCeiling(t *testing.T) {
 	doc := foldDoc(foldClock(0))
 	doc.Totals[usageCounterToolExecutions] = usageTotalCeiling - 1

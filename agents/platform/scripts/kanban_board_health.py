@@ -102,17 +102,24 @@ nothing periodically asked (#656).
 
 ``stuck_in_blocked`` is therefore reported whatever the severity floor says: a
 worker or operator block is sticky, nothing retries it until a human acts, and
-a card nobody is looking at is the one finding this check exists for. The rule
-is stateless and a card still blocked is named once a day until someone
-unblocks, comments on, or archives it, which is the intended nag. Each such
-line carries the card's kind, reason and age, read here from the board, and the
-two operator commands, because the CLI's JSON has neither the kind nor the
-reason and a line that names a stuck card without saying how to move it is a
-line the room learns to skip.
+a card nobody is looking at is the one finding this check exists for. The rule is stateless and a card still blocked is named (directly, or by task ID
+in the omitted list up to the report budget) once a day until someone unblocks,
+comments on, or archives it, which is the intended nag.
+Cards are listed newest first, each with its kind, reason, and age read from the
+board, so recent outages surface at the top. Where multiple cards share a title,
+they are grouped: small groups list each card's task ID, kind, age, and reason,
+while larger groups summarize the count, kind breakdown, and oldest age,
+followed by the newest card's details and task IDs. Long reports are bounded
+to keep recent outage cards and the footer commands within chat limits,
+summarizing any omitted cards by task ID up to the character budget (and
+falling back to a count and list command when omitted IDs exceed the limit). The
+operator unblock and archive commands appear once in a footer (noting they run
+on the agent pod) rather than repeated under every card.
 
 Run on demand:  PLATFORM_AGENT_HOME=/opt/data python3 kanban_board_health.py
 """
 
+import collections
 import json
 import os
 import shutil
@@ -147,9 +154,18 @@ HOME_ENV = "KANBAN_HEALTH_HOME"
 # first line, clipped, and the rest stays behind `hermes kanban diagnostics`.
 DETAIL_MAX_CHARS = 200
 REASON_MAX_CHARS = 200
+TITLE_MAX_CHARS = 200
 HOURS_PER_DAY = 24
 AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
+MAX_STUCK_ITEMS = 15
+MAX_STUCK_CHARS = 5500
+MAX_DIAGNOSTIC_ITEMS = 20
+MAX_DIAGNOSTIC_CHARS = 3500
+MAX_INVARIANT_ITEMS = 20
+MAX_REPORT_CHARS = 8500
+MAX_GROUP_IDS_CHARS = 1000
+GROUP_EXPAND_MAX = 3
 # Pinned to the board file this run read, the way `diagnostics_lines` pins the
 # engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
 UNBLOCK_COMMAND = 'HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban unblock --reason "<why>" {task_id}'
@@ -295,12 +311,13 @@ def render_age(age_hours) -> str:
     return f"{int(hours // HOURS_PER_DAY)}d"
 
 
-def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home: Path) -> list:
+def stuck_card_line(task_id: str, diag: dict, context: dict, entry: dict) -> str:
     """One stuck card: the board's kind and reason, the CLI's title and assignee as fallback."""
-    info = context.get(task_id) or {}
+    info = (context or {}).get(task_id) or {}
     kind = info.get("kind") or NO_KIND
     assignee = info.get("assignee") or entry.get("assignee") or "?"
-    title = info.get("title") or entry.get("title") or ""
+    raw_title = info.get("title") or entry.get("title") or ""
+    title = " ".join(str(raw_title).split())[:TITLE_MAX_CHARS] if raw_title else ""
     reason = " ".join((info.get("reason") or "").split())[:REASON_MAX_CHARS]
     age = render_age((diag.get("data") or {}).get("age_hours"))
     head = f"  - {task_id} ({assignee}, {kind}, blocked {age})"
@@ -308,11 +325,333 @@ def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home:
         head += f": {title}"
     if reason:
         head += f' — "{reason}"'
-    return [
-        head,
-        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=task_id)}",
-        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=task_id)}",
+    return head
+
+
+def _card_age_hours(diag: dict) -> float:
+    try:
+        val = (diag.get("data") or {}).get("age_hours")
+        if val is not None:
+            return float(val)
+    except (TypeError, ValueError, AttributeError):
+        pass
+    return float("inf")
+
+
+def _format_id_list_with_dropped(ids: list, max_chars: int = MAX_GROUP_IDS_CHARS) -> tuple[str, list]:
+    """Format task IDs comma-separated, truncating with ', and N more' if exceeding max_chars.
+
+    Returns (formatted_str, dropped_ids).
+    """
+    if not ids:
+        return "", []
+    all_str = ", ".join(ids)
+    if len(all_str) <= max_chars:
+        return all_str, []
+    chosen = []
+    for i, tid in enumerate(ids):
+        remaining_count = len(ids) - (i + 1)
+        suffix = f", and {remaining_count} more" if remaining_count > 0 else ""
+        candidate = (", ".join(chosen + [tid]) + suffix) if chosen else (tid + suffix)
+        if len(candidate) > max_chars:
+            if chosen:
+                break
+            return f"and {len(ids)} more", list(ids)
+        chosen.append(tid)
+    dropped = list(ids[len(chosen):])
+    remaining_count = len(dropped)
+    if remaining_count > 0:
+        return ", ".join(chosen) + f", and {remaining_count} more", dropped
+    return ", ".join(chosen), []
+
+
+def _take_within_budget(items: list, max_items: int, max_chars: int, line_fn=None) -> list:
+    """Take items up to max_items and max_chars (including newlines)."""
+    taken = []
+    total_chars = 0
+    for item in items:
+        if len(taken) >= max_items:
+            break
+        lines = line_fn(item) if line_fn else item
+        if isinstance(lines, str):
+            lines = [lines]
+        item_chars = sum(len(ln) + 1 for ln in lines)
+        if total_chars + item_chars > max_chars:
+            continue
+        taken.append(item)
+        total_chars += item_chars
+    return taken
+
+
+def _min_stuck_floor(stuck_items: list, home: Path) -> int:
+    """Minimum characters render_stuck_cards emits: header + footer + count-only omission line."""
+    if not stuck_items:
+        return 0
+    tid = str(stuck_items[0][0]) if len(stuck_items) == 1 else "<task_id>"
+    footer_lines = [
+        "  Commands to move a card (run on the agent pod):",
+        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}",
+        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}",
     ]
+    footer_chars = sum(len(ln) + 1 for ln in footer_lines)
+    header = (
+        "Cards blocked with no one looking (a worker or operator block is sticky: "
+        "nothing retries it until a human acts):"
+    )
+    header_chars = len(header) + 1
+    omission_sample = (
+        f"  ... and {len(stuck_items)} older stuck cards omitted "
+        f"(run hermes kanban list on the agent pod to view all)\n"
+    )
+    return header_chars + footer_chars + len(omission_sample)
+
+
+def _format_large_group(it: dict, available_chars: int) -> dict | None:
+    """Format a large group (>3 cards) with ids: line sized to available_chars."""
+    head = it["head"]
+    latest_sub = it["latest_sub"]
+    group = it["cards"]
+    group_ids = it["group_ids"]
+    head_chars = len(head) + 1 + len(latest_sub) + 1
+    if head_chars > available_chars:
+        return None
+    lines_for_group = [head, latest_sub]
+    rem_for_ids = available_chars - head_chars
+    ids_prefix_overhead = len("    ids: ") + 1
+    group_ids_budget = min(MAX_GROUP_IDS_CHARS, max(0, rem_for_ids - ids_prefix_overhead))
+    formatted_ids, dropped_ids = _format_id_list_with_dropped(group_ids, group_ids_budget)
+    if len(dropped_ids) < len(group_ids):
+        lines_for_group.append(f"    ids: {formatted_ids}")
+    if dropped_ids and len(dropped_ids) == len(group_ids):
+        dropped_ids = dropped_ids[1:]
+    return {
+        "age_hours": it["age_hours"],
+        "key": it["key"],
+        "lines": lines_for_group,
+        "card_count": len(group) - len(dropped_ids),
+        "cards": group,
+        "dropped_ids": dropped_ids,
+        "is_large_group": True,
+        "head": head,
+        "latest_sub": latest_sub,
+        "group_ids": group_ids,
+    }
+
+
+def render_stuck_cards(stuck_items: list, context: dict, home: Path, *, max_chars: int | None = None) -> list:
+    """Render stuck cards: grouped by title when duplicated, newest first, commands once.
+
+    Has an irreducible minimum output floor of header + footer + count-only omission line
+    (451 + 4*len(str(home)) characters), below which it returns this floor rather than
+    truncating operator footer commands or suppressing the omission notice.
+    """
+    if not stuck_items:
+        return []
+    if max_chars is None:
+        max_chars = MAX_STUCK_CHARS
+
+    tid = str(stuck_items[0][0]) if len(stuck_items) == 1 else "<task_id>"
+    footer_lines = [
+        "  Commands to move a card (run on the agent pod):",
+        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=tid)}",
+        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=tid)}",
+    ]
+    footer_chars = sum(len(ln) + 1 for ln in footer_lines)
+
+    header = (
+        "Cards blocked with no one looking (a worker or operator block is sticky: "
+        "nothing retries it until a human acts):"
+    )
+    header_chars = len(header) + 1
+
+    budget_for_body = max(0, max_chars - header_chars - footer_chars)
+    min_omission_chars = 120
+    available_for_items = max(0, budget_for_body - min_omission_chars)
+
+    parsed = []
+    for task_id, diag, entry in stuck_items:
+        task_id = str(task_id)
+        info = (context or {}).get(task_id) or {}
+        kind = str(info.get("kind") or NO_KIND)
+        assignee = str(info.get("assignee") or entry.get("assignee") or "?")
+        raw_title = info.get("title") or entry.get("title") or ""
+        title = " ".join(str(raw_title).split()) if raw_title else ""
+        reason = " ".join(str(info.get("reason") or "").split())[:REASON_MAX_CHARS]
+        age_hours = _card_age_hours(diag)
+        parsed.append({
+            "task_id": task_id,
+            "diag": diag,
+            "entry": entry,
+            "kind": kind,
+            "assignee": assignee,
+            "title": title,
+            "reason": reason,
+            "age_hours": age_hours,
+        })
+
+    by_title = collections.defaultdict(list)
+    no_title_cards = []
+    for card in parsed:
+        if card["title"]:
+            by_title[card["title"]].append(card)
+        else:
+            no_title_cards.append(card)
+
+    renderable_items = []
+
+    for title, group in by_title.items():
+        group.sort(key=lambda c: (c["age_hours"], c["task_id"]))
+        if len(group) == 1:
+            card = group[0]
+            line = stuck_card_line(card["task_id"], card["diag"], context, card["entry"])
+            renderable_items.append({
+                "age_hours": card["age_hours"],
+                "key": card["task_id"],
+                "lines": [line],
+                "card_count": 1,
+                "cards": [card],
+                "dropped_ids": [],
+            })
+        else:
+            newest_age = group[0]["age_hours"]
+            oldest_age_hours = max(c["age_hours"] for c in group)
+            oldest_str = render_age(oldest_age_hours if oldest_age_hours != float("inf") else None)
+            kind_counts = collections.Counter(c["kind"] for c in group)
+            sorted_kinds = sorted(kind_counts.items(), key=lambda x: (-x[1], x[0]))
+            kinds_summary = ", ".join(f"{cnt} {k}" for k, cnt in sorted_kinds)
+            head = f"  - {title[:TITLE_MAX_CHARS]} — {len(group)} cards ({kinds_summary}, oldest {oldest_str})"
+            lines_for_group = [head]
+            dropped_ids = []
+            if len(group) <= GROUP_EXPAND_MAX:
+                for card in group:
+                    age_str = render_age(card["age_hours"] if card["age_hours"] != float("inf") else None)
+                    card_sub = f"    - [{card['task_id']}] ({card['kind']}, {age_str})"
+                    if card["reason"]:
+                        card_sub += f' — "{card["reason"]}"'
+                    lines_for_group.append(card_sub)
+                renderable_items.append({
+                    "age_hours": newest_age,
+                    "key": title[:TITLE_MAX_CHARS],
+                    "lines": lines_for_group,
+                    "card_count": len(group),
+                    "cards": group,
+                    "dropped_ids": [],
+                })
+            else:
+                newest_card = group[0]
+                newest_age_str = render_age(newest_card["age_hours"] if newest_card["age_hours"] != float("inf") else None)
+                latest_sub = f"    latest: [{newest_card['task_id']}] ({newest_card['kind']}, {newest_age_str})"
+                if newest_card["reason"]:
+                    latest_sub += f' — "{newest_card["reason"]}"'
+                group_ids = [c["task_id"] for c in group]
+                renderable_items.append({
+                    "age_hours": newest_age,
+                    "key": title[:TITLE_MAX_CHARS],
+                    "head": head,
+                    "latest_sub": latest_sub,
+                    "group_ids": group_ids,
+                    "cards": group,
+                    "is_large_group": True,
+                    "lines": [head, latest_sub],
+                    "card_count": 1,
+                    "dropped_ids": group_ids[1:],
+                })
+
+    for card in no_title_cards:
+        line = stuck_card_line(card["task_id"], card["diag"], context, card["entry"])
+        renderable_items.append({
+            "age_hours": card["age_hours"],
+            "key": card["task_id"],
+            "lines": [line],
+            "card_count": 1,
+            "cards": [card],
+            "dropped_ids": [],
+        })
+
+    renderable_items.sort(key=lambda item: (item["age_hours"], item["key"]))
+
+    taken_items = []
+    total_chars = 0
+    taken_origins = set()
+    for item in renderable_items:
+        if len(taken_items) >= MAX_STUCK_ITEMS:
+            break
+        remaining_budget = available_for_items - total_chars
+        if item.get("is_large_group"):
+            formatted = _format_large_group(item, remaining_budget)
+            if formatted is None:
+                continue
+            item_to_take = formatted
+            item_chars = sum(len(ln) + 1 for ln in item_to_take["lines"])
+        else:
+            item_chars = sum(len(ln) + 1 for ln in item["lines"])
+            if total_chars + item_chars > available_for_items:
+                continue
+            item_to_take = item
+        taken_items.append(item_to_take)
+        taken_origins.add(id(item))
+        total_chars += item_chars
+
+    untaken_items = [it for it in renderable_items if id(it) not in taken_origins]
+
+    if len(untaken_items) == 1 and len(taken_items) < MAX_STUCK_ITEMS:
+        next_item = untaken_items[0]
+        current_chars = sum(sum(len(ln) + 1 for ln in it["lines"]) for it in taken_items)
+        remaining_promo_budget = budget_for_body - current_chars
+        if not any(it.get("dropped_ids") for it in taken_items):
+            if next_item.get("is_large_group"):
+                promo_item = _format_large_group(next_item, remaining_promo_budget)
+                if promo_item and not promo_item.get("dropped_ids"):
+                    taken_items.append(promo_item)
+                    untaken_items = []
+            else:
+                next_chars = sum(len(ln) + 1 for ln in next_item["lines"])
+                if not next_item.get("dropped_ids") and (current_chars + next_chars <= budget_for_body):
+                    taken_items.append(next_item)
+                    untaken_items = []
+
+    taken_items.sort(key=lambda item: (item["age_hours"], item["key"]))
+
+    lines = [header]
+    for it in taken_items:
+        lines.extend(it["lines"])
+
+    rendered_cards = sum(it["card_count"] for it in taken_items)
+    omitted_cards = len(stuck_items) - rendered_cards
+    if omitted_cards > 0:
+        current_body_chars = sum(len(ln) + 1 for ln in lines[1:])
+        remaining_for_omission = max(0, budget_for_body - current_body_chars)
+        shown_cards = []
+        omitted_cards_list = []
+        for it in taken_items:
+            shown_cards.extend(it["cards"][:it["card_count"]])
+            omitted_cards_list.extend(it["cards"][it["card_count"]:])
+        for it in untaken_items:
+            omitted_cards_list.extend(it["cards"])
+
+        omitted_cards_sorted = sorted(omitted_cards_list, key=lambda c: (c["age_hours"], c["task_id"]))
+        omitted_ids = [c["task_id"] for c in omitted_cards_sorted]
+
+        all_omitted_older = (
+            not shown_cards
+            or all(o["age_hours"] >= s["age_hours"] for o in omitted_cards_list for s in shown_cards)
+        )
+        qualifier = "older " if all_omitted_older else "other "
+        prefix = f"  ... and {omitted_cards} {qualifier}stuck card{'s' if omitted_cards != 1 else ''} omitted"
+        list_hint = "; run hermes kanban list on the agent pod to view all"
+        omission_overhead = len(prefix) + len(" (ids: ") + len(list_hint) + len(")\n")
+        max_ids_budget = remaining_for_omission - omission_overhead
+        if max_ids_budget >= 15:
+            formatted_ids, dropped_omitted = _format_id_list_with_dropped(omitted_ids, max_chars=max_ids_budget)
+            if len(dropped_omitted) < len(omitted_ids):
+                lines.append(f"{prefix} (ids: {formatted_ids}{list_hint})")
+            else:
+                lines.append(f"{prefix} (run hermes kanban list on the agent pod to view all)")
+        else:
+            lines.append(f"{prefix} (run hermes kanban list on the agent pod to view all)")
+
+    lines.extend(footer_lines)
+    return lines
 
 
 def invariant_violations(conn: sqlite3.Connection) -> list:
@@ -370,7 +709,8 @@ def _parse_diagnostics_json(out: str):
 
 
 def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
-                      binary=None, env=None, context=None, always=ALWAYS_REPORT_KINDS) -> list:
+                      binary=None, env=None, context=None, always=ALWAYS_REPORT_KINDS,
+                      *, max_chars: int | None = None) -> list:
     """Ask the shipped rule engine. Returns rendered lines; empty when clean.
 
     ``--json`` returns before the human-table branch of ``_cmd_diagnostics``, so
@@ -382,6 +722,10 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     the engine grades it. Stuck cards are rendered from ``context`` (see
     ``blocked_context``) under their own heading; everything else keeps the
     engine's own title and detail.
+
+    When stuck items are present, guarantees output stays <= max_chars when
+    max_chars >= min_stuck_floor + 120. Below this allowance, render_stuck_cards preserves
+    its documented irreducible minimum floor.
     """
     try:
         exe = str(binary) if binary else str(hermes_bin())
@@ -417,19 +761,22 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
     if entries is not None and not isinstance(entries, list):
         return [f"  diagnostics unavailable: CLI returned "
                 f"{type(entries).__name__}, expected a JSON list"]
-    lines = []
-    stuck = []
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS
+
+    diag_lines = []
+    stuck_items = []
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
-        task_id = entry.get("task_id", "?")
-        status = entry.get("status", "?")
+        task_id = str(entry.get("task_id") or "?")
+        status = str(entry.get("status") or "?")
         for diag in entry.get("diagnostics") or []:
             if not isinstance(diag, dict):
                 continue
             kind = diag.get("kind")
             if kind == STUCK_IN_BLOCKED and kind in always:
-                stuck.extend(stuck_card_lines(task_id, diag, context or {}, entry, home))
+                stuck_items.append((task_id, diag, entry))
                 continue
             if not clears_floor(str(diag.get("severity", "")), severity) and kind not in always:
                 continue
@@ -438,18 +785,37 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
             detail = first_line((diag.get("detail") or ""), DETAIL_MAX_CHARS)
             if detail:
                 parts.append(f" - {detail}")
-            lines.append("".join(parts))
-    if stuck:
+            diag_lines.append("".join(parts))
+
+    min_stuck_reserve = _min_stuck_floor(stuck_items, home)
+    diag_allowance = max(0, max_chars - min_stuck_reserve)
+    diag_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, diag_allowance) - 120)
+    shown_diag_lines = _take_within_budget(diag_lines, MAX_DIAGNOSTIC_ITEMS, diag_budget)
+    lines = list(shown_diag_lines)
+    omitted_diags = len(diag_lines) - len(shown_diag_lines)
+    if omitted_diags > 0 and diag_allowance >= 120:
         lines.append(
-            "Cards blocked with no one looking (a worker or operator block is sticky: "
-            "nothing retries it until a human acts):"
+            f"  ... and {omitted_diags} other diagnostic{'s' if omitted_diags != 1 else ''} omitted "
+            f"(run hermes kanban diagnostics on the agent pod to view all)"
         )
-        lines.extend(stuck)
+
+    if stuck_items:
+        current_chars = sum(len(ln) + 1 for ln in lines)
+        remaining = max(0, max_chars - current_chars)
+        stuck_budget = min(MAX_STUCK_CHARS, remaining)
+        lines.extend(render_stuck_cards(stuck_items, context or {}, home, max_chars=stuck_budget))
     return lines
 
 
-def report(home: Path, *, env=None, **kwargs) -> list:
-    """The whole check. Empty list means healthy, which means silent."""
+def report(home: Path, *, env=None, max_chars: int | None = None, **kwargs) -> list:
+    """The whole check. Empty list means healthy, which means silent.
+
+    Guarantees output stays <= max_chars (including 40-char main() reserve) for
+    max_chars >= (MAX_DIAGNOSTIC_CHARS + min_stuck_floor + reserves). Below that threshold,
+    render_stuck_cards preserves its documented minimum output floor.
+    """
+    if max_chars is None:
+        max_chars = MAX_REPORT_CHARS
     db = board_path(home)
     if not db.exists():
         # No board on this profile: not a failure, nothing to say. Skipping the
@@ -462,13 +828,29 @@ def report(home: Path, *, env=None, **kwargs) -> list:
         context = blocked_context(conn)
     finally:
         conn.close()
+
+    used_chars = 40  # reserve for main() header: "kanban board health: attention required\n"
     if violations:
-        lines.append(
-            "Board invariant violations (a direct write to kanban.db is the usual cause):"
-        )
-        lines.extend(violations)
+        header = "Board invariant violations (a direct write to kanban.db is the usual cause):"
+        lines.append(header)
+        header_len = len(header) + 1
+        used_chars += header_len
+        viol_allowance = max(0, max_chars - used_chars)
+        viol_budget = max(0, min(MAX_DIAGNOSTIC_CHARS, viol_allowance) - 120)
+        shown_violations = _take_within_budget(violations, MAX_INVARIANT_ITEMS, viol_budget)
+        lines.extend(shown_violations)
+        omitted_violations = len(violations) - len(shown_violations)
+        if omitted_violations > 0 and viol_allowance >= 120:
+            lines.append(
+                f"  ... and {omitted_violations} other invariant violation{'s' if omitted_violations != 1 else ''} omitted"
+            )
+        used_chars = 40 + sum(len(ln) + 1 for ln in lines)
+
+    diag_header_reserve = len("Active kanban diagnostics:\n")
+    remaining_chars = max(0, max_chars - used_chars - diag_header_reserve)
     diags = diagnostics_lines(
-        home, severity_floor(env), env=env, context=context, always=always_report_kinds(env), **kwargs
+        home, severity_floor(env), env=env, context=context, always=always_report_kinds(env),
+        max_chars=remaining_chars, **kwargs
     )
     if diags:
         lines.append("Active kanban diagnostics:")

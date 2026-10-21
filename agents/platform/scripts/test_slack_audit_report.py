@@ -1123,6 +1123,7 @@ class FailedLineTest(unittest.TestCase):
             "https://gitlab.com/acme/platform/infra/-/issues/12",
             "https://gitlab.example.com/group/fleet/-/work_items/42",
             "http://ghe.example.com/acme/fleet/issues/7",
+            "https://ghe.example.com:8443/acme/fleet/issues/7",
         ):
             with self.subTest(url=url):
                 self.assertIsNone(sar.failed_line(WALL_HEADING + f"\n## What to do\n- Review {url} first.\n"))
@@ -1187,6 +1188,19 @@ class FailedLineTest(unittest.TestCase):
     def test_a_long_report_is_read_quickly(self):
         start = time.monotonic()
         sar.failed_line("x " * LONG_INPUT * 10 + "\n## What's wrong\n" + "y " * LONG_INPUT)
+        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+    def test_a_run_of_urls_is_read_quickly(self):
+        # Each URL's scan ends at the next "://" rather than reading to the end of the run.
+        start = time.monotonic()
+        self.assertIsNone(sar.failed_line("http://" * LONG_INPUT))
+        self.assertLess(time.monotonic() - start, FAST_SECONDS)
+
+    def test_a_label_before_a_long_blank_run_is_read_quickly(self):
+        # The label matched in the search window, then again on the whole report where the
+        # trailing text fails it: the blank run is read once, not once per split of it.
+        start = time.monotonic()
+        self.assertIsNone(sar.failed_line("What's wrong" + "\t" * LONG_INPUT * 2 + "x\n"))
         self.assertLess(time.monotonic() - start, FAST_SECONDS)
 
 if __name__ == "__main__":

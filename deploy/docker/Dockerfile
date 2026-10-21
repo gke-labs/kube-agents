@@ -873,6 +873,13 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # edit_message; the steer and auth failure replies are replaced where they
 # are built, so no exception text reaches Slack). See
 # deploy/docker/patches/slack_boilerplate.py.
+# Slack thread context, whatever the flag: a thread root the bot posted itself is
+# labelled "[thread parent, posted by you earlier]" instead of reading as a
+# person's message, and every context block says it is conversation, not observed
+# cluster state. Without it a sample report the bot once posted read as real, and
+# a "fix the first one" under it filed a fix for a workload that never existed
+# (#3080). verify_slack_thread_provenance.py runs the shipped methods over that
+# thread. See deploy/docker/patches/apply_slack_thread_provenance.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
@@ -910,6 +917,8 @@ COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/patchlib.py \
      deploy/docker/patches/apply_slack_agent_view.py \
      deploy/docker/patches/verify_slack_agent_view.py \
+     deploy/docker/patches/apply_slack_thread_provenance.py \
+     deploy/docker/patches/verify_slack_thread_provenance.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
     grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
@@ -944,6 +953,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     install -m 0644 /tmp/message-surface/slack_boilerplate.py /opt/hermes/gateway/slack_boilerplate.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_boilerplate.py /opt/hermes && \
     grep -qF "_kage_slack_boilerplate.cron_delivery_text" /opt/hermes/cron/scheduler_delivery.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_thread_provenance.py /opt/hermes && \
+    grep -qF "kube-agents patch: thread-context provenance" /opt/hermes/plugins/platforms/slack/adapter.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_agent_view.py /opt/hermes && \
     grep -qF "def _kage_slack_ux_on(" /opt/hermes/hermes_cli/slack_cli.py && \
@@ -961,6 +972,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_ux_failure.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_kanban_progress_lines.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_boilerplate.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_thread_provenance.py /opt/hermes && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
@@ -1731,6 +1743,7 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/credential_redaction.py \
      deploy/docker/patches/apply_credential_redaction.py \
      deploy/docker/patches/verify_credential_redaction.py \
+     agents/chat/defaults/plugins/common/redactor.py \
      deploy/docker/patches/skill_manage_image_owned.py \
      deploy/docker/patches/apply_skill_manage_image_owned.py \
      deploy/docker/patches/verify_skill_manage_image_owned.py \
@@ -1822,6 +1835,9 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
     test "$(grep -c '_kube_agents_redact_tool_argument' /opt/hermes/agent/display.py)" = "2" && \
     test "$(grep -c '_kube_agents_install_transcript_redaction()' /opt/hermes/hermes_cli/main.py)" = "1" && \
+    test "$(grep -c '_kube_agents_install_operator_rules(' /opt/hermes/agent/redact.py)" = "1" && \
+    test "$(grep -c '_kube_agents_redact_message_for_store(' /opt/hermes/hermes_state_messages.py)" = "1" && \
+    test "$(grep -c '_kube_agents_redact_store_text(' /opt/hermes/hermes_cli/kanban_db.py)" = "8" && \
     cp /tmp/latency-patches/skill_manage_image_owned.py /opt/hermes/tools/skill_manage_image_owned.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_skill_manage_image_owned.py /opt/hermes && \
     test "$(grep -c 'from tools.skill_manage_image_owned import image_owned_batch_refusal, image_owned_refusal' /opt/hermes/tools/skill_manager_tool.py)" = "1" && \
@@ -1843,7 +1859,8 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_priority.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_ended_run.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_self_copy.py && \
-    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
+    KUBE_AGENTS_REDACTOR_MODULE=/tmp/latency-patches/redactor.py \
+      /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_skill_manage_image_owned.py && \
     rm -rf /tmp/latency-patches
 
@@ -2105,7 +2122,13 @@ COPY agents/chat/SOUL.md agents/chat/AGENTS.md /opt/defaults/
 # sole writer, and the operator's settings reach it as a read-only managed-scope overlay
 # at /etc/hermes rather than by rewriting it.
 COPY --chown=hermes:hermes agents/chat/config.yaml /opt/chat-template/config.yaml
-RUN rm -f /opt/defaults/config.yaml
+# The second test pins the runtime path of the shared redactor the agent image
+# reads with the switch on (DEFAULT_REDACTOR_MODULE); the build-time verifier
+# in the agent-base stage ran against a copy, because /opt/defaults did not
+# exist there yet. See deploy/docker/patches/credential_redaction.py.
+RUN rm -f /opt/defaults/config.yaml && \
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 -c 'import os, sys; from agent import credential_redaction as c; sys.exit(0 if os.path.isfile(c.DEFAULT_REDACTOR_MODULE) else 1)'
 
 # --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
 # Executable scripts are shared, not per-profile: the router (Chat Agent) and the
