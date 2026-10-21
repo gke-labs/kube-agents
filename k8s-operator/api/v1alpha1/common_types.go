@@ -1066,7 +1066,11 @@ type StorageSpec struct {
 
 // AvailabilitySpec defines high availability and scheduling settings.
 type AvailabilitySpec struct {
-	// Replicas specifies the desired number of pod replicas. If omitted, defaults to 1.
+	// Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1.
+	// The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and
+	// the ReplicasLimited status condition says so. A multi-replica gateway does not start yet,
+	// because its leader election has no in-cluster ServiceAccount token to use and the data
+	// volumes an install creates at one replica are ReadWriteOnce.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
@@ -1343,10 +1347,8 @@ type EgressAllowlistSpec struct {
 	// chose at creation time or at a public address, and the in-cluster
 	// "kubernetes" Service is translated to that address before policy is
 	// evaluated. Leaving this empty is allowed and is the stricter choice. It
-	// costs the agent container its API-server connection, which matters at
-	// spec.deployment.replicas above 1, where the container runs
-	// leader_elect.py and holds a Lease, and to any sidecar or plugin you
-	// added that talks to the API. Find the range with
+	// costs the agent container its API-server connection, which matters to
+	// any sidecar or plugin you added that talks to the API. Find the range with
 	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
 	// On a cluster with a public endpoint that command emits a bare address;
 	// paste it as-is and it is widened to a single-host prefix.
@@ -1591,7 +1593,9 @@ type ForgeSpec struct {
 	// group or project access token, or a dedicated account's personal access
 	// token where the tier offers neither. It is mounted into the credential
 	// broker's pod only, never the agent's or the sandbox's, and read on every
-	// call, so rotating the token is updating the Secret.
+	// call, so rotating the token is updating the Secret. The Secret may also
+	// hold a read-only token under the key `read-token`; the broker presents it
+	// only to clone the forge's context repositories, never on a write.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 
@@ -2059,19 +2063,26 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal,
+// update, and ToolExecutionsTotal, EventsIngestedTotal, SessionsTotal,
 // RemediationsProposedTotal, RemediationsMergedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's, the event watcher's and the chat
-// plugin's metrics
+// ClustersMonitored from the broker's, the event watcher's, the chat
+// plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status. SessionsTotal and
-// RemediationsAppliedTotal are declared so that the schema names them, but
-// nothing writes them yet, and each is absent (omitempty) until a series
-// exists for it.
+// ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
+// is declared so that the schema names it, but nothing writes it yet, and it
+// is absent (omitempty) until a series exists for it.
 type AgentUsageStatus struct {
-	// SessionsTotal is the cumulative number of interactive sessions handled.
-	// Nothing writes it yet.
+	// SessionsTotal is the cumulative count of sessions the agent opened: the
+	// triage sessions the event watcher opened for events the daemon
+	// delivered (its k8s_event_watcher_triage_sessions_total; a session
+	// whose inject was filtered, suppressed or failed is not counted) plus
+	// the chat conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
+	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// chat conversation that resumes after the session store's retention
+	// window (seven days by default) counts again. Read every five minutes
+	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 
