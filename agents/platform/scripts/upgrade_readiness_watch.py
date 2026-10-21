@@ -171,6 +171,11 @@ REFRESH_SLACK_SECONDS = 10 * 60
 
 # Which projects the report enumerates, resolved on this side.
 PROJECTS_ENV = "UPGRADE_READINESS_PROJECTS"
+# A project id or number is one token, as the refusal parser reads it
+# (`REFUSAL_TOKEN_PATTERN`): a hand-typed spelling with a space or a semicolon
+# is a typo, most often a list separated by spaces where commas were meant.
+ROSTER_SPELLING_REFUSED = re.compile(r"[\s;]")
+ROSTER_SPELLING_DETAIL = PROJECTS_ENV + " names {spellings}, which is not a project id or number; separate projects with commas"
 PROJECTS_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
 PROFILES_DIR = "profiles"
@@ -713,6 +718,9 @@ def roster_projects() -> set[str]:
 
 def projects() -> list[str]:
     explicit = [p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(PROJECTS_SEPARATOR) if p.strip()]
+    refused = [p for p in explicit if ROSTER_SPELLING_REFUSED.search(p)]
+    if refused:
+        raise RuntimeError(ROSTER_SPELLING_DETAIL.format(spellings=shown_names([repr(p) for p in refused])))
     if explicit:
         return sorted(set(explicit))
     found = roster_projects()
