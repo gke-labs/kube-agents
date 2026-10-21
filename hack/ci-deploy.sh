@@ -1249,6 +1249,10 @@ case "${EVAL_FORGE_KIND}:${EVAL_FORGE_SELF_MANAGED}" in
     echo "Forge: ${EVAL_FORGE} — ${GITLAB_FORGE_HOST}/${GITLAB_PROJECT} (mapped from PROJECT_ID=${PROJECT_ID}); GitHub integration and minter off"
     ;;
   github:yes)
+    if [ -z "${GITOPS_REPO}" ]; then
+      echo "ERROR: EVAL_FORGE=${EVAL_FORGE} declares the GitHub forge at ${EVAL_FORGE_HOST} for the pool's repository, and none resolved (EVAL_GITOPS_REPO=none is not an option on this forge)." >&2
+      exit 1
+    fi
     FORGE_ARGS=(
       --set-string "platformAgent.integration.github.gitRepo="
       --set-string "platformAgent.integration.forges[0].name=github"

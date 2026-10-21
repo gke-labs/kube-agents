@@ -189,6 +189,11 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                     # CRD through SCRIPT_DIR, the checkout's by default.
                     "EVAL_FORGE": "",
                     "SCRIPT_DIR": str(_REPO_ROOT / "hack"),
+                    # A developer's own forge state must not reach these runs:
+                    # a CA left in the default directory would refuse github.
+                    "EVAL_FORGE_STATE_DIR": str(_REPO_ROOT / "no-such-forge-state"),
+                    "EVAL_GHES_HOST": "",
+                    "EVAL_GITLAB_CE_HOST": "",
                     **env,
                 }
             ),
@@ -437,6 +442,16 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
                 self.assertNotEqual(rc, 0)
                 self.assertNotIn("RESOLVED", out)
                 self.assertIn("its private CA) is missing or empty", err)
+
+    def test_ghes_needs_the_pools_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, out, err = self._resolve(
+                "dev-project", EVAL_GITOPS_REPO="none", EVAL_FORGE="ghes", EVAL_GITHUB_APP_ID="123456",
+                EVAL_FORGE_STATE_DIR=self._state_dir(tmp),
+            )
+        self.assertNotEqual(rc, 0)
+        self.assertNotIn("RESOLVED", out)
+        self.assertIn("EVAL_GITOPS_REPO=none is not an option on this forge", err)
 
     def test_a_ca_left_for_a_public_forge_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
