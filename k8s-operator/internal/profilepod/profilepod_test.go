@@ -149,6 +149,17 @@ func runStage(t *testing.T, c corev1.Container, mountPath string, payload map[st
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(dst, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A distinctive mode on files/ itself: a copy of the directory onto the
+	// mount (rather than of its entries) re-applies it to the mount root, which
+	// is what fails for a non-root container on GNU cp in the pod.
+	if payload != nil {
+		if err := os.Chmod(filepath.Join(root, "files"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 	script := c.Command[2]
 	script = strings.Replace(script, "src=/files", "src="+filepath.Join(root, "files"), 1)
 	script = strings.Replace(script, `dst="`+mountPath+`"`, `dst="`+dst+`"`, 1)
@@ -189,9 +200,12 @@ func TestStagingCopiesOnlyTheFilesPayload(t *testing.T) {
 			t.Errorf("files/%s did not land at <mount>/%s: %v %q", name, name, err, b)
 		}
 	}
-	script := tool.Command[2]
-	if strings.Contains(script, `"$src"/.`+" ") || strings.Contains(script, `"$src"/. `) {
-		t.Errorf("the script copies the /files directory itself onto the mount, which re-applies its mode to the kubelet-owned root: %s", script)
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Errorf("staging changed the mount root's mode to %o (files/ is 0700): the script copied the /files directory onto the mount instead of its entries", got)
 	}
 
 	persona := r.InitContainers[0]
