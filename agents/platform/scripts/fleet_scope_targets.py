@@ -29,8 +29,10 @@ the resolved set and the arguments to pass the collectors, and by the
 `upgrade-readiness-watch` job (upgrade_readiness_watch.py), a `no_agent`
 script on the same pod that hands the readiness report script
 `collector_args`, less the cluster exclusion, beside each project it reads,
-and by the onboarding inventory scan (agents/chat/scripts/bootstrap_scan_gate.py),
-which leaves the declaration's excluded clusters out of the sweep it files. The collectors
+by the `sa-role-watch` job (sa_role_watch.py), which reads the IAM policy of
+each project in the resolved scope, and by the onboarding inventory scan
+(agents/chat/scripts/bootstrap_scan_gate.py), which leaves the declaration's
+excluded clusters out of the sweep it files. The collectors
 themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool
@@ -159,8 +161,9 @@ RENDER_PRESENT_KEY = "present"
 # sweep is then that project, until the next tick writes the resolved set. One
 # name: it is what the platform_control env block forwards to the fleet_scope
 # tool (agents/platform/config.yaml), and what the gateway pod's own
-# environment carries for the upgrade-readiness-watch job and the onboarding
-# inventory scan (bootstrap_scan_gate.py), the other production readers.
+# environment carries for the upgrade-readiness-watch and sa-role-watch jobs
+# and the onboarding inventory scan (bootstrap_scan_gate.py), the other
+# production readers.
 MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID",)
 
 # The keys under `declared` whose presence means the install drew a boundary,

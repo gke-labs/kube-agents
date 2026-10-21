@@ -409,6 +409,10 @@ REFUSAL_PROJECTS_FIELD = "projects"
 REFUSAL_OUTCOME_FIELD = "outcome"
 REFUSAL_FIELDS = (REFUSAL_PROJECT_FIELD, REFUSAL_PROJECTS_FIELD, REFUSAL_OUTCOME_FIELD, "number")
 REFUSAL_FIELD_PATTERN = "(?P<{field}>.+?)"
+# A project id or number is one token, so a stderr that also carries another
+# refusal (one line per refused id) cannot run the group across it.
+REFUSAL_TOKEN_FIELDS = (REFUSAL_PROJECT_FIELD, "number")
+REFUSAL_TOKEN_PATTERN = "(?P<{field}>[^\\s,;]+?)"
 # The remedy rides on the message: every read role the install binds carries
 # resourcemanager.projects.get (cluster_agent_reconcile.py relies on it), and
 # the CRD reference wants spec.harness.projectId to be the id, not the number.
@@ -975,7 +979,8 @@ def refusal_pattern(template: str) -> re.Pattern:
     placeholder a named group."""
     pattern = re.escape(template)
     for field in REFUSAL_FIELDS:
-        pattern = pattern.replace(re.escape("{" + field + "}"), REFUSAL_FIELD_PATTERN.format(field=field))
+        shape = REFUSAL_TOKEN_PATTERN if field in REFUSAL_TOKEN_FIELDS else REFUSAL_FIELD_PATTERN
+        pattern = pattern.replace(re.escape("{" + field + "}"), shape.format(field=field))
     return re.compile(pattern)
 
 
@@ -1852,7 +1857,9 @@ def keep_standing(path: Path, standing: dict[str, list[str]], loaded: dict[str, 
         if ids_moved:
             ledger[PROJECT_IDS_KEY] = ids
         save_ledger(path, ledger)
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
+        # Called inside the failed tick's handler: a ledger this cannot read
+        # or write must not replace the failure the tick is reporting.
         pass
 
 
