@@ -413,8 +413,10 @@ class Inventory:
         # kubeconfig here because the volume has no owner.  `sweep_stale_homes`
         # removes the cluster ones.
         self.stale_homes: list[Row] = []
-        # The agent pod's profile names, read after the sandbox listing.
+        # The agent pod's profile names, read after the sandbox listing, and
+        # the directory they were read from.
         self.agent_profiles: list[str] = []
+        self.agent_profiles_path: Path | None = None
         # The sandbox's profiles root the listing came from.
         self.remote_profiles: Path | None = None
         self.problems: list[str] = []
@@ -492,6 +494,7 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
     inv = Inventory()
     remote_profiles = remote_root / PROFILES_DIR_NAME
     inv.remote_profiles = remote_profiles
+    inv.agent_profiles_path = agent_profiles
     try:
         present = _list(remote_profiles, inv)
     except _SandboxGone:
@@ -529,6 +532,14 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
     return inv
 
 
+def _pod_home_present(home: Path) -> bool:
+    """Whether the agent pod has this home now; an unreadable answer counts as present."""
+    try:
+        return home.is_dir()
+    except OSError:
+        return True
+
+
 def _is_stale_cluster_home(name: str) -> bool:
     """A sandbox home `sweep_stale_homes` may remove: a well-formed cluster profile name."""
     return name.startswith(CLUSTER_PROFILE_PREFIX) and bool(PROFILE_NAME.fullmatch(name))
@@ -548,10 +559,13 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
     rest, as `sweep_overrides` does: nothing legitimate leaves many stale
     homes, and a worker that planted thousands costs one more exec, not one
     each.  Runs as the model's account, which owns the homes, as
-    `_remove_remote` does.
+    `_remove_remote` does.  The pod is read once more right before the ``rm``:
+    the inventory's per-home listings sit between the first pod read and this
+    point, and a cluster re-scaffolded in that window under a name whose old
+    sandbox home is still stale would otherwise lose the home it just got.
     """
     names = [row[0] for row in inv.stale_homes if _is_stale_cluster_home(row[0])]
-    if not names or inv.remote_profiles is None:
+    if not names or inv.remote_profiles is None or inv.agent_profiles_path is None:
         return
     if PLATFORM_PROFILE not in inv.agent_profiles:
         sweep.warnings.append(
@@ -570,6 +584,9 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
             f"(a symlink, or the check failed); stale profile homes not removed"
             + (f": {detail[:STDERR_EXCERPT_CHARS]}" if detail else "")
         )
+        return
+    names = [name for name in names if not _pod_home_present(inv.agent_profiles_path / name)]
+    if not names:
         return
     removed, failed = _remove_remote_batched(remote_profiles, names, sweep)
     sweep.stale_homes_removed.extend(removed)

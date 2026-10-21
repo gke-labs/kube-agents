@@ -348,8 +348,8 @@ from scope or deleted loses its home on the agent pod, and the sandbox's copy,
 kubeconfig included, had nothing else to remove it. The agent pod's profile
 list is the authority, read after the sandbox is listed, and the job removes
 no stale home when that list lacks the platform profile. A stale home whose
-`rm` fails is the one thing here that reaches chat: one bullet naming it, each
-night until it goes. A failure to take the inventory is logged there too
+`rm` fails reaches chat, as the two guards do when they hold: one bullet
+naming it, each night until it goes. A failure to take the inventory is logged there too
 rather than posted.
 
 Inside a home the agent pod does have a profile for, two things are removed,

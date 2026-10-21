@@ -707,6 +707,28 @@ class StaleHomesTest(_HomeFixture):
         self.assertEqual([r[0] for r in inv.stale_homes], ["cluster-gone"])
         self.assertEqual(sweep.stale_homes_removed, ["cluster-gone"])
 
+    def test_a_home_the_pod_regained_before_the_rm_is_kept(self):
+        # The inventory lists every live home between the pod read and the rm.
+        # A cluster re-scaffolded in that window, under a name whose old sandbox
+        # home is still stale, has a pod home again by the time the rm would
+        # run: the pod is read once more and the name is dropped.
+        profiles = self.profiles
+
+        class Rescaffolding(FakeSandbox):
+            def __call__(inner, argv, **kwargs):
+                if argv[1] == "-P":  # the last sandbox call before the rm
+                    (profiles / "cluster-gone").mkdir(exist_ok=True)
+                return super().__call__(argv, **kwargs)
+
+        fake = Rescaffolding(self.tree)
+        inv, sweep = self.sweep(fake)
+        self.assertEqual([r[0] for r in inv.stale_homes], ["cluster-gone"])
+        self.assertEqual(self.rms(fake), [])
+        self.assertEqual(sweep.stale_homes_removed, [])
+        self.assertEqual(sweep.warnings, [])
+        self.assertIn("(mtime=2025-10-09T08:53:20Z, not removed)",
+                      gc._format_inventory(inv, sweep.stale_homes_removed, sweep.stale_homes_failed)[0])
+
     def test_a_pod_that_lists_no_platform_profile_removes_nothing(self):
         shutil.rmtree(self.profiles / "platform")
         fake = FakeSandbox(self.tree)
