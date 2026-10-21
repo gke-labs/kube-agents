@@ -1754,17 +1754,6 @@ class AllowlistTest(unittest.TestCase):
         self.assertTrue(all(e.why for e in entries), "every entry says why")
         self.assertFalse(hasattr(reconcile, "REPLACE_ALLOWED_ADDRESSES"), "one list, in the file")
 
-    def test_the_committed_allowlist_carries_the_seeded_a_default_pool_replace_as_a_one_shot_entry(self):
-        # The machine-type change on seeded-a's default pool is a replace, which
-        # the reconcile refuses on every project until this entry exists; it is
-        # one-shot, so the report names it unused once the fleet has converged
-        # and a follow-up removes it.
-        entries = {e.address: e for e in reconcile.load_allowlist(reconcile.ALLOWLIST_FILE)}
-        self.assertIn("google_container_node_pool.seeded_a_default", entries)
-        entry = entries["google_container_node_pool.seeded_a_default"]
-        self.assertFalse(entry.standing, "a one-time replace, removed by its follow-up")
-        self.assertIn("e2-standard-2", entry.why)
-
     def test_a_delete_on_a_listed_address_is_applied_and_counted(self):
         allow = _allow([("google_compute_disk.orphan", "revert of the cost fixture", False)])
         tofu = _Tofu({P7: DELETE})

@@ -338,8 +338,9 @@ resource "google_container_node_pool" "seeded_a_default" {
     # allocatable, the fixtures are 10m each, and the busier node was within
     # 2-47m of full on every pool project, so each new fixture strands a pod
     # somewhere. A dedicated-core size allocates 1930m, about a core spare
-    # per node. machine_type is ForceNew: changing it REPLACES the pool,
-    # which reconcile-allow.json declares for the reconcile.
+    # per node. The provider updates machine_type in place (plan: one
+    # update, no replace), so GKE recreates the two nodes one at a time
+    # under the pool's surge settings; no reconcile-allow.json entry.
     machine_type    = "e2-standard-2"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels
