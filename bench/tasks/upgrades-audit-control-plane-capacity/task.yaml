@@ -62,6 +62,8 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame, anchored
   # at both ends, with the line's decoration folded first.
   # The frame every cluster must satisfy, counts and window included.
+  # The fold spaces a separator only before a letter, so a count written right
+  # after `:` or `;` stays unspaced; the patterns admit the missing space there.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     mode: assert
@@ -74,7 +76,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window [^\n]+$)'
   # The daily window the fleet declares on each seeded cluster is the invented-value guard;
   # the count of capacity failures is the report's to give: a provider stockout during a
   # seeded cluster's auto-upgrade is a finding the judge reads for the rule's 90-day
@@ -92,9 +94,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: \d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc[^\n]*$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history: (?!\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc)[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: control-plane-upgrade-history:(?! ?\d+ capacity failure\(s\) among \d+ upgrade or repair operation\(s\) in the last 90 days; maintenance window daily at \d{2}:\d{2} utc)[^\n]*$'
 
   - name: no-invented-cves
     role: objective
