@@ -52,8 +52,8 @@ SOURCE = "inventory"
 # What the onboarding scan checks: the slug table in
 # governance/cluster_inventory_audit_sop.md, in its order, with the words the
 # report uses for each. The posture line counts them and names the audits'
-# areas rather than an exclusion list it cannot keep complete; the raw file and
-# the Slack card list them by name.
+# areas rather than an exclusion list it cannot keep complete; the raw file
+# lists them by name.
 SCAN_CHECKS = (
     ("probes-startup", "startup probes"),
     ("no-resourcequota", "ResourceQuota and LimitRange"),

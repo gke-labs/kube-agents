@@ -31,3 +31,4 @@ obtainability-planted-orphan-service
 fleet-audit-unchanged-finding-keeps-wording
 first-install-hello-running
 first-install-hello-done
+gitops-drift-backlog-digest

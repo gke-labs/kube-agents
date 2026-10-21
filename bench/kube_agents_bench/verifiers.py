@@ -6435,7 +6435,7 @@ def _report_body(text: str) -> str:
 
 @VERIFIERS.register("bootstrap_report_posture")
 class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
-    """Checks that the onboarding report opens with the posture the SOP fixes, and judges nothing.
+    """Checks that the onboarding report opens with the posture the SOP fixes.
 
     The prioritization SOP (Step 6) has the worker open the report with what
     was scanned and then the posture line ``inventory_findings.py select``
@@ -6485,7 +6485,8 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
             return "fail", f"the report does not open with the posture the SOP fixes; it opens: {body[: len(expected) + 80]!r}", raw
         if verdicts:
             return "fail", f"the report judges the fleet, which its posture line leaves to the first-run audits: {verdicts}", raw
-        return "pass", "the report opens with the scan counts and the posture line, and judges nothing", raw
+        judged = " and has none of the forbidden verdicts" if self.forbidden_patterns else ""
+        return "pass", f"the report opens with the scan counts and the posture line{judged}", raw
 
 
 # The check rosters of the four audits the oobe stage runs after the scan

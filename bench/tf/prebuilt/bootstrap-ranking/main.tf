@@ -165,11 +165,11 @@ locals {
     open("${local.home}/.user_aligned", "x").close()
     print("armed")
   EOP
-  # Resolves every finding in the raw report's block that the worker or the
-  # delivery job registered, so the findings nudge does not bring the planted
+  # Resolves every finding, in the block of each planted report it is given,
+  # that the worker or the delivery job registered, so the findings nudge does not bring the planted
   # ones to chat after the case and the next run registers them as new. A
-  # finding the queue does not hold (404) was never registered, as when the
-  # run ended before delivery. The delivery's marks count the report's items
+  # finding the queue does not hold (404) was never registered: the run ended
+  # before delivery, or it belongs to the other case on this stack. The delivery's marks count the report's items
   # against that UTC day's critical allowance, which this does not give back.
   # Runs in the agent pod, which serves the queue.
   resolve_py = <<-EOP

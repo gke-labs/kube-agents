@@ -112,7 +112,8 @@ class PresentTest(unittest.TestCase):
     def test_the_scans_posture_line_is_kept_whole_under_the_headline(self):
         line = inventory_presenter.SCAN_SCOPE_LINE
         # SOP Step 6 writes it as its own paragraph; a wrapped copy is the same line.
-        wrapped = line.replace(", Dataplane V2", ",\nDataplane V2")
+        wrapped = line.replace("; ", ";\n")
+        self.assertNotEqual(wrapped, line)
         for posture in (line, wrapped):
             with self.subTest(wrapped=posture != line):
                 report = REPORT.replace(

@@ -29,7 +29,7 @@
 # SOP, which takes a dispatcher slot for most of the stack's wait.
 ---
 id: bootstrap-inventory-posture-scope
-name: The first onboarding report says how far the scan went and judges nothing
+name: The first onboarding report opens with the scan counts and the posture line
 
 fixtures: []
 

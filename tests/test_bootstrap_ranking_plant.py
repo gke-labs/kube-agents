@@ -817,10 +817,10 @@ class ResolveTest(unittest.TestCase):
         self._endpoint = "http://127.0.0.1:%d" % server.server_port
         self._code = _in_pod("resolve_py", {**_IN_POD, "local.scripts": str(_PLATFORM_SCRIPTS)})
 
-    def _resolve(self):
+    def _resolve(self, *reports):
         env = {**os.environ, "FINDINGS_ENDPOINT": self._endpoint, "SESSION_KV_API_KEY": "kv-key"}
         return subprocess.run(
-            [sys.executable, "-", _INTERPOLATIONS["local.raw_b64"]],
+            [sys.executable, "-", *(reports or [_INTERPOLATIONS["local.raw_b64"]])],
             input=self._code, env=env, capture_output=True, text=True, timeout=60,
         )
 
@@ -833,6 +833,21 @@ class ResolveTest(unittest.TestCase):
             self.assertEqual(auth, "Bearer kv-key")
             self.assertEqual(body["outcome"], "resolved")
         self.assertIn("resolved 7 planted finding(s)", out.stdout)
+
+    def test_every_planted_report_passed_is_resolved(self):
+        # The teardowns pass both cases' reports; each report's findings are resolved.
+        import findings_queue
+        import inventory_findings
+
+        out = self._resolve(*_PLANTED)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        every = [
+            findings_queue.derive_finding_id(i["check"], i["project"], i["cluster"], i.get("namespace", ""), i["object"])
+            for raw in sorted(_STACK.glob("inventory-raw*.txt"))
+            for i in inventory_findings.parse_block(raw.read_text())
+        ]
+        self.assertGreater(len(every), len(self._ids))
+        self.assertEqual(sorted(path for path, _, _ in self._seen), sorted(f"/v1/findings/{i}/verified" for i in every))
 
     def test_a_finding_never_registered_is_skipped_and_any_other_refusal_fails(self):
         self._status = {self._ids[0]: 404}
