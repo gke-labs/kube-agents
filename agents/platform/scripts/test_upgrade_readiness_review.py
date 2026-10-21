@@ -861,6 +861,16 @@ class TheTick(unittest.TestCase):
         self.assertEqual(len(latest["registration_errors"]), 2)
         self.assertTrue(all(r["outcome"] == review.REGISTRATION_FAILED for r in latest["findings"]))
 
+    def test_a_record_that_cannot_be_written_still_says_what_the_queue_refused(self):
+        with mock.patch.object(review, "kv_request", side_effect=OSError("HTTP 503 Service Unavailable: the findings queue is busy")), \
+                mock.patch.object(review, "write_record", side_effect=OSError("No space left on device")):
+            code, out = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("could not write the record under", out)
+        self.assertIn(f"{review.LOG_PREFIX}: 5 finding(s) and 2 completeness claim(s) did not reach the findings queue:", out)
+        self.assertIn(review.REGISTRATION_NO_RECORD, out)
+        self.assertNotIn(review.REGISTRATION_IN_REPORT, out)
+
     def test_the_registration_line_names_three_refusals_and_counts_the_rest(self):
         blocked = [member(f"c{i}", "blocked", pdbs={"blocking": [budget(name=f"b{i}")]}) for i in range(4)]
         self.envelope = {"exit": 0, "tables": "", "report": {"members": blocked, "errors": []}}

@@ -13,7 +13,7 @@ and `latest.md`, and the findings queue as this job's pre-run script reads it (o
 
 **Cron id:** `upgrade-readiness-weekly-brief` — `0 7 * * 6` (Saturdays, 07:00 UTC), an hour after
 `upgrade-readiness-weekly-review` starts. The review grades every cluster in scope and registers what
-it finds on the findings queue inside a 45-minute budget, so by 07:00 its summary is on disk, or
+it finds on the findings queue inside a 45-minute read budget and the ten minutes its sends have after it, so by 07:00 its summary is on disk, or
 chat carries one of its lines: the failure line, the partial line, or the line that says its copy
 did not land. Step 1 says what each means; nothing else sequences the two.
 

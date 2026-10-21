@@ -636,8 +636,14 @@ def list_findings(
     severity: str = "",
     limit: int = 200,
     project: str = "",
+    check_prefix: str = "",
 ) -> list[dict]:
     clauses, params = [], []
+    if check_prefix:
+        # A family of checks, as a claim's check_prefix names one, compared as
+        # a plain prefix: LIKE would read `_` in a check as a wildcard.
+        clauses.append("substr(check_slug, 1, ?) = ?")
+        params.extend([len(check_prefix), check_prefix])
     if project:
         clauses.append("project = ?")
         params.append(project)

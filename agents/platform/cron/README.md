@@ -331,7 +331,9 @@ claims the queue could not tell apart; and one with a row the queue would refuse
 would book that finding's row absent. A cluster with no upgrade target (no release channel, or a
 server config that did not answer) is never read in full, since the grader cannot judge its pools'
 skew, so it claims nothing either: a budget or webhook row there that is fixed stays on the queue
-until the user decides it. On an install with no declared scope, a roster that names one
+until the user decides it. The same holds for a cluster on which a readiness rule failed or left an
+`unknown`, even a rule that cannot block: a claim would lower that rule's own rows, which the run
+could not read again. On an install with no declared scope, a roster that names one
 project both by number and by id runs it twice until the daily watch has learned the number's id,
 and on a Saturday `gcloud projects describe` fails, the number's run is booked as a project not
 read; name the project by its id alone to avoid both. The script writes the technical report under `upgrade-readiness/weekly/` beside the

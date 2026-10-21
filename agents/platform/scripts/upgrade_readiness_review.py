@@ -362,7 +362,9 @@ TMP_SUFFIX = watch.LEDGER_TMP_SUFFIX  # a file is written beside its name and re
 FAILED_LINE = "{prefix}: failed: {detail}"
 RECOVERED_LINE = "{prefix}: runs again after a failure"
 PARTIAL_LINE = "{prefix}: {count} project(s) not read this week: {detail}; their clusters keep last week's findings and are not counted"
-REGISTRATION_FAILED_LINE = "{prefix}: {rows} finding(s) and {claims} completeness claim(s) did not reach the findings queue: {detail}; the findings are in the report, not on the queue, and the brief says so; a cluster whose claim did not land keeps last week's rows at full confidence"
+REGISTRATION_FAILED_LINE = "{prefix}: {rows} finding(s) and {claims} completeness claim(s) did not reach the findings queue: {detail}; {where}; a cluster whose claim did not land keeps last week's rows at full confidence"
+REGISTRATION_IN_REPORT = "the findings are in the report, not on the queue, and the brief says so"
+REGISTRATION_NO_RECORD = "the record could not be written either, so this line is the one place they are said"
 COPY_FAILED_LINE = "{prefix}: the sandbox copy failed: {detail}; the brief reads the previous copy until the next review"
 # A failure is announced once per distinct cause: the marker keeps the failure's text
 # with every number replaced, so a timeout that reads 1187s one week and 1203s the
@@ -1401,27 +1403,34 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
         return lines, 0
     report_json = {"generated_at": iso(now), "projects": summary_doc["projects"], watch.MEMBERS_KEY: members, watch.ERRORS_KEY: errors, "project_failures": failures}
     findings_json = {"generated_at": iso(now), "findings": [payload(item) for item in findings], "outcomes": outcomes, "errors": problems}
+    # Said in chat, not on stderr, which the scheduler keeps nowhere for a
+    # zero-exit script: findings off the queue, a copy the brief cannot read and
+    # projects not read are the week's failures whether or not the record is
+    # written, so a record that cannot be written does not silence them.
+    def registration_lines(where: str) -> list[str]:
+        if not problems:
+            return []
+        failed_rows = sum(1 for outcome in outcomes.values() if outcome == REGISTRATION_FAILED)
+        failed_claims = sum(1 for problem in problems if CLAIM_FAILED_MARK in problem)
+        return [REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, rows=failed_rows, claims=failed_claims, detail=shown(problems, MAX_PROBLEMS_IN_LINE), where=where)]
+
+    partial_lines = []
+    if failures:
+        detail = shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE)
+        partial_lines.append(PARTIAL_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))
     try:
         write_record(home, stamp, report_md, report_json, findings_json, summary_doc)
     except OSError as exc:
-        return [FAILED_LINE.format(prefix=LOG_PREFIX, detail=f"could not write the record under {home}: {exc}")], 1
+        failed = FAILED_LINE.format(prefix=LOG_PREFIX, detail=f"could not write the record under {home}: {exc}")
+        return [failed, *registration_lines(REGISTRATION_NO_RECORD), *partial_lines], 1
     copy_error = copy_to_sandbox(report_md, summary_doc)
     lines = []
     if clear_failure_marker():
         lines.append(RECOVERED_LINE.format(prefix=LOG_PREFIX))
-    # Said in chat, not on stderr, which the scheduler keeps nowhere for a
-    # zero-exit script: findings off the queue and a copy the brief cannot read
-    # are the week's failures even when the record was written.
-    if problems:
-        failed_rows = sum(1 for outcome in outcomes.values() if outcome == REGISTRATION_FAILED)
-        failed_claims = sum(1 for problem in problems if CLAIM_FAILED_MARK in problem)
-        lines.append(REGISTRATION_FAILED_LINE.format(prefix=LOG_PREFIX, rows=failed_rows, claims=failed_claims, detail=shown(problems, MAX_PROBLEMS_IN_LINE)))
+    lines += registration_lines(REGISTRATION_IN_REPORT)
     if copy_error:
         lines.append(COPY_FAILED_LINE.format(prefix=LOG_PREFIX, detail=copy_error))
-    if failures:
-        detail = shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE)
-        lines.append(PARTIAL_LINE.format(prefix=LOG_PREFIX, count=len(failures), detail=detail))
-    return lines, 0
+    return lines + partial_lines, 0
 
 
 def main(argv: list[str] | None = None) -> int:

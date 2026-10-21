@@ -12,12 +12,13 @@ instead: the scheduler runs this script before the turn (the entry's
 ``script``) and puts its stdout above the prompt.
 
 - ``open``: ``GET /v1/findings/ranked``, the open backlog, worst first.
-- ``snoozed`` and ``dismissed``: ``GET /v1/findings`` by state, at the queue's
-  page limit, for each project in ``projects`` (the ones the review's summary
-  names, and any other the open backlog holds); without the summary, which is
-  the one list that names a project whose rows are all decided, each state is
-  read once across every project instead.
-- ``cut``: each of those pages that came back full, so its count is a floor;
+- ``snoozed`` and ``dismissed``: ``GET /v1/findings`` by state, one page each
+  across every project, narrowed by the queue to the review's family of checks
+  (``check_prefix=upgrade-``), at the queue's page limit; no project list is
+  needed, so a project whose rows are all decided, or one the summary spells by
+  number, is counted all the same.
+- ``projects``: every project those rows name.
+- ``cut``: each page that came back full, so its count is a floor, and
   ``unread``: each one the script could not read.
 
 Each list keeps only the rows whose check starts with ``upgrade-``. An
@@ -75,27 +76,12 @@ def upgrade_rows(rows: list, open_backlog: bool) -> list[dict]:
     ]
 
 
-def summary_projects() -> list[str]:
-    """The projects the review's own summary names; none when it is missing or unreadable."""
-    try:
-        doc = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    projects = doc.get("projects") if isinstance(doc, dict) else None
-    return [p for p in projects if isinstance(p, str) and p] if isinstance(projects, list) else []
-
-
 def queue_view() -> dict:
     open_rows = upgrade_rows(page_rows(review.kv_request(RANKED_PATH)), open_backlog=True)
-    named = summary_projects()
-    projects = set(named) | {r["project"] for r in open_rows if r.get("project")}
-    # Per project when the summary names them; without it, nothing names a project whose
-    # rows are all decided, so each state is read once across every project instead.
-    pages = [{"state": s, "project": p} for s in DECIDED_STATES for p in sorted(projects)] if named else [{"state": s} for s in DECIDED_STATES]
     decided: dict[str, list[dict]] = {state: [] for state in DECIDED_STATES}
     cut, unread = [], []
-    for page in pages:
-        query = urllib.parse.urlencode({**page, "limit": PAGE_LIMIT})
+    for page in ({"state": state} for state in DECIDED_STATES):
+        query = urllib.parse.urlencode({**page, "check_prefix": review.CHECK_PREFIX, "limit": PAGE_LIMIT})
         try:
             rows = page_rows(review.kv_request(f"{review.KV_FINDINGS_PATH}?{query}"))
         except (OSError, ValueError) as exc:
@@ -106,8 +92,8 @@ def queue_view() -> dict:
         if len(rows) >= PAGE_LIMIT:
             cut.append(page)
         decided[page["state"]] += upgrade_rows(rows, open_backlog=False)
-    projects |= {r["project"] for state in DECIDED_STATES for r in decided[state] if r.get("project")}
-    return {"projects": sorted(projects), "open": open_rows, **decided, "cut": cut, "unread": unread}
+    projects = sorted({r["project"] for rows in (open_rows, *decided.values()) for r in rows if r.get("project")})
+    return {"projects": projects, "open": open_rows, **decided, "cut": cut, "unread": unread}
 
 
 def main() -> int:

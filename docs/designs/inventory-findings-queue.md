@@ -744,7 +744,7 @@ gets the same treatment, for two reasons that are not stylistic:
 | ------------------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
 | `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id |
 | `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in the order below; the whole list, ordering in code                    |
-| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by project, cluster, state, severity                    |
+| `GET /v1/findings`                               | `platform` worker, weekly brief   | the on-demand pull, filterable by project, cluster, state, severity, check prefix      |
 | `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
 | `POST /v1/findings/{id}/surfaced` + `publisher`  | a paced publisher (§7.2)          | also `added_class`, `run`: `first_shown_at` on a first paced showing, and the addition |
 | `GET /v1/findings/additions?day=`                | the nudge                         | items added on a UTC day, by class, from `findings_additions` (§7.2)                   |

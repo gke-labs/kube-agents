@@ -5422,11 +5422,11 @@ def get_ranked_findings() -> Dict[str, Any]:
 
 @app.get("/v1/findings", dependencies=[Depends(verify_api_key)])
 def get_findings(
-    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = ""
+    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = "", check_prefix: str = ""
 ) -> Dict[str, Any]:
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
-            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project)
+            findings = findings_queue.list_findings(conn, cluster, state, severity, limit, project, check_prefix)
     except findings_queue.FindingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
     return {"findings": findings}
