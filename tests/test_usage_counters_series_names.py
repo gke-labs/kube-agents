@@ -128,8 +128,19 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertIsNotNone(match, "toolInvocationsCountedStatuses not found")
         counted = set(re.findall(r'"([^"]+)":\s*true', match.group(1)))
         self.assertEqual({_py_const("TOOL_STATUS_SUCCESS"), _py_const("TOOL_STATUS_ERROR")}, counted)
-        for excluded in ("TOOL_STATUS_BLOCKED", "TOOL_STATUS_BUSY", "TOOL_STATUS_ABANDONED"):
-            self.assertNotIn(_py_const(excluded), counted)
+        excluded = {_py_const(name) for name in ("TOOL_STATUS_BLOCKED", "TOOL_STATUS_BUSY", "TOOL_STATUS_ABANDONED")}
+        self.assertFalse(counted & excluded)
+        # The broker declares its whole vocabulary once; the summed and the
+        # left-out statuses together must be exactly it, so a status the
+        # broker adds and this test does not know fails here rather than
+        # landing silently outside every status counter.
+        match = re.search(r"^TOOL_STATUSES\s*=\s*frozenset\(\{([^}]*)\}\)", _BROKER_PY.read_text(), re.M)
+        self.assertIsNotNone(match, "TOOL_STATUSES not found")
+        vocabulary = {_py_const(name.strip()) for name in match.group(1).split(",") if name.strip()}
+        self.assertEqual(vocabulary, counted | excluded)
+
+    def test_the_brokers_failure_family_is_the_one_the_poller_sums_into_broker_failures(self):
+        self.assertEqual(_py_const("BROKER_FAILURES_METRIC"), _go_const(_SCRAPE_GO, "brokerFailuresSeries"))
 
     def test_the_refused_outcomes_are_the_brokers_blocked_busy_and_abandoned(self):
         source = _SCRAPE_GO.read_text()

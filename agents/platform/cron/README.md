@@ -184,10 +184,23 @@ Which clusters it reads is decided on the agent pod: `UPGRADE_READINESS_PROJECTS
 when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
 sandbox's configured project; and with nothing at all the tick fails closed,
-because the report script's own fallback is every project the credential can
-list. Within those projects the report script
+because on an install that declares no scope the report script's own fallback
+is every project the credential can list. A roster spelling with a space, a semicolon, or a
+comma inside one project's name is not a project id or number, so it fails the tick with the
+places to correct it. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. That read is `gcloud` cluster metadata
+Cluster Agent from is still read here. On an install that declares a scope (a
+`spec.scope` block), the report script, a fleet-audit collector, refuses a bare
+`--project` in the sandbox, so the job reads the declared scope on the agent
+pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
+resolved scope beside each `--project`, the `collector_args` the
+platform_control `fleet_scope` tool hands the SOPs less the cluster exclusion
+(`--scope-projects`, `--scope-unread`): the script reads a project inside the scope and refuses one
+outside it, one listed but unread, a project number it cannot resolve, and any project in a
+sandbox still marked scoped after the scope is gone, each with the reason; the watch adds the
+install's remedy, and the table carries each as that project's failure, and a tick whose every project is
+refused fails, announced once. An install that declares none keeps the bare flag, and a scope
+render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: one `get-credentials` and six `kubectl get`s
 per cluster (budgets, Deployments and StatefulSets; webhook configurations
@@ -217,7 +230,9 @@ It runs the skill the way `stall-watch` runs `stall_report.py`: every module
 under the skill's `scripts/` except its tests, with the data files beside them,
 is read from the agent image's `/opt/platform-template/skills/` copy and handed
 to `python3 -I -` in the sandbox on stdin, behind a loader (a meta-path finder
-serving the shipped set) before running `fleet_upgrade_report.main`. The
+serving the shipped set, the agent image's `fleet_scope_args` among them so the
+script formats a refusal with the constants the job parses it by) before
+running `fleet_upgrade_report.main`. The
 loader gives the report a private `tempfile.mkdtemp` directory for its JSON
 output and rollout record, so nothing the model can write to is on the path
 the result crosses, and removes it afterwards; the sandbox's `/opt/data` is
@@ -245,7 +260,8 @@ runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
 line names each project with a read error and its reason (the budget, the
-sandbox's error, a failed listing, an unresolved project number), the
+sandbox's error, a failed listing, an unresolved project number, a refusal under the
+declared scope with the install's remedy), the
 ledger's `table_errors` keeps the last tick's, and a version's own line names
 the project whose readiness run was not started or was cut short (a version
 none of whose projects ran is not recorded and is retried tomorrow),
@@ -262,11 +278,16 @@ chat line says "none graded" and the version is tried again tomorrow), and the
 weekly comparison carries ten minutes of slack so the tick's own drift cannot
 push a refresh to day eight. A partial table, an ungraded version or a failed
 tick is announced once, not daily: the ledger keeps what was announced (the
-kinds of read error for a partial table; each project and how it went
-ungraded for a version, never the error text, which an outage rewords from
-one run to the next), a
-failed tick (which writes nothing to the ledger) keeps its line in
-`last-failure.txt` beside it, and the next line is the recovery. A version
+kinds of read error for a partial table, and for a refusal the project and
+its cause; each project and how it went ungraded for a version, never the
+error text, which an outage rewords from one run to the next), a
+failed tick (which writes nothing to the ledger but its record of the projects
+the hops refused as outside the declared scope and the ids it learned for
+numbered spellings, kept at whichever step the tick failed unless the ledger
+itself cannot be written or re-read, so the next tick files them under the same cause)
+keeps its key in
+`last-failure.txt` beside it (its line, or, for a tick whose every run was refused, the
+refused projects and their causes), and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
 project one readiness sweep a week rather than one a day; a `blocked` verdict
@@ -341,12 +362,19 @@ script; see `feedback-prompt` below.)
 The same log gets an inventory of the sandbox's profile homes, so that loose
 files a worker leaves there can be seen without exec'ing into the sandbox: each
 home's top-level entries that the product doesn't create, and any home the agent
-pod no longer has a profile for, such as a cluster dropped from scope. That's an
-inventory only: nothing is moved or deleted, and a failure to take it is logged
-there too rather than posted.
+pod no longer has a profile for. The inventory itself moves and deletes nothing;
+what the job removes is below. A
+`cluster-*` home the agent pod has no profile for is removed: a cluster dropped
+from scope or deleted loses its home on the agent pod, and the sandbox's copy,
+kubeconfig included, had nothing else to remove it. The agent pod's profile
+list is the authority, read after the sandbox is listed, and the job removes
+no stale home when that list lacks the platform profile. A stale home whose
+`rm` fails reaches chat, as the two guards do when they hold: one bullet
+naming it, each night until it goes. A failure to take the inventory is logged there too
+rather than posted.
 
-Two things in a profile home are removed, in every home the agent pod has a
-profile for, on the agent pod and in the sandbox. Cron run directories
+Inside a home the agent pod does have a profile for, two things are removed,
+on the agent pod and in the sandbox. Cron run directories
 (`cron/runs/<job>_<execution>`, each cron run's working directory) go after
 seven days, logged as a count. Override trees go the first night, logged by
 name: a top-level directory named `<something>_override`, such as a worker's

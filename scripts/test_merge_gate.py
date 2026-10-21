@@ -14,6 +14,7 @@ parsed from the shape GitHub names it.
 import os
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -22,11 +23,14 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import merge_gate as gate
+import pin_smoke_status
 
 REPO = "gke-labs/kube-agents"
 SHA = "a" * 40
 BASE_SHA = "b" * 40
 APPROVED = {"lgtm", "approved", "size/M"}
+CUTOFF = datetime(2026, 10, 23, 18, 0, tzinfo=timezone.utc)
+BUILD = "https://prow.example/view/gs/bucket/pr-logs/pull/7/pull-kube-agents-smoke-test/1"
 
 
 def pull(labels=APPROVED, statuses=None, draft=False, auto_merge=False, queue_entry=None, base="main"):
@@ -54,10 +58,11 @@ def no_files():
 class FakeAPI:
     """Just enough of `GitHubAPI` for the functions that call it."""
 
-    def __init__(self, raw_pull=None, statuses=(), files=(), nodes=()):
+    def __init__(self, raw_pull=None, statuses=(), files=(), nodes=(), all_statuses=()):
         self.repo = REPO
         self.raw_pull = raw_pull
         self.statuses = list(statuses)
+        self.all_statuses = list(all_statuses)
         self.files = list(files)
         self.nodes = list(nodes)
         self.mutations = []
@@ -71,6 +76,8 @@ class FakeAPI:
     def get_all(self, path, per_page=100):
         if path.endswith("/files"):
             return self.files
+        if path.endswith("/statuses"):
+            return self.all_statuses
         return [self.raw_pull]
 
     def post(self, path, payload=None, tolerate=()):
@@ -157,6 +164,139 @@ class SmokeTest(unittest.TestCase):
         api = FakeAPI(files=[{"filename": "docs/x.py", "previous_filename": "scripts/x.py"}])
         self.assertEqual(gate.changed_files(api, 7), ["docs/x.py"])
         self.assertFalse(gate.smoke_required(gate.changed_files(api, 7)))
+
+
+def smoke_status(created_at, state="success", target_url=BUILD):
+    """One entry of the commit's full status list, which GitHub returns newest first."""
+    return {"context": gate.SMOKE_CONTEXT, "state": state, "target_url": target_url, "created_at": created_at}
+
+
+class CutoffTest(unittest.TestCase):
+    """SMOKE_PIN_NOT_BEFORE: a smoke green from before the mode change must not pass."""
+
+    def test_unset_a_green_passes_without_reading_its_history(self):
+        def unread():
+            raise AssertionError("the status history was read with no cutoff set")
+
+        results = gate.verdicts(pull(statuses=green(gate.SMOKE_CONTEXT)), no_files, None, unread)
+        self.assertEqual(results[gate.SMOKE_GATE][0], gate.SUCCESS)
+
+    def test_a_green_from_before_the_cutoff_waits_for_a_retest(self):
+        before = datetime(2026, 10, 23, 17, 59, tzinfo=timezone.utc)
+        results = gate.verdicts(pull(statuses=green(gate.SMOKE_CONTEXT)), no_files, CUTOFF, lambda: before)
+        self.assertEqual(results[gate.SMOKE_GATE], (gate.PENDING, gate.SMOKE_PREDATES))
+        self.assertLessEqual(len(gate.SMOKE_PREDATES), gate.DESCRIPTION_MAX)
+
+    def test_a_green_from_after_the_cutoff_passes(self):
+        after = datetime(2026, 10, 23, 18, 1, tzinfo=timezone.utc)
+        results = gate.verdicts(pull(statuses=green(gate.SMOKE_CONTEXT)), no_files, CUTOFF, lambda: after)
+        self.assertEqual(results[gate.SMOKE_GATE][0], gate.SUCCESS)
+
+    def test_a_green_of_unknown_age_waits(self):
+        results = gate.verdicts(pull(statuses=green(gate.SMOKE_CONTEXT)), no_files, CUTOFF, lambda: None)
+        self.assertEqual(results[gate.SMOKE_GATE][0], gate.PENDING)
+
+    def test_a_red_or_running_smoke_and_skipped_paths_are_unchanged(self):
+        def unread():
+            raise AssertionError("the status history was read for a smoke that is not green")
+
+        red = {gate.SMOKE_CONTEXT: ("failure", "Job failed.")}
+        self.assertEqual(gate.verdicts(pull(statuses=red), no_files, CUTOFF, unread)[gate.SMOKE_GATE][0], gate.FAILURE)
+        skipped = gate.verdicts(pull(), lambda: ["docs/a.md"], CUTOFF, unread)
+        self.assertEqual(skipped[gate.SMOKE_GATE][0], gate.SUCCESS)
+
+    def test_a_re_pin_copy_counts_from_the_builds_first_report(self):
+        """A re-pin after the cutoff is a fresh copy of a green from before it."""
+        api = FakeAPI(all_statuses=[smoke_status("2026-10-23T19:00:00Z"), smoke_status("2026-10-23T12:00:00Z")])
+        self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc))
+
+    def test_an_other_build_or_a_red_in_the_history_is_not_its_first_report(self):
+        api = FakeAPI(
+            all_statuses=[
+                smoke_status("2026-10-23T19:00:00Z"),
+                smoke_status("2026-10-23T12:00:00Z", state="pending"),
+                smoke_status("2026-10-23T11:00:00Z", target_url=BUILD.replace("/1", "/0")),
+            ]
+        )
+        self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 19, 0, tzinfo=timezone.utc))
+
+    def test_a_status_with_no_build_link_counts_from_the_earliest_with_none(self):
+        """A re-pin copies a link-less green with a new time; the copy must not pass for a new verdict."""
+        api = FakeAPI(
+            all_statuses=[
+                smoke_status("2026-10-23T19:00:00Z", target_url=""),
+                smoke_status("2026-10-23T12:00:00Z", target_url=None),
+                smoke_status("2026-10-23T11:00:00Z"),
+            ]
+        )
+        self.assertEqual(gate.smoke_first_reported(api, SHA), datetime(2026, 10, 23, 12, 0, tzinfo=timezone.utc))
+
+    def test_an_unreadable_time_or_a_latest_that_is_not_green_is_unknown(self):
+        for statuses in (
+            [smoke_status("")],
+            [smoke_status("2026-10-23T19:00:00")],
+            [smoke_status("2026-10-23T19:00:00Z", state="pending")],
+            [],
+        ):
+            with self.subTest(statuses=statuses):
+                self.assertIsNone(gate.smoke_first_reported(FakeAPI(all_statuses=statuses), SHA))
+
+    def test_the_variable_is_read_as_pin_smoke_status_reads_it(self):
+        for raw, want in (("", None), ("  ", None), ("2026-10-23T18:00:00Z", CUTOFF), ("2026-10-23T14:00:00-04:00", CUTOFF)):
+            with self.subTest(raw=raw):
+                self.assertEqual(gate.not_before_from_env({gate.NOT_BEFORE_ENV: raw}), want)
+        self.assertIsNone(gate.not_before_from_env({}))
+        for raw in ("2026-10-23T18:00:00", "tomorrow"):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                gate.not_before_from_env({gate.NOT_BEFORE_ENV: raw})
+
+    def test_an_unparsable_variable_decides_nothing(self):
+        env = {"GITHUB_TOKEN": "t", gate.NOT_BEFORE_ENV: "tomorrow"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(gate, "cmd_group") as group:
+            self.assertEqual(gate.main(["--repo", REPO, "group", "--ref", "x", "--gate", gate.SMOKE_GATE]), 2)
+        group.assert_not_called()
+
+    def test_a_merge_labels_group_does_not_read_the_variable(self):
+        env = {"GITHUB_TOKEN": "t", gate.NOT_BEFORE_ENV: "tomorrow"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(gate, "cmd_group") as group:
+            group.return_value = True, "#42 Merge labels: success"
+            self.assertEqual(gate.main(["--repo", REPO, "group", "--ref", "x", "--gate", gate.LABELS_GATE]), 0)
+        self.assertIsNone(group.call_args.kwargs["not_before"])
+
+    def test_a_green_pin_smoke_status_expired_waits_with_or_without_the_variable(self):
+        def unread():
+            raise AssertionError("the status history was read for an expired green")
+
+        expired = {gate.SMOKE_CONTEXT: ("success", f"Job succeeded. {gate.SMOKE_EXPIRED_NOTE}")}
+        for not_before in (None, CUTOFF):
+            with self.subTest(not_before=not_before):
+                results = gate.verdicts(pull(statuses=expired), no_files, not_before, unread)
+                self.assertEqual(results[gate.SMOKE_GATE], (gate.PENDING, gate.SMOKE_PREDATES))
+
+    def test_the_expired_note_is_the_one_pin_smoke_status_writes(self):
+        self.assertEqual(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.EXPIRED_NOTE)
+        self.assertIn(gate.SMOKE_EXPIRED_NOTE, pin_smoke_status.expired_description("x" * 200))
+
+    def test_the_queue_refuses_a_green_from_before_the_cutoff(self):
+        raw = {"number": 42, "head": {"sha": SHA}, "base": {"ref": "main"}, "labels": []}
+        ref = f"gh-readonly-queue/main/pr-42-{BASE_SHA}"
+        for created, passed in (("2026-10-23T17:00:00Z", False), ("2026-10-23T19:00:00Z", True)):
+            with self.subTest(created=created):
+                head = [{"context": gate.SMOKE_CONTEXT, "state": "success"}]
+                api = FakeAPI(raw_pull=raw, statuses=head, all_statuses=[smoke_status(created)])
+                self.assertEqual(gate.cmd_group(api, ref, gate.SMOKE_GATE, not_before=CUTOFF)[0], passed)
+
+    def test_a_head_status_is_not_posted_green_for_a_green_from_before_the_cutoff(self):
+        api = FakeAPI(all_statuses=[smoke_status("2026-10-23T17:00:00Z")])
+        gate.gate_pull(api, pull(statuses=green(gate.SMOKE_CONTEXT)), not_before=CUTOFF)
+        self.assertEqual([payload["context"] for _, payload in api.posts], [gate.LABELS_GATE])
+
+    def test_a_head_smoke_gate_that_is_green_skips_the_history_read(self):
+        statuses = green(gate.SMOKE_CONTEXT) | {gate.SMOKE_GATE: ("success", f"{gate.SMOKE_CONTEXT} passed")}
+        api = FakeAPI()
+        with mock.patch.object(gate, "smoke_first_reported", side_effect=AssertionError("history read")):
+            gate.gate_pull(api, pull(statuses=statuses), not_before=CUTOFF)
+        self.assertNotIn(gate.SMOKE_GATE, [payload["context"] for _, payload in api.posts])
 
 
 class PostTest(unittest.TestCase):

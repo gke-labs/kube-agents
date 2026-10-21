@@ -293,6 +293,15 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository whose provisioning/ path holds Terraform; no
+    # pool project's repository has one. Run by hand on a dev install whose
+    # repository does (ka-fleet-dev-1, sackheads/kage-fleet-dev at branch hcl).
+    "terraform-spot-replacement-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
+    "terraform-node-pool-autoscaling-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
