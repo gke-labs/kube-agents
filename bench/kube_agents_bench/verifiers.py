@@ -2605,7 +2605,7 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
     shell line's final exit code faithfully reflects this segment's success or failure.
     A segment's failure is preserved (short-circuiting subsequent execution) if and only if
     it is the last segment on the line or every control operator following it is ``&&``,
-    is not backgrounded with ``&``, is not preceded by ``||`` or ``|`` on the same pipeline,
+    is not backgrounded with ``&``, is not preceded by ``||`` on the same pipeline,
     and is not negated with ``!``. A following ``||``, ``;``, ``|``, or ``&`` hands the exit status
     to another command and may mask failure."""
     words, spans = _shell_words_and_spans(command)
@@ -2616,12 +2616,15 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
 
     for word in words:
         if _is_control_operator(word):
+            op_str = str(word)
             if argv:
                 segments.append(argv)
                 argv = []
-                current_ops = [str(word)]
+                current_ops = [op_str]
             else:
-                current_ops.append(str(word))
+                if op_str == _SHELL_LINE_END and current_ops and current_ops[-1] in ("&&", "||", "|"):
+                    continue
+                current_ops.append(op_str)
             continue
         if current_ops and segments:
             ops_after.append(current_ops)
@@ -2637,16 +2640,30 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
 
     for i, seg in enumerate(segments):
         carries_exit = not trailing_bg
-        if seg and seg[0] == "!":
+        cmd_idx = _command_word_index(seg)
+        if "!" in (seg[:cmd_idx] if cmd_idx is not None else seg[:1]):
             carries_exit = False
 
         if carries_exit and i > 0:
+            depth = 0
+            depth0_resolved = False
             for prev_ops in reversed(ops_after[:i]):
-                prev_connectives = [op for op in prev_ops if op not in ("(", ")")]
-                if any(op in (";", _SHELL_LINE_END, "&") for op in prev_connectives):
-                    break
-                if any(op == "||" for op in prev_connectives):
-                    carries_exit = False
+                for op in reversed(prev_ops):
+                    if op == ")":
+                        depth += 1
+                    elif op == "(":
+                        depth -= 1
+                        depth0_resolved = False
+                    elif depth <= 0:
+                        if not depth0_resolved:
+                            if op in (";", _SHELL_LINE_END, "&"):
+                                depth0_resolved = True
+                            elif op == "||":
+                                carries_exit = False
+                                break
+                            elif op == "&&":
+                                depth0_resolved = True
+                if not carries_exit:
                     break
 
         if carries_exit and i < len(segments) - 1:
@@ -2662,7 +2679,7 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
 
         if len(seg) == 1 and _SHELL_ASSIGNMENT_RE.match(seg[0]):
             _, _, val = seg[0].partition("=")
-            inner = _substitution_commands(val)
+            inner = _substitution_commands(val) if val in spans else None
             if inner is not None:
                 handled_spans.append(val)
                 for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(inner):
@@ -3039,8 +3056,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     recovers -- a case names a run this way where the persona dictates one typed
     command, and a worker that runs it through a file is not credited; and ``succeeded: true`` on a required run checks the terminal call's
     overall exit status from the worker trajectory (see ``WorkerRun.succeeded``
-    for the single-command rule: anything joined before or after the script on
-    the same line decides the exit status), while the dictated form is a bare
+    for the exit propagation and operator rules), while the dictated form is a bare
     command or redirection.
     Under
     ``after_result_pattern``: a refused command whose output the call discarded
@@ -3323,7 +3339,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if unrun_masked:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
                     parts.append(
-                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it; "
+                        f"{named} ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a background &, or a command substitution) means that exit 0 is not the command's own; "
                         f"a clean run may sit in the unread part ({gaps_str})"
                     )
                 if traj_missing:
@@ -3344,7 +3360,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if unrun_masked:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
                     parts.append(
-                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it"
+                        f"{named} ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a background &, or a command substitution) means that exit 0 is not the command's own"
                     )
                 if traj_missing:
                     parts.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))
@@ -3378,7 +3394,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if unrun_masked:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
                     unrun_parts.append(
-                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it"
+                        f"{named} ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a background &, or a command substitution) means that exit 0 is not the command's own"
                     )
                 if unrun_missing:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
@@ -3399,7 +3415,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if unrun_masked:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
                     details.append(
-                        f"{named} ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it; "
+                        f"{named} ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a background &, or a command substitution) means that exit 0 is not the command's own; "
                         f"a clean run may sit in the unread part ({gaps_str})"
                     )
                 if traj_missing:

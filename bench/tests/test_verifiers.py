@@ -8498,6 +8498,35 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["OUT=$(python3 f.py --readiness)"], True),
         (["python3", "f.py", "--readiness"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("OUT='$(python3 f.py --readiness)'") == [
+        (["OUT=$(python3 f.py --readiness)"], True),
+    ]
+    assert _shell_argvs("KC=/tmp/kc\nkubectl get pods") == [
+        ["KC=/tmp/kc"],
+        ["kubectl", "get", "pods"],
+    ]
+    assert _shell_argvs_with_exit_propagation("test -f /opt/data/scratch/m.json ||\npython3 f.py --readiness") == [
+        (["test", "-f", "/opt/data/scratch/m.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("time ! python3 f.py --readiness") == [
+        (["time", "!", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("test -d /x || mkdir -p /x && python3 f.py --readiness") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("test -d /x || (mkdir -p /x && python3 f.py --readiness)") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("(test -d /x || mkdir -p /x) && python3 f.py --readiness") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("echo $(python3 f.py --readiness)") == [
         (["echo", "$(python3 f.py --readiness)"], True),
         (["python3", "f.py", "--readiness"], False),
@@ -8651,15 +8680,16 @@ def test_worker_commands_required_run_succeeded_flag():
         ]
         transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
         res_joined = v.verify(5.0)
-        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but a following |/;/||/& on the line hands its exit status to another command, so exit 0 does not credit it" in res_joined.reason
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a background &, or a command substitution) means that exit 0 is not the command's own" in res_joined.reason
 
     # Trajectory entry where the command is followed by && chains, preceded by commands,
-    # continued with newline after &&, or wrapped in a lone assignment IS credited when the call exited 0.
+    # continued with newline after &&, preceded by || then &&, or wrapped in a lone assignment IS credited when the call exited 0.
     for valid_cmd in [
         f'python3 {_SCRIPT_PATH} --readiness && echo "DONE"',
         f"mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
         f"cd /tmp ; python3 {_SCRIPT_PATH} --readiness",
         f"python3 {_SCRIPT_PATH} --readiness &&\necho DONE",
+        f"test -d /tmp || mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
         f"OUT=$(python3 {_SCRIPT_PATH} --readiness)",
     ]:
         traj_valid = [
