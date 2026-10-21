@@ -935,7 +935,8 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     project the install could not read. The projects this pod decided on
     (``projects``) are not all inside by construction: the reconcile keeps a
     profile the scope never produced (one onboarded by hand before the scope
-    was declared) and, for one run, a project removed from the declaration,
+    was declared) and, until its second clean run after the removal, a project
+    removed from the declaration,
     and a hand run may name anything in ``UPGRADE_READINESS_PROJECTS``; such a
     project's run is a table failure named in the partial line, not a read the
     declaration did not allow; the table carries it under its own kind

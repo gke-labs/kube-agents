@@ -185,7 +185,8 @@ when set, otherwise the management project and every project a Cluster Agent
 profile's identity names, the roster `stall-watch` follows; with neither, the
 sandbox's configured project; and with nothing at all the tick fails closed,
 because on an install that declares no scope the report script's own fallback
-is every project the credential can list. Within those projects the report script
+is every project the credential can list. A roster spelling with a space or a semicolon is
+not a project id or number, so it fails the tick with the places to correct it. Within those projects the report script
 enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
 Cluster Agent from is still read here. On an install that declares a scope (a
 `spec.scope` block), the report script, a fleet-audit collector, refuses a bare
@@ -194,9 +195,11 @@ pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
 resolved scope beside each `--project`, the `collector_args` the
 platform_control `fleet_scope` tool hands the SOPs less the cluster exclusion
 (`--scope-projects`, `--scope-unread`): the script reads a project inside the scope and refuses one
-outside it with the reason, which the table carries as that project's failure;
-an install that declares none keeps the bare flag, and a scope render the pod
-cannot read fails the tick with the reason. That read is `gcloud` cluster metadata
+outside it, one listed but unread, a project number it cannot resolve, and any project in a
+sandbox still marked scoped after the scope is gone, each with the reason and the install's
+remedy; the table carries each as that project's failure, and a tick whose every project is
+refused fails, announced once. An install that declares none keeps the bare flag, and a scope
+render the pod cannot read fails the tick with the reason. The cluster read is `gcloud` cluster metadata
 for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: one `get-credentials` and six `kubectl get`s
 per cluster (budgets, Deployments and StatefulSets; webhook configurations
@@ -256,7 +259,8 @@ runs go project by project, the table within the first fifteen minutes and the
 readiness runs with the rest, each run gets what its share has left, a project
 the budget cannot reach or finish is left unread and named: the partial-table
 line names each project with a read error and its reason (the budget, the
-sandbox's error, a failed listing, an unresolved project number), the
+sandbox's error, a failed listing, an unresolved project number, a refusal under the
+declared scope with the install's remedy), the
 ledger's `table_errors` keeps the last tick's, and a version's own line names
 the project whose readiness run was not started or was cut short (a version
 none of whose projects ran is not recorded and is retried tomorrow),
@@ -280,8 +284,9 @@ failed tick (which writes nothing to the ledger but its record of the projects
 the hops refused as outside the declared scope and the ids it learned for
 numbered spellings, kept at whichever step the tick failed unless the ledger
 itself cannot be written or re-read, so the next tick files them under the same cause)
-keeps its line in
-`last-failure.txt` beside it, and the next line is the recovery. A version
+keeps its key in
+`last-failure.txt` beside it (its line, or, for a tick whose every run was refused, the
+refused projects and their causes), and the next line is the recovery. A version
 none of whose clusters can be read is retried
 three days running and then recorded, so an unreachable cluster costs its
 project one readiness sweep a week rather than one a day; a `blocked` verdict
