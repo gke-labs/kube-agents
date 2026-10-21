@@ -3187,8 +3187,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// container at all — the SensitiveEnvVars membership is what turns the
 	// attempt into a webhook rejection instead of a silent no-op.
 	//
-	// Nothing here is Optional any more and nothing needs to be, which is the
-	// one thing the token makes simpler: the skew branch of a2aAgentSurface
+	// Nothing here is Optional, which is the one thing the token makes
+	// simpler (the bus CA bundle volume further down is, for the skew branch's
+	// sake, and says why): the skew branch of a2aAgentSurface
 	// used to need Optional on the SecretKeyRef so a today-lineage install that
 	// hit skew would not roll the pod into CreateContainerConfigError against a
 	// Secret that had never existed. A projected token volume has no such

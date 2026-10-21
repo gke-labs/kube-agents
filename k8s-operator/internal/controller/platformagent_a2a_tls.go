@@ -111,7 +111,7 @@ const (
 	// a2aNATSSerialBits bounds a certificate serial number.
 	a2aNATSSerialBits = 128
 	// a2aNATSFingerprintLength is how much of a certificate's SHA-256 the
-	// rollout hash and the session stamp carry.
+	// rollout hash carries.
 	a2aNATSFingerprintLength = 16
 	// a2aNATSClusterDomain is the cluster DNS suffix of the last SAN. The
 	// shorter names are what every client actually dials.
@@ -219,9 +219,13 @@ func (r *PlatformAgentReconciler) ensureA2ANATSCA(ctx context.Context, agent *ag
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, nil, nil, err
 	}
-	// Only a Secret this PlatformAgent controls is trusted to sign with. One
-	// that merely carries the name, written by anything else that can create
-	// Secrets here, is replaced and taken over rather than adopted.
+	// Only a Secret this PlatformAgent controls is trusted to sign with, and
+	// one that merely carries the name is replaced rather than adopted. This
+	// catches a collision or a careless copy, not a determined planter: a
+	// controller ownerReference is metadata anyone who can create the Secret
+	// can write, PlatformAgent UID included, and such a caller can already
+	// read the callout's issuer seed in this namespace. Anchoring the CA to
+	// something only the operator writes is a later change.
 	if err == nil && metav1.IsControlledBy(existing, agent) {
 		if cert, key, ok := readA2ANATSCA(existing, now); ok {
 			return cert, key, existing.Data[a2aNATSCACertKey], nil

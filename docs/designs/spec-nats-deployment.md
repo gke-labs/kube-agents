@@ -949,7 +949,16 @@ reads it on each handshake. The gateway also gets `NATS_CA_CONFIGMAP` and mounts
 ConfigMap into each session pod it spawns, at the same path. `NATS_CA_FILE` is reserved
 like `NATS_URL`: pointed at a CA of someone else's choosing, a client accepts a server
 that CA signed and hands it the bearer token at CONNECT. The provision Job passes the
-bundle to the `nats` CLI as `--tlsca`.
+bundle to the `nats` CLI as `--tlsca`. A sidecar the CR declares, a bridge among them,
+gets `NATS_CA_FILE` and the bundle mount from the operator too, overriding its own value.
+
+**Ownership.** A CA or serving Secret under those names that the `PlatformAgent` does not
+control is deleted on its UID and recreated, never rewritten, so a stray or copied Secret
+neither becomes the bus CA nor carries the key out under someone else's metadata. That
+check reads the controller ownerReference, which anyone able to create the Secret can
+write, so it does not stop a caller with Secret write access in the namespace, who can
+already read the callout's issuer seed there. Anchoring the CA to something only the
+operator writes, such as a fingerprint in the status, is not done yet.
 
 **Rotation.** The reconcile reissues either certificate once fewer than 30 days remain,
 and replaces whichever Secret it cannot use (unparseable, a key that is not the
@@ -977,7 +986,7 @@ every client the operator renders to `tls://`, in the same reconcile, so the bus
 once and every client rolls on its new env. Two things the operator does not re-render:
 
 - **Session pods the gateway reuses** keep the env they were spawned with. The spawner
-  stamps each pod with its bus transport (a digest of the URL and the CA bundle), and a
+  stamps each pod with its bus transport (a digest of the URL and the CA path it was handed), and a
   pod whose stamp does not match the gateway's is never handed another task, so the
   conversation gets a fresh pod. A task in flight in an old pod when the bus restarts
   fails, as on any bus restart.

@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -204,6 +205,10 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 		name      string
 		spec      corev1.PodSpec
 		container string
+		// optional is whether the bundle volume may be missing: the agent
+		// pod's alone, for the skew branch, where the bus and its bundle may
+		// never have been rendered. Every other client waits for it.
+		optional bool
 	}
 	gateway := buildA2AGatewayDeployment(agent)
 	verifier := buildA2AVerifierDeployment(agent)
@@ -215,11 +220,11 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 	// renders it rather than trusted to follow the agent container.
 	bridgePod := bridgeTestPod(provisionedAgent())
 	for _, tc := range []podSpec{
-		{"bridge", bridgePod.Spec, a2aBridgeContainerName},
-		{"gateway", gateway.Spec.Template.Spec, ""},
-		{"verifier", verifier.Spec.Template.Spec, ""},
-		{"callout", callout.Spec.Template.Spec, ""},
-		{"agent", agentPod.Spec, "platform-agent"},
+		{"bridge", bridgePod.Spec, a2aBridgeContainerName, true},
+		{"gateway", gateway.Spec.Template.Spec, "", false},
+		{"verifier", verifier.Spec.Template.Spec, "", false},
+		{"callout", callout.Spec.Template.Spec, "", false},
+		{"agent", agentPod.Spec, "platform-agent", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := tc.spec.Containers[0]
@@ -250,9 +255,10 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 				t.Errorf("no read-only bundle mount at %s: %v", a2aNATSCABundleMountDir, c.VolumeMounts)
 			}
 			if !slices.ContainsFunc(tc.spec.Volumes, func(v corev1.Volume) bool {
-				return v.Name == a2aNATSCABundleVolumeName && v.ConfigMap != nil && v.ConfigMap.Name == a2aNATSCABundleName(agent)
+				return v.Name == a2aNATSCABundleVolumeName && v.ConfigMap != nil && v.ConfigMap.Name == a2aNATSCABundleName(agent) &&
+					ptr.Deref(v.ConfigMap.Optional, false) == tc.optional
 			}) {
-				t.Errorf("no bundle volume from %s", a2aNATSCABundleName(agent))
+				t.Errorf("no bundle volume from %s with optional=%v", a2aNATSCABundleName(agent), tc.optional)
 			}
 		})
 	}
@@ -263,7 +269,7 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 		t.Error("the provision Job's nats CLI does not dial tls:// with the bundle as --tlsca")
 	}
 	if !slices.ContainsFunc(job.Spec.Template.Spec.Volumes, func(v corev1.Volume) bool {
-		return v.Name == a2aNATSCABundleVolumeName && v.ConfigMap != nil
+		return v.Name == a2aNATSCABundleVolumeName && v.ConfigMap != nil && !ptr.Deref(v.ConfigMap.Optional, false)
 	}) {
 		t.Error("the provision Job does not mount the bundle")
 	}
@@ -425,5 +431,59 @@ func TestEnsureA2ANATSTLSTakesOverAnUnownedCASecret(t *testing.T) {
 	}
 	if len(ca.Annotations) != 0 || ca.Labels["planted"] != "" {
 		t.Errorf("the planted metadata survived: annotations %v, labels %v", ca.Annotations, ca.Labels)
+	}
+}
+
+// A bridge the CR declares brings its own NATS_URL and credentials and
+// nothing that trusts the operator's CA. Against a bus that requires TLS it
+// would fail verification and crash-loop the agent pod, so the render gives
+// every declared sidecar the CA, overriding a value of the sidecar's own, and
+// the bundle mount the pod already carries a volume for.
+func TestADeclaredBridgeTrustsTheBundle(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+		Name: a2aBridgeContainerName, Image: "registry.example/declared-bridge:1",
+		Env: []corev1.EnvVar{
+			{Name: "NATS_URL", Value: "nats://test-agent-a2a-nats.test-ns.svc:4222"},
+			{Name: a2aNATSCAFileEnv, Value: "/opt/data/elsewhere/ca.crt"},
+		},
+	}}}
+	pod := bridgeTestPod(agent)
+	bridges := containersNamed(pod, a2aBridgeContainerName)
+	if len(bridges) != 1 {
+		t.Fatalf("got %d bridges", len(bridges))
+	}
+	b := bridges[0]
+	var ca []string
+	for _, e := range b.Env {
+		if e.Name == a2aNATSCAFileEnv {
+			ca = append(ca, e.Value)
+		}
+	}
+	if len(ca) != 1 || ca[0] != a2aNATSCAFile() {
+		t.Errorf("%s on the declared bridge = %v, want exactly the operator's %q", a2aNATSCAFileEnv, ca, a2aNATSCAFile())
+	}
+	mounts := 0
+	for _, m := range b.VolumeMounts {
+		if m.Name == a2aNATSCABundleVolumeName && m.MountPath == a2aNATSCABundleMountDir && m.ReadOnly {
+			mounts++
+		}
+	}
+	if mounts != 1 {
+		t.Errorf("the declared bridge has %d bundle mounts, want 1: %v", mounts, b.VolumeMounts)
+	}
+	if !slices.ContainsFunc(pod.Spec.Volumes, func(v corev1.Volume) bool { return v.Name == a2aNATSCABundleVolumeName }) {
+		t.Error("the pod carries no bundle volume for the declared bridge's mount")
+	}
+	// The rendered bridge already inherits the mount; it must not get two.
+	rendered := containersNamed(bridgeTestPod(provisionedAgent()), a2aBridgeContainerName)[0]
+	n := 0
+	for _, m := range rendered.VolumeMounts {
+		if m.Name == a2aNATSCABundleVolumeName {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("the rendered bridge has %d bundle mounts, want 1", n)
 	}
 }

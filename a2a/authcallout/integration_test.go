@@ -447,11 +447,14 @@ func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
 	_, _ = withTestTLS(t, renderedTLSDir)
 	otherCA := os.Getenv(lib.EnvNATSCAFile)
 
+	// A token the harness maps, so the third case connects outright rather
+	// than being refused at authorization after a handshake it may or may not
+	// have made.
 	dial := func(t *testing.T, ca, serverName string) error {
 		t.Helper()
 		t.Setenv(lib.EnvNATSCAFile, ca)
 		t.Setenv(lib.EnvNATSTLSServerName, serverName)
-		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(tokenPodA), nats.Name("tls-options"))...)
+		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(gatewayToken), nats.Name("tls-options"))...)
 		if err == nil {
 			nc.Close()
 		}
@@ -463,8 +466,8 @@ func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
 	if err := dial(t, rightCA, "attacker.example"); err == nil || !strings.Contains(err.Error(), "certificate") {
 		t.Errorf("the right CA under a name the certificate lacks: err = %v, want a certificate verification failure", err)
 	}
-	if err := dial(t, rightCA, "localhost"); err != nil && strings.Contains(err.Error(), "certificate") {
-		t.Errorf("the right CA under the certificate's name failed verification: %v", err)
+	if err := dial(t, rightCA, "localhost"); err != nil {
+		t.Errorf("the right CA under the certificate's name did not connect: %v", err)
 	}
 }
 
