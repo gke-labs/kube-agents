@@ -16,9 +16,9 @@ Two tables, one per route family:
   makes, each pinned to the one subscription the operator configured.
 - `/v1/k8s/<project>/<location>/<cluster>/<path>`: GET only. List and watch of
   core/v1 events across the cluster (the event watcher), and a GET of one named
-  object of any kind but `secrets` (the drift detector's join reads the object
-  an audit record names). No other list, no watch of anything else (the
-  deprecated `watch/<resource>` paths included), no subresource.
+  object of a kind in `WATCHER_NAMED_READS` (the drift detector's join reads the
+  object an audit record names). No other list, no watch of anything else (the
+  deprecated `watch/<resource>` paths included), no subresource, never a Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.
@@ -51,6 +51,7 @@ RULE_K8S_METHOD = "kubernetes.watcher.method"
 RULE_K8S_TARGET = "kubernetes.watcher.target"
 RULE_K8S_PATH = "kubernetes.watcher.path"
 RULE_K8S_SECRETS = "kubernetes.watcher.secrets"
+RULE_K8S_KIND = "kubernetes.watcher.kind"
 RULE_K8S_LEGACY = "kubernetes.watcher.legacy-path"
 RULE_K8S_QUERY = "kubernetes.watcher.query"
 
@@ -96,6 +97,64 @@ _NAMED_GROUP = re.compile(
 # `namespaces/<ns>` alone matches the cluster-scoped named form with resource
 # "namespaces"; that is a named GET of a Namespace object and is allowed.
 REFUSED_RESOURCES = frozenset({"secrets"})
+
+# The GitOps reconcilers' sync objects: the six kinds gke-labs/kube-agents#2987
+# adds to the agent's `minimal` ClusterRole (get/list/watch, in
+# k8s-operator/internal/controller/platformagent_manifests.go). Drift on a
+# GitOps-managed object is what the drift detector exists for, and the join
+# reading only kinds the agent itself can read keeps the two grants in step. A
+# change to either list has to change both. Today
+# test_the_reconciler_kinds_are_the_six_the_agent_can_read pins a copy of the
+# six; a check that reads the rendered role is owed once #2987 has merged.
+RECONCILER_NAMED_READS = frozenset(
+    {
+        ("argoproj.io", "applications"),
+        ("kustomize.toolkit.fluxcd.io", "kustomizations"),
+        ("source.toolkit.fluxcd.io", "gitrepositories"),
+        ("source.toolkit.fluxcd.io", "ocirepositories"),
+        ("configsync.gke.io", "rootsyncs"),
+        ("configsync.gke.io", "reposyncs"),
+    }
+)
+# The kinds the drift detector's join may read by name, as (API group, resource
+# plural): what an audit record's resourceName carries, any version. The audit
+# sink and the detector's classifier filter no kinds (terraform/modules/
+# drift-pubsub, cmd/drift-detector/classify.go), so this table is the only kind
+# boundary on the join. These are the declarative kinds a person edits out of
+# band. Controller-written kinds (pods, replicasets, nodes, leases, events) are
+# left out, and so is every other custom resource. A record of an unlisted kind
+# is still reported: the join fails open and forwards it unenriched, with this
+# refusal as its lookup error. Widen by PR, as with api_policy.API_READ_ROUTES.
+WATCHER_NAMED_READS = frozenset(
+    {
+        ("", "configmaps"),
+        ("", "limitranges"),
+        ("", "namespaces"),
+        ("", "persistentvolumeclaims"),
+        ("", "resourcequotas"),
+        ("", "serviceaccounts"),
+        ("", "services"),
+        ("admissionregistration.k8s.io", "mutatingwebhookconfigurations"),
+        ("admissionregistration.k8s.io", "validatingadmissionpolicies"),
+        ("admissionregistration.k8s.io", "validatingadmissionpolicybindings"),
+        ("admissionregistration.k8s.io", "validatingwebhookconfigurations"),
+        ("apiextensions.k8s.io", "customresourcedefinitions"),
+        ("apps", "daemonsets"),
+        ("apps", "deployments"),
+        ("apps", "statefulsets"),
+        ("autoscaling", "horizontalpodautoscalers"),
+        ("batch", "cronjobs"),
+        ("batch", "jobs"),
+        ("networking.k8s.io", "ingresses"),
+        ("networking.k8s.io", "networkpolicies"),
+        ("policy", "poddisruptionbudgets"),
+        ("rbac.authorization.k8s.io", "clusterrolebindings"),
+        ("rbac.authorization.k8s.io", "clusterroles"),
+        ("rbac.authorization.k8s.io", "rolebindings"),
+        ("rbac.authorization.k8s.io", "roles"),
+    }
+    | RECONCILER_NAMED_READS
+)
 # Segments the API server serves in the resource position that are not a
 # resource: the deprecated `watch/<resource>` prefix (a watch, of any kind,
 # Secrets included) and `proxy/`. Read as a named GET they would be a watch the
@@ -123,6 +182,20 @@ EVENTS_QUERY_KEYS = frozenset(
 )
 # A named GET may only ask for a resource version.
 NAMED_QUERY_KEYS = frozenset({"resourceVersion"})
+
+
+def _validate_named_reads(table: frozenset[tuple[str, str]]) -> None:
+    """Refuse a malformed table at import, so a bad edit fails every test."""
+    for group, resource in table:
+        if group and not re.fullmatch(SEGMENT, group):
+            raise ValueError(f"WATCHER_NAMED_READS: group {group!r} is not an API group")
+        if not re.fullmatch(r"[a-z][a-z0-9]*", resource):
+            raise ValueError(f"WATCHER_NAMED_READS: {resource!r} is not a lower-case resource plural")
+        if resource in REFUSED_RESOURCES or resource in REFUSED_PATH_SEGMENTS:
+            raise ValueError(f"WATCHER_NAMED_READS: {resource!r} is refused under every group")
+
+
+_validate_named_reads(WATCHER_NAMED_READS)
 
 
 # What of a GKE `Cluster` the watchers are relayed: the fields the Go side reads
@@ -241,6 +314,13 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]]) -> Decisio
         )
     if match.group("resource") in REFUSED_RESOURCES:
         return _refuse(RULE_K8S_SECRETS, "The watcher's Kubernetes route never reads a Secret.")
+    group = match.groupdict().get("group") or ""
+    if (group, match.group("resource")) not in WATCHER_NAMED_READS:
+        return _refuse(
+            RULE_K8S_KIND,
+            "The watcher's Kubernetes route reads only the kinds in its table; "
+            "the drift record is reported without ownership.",
+        )
     if not set(query) <= NAMED_QUERY_KEYS:
         return _refuse(RULE_K8S_QUERY, "A named read carries a query key this route does not forward.")
     return Decision(allowed=True, rule_id="kubernetes.watcher.named-get", message="")

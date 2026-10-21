@@ -1,0 +1,76 @@
+# Domain: chat and routing. Journey: a written report survives a thread that
+# cannot receive it.
+#
+# `send_notification` is the egress a Platform Agent uses to put a written
+# report in front of a human: into the session's own chat thread where there is
+# one, and into the install's home channel where there is not. It has a
+# fallback for the first case failing, and before gke-labs/kube-agents#743's fix
+# that fallback could not fire. The broadcast was gated on `if not targets` — on
+# whether a target had been *composed*, not on whether one had been
+# *delivered* — so a thread that refused the post ended the call with an error
+# and the report reached nobody. #743 is that: an RCA report that went nowhere.
+#
+# bench/tf/prebuilt/notify-dead-thread writes one session row naming a Google
+# Chat thread in a space this install does not own, then calls the tool with
+# that session id and records its answer. Under `next` the A2A gateway posts a
+# threaded notification only into a thread of the home channel and refuses
+# anything else (a2a/gateway/notify.go), so the threaded send fails on every
+# run with no deleted thread or archived space to arrange. The verifier
+# (kube_agents_bench/notify_fallback.py) reads the answer and passes only when
+# the thread refused the report *and* the home channel received it. An image
+# without the fix returns the refusal alone, which is the red.
+#
+# It needs a chat platform: on an install with none there is no home channel to
+# fall back to and the case can only fail. No CI install has one
+# (hack/ci-deploy.sh exports GOOGLE_CHAT_ENABLED and SLACK_ENABLED false), so
+# the case is a FIXTURE_NOT_READY entry in scripts/validate_bench_cases.py and
+# runs by hand against a chat install, as the two sibling chat-delivery cases
+# do.
+#
+# The conversation is not what is graded. Its prompt asks for one roster read
+# (a tool call, so the run has a trajectory) and nothing that touches the board
+# or sends anything of its own, and the safeguards hold it to that.
+id: notification-dead-thread-falls-back
+name: A report refused by its thread still reaches the home channel
+fixtures: []
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/notify-dead-thread"
+  teardown: true
+validated: false
+domain: chat-and-routing
+owner: stalhaali
+prompt: |
+  Which specialist agents can you hand work to on this install? Check your
+  roster and name them in one line. Do not file any task, do not send any
+  notification, and do not run, trigger or schedule anything.
+expected_output: |
+  critical requirements:
+  - One line naming the specialist agents the roster lists, read from the roster.
+  - No task is filed, no notification is sent, and no job is run, triggered or
+    scheduled.
+verification_spec:
+  - name: refused-thread-falls-back-to-home
+    role: objective
+    mode: assert
+    check:
+      type: notification_fell_back_to_home
+  - name: conversation-files-no-card
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
+  - name: conversation-sends-no-notification
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["mcp_platform_control_send_notification"]

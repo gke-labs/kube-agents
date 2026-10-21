@@ -85,6 +85,7 @@ jobs:
         continue-on-error: ${{ github.event_name == 'pull_request_target' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMOKE_PIN_NOT_BEFORE: ${{ vars.SMOKE_PIN_NOT_BEFORE }}
           EVENT: ${{ github.event_name }}
           NUMBER: ${{ github.event.pull_request.number }}
           SHA: ${{ github.event.sha }}
@@ -127,6 +128,7 @@ jobs:
       - name: Judge the queued pull request
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMOKE_PIN_NOT_BEFORE: ${{ vars.SMOKE_PIN_NOT_BEFORE }}
           REF: ${{ github.event.merge_group.head_ref }}
           GATE: ${{ matrix.gate }}
         run: python3 scripts/merge_gate.py group --ref "$REF" --gate "$GATE"

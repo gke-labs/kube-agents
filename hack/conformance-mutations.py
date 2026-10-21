@@ -23,6 +23,7 @@ counts as KILLED: the recorded gap moved, which is exactly the signal wanted.
 Usage:
     python3 hack/conformance-mutations.py            # every mutation
     python3 hack/conformance-mutations.py --list
+    python3 hack/conformance-mutations.py --summary  # counts, nothing run
     python3 hack/conformance-mutations.py -k C1      # substring filter on the id
 
 The tree must be clean. It edits tracked files in place and restores them, so a
@@ -57,8 +58,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. Three today: B1-denylist-rule, A3-fastpath-redundant
-    #: and B1-gke-mcp-overlay-copy-redundant.
+    #: and KILLED is the failure. `--summary` names the current ones.
     must_survive: bool = False
 
 
@@ -628,6 +628,15 @@ Mutation(
         "project, and two clean runs later its profiles are retired",
     ),
     Mutation(
+        "C3-stall-watch-exclusion-unpinned",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        ("    STALL_WATCH_EXCLUDE_NAMESPACES=\n", ""),
+        "test_C3_the_stall_watch_knobs_cannot_come_from_the_agents_env_file",
+        "drop the empty STALL_WATCH_EXCLUDE_NAMESPACES pin because the CR does not "
+        "set it -- one line in the agent-writable PVC .env then silences the stall "
+        "watch for a namespace nobody excluded",
+    ),
+    Mutation(
         "C1-watcher-route-allows-a-list",
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
@@ -645,6 +654,36 @@ Mutation(
         "drop `watch` from the refused segments as a leftover of an older API -- "
         "the server still serves watch/secrets, and the named-GET rule reads it "
         "as an object called `secrets`",
+    ),
+    Mutation(
+        "C1-watcher-kind-list-widened",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        ("", "configmaps"),\n',
+         '        ("", "configmaps"),\n        ("", "nodes"),\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "add nodes to the watcher's kind table so drift on a node label is "
+        "enriched -- every fleet node, its addresses and taints, becomes "
+        "readable on the broker's credential for a kind no person edits",
+    ),
+    Mutation(
+        "C1-watcher-kind-group-ignored",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if (group, match.group("resource")) not in WATCHER_NAMED_READS:\n',
+         '    if match.group("resource") not in {r for _, r in WATCHER_NAMED_READS}:\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "match the table on the plural alone to save a parse -- any CRD that "
+        "names its plural `deployments` or `roles` is then read as if it were "
+        "the built-in kind",
+    ),
+    Mutation(
+        "C1-watcher-secrets-moved-into-the-table",
+        "agents/platform/scripts/watcher_policy.py",
+        ('REFUSED_RESOURCES = frozenset({"secrets"})\n',
+         'REFUSED_RESOURCES = frozenset()\n'),
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "drop the separate Secrets refusal as redundant now that the kind table "
+        "exists -- it is the only rule that refuses a Secret under a group the "
+        "table may one day list, and the import check leans on it",
     ),
     Mutation(
         "C1-watcher-subscription-unpinned",
@@ -1286,6 +1325,14 @@ Mutation(
          'safe_hint = log_hint if log_hint else "unknown"'),
         "test_D1_a_log_hint_cannot_forge_a_record",
         "log the hint raw, which is the state the sanitiser was added to fix",
+    ),
+    Mutation(
+        "D1-cluster-profile-unaudited",
+        "agents/cluster/config.yaml",
+        ("    - hermes_otel\n    - tool_call_audit\n", "    - hermes_otel\n"),
+        "test_D1_every_profile_records_its_tool_calls",
+        "trim the Cluster Agent template's plugin list back to otel alone, the "
+        "state the template shipped in",
     ),
     Mutation(
         "D1-platform-role-reaches-secrets",
@@ -2413,13 +2460,37 @@ def _git_clean() -> bool:
     ).stdout.strip()
 
 
-def main() -> int:
+def summary(mutations: list[Mutation]) -> str:
+    """The counts a reader wants from the mutation table, computed (#3553).
+
+    The README used to restate them by hand, so every pull request that added
+    a mutation rewrote the same line and conflicted with every other one. What
+    a run measures (killed, noisy) is true only of the commit it ran on, and
+    belongs to the pull request that ran it.
+    """
+    controls = [m.id for m in mutations if m.must_survive]
+    return (
+        f"{len(mutations)} mutations, {len(controls)} must_survive control(s): "
+        f"{', '.join(controls) or 'none'}.\n"
+        f"A full run's last line counts the other {len(mutations) - len(controls)}: "
+        f"killed + noisy + survived + stale. A control that passes, SURVIVED (expected), "
+        f"is none of those; one that goes red (OVERSHOT) counts as survived, and one "
+        f"whose anchor moved counts as stale."
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list", action="store_true")
+    parser.add_argument("--summary", action="store_true",
+                        help="print the mutation and must_survive counts; runs nothing")
     parser.add_argument("-k", "--filter", default="")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(argv)
 
     selected = [m for m in MUTATIONS if arguments.filter in m.id]
+    if arguments.summary:
+        print(summary(selected))
+        return 0
     if arguments.list:
         for mutation in selected:
             print(f"{mutation.id:38} {mutation.path}")

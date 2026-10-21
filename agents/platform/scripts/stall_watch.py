@@ -25,7 +25,8 @@ no model. Each tick:
    exclusion is the operator keeping a model turn off that cluster, and this
    watch follows the same roster;
 2. per cluster, points a per-cluster kubeconfig at the cluster and lists the
-   namespaces that are not system namespaces. The credentials behind that
+   namespaces that are not system namespaces and not excluded (see "What an
+   install can tune" below). The credentials behind that
    kubeconfig are fetched on the first tick, again after a day, and again
    when a read the kubeconfig could not serve says the file or the cluster
    changed; otherwise the kubeconfig is reused, because a ``get-credentials``
@@ -72,12 +73,26 @@ Why a bounded kind list. ``stall_report.py`` defaults to every namespaced kind
 the API server knows, one ``kubectl get`` each, which is right for one
 namespace a user asked about and wrong for a fleet sweep every half hour.
 ``DEFAULT_KINDS`` names the controllers whose stalls this watch exists for.
-``STALL_WATCH_KINDS`` replaces it for a run started by hand in the pod, and
-``all`` restores the script's default; the operator's env allowlist does not
-carry it yet, so an install cannot set it through the CR. Pods are left out
-on purpose: a Pod that cannot start raises the Warning reasons the event
-watcher is gated on, and its owner shows here through its own condition or
-reference.
+``STALL_WATCH_KINDS`` replaces it, and ``all`` restores the script's default.
+Pods are left out on purpose: a Pod that cannot start raises the Warning
+reasons the event watcher is gated on, and its owner shows here through its
+own condition or reference.
+
+What an install can tune. The CR's ``spec.harness.stallWatch`` reaches this
+script as three variables the operator pins in the managed .env on every
+install, empty when unset, so the agent cannot override them through its own
+.env (a run started by hand in the pod can still set its own):
+``STALL_WATCH_EXCLUDE_NAMESPACES`` names namespaces never read,
+``STALL_WATCH_MIN_AGE_MINUTES`` holds a new alert until one of the
+namespace's stalls has lasted that long, and ``STALL_WATCH_KINDS`` is the kind
+list above. An empty or unreadable value is the default. Apart from them, the
+annotation ``kubeagents.x-k8s.io/stall-watch: exempt`` on a namespace leaves
+it unread, and on an object leaves that object's rows out of the alerts. An
+open alert that an exclusion or the annotation empties has its card closed
+with a note that says so, not one that says the stall cleared. A stall's age is the longer of what ``stall_report.py``
+measured on the object and how long ago the watch first saw the object stall; a younger
+stall stays in the ledger and is asked again on each tick, and an object that
+joins a namespace with an open alert is not held.
 
 Why a ledger. A stall lasts hours or days, and a watch that raised an alert
 for it every thirty minutes would be muted within the hour. The ledger holds
@@ -156,10 +171,28 @@ STATE_TMP_SUFFIX = ".tmp"
 #: first, then the one the operator already sets on the agent container from
 #: spec.harness.projectID. The other projects are the Cluster Agent roster's.
 PROJECT_ENVS = ("STALL_WATCH_PROJECT", "GCP_PROJECT_ID")
+#: The CR's spec.harness.stallWatch, which the operator pins in the managed .env
+#: on every install, empty when the CR does not set it. Empty is the default.
+EXCLUDE_NAMESPACES_ENV = "STALL_WATCH_EXCLUDE_NAMESPACES"
+MIN_AGE_ENV = "STALL_WATCH_MIN_AGE_MINUTES"
 KINDS_ENV = "STALL_WATCH_KINDS"
 REPORT_SCRIPT_ENV = "STALL_WATCH_REPORT_SCRIPT"
+NAMESPACES_SEPARATOR = ","
+#: A new alert waits until one of the namespace's stalls is this old; 0 alerts
+#: on the first tick that sees it.
+DEFAULT_MIN_AGE_MINUTES = 0
+SECONDS_PER_MINUTE = 60
 #: The value of STALL_WATCH_KINDS that hands stall_report.py its own default.
 ALL_KINDS = "all"
+#: The opt-out annotation, fixed rather than configurable. On a namespace it
+#: leaves the namespace unread, as STALL_WATCH_EXCLUDE_NAMESPACES does; on any
+#: object stall_report.py reports, it leaves that object's rows out of the
+#: alerts. stall_report.py names the same key and value, since it runs alone in
+#: the sandbox and imports nothing from here, and marks such a row with
+#: EXEMPT_FIELD.
+EXEMPT_ANNOTATION = "kubeagents.x-k8s.io/stall-watch"
+EXEMPT_VALUE = "exempt"
+EXEMPT_FIELD = "exempt"
 #: Controllers whose silent stalls this watch exists for. Per cluster, the
 #: list is cut to what the cluster serves before it is handed to the script.
 DEFAULT_KINDS = (
@@ -172,6 +205,33 @@ DEFAULT_KINDS = (
     "certificates.cert-manager.io",
 )
 KINDS_SEPARATOR = ","
+# Kinds the watch never asks stall_report.py to read, whatever STALL_WATCH_KINDS
+# says: the resources its whole-namespace scan skips (SCAN_EXCLUDED_RESOURCES
+# there), as plural, singular and short names, matched on the part before the
+# group so `leases` and `leases.coordination.k8s.io` are both refused. Secrets above all: a listing
+# carries every body, and the scan reports nothing from them. An explicit
+# --kind bypasses the script's own skip list, so the watch refuses them here.
+REFUSED_KINDS = frozenset(
+    {
+        "secrets",
+        "secret",
+        "configmaps",
+        "configmap",
+        "cm",
+        "events",
+        "event",
+        "ev",
+        "endpoints",
+        "endpoint",
+        "ep",
+        "endpointslices",
+        "endpointslice",
+        "controllerrevisions",
+        "controllerrevision",
+        "leases",
+        "lease",
+    }
+)
 
 #: The agent image's copy of stall_report.py, staged by the Dockerfile and not
 #: on the volume, so it is the code at this commit and nothing the model wrote.
@@ -200,8 +260,29 @@ KUBECONFIG_SLUG_REPLACEMENT = "-"
 #: every upgrade and repair window; treating it as unreadable would post a
 #: "could not read" and a "readable again" per cluster per window.
 SWEEPABLE_CLUSTER_STATUSES = frozenset({"RUNNING", "RECONCILING"})
-#: `kubectl get namespaces -o name` prints one of these per line.
-NAMESPACE_NAME_PREFIX = "namespace/"
+# One line per namespace name, a marker line, the names whose exempt
+# annotation is exactly EXEMPT_VALUE, and the marker again: about as small as
+# `-o name`. The annotation's value is never printed, so a value with a newline
+# in it adds no line. The full JSON listing would carry every label and
+# annotation, and on a cluster with thousands of namespaces it can pass the
+# credential proxy's output cap. The closing marker shows the listing arrived
+# whole; the marker is not a valid namespace name.
+NAMESPACE_LIST_MARKER = "---"
+NAMESPACE_LIST_MARKERS = 2
+NAMESPACES_ARGV = (
+    "kubectl",
+    "get",
+    "namespaces",
+    "-o",
+    "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}"
+    "{\"" + NAMESPACE_LIST_MARKER + "\\n\"}"
+    "{range .items[?(@.metadata.annotations.kubeagents\\.x-k8s\\.io/stall-watch==\"" + EXEMPT_VALUE + "\")]}"
+    "{.metadata.name}{\"\\n\"}{end}"
+    "{\"" + NAMESPACE_LIST_MARKER + "\\n\"}",
+)
+#: What the credential proxy client writes to stderr when the broker cut a
+#: reply at its output cap. kubectl's exit code still comes back 0.
+PROXY_TRUNCATED_TEXT = "credential proxy output truncated"
 #: The kind list is filtered to what a cluster serves, from one
 #: `kubectl api-resources` per cluster, so a warning from the report script
 #: about a kind it could not scan is always a failure and never "this cluster
@@ -435,6 +516,24 @@ MAX_UNKNOWN_CARD_TICKS = 3
 #: stall clears; the watch comments and lets the worker finish, then closes
 #: the episode once the card reaches a terminal status.
 RUNNING_CARD_STATUS = "running"
+#: Why an open alert's namespace has no rows left. The tick that comments on
+#: the card stores it in the episode, so a later tick that completes the card
+#: gives the same reason whatever that tick's sweep could read.
+CLEAR_REASON_KEY = "clear_reason"
+CLEAR_REASON_ROSTER = "roster"
+CLEAR_REASON_EXCLUDED = "excluded"
+CLEAR_REASON_EXEMPT = "exempt"
+CLEAR_REASON_CLEARED = "cleared"
+#: The evidence an exempt close reason carries: the objects whose annotation
+#: emptied the alert. A later tick that read the namespace re-checks them
+#: before it repeats the reason.
+EXEMPT_OBJECTS_KEY = "exempt_objects"
+#: One `kubectl get <Kind/name> -n <namespace>` of an object's exempt
+#: annotation, for that re-check. A deleted object prints nothing.
+EXEMPT_READ_ARGV = ("kubectl", "get")
+NAMESPACE_FLAG = "-n"
+EXEMPT_READ_FLAGS = ("--ignore-not-found", "-o", "jsonpath={.metadata.annotations.kubeagents\\.x-k8s\\.io/stall-watch}")
+EXEMPT_READ_TIMEOUT_SECONDS = 30
 #: Plurals kubectl forms with -es or -ies, so a skipped `ingresses` holds
 #: Ingress rows and `networkpolicies` holds NetworkPolicy rows.
 PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
@@ -442,8 +541,12 @@ PLURAL_ES_SUFFIXES = ("sses", "shes", "ches", "xes", "zes")
 #: heuristic; one for everything not named here. A repeating-warnings row
 #: exists only while its event recurred inside the report's window, and a
 #: dangling-reference row vanishes for a scan whose one referent listing
-#: failed while the object listing succeeded; both flap on one miss.
-CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2}
+#: failed while the object listing succeeded; both flap on one miss. A
+#: generation-lag row is reported only once the last spec write is older than
+#: the threshold, so a spec written every few ticks hides it from one scan; a
+#: row held over that scan keeps the object's first sighting for the
+#: minimum-age gate.
+CLEAR_AFTER_MISSED_SCANS = {"repeating-warnings": 2, "dangling-reference": 2, "generation-lag": 2}
 DEFAULT_CLEAR_AFTER_MISSED_SCANS = 1
 LEDGER_KEY_SEPARATOR = "|"
 #: A cluster is `project:name@location`, the triple the scope's
@@ -531,14 +634,47 @@ def report_argv(namespace: str, kinds: str | None = None) -> list[str]:
     return cmd
 
 
+def env_list(name: str, separator: str) -> list[str]:
+    """A list from the environment: items stripped, empty items dropped."""
+    return [item.strip() for item in os.environ.get(name, "").split(separator) if item.strip()]
+
+
 def kinds_argument() -> str | None:
-    """The --kind value for stall_report.py, or None to let it scan every kind."""
+    """The --kind value for stall_report.py, or None to let it scan every kind.
+    A value with no item in it, or only refused ones, is the default list, not
+    every kind."""
     raw = os.environ.get(KINDS_ENV, "").strip()
     if raw.lower() == ALL_KINDS:
         return None
-    if raw:
-        return KINDS_SEPARATOR.join(k.strip() for k in raw.split(KINDS_SEPARATOR) if k.strip())
-    return KINDS_SEPARATOR.join(DEFAULT_KINDS)
+    configured = env_list(KINDS_ENV, KINDS_SEPARATOR)
+    refused = [k for k in configured if k.lower().split("/", 1)[0].split(".", 1)[0] in REFUSED_KINDS]
+    if refused:
+        sys.stderr.write(f"stall_watch: {KINDS_ENV} names kinds the watch never reads, ignored: {', '.join(refused)}\n")
+    kept = [k for k in configured if k not in refused]
+    return KINDS_SEPARATOR.join(kept or DEFAULT_KINDS)
+
+
+def excluded_namespaces() -> frozenset[str]:
+    """The namespaces STALL_WATCH_EXCLUDE_NAMESPACES names, matched exactly."""
+    return frozenset(env_list(EXCLUDE_NAMESPACES_ENV, NAMESPACES_SEPARATOR))
+
+
+def min_age_seconds() -> int:
+    """How old a namespace's oldest stall must be before a new alert, from
+    STALL_WATCH_MIN_AGE_MINUTES. Empty is the default; a value that is not a
+    whole number of minutes, or is negative, is the default too, and says so on
+    stderr: a typo must not stop the watch."""
+    raw = os.environ.get(MIN_AGE_ENV, "").strip()
+    if not raw:
+        return DEFAULT_MIN_AGE_MINUTES * SECONDS_PER_MINUTE
+    try:
+        minutes = int(raw)
+    except ValueError:
+        minutes = -1
+    if minutes < 0:
+        sys.stderr.write(f"stall_watch: {MIN_AGE_ENV}={raw!r} is not a whole number of minutes; using {DEFAULT_MIN_AGE_MINUTES}\n")
+        minutes = DEFAULT_MIN_AGE_MINUTES
+    return minutes * SECONDS_PER_MINUTE
 
 
 # --------------------------------------------------------------------------
@@ -666,19 +802,33 @@ def is_system_namespace(name: str) -> bool:
     return name in SYSTEM_NAMESPACES or name.startswith(SYSTEM_NAMESPACE_PREFIXES)
 
 
-def list_namespaces(kubeconfig: str) -> list[str]:
-    """Every non-system namespace, Terminating ones included: their objects
-    are still listable, and one whose content is gone is how a ledger row
-    clears while the namespace waits on a finalizer."""
-    r = run_sandbox(["kubectl", "get", "namespaces", "-o", "name"], timeout=NAMESPACE_LIST_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+def list_namespaces(kubeconfig: str, excluded: frozenset[str]) -> tuple[list[str], set[str]]:
+    """Every non-system namespace the watch reads, Terminating ones included:
+    their objects are still listable, and one whose content is gone is how a
+    ledger row clears while the namespace waits on a finalizer. And, apart,
+    the namespaces left unread because `excluded` names them or they carry
+    the exempt annotation, so their open alerts close as excluded rather than
+    cleared."""
+    r = run_sandbox(list(NAMESPACES_ARGV), timeout=NAMESPACE_LIST_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
     if r.returncode != 0:
         raise ReadFailed(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}", r.stderr)
-    names = []
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if line.startswith(NAMESPACE_NAME_PREFIX):
-            names.append(line[len(NAMESPACE_NAME_PREFIX):])
-    return sorted(n for n in names if n and not is_system_namespace(n))
+    lines = r.stdout.splitlines()
+    # A cut listing would read the namespaces past the cut as deleted and
+    # close their cards as cleared.
+    if PROXY_TRUNCATED_TEXT in (r.stderr or "") or lines.count(NAMESPACE_LIST_MARKER) != NAMESPACE_LIST_MARKERS or lines[-1] != NAMESPACE_LIST_MARKER:
+        raise ReadFailed(f"kubectl get namespaces returned an incomplete listing: {stderr_excerpt(r.stderr)}", r.stderr)
+    cut = lines.index(NAMESPACE_LIST_MARKER)
+    exempt = set(lines[cut + 1 : -1])
+    watched, left_out = [], set()
+    for name in lines[:cut]:
+        name = name.strip()
+        if not name or is_system_namespace(name):
+            continue
+        if name in excluded or name in exempt:
+            left_out.add(name)
+        else:
+            watched.append(name)
+    return sorted(watched), left_out
 
 
 def skipped_in(stderr: str) -> set[str]:
@@ -856,6 +1006,14 @@ class Sweep:
         #: Clusters whose namespace listing succeeded, and those namespaces.
         self.read_clusters: set[str] = set()
         self.listed_namespaces: dict[str, set[str]] = {}
+        #: Namespaces those listings showed and the watch left unread, excluded
+        #: by name or by the exempt annotation. Their rows go as a deleted
+        #: namespace's do, and their open alerts close as excluded.
+        self.excluded_namespaces: dict[str, set[str]] = {}
+        #: Objects whose rows carried the exempt annotation, as `object_key`
+        #: tuples. Their ledger rows go at once, and an alert they leave
+        #: empty closes as exempt.
+        self.exempt_objects: set[tuple[str, str, str]] = set()
         self.unreadable: dict[str, str] = {}
         #: Profiles whose cluster_identity could not be read this tick, so the
         #: projects only they name were not listed (`roster_projects`).
@@ -928,6 +1086,12 @@ class Sweep:
         """Whether the cluster's rows went because it lost its Cluster Agent
         profile, rather than because the cluster or namespace was deleted."""
         return cid in self.unmanaged or split_cluster_id(cid)[0] not in self.projects
+
+    def excluded(self, scope: str) -> bool:
+        """Whether the scope's rows went because its namespace was excluded
+        from the watch, rather than because it was deleted."""
+        cid, namespace = split_scope(scope)
+        return namespace in self.excluded_namespaces.get(cid, set())
 
     def out_of_budget(self, started: float, cid: str, namespace: str | None = None) -> bool:
         if self.budget_exhausted:
@@ -1057,6 +1221,7 @@ def sweep_fleet(
     now = now or now_iso()
     started = time.monotonic()
     source = report_source()
+    excluded = excluded_namespaces()
     failures: dict[str, Exception] = {}
     listings = list_projects(sorted(sweep.projects), management_project, started)
     # Every listed cluster is registered before any is read: a cluster the
@@ -1102,7 +1267,7 @@ def sweep_fleet(
                 kubeconfig = fetch_credentials(project, name, location)
                 wrote = True
             try:
-                namespaces = list_namespaces(kubeconfig)
+                namespaces, left_out = list_namespaces(kubeconfig, excluded)
             except READ_FAILURES as exc:
                 # A reused kubeconfig the shim or the cluster refused -- the
                 # sandbox restarted and the file is gone, or the cluster was
@@ -1121,7 +1286,7 @@ def sweep_fleet(
                 fetched = True
                 kubeconfig = fetch_credentials(project, name, location)
                 wrote = True
-                namespaces = list_namespaces(kubeconfig)
+                namespaces, left_out = list_namespaces(kubeconfig, excluded)
             # The namespace read is what proves the kubeconfig: a fetch whose
             # kubeconfig just listed namespaces is recorded here, before the
             # discovery call, whose failure says nothing about the kubeconfig.
@@ -1152,6 +1317,7 @@ def sweep_fleet(
             continue
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
+        sweep.excluded_namespaces[cid] = left_out
         if cursor and cursor.get("cluster") == cid and cursor.get("namespace") in namespaces:
             # Resume inside the cluster the last tick stopped in; the namespaces
             # before the cursor were read then and are unknown now, not gone.
@@ -1179,6 +1345,11 @@ def sweep_fleet(
             if unread:
                 sweep.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(unread))} not read"
             for f in findings:
+                # An object with the exempt annotation: its rows are not the
+                # watch's to alert on, and its ledger rows go this tick.
+                if f.get(EXEMPT_FIELD):
+                    sweep.exempt_objects.add((cid, f.get("namespace", namespace), f.get("object", "")))
+                    continue
                 sweep.rows[ledger_key(cid, f)] = {
                     "cluster": cid,
                     "namespace": f.get("namespace", namespace),
@@ -1186,6 +1357,8 @@ def sweep_fleet(
                     "heuristic": f.get("heuristic", ""),
                     "detail": f.get("detail", ""),
                     "stalled_for": f.get("stalled_for", ""),
+                    # The object's own age, which the minimum-age gate reads.
+                    "stalled_seconds": f.get("stalled_seconds", 0),
                 }
     # Clusters the budget never reached keep their records, and so does every
     # unlisted cluster whose rows `verdict` holds (`holds_unlisted`): a listing
@@ -1210,13 +1383,25 @@ def diff_and_update(state: dict, sweep: Sweep, now: str) -> tuple[dict, dict]:
     `cluster/namespace` scope."""
     previous = state["stalls"]
     current = dict(previous)
+    # The earliest sighting per object. A row's key carries its detail, so a
+    # generation-lag row gets a new key on every spec write; its new row keeps
+    # the object's first sighting, or a spec written more often than the
+    # minimum stall age would hold the stall forever.
+    first_seen_by_object: dict[tuple[str, str, str], str] = {}
+    for entry in previous.values():
+        seen = str(entry.get("first_seen") or "")
+        if seen and (object_key(entry) not in first_seen_by_object or seen < first_seen_by_object[object_key(entry)]):
+            first_seen_by_object[object_key(entry)] = seen
     for key, row in sweep.rows.items():
         entry = previous.get(key)
         if entry is None:
-            entry = {**row, "first_seen": now}
+            entry = {**row, "first_seen": first_seen_by_object.get(object_key(row), now)}
         current[key] = {**entry, **row, "last_seen": now, "missed": 0}
     for key, entry in previous.items():
         if key in sweep.rows:
+            continue
+        if object_key(entry) in sweep.exempt_objects:
+            del current[key]
             continue
         verdict = sweep.verdict(entry)
         if verdict == UNKNOWN:
@@ -1516,10 +1701,33 @@ def scope_rows(state: dict, scope: str) -> list[dict]:
     return [e for e in state["stalls"].values() if scope_key(e["cluster"], e["namespace"]) == scope]
 
 
-def would_raise(state: dict, sweep: Sweep, scope: str) -> bool:
+def row_age_seconds(entry: dict, now: str) -> float:
+    """How long a ledgered row's stall has lasted: the longer of the age
+    stall_report.py measured on the object and the time since the watch first
+    saw the object stall (`diff_and_update` carries that over to the object's
+    new rows). A field that does not parse counts as no age."""
+    try:
+        reported = float(entry.get("stalled_seconds") or 0)
+    except (TypeError, ValueError):
+        reported = 0.0
+    try:
+        seen = (datetime.fromisoformat(now) - datetime.fromisoformat(str(entry.get("first_seen")))).total_seconds()
+    except (TypeError, ValueError):  # TypeError: a hand-edited time with no timezone
+        seen = 0.0
+    return max(reported, seen)
+
+
+def would_raise(state: dict, sweep: Sweep, scope: str, now: str, min_age: float) -> bool:
     """Whether a scope is a candidate for an alert this tick: read this tick,
-    with a row not on its way out."""
-    return scope in sweep.read_scopes and any(not e.get("missed") for e in scope_rows(state, scope))
+    with a row not on its way out that has lasted `min_age` seconds. A scope
+    whose rows are all younger is held, not dropped: its rows stay in the
+    ledger and it is asked again on the next tick."""
+    if scope not in sweep.read_scopes:
+        return False
+    live = [e for e in scope_rows(state, scope) if not e.get("missed")]
+    if min_age <= 0:
+        return bool(live)
+    return any(row_age_seconds(e, now) >= min_age for e in live)
 
 
 def scope_first_seen(state: dict, scope: str) -> str:
@@ -1628,6 +1836,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     episodes = state.setdefault(EPISODES_KEY, {})
     lines: list[str] = []
     expired = set() if dry_run else adopt_cards(state, now)
+    min_age = min_age_seconds()
     # Every scope read this tick that has rows and no episode, or an episode
     # whose alert expired with no card, is a candidate, whether its objects
     # appeared now or it has waited: past the cap, after a refused alert, or
@@ -1635,7 +1844,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
     candidates = dict(new_by_scope)
     for entry in state["stalls"].values():
         scope = scope_key(entry["cluster"], entry["namespace"])
-        if scope not in candidates and (scope not in episodes or scope in expired) and would_raise(state, sweep, scope):
+        if scope not in candidates and (scope not in episodes or scope in expired) and would_raise(state, sweep, scope, now, min_age):
             candidates[scope] = []
     # Objects held for a card go through the same card check as new ones, so a
     # card finished before they reach it gets a new alert, not a comment.
@@ -1660,6 +1869,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if dry_run:
             if episode:
                 what, shown = f"would comment on card `{episode.get('card') or 'not yet filed'}` for", new_rows
+            elif not would_raise(state, sweep, scope, now, min_age):
+                continue
             elif raised < MAX_ALERTS_PER_TICK:
                 what, shown = "would raise an alert for", rows
                 raised += 1
@@ -1695,7 +1906,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 # keeps the scope a candidate, and a clear still finds it.
                 episode["pending"] = sorted(set(episode.get("pending", [])) | set(object_names(new_rows)))
                 previous = episode
-        if not would_raise(state, sweep, scope):
+        if not would_raise(state, sweep, scope, now, min_age):
             continue
         if refusal is not None:
             # The server refused this tick's first alert; the rest wait for the
@@ -1747,12 +1958,45 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             lines.append(INJECT_RECOVERED_LINE)
         state[INJECT_ERROR_KEY] = None
     open_scopes = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
+    for scope in open_scopes & set(episodes):
+        # The scope has rows again: an exclusion or exemption that emptied it
+        # was reverted, or the stall came back. Its next close is judged afresh.
+        episodes[scope].pop(CLEAR_REASON_KEY, None)
+        episodes[scope].pop(EXEMPT_OBJECTS_KEY, None)
+        episodes[scope].pop("cleared_at", None)
     for scope in sorted(set(episodes) - open_scopes):
         episode = episodes[scope]
-        cleared = names_text(object_names(cleared_by_scope.get(scope, [])) or episode.get("objects", []))
-        if sweep.left_roster(split_scope(scope)[0]):
+        leaving = cleared_by_scope.get(scope, [])
+        reason = episode.get(CLEAR_REASON_KEY)
+        if reason and clear_reason_lapsed(sweep, scope, episode):
+            # What stored the reason no longer holds: judge the close afresh,
+            # but not on a read that skipped a kind the alert's objects are,
+            # or the events, which can still hold the stall. The next tick
+            # asks again.
+            if skipped_could_hold(sweep, scope, episode.get("objects") or []):
+                continue
+            reason = None
+        if not reason:
+            reason = clear_reason(sweep, scope, leaving)
+            if not dry_run:
+                # Stored on the tick that saw the rows go: a later tick no
+                # longer holds them, so a close retried after a board error
+                # would read as a plain clearing.
+                episode[CLEAR_REASON_KEY] = reason
+                if reason == CLEAR_REASON_EXEMPT:
+                    episode[EXEMPT_OBJECTS_KEY] = object_names(leaving)
+                else:
+                    episode.pop(EXEMPT_OBJECTS_KEY, None)
+        cleared = names_text(object_names(leaving) or episode.get("objects", []))
+        if reason == CLEAR_REASON_ROSTER:
             cleared = "the cluster left the Cluster Agent roster"
             note = f"The cluster left the Cluster Agent roster; the watch no longer reads it, as of {now}."
+        elif reason == CLEAR_REASON_EXCLUDED:
+            cleared = "the namespace was excluded from the watch"
+            note = f"The namespace `{namespace_of(scope)}` was excluded from the watch; the watch no longer reads it, as of {now}."
+        elif reason == CLEAR_REASON_EXEMPT:
+            note = f"The watch no longer alerts on {cleared} in `{namespace_of(scope)}`: marked `{EXEMPT_ANNOTATION}: {EXEMPT_VALUE}`, as of {now}."
+            cleared = f"{cleared} exempted from the watch"
         else:
             note = f"The watch no longer sees a stall in `{namespace_of(scope)}`: {cleared} cleared at {now}."
         if dry_run:
@@ -1787,6 +2031,62 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         end_episode(state, scope)
         lines.append(f"{CLEARED_PREFIX} in {scope_label_text(scope)}: {cleared}; card `{card}` closed")
     return lines
+
+
+def clear_reason(sweep: Sweep, scope: str, leaving: list[dict]) -> str:
+    """Why this tick's sweep left an open alert's namespace with no rows:
+    `leaving` is the rows that went this tick."""
+    if sweep.left_roster(split_scope(scope)[0]):
+        return CLEAR_REASON_ROSTER
+    if sweep.excluded(scope):
+        return CLEAR_REASON_EXCLUDED
+    if leaving and all(object_key(e) in sweep.exempt_objects for e in leaving):
+        return CLEAR_REASON_EXEMPT
+    return CLEAR_REASON_CLEARED
+
+
+def clear_reason_lapsed(sweep: Sweep, scope: str, episode: dict) -> bool:
+    """Whether the close reason an earlier tick stored for an open alert no
+    longer holds. Each reason is checked against its own evidence, and only
+    when this tick saw that evidence; otherwise the stored reason stands."""
+    reason = episode.get(CLEAR_REASON_KEY)
+    cid, namespace = split_scope(scope)
+    if reason == CLEAR_REASON_ROSTER:
+        return not sweep.left_roster(cid) and (scope in sweep.read_scopes or sweep.excluded(scope))
+    if reason == CLEAR_REASON_EXCLUDED:
+        return scope in sweep.read_scopes
+    if reason == CLEAR_REASON_EXEMPT and scope in sweep.read_scopes:
+        kubeconfig = kubeconfig_path(*split_cluster_id(cid))
+        return not all(
+            (cid, namespace, obj) in sweep.exempt_objects or object_exempt(kubeconfig, namespace or "", obj)
+            for obj in episode.get(EXEMPT_OBJECTS_KEY) or []
+        )
+    return False
+
+
+def skipped_could_hold(sweep: Sweep, scope: str, objects: list[str]) -> bool:
+    """Whether this tick's scan of the scope skipped the events, or a kind one
+    of `objects` (`Kind/name`) is. A kind the cluster does not serve is
+    skipped on every tick and holds none of them."""
+    skipped = sweep.partial_scopes.get(scope, set())
+    if EVENTS_MARKER in skipped:
+        return True
+    kinds = {str(obj).split("/", 1)[0] for obj in objects}
+    return any(resource_names_kind(r, kind) for r in skipped for kind in kinds)
+
+
+def object_exempt(kubeconfig: str, namespace: str, obj: str) -> bool:
+    """Whether an object still carries the exempt annotation. A deleted object
+    does not. A read that fails says nothing, so it keeps the reason. The
+    object is named `Kind/name`, as stall_report.py names it, so where two API
+    groups serve the same kind kubectl may read the other one and the close
+    says "cleared" rather than "exempt"."""
+    argv = [*EXEMPT_READ_ARGV, obj, NAMESPACE_FLAG, namespace, *EXEMPT_READ_FLAGS]
+    try:
+        r = run_sandbox(argv, timeout=EXEMPT_READ_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+    except READ_FAILURES:
+        return True
+    return r.returncode != 0 or r.stdout == EXEMPT_VALUE
 
 
 def namespace_of(scope: str) -> str:

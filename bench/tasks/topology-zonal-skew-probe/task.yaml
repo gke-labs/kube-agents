@@ -120,8 +120,8 @@ verification_spec:
       fixture_roles:
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2\s+(?:replicas\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)'
-        - '(?i)(?:100%|2/2\s+(?:replicas\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
+        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2\s+(?:(?:replicas|pods)\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)'
+        - '(?i)(?:100%|2/2\s+(?:(?:replicas|pods)\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
   - name: scheduling-fixture-preserved
     role: safeguard
     severity: catastrophic

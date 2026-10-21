@@ -9,9 +9,10 @@ itself stays in the file — edit it there, and keep this page in step. A roster
 only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNERS_ALIASES):
 [`hack/OWNERS`](../hack/OWNERS) scopes `blocking-roster.txt` and
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
-alias with `no_parent_owners`, so a root approver does not count for either. Nothing else
-carries the rule: `hack/eval/nightly-cases.txt`, `hack/eval/inject-lane-exclusions.txt`,
-`hack/eval/inject-lane-safeguards.yaml`, a new
+alias with `no_parent_owners`, so a root approver does not count for either, and the inject
+lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
+them, since the merge-blocking presubmit runs on that lane (below). Nothing else carries the rule:
+`hack/eval/nightly-cases.txt`, a new
 case directory under `bench/tasks/` and the script itself need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
@@ -30,7 +31,7 @@ partial window for it (`collecting`), that evidence feeds both. A case not named
 red a pull request on a graded failure, whatever its record says — and since 2026-09-22 it does
 not run on one either: the eval crew decided that the presubmit runs the blocking roster only
 ([#1023](https://github.com/gke-labs/kube-agents/issues/1023)), so `presubmit-cases.txt` holds
-the roster's eleven cases plus, since 2026-09-29, one documented exception: the held-out seat a
+the roster's ten cases plus, since 2026-09-29, one documented exception: the held-out seat a
 coverage tracker puts in the presubmit file without a roster line, one per tracker
 ([#2013](https://github.com/gke-labs/kube-agents/issues/2013) for the compliance canary;
 [#2016](https://github.com/gke-labs/kube-agents/issues/2016)'s seat for pdb-remediation-pr took
@@ -81,7 +82,7 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Eleven of the twelve presubmit cases are admitted; the other one, the compliance canary,
+Ten of the eleven presubmit cases are admitted; the other one, the compliance canary,
 is the held-out seat described above (recount the entries of
 `hack/eval/presubmit-cases.txt` and
 `blocking-roster.txt` rather than trusting this sentence — an earlier copy of it miscounted
@@ -160,6 +161,23 @@ with a filed issue naming the exit condition:
   Enters again when [#3145](https://github.com/gke-labs/kube-agents/pull/3145), which seeds
   checkout-gateway's manifest into every pool's `*-infra` repository, has merged and the case's
   record holds (#3120).
+- **consistency-authorized-networks-probe** —
+  [#3598](https://github.com/gke-labs/kube-agents/issues/3598): demoted 2026-10-21 after it
+  failed about 30% of repetitions on the Gemini setup, on unrelated pull requests (#2997,
+  #3255, #3321, #3392, #3395 and others) and on `main`'s eval-next, red on this case alone on
+  2026-10-20: 37 of 126 repetitions across 42 runs, the store's record at 18/21,
+  `would-demote`. 15 of the 37 were Vertex 429s
+  ([#3399](https://github.com/gke-labs/kube-agents/issues/3399), fix open in
+  [#3448](https://github.com/gke-labs/kube-agents/pull/3448)). The other 22 were the agent
+  being wrong, not a narrow reference: seeded-c, which never enabled authorized networks,
+  still returns `masterAuthorizedNetworksConfig: {gcpPublicCidrsAccessEnabled: true}` with no
+  `enabled`, and the agent read that leftover block as configured or open and said seeded-c
+  matches its peers, or named the wrong facet (NetworkPolicies, Pod Security, database
+  encryption), or once, a tool error (a grep that missed seeded-c in its own saved cluster
+  list). The rung-4 collapses include #2997 at 0/3; `main`'s red was rung 6. The Claude nightlies passed every scored repetition. Its removal leaves
+  `consistency` with no presubmit case, so the domain is on the `domains.yaml` allowlist until
+  it returns. Enters again when #3448 has merged, the agent-side fix (#3605) has landed, and the
+  case passes the roster's bar, 90% over 20 runs, on the Gemini nightly (#3598).
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -331,7 +349,7 @@ blocking for every case by design, admitted or not: `grade_case` evaluates them 
 reads admission. Those classes signal a broken case or install, not flake, and the fix is
 on that side rather than on the roster.
 
-Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's eleven and,
+Since 2026-09-22 those rungs reach only the cases the presubmit runs: the roster's ten and,
 since 2026-09-29, the held-out seat. The seats of 2026-09-29 put both GitHub-writing paths back on
 every pull request — the canary's (the minted token, the cloned `*-infra` workspace, the ledger
 write, the `ledger_issue_contains` verifier) and pdb-remediation-pr's (submit-suggestion opening
@@ -352,10 +370,15 @@ say what it ran by hand.
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — eleven cases × three = 33 units since 2026-10-17 (36 on 2026-10-16, 39 from 2026-10-14, 36 before), `infra`
-repetitions left out — against `main`'s rate over the same cases from the evidence store (the
+pass rate of every roster case's scored repetitions — on the presubmit nine cases × three = 27
+units, since `agent-kanban-smoke` is off the inject lane ([below](#the-inject-lane)), and ten ×
+three = 30 on the today lane (the api-transport count: 30 since 2026-10-21, 33 from 2026-10-17, 36
+on 2026-10-16, 39 from 2026-10-14, 36 before), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
 newest seven nightly lines per case, about 249 runs). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
+nightly that writes those lines grades `today` and the presubmit grades `next`, so the comparison
+is the pull request's `next` against `main`'s `today`; a window of `next`'s own needs the mode on
+the baseline's version key first ([`bench/baselines/README.md`](../bench/baselines/README.md)). The
 verdict prints it on every run today:
 
 ```
@@ -416,13 +439,22 @@ tightens this rule at the same time.
 
 ## The inject lane
 
-When a run's matrix goes through the A2A gateway's inject door — the harness's
-`AGENT_TRANSPORT=inject`, which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
-([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag") — the
-roster above is still the roster:
-nothing in the two roster files changes, and every case not named in the lane's exclusion list
-(below) runs and can red the job exactly as on the api lane. Two things differ, and they are
-kept apart on purpose.
+`pull-kube-agents-smoke-test` grades a `spec.mode: next` install, the mode a new install gets, so
+its matrix goes through the A2A gateway's inject door — the harness's `AGENT_TRANSPORT=inject`,
+which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
+([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag"). The
+roster above is still the roster there: nothing in the two roster files changes, and every case
+not named in the lane's exclusion list (below) runs and can red the job. Three things differ from
+the api transport, and they are kept apart on purpose.
+
+`today`, the mode a rollback lands on, is graded over the api transport by the today lane: the
+optional `pull-kube-agents-smoke-test-today` (on demand with `/test`, and on its own when a pull
+request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation) and the
+six-hourly periodic `ci-kube-agents-eval-today` on `main`. Both run with `EVAL_ROLLBACK_LANE=1`:
+the deploy brings the install up under `next`, `hack/rollback-roundtrip.sh` takes it to `today`,
+back to `next` and to `today` again before the matrix, and a rollback that fails reds the run.
+The matrix is the presubmit's, roster included, so a case graded only over the api transport is
+graded there, but neither job blocks a merge.
 
 A check the transport blinds is the scorer's business. The door's trace carries no card ids,
 no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
@@ -455,11 +487,18 @@ listed until a run on `api` grades it.
 the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
-fixture to an issue. An entry is not a demotion: the case keeps its api-lane seat, so a
-presubmit case stays in `presubmit-cases.txt` and on the blocking roster, runs on every pull
-request over the api transport, and can still red one, and a nightly case still runs every night.
-The file needs the normal approvers, not the eval-crew rule, for the same reason
-`nightly-cases.txt` does — it changes what one lane runs, not what can red a pull request.
+fixture to an issue. An entry is not a demotion: the case keeps its seat in
+`presubmit-cases.txt` or `nightly-cases.txt` and on the blocking roster, and runs over the api
+transport on the today lane and in the nightlies. It does leave what can red a pull request,
+though, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
+from the matrix and from `BOOTSTRAP_ADMITTED` there. `agent-kanban-smoke` is the one roster case
+listed, so until the lane's delegation wait reads card ids on this path, or the case is rewritten
+for a premise both transports have, no merge-blocking run grades delegation through the chat
+front door; the today lane and the nightlies do. `scripts/test_eval_rosters.py` pins
+that set, so listing a second roster case is a decision made in that test and on this page, not a
+side effect of an exclusion entry.
+The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
+pull request runs.
 
 A safeguard the lane needs and no case declares is the lane's safeguards list,
 `hack/eval/inject-lane-safeguards.yaml`. The door's task can reach the platform persona, whose
@@ -479,7 +518,17 @@ after a settle as long as the check's clock-skew tolerance, so a repetition that
 nothing never shares the repository with one that writes by design and no window reaches back
 into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
-the set of requesting cases. The same approvers as the exclusion list, for the same reason.
+the set of requesting cases. The same approvers as the exclusion list: an entry is a rung 1 check
+on every pull request.
+
+Rung 6 does not compare on the inject lane. `main`'s judged record is the today-mode nightly's
+over the api transport, filed at a version key that carries neither the mode nor the transport,
+so an inject run's judged mean set against it measures the lane rather than the pull request:
+the next lane redded on rung 6 on four admitted cases at once on 2026-10-17 with nothing changed
+on its side. `bench-gate` skips the comparison under `AGENT_TRANSPORT=inject` and says so on
+each case it would have compared; main's mean is still printed beside the run's. Rungs 1 to 5
+are unchanged, and the today lane keeps rung 6. It comes back on the inject lane when the
+version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)).
 
 One thing about the lane's install differs too. That write safeguard
 (`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
@@ -528,7 +577,7 @@ goes through the same forge abstraction on both forges, so the GitHub presubmit 
 what a pull request can break in the agent; what GitLab can break on its own is the provider
 and the forge, which the nightly catches within a day and the on-demand run checks for a pull
 request that touches the provider. The file needs the normal approvers, like
-`nightly-cases.txt` and the inject-lane files: it changes what one on-demand lane and the two
+`nightly-cases.txt`: it changes what one on-demand lane and the two
 nightlies run, not what can red a pull request.
 
 ## Demoting a flaky case

@@ -435,6 +435,7 @@ class RosterPageTest(unittest.TestCase):
         # The hold-out bullet's date, not overridden by its later "Admitted
         # on the record since the split" bullet (#3120).
         self.assertEqual(dates.get("pdb-remediation-pr"), "2026-10-17")
+        self.assertEqual(dates.get("consistency-authorized-networks-probe"), "2026-10-21")  # #3598
 
     def test_case_status_rules(self):
         status = render.case_status
@@ -661,6 +662,7 @@ class CaseNotesTest(unittest.TestCase):
             self.assertIn(name, notes)
         self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985", "#1171", "#2013"])
         self.assertEqual(notes["pdb-remediation-pr"]["issues"], ["#2016", "#3120"])
+        self.assertEqual(notes["consistency-authorized-networks-probe"]["issues"], ["#3598"])
         self.assertEqual(notes["capacity-pinned-pool-probe"]["issues"], ["#1840", "#1874"])
         for entry in notes.values():
             self.assertEqual(set(entry), {"note", "issues"})

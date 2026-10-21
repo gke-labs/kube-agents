@@ -1441,7 +1441,7 @@ space — the canonical example above. In a DM space, top-level messages share o
 `gchat:dm/spaces/AAA`, answered top-level, and a message typed inside an existing thread is
 a side thread, its own conversation `gchat:dm/spaces/AAA/threads/BBB`, answered in that
 thread. This is the main-flow and side-thread rule of the Hermes Google Chat adapter that
-default mode runs.
+`today` runs.
 Chat attaches a thread to every DM message, the one it auto-created for a top-level message
 included, so the thread name cannot tell them apart; Chat's `message.threadReply` flag does
 (true only for a reply in a thread, per the Chat API `Message` resource; measured: the
