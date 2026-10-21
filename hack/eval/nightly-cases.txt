@@ -894,6 +894,13 @@
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
 
+# A crash loop that outlasts the settle period is forwarded, the pod recovers,
+# and 15m after its last event the watcher's quiet follow-up lands on the
+# alert's thread and card ("Quiet since HH:MM UTC", #612). deployer: tofu, the
+# autoops-incident stack's transient shape; the plant waits out the quiet
+# period. Nightly from its first merge; a presubmit seat waits on its record.
+./tasks/autoops-quiet-followup/task.yaml
+
 # autoops-warning-event-no-action-triage (#3267): a Warning event that cleared
 # by itself is triaged to one "No action needed" bullet, with no Option
 # letters and no "To authorize:" call to action. Its stack plants a healthy
@@ -905,6 +912,12 @@
 # serial minutes to it. 900s hint, unmeasured (the shape of
 # autoops-warning-event-triage).
 ./tasks/autoops-warning-event-no-action-triage/task.yaml
+
+# The event triage re-reads the object and opens "What's wrong" with
+# "State at HH:MM UTC:" (#612), so a card read hours later says what was true
+# when. deployer: tofu, the autoops-incident stack's OOM shape in its own
+# namespace; the incumbent's delivery checks and safeguards.
+./tasks/autoops-warning-event-triage-state-stamp/task.yaml
 
 # #3090: the first onboarding report opens with the scan counts and the line
 # `inventory_findings.py select` prints, graded by equality. The

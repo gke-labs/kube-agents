@@ -2914,6 +2914,11 @@ unit_cost_hint() {
     # a plant that blocks on a card appearing, then an agent turn that waits on
     # that card finishing. A wrong hint costs packing, not correctness.
     gitops-drift-out-of-band-triage) echo 900 ;;
+    # The #612 cases on the same stack: the stamp case is the incumbent's
+    # shape; the quiet case's plant waits out the 15m quiet period before a
+    # short turn.
+    autoops-warning-event-triage-state-stamp) echo 900 ;;
+    autoops-quiet-followup) echo 1800 ;;
     # Another of the same shape: infra lock, a plant that publishes a burst and
     # then waits out the human record's card, then an agent turn that is a
     # board read. Priced at the band rather than at the 566-677s its

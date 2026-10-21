@@ -115,6 +115,29 @@ type injectMessageRequest struct {
 // later.
 type injectResponse struct {
 	Status string `json:"status"`
+	// Features is what the daemon says it does with this session beyond
+	// posting the alert. The one read today is injectFeatureFollowup: a daemon
+	// that lists it posts a k8s-event-followup into the alert's thread; one
+	// that does not takes that kind down the event path and would post a
+	// second alert, so the dispatcher sends none to it (dedupEntry.
+	// FollowupSupported). Negotiated here rather than on /healthz because the
+	// answer is per inject and this is the channel the watcher already reads.
+	Features []string `json:"features,omitempty"`
+}
+
+// injectFeatureFollowup is the daemon's word for "I post a
+// k8s-event-followup into the alert's thread"; session_kv_server spells it
+// in INJECT_RESPONSE_FEATURES.
+const injectFeatureFollowup = "followup"
+
+// Supports reports whether the daemon listed feature on this response.
+func (r injectResponse) Supports(feature string) bool {
+	for _, f := range r.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
 }
 
 // injectStatusSuppressed is the daemon's word for "accepted, and then dropped
@@ -195,21 +218,29 @@ const injectFeaturePolicyFiltered = "policy-filtered"
 // daemon predating this field is one that always delivers, and guessing
 // "dropped" would reopen every incident on every sighting.
 func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectPayload) (string, error) {
+	resp, err := i.InjectDetailed(ctx, sessionID, payload)
+	return resp.Status, err
+}
+
+// InjectDetailed is Inject returning the daemon's whole answer, for the one
+// caller that reads its features.
+func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload InjectPayload) (injectResponse, error) {
+	var none injectResponse
 	if sessionID == "" {
-		return "", errors.New("injector: Inject: sessionID is required")
+		return none, errors.New("injector: Inject: sessionID is required")
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("injector: marshal payload: %w", err)
+		return none, fmt.Errorf("injector: marshal payload: %w", err)
 	}
 	wrapped, err := json.Marshal(injectMessageRequest{Message: string(body)})
 	if err != nil {
-		return "", fmt.Errorf("injector: wrap inject envelope: %w", err)
+		return none, fmt.Errorf("injector: wrap inject envelope: %w", err)
 	}
 	url := i.cfg.daemonURL + "/sessions/" + sessionID + "/inject"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wrapped))
 	if err != nil {
-		return "", fmt.Errorf("injector: build POST inject: %w", err)
+		return none, fmt.Errorf("injector: build POST inject: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+i.cfg.bearerToken)
 	req.Header.Set("Content-Type", "application/json")
@@ -219,14 +250,14 @@ func (i *injector) Inject(ctx context.Context, sessionID string, payload InjectP
 	}
 	resp, err := i.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("injector: POST inject: %w", err)
+		return none, fmt.Errorf("injector: POST inject: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
+		return none, fmt.Errorf("injector: POST inject: status %d: %s", resp.StatusCode, string(respBody))
 	}
 	var parsed injectResponse
 	_ = json.Unmarshal(respBody, &parsed)
-	return parsed.Status, nil
+	return parsed, nil
 }
