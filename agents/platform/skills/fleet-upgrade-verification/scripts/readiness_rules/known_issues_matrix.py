@@ -23,9 +23,12 @@ issue's versions and the add-on it names is in the inventory (at a listed tag, o
 when the issue lists none; an issue naming no add-on matches by version alone); one more when
 the member's target version would land on one. A target given without its build
 (`MAJOR.MINOR.PATCH`, which the API reads as the patch's newest listed build) is graded against
-every build of the patch the cluster's channel lists: an issue that affects all of them is the
-target's risk or open note as for a full version, one that affects some is a note naming the
-affected builds, and a patch the channel lists no build of is a note and no grade. The grade is
+every listed build of the patch the member's upgrade can land on, read as `target-patch-valid`
+reads it (`target_patch_valid.target_builds`: the channel's list, or `validNodeVersions`
+when the pools alone move): an issue that affects all of them is the target's risk or open note
+as for a full version, one that affects some is a note naming the affected builds, and a patch
+no list its move reads carries a build of is a note and no grade; a server config that was not
+read, or that does not carry the channel, is an `unknown` naming it, never the note. The grade is
 the matched spec's: a match
 through a spec with no upper bound (`all_versions`, `from_minor`, `from` with no `to`), which
 stands on every later version until the page changes, is a note on the member naming the
@@ -59,7 +62,20 @@ from readiness_rules import (
     read_error,
     read_items,
 )
-from readiness_rules.target_patch_valid import BUILD_SEPARATOR, CHANNEL_KEY, NO_CHANNEL_LABEL, NO_CHANNEL_VALUES, RELEASE_CHANNEL_KEY, channel_roster, parse_version
+from readiness_rules.target_patch_valid import (
+    BUILD_SEPARATOR,
+    CHANNEL_KEY,
+    CURRENT_MASTER_VERSION_KEY,
+    NO_CHANNEL_LABEL,
+    NO_CHANNEL_VALUES,
+    RELEASE_CHANNEL_KEY,
+    SERVER_CONFIG_NOT_A_DICT,
+    VALID_NODE_VERSIONS_KEY,
+    channel_roster,
+    control_plane_moves,
+    parse_version,
+    target_builds,
+)
 
 RULE_ID = "known-issues-matrix"
 ENTRY = 26
@@ -120,6 +136,10 @@ GRADE_RISK = "risk"
 GRADE_OPEN = "open"
 TARGET_BUILDS_SEPARATOR = ", "
 SHORT_TARGET_NO_BUILDS_NOTE = "target {target} names no build the {channel} channel lists at {location}, so the table was not read for it; a target with its build is graded"
+SHORT_TARGET_NO_BUILDS_POOL_MOVE_NOTE = "target {target} names no build the {channel} channel or validNodeVersions lists at {location} for its pool move, so the table was not read for it; a target with its build is graded"
+# The server config the builds are read from: a failed read, or a channel it does not carry, is an unknown, never the note.
+SERVER_CONFIG_UNREAD_REASON = "server config at {location} not read ({error}), so whether the {channel} channel still lists a build of target {target} is unknown; a target with its build is graded"
+CHANNEL_NOT_IN_CONFIG_REASON = "channel {channel} is not in the server config at {location}, so whether it lists a build of target {target} is unknown; a target with its build is graded"
 PARTIAL_TARGET_NOTE_FORMAT = "target {target} is graded against the {n} listed build(s) of its patch ({builds}); known issue {id} ({summary}) affects {affected} of them, so whether the upgrade lands on it depends on the build picked; a target with its build says which: {url}"
 NOTE_FORMAT = "{addons} add-on(s) inventoried in {namespaces}; {matches} known issue(s) match GKE {master} or target {target} ({open} open issue(s) with no published fix noted); table generated {generated} ({issues} issue(s), newest known version {newest})"
 OPEN_NOTE_FORMAT = "{n} open known issue(s) with no published fix on GKE {version}, noted and not graded as risks: {ids}; each is on {url}"
@@ -233,22 +253,35 @@ def spec_is_open(spec) -> bool:
     return spec.get(ALL_VERSIONS_KEY) is True or FROM_MINOR_KEY in spec or (RANGE_FROM_KEY in spec and RANGE_TO_KEY not in spec and MINOR_KEY not in spec)
 
 
-def target_builds(target_text, cluster: dict, context) -> tuple[list[str] | None, str | None]:
-    """The builds a target names: itself for a full version; for a build-less one, every build of
-    the patch the cluster's channel lists (validMasterVersions on no channel), newest first; (None,
-    a note) when the channel lists none."""
+def target_candidates(target_text, cluster: dict, context) -> tuple[list[str] | None, str | None, str | None]:
+    """(the builds a target names, a note, an unknown): itself for a full version; for a build-less
+    one, the listed builds of its patch the member's upgrade can land on, as `target-patch-valid`
+    reads them (`target_builds`: the channel's list, validMasterVersions on no channel, or
+    validNodeVersions when the pools alone move), newest first; (None, a note, None) when no list
+    its move reads carries one; (None, None, why) when the server config was not read or does not
+    carry the channel, which is an unknown and never a note."""
     if not isinstance(target_text, str) or not target_text:
-        return None, None
+        return None, None, None
     if BUILD_SEPARATOR in target_text:
-        return [target_text], None
-    server_config, _ = project_read(context, LOCATION_READ_SERVER_CONFIG)
+        return [target_text], None, None
+    location = str(context.get(CONTEXT_LOCATION) or cluster.get("location") or "")
     channel = str((cluster.get(RELEASE_CHANNEL_KEY) or {}).get(CHANNEL_KEY) or "")
-    roster, _ = channel_roster(server_config if isinstance(server_config, dict) else {}, channel)
-    prefix = target_text + BUILD_SEPARATOR
-    builds = [version for version in roster or [] if isinstance(version, str) and version.startswith(prefix)]
+    channel_label = channel if channel not in NO_CHANNEL_VALUES else NO_CHANNEL_LABEL
+    server_config, error = project_read(context, LOCATION_READ_SERVER_CONFIG)
+    if error is None and not isinstance(server_config, dict):
+        error = SERVER_CONFIG_NOT_A_DICT.format(type=type(server_config).__name__)
+    if error is not None:
+        return None, None, SERVER_CONFIG_UNREAD_REASON.format(location=location, error=error, channel=channel_label, target=target_text)
+    roster, _ = channel_roster(server_config, channel)
+    if roster is None:
+        return None, None, CHANNEL_NOT_IN_CONFIG_REASON.format(channel=channel_label, location=location, target=target_text)
+    node_versions = list(server_config.get(VALID_NODE_VERSIONS_KEY) or [])
+    moves_control_plane = control_plane_moves(target_text, cluster.get(CURRENT_MASTER_VERSION_KEY), roster)
+    builds = target_builds(target_text, roster, node_versions, moves_control_plane)
     if builds:
-        return builds, None
-    return None, SHORT_TARGET_NO_BUILDS_NOTE.format(target=target_text, channel=channel if channel not in NO_CHANNEL_VALUES else NO_CHANNEL_LABEL, location=context.get(CONTEXT_LOCATION) or cluster.get("location") or "")
+        return builds, None, None
+    note = SHORT_TARGET_NO_BUILDS_NOTE if moves_control_plane else SHORT_TARGET_NO_BUILDS_POOL_MOVE_NOTE
+    return None, note.format(target=target_text, channel=channel_label, location=location), None
 
 
 def _grade(version, specs) -> str | None:
@@ -298,7 +331,9 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         out["risks"].append({"kind": KIND_STALE_AGE, "generated": generated_text, "age_days": age_days, "limit_days": STALE_AFTER_DAYS})
     master = cluster.get("currentMasterVersion")
     target_text = context.get(CONTEXT_TARGET_TEXT)
-    builds, builds_note = target_builds(target_text, cluster, context)
+    builds, builds_note, builds_unknown = target_candidates(target_text, cluster, context)
+    if builds_unknown:
+        out["unknown"].append(builds_unknown)
     matches = 0
     open_issues = {master: [], target_text: []}  # the note-graded matches, per version
     partial_notes = []
@@ -313,7 +348,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
             if not version or (kind == KIND_TARGET and version == master):
                 continue
             if kind == KIND_TARGET and builds is None:
-                continue  # a build-less target the channel lists no build of: noted once below
+                continue  # a build-less target with no listed build to grade: noted, or filed as unknown, once
             candidates = builds if kind == KIND_TARGET else [version]
             graded = [_grade(build, specs) for build in candidates]
             affected = [build for build, grade in zip(candidates, graded) if grade]

@@ -1187,6 +1187,17 @@ class TargetPatchValidRuleTest(unittest.TestCase):
         self.assertFalse(target_patch_valid.version_listed("1.36.4", ["1.36.40-gke.1"]))
         self.assertFalse(target_patch_valid.version_listed("1.36.4-gke.2", ["1.36.4-gke.1495002"]))
         self.assertFalse(target_patch_valid.version_listed(None, ["1.36.4-gke.1495002"]))
+        # The one reading of a target's builds both rules grade through: the channel's list first, validNodeVersions
+        # for a pool move alone, never for a control-plane move.
+        roster = ["1.36.4-gke.1495002", "1.36.40-gke.1", "1.36.4-gke.1391002"]
+        self.assertEqual(target_patch_valid.listed_builds("1.36.4", roster), ["1.36.4-gke.1495002", "1.36.4-gke.1391002"])
+        self.assertEqual(target_patch_valid.listed_builds("1.36.4-gke.1391002", roster), ["1.36.4-gke.1391002"])
+        self.assertEqual(target_patch_valid.listed_builds("1.36.4-gke.2", roster), [])
+        self.assertEqual(target_patch_valid.listed_builds(None, roster), [])
+        self.assertEqual(target_patch_valid.target_builds("1.36.4", roster, ["1.36.4-gke.1"], False), ["1.36.4-gke.1495002", "1.36.4-gke.1391002"])
+        self.assertEqual(target_patch_valid.target_builds("1.36.998", roster, ["1.36.998-gke.1"], False), ["1.36.998-gke.1"])
+        self.assertEqual(target_patch_valid.target_builds("1.36.998", roster, ["1.36.998-gke.1"], True), [])
+        self.assertEqual(target_patch_valid.target_builds("1.36.997", roster, ["1.36.998-gke.1"], False), [])
 
     def test_no_channel_unknown_channel_and_a_failed_read(self):
         record = {**seeded_b(), "releaseChannel": {"channel": "UNSPECIFIED"}}
@@ -1410,6 +1421,46 @@ class KnownIssuesMatrixRuleTest(unittest.TestCase):
             none = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.9"))
         self.assertEqual([f for f in none["risks"] if f["kind"] == "target"], [])
         self.assertEqual(none["notes"][-1], "target 1.36.9 names no build the REGULAR channel lists at us-central1-a, so the table was not read for it; a target with its build is graded")
+
+    def test_a_short_target_reads_the_server_config_as_target_patch_valid_does(self):
+        # A failed get-server-config read: an unknown naming the read, never the "names no build" note; the running
+        # version is still graded, and a target with its build reads no server config.
+        record = seeded_b()
+        failed = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: failed_read("get-server-config failed for us-central1-a")})
+        result = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4", reads=failed))
+        self.assertEqual(result["unknown"], ["server config at us-central1-a not read (get-server-config failed for us-central1-a), so whether the REGULAR channel still lists a build of target 1.36.4 is unknown; a target with its build is graded"])
+        self.assertFalse(any("names no build" in note for note in result["notes"]), result["notes"])
+        self.assertEqual([f for f in result["risks"] if f["kind"] == "target"], [])
+        self.assertTrue(any(f["kind"] == "running" for f in result["risks"]))
+        self.assertEqual(known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4-gke.1391002", reads=failed))["unknown"], [])
+        # A read that returned no dict, and a channel the config does not carry: each an unknown, never the note.
+        not_a_dict = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: ["not", "a", "config"]})
+        self.assertEqual(known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.4", reads=not_a_dict))["unknown"], ["server config at us-central1-a not read (the server-config read returned list, not a dict), so whether the REGULAR channel still lists a build of target 1.36.4 is unknown; a target with its build is graded"])
+        weekly = {**record, "releaseChannel": {"channel": "WEEKLY"}}
+        result = known_issues_matrix.evaluate(weekly, {}, seeded_b_read(), None, context_for(weekly, target_text="1.36.4"))
+        self.assertEqual(result["unknown"], ["channel WEEKLY is not in the server config at us-central1-a, so whether it lists a build of target 1.36.4 is unknown; a target with its build is graded"])
+        self.assertFalse(any("names no build" in note for note in result["notes"]), result["notes"])
+        # A build the node list alone carries: target-patch-valid admits it for a pool move alone, so the matrix grades
+        # the target against it on a pool move and names both lists when neither carries one; on a control-plane move
+        # the channel's list alone counts, as the sibling's blocker says.
+        table = {"generated": "2026-10-20", "source": self.PAGE, "newest_gke_version": "1.37.1-gke.1", "issues": [
+            {"id": "node-build", "summary": "the node build", "gke_versions": ["1.36.998-gke.1"], "addon": None, "addon_versions": [], "fixed_in": "1.36.998-gke.2 and later", "url": self.PAGE + "#node-build"},
+        ]}
+        node_only = copy.deepcopy(recorded("server_config_us_central1_a.json"))
+        node_only["validNodeVersions"].insert(0, "1.36.998-gke.1")
+        reads = project_reads(**{shared.LOCATION_READ_SERVER_CONFIG: node_only})
+        at_the_build = {**record, "currentMasterVersion": "1.36.998-gke.1"}
+        with patch.object(known_issues_matrix, "load_table", return_value=(table, None)):
+            pools = known_issues_matrix.evaluate(at_the_build, {}, seeded_b_read(), None, context_for(at_the_build, target_text="1.36.998", reads=reads))
+            neither = known_issues_matrix.evaluate(at_the_build, {}, seeded_b_read(), None, context_for(at_the_build, target_text="1.36.997", reads=reads))
+            moving = known_issues_matrix.evaluate(record, {}, seeded_b_read(), None, context_for(record, target_text="1.36.998", reads=reads))
+        self.assertEqual([(f["kind"], f["issue"], f["version"]) for f in pools["risks"]], [("running", "node-build", "1.36.998-gke.1"), ("target", "node-build", "1.36.998")])
+        self.assertEqual(pools["unknown"], [])
+        self.assertEqual(target_patch_valid.evaluate(at_the_build, {}, None, None, context_for(at_the_build, target_text="1.36.998", reads=reads))["blocking"], [])  # the sibling agrees: valid
+        self.assertEqual(neither["notes"][-1], "target 1.36.997 names no build the REGULAR channel or validNodeVersions lists at us-central1-a for its pool move, so the table was not read for it; a target with its build is graded")
+        self.assertEqual([f for f in moving["risks"] if f["kind"] == "target"], [])
+        self.assertEqual(moving["notes"][-1], "target 1.36.998 names no build the REGULAR channel lists at us-central1-a, so the table was not read for it; a target with its build is graded")
+        self.assertEqual([f["move"] for f in target_patch_valid.evaluate(record, {}, None, None, context_for(record, target_text="1.36.998", reads=reads))["blocking"]], ["control-plane move"])  # and the sibling blocks the same move
 
     def test_the_version_grammar(self):
         vm = known_issues_matrix.version_matches

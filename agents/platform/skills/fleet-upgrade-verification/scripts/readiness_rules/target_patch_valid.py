@@ -112,16 +112,24 @@ def parse_version(text) -> tuple | None:
     return tuple(int(part or 0) for part in m.groups())
 
 
+def listed_builds(text, roster) -> list[str]:
+    """The versions in `roster` that `text` names, in the list's order (newest first as the API
+    serves it): itself when the roster carries it; for a version with no `-gke.` build
+    (`MAJOR.MINOR.PATCH`, which the API reads as that patch's newest listed build), every listed
+    build of the patch; [] when the roster carries none."""
+    if text in roster:
+        return [text]
+    if not isinstance(text, str) or BUILD_SEPARATOR in text:
+        return []
+    prefix = text + BUILD_SEPARATOR
+    return [candidate for candidate in roster if isinstance(candidate, str) and candidate.startswith(prefix)]
+
+
 def version_listed(text, roster) -> bool:
     """Whether `text` is in `roster`: a full version by exact match; a version with no `-gke.`
     build (`MAJOR.MINOR.PATCH`, which the API reads as that patch's newest listed build) when a
     listed version carries it as the prefix before `-gke.`."""
-    if text in roster:
-        return True
-    if not isinstance(text, str) or BUILD_SEPARATOR in text:
-        return False
-    prefix = text + BUILD_SEPARATOR
-    return any(isinstance(candidate, str) and candidate.startswith(prefix) for candidate in roster)
+    return bool(listed_builds(text, roster))
 
 
 def control_plane_moves(target_text, master_text, roster) -> bool:
@@ -137,6 +145,18 @@ def control_plane_moves(target_text, master_text, roster) -> bool:
         builds = [build for build in builds if build is not None]
         target = max(builds) if builds else target
     return target > master
+
+
+def target_builds(target_text, roster, node_versions, moves_control_plane: bool) -> list[str]:
+    """The listed versions the member's upgrade to `target_text` lands on, the one reading of a
+    target this rule and `known-issues-matrix` share: the versions in the channel's `roster` the
+    target names (`listed_builds`); else, when the pools alone move, the ones in `node_versions`,
+    the list a pool move alone takes a version from (a control-plane move takes one from the
+    channel's list only); [] when the lists its move reads carry none."""
+    builds = listed_builds(target_text, roster)
+    if builds or moves_control_plane:
+        return builds
+    return listed_builds(target_text, node_versions)
 
 
 def channel_roster(server_config: dict, channel: str) -> tuple[list[str] | None, str]:
@@ -224,7 +244,7 @@ def evaluate(cluster: dict, member: dict, read, target, context) -> dict:
         moves_control_plane = control_plane_moves(target_text, master_text, roster)
         move = MOVE_CONTROL_PLANE if moves_control_plane else MOVE_POOLS
         in_node_list = version_listed(target_text, node_versions)
-        if version_listed(target_text, roster) or (in_node_list and not moves_control_plane):
+        if target_builds(target_text, roster, node_versions, moves_control_plane):  # the lists its move reads, as known-issues-matrix reads them
             target_verdict = TARGET_VALID
         else:
             target_verdict = TARGET_WITHDRAWN
