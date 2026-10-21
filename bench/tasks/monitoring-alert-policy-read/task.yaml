@@ -117,8 +117,19 @@ verification_spec:
       type: worker_commands
       forbidden_runs:
         - script: gcloud
-          word_patterns: ["^monitoring$", "^(policies|channels)$", "^(create|update|delete|migrate)$"]
+          word_patterns:
+            [
+              "^monitoring$",
+              "^(policies|channels)$",
+              "^(create|update|delete|migrate)$",
+            ]
         - script: gcloud
-          word_patterns: ["^monitoring$", "^policies$", "^conditions$", "^(create|update|delete)$"]
+          word_patterns:
+            [
+              "^monitoring$",
+              "^policies$",
+              "^conditions$",
+              "^(create|update|delete)$",
+            ]
       forbidden_patterns:
         - '(\$\(|`|<\()[^)`]*monitoring\s+(policies|channels)\s+(create|update|delete|migrate)\b'
