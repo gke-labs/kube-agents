@@ -269,21 +269,21 @@ and a manifest you add declares its object, so merging it keeps the object.
    the object only if a reconciler syncs that directory and prunes. Read the
    reconciler objects on the target cluster, and on the hub that deploys to it
    when your kubeconfig reaches one (Argo CD usually runs on a hub). Your
-   default context is the cluster this agent runs on, not the target: pin a
-   per-target `KUBECONFIG` and fetch the target's credentials first
-   (**gke-basics**, "Cluster Credentials"), and read there. An answer of
+   default context is the cluster this agent runs on, not the target: pass
+   the target's own kubeconfig, `$HERMES_HOME/.kubeconfigs/kubeconfig_<project>_<cluster>_<location>.yaml`,
+   with `--kubeconfig` on every read. When that file is not there yet,
+   fetch the target's credentials into it first (**gke-basics**, "Cluster
+   Credentials"). An answer of
    `the server doesn't have a resource type` means that reconciler is not
    installed on the context you read, and on this agent's own cluster it
    says nothing about the target. Match each object's source against
    `<repo>` and the file's directory:
 
    ```bash
-   export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
-   gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
-   kubectl get applications.argoproj.io -A -o yaml
-   kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o yaml
-   kubectl get rootsyncs.configsync.gke.io -A -o yaml
-   kubectl get reposyncs.configsync.gke.io -A -o yaml
+   kubectl get applications.argoproj.io -A -o yaml --kubeconfig "<target kubeconfig>"
+   kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o yaml --kubeconfig "<target kubeconfig>"
+   kubectl get rootsyncs.configsync.gke.io -A -o yaml --kubeconfig "<target kubeconfig>"
+   kubectl get reposyncs.configsync.gke.io -A -o yaml --kubeconfig "<target kubeconfig>"
    ```
 
    - Argo CD prunes only with `spec.syncPolicy.automated.prune: true`; without

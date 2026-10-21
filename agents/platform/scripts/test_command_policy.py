@@ -2191,12 +2191,12 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
         return text[start:text.index("\n### ", start + 1)]
 
     def test_the_section_runs_only_allowed_reads(self):
-        # Its fences are the preflight, a search of the working copy, the
-        # target cluster's credentials (the default context is the agent's own
-        # cluster, #3644's lane runs), and `kubectl get` of the reconciler
-        # objects and their CRDs. The one gcloud line is get-credentials, and
-        # every governed line is one the policy allows, so nothing in it can
-        # coach a write the policy refuses.
+        # Its fences are the preflight, a search of the working copy, and
+        # `kubectl get` of the reconciler objects and their CRDs, each on the
+        # target's own kubeconfig (the default context is the agent's own
+        # cluster, #3644's lane runs). No gcloud, and every kubectl line is a
+        # get the policy allows, so nothing in it can coach a write the policy
+        # refuses.
         lines = []
         for _, block in self.INDENTED_FENCE.findall(self._section()):
             lines += [line.strip() for line in block.splitlines() if line.strip()]
@@ -2205,9 +2205,7 @@ class TheDeletionSectionStaysInsideThePolicy(unittest.TestCase):
         for line in lines:
             with self.subTest(command=line):
                 argv = shlex.split(line)
-                if argv[0] == "gcloud":
-                    self.assertEqual(["container", "clusters", "get-credentials"], argv[1:4])
-                    self.assertTrue(evaluate(argv).allowed, line)
+                self.assertNotEqual("gcloud", argv[0])
                 if argv[0] == "kubectl":
                     kubectl += 1
                     self.assertEqual("get", argv[1])
