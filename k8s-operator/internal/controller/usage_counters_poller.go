@@ -108,7 +108,7 @@ const (
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
 // eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal,
-// chatMessagesInboundTotal, sessionsTotal, toolExecutionsBlockedTotal and lastActiveTime on every
+// chatMessagesInboundTotal, sessionsTotal, toolExecutionsBlockedTotal, brokerFailuresTotal and lastActiveTime on every
 // PlatformAgent, and the two cluster gauges, from the broker's, the
 // watcher's, the chat plugin's and the A2A gateway's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
@@ -135,7 +135,7 @@ type UsageCounterPoller struct {
 	streaks map[usageStreakKey]*usageScrapeStreak
 	// prunedNewerFields records, per CR and per newer field -- the cluster
 	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal,
-	// toolExecutionsBlockedTotal -- the last poll in which that
+	// toolExecutionsBlockedTotal and brokerFailuresTotal -- the last poll in which that
 	// field was written and came back absent: a served CRD at a previous
 	// schema, which has the first-schema counters (every CRD with status.usage
 	// has carried remediationsProposedTotal and sessionsTotal) and not every
@@ -898,6 +898,7 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
 		usageCounterRemediationsMerged:   usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
 		usageCounterChatMessagesInbound:  usageStatusFloor(agent.Status.Usage.ChatMessagesInboundTotal),
+		usageCounterBrokerFailures:       usageStatusFloor(agent.Status.Usage.BrokerFailuresTotal),
 		// One status value for two halves: it seeds the chat half, and the
 		// read-back bound holds the pair's sum to it (usageDocumentInvalid).
 		usageCounterSessionsTriage:        0,
@@ -1049,13 +1050,14 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	proposed := doc.Totals[usageCounterRemediationsProposed]
 	merged := doc.Totals[usageCounterRemediationsMerged]
 	chat := doc.Totals[usageCounterChatMessagesInbound]
+	failures := doc.Totals[usageCounterBrokerFailures]
 	sessions := usageSessionsTotal(doc.Totals)
 	blocked := doc.Totals[usageCounterToolExecutionsBlocked]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first-schema counters are in every served CRD that has status.usage;
-	// the gauges, the merged counter, the chat counter and the blocked
-	// counter arrived later, each at its own release, and a CRD at a previous schema prunes some or all of
+	// the gauges, the merged counter, the chat counter, the blocked counter and
+	// the failures counter arrived later, each at its own release, and a CRD at a previous schema prunes some or all of
 	// them, so a difference in one of them alone waits while that field's
 	// record is fresh rather than re-patching every poll, and the others keep
 	// landing.
@@ -1063,10 +1065,11 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
 	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
 	blockedPruned := p.newerFieldPruned(agent, usageCounterToolExecutionsBlocked)
+	failuresPruned := p.newerFieldPruned(agent, usageCounterBrokerFailures)
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
 	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat) ||
-		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked)
+		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures)
 	// sessionsTotal is in the first schema beside the first three counters
 	// (every CRD with status.usage has carried it), so it has no record of
 	// its own: a served CRD prunes it only with status.usage whole.
@@ -1081,6 +1084,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.RemediationsProposedTotal = proposed
 	usage.RemediationsMergedTotal = merged
 	usage.ChatMessagesInboundTotal = chat
+	usage.BrokerFailuresTotal = failures
 	usage.SessionsTotal = sessions
 	usage.ToolExecutionsBlockedTotal = blocked
 	if doc.LastMoved != nil {
@@ -1115,6 +1119,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if blocked > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterToolExecutionsBlocked, agent.Status.Usage.ToolExecutionsBlockedTotal == blocked)
+	}
+	if failures > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterBrokerFailures, agent.Status.Usage.BrokerFailuresTotal == failures)
 	}
 	return nil
 }

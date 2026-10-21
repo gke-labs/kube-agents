@@ -83,6 +83,9 @@ const (
 	// chatInboundSeries is the chat_metrics plugin's counter of messages the
 	// gateway accepted, by platform; summed over every platform.
 	chatInboundSeries = "kubeagents_chat_messages_inbound_total"
+	// brokerFailuresSeries is the broker's failure counter, summed over its
+	// kind label into brokerFailuresTotal; the kinds stay in Prometheus.
+	brokerFailuresSeries = "kubeagents_broker_execution_failures_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -178,6 +181,8 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return chatSessionsSeries, nil
 	case usageCounterToolExecutionsBlocked:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsRefusedStatuses}
+	case usageCounterBrokerFailures:
+		return brokerFailuresSeries, nil
 	default:
 		return toolInvocationsSeries, usageLabelFilter{toolInvocationsStatusLabel: toolInvocationsCountedStatuses}
 	}

@@ -17,6 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CLUSTER_WORKLOAD_SECURITY = REPO_ROOT / "agents/cluster/skills/gke-workload-security/SKILL.md"
 # gke-manifest-generation's routing patch sends Config Connector manifests here.
 CONFIG_CONNECTOR_SKILL = REPO_ROOT / "agents/platform/skills/gcp-config-connector/SKILL.md"
+# gcp-config-connector routes Terraform HCL repositories here.
+TERRAFORM_SKILL = REPO_ROOT / "agents/platform/skills/gcp-terraform/SKILL.md"
 # gke-manifest-generation's routing patch and gke-basics' cli-reference patch send
 # third-party Helm charts here.
 HELM_CHART_SKILL = REPO_ROOT / "agents/platform/skills/gitops-helm-chart/SKILL.md"
@@ -41,6 +43,8 @@ class RoutedSkillsExistTest(unittest.TestCase):
     def test_config_connector_skill_exists(self):
         self.assertTrue(CONFIG_CONNECTOR_SKILL.is_file())
 
+    def test_terraform_skill_exists(self):
+        self.assertTrue(TERRAFORM_SKILL.is_file())
     def test_helm_chart_skill_exists(self):
         self.assertTrue(HELM_CHART_SKILL.is_file())
 

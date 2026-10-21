@@ -39,17 +39,28 @@ the task-shaped directories other code paths leave outside the kanban roots:
 a live sandbox has ``/opt/data/tmp/t_384aaaba`` and ``/opt/data/gitops/
 t_dc3f1647``, and a ``find -name 't_*'`` would have eaten both.
 
-The job also takes an inventory of each sandbox profile home, and only an
-inventory (#2989).  Hermes cron runs start in the profile home, so a worker's
-loose files land beside the skills and config, on a volume that outlives
-restarts, upgrades and ``helm uninstall``.  A later session lists the home and
-can't tell an invented ``dummy-gitops-state`` from something the product put
-there.  Every top-level entry not expected for that kind of home is logged with
-its mtime and size, as is any sandbox profile home the agent pod no longer has
-a profile for.  Nothing is moved or deleted, and nothing goes to chat:
-an allowlist mover would eventually displace a file someone put there on
+The job also takes an inventory of each sandbox profile home (#2989).  Hermes
+cron runs used to start in the sandbox's unwritable login home, so a worker's
+scratch landed in the profile home, beside the skills and config, on a volume
+that outlives restarts, upgrades and ``helm uninstall``.  A later session lists the home and can't tell an invented
+``dummy-gitops-state`` from something the product put there.  Every top-level
+entry not expected for that kind of home is logged with its mtime and size.
+The inventory moves and deletes nothing inside a home, and nothing goes to
+chat: an allowlist mover would eventually displace a file someone put there on
 purpose, so whether to move anything is a later decision with the inventory
 behind it.
+
+One kind of entry the inventory finds does go: a ``cluster-*`` home in the
+sandbox with no profile on the agent pod (#2989).
+``cluster_agent_profile.delete_profile`` removes the agent pod's home when a
+cluster leaves the scope or is deleted, and nothing removed the sandbox's
+copy, which kept the cluster's kubeconfig.  The agent pod's profile list is the authority: the
+sandbox is listed first, then the pod, so a profile scaffolded between the two
+reads has its pod home by the time the pod is read and is never taken for
+stale.  Only names with the cluster prefix go, only when the pod lists the
+platform profile (a pod that lists nothing was misread, not emptied), and only
+under a sandbox profiles root that is a real directory, one ``rm`` per home
+up to `INVENTORY_LIMIT` and one more for the rest.
 
 It also prunes cron run directories (#2989).  A cron agent run's terminal
 starts in ``<profile home>/cron/runs/<job>_<execution>`` (the Hermes patch
@@ -78,6 +89,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -149,6 +161,8 @@ CLUSTER_HOME_ENTRIES = {
 }
 PLATFORM_PROFILE = "platform"
 CLUSTER_PROFILE_PREFIX = "cluster-"
+# The directory under either data root that holds the profile homes.
+PROFILES_DIR_NAME = "profiles"
 
 
 def expected_entries(profile: str) -> dict[str, str]:
@@ -189,6 +203,11 @@ INVENTORY_LIMIT = 40
 CRON_RUNS_PARTS = ("cron", "runs")
 CRON_RUNS_MAX_AGE_DAYS = 7
 CRON_RUN_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+# The shape of a profile name `sweep_stale_homes` will pass to `rm`: the same
+# one. `cluster_agent_profile.profile_name` rewrites every character outside
+# `[a-z0-9-]` to `-` and hashes past its length cap, so every name the product
+# mints matches; a change to that sanitiser has to keep this gate in step.
+PROFILE_NAME = CRON_RUN_NAME
 
 # A worker's override copy of a shipped tree, at the top of a profile home
 # (#3551): `skills_override`, `scripts_override` and the like.  No product
@@ -208,6 +227,8 @@ class Sweep:
         self.remote_removed: list[str] = []
         self.cron_runs_removed: list[str] = []
         self.overrides_removed: list[str] = []
+        self.stale_homes_removed: list[str] = []
+        self.stale_homes_failed: list[str] = []
         self.warnings: list[str] = []
 
 
@@ -315,6 +336,38 @@ def _remove_remote(root: Path, names: list[str], sweep: Sweep) -> None:
     sweep.remote_removed.extend(names)
 
 
+def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep,
+                           keep: Callable[[str], bool] | None = None) -> tuple[list[str], list[str]]:
+    """`_remove_remote` one name at a time up to INVENTORY_LIMIT, then the rest in one call.
+
+    One rm per name, so a name the worker made unremovable doesn't hide the
+    ones that did go from the log; past INVENTORY_LIMIT the rest go in one
+    call, so a worker that planted thousands costs one more exec, not one
+    each.  *keep*, when given, is asked about each name right before its
+    batch's rm, so a caller's last-moment check is as fresh as the rm it
+    guards rather than one check for the whole run.  A name it refuses is
+    neither removed nor failed.  Returns (removed, failed); the names are
+    left out of ``sweep.remote_removed`` for the caller to account for.
+    """
+    batches = [[name] for name in names[:INVENTORY_LIMIT]]
+    if names[INVENTORY_LIMIT:]:
+        batches.append(names[INVENTORY_LIMIT:])
+    removed_all: list[str] = []
+    failed_all: list[str] = []
+    for batch in batches:
+        if keep is not None:
+            batch = [name for name in batch if keep(name)]
+            if not batch:
+                continue
+        before = len(sweep.remote_removed)
+        _remove_remote(root, batch, sweep)
+        removed = sweep.remote_removed[before:]
+        del sweep.remote_removed[before:]
+        removed_all.extend(removed)
+        failed_all.extend(name for name in batch if name not in removed)
+    return removed_all, failed_all
+
+
 def _remove_local(path: Path, sweep: Sweep) -> None:
     """Remove one workspace on the agent pod.
 
@@ -365,8 +418,15 @@ class Inventory:
         self.unexpected: dict[str, list[Row]] = {}
         # Sandbox profile homes the agent pod has no profile for: a cluster
         # dropped from scope, or a profile deleted, keeps its home and its
-        # kubeconfig here because the volume has no owner.
+        # kubeconfig here because the volume has no owner.  `sweep_stale_homes`
+        # removes the cluster ones.
         self.stale_homes: list[Row] = []
+        # The agent pod's profile names, read after the sandbox listing, and
+        # the directory they were read from.
+        self.agent_profiles: list[str] = []
+        self.agent_profiles_path: Path | None = None
+        # The sandbox's profiles root the listing came from.
+        self.remote_profiles: Path | None = None
         self.problems: list[str] = []
 
 
@@ -434,9 +494,19 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
     The profile list comes from the agent pod, as the mirror's does.  The
     sandbox's ``profiles/`` listing adds stale homes, and flags a live home
     that isn't a directory there (a symlink lists as empty under find's
-    default ``-P``, which would read as clean).  Nothing is moved or deleted.
+    default ``-P``, which would read as clean).  The sandbox is listed before
+    the pod is read: `sweep_stale_homes` removes a stale cluster home, and a
+    profile the pod scaffolds between the two reads must never be one.
+    Nothing here moves or deletes anything.
     """
     inv = Inventory()
+    remote_profiles = remote_root / PROFILES_DIR_NAME
+    inv.remote_profiles = remote_profiles
+    inv.agent_profiles_path = agent_profiles
+    try:
+        present = _list(remote_profiles, inv)
+    except _SandboxGone:
+        return inv
     try:
         names = sorted(
             e.name for e in agent_profiles.iterdir()
@@ -445,9 +515,8 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
     except OSError as exc:
         inv.problems.append(f"could not read {agent_profiles}: {exc}")
         return inv
-    remote_profiles = remote_root / "profiles"
+    inv.agent_profiles = names
     try:
-        present = _list(remote_profiles, inv)
         if present is not None:
             inv.stale_homes = [
                 row for row in present
@@ -471,16 +540,96 @@ def take_inventory(agent_profiles: Path, remote_root: Path) -> Inventory:
     return inv
 
 
+def _pod_home_present(home: Path) -> bool:
+    """Whether the agent pod has this home now; an unreadable answer counts as present."""
+    try:
+        return home.is_dir()
+    except OSError:
+        return True
+
+
+def _is_stale_cluster_home(name: str) -> bool:
+    """A sandbox home `sweep_stale_homes` may remove: a well-formed cluster profile name."""
+    return name.startswith(CLUSTER_PROFILE_PREFIX) and bool(PROFILE_NAME.fullmatch(name))
+
+
+def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
+    """Remove the sandbox's ``cluster-*`` homes the agent pod has no profile for.
+
+    `take_inventory` found them, listing the sandbox before reading the pod.
+    The pod's list must name the platform profile: a pod that lists nothing
+    was misread, and reading it as empty would remove every cluster home.  The
+    profiles root is checked to be a real directory on the sandbox side, so a
+    link cannot point the ``rm`` elsewhere; each home is a ``d`` in the
+    listing already (find's default ``-P`` reports a symlink as ``l``).  One
+    ``rm`` per home, so a home that cannot be removed is the only one logged
+    as not removed, up to `INVENTORY_LIMIT` homes and then one ``rm`` for the
+    rest, as `sweep_overrides` does: nothing legitimate leaves many stale
+    homes, and a worker that planted thousands costs one more exec, not one
+    each.  Runs as the model's account, which owns the homes, as
+    `_remove_remote` does.  The pod is read once more right before each
+    ``rm``: the inventory's per-home listings and the earlier ``rm`` calls sit
+    between the first pod read and a given home's turn, and a cluster
+    re-scaffolded in that window under a name whose old sandbox home is still
+    stale would otherwise lose the home it just got.
+    """
+    names = [row[0] for row in inv.stale_homes if _is_stale_cluster_home(row[0])]
+    if not names or inv.remote_profiles is None or inv.agent_profiles_path is None:
+        return
+    if PLATFORM_PROFILE not in inv.agent_profiles:
+        sweep.warnings.append(
+            f"the agent pod lists no {PLATFORM_PROFILE!r} profile; "
+            f"{len(names)} stale sandbox cluster home(s) not removed"
+        )
+        return
+    remote_profiles = inv.remote_profiles
+    first_warning = len(sweep.warnings)
+    if not _real_dirs_remote([remote_root, remote_profiles], sweep):
+        # One bullet, with the check's own words folded in when it raised.
+        detail = "; ".join(sweep.warnings[first_warning:])
+        del sweep.warnings[first_warning:]
+        sweep.warnings.append(
+            f"could not confirm {remote_profiles} in the sandbox is a real directory "
+            f"(a symlink, or the check failed); stale profile homes not removed"
+            + (f": {detail[:STDERR_EXCERPT_CHARS]}" if detail else "")
+        )
+        return
+    pod_profiles = inv.agent_profiles_path
+    removed, failed = _remove_remote_batched(
+        remote_profiles, names, sweep, keep=lambda name: not _pod_home_present(pod_profiles / name))
+    sweep.stale_homes_removed.extend(removed)
+    if failed:
+        # One chat bullet for the run that names the homes, with the rm's own
+        # words folded in, rather than one generic bullet per failed call.
+        sweep.stale_homes_failed.extend(failed)
+        detail = "; ".join(sweep.warnings[first_warning:])
+        del sweep.warnings[first_warning:]
+        shown = ", ".join(repr(n) for n in failed[:INVENTORY_LIMIT])
+        more = f" and {len(failed) - INVENTORY_LIMIT} more" if len(failed) > INVENTORY_LIMIT else ""
+        sweep.warnings.append(
+            f"stale sandbox cluster home(s) not removed: {shown}{more}: {detail[:STDERR_EXCERPT_CHARS]}"
+        )
+
+
 def _stamp(mtime: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mtime))
 
 
-def _format_inventory(inv: Inventory) -> list[str]:
+def _format_inventory(inv: Inventory, removed: Collection[str] = (),
+                      failed: Collection[str] = ()) -> list[str]:
     lines = []
     for name, mtime, _, _ in inv.stale_homes:
+        if name in removed:
+            outcome = "removed"
+        elif name in failed:
+            outcome = "rm failed, not removed"
+        elif _is_stale_cluster_home(name):
+            outcome = "not removed"
+        else:
+            outcome = "not eligible, not removed"
         lines.append(
             f"{LOG_PREFIX}: sandbox profile home {name!r} has no profile on the "
-            f"agent pod (mtime={_stamp(mtime)}, not removed)"
+            f"agent pod (mtime={_stamp(mtime)}, {outcome})"
         )
     for home, rows in sorted(inv.unexpected.items()):
         lines.append(
@@ -761,18 +910,8 @@ def sweep_overrides(agent_profiles: Path, remote_root: Path | None, sweep: Sweep
             sweep.warnings.append(f"could not confirm {remote_home} in the sandbox is a real directory (a symlink, "
                                   f"or the check failed); its override trees were not removed")
             found = []
-        # One rm per tree, so a tree the worker made unremovable doesn't hide the
-        # ones that did go from the log.  Past INVENTORY_LIMIT the rest go in one
-        # call, so a worker that planted thousands costs one more exec, not one each.
-        batches = [[entry] for entry in found[:INVENTORY_LIMIT]]
-        if found[INVENTORY_LIMIT:]:
-            batches.append(found[INVENTORY_LIMIT:])
-        for batch in batches:
-            before = len(sweep.remote_removed)
-            _remove_remote(remote_home, batch, sweep)
-            removed = sweep.remote_removed[before:]
-            del sweep.remote_removed[before:]
-            sweep.overrides_removed.extend(f"sandbox {name}/{e}" for e in removed)
+        removed, _ = _remove_remote_batched(remote_home, found, sweep)
+        sweep.overrides_removed.extend(f"sandbox {name}/{e}" for e in removed)
     return remote_root
 
 
@@ -823,7 +962,9 @@ def main() -> int:
                      f"trees: {', '.join(named)}" + (f" and {more} more" if more else ""))
     if remote_root is not None:
         try:
-            lines.extend(_format_inventory(take_inventory(agent_home() / "profiles", remote_root)))
+            inv = take_inventory(agent_home() / PROFILES_DIR_NAME, remote_root)
+            sweep_stale_homes(inv, remote_root, sweep)
+            lines.extend(_format_inventory(inv, sweep.stale_homes_removed, sweep.stale_homes_failed))
         except Exception as exc:  # noqa: BLE001 - the inventory never fails the job
             lines.append(f"{LOG_PREFIX}: inventory skipped: {exc}")
     append_log(lines, agent_home())
