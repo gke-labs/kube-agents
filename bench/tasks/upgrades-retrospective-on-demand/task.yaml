@@ -17,14 +17,34 @@
 # entries, but an answer from the record is an answer from the retrospective, so the
 # route accepts it and the report-file check accepts its path.
 #
+# The route objective is an `any` of two reads of the same sources, because the
+# harness records them apart: `worker_commands` sees the worker's `terminal` and
+# `execute_code` calls and nothing else, and a `read_file` of the same path is a
+# tagged worker call that only `tool_called` (scope `workers`) sees. On the dev
+# install on 2026-10-21 two of three runs read the chat record through `read_file`
+# and were graded as having typed nothing: the harness's blind spot, not a wrong
+# source, and a correct read of the saved report through `read_file` would fail
+# the same way. The `read_file` leaf admits the store and the chat record (a read
+# of the collector's source is not a run of it). Not admitted, in either
+# objective: `/opt/data/scratch/manifest_upgrade-retrospective.json`, the
+# collector's manifest for `audit_report.py finish`, and
+# `findings_upgrade-retrospective.json`, the SOP's ledger document drafted from
+# it. Neither is the report: each carries a candidate per incident of the
+# reviewed clusters plus the held failure guards of the unchanged ones, no risk
+# shape and no `generated_at`, so a line read from them is not the report's (on
+# 2026-10-21 the three answers read from them gave seeded-a `errors 2; warnings
+# 2`, `0; 4` and `2; 2` where the report's sections held nothing for it), and the
+# SOP's section 7 sends the on-demand answer to the report itself.
+#
 # What is deterministic here is the route and the shape of the answer, not the
 # fleet's state: which seeded clusters were upgraded in the window, and what the
 # collector found on them, changes from night to night, so no line asserts a
-# verdict. Two checks read the route -- the worker's terminal reached the store, the
-# collector or the job's chat record, and the reply names the report file -- and four read one declared
-# line per seeded cluster, in the form the sibling upgrade cases use: every value a
-# word from a closed set or an integer, so a hedge, a qualifier or a missing cluster
-# fails the line. The prose, the verdicts and the advice are the judge's.
+# verdict. Two checks read the route -- the worker reached the store, the collector
+# or the job's chat record, in its terminal or through `read_file`, and the reply
+# names the report file -- and four read one declared line per seeded cluster, in
+# the form the sibling upgrade cases use: every value a word from a closed set or
+# an integer, so a hedge, a qualifier or a missing cluster fails the line. The
+# prose, the verdicts and the advice are the judge's.
 #
 # The declared line per cluster:
 #
@@ -106,17 +126,29 @@ audit_streams: [upgrade-retrospective]
 
 verification_spec:
   # The route: the worker read the retrospective's store, ran its collector, or read
-  # the job's chat record (`chat_report_upgrade-retrospective.json`) in its terminal.
-  # An answer assembled from a version table, a readiness report or ad-hoc kubectl
-  # reads leaves no such command and fails here.
+  # the job's chat record (`chat_report_upgrade-retrospective.json`) in its terminal,
+  # or read the store or the chat record with `read_file`. An answer assembled from
+  # a version table, a readiness report, ad-hoc kubectl reads or the scratch
+  # manifest and findings files leaves no such command or read and fails here.
   - name: the-answer-comes-from-the-retrospective
     role: objective
     # assert, not converge: the transcript is immutable once the run ends.
     mode: assert
     check:
-      type: worker_commands
-      required_patterns:
-        - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
+      type: any
+      checks:
+        # The terminal: a command on the store, the collector or the chat record.
+        - type: worker_commands
+          required_patterns:
+            - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
+        # The same store or record read with `read_file`, which leaves no terminal
+        # command; the path is matched whole, so the frame is `.*` on both sides.
+        - type: tool_called
+          scope: workers
+          tool_names: ["read_file"]
+          arguments:
+            path: '.*(?:upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective).*'
+          require_success: true
 
   # The reply names the report it answered from: the latest link, a dated report
   # (a `-scoped` one when the question named clusters), or the job's chat record.

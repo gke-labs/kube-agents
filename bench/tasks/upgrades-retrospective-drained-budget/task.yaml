@@ -8,12 +8,28 @@
 # `upgrade-broke-workload`, with `persists since <date>, <n> review(s)`) while the guard from
 # that run is live; and otherwise as a risk shape, in the cluster's Info block when the run
 # reviewed it or, when the latest report lists the cluster as unchanged, in the report of the
-# review its row names or in its `kind: risk` guard in `guards.json`, which the SOP's section 7
-# reads for an unchanged cluster, since the budget is present whether or not an upgrade ran
-# that week. The question asks for
-# one line per failure and per risk the report names, so the budget's line is owed under all
-# three readings, and nothing here asserts which one applied: the planted noun is the object
-# and its entry number, and those are what the deterministic check reads.
+# review its row names, in the latest report's JSON `guards[]` or in its `kind: risk` guard in
+# `guards.json`, which the SOP's section 7 reads for an unchanged cluster, since the budget is
+# present whether or not an upgrade ran that week. The question asks for one line per failure
+# and per risk the retrospective holds for each cluster, an unchanged cluster's included, so the
+# budget's line is owed under all three readings, and nothing here asserts which one applied:
+# the planted noun is the object and its entry number, and those are what the deterministic
+# check reads.
+#
+# The precondition the fixture does not set: the line is in the latest report's body only when
+# that run reviewed seeded-b, its first run after a reset or a run after an upgrade operation
+# on it. On an install in steady state the latest report lists seeded-b as unchanged (no
+# operation in the window), its body names no budget, and the risk is a `kind: risk` guard,
+# `entry` 1 on `seeded-upgrade/PodDisruptionBudget/pinned-batch-runner`, in that report's JSON
+# `guards[]` and in `guards.json`; the prompt therefore asks for the risks held for an unchanged
+# cluster, and the verdict is not loosened for it. Measured on the dev install on 2026-10-21:
+# report 20261021T100016Z listed seeded-b unchanged (last upgrade operation none recorded, last
+# reviewed 2026-10-20T20:39:49Z), its body carried no budget line, its JSON `guards[]` and
+# `guards.json` carried the two risk guards at entry 1 (first seen 2026-10-20T20:39:49Z, three
+# reviews); the three runs that missed the line read `manifest_upgrade-retrospective.json` or
+# `findings_upgrade-retrospective.json` in `/opt/data/scratch`, which carry failures only, and
+# none opened the store; the two runs that passed the day before, against a latest report with
+# the same unchanged row, read that report's JSON `guards[]`.
 #
 # The declared line, the form the design names for the catalogue's scenario cases:
 #
@@ -34,8 +50,11 @@
 # ignored; the verdicts and the advice around them are the judge's.
 #
 # The route check proves the answer came from the retrospective (its store or the job's
-# chat record, read in the worker's terminal, or its collector), not from a readiness table
-# or ad-hoc kubectl reads.
+# chat record, read in the worker's terminal or with `read_file`, or its collector), not from
+# a readiness table or ad-hoc kubectl reads. The scratch manifest and findings files are not
+# admitted, there or in the on-demand case: they carry a candidate per incident and the held
+# failure guards, never a risk shape, so an answer from them cannot carry the budget's line
+# (the on-demand case's header has the measurements).
 #
 # audit_streams: a fleet-wide question with a stale or missing report is a full run, and on
 # an install with a GitOps repository a full run files the stream's ledger issue, so the
@@ -53,9 +72,10 @@ prompt: >-
   which of the twenty catalogued upgrade failures each one is. Answer from what
   you already have or can read; do not change, upgrade or remove anything. Name
   the report file you answered from, with its path, on a line of its own. End
-  your answer with one line per failure and per risk the report names, in
-  exactly this form and no other words on the line:
-  "<cluster>/<namespace>/<kind>/<name>: entry <n>", with the kind spelled as
+  your answer with one line per failure and per risk the retrospective records
+  for each cluster, including the risks it still holds for a cluster its latest
+  report lists as unchanged, in exactly this form and no other words on the
+  line: "<cluster>/<namespace>/<kind>/<name>: entry <n>", with the kind spelled as
   the API shows it (PodDisruptionBudget, Deployment, Node), no namespace
   segment for a cluster-scoped object, and the catalogue entry number as n.
   Write each name exactly as the API shows it, with nothing around it.
@@ -92,15 +112,28 @@ audit_streams: [upgrade-retrospective]
 
 verification_spec:
   # The route: the worker read the retrospective's store, ran its collector, or read
-  # the job's chat record (`chat_report_upgrade-retrospective.json`) in its terminal.
+  # the job's chat record (`chat_report_upgrade-retrospective.json`) in its terminal,
+  # or read the store or the chat record with `read_file` (the on-demand case says
+  # why the two reads are two leaves).
   - name: the-answer-comes-from-the-retrospective
     role: objective
     # assert, not converge: the transcript is immutable once the run ends.
     mode: assert
     check:
-      type: worker_commands
-      required_patterns:
-        - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
+      type: any
+      checks:
+        # The terminal: a command on the store, the collector or the chat record.
+        - type: worker_commands
+          required_patterns:
+            - 'upgrade_retrospective\.py|upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective'
+        # The same store or record read with `read_file`, which leaves no terminal
+        # command; the path is matched whole, so the frame is `.*` on both sides.
+        - type: tool_called
+          scope: workers
+          tool_names: ["read_file"]
+          arguments:
+            path: '.*(?:upgrade-retrospective/|upgrade-retro-report\.md|chat_report_upgrade-retrospective).*'
+          require_success: true
 
   # The verdict: the budget's line, entry 1, an aside after the number tolerated. The
   # forbids: the same object under any other entry number; a second number or a hedge

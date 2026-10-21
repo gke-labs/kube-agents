@@ -8626,11 +8626,16 @@ def test_drained_budget_declared_line_refused(text, forbidden):
 
 # ------------------------------- the retrospective cases' route and report-file checks
 #
-# The route: the worker's terminal reached the retrospective's store, its collector,
-# or the job's chat record (`chat_report_upgrade-retrospective.json`, the fleet-audit
-# skill's record of the last run's report). The command sets are the dev install's:
-# the three green on-demand runs read the chat record; a drained-budget run ran the
-# collector; the reds answered from the readiness tooling.
+# The route: the worker reached the retrospective's store, its collector, or the
+# job's chat record (`chat_report_upgrade-retrospective.json`, the fleet-audit
+# skill's record of the last run's report), in its terminal or with `read_file`.
+# The objective is an `any` of the two reads because the harness records them
+# apart: `worker_commands` sees terminal commands, `tool_called` the tagged
+# `read_file` call. The command and read sets are the dev install's: the green
+# on-demand runs read the chat record in the terminal and, on 2026-10-21, with
+# `read_file` alone; a drained-budget run ran the collector; the reds answered
+# from the readiness tooling or from the scratch manifest and findings files,
+# which are not admitted (the cases' headers say why).
 
 _ON_DEMAND_CASE = TASKS / "upgrades-retrospective-on-demand" / "task.yaml"
 _ON_DEMAND_SPEC = yaml.safe_load(_ON_DEMAND_CASE.read_text(encoding="utf-8"))
@@ -8652,27 +8657,86 @@ _READINESS_COMMANDS = [
     "cat /opt/data/state/fleet-upgrade-verification/channel-default.json",
     "kubectl get pdb -A",
 ]
+# The 2026-10-21 drained-budget reds: the harness manifest and the ledger document.
+_SCRATCH_FILE_COMMANDS = [
+    "find /opt/data/scratch -iname '*retrospective*' -o -iname '*report*' -o -iname '*upgrade*' 2>/dev/null",
+    "cat /opt/data/scratch/findings_upgrade-retrospective.json",
+    "cat /opt/data/scratch/manifest_upgrade-retrospective.json | grep -E 'check\": \"(upgrade-broke-workload)' -A 10",
+]
+_CHAT_RECORD_PATH = "/opt/data/scratch/chat_report_upgrade-retrospective.json"
+_SAVED_REPORT_PATH = "/opt/data/upgrade-retrospective/upgrade-retro-report.md"
+_DATED_REPORT_JSON_PATH = "/opt/data/upgrade-retrospective/reports/20261021T100016Z.json"
+_FINDINGS_PATH = "/opt/data/scratch/findings_upgrade-retrospective.json"
+_MANIFEST_PATH = "/opt/data/scratch/manifest_upgrade-retrospective.json"
+_COLLECTOR_SOURCE_PATH = "/opt/data/profiles/platform/skills/fleet-audit/scripts/upgrade_retrospective.py"
+_RETROSPECTIVE_CASES = ["upgrades-retrospective-on-demand", "upgrades-retrospective-drained-budget"]
 
 
-def _route_check(case: str):
+def _route_entry(case: str) -> VerificationEntry:
+    """The route objective as the runner evaluates it: an `any` compound has no
+    `verify` of its own, so the entry goes through `VerifierAgent.run_entry`."""
     spec = yaml.safe_load((TASKS / case / "task.yaml").read_text(encoding="utf-8"))
-    return next(e["check"] for e in spec["verification_spec"] if e["name"] == _ROUTE_OBJECTIVE)
+    return VerificationEntry.model_validate(next(e for e in spec["verification_spec"] if e["name"] == _ROUTE_OBJECTIVE))
 
 
-@pytest.mark.parametrize("case", ["upgrades-retrospective-on-demand", "upgrades-retrospective-drained-budget"])
+def _worker_read(path: str, status: str = "completed") -> dict:
+    """A platform worker's `read_file` call, tagged as the capture tags it."""
+    return {
+        "name": "read_file",
+        "args": {"offset": 1, "limit": 2000, "path": path},
+        "result": '{"content": "1|..."}',
+        "status": status,
+        "agent": "platform",
+        "task": "t_1",
+        "session": "s_1",
+        "at": 10.0,
+    }
+
+
+def _stash_route(commands: list[str], reads: list[dict]) -> None:
+    """The route's two records: the card's terminal commands and the worker's tagged
+    calls. A tagged `kanban_complete` shows the capture ran, as every worker's does."""
+    done = {"name": "kanban_complete", "args": {}, "result": "ok", "status": "completed", "agent": "platform", "task": "t_1", "session": "s_1", "at": 20.0}
+    transcript.set("ok", _TRAJECTORY + reads + [done], worker_commands=[{"task": "t_1", "command": c} for c in commands])
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
 @pytest.mark.parametrize(
-    "commands, passes",
+    "commands, reads, status",
     [
-        (_ON_DEMAND_GREEN_COMMANDS, True),
-        (_COLLECTOR_COMMANDS, True),
-        (["readlink /opt/data/upgrade-retrospective/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], True),
-        (_READINESS_COMMANDS, False),
-        (["ls -la /opt/data/scratch/", "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json"], False),
+        # the terminal: the chat record, the collector, the store
+        (_ON_DEMAND_GREEN_COMMANDS, [], "pass"),
+        (_COLLECTOR_COMMANDS, [], "pass"),
+        (["readlink /opt/data/upgrade-retrospective/upgrade-retro-report.md", "cat /opt/data/upgrade-retrospective/reports/20261020t204516z.json"], [], "pass"),
+        # the same sources with read_file and no terminal command that names them
+        ([], [_worker_read(_CHAT_RECORD_PATH)], "pass"),
+        (["find /opt/data -type f -name '*retrospective*.json'"], [_worker_read(_CHAT_RECORD_PATH), _worker_read(_MANIFEST_PATH)], "pass"),
+        ([], [_worker_read(_SAVED_REPORT_PATH)], "pass"),
+        ([], [_worker_read(_DATED_REPORT_JSON_PATH)], "pass"),
+        # not the retrospective: the readiness tooling, another stream's record, the
+        # scratch manifest and findings files, a read that failed, the collector's source
+        (_READINESS_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/", "cat /opt/data/scratch/chat_manifest_fleet_upgrade.json"], [], "fail"),
+        (_SCRATCH_FILE_COMMANDS, [], "fail"),
+        (["ls -la /opt/data/scratch/"], [_worker_read(_FINDINGS_PATH), _worker_read(_MANIFEST_PATH)], "fail"),
+        ([], [_worker_read(_CHAT_RECORD_PATH, status="error")], "fail"),
+        ([], [_worker_read(_COLLECTOR_SOURCE_PATH)], "fail"),
     ],
 )
-def test_retrospective_route_reads_the_store_the_collector_or_the_chat_record(case, commands, passes):
-    _stash_commands(commands)
-    assert parse_node(_route_check(case)).verify(5.0).success is passes, (case, commands)
+def test_retrospective_route_reads_the_store_the_collector_or_the_chat_record(case, commands, reads, status):
+    _stash_route(commands, reads)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == status, (case, commands, reads, verdict.reason)
+
+
+@pytest.mark.parametrize("case", _RETROSPECTIVE_CASES)
+def test_retrospective_route_with_no_tagged_worker_call_is_an_error_not_a_fail(case):
+    # Card log lines with no tagged call: the terminal leaf grades the lines and fails,
+    # the read_file leaf cannot observe its subject, and the `any` reports the unknown
+    # rather than a fail, as `worker_commands` itself does on an absent capture.
+    _stash_commands(_READINESS_COMMANDS)
+    verdict = VerifierAgent().run_entry(_route_entry(case), timeout_sec=5.0)
+    assert verdict.status == "error", verdict.reason
 
 
 @pytest.mark.parametrize(
@@ -8684,6 +8748,9 @@ def test_retrospective_route_reads_the_store_the_collector_or_the_chat_record(ca
         ("Report: /opt/data/upgrade-retrospective/reports/20261020T204516Z-scoped.md", True),
         ("The fleet upgrade report file is located at: /opt/data/state/fleet-upgrade-verification/channel-default.json", False),
         ("Report: /opt/data/scratch/chat_manifest_fleet_upgrade.json", False),
+        # the 2026-10-21 reds: the ledger document and the harness manifest are not the report
+        ("Answered from:\n`/opt/data/scratch/findings_upgrade-retrospective.json`", False),
+        ("**/opt/data/scratch/manifest_upgrade-retrospective.json**", False),
     ],
 )
 def test_retrospective_reply_names_the_report_or_the_chat_record(final_message, passes):
