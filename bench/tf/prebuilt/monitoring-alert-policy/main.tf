@@ -20,8 +20,9 @@
 #
 # The policy is disabled and names no notification channel, so it never fires
 # and never notifies anyone. Its documentation text is written like a real
-# policy's, so it neither states the answer nor tells the agent it is a test. Its condition watches container restarts against
-# a threshold no workload reaches. `teardown: true` in the task destroys it.
+# policy's, so it neither states the answer nor tells the agent it is a test.
+# Its condition watches container restarts against a threshold no workload
+# reaches. `teardown: true` in the task destroys it.
 
 terraform {
   required_version = ">= 1.5.0"
@@ -47,8 +48,8 @@ resource "google_monitoring_alert_policy" "fixture" {
     mime_type = "text/markdown"
   }
 
-  # The same identity labels the per-run clusters carry, so a janitor can
-  # find a policy a killed run left behind.
+  # The same identity labels the per-run clusters carry, so a policy that a
+  # killed run left behind can be found by label and deleted.
   user_labels = {
     managed-by  = "kube-agents-bench"
     build-id    = var.prow_build_id != "" ? var.prow_build_id : "local"

@@ -341,7 +341,7 @@ not in it: the method check refuses everything but `GET` before the host is read
 
 The relay refuses `alertPolicies` because no table entry names it, not because the read is forbidden.
 The broker serves the same read through `/v1/exec` as `gcloud monitoring policies list` or `describe`
-(`GCLOUD_READ_COMMANDS` in `command_policy.py`). The row shows the path check.
+(`GCLOUD_READ_COMMANDS` in `command_policy.py`). The table row above shows only the relay's path check.
 
 **Residual, stated.** The broker forwards with a `cloud-platform` token because narrowing is
 unavailable; a table entry added carelessly is therefore a project-wide read of whatever it

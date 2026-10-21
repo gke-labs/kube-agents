@@ -179,6 +179,16 @@ KNOWN_UNREGISTERED = {
     # nightly is a tier decision nobody has made; this entry is the record
     # that the omission is known rather than accidental.
     "cluster-provision-kanban": "cluster-scoped provisioning task, tier decision pending",
+    # Has its fixture (its own stack) and its eval record (#3467: red on main,
+    # three greens on the fix, on a dev install), and belongs in the nightly.
+    # The pool runners hold no role that creates a Cloud Monitoring alert
+    # policy, so every apply of its stack would fail with 403; #3632 grants
+    # roles/monitoring.alertPolicyEditor. The entry goes when the case joins
+    # hack/eval/nightly-cases.txt.
+    "monitoring-alert-policy-read": (
+        "#3632: stack case held out of the nightly until the pool runners can "
+        "create a Cloud Monitoring alert policy"
+    ),
     # Has its fixture (its own stack) and its eval record (#2468: red on main,
     # three greens on the fix), and belongs in the nightly. #2755 lists what it
     # still needs first: Compute network permission for the CI runners,
@@ -287,12 +297,6 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
-    "monitoring-alert-policy-read": (
-        "#3632: its stack plants a Cloud Monitoring alert policy, and the pool "
-        "runners hold no role that creates one (roles/monitoring.alertPolicyEditor "
-        "is not among their grants), so every apply would fail with 403; seen red "
-        "on main and green three times on a dev install for #3467"
-    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "

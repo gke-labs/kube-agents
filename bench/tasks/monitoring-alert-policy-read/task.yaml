@@ -19,12 +19,13 @@
 # policy is disabled. A third objective reads the route: a worker ran
 # `monitoring policies list` or `describe`, and did not take the name from the
 # audit log of the apply or from Cloud Asset Inventory. On a build without
-# the allowlist entries the first two are red. The safeguard holds the worker to reads: no
-# `monitoring policies` or `monitoring channels` write appears in its terminal.
+# the allowlist entries the first two are red. The safeguard holds the worker
+# to reads: no `monitoring policies` or `monitoring channels` write appears in
+# its terminal.
 #
 # Planted defect required: none; the fixture is the planted policy.
 # Isolation class: planted per run, destroyed by the teardown.
-# Tier: none yet. Parked in FIXTURE_NOT_READY (scripts/validate_bench_cases.py)
+# Tier: none yet. Parked in KNOWN_UNREGISTERED (scripts/validate_bench_cases.py)
 # until #3632 lets the pool runners create the alert policy; then it joins
 # hack/eval/nightly-cases.txt, the default home of a new case.
 id: monitoring-alert-policy-read
