@@ -213,6 +213,9 @@ func TestLoadRefuses(t *testing.T) {
 		{"repeated parameter", func(t *testing.T, d string) {
 			replaceIn(t, d, ManifestFile, "requires:", "  - name: cluster\nrequires:")
 		}, "parameters[1].name: \"cluster\" repeats"},
+		{"a parameter name with a hyphen", func(t *testing.T, d string) {
+			replaceIn(t, d, ManifestFile, "requires:", "  - name: target-cluster\nrequires:")
+		}, "parameters[1].name: \"target-cluster\" is not lowercase letters"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -72,6 +72,14 @@ var _ persona.Adapter = Adapter{}
 // Render maps p for Claude Code. It never fails on something Claude Code
 // cannot express; that is a warning.
 func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, error) {
+	// A relay whose args never name the server would start every broker
+	// server as the same proxy with no target. That is the worker's mistake,
+	// not something Claude Code cannot express, so it is an error.
+	if t.Relay.URL != "" && !slices.ContainsFunc(t.Relay.Args, func(a string) bool {
+		return strings.Contains(a, urlPlaceholder)
+	}) {
+		return persona.Output{}, fmt.Errorf("the relay's args do not carry %s, so no server would know its target", urlPlaceholder)
+	}
 	out := persona.Output{Model: p.Manifest.Model}
 	warn := func(format string, args ...any) { out.Warnings = append(out.Warnings, fmt.Sprintf(format, args...)) }
 

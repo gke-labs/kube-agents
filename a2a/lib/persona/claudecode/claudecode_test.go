@@ -291,3 +291,13 @@ func TestSkillsGrantTheSkillTool(t *testing.T) {
 		t.Errorf("a persona with no skills grants %s", skillTool)
 	}
 }
+
+// A relay that never names the server is refused, not rendered as N
+// identical proxies with no target.
+func TestARelayWithoutTheURLPlaceholderIsAnError(t *testing.T) {
+	bad := relay
+	bad.Args = []string{"/opt/mcp-remote/dist/proxy.js", "--transport", "http-only"}
+	if _, err := (Adapter{}).Render(load(t, exampleDir), persona.Target{Relay: bad}); err == nil {
+		t.Fatal("a relay with no {url} in its args rendered")
+	}
+}

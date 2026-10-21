@@ -86,6 +86,6 @@ go run ./cmd/persona render --harness claude-code --in <dir> --out /tmp/out \
 
 `render` writes into an empty `--out` and prints `{args, model, warnings}`
 as JSON on stdout; the warnings also go to stderr. `--relay-command` is
-space-separated, and `{url}` becomes each server's relay URL. Without the
+space-separated, and `{url}` becomes each server's relay URL; a relay with no `{url}` in its args is an error. Without the
 relay flags every broker server is dropped; the two go together, and either
 one alone is a usage error.
