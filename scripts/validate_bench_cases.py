@@ -287,6 +287,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository that declares the namespace under a path a
+    # reconciler syncs; no pool project's repository has one. Run by hand on
+    # the GitOps-wired dev lane (gitops-target-1, sackheads/kage-fleet-dev).
+    "delete-namespace-declared-pr": (
+        "#3576: needs a declared, reconciler-synced namespace in the pool GitOps repositories"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
