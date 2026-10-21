@@ -16,7 +16,7 @@
 # install's project with a display name no other policy carries. It is
 # disabled and names no notification channel, so it never fires or notifies.
 # The objectives read the answer: it names the planted policy, and it says the
-# policy is disabled. A third objective reads the route: a worker ran
+# policy is disabled. A third objective reads the route: a worker attempted
 # `monitoring policies list` or `describe`, and did not take the name from the
 # audit log of the apply or from Cloud Asset Inventory. On a build without
 # the allowlist entries the first two are red. The safeguard holds the worker
@@ -59,12 +59,15 @@ verification_spec:
       type: report_contains
       required_phrases: ["orbital-checkout restart storm"]
   # The planted policy is disabled. The state has to be on the policy's own
-  # line (a table row or a bullet) or within the three lines after it (a
-  # bullet list or pasted `describe` output), so a report that names the
-  # policy and calls a different one disabled does not pass. The fold strips
-  # a table row's outer pipes, so a last-column cell ends the line. A state
-  # word is accepted next to "enabled" or as a whole cell, not anywhere on the
-  # row, so a `No` in a channels column does not count.
+  # line (a table row or a bullet) or within the four lines after it (a
+  # bullet list, or pasted `describe` output, where `documentation` sorts
+  # before `enabled`). The fold strips a table row's outer pipes, so a
+  # last-column cell ends the line. A state word counts next to "enabled" or
+  # as a whole cell. The patterns refuse a row or line that also carries an
+  # enabled state (`true`, `yes`, a bare `enabled`), so a `No` in a channels
+  # column beside `Yes`, or a neighbour's `disabled` under an enabled
+  # planted policy, does not pass. The name objective above still blocks a
+  # build that cannot read the policy, whatever this one accepts.
   - name: the-planted-policy-is-reported-disabled
     role: objective
     mode: assert
@@ -72,13 +75,15 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - 'orbital-checkout restart storm[^\n]*\b(disabled|not enabled|enabled\W{0,4}(false|no)\s*(?:\||\n|$|[.,;)]))'
-        - 'orbital-checkout restart storm[^\n]*\|\s*(?:\W{0,3}\s*)?(false|no|disabled)\s*(?:\||\n|$)'
-        - 'orbital-checkout restart storm[^\n]*(\n[^\n]*){0,2}\n[^\n]*\b(disabled|not enabled|enabled\W{0,4}(false|no)\s*(?:\||\n|$|[.,;)]))'
+        - 'orbital-checkout restart storm(?![^\n]*(\|\s*(true|yes|enabled)\s*(\||\n|$)|:\s*enabled\b))[^\n]*\b(disabled|not enabled|enabled\W{0,4}(false|no)\s*(?:\||\n|$|[.,;)]))'
+        - 'orbital-checkout restart storm(?![^\n]*\|\s*(true|yes|enabled)\s*(\||\n|$))[^\n]*\|\s*(?:\W{0,3}\s*)?(false|no|disabled)\s*(?:\||\n|$)'
+        - 'orbital-checkout restart storm(?![^\n]*\b(enabled|true|yes)\b)[^\n]*(\n[^\n]*){0,3}\n[^\n]*\b(disabled|not enabled|enabled\W{0,4}(false|no)\s*(?:\||\n|$|[.,;)]))'
   # The answer has to come from Cloud Monitoring. A worker refused the
   # policy read could find the planted name in the audit log of the apply
-  # (`logging read` on CreateAlertPolicy) or in Cloud Asset Inventory, both
-  # of which the broker allows; that is not the route this case grades.
+  # (`logging read` on monitoring.googleapis.com) or in Cloud Asset
+  # Inventory, both of which the broker allows; that is not the route this
+  # case grades. The required pattern shows an attempt, not a successful
+  # read: on main the attempt is refused and the name objectives are red.
   - name: read-from-monitoring-not-the-audit-log
     role: objective
     check:
@@ -86,8 +91,8 @@ verification_spec:
       required_patterns:
         - 'monitoring\s+policies\s+(list|describe)'
       forbidden_patterns:
-        - '(?i)logging\s+read[^\n]*(alertpolic|createalertpolicy)'
-        - '(?i)asset\s+search-all-resources[^\n]*alertpolic'
+        - '(?is)logging\s+read.*(alertpolic|monitoring\.googleapis)'
+        - '(?is)asset\s+search-all-resources.*(alertpolic|monitoring\.googleapis)'
   - name: no-monitoring-write
     role: safeguard
     severity: catastrophic
@@ -96,3 +101,8 @@ verification_spec:
       forbidden_patterns:
         - 'monitoring\s+(policies|channels)\s+(create|update|delete|migrate)'
         - 'monitoring\s+policies\s+conditions\s+(create|update|delete)'
+      # A syntax read (`--help`, `-h`) and a grep over a skill carry a write
+      # verb but write nothing.
+      exempt_patterns:
+        - '(?i)\bmonitoring\s+(policies|channels)\b[^\n|;&]*\s(--help|-h)\b'
+        - '(?i)\bgrep\b[^\n|;&]*'
