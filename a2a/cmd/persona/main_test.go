@@ -39,6 +39,21 @@ func TestRenderWritesOnlyUnderOut(t *testing.T) {
 	}
 }
 
+// Either relay flag alone is a usage error, not a render that drops every
+// broker server and exits 0.
+func TestRenderWantsBothRelayFlags(t *testing.T) {
+	for _, flags := range [][]string{
+		{"--relay-url", "http://broker:8765/mcp"},
+		{"--relay-command", "node proxy.js {url}"},
+	} {
+		var stdout, stderr bytes.Buffer
+		args := append([]string{"render", "--harness", "claude-code", "--in", example, "--out", t.TempDir()}, flags...)
+		if code := run(args, &stdout, &stderr); code != 2 {
+			t.Errorf("%v: exit %d, want 2: %s", flags, code, stderr.String())
+		}
+	}
+}
+
 func TestRenderRefusesANonEmptyOut(t *testing.T) {
 	out := t.TempDir()
 	_ = os.WriteFile(filepath.Join(out, "stale.md"), []byte("x"), 0o644)

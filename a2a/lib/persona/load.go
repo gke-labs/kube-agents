@@ -81,6 +81,11 @@ func (l *loader) load() *Persona {
 	}
 	known := map[string]bool{ManifestFile: true, InstructionsFile: true, SkillsDir: true, MCPFile: true, ReadmeFile: true}
 	for _, e := range entries {
+		// README.md is never read, so its symlink check is here; the files
+		// that are read get theirs at the open.
+		if known[e.Name()] && e.Name() == ReadmeFile && e.Type()&fs.ModeSymlink != 0 {
+			l.add(e.Name(), "", "is not a regular file (symlinks and devices are refused)")
+		}
 		if !known[e.Name()] {
 			l.add(e.Name(), "", "not part of the persona format (%s, %s, %s/, %s or %s)",
 				ManifestFile, InstructionsFile, SkillsDir, MCPFile, ReadmeFile)
@@ -222,6 +227,12 @@ func (l *loader) skill(rel, name string) (Skill, bool) {
 		}
 		fileRel, _ := filepath.Rel(filepath.Join(l.dir, rel), full)
 		fileRel = filepath.ToSlash(fileRel)
+		// The adapter writes the file under this path, and the output
+		// check refuses one LocalPath does (a backslash in a name).
+		if !LocalPath(fileRel) {
+			l.add(path.Join(rel, fileRel), "", "is not a plain relative path (a backslash in a name?)")
+			return nil
+		}
 		info, err := d.Info()
 		if err != nil {
 			return err
@@ -381,6 +392,8 @@ func (l *loader) validateMCP(m MCP) {
 			l.add(MCPFile, field, "server name is not lowercase letters, digits, '-' and single '_'")
 		} else if strings.Contains(name, "__") {
 			l.add(MCPFile, field, "server name must not contain \"__\"")
+		} else if slices.Contains(BuiltinTools, name) {
+			l.add(MCPFile, field, "server name is a built-in tool name (%s); a tools entry could not tell them apart", strings.Join(BuiltinTools, ", "))
 		}
 		switch {
 		case s.Broker == "":

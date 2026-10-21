@@ -123,6 +123,16 @@ func TestLoadRefuses(t *testing.T) {
 		{"headers in a server", func(t *testing.T, d string) {
 			replaceIn(t, d, MCPFile, "broker: gke", "broker: gke\n    headers: {Authorization: x}")
 		}, "unknown field \"headers\""},
+		{"a server named like a built-in", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "servers:", "servers:\n  shell:\n    broker: gke")
+		}, "mcp.yaml: servers.shell: server name is a built-in tool name"},
+		{"a backslash in a skill file name", func(t *testing.T, d string) {
+			_ = os.WriteFile(filepath.Join(d, `skills/notes/a\b.md`), []byte("x\n"), 0o644)
+		}, `skills/notes/a\b.md: is not a plain relative path`},
+		{"a symlinked README", func(t *testing.T, d string) {
+			_ = os.Remove(filepath.Join(d, ReadmeFile))
+			_ = os.Symlink("/etc/hosts", filepath.Join(d, ReadmeFile))
+		}, "README.md: is not a regular file"},
 		{"allowed-tools in a skill", func(t *testing.T, d string) {
 			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "allowed-tools: Bash\ndescription:")
 		}, "skills/triage/SKILL.md: allowed-tools: is not an allowed frontmatter key"},

@@ -109,11 +109,14 @@ func renderCmd(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	target := persona.Target{}
+	fields := strings.Fields(*relayCmd)
+	switch {
+	case *relayURL != "" && len(fields) == 0:
+		return usageError("--relay-url needs --relay-command")
+	case *relayURL == "" && len(fields) > 0:
+		return usageError("--relay-command needs --relay-url")
+	}
 	if *relayURL != "" {
-		fields := strings.Fields(*relayCmd)
-		if len(fields) == 0 {
-			return usageError("--relay-url needs --relay-command")
-		}
 		target.Relay = persona.Relay{URL: *relayURL, Command: fields[0], Args: fields[1:]}
 	}
 	output, err := adapter.Render(p, target)
