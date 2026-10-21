@@ -138,9 +138,9 @@ class FakeSandbox:
                 scope.set(flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG), flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG))
             # On the id the report resolves, as `get_target_projects` checks it: a number
             # resolves through `projects describe` (the aliases) unless describe is down, when
-            # the digits reach the rule, which refuses them.
+            # the digits reach the rule, which refuses them; an id is checked as it is.
             # Over every --project, as `get_target_projects` decides: one refusal refuses the run.
-            resolved_ids = sorted({a if a in self.describe_down else self.aliases.get(a, a) for a in asked})
+            resolved_ids = sorted({a if a in self.describe_down else self.resolves_to(a) for a in asked})
             reason = next((r for r in (scope.override_error(p) for p in resolved_ids) if r is not None), None)
             if reason is not None:
                 # The script's usage exit, no report, the reason on stderr.
@@ -152,8 +152,8 @@ class FakeSandbox:
         body = self.readiness if wanted else self.versions
         # Both hops run once per project: answer with that project's slice.
         down = {a for a in asked if a in self.describe_down}
-        resolved = {a: (a if a in down else self.aliases.get(a, a)) for a in asked}
-        projects = {self.aliases.get(a, a) for a in asked}
+        resolved = {a: (a if a in down else self.resolves_to(a)) for a in asked}
+        projects = {self.resolves_to(a) for a in asked}
 
         def spelled(project: str) -> str:
             # On a describe outage the script keys members and errors alike by the spelling it was asked for.
@@ -164,6 +164,11 @@ class FakeSandbox:
         exit_code = body.get("exit", 0) if errors else (1 if down else 0)
         body = dict(body, exit=exit_code, report=dict(body["report"], members=members, errors=errors, projects=sorted(resolved.values())))
         return subprocess.CompletedProcess(argv, 0, stdout=f"noise\n{watch.ENVELOPE_SENTINEL}\n{json.dumps(body)}\n", stderr="")
+
+    def resolves_to(self, spelling: str) -> str:
+        """The id the report resolves a spelling to (`_normalise_project_id`): a number
+        through `projects describe`, the aliases; anything else as it is."""
+        return self.aliases.get(spelling, spelling) if spelling.isdigit() else spelling
 
     def kinds(self) -> list[str]:
         return [c[0] for c in self.calls]
