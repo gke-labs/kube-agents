@@ -13,11 +13,13 @@ repositories that CI pulls from.
 ## The path
 
 1. Write the case under `bench/tasks/<name>/task.yaml`, and its OpenTofu stack, if it has
-   one, under `bench/tf/prebuilt/<name>/`. Both directories are what the rules below scan.
+   one, under `bench/tf/prebuilt/<name>/`. These directories (along with shared modules under
+   `bench/tf/modules/`) are what the rules below scan.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
    about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
-3. Register the case: add its `./tasks/<name>/task.yaml` line to
-   `hack/eval/nightly-cases.txt`, with a `#` line naming anything that still blocks it. That
+3. Register the case: add its `./tasks/<name>/task.yaml` line to the sorted section at the
+   foot of `hack/eval/nightly-cases.txt`, at its place in case-id order, with the `#` lines
+   directly above it saying why it's there and naming anything that still blocks it. That
    is where a new case lands; a presubmit seat (`hack/eval/presubmit-cases.txt`) is a later
    pull request that cites the case's nightly record, and it needs an `eval-crew` approver
    where the nightly line needs only the normal ones. A case whose fixture does not exist at
@@ -41,7 +43,7 @@ bare YAML boolean.
 
 `task.yaml` follows [`docs/designs/bench-case-format.md`](../docs/designs/bench-case-format.md):
 `id` equal to the directory name, a `domain` slug from `docs/designs/domains.yaml`, a
-`fixtures` list for anything that reads cluster state, an `owner` (below), and a
+`fixtures` list for anything that reads cluster state, optionally an `owner` (below), and a
 `verification_spec` declared as a block. The exact half of the grade is a check on something
 the case planted; the judge scores the prose the agent composed. That document is the
 contract; this page does not restate it.
@@ -61,13 +63,13 @@ stack says in the pull request why neither would do, and stays in the nightly.
 ## Fixture sanitization
 
 A suite that encodes a real environment carries that environment's addresses, names and
-credentials, and a fixture merged here is public. The rule: nothing under `bench/tasks/` or
-`bench/tf/prebuilt/` names a real address, host, cluster, project or credential. Use the
+credentials, and a fixture merged here is public. The rule: nothing under `bench/tasks/`,
+`bench/tf/prebuilt/` or `bench/tf/modules/` names a real address, host, cluster, project or credential. Use the
 RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) for
 addresses, `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` for the cluster the runner provisions, and
 invented names for everything else.
 
-**Check:** `make bench-case-check` and the CI lint scan every text file under those two
+**Check:** `make bench-case-check` and the CI lint scan every text file under those
 directories and fail on a line that carries either:
 
 - an IPv4 literal outside the three documentation ranges. That covers every RFC 1918
@@ -100,19 +102,25 @@ separates a real one from an invented one, so the reviewer asks.
 
 ## Ownership
 
-Every case names who answers for it:
+A case's `owner` is the person whose bugs it is first. Authors are encouraged to set
+themselves:
 
 ```yaml
 owner: some-login
 ```
 
-The value is a GitHub login without the at sign, or the literal `maintainers`, meaning the
-approvers in the repository's [`OWNERS`](../OWNERS) file. Bare because a `task.yaml` gets
-quoted into issues and comments, where a leading at sign pages someone. devops-bench
-discards the key, so it is a repository-lint field like `domain`.
+The field is optional and takes any GitHub login. Without it the case belongs to its
+domain's `owner:` in [`docs/designs/domains.yaml`](../docs/designs/domains.yaml);
+`scripts/case_owner.py` resolves that effective owner. The lint runs offline, so it cannot
+tell whether GitHub will assign the login an issue; that is the bug filer's check, and a filer
+that GitHub refuses the assignee for (not an organisation member or collaborator) must file to
+the domain owner instead.
+The login is written without the at sign, because a `task.yaml` gets quoted into issues and
+comments, where a leading at sign pages someone. devops-bench discards the key, so it is a
+repository-lint field like `domain`.
 
-**Check:** `make bench-case-check` rejects a case with no `owner`, a value with a leading at
-sign, or one that is not a login.
+**Check:** `make bench-case-check` rejects `owner: maintainers`, which named nobody, a value
+with a leading at sign, and one that is not a login.
 
 What the owner is on the hook for is the demotion mechanic in
 [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md): the issue a demotion files goes

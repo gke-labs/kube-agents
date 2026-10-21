@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) with an unreachable backend, maintenance exclusions and windows, node-pool version skew, and what the per-entry rules of the upgrade-failure catalogue find, each a blocker or a risk that does not block (a zonal control plane is one). Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, plus the audit log through gcloud logging read when a registered rule reads it, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors, and answers whether one cluster is current for its channel (--cluster); run again during a rollout, it shows which members started, completed or stalled since the previous run; with --readiness, it also grades each member on what would stop the upgrade, naming drain-blocking PodDisruptionBudgets, fail-closed admission webhooks in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public) with an unreachable backend, maintenance exclusions and windows, node-pool version skew, and what the per-entry rules of the upgrade-failure catalogue find, each a blocker or a risk that does not block (a zonal control plane is one). Scans the linked GitOps repositories' manifests for apiVersions the target removes, with each hit's replacement. Read-only against GCP, the clusters and Git, from gcloud container, kubectl get and repository reads, plus the audit log through gcloud logging read when a registered rule reads it, keeping only its own record of each run and per-member kubeconfig files; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -9,7 +9,8 @@ Answer "against version X, which clusters lag, by how much, and is it the contro
 pool" with a table read from the fleet, not from memory, and "which manifests in our GitOps
 repositories declare an API that version X removes" with a scan read from Git. Use it when a user
 asks whether an upgrade has reached every cluster, which members are behind a target, how far the
-fleet is from a release-channel default, or whether the repositories are ready for a target
+fleet is from a release-channel default, whether one cluster's control plane is current for its
+channel (`--cluster <location>/<name>`), or whether the repositories are ready for a target
 version. Run the version report again during a rollout and it also says, per member, what changed
 since the previous run and which members have stopped moving (see "Track a rollout across runs").
 With `--readiness` it also says, per member, what would stop the upgrade: a PodDisruptionBudget
@@ -34,7 +35,7 @@ Neither reads versions against a target.
   <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> \
   [--project <project>]... [--cluster <location>/<name>... | --rollout-in-progress] [--target-version <version>] \
   [--readiness [--at <RFC 3339>] [--kubeconfig-dir <dir>]] \
-  --output /opt/data/scratch/fleet_versions.json
+  --output /opt/data/scratch/fleet_versions_$(date +%s)_$$.json
 ```
 
 The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py`).
@@ -73,10 +74,12 @@ The script lives under the profile home, `/opt/data/profiles/platform` (`/opt/da
   full run only, the `rollout` block and the per-member `progress` fields described below. A
   `--cluster` run writes neither, since it neither reads nor compares the record; it prints a
   note where the progress section would be.
-  The file is written whole (a temp file, then a rename) when the run finishes and never
-  before, so a reader never meets a partial document and a run that dies leaves the path as it found
-  it. `/opt/data/scratch` is shared by every card, so a run that must tell its own file from an
-  earlier one gives it a name of its own (the Delegation bullet in `AGENTS.md` adds a timestamp and the shell's PID, since a timestamp alone is second-resolution).
+  The file is written whole (a temp file, then a rename) at the end of the run, so a reader never
+  meets a partial document and a run that dies leaves the path as it found it. `/opt/data/scratch`
+  is shared by every card, so an output name you choose carries a timestamp and the shell's PID, as
+  the block above does; read back the path the script prints on its `Wrote … to` line.
+  The weekly audit's collector is the exception: it moves its own per-run file onto the fixed name
+  described below.
 - `--rollout-in-progress` and `--state-dir` belong to rollout tracking, below; `--readiness`,
   `--at` and `--kubeconfig-dir` to the readiness check, below that.
 
@@ -102,6 +105,29 @@ such as a quota project, is one. The weekly upgrade audit's collector also runs 
 `--readiness --cluster <location>/<name>`, once per behind cluster: that run writes
 `upgrade-readiness_<project>_<location>_<name>.json` under `/opt/data/scratch/`, and a `--cluster` run
 neither reads nor writes the rollout record, so the record above is untouched by it.
+
+### Reading `get-server-config` by hand
+
+Prefer the script, even for one cluster: the command above with `--cluster <location>/<name>`
+added (and the `collector_args`, as always) answers "is this control plane current for its
+channel?" against the right field. Read the control-plane column for that question: a member's
+status also folds in its node pools. If you do read `gcloud container get-server-config`
+yourself, read it at the cluster's location (`--location`, `--project`). Each entry of
+`channels[]` carries up to three versions, and only one of them is the channel's current version:
+
+- `defaultVersion` is the version the channel offers now, what a new cluster on it gets. A cluster
+  is behind its channel when its `currentMasterVersion` is below this, and the lag in minors is
+  measured against it.
+- `upgradeTargetVersion`, where present, is the version GKE's automatic upgrades currently move
+  clusters on the channel to, and it can trail `defaultVersion` by a minor: on 2026-10-16 REGULAR's
+  was `1.35.8-gke.1439001` while its default was `1.36.4-gke.1391002`. It is not the channel's
+  current version, so a cluster at or above it can still be a minor behind `defaultVersion`.
+- `validVersions` is what the channel currently offers. A running version absent from it can still
+  be served (GKE keeps patching a version a channel has promoted past), so its absence does not
+  mean unsupported.
+
+So "at the automatic-upgrade version" and "current" are different answers. Report the cluster's
+version, the channel's `defaultVersion`, and the gap in minors between them.
 
 ## Read the table
 
@@ -355,9 +381,14 @@ error (exit 2).
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-upgrade-verification/scripts/api_deprecation_scan.py \
-  --versions /opt/data/scratch/fleet_versions.json --target-version <version> \
-  [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations.json
+  --versions <the path the version report printed on its Wrote line> --target-version <version> \
+  [--repo <owner/name | host/path>]... [--manifests-dir <path>] --output /opt/data/scratch/api_deprecations_$(date +%s)_$$.json
 ```
+
+A scan for a second target names the target as well as the run
+(`api_deprecations_<target>_$(date +%s)_$$.json`): two scans in one shell share `$$` and can
+share the second, and a name without the run's suffix is a file another card can write or has
+already written.
 
 - `--versions` is the version report's `--output`. The scan's floor is its lowest control-plane
   minor: the API server is what stops serving a removed version, so node-pool versions do not
@@ -399,7 +430,9 @@ is an apiVersion removed after the floor and no later than the target; a removal
 the floor has already happened on every member and is not reported. A clean section says so
 with the file and document counts it read. Under either, `skipped` lines name the files it did
 not read and why, and a `partial` line means a size cap stopped the scan; a clean section with
-skipped files is clean for what it read, so say that.
+skipped files is clean for what it read, so say that. A section headed `not scanned` means this
+run did not read that repository: report it as not read, with the error the section gives, and
+never answer for it from a scan file this run did not write or from another card's result.
 
 The scan reads what Git declares. Whether a client is still calling a deprecated API on a live
 cluster is a different question, answered by GKE Deprecation Insights from the cluster's audit

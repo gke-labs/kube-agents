@@ -24,7 +24,9 @@
 #
 # Planted defect required: none; the fixture is the planted policy.
 # Isolation class: planted per run, destroyed by the teardown.
-# Tier: nightly (hack/eval/nightly-cases.txt), the default home of a new case.
+# Tier: none yet. Parked in FIXTURE_NOT_READY (scripts/validate_bench_cases.py)
+# until #3632 lets the pool runners create the alert policy; then it joins
+# hack/eval/nightly-cases.txt, the default home of a new case.
 id: monitoring-alert-policy-read
 name: Alert policy question is answered from Cloud Monitoring through the broker
 domain: observability

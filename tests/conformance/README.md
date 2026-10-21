@@ -179,7 +179,7 @@ currently fails.
 | B1  | only the gateway reaches the MCP relay                                                    | 1        | `test_B1_only_the_gateway_reaches_the_mcp_relay`                                                    | the shell sandbox or a session pod gaining a GKE read path through the relay                                                                                                                                                                             |
 | B1  | the operator's relay URL is the route the policy guards                                   | 1        | `test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route`                                | the route renamed on one side, leaving every `gke` call failing with no policy refusal to read                                                                                                                                                           |
 | B2  | no workflow approves or merges a pull request                                             | 1        | `test_B2_no_workflow_approves_or_merges_a_pull_request`                                             | a model verdict causing a merge                                                                                                                                                                                                                          |
-| B2  | `pull-requests: write` has exactly six holders                                            | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                                           | —                                                                                                                                                                                                                                                        |
+| B2  | `pull-requests: write` has exactly seven holders                                          | 1        | `test_B2_no_workflow_grants_a_bot_the_ability_to_approve`                                           | —                                                                                                                                                                                                                                                        |
 | B2  | no script merges, bar the label-gated enqueue sweep                                       | 1        | `test_B2_no_script_merges_except_the_enqueue_sweep`                                                 | a merge call moved into a script the workflow scan cannot read                                                                                                                                                                                           |
 | B2  | the enqueue sweep assents only on `lgtm` + `approved`                                     | 1        | `test_B2_the_enqueue_sweep_assents_only_on_both_human_labels`                                       | a held or half-approved pull request enqueued                                                                                                                                                                                                            |
 | B2  | App-token write grants are pinned                                                         | 1        | `test_B2_app_token_write_grants_are_pinned`                                                         | a workflow minting Pull requests or Contents write that no `permissions:` block shows                                                                                                                                                                    |
@@ -301,32 +301,21 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-115 mutations: 89 KILLED, 24 NOISY, two `must_survive` controls (one on the
-harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-25 against
-this branch on `main` at `525b37e7`, plus `A3-slack-click-authorization`,
-KILLED when it was added on 2026-09-30, `D1-platform-role-reaches-secrets`,
-KILLED when it was added on 2026-10-05, the four `C1-a2a-gateway-*` mutations and
-the three `B1-slack-*` mutations, all KILLED when they were added on 2026-10-06,
-`B1-slack-method-shape-dropped`, KILLED when it was added on 2026-10-07,
-`A3-agent-answers-its-own-notify` (KILLED) and
-`A3-bridge-sends-a-notify` (NOISY: it also trips the served-config precondition) when
-they were added on 2026-10-07, and `A3-session-sends-a-notify` (KILLED) on 2026-10-08, and
-`A3-agent-answers-the-board` and `A3-session-asks-the-board`, both KILLED when they were added on 2026-10-16, and
-`C4-skills-unchecked`, `C4-skills-check-silenced`, `C4-skills-check-skips-lock` and
-`C4-skills-make-noop`, all KILLED when they were added on 2026-10-07, and
-`C4-skills-check-blank-line-escape` and `C4-skills-check-comment-escape`, both KILLED when they were added on 2026-10-13, and
-`B2-script-merge`, `B2-enqueue-predicate-ignores-holds`,
-`B2-app-token-grants-pull-requests` and `B2-app-token-scopes-dropped`, all KILLED
-when they were added on 2026-10-13 and 2026-10-14;
-re-run the harness rather than trusting these numbers, which is the sentence this
-paragraph exists to make cheap.
-Note that the summary line the harness prints accounts for 113 of the 115: a
+206 mutations: 175 KILLED, 28 NOISY, three `must_survive` controls
+(`A3-fastpath-redundant`, `B1-denylist-rule` and
+`B1-gke-mcp-overlay-copy-redundant`), zero genuine survivors, zero stale.
+Measured 2026-10-19 on `main` at `1b783dac` plus #3261's re-aimed
+`A3-session-sends-a-notify`. Re-run the harness rather than trusting these
+numbers, which is the sentence this paragraph exists to make cheap.
+Note that the summary line the harness prints accounts for 203 of the 206: a
 `must_survive` control's verdict is `SURVIVED (expected)`, which is neither
 killed, noisy, nor a survivor. Each mutation names the control it removes,
 the test that must notice, and the plausible bad change it imitates. It is
 not run in CI — it edits tracked files in place — so it is a thing to run
-when adding a test, which step 4 below says to do.
+when adding a test, which step 4 below says to do. Its STALE check needs no
+edit, so that part does run on every pull request:
+`test_every_mutation_still_finds_the_text_it_edits` fails when a refactor
+moves the text a mutation edits, naming the mutation to rewrite.
 
 **The coverage of that set is checked by the suite, because it rotted once.**
 The first version of this file claimed every test had been mutation-verified

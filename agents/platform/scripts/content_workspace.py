@@ -1004,11 +1004,14 @@ class ContentWorkspaceStore:
         Made current again first rather than replayed from the clone: the
         clone-time token may have expired over the workspace's lifetime, and a
         fresh mint is what a fetch on a live token needs. The layer keeps the
-        ambient helper cleared either way, so a repository that was context at
-        `open` and is managed by `commit` is refused a fresh read token and the
-        fetch runs with no credential at all, never on the write token this
-        handle was opened without; reopening the repository is what presents
-        the credential its new role earns.
+        ambient helper cleared either way. A minted read token is not re-asked:
+        a repository that was context at `open` and is managed by `commit` is
+        refused a fresh one, and the fetch runs with no credential at all. A
+        stored token is re-asked on every fetch and push, and the answer
+        follows the repository's current role: a GitLab context repository
+        opened on its stored read token that is managed by `commit` is answered
+        with the write token, which its current role earns. Reopening the
+        repository presents the same credential either way.
         """
         if workspace.credential is None:
             return ()

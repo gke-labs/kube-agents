@@ -3,7 +3,7 @@ name: gke-manifest-generation
 metadata:
   category: Containers
 description: >-
-  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), Google Cloud resources as Config Connector manifests, a new cluster included (use gcp-config-connector), or cluster shape and template advice (use gke-cluster-creation).
+  Generates and updates secure, production-ready Kubernetes YAML manifests optimized for GKE Autopilot and GKE Standard clusters. Use when creating or modifying GKE deployment manifests, configuring container security contexts, setting CPU/memory resource limits, defining readiness/liveness/startup probes, mounting secrets and volumes, configuring GKE Gateway API routes, targeting Spot VMs, or deploying AI model inference workloads (vLLM, TGI, Gemma). Don't use for live cluster operations, pod troubleshooting (use gke-workload-troubleshooting), Google Cloud resources as Config Connector manifests, a new cluster included (use gcp-config-connector), cluster shape and template advice (use gke-cluster-creation), third-party Helm charts (use gitops-helm-chart), or deleting a resource (use submit-suggestion's "Deleting a resource").
 ---
 
 # GKE Manifest Generation Skill
@@ -161,6 +161,10 @@ following rules:
     than modifying it.
 -   **Minimal Diff**: Make only the changes requested. Adhere closely to
     existing labels, annotations, and conventions.
+-   **Deletion Is Removal**: A manifest cannot ask for its object to be
+    deleted. Adding one, with any annotation or label, declares the object
+    and keeps it. For a request to delete a resource, follow
+    submit-suggestion's "Deleting a resource".
 
 --------------------------------------------------------------------------------
 

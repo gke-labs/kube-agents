@@ -72,6 +72,13 @@ type injectRig struct {
 // backend armed on a loopback port, and runs it.
 func startInjectRig(t *testing.T) *injectRig {
 	t.Helper()
+	return startInjectRigWith(t, nil)
+}
+
+// startInjectRigWith is startInjectRig with a hook into the Config before
+// New sees it.
+func startInjectRigWith(t *testing.T, tweak func(*Config)) *injectRig {
+	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
 	provision(t, url)
@@ -123,6 +130,9 @@ func startInjectRig(t *testing.T) *injectRig {
 		IdleTTL:                30 * time.Minute,
 		FirstEventGrace:        injectTestGrace,
 		AttributionSalt:        []byte("test-salt"),
+	}
+	if tweak != nil {
+		tweak(cfg)
 	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: injectBackend})
 	if err != nil {

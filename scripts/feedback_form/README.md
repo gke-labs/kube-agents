@@ -117,10 +117,15 @@ that lost Issues: write (422 minting the token), and a GitHub outage.
   `GITHUB_APP_PRIVATE_KEY` script property, then revoke the old key. Nothing else changes.
 - **Retiring it.** Close the form to responses, delete the trigger, revoke the key, remove
   the redirect from `docs/site/astro.config.mjs`, and remove the links from the contributing
-  guide and the root `README.md`. The agents hand the short link out too, and none of that
+  guide, the root `README.md` and the `/feedback` section of
+  `docs/site/src/content/docs/concepts/chatops.md`, which quotes the gateway's notice. The agents hand the short link out too, and none of that
   is reached by editing the site: drop the "Reporting a Problem with kube-agents Itself"
-  bullet from `agents/platform/SOUL.md` and `agents/cluster/SOUL.md` and the routing row
-  from `agents/chat/SOUL.md`; ship the `feedback-prompt` cron job with `enabled: false`
+  bullet from `agents/platform/SOUL.md` and `agents/cluster/SOUL.md`, the routing row and
+  the `/feedback <text>` bullet from `agents/chat/SOUL.md`, the `kube-agents-feedback` skill
+  under `agents/platform/skills/` and the broker verb behind it
+  (`agents/platform/scripts/feedback_broker.py`, `POST /v1/feedback/submit`), and the two
+  link constants in `a2a/lib/chattext/commands.go` with the gateway's `/feedback` notice
+  (`docs/designs/chat-feedback-command.md`); ship the `feedback-prompt` cron job with `enabled: false`
   (the retirement path in `agents/platform/cron/README.md`), since
   `agents/platform/scripts/feedback_prompt.py` posts the link once to every install, and
   remove `FORM_URL` from that script; then delete `tests/test_feedback_reference.py`, which

@@ -129,6 +129,16 @@ past 4000 characters across messages:
   next step. Say it once: the sentences after the lead give evidence, never a
   second verdict that repeats the lead, and do not narrate the request back or
   how you investigated.
+- When there is an obvious next step on the very thing the requester asked
+  about (the fix for what you found, or the follow-up on that same workload,
+  cluster or change), end the answer with it on a last line of its own,
+  `[next: upgrade plan for seeded-c]`, after everything else, a `## Sources`
+  section included. Only that: anything else you noticed along the way, such
+  as another workload, even one they mentioned in passing, is never a step
+  line; offer it as a question in the answer.
+  Slack shows the step as a button that sends its words, so write what the
+  user would type, at most 75 characters, with no backticks, link or
+  mention. Never more than one, and none when no single step is obvious.
 - A question gets that paragraph and nothing more: no sections, no list of the
   commands you ran. A question that spans clusters may follow it with one pipe
   table, a row per cluster, holding the finding each one rests on.

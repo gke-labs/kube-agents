@@ -1055,7 +1055,7 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), text)
+	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(text))
 	cancel()
 	run.noticeMu.Unlock()
 	if err != nil {
@@ -1489,6 +1489,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		return
 	}
 	run.act.Store(act)
+	started := time.Now()
 	if err := cmd.Start(); err != nil {
 		// No child, so no publisher to join and nothing to drain.
 		run.act.Store(nil)
@@ -1540,7 +1541,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	switch {
 	case err == nil:
 		// A canceled task that finished anyway won the race: completed wins,
-		// per the payload spec's cancel mapping.
+		// per the payload spec's cancel mapping. The CLI reports no tokens,
+		// so the turn's usage is its wall time alone.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
+		}
+		run.mu.Unlock()
 		out := stdout.String()
 		b.finalize(run, lib.StateCompleted, "", &out)
 	case run.deadlineHit.Load():
@@ -1554,6 +1561,13 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		// kill, so this arm wins only when the reap was quick.
 		b.finalize(run, lib.StateFailed, shutdownReason, nil)
 	default:
+		// A run that failed on its own still took its time; a killed one
+		// (the arms above) has no turn to account for.
+		run.mu.Lock()
+		if run.state == stateRunning {
+			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
+		}
+		run.mu.Unlock()
 		b.finalize(run, lib.StateFailed, failureReason(err, stdout.String(), stderr.String()), nil)
 	}
 }
@@ -1759,7 +1773,9 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 				chat = part.Data
 			}
 		}
-		if err := b.resultPublish(ctx, run, *resultOutput, chat); err != nil && copyOnly {
+		// The chat message is read from the answer as the agent wrote it; the text a
+		// person sees carries no step line (visibleText).
+		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {
 			b.cfg.Logger.Error("result publish failed; the answer is on the stream as a turn, so the terminal keeps its state",
 				"task", run.origin.TaskID, "state", state, "err", err)
 		} else if err != nil {
@@ -1835,6 +1851,35 @@ func (b *Bridge) publishHandoff(ctx context.Context, run *taskRun, state lib.Tas
 		return
 	}
 	b.publishArtifactPartsCtx(ctx, run, lib.ArtifactHandoff, lib.Part{Kind: "text", Text: lib.HandoffCards})
+}
+
+// publishUsageLocked publishes one finished turn's cost as a part on the
+// usage artifact (payload spec "Reserved artifact names"). The caller holds
+// run.mu with the run still running: a finalizer takes the same lock before
+// its terminal, so the part is on the stream ahead of the final event, never
+// after it. Best-effort, like every artifact but the result; a usage with no
+// figure publishes nothing, so a reader sees absence rather than zeroes.
+func (b *Bridge) publishUsageLocked(run *taskRun, u lib.Usage) {
+	part, err := lib.UsagePart(u)
+	if err != nil {
+		if u != (lib.Usage{Model: u.Model}) {
+			// A figure was there and the part was refused (a negative
+			// one): say so, since the turn's time and counts are not on
+			// the bus. A usage with no figure at all is the quiet case.
+			b.cfg.Logger.Warn("usage part refused; the turn's figures are not on the bus",
+				"task", run.origin.TaskID, "err", err)
+		}
+		return
+	}
+	if run.act.Load() == nil {
+		// No activity state means no turn was started through runTask or
+		// runTaskAPI (a turn driven by hand in a test); there is no
+		// append tracker to publish under, so there is no artifact.
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	defer cancel()
+	b.publishArtifactPartsCtx(ctx, run, lib.ArtifactUsage, part)
 }
 
 // cardsSettleTheAsk reports whether the cards of origin's conversation carry

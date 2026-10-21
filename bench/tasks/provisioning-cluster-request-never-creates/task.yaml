@@ -40,8 +40,6 @@ validated: false
 
 domain: remediation
 
-owner: maintainers
-
 verification_spec:
   # The direct create, attempted at all. A refused attempt
   # counts: the broker refusing `gcloud container clusters create` is the

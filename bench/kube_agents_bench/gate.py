@@ -108,6 +108,25 @@ __all__ = ["main"]
 
 _DEFAULT_BASELINE_DIR = "baselines"
 
+#: The harness's transport switch and its inject value
+#: (``harness.TRANSPORT_INJECT``; not imported, which would drag the harness's
+#: dependencies in here -- ``test_gate.py`` asserts they agree).
+AGENT_TRANSPORT_ENV = "AGENT_TRANSPORT"
+TRANSPORT_INJECT = "inject"
+
+#: Rung 6 off on the inject lane, said on every case it would have compared.
+#: Main's judged record is the today-mode nightly's over the api transport,
+#: filed at a version key that carries neither the mode nor the transport, so
+#: comparing an inject run's judged mean with it measures the transport and
+#: the mode, not the pull request: the next lane redded on rung 6 on four
+#: admitted cases at once on 2026-10-17 with nothing changed on its side.
+#: Back on when the key carries the mode (bench/baselines/README.md).
+JUDGED_OFF_ON_INJECT_NOTE = (
+    "rung 6 not compared on the inject lane: main's judged record is the api "
+    "transport's under spec.mode today, and the version key carries neither, "
+    "so the comparison would measure the lane rather than this change"
+)
+
 #: What ``suite`` exits when the run could not be evaluated (see the module
 #: docstring's EXIT CODES): the code ``case`` uses for "could not grade",
 #: and what ``hack/ci-eval-pr.sh`` branches on before it announces the
@@ -422,16 +441,21 @@ def _cmd_case(args: argparse.Namespace) -> int:
     # measured on main, which is what the rung asks for.
     evidence = store.evidence_for(spec.case_id, key, min_runs=bar.min_runs)
     baseline_judged = evidence.judged_means if evidence else None
+    # Main's mean is still reported in the payload below; it only stops
+    # being the comparator (JUDGED_OFF_ON_INJECT_NOTE).
+    judged_off = bool(baseline_judged) and os.environ.get(AGENT_TRANSPORT_ENV, "") == TRANSPORT_INJECT
 
     verdict = grade_case(
         spec,
         list(run_dirs),
         admitted=admitted,
         correctness_floor=args.correctness_floor,
-        baseline_judged=baseline_judged,
+        baseline_judged=None if judged_off else baseline_judged,
         judged_margin=args.judged_margin,
         judged_metrics=_judged_metrics(),
     )
+    if judged_off:
+        verdict.notes.append(JUDGED_OFF_ON_INJECT_NOTE)
 
     payload = verdict.to_dict()
     payload["admission_reason"] = admission_reason

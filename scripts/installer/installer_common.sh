@@ -128,6 +128,10 @@ readonly IPV6_GROUP_BITS=16
 readonly IPV4_OCTET_BITS=8
 readonly IPV4_OCTET_MAX=255
 readonly K8S_SECRET_NAME_MAX_LENGTH=253
+# A Kubernetes Secret name (a lowercase DNS subdomain), and a LiteLLM provider
+# slug (azure, bedrock, ...): the chart checks both with the same patterns.
+readonly K8S_SECRET_NAME_PATTERN='^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+readonly LITELLM_PROVIDER_SLUG_PATTERN='^[a-z][a-z0-9_]*$'
 # A dotted-quad host, and one in the ranges the gateway's port-443 rule excepts
 # (RFC 1918, link-local, CGNAT), the chart's own patterns: such a host needs
 # CIDRs even on 443.
@@ -167,6 +171,16 @@ readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
 readonly HELM_LOCK_POLL_INTERVAL_DEFAULT=10
 # Timeout for rolling back a stuck pending release to the last healthy revision.
 readonly HELM_ROLLBACK_TIMEOUT_DEFAULT="2m"
+
+# ─── Cloud KMS Propagation Defaults ───────────────────────────────────────────
+# Defaults for Cloud KMS resource creation retry across the first-enablement
+# propagation window. Matching lifecycle.sh:203-204 without colliding with exported
+# variables or lifecycle.sh re-declarations.
+readonly KMS_API_PROPAGATION_DEFAULT_ATTEMPTS=5
+readonly KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS=60
+# Cloud KMS answers some requests with 403 for a few minutes after a project's
+# first enablement. Declared without readonly so sourcing lifecycle.sh does not collide.
+KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
 
 # ─── Chart contract ───────────────────────────────────────────────────────────
 # Names the kube-agents chart fixes and the front doors address by name: the
@@ -221,6 +235,21 @@ readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/
 # the same rule. Keep the three in step (docs/README.md lists them; a test
 # checks all three agree).
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
+# The prefix of a Google Chat space's resource name, the only home channel
+# form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
+# The gateway and the operator hold the same rule; keep the three in step
+# (docs/README.md lists them; a test checks all three agree).
+readonly GCHAT_SPACE_PREFIX="spaces/"
+# What Go's strings.TrimSpace strips (unicode.IsSpace), as UTF-8: ASCII
+# whitespace, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
+# U+205F and U+3000. The operator and the gateway trim a home channel this
+# way, so a value pasted with a no-break space is still the space they use.
+readonly -a GO_TRIMSPACE_CHARS=(
+  $'\t' $'\n' $'\v' $'\f' $'\r' ' ' $'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80'
+  $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82' $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85'
+  $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88' $'\xe2\x80\x89' $'\xe2\x80\x8a'
+  $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
+)
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -356,6 +385,9 @@ readonly SCOPE_PROBE_UNDECIDED=2
 # is nothing live to protect, not that the read failed.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="the server doesn't have a resource type|could not find the requested resource"
 readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
+# gcloud's answer for a cluster that does not exist. Any other describe failure
+# (auth expiry, a 403, a network blip) is a cluster that could not be read.
+readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -443,20 +475,55 @@ normalize_memory_vars() {
 }
 
 # Model provider → the model the install defaults to for that provider. The
-# names live in install.defaults.env; vertex_ai (and anything unrecognised,
-# which the validator rejects separately) takes the Gemini one.
+# names live in install.defaults.env; vertex_ai takes the Gemini one. No
+# default for openai_compatible (the model is whatever the server serves) or
+# for a LiteLLM provider slug outside the table (the install has to name it).
 default_model_for_provider() {
   case "${1:-}" in
+    gemini | vertex_ai) echo "$DEFAULT_MODEL_GEMINI" ;;
     openai) echo "$DEFAULT_MODEL_OPENAI" ;;
     anthropic) echo "$DEFAULT_MODEL_ANTHROPIC" ;;
-    # No default: the model is whatever the server serves.
-    openai_compatible) echo "" ;;
-    *) echo "$DEFAULT_MODEL_GEMINI" ;;
+    sap) echo "$DEFAULT_MODEL_SAP" ;;
+    *) echo "" ;;
   esac
 }
 
+# The providers the installer and the chart know by name: a menu entry, a
+# default model (openai_compatible excepted), and their own credential path.
+is_table_model_provider() {
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible|sap)$ ]]
+}
+
+# Those, or any other LiteLLM provider slug (azure, bedrock, databricks, ...),
+# which the chart accepts when MODEL_DEFAULT_NAME names the model and whose
+# credentials arrive through LITELLM_ENV_SECRET_NAME. chatgpt is a slug the
+# chart refuses by name (a subscription needs an OAuth token store it does
+# not ship), so it is refused here too, before anything is built.
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|openai_compatible)$ ]]
+  [ "${1:-}" != "chatgpt" ] && { is_table_model_provider "${1:-}" || [[ "${1:-}" =~ $LITELLM_PROVIDER_SLUG_PATTERN ]]; }
+}
+
+# A provider outside the table has no default model, so the chart refuses to
+# render it without one; refused here first, for the MODEL_MAX_TOKENS reason.
+# $1 the provider, $2 the model.
+validate_model_provider_inputs() {
+  local provider="${1:-}" model="${2:-}"
+  if ! is_table_model_provider "$provider" && [ -z "$model" ]; then
+    print_error "MODEL_PROVIDER='${provider}' is a LiteLLM provider slug outside the installer's table, which has no default model: set --model-default-name (MODEL_DEFAULT_NAME in install.env) to the model it serves."
+    return 1
+  fi
+}
+
+# LITELLM_ENV_SECRET_NAME: the Secret the gateway reads as environment
+# variables. Empty is allowed (nothing is mounted); anything else must be a
+# name Kubernetes takes, as the chart checks. $1 the name.
+validate_litellm_env_secret_name() {
+  local name="${1:-}"
+  if [ -n "$name" ] &&
+    { [ "${#name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] || [[ ! "$name" =~ $K8S_SECRET_NAME_PATTERN ]]; }; then
+    print_error "LITELLM_ENV_SECRET_NAME='${name}' is not a valid Kubernetes Secret name."
+    return 1
+  fi
 }
 
 # An OpenAI-compatible base URL → "<host> <port>", the host lowercased and an
@@ -745,7 +812,7 @@ validate_openai_compatible_inputs() {
 
   if [ -n "$ca_bundle_name" ] &&
     { [ "${#ca_bundle_name}" -gt "$K8S_SECRET_NAME_MAX_LENGTH" ] ||
-      [[ ! "$ca_bundle_name" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$ ]]; }; then
+      [[ ! "$ca_bundle_name" =~ $K8S_SECRET_NAME_PATTERN ]]; }; then
     print_error "OPENAI_COMPATIBLE_CA_SECRET_NAME='${ca_bundle_name}' is not a valid Kubernetes Secret name."
     return 1
   fi
@@ -959,11 +1026,15 @@ platform_agent_mode_extra_values_caveat() {
 # that applies it names it first. A key the apply cannot bring the CR to,
 # because the CR carries a mode set outside this installer, is named too.
 # Silent when either value is empty (no CR, no release: a first install),
-# and on a re-apply of the same mode. A read that failed is not empty: the
+# and on a re-apply of the same mode. Sets PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
+# to true when it names a switch, so install.sh -y can refuse one nobody chose. A read that failed is not empty: the
 # front-door call says so itself (announce_platform_agent_mode_for_apply).
 # Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
   local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   [ -n "$record" ] && [ -n "$live" ] || return 0
   from="$(effective_platform_agent_mode "$live")"
   to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
@@ -975,9 +1046,11 @@ announce_platform_agent_mode_switch() {
     fi
     return 0
   fi
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
   print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
   if [ "$to" = "next" ]; then
-    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, Google Chat moves from the agent to the A2A gateway."
+    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat, or Slack when it is the only chat platform enabled."
   else
     print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
   fi
@@ -1015,6 +1088,14 @@ slack_moves_to_a2a_gateway() {
   [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
 }
 
+# Whether Google Chat is consumed by the A2A gateway after this apply: the
+# operator's a2aChatArmed (k8s-operator platformagent_a2a_manifests.go),
+# spec.mode next with Google Chat enabled. $1 the mode the apply renders, $2
+# GOOGLE_CHAT_ENABLED.
+google_chat_moves_to_a2a_gateway() {
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
+}
+
 # The three checks behind refuse_next_slack_gateway_settings, one per
 # setting, which the install.sh interview also uses to re-ask. Each prints
 # nothing for a setting that passes.
@@ -1029,18 +1110,53 @@ slack_allowlist_emails() {
   printf '%s' "$emails"
 }
 
-# A Slack home channel ($1), trimmed, when it is set and is not a channel id
-# (SLACK_HOME_CHANNEL_ID_RE).
+# A Slack home channel ($1), trimmed as the operator trims it (trim_go_space),
+# when it is set and is not a channel id (SLACK_HOME_CHANNEL_ID_RE).
 slack_home_channel_not_an_id() {
   # The C locale: under a legacy collation (glibc before 2.28) the range
   # A-Z also matches lowercase, which the gateway's rune comparison refuses.
   local LC_ALL=C
-  local home="${1:-}"
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home
+  home="$(trim_go_space "${1:-}")"
   if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
     printf '%s' "$home"
   fi
+}
+
+# $1 with what Go's strings.TrimSpace strips (GO_TRIMSPACE_CHARS) removed
+# from both ends. Byte-wise, so the result does not depend on the locale.
+trim_go_space() {
+  local LC_ALL=C value="${1:-}" sp trimmed=false
+  until $trimmed; do
+    trimmed=true
+    for sp in "${GO_TRIMSPACE_CHARS[@]}"; do
+      if [[ "$value" == "$sp"* ]]; then value="${value#"$sp"}"; trimmed=false; fi
+      if [[ "$value" == *"$sp" ]]; then value="${value%"$sp"}"; trimmed=false; fi
+    done
+  done
+  printf '%s' "$value"
+}
+
+# A Google Chat home channel ($1), trimmed, when it is set and is not a bare
+# space name: "spaces/" and an id with no further "/". The gateway's
+# gchatIsSpaceName (a2a/gateway/gchat.go) refuses anything else and leaves
+# its notify route unarmed; the operator's a2aGchatHomeSpace holds the same
+# rule.
+gchat_home_channel_not_a_space_name() {
+  local home id
+  home="$(trim_go_space "${1:-}")"
+  [ -n "$home" ] || return 0
+  id="${home#"$GCHAT_SPACE_PREFIX"}"
+  if [ "$id" = "$home" ] || [ -z "$id" ] || [[ "$id" == */* ]]; then
+    printf '%s' "$home"
+  fi
+}
+
+# Whether a Google Chat allowlist ($1) holds no address once split the way
+# hcl_csv_list renders it, which drops blank items: the operator then renders
+# allow-all for the gateway.
+gchat_allowlist_is_empty() {
+  [ -z "$(csv_list_items "${1:-}")" ]
 }
 
 # The number of tokens a Slack bot token ($1) holds, when it is more than
@@ -1095,7 +1211,7 @@ slack_bot_token_has_separator() {
 # returns 0.
 refuse_next_slack_gateway_settings() {
   local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
-  local emails bad_home count refused=false via say=print_error lead=""
+  local emails bad_home count refused=false via keep_today say=print_error lead=""
   slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
@@ -1117,9 +1233,14 @@ refuse_next_slack_gateway_settings() {
   fi
   count="$(slack_bot_token_list_count "$token")"
   if [ -n "$count" ]; then
-    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    via="install.env"; keep_today="PLATFORM_AGENT_MODE=today"
+    if [ "$flags" = "flags" ]; then
+      via="install.env or --slack-bot-token"
+      # A first install is next by default, so the flag is the way to stay on today.
+      keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
+    fi
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
@@ -1158,13 +1279,13 @@ next_home_channel_unset_key() {
   [ "${1:-}" = "next" ] || return 0
   if is_truthy "${3:-}"; then
     home="${5:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
     return 0
   fi
   if is_truthy "${2:-}"; then
     home="${4:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
   fi
   return 0
@@ -1191,8 +1312,9 @@ next_home_channel_unset_remedy() {
   esac
 }
 
-# Set by warn_next_home_channel_unset so the front door's closing summary can
-# say it again where the reader of a non-interactive run's log will see it.
+# Set by warn_next_home_channel_unset, and again by install.sh from the mode
+# after the apply, so the front door's closing summary can say it again where
+# the reader of a non-interactive run's log will see it.
 NEXT_HOME_CHANNEL_UNSET_KEY=""
 
 # Warns when the apply leaves the gateway's chat backend without a home
@@ -1231,6 +1353,13 @@ _platform_agent_mode_unread() {
   print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
 }
 
+# The spec.mode the CR carries after this apply, for the chat checklists that
+# follow it: the key, unless the reads below show a CR the apply leaves on
+# another mode (platform_agent_mode_after_apply). A platformAgent.mode in the
+# composition's extra_helm_values is not followed: the installer cannot read
+# it (platform_agent_mode_extra_values_caveat).
+PLATFORM_AGENT_MODE_AFTER_APPLY=""
+
 # The front door's call, after the scope check beside it: $1 namespace, $2
 # the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
 # confirmation after the notice. Quiet where there is nothing to switch (a cluster the tfvars
@@ -1242,8 +1371,13 @@ _platform_agent_mode_unread() {
 # absent, or a get-credentials that did not land on the --dry-run and
 # --generate-only routes the scope check skips) is a read that did not
 # happen, and is said with the scope check's remedy.
+# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$key")"
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
     PLATFORM_AGENT_READS_HELD_FOR=""
     return 0
@@ -1273,7 +1407,41 @@ announce_platform_agent_mode_for_apply() {
   else
     record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
   fi
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
   announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
+}
+
+# After announce_platform_agent_mode_for_apply, from the reads it left:
+# succeeds unless they show that no install runs next, that is no cluster, no
+# PlatformAgent type, a CR on today, or, with the CR gone, no release or one
+# that records today (the next apply recreates the CR from it). A read that
+# failed or did not happen is not today. upgrade.sh refuses a keyless
+# install.env on this, since such a file renders today.
+platform_agent_install_may_run_next() {
+  local live record
+  [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ] && return 1
+  case "${PLATFORM_AGENT_CR_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  if [ -n "$live" ]; then
+    [ "$(effective_platform_agent_mode "$live")" = "next" ]
+    return
+  fi
+  case "${PLATFORM_AGENT_RECORD_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  [ "${PLATFORM_AGENT_SERVED_READ:-}" = "$PLATFORM_AGENT_READ_FAILED" ] && return 0
+  if [ -n "${PLATFORM_AGENT_SERVED_REVISION:-}" ]; then
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
+  else
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+  fi
+  [ "$(effective_platform_agent_mode "$record")" = "next" ]
 }
 
 # upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
@@ -1881,6 +2049,74 @@ tf_state_prefix() {
   echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${cluster}}"
 }
 
+# ─── Cloud KMS ─────────────────────────────────────────────────────────────────
+# Cloud KMS answers some requests with 403 "Google Cloud KMS API has not been
+# used in project <n> before or it is disabled" for a few minutes after a
+# project's FIRST enablement -- which is the enablement install.sh performs
+# seconds before creating the key ring and key.
+
+_sanitize_kms_int() {
+  local val="$1" default_val="$2" min_val="${3:-0}" name="${4:-}"
+  if [ -z "$val" ]; then
+    echo "$default_val"
+    return 0
+  fi
+  if [[ "$val" =~ ^[0-9]{1,9}$ ]] && [ "$val" -ge "$min_val" ]; then
+    echo "$val"
+  else
+    if [ -n "$name" ]; then
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      else
+        echo -e "  ⚠ ${name}='${val}' is not a whole number >= ${min_val}; using default ${default_val}." >&2
+      fi
+    fi
+    echo "$default_val"
+  fi
+}
+
+# Retries a Cloud KMS command on Cloud KMS's first-enablement 403
+# (KMS_API_PROPAGATION_PATTERN). On a fresh GCP project, Cloud KMS can answer 403
+# for a few minutes after being enabled. Output of the command is preserved and
+# echoed on completion; retry warnings are printed to stderr.
+retry_kms_create() {
+  local max_attempts
+  max_attempts="$(_sanitize_kms_int "${KMS_API_PROPAGATION_ATTEMPTS:-}" "$KMS_API_PROPAGATION_DEFAULT_ATTEMPTS" 0 "KMS_API_PROPAGATION_ATTEMPTS")"
+  local wait_seconds
+  wait_seconds="$(_sanitize_kms_int "${KMS_API_PROPAGATION_WAIT_SECONDS:-}" "$KMS_API_PROPAGATION_DEFAULT_WAIT_SECONDS" 0 "KMS_API_PROPAGATION_WAIT_SECONDS")"
+  local attempt=1 status=0 output=""
+  while :; do
+    output="$(trap - ERR; "$@" 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+      if [ "$attempt" -ge "$max_attempts" ]; then
+        if type print_warning >/dev/null 2>&1; then
+          print_warning "Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        else
+          echo -e "  ⚠ Cloud KMS still rejects requests $attempt attempts after enabling it." >&2
+        fi
+        [ -n "$output" ] && printf '%s\n' "$output"
+        return "$status"
+      fi
+      attempt=$((attempt + 1))
+      if type print_warning >/dev/null 2>&1; then
+        print_warning "Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        print_warning "Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      else
+        echo -e "  ⚠ Cloud KMS was enabled minutes ago and has not finished propagating; it 403s some requests for a few minutes after a project's first enablement." >&2
+        echo -e "  ⚠ Waiting ${wait_seconds}s, then retrying (attempt $attempt of $max_attempts)..." >&2
+      fi
+      sleep "$wait_seconds"
+      continue
+    fi
+    [ -n "$output" ] && printf '%s\n' "$output"
+    return "$status"
+  done
+}
+
 # The basename of the first ENABLED version of a Cloud KMS key, or nothing.
 # The token minter cannot pass readiness without one, so the generator,
 # install.sh and upgrade.sh all ask before enabling it; one pipeline here so
@@ -2149,7 +2385,12 @@ live_github_app_id() {
 # GitOps came from install.sh's flags, which earlier releases did not record
 # in install.env, so the next upgrade.sh rendered from the file alone. Run
 # after the generator (TFVARS_ENABLE_GITHUB_MINTER). Prints the exact lines to
-# append, with the live values filled in, so the fix needs no docs.
+# set, with the live values filled in, so the fix needs no docs. A minter
+# that this install did not make (see below) is not removed by the apply, so
+# it asks for no GITHUB_APP_ID; there it refuses a run that would drop or
+# change the PlatformAgent's GitOps repository (its owner, name or host), a
+# PlatformAgent or repository it cannot read, and a run that would render the
+# chart's own minter over the other one.
 # $1 namespace, $2 the install.env path, $3 SCOPE_CHECK_MODE_WARN for a run
 # that applies nothing (it warns and returns 0).
 refuse_apply_dropping_live_gitops() {
@@ -2199,10 +2440,14 @@ refuse_apply_dropping_live_gitops() {
     return 1
   fi
   [ -z "$minter_out" ] || minter="present"
+  local cr_read="true"
   cr_json="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
-    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) || true)"
-  # "<org> <owner/repo or repo>" of the GitOps repository, from either spelling.
-  IFS=$'\t' read -r live_org live_repo <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
+    get platformagents.kubeagents.x-k8s.io -n "$namespace" -o json 2>/dev/null) )" || cr_read="false"
+  # "<org> <owner/repo or repo> <declared> <host>" of the GitOps repository,
+  # from either spelling; declared is 1 when the CR names one, readable or not,
+  # and host is its forge's host, "" for github.com in any spelling.
+  local live_declared="" live_host=""
+  IFS=$'\t' read -r live_org live_repo live_declared live_host <<<"$(printf '%s' "$cr_json" | (trap - ERR; python3 -c '
 import json, sys
 try:
     items = (json.load(sys.stdin) or {}).get("items") or []
@@ -2210,6 +2455,7 @@ except ValueError:
     items = []
 integ = ((items[0].get("spec") or {}).get("integration") or {}) if items else {}
 gh = integ.get("github") or {}
+host = ""
 repo, org = gh.get("gitRepo") or "", gh.get("org") or ""
 ns = ""
 if repo.strip() in ("None", "none"):
@@ -2224,6 +2470,9 @@ if not repo:
             # The namespace qualifies a bare name only; a path with an owner
             # names its own (as the operator resolves it).
             ns = r.get("namespace") or forge.get("namespace") or ""
+            host = (forge.get("host") or "").strip().lower()
+            if host in ("github.com", "www.github.com", "ssh.github.com"):
+                host = ""
             break
 def path_of(ref):
     # As the operator reads a reference (ParseRepoRef): a clone URL or an scp
@@ -2249,16 +2498,108 @@ elif not org:
 # operator would refuse (anything but A-Za-z0-9_.-) is printed as unknown.
 import re
 ok = re.compile(r"^[A-Za-z0-9_.-]+$")
-print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-"))
-' 2>/dev/null) || printf '%s\t%s' - -)"
+print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "") else "-") + "\t" + ("1" if repo else "0")
+      + "\t" + (host if re.match(r"^[a-z0-9.-]*$", host) else "-"))
+' 2>/dev/null) || printf '%s\t%s\t%s\t%s' - - 1 -)"
   [ "$live_org" = "-" ] && live_org=""
   [ "$live_repo" = "-" ] && live_repo=""
-  # Only a running minter is something the apply destroys. A GitOps repository
-  # with no minter (the App ID left blank, or the minter deferred) renders the
-  # same either way, so there is nothing here to protect.
+  # Only an install where a minter runs is guarded here. A GitOps repository
+  # with no minter (the App ID left blank, or the minter deferred) is out of
+  # this check's scope.
   [ -n "$minter" ] || return 0
   repo_name="$live_repo"
   [ -z "$live_org" ] || [ -z "$live_repo" ] || live_repo="${live_org}/${live_repo}"
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    say=print_warning
+    lead="An applying run would be refused: "
+  fi
+  # A minter that this install did not make. Three signals, and all must say
+  # so: the release record (helm get values) has githubMinter.enabled false,
+  # which the chart's minter and the composition's minter module (its service
+  # account and Cloud KMS key) both follow, and the Deployment carries no
+  # meta.helm.sh annotations that name this release, so Helm does not delete
+  # it. That is a minter made by hand, by the kustomize dev path (make
+  # deploy-github) or by another Helm release. The apply removes nothing of
+  # it, so the run needs no GITHUB_APP_ID. A read that fails keeps the
+  # refusals further down.
+  local record_minter="" owner=""
+  record_minter="$( (trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$ctx" -o json 2>/dev/null) |
+    (trap - ERR; python3 -c '
+import json, sys
+try:
+    values = json.load(sys.stdin) or {}
+except ValueError:
+    sys.exit(0)
+print("true" if ((values.get("githubMinter") or {}).get("enabled") is True) else "false")
+' 2>/dev/null) || true)"
+  # A third signal for the composition's half: the minter module (its service
+  # account, Cloud KMS key and their bindings) must not be in this install's
+  # Terraform state. An apply that turned the minter off and stopped after
+  # the Helm release, before the module's destroy, leaves the record false and
+  # the module in state, and the next apply would destroy it under a minter
+  # made by hand on the same names. A state that cannot be read keeps the
+  # refusals further down.
+  local state_rc=0
+  if [ "$record_minter" = "false" ]; then
+    tf_state_manages_module "module.github_minter" >/dev/null 2>&1 || state_rc=$?
+  fi
+  if [ "$record_minter" = "false" ] && [ "$state_rc" -eq 1 ] &&
+    owner="$( (trap - ERR; kubectl --context "$ctx" --request-timeout="$KUBECTL_PROBE_REQUEST_TIMEOUT" \
+      get deployment "$GITHUB_MINTER_DEPLOYMENT" -n "$namespace" \
+      -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}/{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null) )" &&
+    [ "$owner" != "${KUBE_AGENTS_HELM_RELEASE}/${namespace}" ]; then
+    if [ "$minter_stays_on" = "true" ]; then
+      # The chart renders its own minter under the same names, and Helm does
+      # not take over objects that another owner made: the apply would fail
+      # on them, after the cluster work.
+      "$say" "${lead}a GitHub token minter that this install did not make runs in namespace '${namespace}', and this run renders the chart's own minter under the same names. Helm does not take over objects it does not own, so the apply would fail on them."
+      print_info "Remove the other minter first, all of its objects: make -C k8s-operator undeploy-github with the same GITHUB_MINTER_KSA_NAME exported if it came from the kustomize path, or turn it off in the Helm release that made it; and delete the github-app-credentials Secret if you made it by hand. Or keep the other minter: set GITHUB_APP_ID empty in ${file} (and, with install.sh, give no --github-app-id). Then re-run the same command."
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    # The apply removes no minter, but it renders the PlatformAgent's GitOps
+    # repository from GITOPS_ORG and GITOPS_REPO, so a run that does not name
+    # the live repository would take it out of the CR, or point the CR at
+    # another one. A CR that cannot be read, or a repository that cannot be
+    # named, is refused, as it cannot be compared.
+    if [ "$cr_read" != "true" ]; then
+      "$say" "${lead}the PlatformAgent in namespace '${namespace}' could not be read, so this run cannot tell whether the apply keeps its GitOps repository."
+      print_info "Fix the read (kubectl get platformagents -n ${namespace} --context ${ctx}) and re-run the same command."
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    local remove_hint="KUBE_AGENTS_REMOVE_GITOPS=true in the environment skips this check: the apply then renders the repository that GITOPS_ORG and GITOPS_REPO name, or none when GITOPS_ORG is empty."
+    if [ "$live_declared" = "1" ] && { [ -z "$live_org" ] || [ -z "$repo_name" ] || [ "$live_host" = "-" ]; }; then
+      # A repository the CR names in a form this check cannot read: no keys
+      # can be compared with it, so none are offered.
+      "$say" "${lead}the PlatformAgent names a GitOps repository that this check cannot read, so this run cannot tell whether the apply keeps it. The ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' is not this install's, and the apply leaves it as it is."
+      print_info "See what it names: kubectl get platformagents -n ${namespace} --context ${ctx} -o jsonpath='{.items[0].spec.integration}'. To go on, remove the other minter (this check then does not run), or: ${remove_hint}"
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    local run_host=""
+    [ "${GITOPS_FORGE:-github}" = "github" ] && run_host="${GITOPS_HOST:-}"
+    if [ "$live_declared" = "1" ] &&
+      { [ "${GITOPS_ORG:-}" != "$live_org" ] || [ "${GITOPS_REPO:-}" != "$repo_name" ] || [ "$run_host" != "$live_host" ]; }; then
+      "$say" "${lead}the PlatformAgent opens pull requests on ${live_repo}${live_host:+ at ${live_host}}, but this run's GITOPS_ORG, GITOPS_REPO and GITOPS_HOST (from ${file}, or the installer's defaults where it sets none) do not name that repository, so the apply would take it out of the PlatformAgent or point the PlatformAgent at another one. The ${GITHUB_MINTER_DEPLOYMENT} Deployment in namespace '${namespace}' is not this install's, and the apply leaves it as it is."
+      print_info "Set these lines in ${file} (add them, or replace the ones it has), then re-run the same command:"
+      [ "${GITOPS_ORG:-}" = "$live_org" ] || print_info "  GITOPS_ORG=${live_org}"
+      [ "${GITOPS_REPO:-}" = "$repo_name" ] || print_info "  GITOPS_REPO=${repo_name}"
+      if [ "$run_host" != "$live_host" ]; then
+        if [ -n "$live_host" ]; then
+          print_info "  GITOPS_FORGE=github"
+          print_info "  GITOPS_HOST=${live_host}"
+        else
+          print_info "  GITOPS_HOST= (empty: the repository is on github.com)"
+        fi
+      fi
+      print_info "$remove_hint"
+      [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
+      return 1
+    fi
+    print_info "A ${GITHUB_MINTER_DEPLOYMENT} Deployment runs in namespace '${namespace}', but this install did not make it (the ${KUBE_AGENTS_HELM_RELEASE} release renders no minter, and does not own the Deployment), so the apply leaves it as it is${live_repo:+, and the PlatformAgent keeps its GitOps repository ${live_repo}}."
+    return 0
+  fi
   # The minter stays on, so nothing is destroyed; but a run that fell back to
   # an auto-selected organisation or the default repository name would point
   # the running minter at another repository, and record it. Said before the
@@ -2271,10 +2612,6 @@ print((org if ok.match(org or "") else "-") + "\t" + (name if ok.match(name or "
     return 0
   fi
   app_id="$(live_github_app_id "$namespace")"
-  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
-    say=print_warning
-    lead="An applying run would be refused: "
-  fi
   # All three keys set and matching what runs: the keys are right, and the
   # generator left the minter off because its Cloud KMS key check found no
   # ENABLED key version (or could not list them). Say that, not "set these".
@@ -3344,6 +3681,34 @@ sys.exit(0 if managed else 1)
 ' "$1" "$2" "$TF_STATE_RC_UNREADABLE"
 }
 
+# Whether this install's Terraform state manages any resource in module $1
+# (for example module.github_minter, which the state records as
+# module.github_minter[0]): managed mode, with at least one instance. Returns
+# 1 when it does not or there is no state, and TF_STATE_RC_UNREADABLE when the
+# state could not be read or parsed, which a caller must not read as "no".
+tf_state_manages_module() {
+  local state
+  state=$(tf_state_read) || return $?
+  printf '%s' "$state" | python3 -c '
+import json, sys
+module, unreadable = sys.argv[1], int(sys.argv[2])
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(unreadable)
+def in_module(address):
+    address = address or ""
+    return address == module or address.startswith(module + "[") or address.startswith(module + ".")
+managed = any(
+    in_module(r.get("module"))
+    and r.get("mode") == "managed"
+    and len(r.get("instances", [])) > 0
+    for r in doc.get("resources", [])
+)
+sys.exit(0 if managed else 1)
+' "$1" "$TF_STATE_RC_UNREADABLE"
+}
+
 # The account ids of every google_service_account this install's state
 # manages, one per line. Empty when there is no state; tf_state_read's return
 # code when there is none or it could not be read, so a caller can tell
@@ -3982,6 +4347,13 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
   return 1
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the cluster does not exist. The tfvars generator and install.sh's mode
+# settle both ask this, so they cannot disagree about what absence is.
+gke_describe_error_is_not_found() {
+  printf '%s' "${1:-}" | grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN"
+}
+
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -4072,7 +4444,7 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! printf '%s' "$describe_err" | grep -qiE "not.?found|404"; then
+    if ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
@@ -4435,6 +4807,10 @@ write_tfvars_from_state() {
   validate_openai_compatible_inputs "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" "${MODEL_DEFAULT_NAME:-}" \
     "${OPENAI_COMPATIBLE_API_BASE:-}" "${OPENAI_COMPATIBLE_TARGET_PORT:-}" \
     "${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}" "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}" || return 1
+  # Same reason: a provider slug with no model, or a Secret name the chart
+  # refuses, stops here with the file untouched.
+  validate_model_provider_inputs "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" "${MODEL_DEFAULT_NAME:-}" || return 1
+  validate_litellm_env_secret_name "${LITELLM_ENV_SECRET_NAME:-}" || return 1
   # Checked here for the MODEL_MAX_TOKENS reason: upgrade.sh and uninstall.sh
   # regenerate from install.env without install.sh's checks. A misspelt toggle
   # is refused rather than read as off, which would forward requests
@@ -4528,6 +4904,10 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    # Only when set, so an install without one keeps the file it had.
+    if [ -n "${LITELLM_ENV_SECRET_NAME:-}" ]; then
+      echo "litellm_env_secret_name = $(hcl_str "${LITELLM_ENV_SECRET_NAME}")"
+    fi
     # Only for this provider, so every other install's file stays as it was.
     # The target port is 0, the variable's "unset", when empty.
     if [ "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}" = "openai_compatible" ]; then

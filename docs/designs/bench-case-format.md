@@ -102,11 +102,10 @@ say) names one role per slot it reads and grounds the objective that needs every
 `report_contains`'s `fixture_roles`, saying in a comment that the roles stand for their
 slots; the grep then still finds it when a slot's cluster is replaced.
 
-`owner` is who answers for the case when it flakes: a GitHub login written without the at
-sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
-the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to, and
-`bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
-spelled out.
+`owner` is optional: the person whose bugs the case is first, falling back to the domain's
+owner. The demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to that
+effective owner, and [`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership) states
+the rule.
 
 `expected_fail` is the eval-driven-development marker, for a case whose fix is not yours: the
 case lands red so the gap is on record, and `bench-gate` reads it inverted — failing is the
@@ -240,7 +239,10 @@ before any role on it is confirmed), and a slot the runner did not reach returns
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's
-lead), `tool_called` (calls in the
+lead), `report_times_in_window` (every date and time on a report line one of its
+`label_patterns` regexes matches falls between the run's start and the check, each widened by
+`max_clock_skew_sec`, and its minute must be one some tool output in the trajectory shows,
+the workers' included; a report that states none passes), `tool_called` (calls in the
 trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
 published), `pull_request_opened` (the remediation pull request the run opened,
 resolved through GitHub and required to be this run's rather than an earlier
@@ -294,7 +296,10 @@ agent pod's `cron/executions.db` instead and passes when the delivery job's run 
 the report completed, which is the condition for the scheduler to post what it printed.
 `sandbox_tree_matches_image` execs into the agent's shell sandbox Pod and diffs the image's
 staged skills, scripts and governance against the copies the sandbox runs, so a case can
-grade an edit to them by its effect. `findings_item_state` reads the findings queue through the
+grade an edit to them by its effect. A stack that runs Python in the sandbox does it as
+root (`kubectl exec`), so the image sets `PYTHONDONTWRITEBYTECODE=1` and such a run leaves
+no `__pycache__` in the reference tree for this check to read as an edit. The check
+still flags a cache file that appears anyway, since a `.pyc` is code. `findings_item_state` reads the findings queue through the
 Session KV server in the agent pod and passes when every row in `finding_ids`, under `project`,
 is in `state`. A listed row the queue does not hold is `status: "error"`, since it means the
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
@@ -445,7 +450,10 @@ the suite reports green around it — which is how `agent-kanban-smoke`, a case 
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
 
-A new case lands in the nightly file (decided 2026-09-15,
+A new case lands in the nightly file's sorted section, the last one, at its place in
+case-id order with its reason as the `#` lines directly above its entry (#3495; the roster
+test checks both, so two case pull requests don't edit the same lines). It lands there by
+decision (2026-09-15,
 [#1546](https://github.com/gke-labs/kube-agents/issues/1546),
 [#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
 the night it merges, its record accrues in the evidence store, and a presubmit seat is a
@@ -485,8 +493,8 @@ statement of the rule; `bench/CUSTOM-TASKS.md`, `bench/CONTRIBUTING.md` and
 id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define (outside a `FIXTURE_NOT_READY` case, which names the role its issue plants), a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
-a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, an `expected_fail:` or `tool_calls_optional:`
+a check that carries no assertion and so can only pass, an `owner:` that is `maintainers`,
+written as a mention or not a login, an `expected_fail:` or `tool_calls_optional:`
 that is not a bare YAML boolean, an `audit_streams:` that is not a non-empty list or names a job the Platform Agent
 does not have, a case that is registered nowhere, and a file that writes one key twice in
 the same mapping, which PyYAML would load with the last value and devops-bench's loader
@@ -495,8 +503,8 @@ also applies the entry vocabulary above — role, the severity pairing, the reje
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
 
-It also scans what the case brings with it: every text file under `bench/tasks/` and
-`bench/tf/prebuilt/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
+It also scans what the case brings with it: every text file under `bench/tasks/`,
+`bench/tf/prebuilt/` and `bench/tf/modules/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
 string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 `sanitizer: allow <reason>` as the per-line escape. `bench/CONTRIBUTING.md` is the home of
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that

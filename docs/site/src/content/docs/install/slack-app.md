@@ -5,12 +5,12 @@ description: Create the Slack app, its tokens and its allowlist for a kube-agent
 
 kube-agents talks to Slack through one Slack app that you create in your workspace. The app connects over Socket Mode (an outbound websocket), so nothing on the cluster needs an inbound endpoint. Which process holds the connection depends on the install's `spec.mode`:
 
-- **`today`** (the default): the credential broker (the `platform-agent-credential-proxy` Deployment) holds the connection and relays each event to the Planning Agent's Hermes Slack listener in the `platform-agent-gateway` Deployment.
-- **`next`**: the A2A gateway, in the `platform-agent-a2a-gateway` Deployment. This needs release **0.9.0 or later**: earlier operators keep Slack on the `today` path even under `next`. If Google Chat is also enabled, Google Chat holds the A2A gateway and Slack stays on the `today` path.
+- **`today`**: the credential broker (the `platform-agent-credential-proxy` Deployment) holds the connection and relays each event to the Planning Agent's Hermes Slack listener in the `platform-agent-gateway` Deployment.
+- **`next`** (a first install's default): the A2A gateway, in the `platform-agent-a2a-gateway` Deployment. This needs release **0.9.0 or later**: earlier operators keep Slack on the `today` path even under `next`. If Google Chat is also enabled, Google Chat holds the A2A gateway and Slack stays on the `today` path.
 
 The two need different app settings, so follow the section for your mode. The tokens and the allowlist work the same way in both.
 
-To install with the `next` path, pass `--mode=next` to the installer (`./install.sh --mode=next`, with the Slack flags below). `next` is an unsupported development stack; `today` is the default. The `--mode` flag is in releases after 0.9.0 and on `main`. On 0.9.0 itself, patch the resource instead: `kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p '{"spec":{"mode":"next"}}'`; that patched mode survives later upgrades, because a release that renders no mode sends Helm no change; to have the installer record it, set `PLATFORM_AGENT_MODE=next` in `install.env`. The installer records the mode in `install.env` as `PLATFORM_AGENT_MODE`; to switch a running install later, edit that key and re-run the installer ([Switching `spec.mode`](/kube-agents/install/upgrade/#switching-specmode)).
+A first install runs `next` unless you pass `--mode=today` (`./install.sh --mode=today`, with the Slack flags below) or mirror the third-party images ([quickstart](/kube-agents/install/quickstart-gke/#common-flags-and-toggles)); a cluster that already runs kube-agents keeps the mode it runs unless `--mode` or `install.env` names another. An install whose Slack bot token is a list for several workspaces must stay on `today`. The `--mode` flag is in releases after 0.9.0 and on `main`. On 0.9.0 itself, patch the resource instead: `kubectl patch platformagent platform-agent -n kubeagents-system --type merge -p '{"spec":{"mode":"next"}}'`; that patched mode survives later upgrades, because a release that renders no mode sends Helm no change; to have the installer record it, set `PLATFORM_AGENT_MODE=next` in `install.env`. The installer records the mode in `install.env` as `PLATFORM_AGENT_MODE`; to switch a running install later, edit that key and re-run the installer ([Switching `spec.mode`](/kube-agents/install/upgrade/#switching-specmode)).
 
 ## Before you start
 
@@ -122,7 +122,7 @@ The allowlist decides who may talk to the agent. It takes **Slack member IDs**, 
 
 What a member who is not on the list sees:
 
-- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. Members of other workspaces get no reply.
+- **`next`:** the gateway answers once per member with a notice that it cannot verify them, naming their member ID, so an admin can add them. A member of another workspace in a Slack Connect channel is not served, even with an empty list. The first time they mention the bot, send it a direct message, or click one of its buttons, the bot replies once, in that thread, that it answers only its own workspace, and names their member ID. The reply is a public post in the thread, so in a Slack Connect channel members of both organizations can read it.
 - **`today`:** the message is ignored, with no reply.
 
 The pairing step in `INSTALL.md` applies only if you set the Hermes Slack DM policy to `pairing` yourself. A kube-agents install configures the allowlist instead, and the A2A gateway has no pairing.
@@ -158,5 +158,5 @@ The gateway reads the map when it starts, so restart it after every change. The 
    | none at all for your message                                                                           | A missing history scope or event subscription, or the messages tab is off | Compare the app with the manifest above, then reinstall it |
    | `dropping message from unverified sender`                                                              | Your member ID is not on the allowlist                                    | Add the member ID, not an email                            |
    | `slack allowlist is empty and allow-all is off; every inbound message will be dropped at verification` | The list has only blank entries                                           | Set real member IDs, or remove the list to admit everyone  |
-   | `slack: ignoring a message from another workspace's member`                                            | The sender is in another workspace                                        | Use the workspace the app is installed in                  |
+   | `slack: ignoring a message from another workspace's member`                                            | The sender (`user`) is in another workspace (`userTeam` or `messageTeam`) | Use the workspace the app is installed in                  |
    | `chat backend stopped; restarting it, the console stays up`                                            | The tokens were refused, for example a comma-separated bot token          | Pass one `xoxb-` bot token and one `xapp-` app token       |

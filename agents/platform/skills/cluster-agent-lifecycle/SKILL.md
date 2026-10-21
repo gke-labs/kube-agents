@@ -1,6 +1,6 @@
 ---
 name: cluster-agent-lifecycle
-description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded, deleted or taken out of management, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent.
+description: Create, delegate to, and tear down per-cluster Cluster Agent Hermes profiles. Use whenever a GKE cluster is onboarded, deleted or taken out of management, or whenever a single-cluster runtime debugging/operations task should be delegated to that cluster's Cluster Agent. Not for a request to delete or change a resource on a cluster (a namespace, a workload; not the cluster itself): that is submit-suggestion's "Deleting a resource" or its pull request path; this skill manages Cluster Agent profiles only.
 ---
 
 # Cluster Agent Lifecycle Skill

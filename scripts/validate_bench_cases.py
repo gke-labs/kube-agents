@@ -6,8 +6,8 @@ run the agent, score, read the log. Most of the mistakes are static. A domain
 slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
 nothing; a fixture role the seeded fleet does not define is a case addressing
 a defect that was never planted; a check with no assertion is a check that
-cannot fail; a case no roster file under `hack/eval/` names never runs; a case with no
-`owner:` has nobody to answer when it flakes; a fixture carrying a real
+cannot fail; a case no roster file under `hack/eval/` names never runs; an
+`owner: maintainers` sends a case's bugs to nobody; a fixture carrying a real
 address or a credential is a leak the moment it merges. None of those needs a
 cluster to find.
 
@@ -47,6 +47,7 @@ import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+import case_owner  # noqa: E402
 import eval_rosters  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -77,24 +78,22 @@ FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # to name a role differently, which fixture_catalog_disagreements() enforces.
 ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
 
-# The `owner:` field, from bench/CONTRIBUTING.md. A GitHub login, bare, or
-# this literal for a case the OWNERS approvers answer for. Bare because the
-# field is a name to look up, not a mention: a task.yaml is quoted into
-# issues and pull-request comments, where a leading at sign pages someone.
-OWNER_MAINTAINERS = "maintainers"
-# GitHub's own login rule: alphanumerics and single interior hyphens, at most
-# 39 characters, so a stray e-mail address or a display name is rejected
-# before a reviewer has to spot it.
-GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+# The optional `owner:` field, from bench/CONTRIBUTING.md: a GitHub login,
+# written bare because the field is a name to look up, not a mention -- a
+# task.yaml is quoted into issues and pull-request comments, where a leading
+# at sign pages someone. Absent, the case's bugs go to its domain's owner
+# (scripts/case_owner.py, which owns the login rule).
+GITHUB_LOGIN = case_owner.GITHUB_LOGIN
 
 # The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
-# contributed case brings with it lives in one of these two trees -- the case
-# directory, and the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
-# put under bench/tf/prebuilt/<stack>/. Nothing else under bench/tf/ is
-# scanned: the shared modules and the seeded fleet are in-house and carry
-# in-house addresses on purpose.
+# contributed case brings with it lives in one of these trees -- the case
+# directory, the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
+# put under bench/tf/prebuilt/<stack>/, and shared modules under
+# bench/tf/modules/. Nothing else under bench/tf/ is scanned: the seeded
+# fleet is in-house and carries in-house addresses on purpose.
 PREBUILT_DIR = REPO_ROOT / "bench" / "tf" / "prebuilt"
-SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR)
+MODULES_DIR = REPO_ROOT / "bench" / "tf" / "modules"
+SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR, MODULES_DIR)
 # Local artefacts of running a stack, never committed and full of real
 # addresses by construction. A path component beginning with a dot
 # (.terraform/, .terraform.lock.hcl) is skipped for the same reason.
@@ -155,6 +154,13 @@ CREDENTIAL_SHAPES: dict[str, str] = {
 # review. Delete an entry once its case is registered -- staleness is only
 # enforced for cases that no longer exist, because an in-flight branch
 # registering a case must not red main the day it merges.
+# Why the twelve upgrade-failure scenario cases below wait, in one sentence
+# their KNOWN_UNREGISTERED reasons share.
+SCENARIO_BATCH_WAIT = (
+    "enters hack/eval/nightly-cases.txt in a later batch of five as the main "
+    "part's nights allow, the next after the first batch's nights are measured"
+)
+
 KNOWN_UNREGISTERED = {
     # The two CUJ 1 cases (#2889), held out for the same infra-lock budget
     # as the stack cases below: a `stack:` case runs alone on lock-infra
@@ -213,6 +219,59 @@ KNOWN_UNREGISTERED = {
         "needs the GHES proxy and a GHES-forge install, which no eval lane has; "
         "run by hand with the recipe in the case header"
     ),
+    # The upgrade-failure catalogue's scenario cases enter
+    # hack/eval/nightly-cases.txt in batches of five (decided 2026-10-15 on
+    # the registration's review). The nightly's main part ran 370-401 minutes
+    # on its clear nights of 10-15 October against the 480m deadline, the
+    # seventeen measure 770-1,145 serial minutes a night, and the cost-ordered
+    # queue would charge a deadline kill to the existing cases' last
+    # repetition; each entry below carries its measured cost, and
+    # hack/ci-eval-pr.sh's unit_cost_hint prices the seventeen from the same
+    # record. The first batch, entries 1, 3, 5, 12 and 20, is in the roster's
+    # sorted section. These twelve have a fixture the fleet plants and a
+    # task file, and wait for a later batch: the next after the first batch's
+    # first measured week of nights, in the order of measured cost, the five
+    # with no clean pass last. An entry goes when its batch's pull request
+    # moves the case to the roster's sorted section.
+    "upgrades-no-surge-pool-recreate-warned": (
+        f"catalogue entry 2: {SCENARIO_BATCH_WAIT}; median 1065s on three clean "
+        "passes, the record's heaviest run at 3163s"
+    ),
+    "upgrades-node-local-state-named": (
+        f"catalogue entry 4: {SCENARIO_BATCH_WAIT}; median 1226s on two clean passes"
+    ),
+    "upgrades-removed-api-callers-distinguished": (
+        f"catalogue entry 6: {SCENARIO_BATCH_WAIT}; no clean pass on record, an "
+        "agent gap on its complete runs"
+    ),
+    "upgrades-pod-security-latest-pinned-named": (
+        f"catalogue entry 8: {SCENARIO_BATCH_WAIT}; one clean pass, 750s"
+    ),
+    "upgrades-stale-client-skew-named": (
+        f"catalogue entry 10: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-containerd-socket-agent-named": (
+        f"catalogue entry 13: {SCENARIO_BATCH_WAIT}; one clean pass, 540s"
+    ),
+    "upgrades-cgroup-blind-runtime-named": (
+        f"catalogue entry 14: {SCENARIO_BATCH_WAIT}; one clean pass, 360s"
+    ),
+    "upgrades-multi-process-oom-group-named": (
+        f"catalogue entry 15: {SCENARIO_BATCH_WAIT}; no clean pass on record, an "
+        "agent gap on its complete run"
+    ),
+    "upgrades-network-policy-enforcement-stated": (
+        f"catalogue entry 16: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-node-image-coupled-agent-named": (
+        f"catalogue entry 17: {SCENARIO_BATCH_WAIT}; one clean pass, 2180s wall"
+    ),
+    "upgrades-cuda-pinned-gpu-job-named": (
+        f"catalogue entry 18: {SCENARIO_BATCH_WAIT}; no clean pass on record"
+    ),
+    "upgrades-intree-volume-named": (
+        f"catalogue entry 19: {SCENARIO_BATCH_WAIT}; median 1167s on two clean passes"
+    ),
 }
 
 # Cases whose fixture does not exist at all, waiting on the issue that plants
@@ -228,6 +287,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    "monitoring-alert-policy-read": (
+        "#3632: its stack plants a Cloud Monitoring alert policy, and the pool "
+        "runners hold no role that creates one (roles/monitoring.alertPolicyEditor "
+        "is not among their grants), so every apply would fail with 403; seen red "
+        "on main and green three times on a dev install for #3467"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
@@ -316,6 +381,14 @@ FIXTURE_NOT_READY = {
         "each pool project's *-infra repository, so 3.3's fix is a manifest "
         "rather than manual"
     ),
+    "obtainability-pdb-kustomize-overlay": (
+        "#2686: needs checkout-gateway declared in a Kustomize root under "
+        "clusters/seeded-a/seeded-reliability/ in each pool project's *-infra "
+        "repository (the two files are in the case's header), so a new "
+        "PodDisruptionBudget there renders only if the kustomization lists it; "
+        "the fixture cannot share a repository with "
+        "obtainability-major-pdb-auto-pr's (#2228)"
+    ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
         "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "
@@ -369,6 +442,8 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "forbidden_patterns",
         "required_patterns",
     ),
+    # The lines whose times are observation times; with none it can only pass.
+    "report_times_in_window": ("label_patterns",),
     # The parsed manifest's fields and selector are the assertion; `kind` alone
     # only names what to look for.
     "report_manifest": ("fields", "selects", "excludes"),
@@ -555,7 +630,20 @@ def platform_job_ids() -> set[str]:
 def known_domains() -> set[str]:
     """Slugs defined in docs/designs/domains.yaml."""
     data = _load_yaml(DOMAINS_FILE) or {}
-    return {d["slug"] for d in data.get("domains") or []}
+    rows = data.get("domains") or []
+    # The filer resolves a case with no owner through case_owner's line scan
+    # of this file, so a row the scan reads differently (slug not first, a
+    # quoted slug, a nested owner:) would route to someone else, or nobody.
+    parsed = {d.get("slug"): d.get("owner") for d in rows if isinstance(d, dict)}
+    scanned = case_owner.parse_domain_owners(DOMAINS_FILE.read_text(encoding="utf-8"))
+    differ = sorted(str(slug) for slug in parsed.keys() | scanned.keys() if parsed.get(slug) != scanned.get(slug))
+    if differ:
+        raise CaseError(
+            f"{DOMAINS_FILE}: scripts/case_owner.py reads the owner of domain(s) "
+            f"{', '.join(differ)} differently from YAML. Start each row with "
+            "'- slug: <slug>' unquoted and give it one plain 'owner: <login>'"
+        )
+    return {d["slug"] for d in rows}
 
 
 # `{cluster:<slot>}` in a report_contains pattern, as bench/kube_agents_bench/
@@ -922,30 +1010,56 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "not define"
         )
 
-    # The owner. Demotion (docs/eval-gate-roster.md) files an issue against a
-    # flaking case, and this field is who that issue goes to. devops-bench
-    # discards the key, so like `domain` it is enforced here or nowhere.
+    # The owner, optional. A case's bugs go to it first, and to the domain's
+    # owner in docs/designs/domains.yaml when it is absent (scripts/case_owner.py).
+    # Offline: whether GitHub accepts the login as an assignee is checked when
+    # a bug is filed, not here. devops-bench discards the key, so like `domain`
+    # it is enforced here or nowhere. A bare `owner:` counts as absent.
+    owner_problems = len(problems)
     owner = spec.get("owner")
-    if owner is None:
-        problems.append(
-            "declares no 'owner:'. Name the GitHub login (without the at sign) "
-            f"that answers when this case flakes, or {OWNER_MAINTAINERS!r} for "
-            "a case the OWNERS approvers own -- see bench/CONTRIBUTING.md"
-        )
-    elif not isinstance(owner, str) or not owner:
-        problems.append(f"'owner:' {owner!r} is not a GitHub login string")
-    elif owner.startswith("@"):
-        problems.append(
-            f"owner {owner!r} carries a leading at sign; write the login bare, "
-            "so a task.yaml quoted into an issue names someone rather than "
-            "paging them"
-        )
-    elif owner != OWNER_MAINTAINERS and not GITHUB_LOGIN.fullmatch(owner):
-        problems.append(
-            f"owner {owner!r} is neither a GitHub login (letters, digits and "
-            "single hyphens, at most 39 characters) nor the literal "
-            f"{OWNER_MAINTAINERS!r}"
-        )
+    if owner is not None:
+        if not isinstance(owner, str) or not owner:
+            problems.append(f"'owner:' {owner!r} is not a GitHub login string")
+        elif owner.startswith("@"):
+            problems.append(
+                f"owner {owner!r} carries a leading at sign; write the login bare, "
+                "so a task.yaml quoted into an issue names someone rather than "
+                "paging them"
+            )
+        elif case_owner.is_retired_owner(owner):
+            problems.append(
+                f"'owner: {owner}' is no longer allowed: it names nobody. Delete "
+                "the line and the case's bugs go to its domain's owner in "
+                "docs/designs/domains.yaml, or name the person whose bugs this "
+                "case is -- see bench/CONTRIBUTING.md"
+            )
+        elif not GITHUB_LOGIN.fullmatch(owner):
+            problems.append(
+                f"owner {owner!r} is not a GitHub login (letters, digits and "
+                "single hyphens, at most 39 characters)"
+            )
+
+    # The filer routes a red with case_owner's line scan, not this YAML read.
+    # Where the two read `owner:` or `domain:` differently (`owner: null`, a
+    # block scalar, an anchor, a quoted key), the lint would show one person
+    # and the bug would go to another, so the case is rejected here.
+    if len(problems) == owner_problems:
+        text = path.read_text(encoding="utf-8")
+        for key in ("owner", "domain"):
+            parsed = spec.get(key)
+            if parsed is not None and not isinstance(parsed, str):
+                continue  # already reported above as not a string
+            scanned = case_owner.task_field(text, key)
+            if scanned != parsed:
+                problems.append(
+                    f"'{key}:' reads as {parsed!r} to YAML but as {scanned!r} to "
+                    "scripts/case_owner.py, which routes the case's bugs from the "
+                    f"first line that starts '{key}:' at column 0. Make that line a "
+                    f"plain '{key}: value' (no null, block scalar, anchor or quoted "
+                    "key), and check for such a line inside another field's text or "
+                    "an invisible character such as a byte-order mark before it"
+                    + (", or delete an empty 'owner:' line" if key == "owner" else "")
+                )
 
     # The audit streams a case drives without grading their ledger. The runner
     # holds each one's lock for the unit (hack/ci-eval-pr.sh, task_streams); an

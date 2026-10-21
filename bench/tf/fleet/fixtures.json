@@ -695,7 +695,7 @@
     "moving-admission-default": {
       "cluster_slot": "a",
       "namespace": "seeded-defaults",
-      "probes": ["deployment/baseline-edge-worker"],
+      "probes": ["namespace/seeded-defaults", "deployment/baseline-edge-worker"],
       "fixture": "seeded-defaults namespace with Pod Security Admission pinned to enforce baseline at version latest, so the rule set applied to its workloads changes at every minor without anyone editing it; baseline-edge-worker (one replica) is admitted by today's baseline",
       "state": [
         {

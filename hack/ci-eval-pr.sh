@@ -93,6 +93,17 @@ readonly EVAL_NOT_RUN_DIR="not-run"
 readonly EVAL_TIMING_FILE="timing.json"
 # The record's status: what the harness writes for a run that did not succeed.
 readonly EVAL_NOT_RUN_STATUS="failed"
+# Where each unit writes a repetition's log (run_one_unit) and grading reads it
+# back (analyze_eval_phases). CI keeps /tmp. A run that shares the machine with
+# other runs sets a private directory: the tests point it at a mktemp -d. It is
+# made absolute and created here: the write runs in a subshell that cds into
+# BENCH_DIR, so a relative value would write in one place and read in another.
+# CDPATH is cleared for that cd: it would send a relative name to another
+# directory and print the path, which the substitution would capture.
+EVAL_LOG_DIR="${EVAL_LOG_DIR:-/tmp}"
+mkdir -p "${EVAL_LOG_DIR}"
+EVAL_LOG_DIR="$(CDPATH='' cd -- "${EVAL_LOG_DIR}" && pwd)"
+readonly EVAL_LOG_DIR
 
 # EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
 # `spec.mode: next` under, in the same job environment. Under it the matrix
@@ -101,13 +112,16 @@ readonly EVAL_NOT_RUN_STATUS="failed"
 # from the Secret the operator renders beside the door -- <agent>-a2a-inject,
 # key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
 # already waited for it). Unset, the matrix runs over the agent API exactly
-# as before. Four places read the flag: section 4 below; the baseline
+# as before. The merge-blocking presubmit runs under it: next is the mode a
+# new install gets. Five places read the flag: the today lane's step in
+# section 3 (run_rollback_lane, which refuses EVAL_ROLLBACK_LANE=1 without
+# it); section 4 below, whose door it skips on that lane; the baseline
 # recorder (its decision, EVAL_IS_MAIN_RUN, and the log line at the record
 # step after the fan-out); the dashboard publisher's gate, which mirrors
 # the recorder's; and the rollback round trip after the suite verdict
 # (run_rollback_roundtrip, below). A flagged run passes neither the recorder
-# nor the publisher: the next lane's periodic on
-# main runs under it with no PULL_NUMBER, the shape both otherwise write
+# nor the publisher: the next-mode nightly and the today lane's periodic on
+# main run under it with no PULL_NUMBER, the shape both otherwise write
 # from, and a next-mode sample in today's window would be indistinguishable
 # once written (VersionKey in bench/kube_agents_bench/baselines.py carries
 # no mode field), as would a dashboard that has no next lane to file it under.
@@ -121,8 +135,11 @@ readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
 # sits clear of the API range (28642 + seq) for any matrix this job runs.
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
 
-# The rollback round trip under EVAL_MODE_NEXT=1 (run_rollback_roundtrip, after
-# the suite verdict is computed): hack/rollback-roundtrip.sh flips the install
+# The rollback round trip under EVAL_MODE_NEXT=1 on main (run_rollback_roundtrip,
+# after the suite verdict is computed; a pull request's run and a
+# release-candidate run skip it, for the reasons the function gives, and the
+# today lane runs it before its matrix instead, run_rollback_lane):
+# hack/rollback-roundtrip.sh flips the install
 # next -> today -> next and checks the JetStream PVC and the bus creds Secret
 # come through it (cutover condition 6, #2461). Reported beside the verdict,
 # never in it: its own log section and artifacts, no case, no effect on the
@@ -142,6 +159,17 @@ readonly EVAL_ROLLBACK_TIMEOUT_SECONDS=3600
 readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
 readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
 readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
+# The round trip after the suite verdict is for a next-mode run on main: a
+# pull request's next-mode run (the merge-blocking presubmit's, or a Tide
+# batch's) skips it, since nobody reads a report-only result there and the
+# today lane below proves the same path every six hours on main, and on
+# demand on a pull request.
+readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
+# The today lane, EVAL_ROLLBACK_LANE=1 beside EVAL_MODE_NEXT=1
+# (run_rollback_lane, in section 3): the deploy brings the install up under
+# next, the round trip runs before the matrix and ends with the install at
+# this mode, and the matrix then grades today over the agent API.
+readonly EVAL_ROLLBACK_LANE_END_MODE="today"
 
 # release_inflight_note (beside the ledger reset, section 5): the sandbox
 # pod's shell container, the scratch directory audit_report.py writes its
@@ -219,7 +247,7 @@ readonly STATE_LOCK_RETRY_SECONDS=30
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
 # evaluation project (kube-agents-presubmits.yaml in oss-test-infra). Run
 # here too, first, so a job definition that has not yet hoisted it still
-# saves the eval matrix, and so the next-mode lane that runs this script
+# saves the eval matrix, and so the today lane's presubmit that runs this script
 # under its own JOB_NAME is covered the same way. The script's header owns
 # the rules: a green at this head, whatever main has done since (#1202),
 # or at an earlier head when everything since is inert (#1179), is reused;
@@ -457,7 +485,7 @@ EVAL_FORGE_HELPER_ARGS=()
 # reach; that split is what makes the boundary structural, exactly as
 # docs/designs/eval-scorer.md#the-two-service-accounts argues for the
 # baseline store. The recorder's fourth condition, EVAL_MODE_NEXT unset,
-# is mirrored too: the next lane's periodic reports nothing to a dashboard
+# is mirrored too: a flagged periodic reports nothing to a dashboard
 # that has no lane for it yet.
 #
 # Nothing publishes until BOTH prerequisites exist:
@@ -878,6 +906,58 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 start_agent_pod_watch
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
+
+# ─── The today lane: roll the next install back before grading ──────────────
+# EVAL_ROLLBACK_LANE=1, set beside EVAL_MODE_NEXT=1 on the today lane's jobs
+# (ci-kube-agents-eval-today and pull-kube-agents-smoke-test-today in
+# oss-test-infra). With next the mode new installs get and the merge-blocking
+# presubmit grading it, today is what a rollback lands on, and this lane proves
+# that path: the deploy brings the install up under next exactly as for the
+# next lane, this step runs hack/rollback-roundtrip.sh with ROLLBACK_END_MODE
+# set to EVAL_ROLLBACK_LANE_END_MODE (next -> today -> next -> today: the
+# rollback, the flip forward on the kept PVC and creds Secret, and the
+# rollback again), and the matrix then runs over the agent API on the
+# rolled-back install (section 4 leaves the transport alone on this lane).
+#
+# Unlike the report-only round trip after a next-mode matrix, a failure here
+# stops the job: a rollback that does not land leaves nothing for today's
+# matrix to grade, and on this lane the failure is the finding. It runs here,
+# before the ledger and repository resets and the audit pause below, so they
+# act on the pod the matrix will talk to; the pod watch above already covers
+# the pods the flips replace. Run in the background and waited on, so the
+# job's deadline TERM reaches the round trip, as in run_rollback_roundtrip.
+run_rollback_lane() {
+  if [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
+    return 0
+  fi
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    echo "ERROR: EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane rolls a next install back to today, and without the flag the deploy installed today and there is nothing to roll back." >&2
+    exit 1
+  fi
+  local artifacts="${ARTIFACTS:-/tmp/artifacts}" status=0
+  local -a bound=()
+  mkdir -p "${artifacts}"
+  profile_begin "rollback lane: next -> today -> next -> today, before the matrix"
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback lane: rolling the next install back to ${EVAL_ROLLBACK_LANE_END_MODE} before grading its matrix (EVAL_ROLLBACK_LANE=1) ==="
+  if command -v timeout >/dev/null 2>&1; then
+    bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
+  fi
+  ROLLBACK_END_MODE="${EVAL_ROLLBACK_LANE_END_MODE}" ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" \
+    ROLLBACK_RESULTS_FILE="${artifacts}/${EVAL_ROLLBACK_RESULTS}" \
+    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
+    > >(tee "${artifacts}/${EVAL_ROLLBACK_LOG}") 2>&1 &
+  EVAL_ROLLBACK_PID=$!
+  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; exit 143' TERM INT
+  wait "${EVAL_ROLLBACK_PID}" || status=$?
+  trap 'exit 143' TERM INT
+  if [ "${status}" -ne 0 ]; then
+    echo "ERROR: the rollback lane's round trip failed (exit ${status}): the next install did not roll back to ${EVAL_ROLLBACK_LANE_END_MODE} cleanly, so its matrix is not run. The last FAIL line above names the check, or says the run was stopped at its ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound (transcript: ${artifacts}/${EVAL_ROLLBACK_LOG})." >&2
+    exit 1
+  fi
+  echo "✓ Rolled back to ${EVAL_ROLLBACK_LANE_END_MODE}; the matrix runs over the agent API on this install"
+}
+run_rollback_lane
+
 # The harness's default delegation wait (1800s) sits INSIDE the compliance
 # canary's observed completion spread: on 2026-08-27 (build
 # 2093054394793725952, kube-agents-evals-2) the audit worker finished and
@@ -1832,8 +1912,11 @@ export PLATFORM_AGENT_TOKEN
 # agent token above is still fetched: the transport switch changes how a
 # prompt reaches the agent, not what else the run reads from the install.
 # Everything about the door the harness needs beyond these two it derives
-# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
-if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above. The today lane
+# (EVAL_ROLLBACK_LANE=1) carries the flag for its deploy, but run_rollback_lane
+# has rolled the install back by now and the door is gone with the bus, so its
+# matrix stays on the agent API.
+if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
   EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
   if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
     echo "ERROR: EVAL_MODE_NEXT=1 but the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
@@ -1972,10 +2055,11 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # case (decided 2026-09-15 on #1546/#1564): it lands there, builds its record
 # in the evidence store (EVAL_BASELINE_STORE below), and earns a presubmit
 # seat on that record; measured cost, presubmit redundancy or grading
-# something outside the core journeys keep a case there for good. The file's
-# header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=8 (6 from #1491 until oss-test-infra#2707, merged
-# 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# something outside the core journeys keep a case there for good. The budget
+# arithmetic its header used to carry (against the periodic's 480m deadline
+# at EVAL_TASK_PARALLELISM=8) is frozen in hack/eval/nightly-budget-history.txt
+# (#3495); a run's matrix is the "Eval matrix: ..." line below, and
+# `python3 scripts/eval_rosters.py --summary` counts the files. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # where a held-out case lives, with its hold-out reason, unless a coverage
 # tracker seats it in the presubmit file held out (#2013; #2016's seat took
@@ -2424,10 +2508,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # and the 16.4min fixed term extrapolate honestly, which is what the four
 # estimates before them did not.
 #
-# Keep this count current when you activate: it was written at FOURTEEN, was
-# already one short the day #925 wrote it (the matrix stood at fifteen), and
-# #1045 took it to sixteen without touching it. Recount the entries in
-# hack/eval/presubmit-cases.txt rather than incrementing what is here.
+# The counts above are as of the day each paragraph was written, and they
+# drifted (one was written at FOURTEEN when the matrix stood at fifteen).
+# Don't hand-maintain one here: each run logs its matrix as "Eval matrix: ..."
+# and `python3 scripts/eval_rosters.py --summary` counts the files (#3495).
 #
 # The budget has been raised three times to get here, all merged: oss-test-infra
 # #2667 took it 85m -> 150m off an estimate, #2669 took it 150m -> 240m off a
@@ -2556,6 +2640,12 @@ if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "Zero repetitions would run nothing and report green -- refusing." >&2
   exit 1
 fi
+# The matrix's size, computed (#3495). The roster files don't carry totals any
+# more, so this line is where a run's count is read; for the files themselves,
+# `python3 scripts/eval_rosters.py --summary`.
+# awk reads every value the check above accepts (08, +3, " 3") as the number
+# seq does, so a log line can never stop the job.
+echo "Eval matrix: ${#TASKS[@]} case(s) x ${EVAL_REPETITIONS} repetition(s) = $(awk -v n="${#TASKS[@]}" -v r="${EVAL_REPETITIONS}" 'BEGIN { print n * r }') unit(s)"
 
 # How far a judged mean may fall below main's before rung 6 fires. 0.5 is
 # arithmetic on the measured spread, not a preference: three repetitions of one
@@ -2634,9 +2724,9 @@ esac
 # eval-crew alias (#1546).
 #
 # Demoting a flaky case is a same-day edit: delete its name from that file
-# and its line from presubmit-cases.txt, add the line to nightly-cases.txt
-# with the issue that names its re-admission condition as the # line above
-# it, and cite what the record says about it.
+# and its line from presubmit-cases.txt, add the line to nightly-cases.txt's
+# sorted section (#3495) with the issue that names its re-admission
+# condition as the # line above it, and cite what the record says about it.
 #
 # A name that is not a presubmit case stops the job here: a misspelled entry
 # would otherwise arm nothing and look like a working roster, and a nightly
@@ -2692,9 +2782,9 @@ done <<< "${BLOCKING_ROSTER_ENTRIES}"
 # names every roster case would leave the export empty on the inject lane
 # with rung 4 disarmed for whatever the matrix still holds (the nightly tier
 # keeps its own cases past the every-case-excluded stop) and no banner,
-# because no name is misspelled. Stop instead: the exclusion file needs only
-# the normal approvers, and it must not be able to do what the roster file
-# is guarded against. An explicit BOOTSTRAP_ADMITTED in the job's
+# because no name is misspelled. Stop instead: an exclusion entry is not a
+# demotion, and it must not be able to do what the roster file is guarded
+# against. An explicit BOOTSTRAP_ADMITTED in the job's
 # environment, empty included, is the stated way to mean it, and wins below.
 # Read before the nightly part's drop, which empties the export by design
 # when the part holds no roster case, and is not the lane's doing.
@@ -2826,9 +2916,13 @@ unit_cost_hint() {
     # then waits out the human record's card, then an agent turn that is a
     # board read. Priced at the band rather than at the 566-677s its
     # dev-install repetitions measured, because those met a quiet board and the
-    # nightly's is shared. hack/eval/nightly-cases.txt's 2026-10-13 paragraph
-    # carries the measurements and the budget arithmetic.
+    # nightly's is shared. The 2026-10-13 paragraph of
+    # hack/eval/nightly-budget-history.txt carries the measurements and the
+    # budget arithmetic.
     gitops-drift-noise-filtered-triage) echo 900 ;;
+    # The same shape again, plus a detector stop and relaunch before the live
+    # card wait. Unmeasured; priced with its siblings.
+    gitops-drift-backlog-digest) echo 900 ;;
     # Tofu too, and the same shape, plus a plant that waits out
     # stall_report.py's ten-minute Deployment threshold before it posts the
     # record and then waits for the card. 1040-1080s a repetition on a dev
@@ -2956,6 +3050,53 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
+    # The upgrade-failure catalogue's scenario cases: read-only chat prompts
+    # over the seeded clusters (entries 1 and 2 one Cluster Agent card per
+    # cluster; entries 6 and 16 one declared line per cluster; entry 5 one
+    # maintenance-policy read per cluster; entry 3 and the eleven on the
+    # seeded-a shapes a read of every cluster for one planted object the
+    # prompt does not place). Five are in the nightly from 2026-10-15, the
+    # first batch; the other twelve wait in scripts/validate_bench_cases.py's
+    # KNOWN_UNREGISTERED for their batch. Each measured case is priced at the
+    # median wall clock of its clean passes on a dev install with one user
+    # worker slot
+    # (57 runs, 2026-10-07 to 10-15, re-graded at the head's task files),
+    # rounded up to the next 100s, the way compliance-rbac-overgrant,
+    # capacity-pinned-pool-probe and cluster-agent-delegation-profile-lookup
+    # above are priced at their medians. The clean-pass walls per entry:
+    # entry 1: 514, 782 and 1081s.
+    upgrades-drain-blocking-budget-named) echo 800 ;;
+    # entry 2: 924, 1065 and 3163s, with two more runs lost at the 2400s
+    # delegation ceiling.
+    upgrades-no-surge-pool-recreate-warned) echo 1100 ;;
+    # entry 3: 454, 541, 672 and 983s.
+    upgrades-zonal-skew-replicas-warned) echo 700 ;;
+    # entry 5: 237, 240, 316, 441 and 571s.
+    upgrades-exclusion-end-date-named) echo 400 ;;
+    # entry 4: 1171 and 1280s.
+    upgrades-node-local-state-named) echo 1300 ;;
+    # entry 8: one pass, 750s.
+    upgrades-pod-security-latest-pinned-named) echo 800 ;;
+    # entry 12: 510 and 1161s.
+    upgrades-deprecated-node-label-selector-named) echo 900 ;;
+    # entry 13: one pass, 540s.
+    upgrades-containerd-socket-agent-named) echo 600 ;;
+    # entry 14: one pass, 360s.
+    upgrades-cgroup-blind-runtime-named) echo 400 ;;
+    # entry 17: one pass, 2180s: the agent answered at 264s and the harness
+    # was still waiting on the delegated cards when the sequence stopped it.
+    upgrades-node-image-coupled-agent-named) echo 2200 ;;
+    # entry 19: 1042 and 1291s.
+    upgrades-intree-volume-named) echo 1200 ;;
+    # entry 20: 390 and 1762s.
+    upgrades-retired-registry-image-named) echo 1100 ;;
+    # Entries 6, 10, 15, 16 and 18 have no clean pass on record, so no
+    # measurement: every run was a loss (682-3943s wall, most at the 2400s
+    # delegation ceiling) or an agent gap. They keep the 900 band of their
+    # shape until a clean pass measures them.
+    upgrades-removed-api-callers-distinguished | upgrades-network-policy-enforcement-stated) echo 900 ;;
+    upgrades-stale-client-skew-named | upgrades-multi-process-oom-group-named) echo 900 ;;
+    upgrades-cuda-pinned-gpu-job-named) echo 900 ;;
     *) echo 200 ;;
   esac
 }
@@ -3225,7 +3366,7 @@ grade_case() { # <task-path> <task-name>
     end_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.end" 2>/dev/null || echo 0)"
     rep_result=""
     [ -n "${run_dir}" ] && rep_result="${run_dir}/results.json"
-    analyze_eval_phases "/tmp/eval_${name}_rep${rep}.log" "${start_ms}" "${end_ms}" "${name} rep ${rep}" "${rep_result}"
+    analyze_eval_phases "${EVAL_LOG_DIR}/eval_${name}_rep${rep}.log" "${start_ms}" "${end_ms}" "${name} rep ${rep}" "${rep_result}"
     if [ -n "${run_dir}" ]; then
       result_args+=(--result "${run_dir}")
       cp "${run_dir}/results.json" "results_${name}_rep${rep}.json" 2>/dev/null || true
@@ -3373,7 +3514,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
 
 run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq> <streams>
   local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6" streams="${7:-}"
-  local log="/tmp/eval_${name}_rep${rep}.log"
+  local log="${EVAL_LOG_DIR}/eval_${name}_rep${rep}.log"
   # A distinct local port per unit: the harness's port-forward is owned by
   # the process that spawned it and its atexit teardown would drop a shared
   # listener under every sibling mid-conversation. On its own port, each
@@ -3862,12 +4003,14 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
-# EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The next
-# lane's periodic and nightlies on main (ci-kube-agents-eval-next,
-# ci-kube-agents-eval-nightly-next-claude and
+# EVAL_MODE_NEXT=1 is the fourth, for the same reason as the third. The
+# next-mode nightlies on main (ci-kube-agents-eval-nightly-next-claude and
 # ci-kube-agents-eval-nightly-gitlab-next) are also periodics with no
 # PULL_NUMBER, and the key has no mode field either, so their samples would
-# be today's the moment they landed. The deploy admits the flag on those
+# be today's the moment they landed. The today lane's periodic
+# (ci-kube-agents-eval-today) carries the flag for its deploy and grades a
+# rolled-back install, which is not the fresh today install the window
+# measures, so it stays out on the same flag. The deploy admits the flag on those
 # jobs by name (EVAL_MODE_NEXT_JOB_NAMES in hack/ci-deploy.sh); this is what
 # keeps the admission from moving the window. Whatever the job's identity may hold
 # on the store is a grant in oss-test-infra this script cannot see, not a
@@ -4029,6 +4172,26 @@ job_started_epoch() {
 # not for a slow deploy.
 run_rollback_roundtrip() {
   if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    return 0
+  fi
+  # The today lane ran its round trip before the matrix (run_rollback_lane)
+  # and is under today now; there is no next install here to start from.
+  if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
+    return 0
+  fi
+  local skip_type
+  for skip_type in ${EVAL_ROLLBACK_SKIP_JOB_TYPES}; do
+    if [ "${skip_type}" = "${JOB_TYPE:-}" ]; then
+      echo "Rollback round trip skipped: a pull request's run (JOB_TYPE=${JOB_TYPE}); the today lane proves the rollback path on main and on demand"
+      return 0
+    fi
+  done
+  # A release-candidate run's verdict is read only once the job has finished
+  # (scripts/release/poll_rc_eval_verdict.py waits for finished.json, and
+  # gives up at 330 minutes), so an hour of report-only round trip here would
+  # be an hour off the promotion's budget for a check that cannot change it.
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    echo "Rollback round trip skipped: a release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}); its verdict waits on this job finishing, and the round trip is reported, never gated"
     return 0
   fi
   local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"

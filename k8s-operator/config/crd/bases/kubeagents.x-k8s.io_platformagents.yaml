@@ -1102,9 +1102,12 @@ spec:
                             node's labels for the pod to be scheduled
                           type: object
                         replicas:
-                          description:
-                            Replicas specifies the desired number of pod
-                            replicas. If omitted, defaults to 1.
+                          description: |-
+                            Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1.
+                            The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and
+                            the ReplicasLimited status condition says so. A multi-replica gateway does not start yet,
+                            because its leader election has no in-cluster ServiceAccount token to use and the data
+                            volumes an install creates at one replica are ReadWriteOnce.
                           format: int32
                           minimum: 0
                           type: integer
@@ -9561,6 +9564,70 @@ spec:
                         Omitting it leaves every kubectl call in the sidecar pointed at
                         localhost:8080. See buildCredentialProxyEnv.
                       type: string
+                    stallWatch:
+                      description: |-
+                        StallWatch tunes the controller stall watch — the stall-watch cron job on the
+                        Platform Agent's roster that sweeps the fleet for controllers that stopped
+                        making progress and raises an alert for each new stall. Absent keeps the
+                        watch's built-in behaviour.
+                      properties:
+                        excludeNamespaces:
+                          description: |-
+                            ExcludeNamespaces names namespaces the watch never reads, on every cluster,
+                            in addition to the system namespaces it always skips. Matched exactly. An
+                            open alert in a namespace added here is closed with a note that the
+                            namespace was excluded.
+                          items:
+                            maxLength: 63
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                          maxItems: 100
+                          type: array
+                          x-kubernetes-list-type: set
+                        kinds:
+                          description: |-
+                            Kinds replaces the watch's default list of resources to scan (Deployments,
+                            StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
+                            cert-manager Certificates). Each item is a kubectl resource name such as
+                            `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
+                            scans every namespaced kind the cluster serves, one read per kind per
+                            namespace, which is slow on a large fleet. Absent or empty keeps the
+                            default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+                            ControllerRevisions and Leases are refused: the scan reports nothing from
+                            them, and a Secret listing would carry every body.
+                          items:
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          maxItems: 20
+                          type: array
+                          x-kubernetes-list-type: set
+                          x-kubernetes-validations:
+                            - message: "kinds: all must be the only item"
+                              rule: "!self.exists(k, k == 'all') || self.size() == 1"
+                            - message:
+                                "kinds: secrets, configmaps, events, endpoints,
+                                endpointslices, controllerrevisions and leases are never
+                                scanned"
+                              rule:
+                                "!self.exists(k, k.split('.')[0] in ['secrets',
+                                'secret', 'configmaps', 'configmap', 'cm', 'events',
+                                'event', 'ev', 'endpoints', 'endpoint', 'ep',
+                                'endpointslices', 'endpointslice', 'controllerrevisions',
+                                'controllerrevision', 'leases', 'lease'])"
+                        minStallAgeMinutes:
+                          description: |-
+                            MinStallAgeMinutes holds a new alert until one of the namespace's stalls has
+                            lasted at least this long. The age is the longer of what stall_report.py
+                            measures on the object and how long the watch has seen it. A stall that is
+                            younger stays in the watch's ledger and is checked again on each run; an
+                            object that joins a namespace with an open alert is not held. Absent or 0
+                            alerts on the first run that sees the stall.
+                          format: int32
+                          maximum: 1440
+                          minimum: 0
+                          type: integer
+                      type: object
                     tuning:
                       description: |-
                         Tuning sets per-persona execution limits. Unset values keep the defaults
@@ -9856,7 +9923,9 @@ spec:
                               group or project access token, or a dedicated account's personal access
                               token where the tier offers neither. It is mounted into the credential
                               broker's pod only, never the agent's or the sandbox's, and read on every
-                              call, so rotating the token is updating the Secret.
+                              call, so rotating the token is updating the Secret. The Secret may also
+                              hold a read-only token under the key `read-token`; the broker presents it
+                              only to clone the forge's context repositories, never on a write.
                             properties:
                               name:
                                 description:
@@ -10739,10 +10808,8 @@ spec:
                             chose at creation time or at a public address, and the in-cluster
                             "kubernetes" Service is translated to that address before policy is
                             evaluated. Leaving this empty is allowed and is the stricter choice. It
-                            costs the agent container its API-server connection, which matters at
-                            spec.deployment.replicas above 1, where the container runs
-                            leader_elect.py and holds a Lease, and to any sidecar or plugin you
-                            added that talks to the API. Find the range with
+                            costs the agent container its API-server connection, which matters to
+                            any sidecar or plugin you added that talks to the API. Find the range with
                             `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
                             On a cluster with a public endpoint that command emits a bare address;
                             paste it as-is and it is widened to a single-host prefix.
@@ -11576,8 +11643,16 @@ spec:
                       type: integer
                     sessionsTotal:
                       description: |-
-                        SessionsTotal is the cumulative number of interactive sessions handled.
-                        Nothing writes it yet.
+                        SessionsTotal is the cumulative count of sessions the agent opened: the
+                        triage sessions the event watcher opened for events the daemon
+                        delivered (its k8s_event_watcher_triage_sessions_total; a session
+                        whose inject was filtered, suppressed or failed is not counted) plus
+                        the chat conversations the gateway opened a session for (the session_store
+                        plugin's kubeagents_chat_sessions_total on a today install, the A2A
+                        gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+                        chat conversation that resumes after the session store's retention
+                        window (seven days by default) counts again. Read every five minutes
+                        and kept monotonic across restarts, like toolExecutionsTotal.
                       format: int64
                       type: integer
                     toolExecutionsTotal:

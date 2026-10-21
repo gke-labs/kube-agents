@@ -28,6 +28,17 @@ ARG PYTHON_IMAGE=python
 ARG PYTHON_VERSION=3.14-slim
 FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}
 
+# No bytecode caches from any process the container's own environment reaches,
+# which is every `kubectl exec`, and those run as root (#3047). The image trees
+# under /opt/defaults are root-owned so the model can't change them, but root
+# can still write there, so a root-run script that imports from
+# /opt/defaults/scripts would leave a __pycache__ in the reference tree. That
+# tree is what `sandbox_tree_matches_image` compares the read-only copies
+# against, so the stray cache reads as an edit. The model's own sessions come in
+# through sshd and don't inherit this; they could never write a cache into those
+# trees anyway, so nothing they run loses one.
+ENV PYTHONDONTWRITEBYTECODE=1
+
 # openssh-server is baked rather than installed by the startup command. The
 # prototype this image replaces ran `apt-get install openssh-server` in the
 # Sandbox pod's args on every cold start: slow, and a hard dependency on
@@ -459,6 +470,13 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          /usr/local/bin/credential-proxy-exec above, as the
 #                          kubectl/gcloud shim; that copy is not importable by
 #                          module name, so it is staged here as well
+#   credential_shapes.py   the token shapes the feedback gate refuses and the broker
+#                          redacts before logging: one list, imported by
+#                          feedback_broker here and by credential_proxy off-pod
+#   feedback_broker.py     the constants the kube-agents-feedback client reads (the
+#                          route, the statuses, the fallback links, the payload's
+#                          normalisation); the same module's broker half files the
+#                          form from the broker pod, which is the side with egress
 #   fleet_scope_args.py    the flags (`--scope-projects`, `--scope-unread`,
 #                          `--scope-exclude-clusters`) the
 #                          fleet-audit collectors take the install's declared scope
@@ -529,6 +547,8 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/gitops_preflight.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/credential_shapes.py \
+     agents/platform/scripts/feedback_broker.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \

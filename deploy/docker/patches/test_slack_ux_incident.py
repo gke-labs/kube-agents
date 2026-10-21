@@ -307,6 +307,34 @@ class RuntimeTest(unittest.TestCase):
         self.assertTrue(update["text"].endswith(REPORT.strip()))
         self.assertEqual(adapter.client_metadata, {"thread_id": ALERT_TS})
 
+    def test_a_declared_next_step_is_in_neither_the_fold_nor_the_text(self):
+        adapter = _Adapter()
+        self.deliver(adapter, result=REPORT.rstrip() + "\n\n[next: apply option B]")
+        update = adapter.log[0][1]
+        self.assertNotIn("[next:", update["text"])
+        self.assertNotIn("[next:", json.dumps(update["blocks"]))
+        self.assertTrue(update["text"].endswith(REPORT.strip()))
+
+    def test_a_report_at_the_result_limit_never_edits_the_alert(self):
+        # A report long enough to be clipped is past the fold's limit, so the clip can never
+        # leave a cut step-line fragment in an edited alert; the step line goes before the clip.
+        filler = "\n\n" + "x " * kanban_notifier.RESULT_LIMIT
+        adapter = _Adapter()
+        self.assertIs(self.wrap(adapter, result=REPORT.rstrip() + filler + "\n\n[next: apply option B]"), adapter)
+        self.assertGreater(kanban_notifier.RESULT_LIMIT, runtime.FOLD_TEXT_MAX)
+
+    def test_under_next_a_declared_next_step_is_not_in_the_edit(self):
+        class StandIn(_Adapter):
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                self.log.append(("send_chat", chat_id, content, chat, update))
+                return SimpleNamespace(success=True, error=None)
+
+        adapter = StandIn()
+        self.deliver(adapter, result=REPORT.rstrip() + "\n\n[next: apply option B]")
+        (_kind, _chat_id, text, chat, _update), = adapter.log
+        self.assertNotIn("[next:", text)
+        self.assertNotIn("[next:", json.dumps(chat))
+
     def test_the_message_text_is_the_report_as_mrkdwn(self):
         adapter = _Adapter()
         adapter.format_message = lambda s: "fmt:" + s

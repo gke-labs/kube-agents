@@ -145,11 +145,16 @@ working directory, off the module path, so a `json.py` the model dropped there i
 not the code that runs. The per-cluster kubeconfigs stay in
 `/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
 prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
-cluster to what `kubectl api-resources` says it serves, and is not
-operator-configurable on this release: `STALL_WATCH_KINDS` replaces it for a run
-started by hand in the pod (`all` hands `stall_report.py` its every-kind
-default), but the operator's env allowlist does not carry it, so a value on the
-CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
+cluster to what `kubectl api-resources` says it serves. The CR's
+`spec.harness.stallWatch` sets three knobs, which the operator pins in the
+managed `.env` on every install (empty when unset, which is the default):
+`STALL_WATCH_EXCLUDE_NAMESPACES` names namespaces never read,
+`STALL_WATCH_MIN_AGE_MINUTES` holds a new alert until a stall in the namespace
+has lasted that long, and `STALL_WATCH_KINDS` replaces the kind list (`all`
+hands `stall_report.py` its every-kind default). The annotation
+`kubeagents.x-k8s.io/stall-watch: exempt` leaves a namespace unread, or an
+object's rows out of the alerts; `stall_report.py` marks such a row `exempt`
+in its `--json` output and its table is unchanged. The k8s-event-watcher and
 this job split the work by signal: a Warning whose reason is on the watcher's
 list is the watcher's within seconds; a condition, a reference or an event the
 list never names is this job's within the half hour. It declares `risk: high`
@@ -273,6 +278,48 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.
 
+## `sa-role-watch` says when the agent's account holds more than `read-only`
+
+The install grants the agent's Google service account the `read-only`
+permission set, and the installer warns about an admin role in a `custom` set,
+but only when the set is chosen. A role granted afterwards, by hand or by
+another tool, is what the Google-hosted GKE MCP server acts with when the agent
+container calls it on that account's credentials, and nothing in the product
+said so. `sa_role_watch.py` is that check.
+
+Each tick reads, through the shell sandbox and so through the credential
+broker, the `PlatformAgent` in the agent's namespace and the ServiceAccount it
+runs the agent and broker pods as. The ServiceAccount's
+`iam.gke.io/gcp-service-account` annotation is the account the agent
+container's own credentials resolve to; the CR's
+`spec.security.workloadIdentityFederation`, when both its fields are set, is the
+one the broker impersonates instead, and both are checked. With federation
+armed, an absent annotation is said once, since the agent container then has no
+Google credential of its own; with neither, there is no account to check and the
+job reports a check failure, once. A role bound to the ServiceAccount's own
+Workload Identity principal is not checked (#3450). Then `gcloud projects get-iam-policy` runs for the management project and
+each project in the resolved `spec.scope` (`fleet_scope_targets`), four at a
+time, and every role bound to one of those accounts that is not in the script's
+`READ_ONLY_ROLES` is a finding. `tests/test_agent_iam_ceiling.py` holds that
+list equal to `read_only_roles` in the full-install composition.
+
+It keeps a ledger at `profiles/platform/cron/sa_role_watch.json`, the way
+`stall-watch` does, so chat hears a role on the tick it first appears and again
+when it goes. A role still held is said again once a day, on the first tick from
+12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats: a
+grant said once in a busy channel can be missed, and nothing else would raise it
+again. Any other tick on an unchanged account prints nothing. That is why it can run
+hourly: a fresh install or a new grant is named within the hour, and a quiet
+hour costs one `kubectl` pair and one policy read per project, no model turn. A
+project whose policy cannot be read keeps its last answer and its failure is
+said once. So does a project missing from a scope the tick could read only in part (the
+render unreadable, or members the reconcile has not resolved), and the partial
+scope is said once. Losing the shell sandbox mid-tick is one failure line, not
+one per project. It reads project-level bindings only: a role granted on a folder,
+the organisation or a group is not in that answer, and reading those needs
+verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
+is reported like any other grant, and repeated daily like one.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
@@ -297,6 +344,16 @@ home's top-level entries that the product doesn't create, and any home the agent
 pod no longer has a profile for, such as a cluster dropped from scope. That's an
 inventory only: nothing is moved or deleted, and a failure to take it is logged
 there too rather than posted.
+
+Two things in a profile home are removed, in every home the agent pod has a
+profile for, on the agent pod and in the sandbox. Cron run directories
+(`cron/runs/<job>_<execution>`, each cron run's working directory) go after
+seven days, logged as a count. Override trees go the first night, logged by
+name: a top-level directory named `<something>_override`, such as a worker's
+patched copy of a shipped skill in `skills_override/`. No product code writes
+one, and a test keeps literal paths in shipped import-path calls and configs
+off them. Neither prune
+follows a symlink.
 
 Daily is deliberate rather than conservative. The first install to run this had
 accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and

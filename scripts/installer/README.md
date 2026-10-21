@@ -23,7 +23,8 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_PLATFORM_AGENT_MODE`                                             | The PlatformAgent's `spec.mode` (`today`); the composition then renders no mode        |
+| `DEFAULT_PLATFORM_AGENT_MODE`                                             | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
+| `DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`                               | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
@@ -43,8 +44,11 @@ their own copies:
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
 | `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
-| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`, `openai_compatible`  |
+| `is_table_model_provider <provider>`                                      | The providers with a menu entry (`openai_compatible` and `sap` included)               |
+| `is_valid_model_provider <provider>`                                      | Those, or any other LiteLLM provider slug (`^[a-z][a-z0-9_]*$`)                        |
 | `validate_openai_compatible_inputs <provider> …`                          | The `openai_compatible` values the chart or the operator would refuse                  |
+| `validate_model_provider_inputs <provider> <model>`                       | A slug outside the menu needs `MODEL_DEFAULT_NAME`                                     |
+| `validate_litellm_env_secret_name <name>`                                 | `LITELLM_ENV_SECRET_NAME`: a Kubernetes Secret name, or empty                          |
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
@@ -367,6 +371,17 @@ The token, and the paths of the token file and the CA file, are never recorded.
 the host, `install.sh` drops a `GITOPS_CA_FILE` from the environment, but refuses the flag. With
 github.com, it refuses both.
 
+`GITLAB_READ_TOKEN_FILE`, in `install.env` or the environment, is the optional path to a file that
+holds a read-only GitLab token. The broker presents this token only to clone private context
+repositories, never on a write. `install.sh` writes it into the `GITLAB_TOKEN_SECRET` Secret under
+the key `read-token`, beside `token`, and does not record the path. Set it only for the run that
+stores or replaces the read token, then remove it: a run with it set applies the file again, over a
+token rotated since, and stops when the file is gone. A later run without the key keeps the stored
+read token: the installer writes each key with its own server-side-apply field
+manager, so the write-token apply never removes `read-token`. Use a GitLab project or group access
+token with the Reporter role and only the `read_repository` scope, on the GitOps forge's host
+(gitlab.com or self-managed). On GitHub, `install.sh` refuses the key.
+
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.
 - A run that you decline, or that ends with `--generate-only`, does not change them in an existing
@@ -394,7 +409,21 @@ path is never recorded. A declined run, or `--dry-run`, leaves the file as it wa
 
 Each applying front door (`install.sh`, the Day-2 menu, a full `upgrade.sh`) also refuses an apply
 that would render GitOps off while the minter is running, and prints the lines to set with the
-live values filled in. `install.sh --generate-only` is refused too, and removes the tfvars it
+live values filled in. A minter that this install did not make (one made by hand, by
+`make deploy-github`, or by another Helm release: the `kube-agents` release record has
+`githubMinter.enabled` false, the Deployment carries no Helm annotations for this release, and
+the install's Terraform state holds no `module.github_minter`) is not something the apply removes, so the run does not ask for `GITHUB_APP_ID`. Over such a
+minter, the run refuses when its `GITOPS_ORG`, `GITOPS_REPO` and `GITOPS_HOST` do not name the
+PlatformAgent's live GitOps repository, or when it cannot read the PlatformAgent or that
+repository, because the apply would take the repository out of the PlatformAgent or point it at
+another one. It also refuses to render the chart's own minter over the other one, because Helm
+does not take over objects it does not own: remove all of the other minter's objects first
+(`make -C k8s-operator undeploy-github` with the same `GITHUB_MINTER_KSA_NAME` for the kustomize
+path, and a `github-app-credentials` Secret made by hand), or set `GITHUB_APP_ID` empty (and, with
+`install.sh`, give no `--github-app-id`). With no readable release record (a first install), these
+cases get the checks above. `KUBE_AGENTS_REMOVE_GITOPS=true` skips all of these checks; the apply
+then renders the repository that `GITOPS_ORG` and `GITOPS_REPO` name, or none when `GITOPS_ORG` is
+empty. `install.sh --generate-only` is refused too, and removes the tfvars it
 wrote, since its handoff is `lifecycle.sh apply`; `--plan` and `--dry-run` warn. A minter
 Deployment that cannot be read is refused rather than read as absent. `KUBE_AGENTS_REMOVE_GITOPS=true`
 in the environment removes GitOps on purpose. `GITHUB_APP_ID` must be the App's number (its
@@ -529,9 +558,27 @@ cannot refuse a teardown.
 
 `PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
 ([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
-renders). The generator writes `platform_agent_mode` on every run, `today` by default, and the
+renders). An `install.sh` run that chooses no mode (no `--mode`, no `PLATFORM_AGENT_MODE` in
+`install.env`, whose line `install.env.example` leaves commented out, and on a first install none
+exported) settles it from the target cluster. A cluster already running a `PlatformAgent` keeps
+its `spec.mode` (absent is `today`); one whose `PlatformAgent` was deleted while the
+`kube-agents` release is still installed keeps the mode the release records. Only a cluster with
+neither, or none yet, is a first install, which gets `next`
+(`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`), or `today` when it mirrors its third-party images
+with `--third-party-registry-prefix`, because nothing points `next`'s NATS images at the mirror;
+`--mode=next` overrides that. The read uses a kubeconfig of its own, so `--dry-run` and
+`--generate-only` leave the current context alone. Only gcloud's NOT_FOUND is no cluster: one
+that cannot be described or read is never taken for a first install, and over an `install.env`
+with no key the run renders `today`; with no `install.env`, `--dry-run` and `--generate-only`
+render `today` with a warning and an applying run is refused until `--mode` names one. `install.sh` then records the mode it settled on in an
+`install.env` that assigns none, unless it was that unread guess. The Day-2 menu's Save & Apply
+settles and saves a missing key the same way. `upgrade.sh` and the generator read a file with no
+key, or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as
+an existing install's mode), and a full `upgrade.sh` over a file with no key is refused unless
+its reads show no install on `next` (a read that failed shows nothing), rather than apply a
+switch nobody chose. The generator writes `platform_agent_mode` on every run, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
-takes `--mode` and records it, or the default, on a first install. Over an existing
+takes `--mode` and records it, or the settled mode, on a first install. Over an existing
 `install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
 with what the file resolves to (an empty key is `today`) is refused rather than applied for one
 run, because the next run, and every `upgrade.sh`, which takes no `--mode`, would switch the

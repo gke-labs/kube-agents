@@ -1454,7 +1454,8 @@ Sizing the two volumes together has an upgrade cost, because `volumeClaimTemplat
 immutable and the template sizes only the claims it creates. An install that predates it
 therefore needs both halves done to it: the operator widens the existing claim in place
 (online, with the volume still mounted) and recreates the StatefulSet with Orphan
-propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`,
+propagation so the pod and its disk survive the swap. Both are in `reconcileShellSandbox`;
+the widening is `growDataClaim`, which `reconcilePVC` also runs on the agent's own claim,
 and both are best-effort in the direction that matters — a StorageClass without
 `allowVolumeExpansion` leaves a smaller volume and a bounded migration rather than a failed
 reconcile that would take the agent down with it.
@@ -2149,6 +2150,19 @@ the test fleet after cron runs get a working directory of their own. The listing
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
+
+Two shapes are removed rather than inventoried. A cron run's working directory
+(`<home>/cron/runs/<run>`) is pruned after seven days. An override tree, a top-level
+directory named `<something>_override`, is removed the first night (#3551): it is a
+worker's copy of a shipped skill or script, patched to run in place of the original
+(#3444). No product code writes one, and `scripts/test_shipped_import_paths.py` keeps
+the literal paths it reads in shipped import-path calls, shell `PYTHONPATH` and configs
+off them. That test is a guard on the obvious forms, not a proof; the prune is the
+enforcement. Both
+prunes cover the homes the agent pod has a profile for, so a stale sandbox home is left
+to the inventory. Neither follows a symlink the model planted: the home, `cron` and
+`cron/runs` must be real directories for the runs prune, a symlinked home is left alone
+by the override prune, and a symlinked override entry is unlinked rather than followed.
 
 #### The agent pod gives up cluster tooling entirely
 

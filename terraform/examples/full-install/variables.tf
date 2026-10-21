@@ -323,19 +323,32 @@ variable "image_pull_secrets" {
 }
 
 variable "third_party_image_registry" {
-  description = "Registry prefix for the images this project does not build (LiteLLM, fluent-bit). Defaults to image_registry; set it only when the mirror keeps third-party images under a different path."
+  description = "Registry prefix for the images this project does not build (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight). Empty leaves them on their upstream registries; set it to mirror third-party images."
   type        = string
   default     = ""
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, vertex_ai, or openai_compatible). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; openai_compatible is any server speaking the OpenAI chat-completions API (vLLM, TGI, an internal gateway), set with model_default_name and the openai_compatible_* variables."
+  description = "Model provider the LiteLLM gateway routes model-default to: gemini, anthropic, openai, vertex_ai, openai_compatible, sap, or any other LiteLLM provider slug. Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; openai_compatible is any server speaking the OpenAI chat-completions API (vLLM, TGI, an internal gateway), set with model_default_name and the openai_compatible_* variables; sap (SAP AI Core) and any other slug read their credentials from the Secret litellm_env_secret_name names, and a slug outside that list needs model_default_name."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "openai_compatible"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, or openai_compatible."
+    # One shape admits every provider the chart knows and every other LiteLLM
+    # slug; chatgpt is the slug the chart refuses by name (a subscription needs
+    # an OAuth token store it does not ship), so the plan refuses it here.
+    condition     = can(regex("^[a-z][a-z0-9_]*$", var.model_provider)) && var.model_provider != "chatgpt"
+    error_message = "model_provider must be gemini, anthropic, openai, vertex_ai, openai_compatible, sap, or another LiteLLM provider slug (lowercase letters, digits and underscores); chatgpt is not supported, use openai with an API key."
+  }
+}
+
+variable "litellm_env_secret_name" {
+  description = "Name of a Secret, in the agent's namespace, that the LiteLLM gateway reads whole as environment variables (envFrom, optional). It carries whatever the provider reads from the environment: AICORE_SERVICE_KEY and AICORE_RESOURCE_GROUP for sap, the driver's variables for another slug, and for openai_compatible the OAuth2 client-credentials trio OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID and _CLIENT_SECRET. Empty: nothing is mounted. Terraform only names it; create the Secret yourself, and it stays out of state."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.litellm_env_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.litellm_env_secret_name)) && length(var.litellm_env_secret_name) <= 253)
+    error_message = "litellm_env_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
   }
 }
 
@@ -881,7 +894,7 @@ variable "enable_drift_detector" {
 }
 
 variable "platform_agent_mode" {
-  description = "The PlatformAgent's spec.mode: \"today\", the current architecture, or \"next\", which also renders the NATS bus and the A2A gateway, a development stack (docs/designs/spec-mode-switch.md). \"today\" passes nothing to the chart, so the CR carries no mode field, which the operator reads as today, and an install that never sets this renders what it did before the variable existed. Changing it on a running install is a mode switch: the operator rolls the agent and renders or retires the A2A stack. A mode set on the CR by hand with kubectl is left alone while this stays \"today\", because Helm patches only the fields its renders differ in. Mirrors PLATFORM_AGENT_MODE, which install.sh sets from --mode."
+  description = "The PlatformAgent's spec.mode: \"today\", the previous stack kept as a rollback, or \"next\", which puts the NATS bus and the A2A gateway in front of the agent and is what install.sh records on a first install (docs/designs/spec-mode-switch.md). \"today\" passes nothing to the chart, so the CR carries no mode field, which the operator reads as today, and an install that never sets this renders what it did before the variable existed. Changing it on a running install is a mode switch: the operator rolls the agent and renders or retires the A2A stack. A mode set on the CR by hand with kubectl is left alone while this stays \"today\", because Helm patches only the fields its renders differ in. Mirrors PLATFORM_AGENT_MODE, which install.sh sets from --mode."
   type        = string
   default     = "today"
   nullable    = false

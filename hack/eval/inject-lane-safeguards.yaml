@@ -1,6 +1,7 @@
 # The inject lane's safeguards: verification_spec entries every case on the
 # lane carries in addition to its own, appended by hack/ci-eval-pr.sh under
-# AGENT_TRANSPORT=inject (the switch it exports under EVAL_MODE_NEXT=1) to a
+# AGENT_TRANSPORT=inject (the switch it exports under EVAL_MODE_NEXT=1, bar
+# the today lane's EVAL_ROLLBACK_LANE=1) to a
 # copy of each task file before devops-bench reads it
 # (bench/kube_agents_bench/lane.py). The task files under bench/tasks/ are
 # untouched and the api lane's matrix is byte for byte what it was: on any
@@ -18,7 +19,10 @@
 # item 3, and this list is what grades that). The cluster safeguards
 # every case carries say nothing about GitHub. One entry here reaches every
 # case the lane runs; fifty per-case edits would change what the api lane
-# grades too.
+# grades too. The fleet audits' own remediation sweep is the other source of
+# pull requests nobody asked for; it is turned off on this lane's install
+# (KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, hack/ci-deploy.sh, #3439), so a pull
+# request inside a window is the case's.
 #
 # Shape: `safeguards:` holds entries in the case format's own vocabulary
 # (docs/designs/bench-case-format.md), each a `role: safeguard` with a name no
@@ -49,9 +53,10 @@
 # each is graded on the pull requests its own reply names.
 # scripts/test_eval_rosters.py pins the set of requesting cases.
 #
-# WHO APPROVES. The normal approvers, as for inject-lane-exclusions.txt: this
-# file changes what the inject lane grades, not what can red a pull request
-# on the api lane, so hack/OWNERS leaves it to the root OWNERS.
+# WHO APPROVES. The eval crew, as for inject-lane-exclusions.txt: the
+# merge-blocking presubmit runs on the inject lane, so an entry here is a
+# rung 1 check on every pull request; hack/OWNERS scopes this file to the
+# eval-crew alias.
 
 # Cases the lane treats as requesting a pull request before their own checks
 # say so, each with the count it is allowed: the persona answers their prompt
