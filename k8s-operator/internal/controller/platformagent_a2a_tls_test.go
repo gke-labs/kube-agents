@@ -371,7 +371,22 @@ func TestTheCardPublishersTrustIsReadFromTheBundleOnEachHandshake(t *testing.T) 
 // create a Secret in the namespace first cannot choose the bus's CA.
 func TestEnsureA2ANATSTLSTakesOverAnUnownedCASecret(t *testing.T) {
 	agent := a2aTestAgent()
-	r, cl := a2aTLSTestReconciler(t, agent)
+	scheme := setupScheme()
+	deleted := 0
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent.DeepCopy()).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == agentv1alpha1.A2ANATSCASecretName(agent.Name) {
+					deleted++
+				}
+				return c.Delete(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
 	a2aTLSTestClock(t, now)
 	ctx := context.Background()
@@ -379,10 +394,17 @@ func TestEnsureA2ANATSTLSTakesOverAnUnownedCASecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cl.Create(ctx, &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSCASecretName(agent.Name), Namespace: agent.Namespace},
-		Data:       map[string][]byte{a2aNATSCACertKey: certPEM, a2aNATSCAKeyKey: keyPEM},
-	}); err != nil {
+	plantedSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: agentv1alpha1.A2ANATSCASecretName(agent.Name), Namespace: agent.Namespace,
+			// Metadata another controller might act on, such as a mirror
+			// annotation that copies a Secret elsewhere.
+			Annotations: map[string]string{"replicator.example/replicate-to": "elsewhere"},
+			Labels:      map[string]string{"planted": "true"},
+		},
+		Data: map[string][]byte{a2aNATSCACertKey: certPEM, a2aNATSCAKeyKey: keyPEM},
+	}
+	if err := cl.Create(ctx, plantedSecret); err != nil {
 		t.Fatal(err)
 	}
 	got, err := r.ensureA2ANATSTLS(ctx, agent)
@@ -395,5 +417,13 @@ func TestEnsureA2ANATSTLSTakesOverAnUnownedCASecret(t *testing.T) {
 	ca := a2aGetSecret(t, cl, agent, agentv1alpha1.A2ANATSCASecretName(agent.Name))
 	if len(ca.OwnerReferences) != 1 || ca.OwnerReferences[0].Name != agent.Name {
 		t.Errorf("the replaced CA Secret is not owned by the PlatformAgent: %+v", ca.OwnerReferences)
+	}
+	// Replaced, not rewritten: the key went into a new object, not into one
+	// whose metadata someone else chose.
+	if deleted != 1 {
+		t.Errorf("the planted Secret was deleted %d times, want once: the key must go into a new object", deleted)
+	}
+	if len(ca.Annotations) != 0 || ca.Labels["planted"] != "" {
+		t.Errorf("the planted metadata survived: annotations %v, labels %v", ca.Annotations, ca.Labels)
 	}
 }

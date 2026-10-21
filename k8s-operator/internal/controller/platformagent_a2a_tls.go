@@ -38,6 +38,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -232,28 +233,50 @@ func (r *PlatformAgentReconciler) ensureA2ANATSCA(ctx context.Context, agent *ag
 		return nil, nil, nil, gerr
 	}
 	data := map[string][]byte{a2aNATSCACertKey: certPEM, a2aNATSCAKeyKey: keyPEM}
+	var found *corev1.Secret
 	if err == nil {
-		existing.Data = data
-		if err := ctrl.SetControllerReference(agent, existing, r.Scheme); err != nil {
-			return nil, nil, nil, err
-		}
-		if err := r.Update(ctx, existing); err != nil {
-			return nil, nil, nil, err
-		}
-		return cert, key, certPEM, nil
+		found = existing
 	}
-	secret := &corev1.Secret{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{Name: name.Name, Namespace: name.Namespace, Labels: a2aLabels(agent, "nats-ca")},
-		Data:       data,
-	}
-	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
-		return nil, nil, nil, err
-	}
-	if err := r.Create(ctx, secret); err != nil {
+	if err := r.writeA2ATLSSecret(ctx, agent, name, found, "nats-ca", corev1.SecretTypeOpaque, data); err != nil {
 		return nil, nil, nil, err
 	}
 	return cert, key, certPEM, nil
+}
+
+// writeA2ATLSSecret stores freshly issued key material under name. Into a
+// Secret this PlatformAgent controls it writes the data and resets the
+// metadata to the operator's own. A Secret under that name that it does not
+// control is deleted, on its UID, and a new one created: the key never goes
+// into an object whose labels, annotations or owners someone else chose, any
+// of which could hand it to another controller.
+func (r *PlatformAgentReconciler) writeA2ATLSSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent, name types.NamespacedName, existing *corev1.Secret, component string, typ corev1.SecretType, data map[string][]byte) error {
+	sameType := existing != nil && (existing.Type == typ || (existing.Type == "" && typ == corev1.SecretTypeOpaque))
+	if existing != nil && metav1.IsControlledBy(existing, agent) && sameType {
+		existing.Labels = a2aLabels(agent, component)
+		existing.Annotations = nil
+		existing.OwnerReferences = nil
+		if err := ctrl.SetControllerReference(agent, existing, r.Scheme); err != nil {
+			return err
+		}
+		existing.Data = data
+		return r.Update(ctx, existing)
+	}
+	if existing != nil {
+		uid := existing.UID
+		if err := r.Delete(ctx, existing, client.Preconditions{UID: &uid}); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("deleting the Secret %s that this PlatformAgent does not control: %w", name.Name, err)
+		}
+	}
+	secret := &corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Name: name.Name, Namespace: name.Namespace, Labels: a2aLabels(agent, component)},
+		Type:       typ,
+		Data:       data,
+	}
+	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
+		return err
+	}
+	return r.Create(ctx, secret)
 }
 
 // ensureA2ANATSServing returns the serving certificate's DER, issuing a new one
@@ -278,26 +301,11 @@ func (r *PlatformAgentReconciler) ensureA2ANATSServing(ctx context.Context, agen
 		return nil, gerr
 	}
 	data := map[string][]byte{a2aNATSTLSCertKey: certPEM, a2aNATSTLSKeyKey: keyPEM, a2aNATSTLSCAKey: caPEM}
+	var found *corev1.Secret
 	if err == nil {
-		existing.Data = data
-		if err := ctrl.SetControllerReference(agent, existing, r.Scheme); err != nil {
-			return nil, err
-		}
-		if err := r.Update(ctx, existing); err != nil {
-			return nil, err
-		}
-		return der, nil
+		found = existing
 	}
-	secret := &corev1.Secret{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
-		ObjectMeta: metav1.ObjectMeta{Name: name.Name, Namespace: name.Namespace, Labels: a2aLabels(agent, "nats-tls")},
-		Type:       corev1.SecretTypeTLS,
-		Data:       data,
-	}
-	if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
-		return nil, err
-	}
-	if err := r.Create(ctx, secret); err != nil {
+	if err := r.writeA2ATLSSecret(ctx, agent, name, found, "nats-tls", corev1.SecretTypeTLS, data); err != nil {
 		return nil, err
 	}
 	return der, nil
