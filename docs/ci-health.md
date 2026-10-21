@@ -247,7 +247,7 @@ latency (#1586). The wall clock is therefore a note beside the state, never a
 state, and only beside a GREEN one: inside a storm or an outage the long runs
 are the incident's symptom, and the incident's advice stands alone.
 `health.json`'s `slow` is set, while the state is GREEN, when the median wall
-clock of the last 5 full runs — a concluded run of at least one case fewer than `hack/eval/presubmit-cases.txt` lists (13+ today), all five
+clock of the last 5 full runs — a concluded run of at least one case fewer than the presubmit runs (`hack/eval/presubmit-cases.txt` less the inject lane's exclusions), all five
 finished in the last 6 hours — is at least 1.2× the median of the trailing 7
 days' full runs (at least 20 of them), and stays set until that median is back
 under 1.1×. Wall clock is a run's finish minus its start, the digest's
@@ -1005,7 +1005,8 @@ run passes with is said the other way round: the verifier lists those in
 `LEASE_SILENT_FINDINGS` (today `gke/host-otel-scope`, a host cluster that serves
 the lease and exports no traces; the one case that reads those traces,
 `observability-trace-latency-brokered`, runs in the nightly and fails its report
-check on such a cluster, while a presubmit run still passes the lease),
+check on such a cluster, while a presubmit run still passes the lease; and
+`iam/compute-sweeper/missing`, which fails only the Compute plant sweep),
 `health.py` splits the firing findings once,
 into the incident's `passes_leases` and `reds_runs` with the projects one of
 the latter is on under `reds_runs_projects` (the `pool_state` block carries the

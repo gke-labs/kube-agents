@@ -46,6 +46,12 @@ const (
 	// chatMessagesInboundTotal, which the chat_metrics plugin counts for the
 	// Hermes-side ingress (docs/designs/usage-counters-producer.md).
 	messagesInboundName = "messages_inbound_total"
+	// sessionsName counts the conversations the gateway minted a session
+	// record for, by platform: the next-mode chat half of status.usage's
+	// sessionsTotal, beside the watcher's triage sessions and the
+	// session_store plugin's count for the Hermes-side ingress
+	// (docs/designs/usage-counters-producer.md).
+	sessionsName = "sessions_total"
 	// processStartTimeName is the gauge the operator's usage poller reads to
 	// tell a gateway that restarted in place from a counter that fell for
 	// another reason: the Go process collector's name, but captured once at
@@ -159,6 +165,7 @@ type Metrics struct {
 	chatMessages        *prometheus.CounterVec
 	notifyMarksDropped  prometheus.Counter
 	messagesInbound     *prometheus.CounterVec
+	sessions            *prometheus.CounterVec
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
 	processStart prometheus.Gauge
@@ -204,18 +211,25 @@ func NewMetrics() *Metrics {
 			Name:      messagesInboundName,
 			Help:      "Chat messages the gateway accepted as turns, by platform (googlechat, slack, discord, console, other), counted before the sender is verified; a door's turns are not chat and are not counted.",
 		}, []string{labelPlatform}),
+		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      sessionsName,
+			Help:      "Conversations the gateway minted a session for, by the platform of the first message (googlechat, slack, discord, console, other); a conversation is counted once, and a door's are not chat and are not counted.",
+		}, []string{labelPlatform}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeName,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
 		}),
 	}
 	m.processStart.Set(float64(time.Now().UnixNano()) / float64(time.Second))
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.processStart)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.sessions, m.processStart)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}
 	for _, platform := range append(append([]string(nil), metricsPlatforms...), metricsLabelOther) {
 		m.messagesInbound.WithLabelValues(platform)
+		m.sessions.WithLabelValues(platform)
 	}
 	for _, state := range append(append([]lib.TaskState(nil), metricsTerminalStates...), metricsLabelOther) {
 		for _, source := range append(append([]TerminalSource(nil), metricsTerminalSources...), metricsLabelOther) {
@@ -281,6 +295,17 @@ func (m *Metrics) messageInbound(platform string) {
 		return
 	}
 	m.messagesInbound.WithLabelValues(platform).Inc()
+}
+
+// sessionMinted counts one conversation whose session record this gateway
+// created, under its platform. Its one caller is mintSession, on the create
+// that won; the loser of a mint race adopts the winner's record and counts
+// nothing, so two replicas racing first contact count one session.
+func (m *Metrics) sessionMinted(platform string) {
+	if m == nil {
+		return
+	}
+	m.sessions.WithLabelValues(platform).Inc()
 }
 
 // metricsPlatformLabel is the platform label for a message that arrived

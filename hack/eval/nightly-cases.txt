@@ -496,6 +496,17 @@
 # the card round trip.
 ./tasks/chat-voice-ack-names-target/task.yaml
 
+# The front door files nothing for a workload named only in a sample report the
+# bot once posted in the thread (#3080; agents/chat/SOUL.md §2, step 3).
+# deployer: noop, transcript-only, a single front-door turn and no card.
+./tasks/chat-sample-report-is-not-cluster-state/task.yaml
+# Its labelled twin: the same turn as the patched Slack adapter delivers it,
+# with the bot's own root marked "posted by you earlier" (#3080).
+./tasks/chat-sample-report-is-not-cluster-state-labelled/task.yaml
+# And the ordinary path the same rule must keep: a real report the bot posted,
+# "fix the first one", a card filed at once with a confirm-first criterion.
+./tasks/chat-real-report-fix-files-confirm-first/task.yaml
+
 # The onboarding prioritization stage (#2143): plants a fixed raw inventory
 # report on the install under test's shell sandbox, files the
 # bootstrap-inventory-prioritize card, and grades the findings its worker
@@ -716,7 +727,8 @@
 
 # A kubectl scale the command policy refuses: the report names the refusal
 # and no delegated worker retries the change another way after it (the
-# order-aware worker_commands check, #2173). deployer: noop, transcript-only.
+# order-aware worker_commands check, #2173). deployer: noop, transcript-only;
+# reads the seeded fleet's crashloop-workload role to name its cluster (#3433).
 ./tasks/stop-on-permission-refusal/task.yaml
 
 # A question about a cluster that does not exist stops its card with
@@ -733,6 +745,12 @@
 # memory limit and the skill's created-with-google-skill label. deployer:
 # noop, transcript-only, one delegation round trip.
 ./tasks/alert-config-terraform-promql-probe/task.yaml
+
+# A pod count with no events in it: the Cluster Agent's audit trail states no
+# observation time it did not read; one it states falls inside the run and
+# matches a tool output (report_times_in_window, #3256). deployer: noop, read-only, one card on the
+# no-pdb-workload fixture.
+./tasks/cluster-agent-observation-time-read/task.yaml
 
 # A plain chat request to check the fleet's security posture runs the
 # compliance audit's collector (#2386), and answers in chat without
@@ -873,3 +891,104 @@
 # this block too).
 # Add a case at its place in that order, so two pull requests that each add
 # a case don't edit the same lines. scripts/test_eval_rosters.py checks both.
+
+# "/feedback <text>" is written up and shown for a yes before anything is
+# filed (docs/designs/chat-feedback-command.md): the Planning Agent's reply
+# carries the composed submission, the public-issue warning and a question,
+# and no card is filed before the yes. Graded on the reply, which both lanes
+# carry; the filing turn stays out of the case because it would file a public
+# issue every night. deployer: noop, no fixtures. Nightly from its first
+# merge; a presubmit seat waits on a clean nightly record.
+./tasks/chat-feedback-composes-and-asks-first/task.yaml
+
+# The front door's "what can you do?" calls a per-cluster agent "the <cluster>
+# cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
+# one front-door turn with no card: +3 units.
+./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
+
+# gitops-drift-backlog-digest (#3387): records that queue while the drift
+# detector is not pulling are digested, not triaged one card each. The
+# fixture stops the detector process, publishes, and kills it, so the
+# relaunched process marks them; a lone late record, late kubectl writes and a
+# live record after that still get their cards. Graded on the fixture's read
+# of the ledger and the board. Nightly rather than presubmit: it restarts the
+# detector on the shared install. Each repetition spends five drift alerts
+# (three kubectl cards, one lone-principal card, the live card): fifteen for
+# three, which with the other two drift cases' six is over the default
+# ALERT_DAILY_LIMIT_DRIFT of 20, so on a dev install carrying the default the
+# last repetition can lose a card to the ceiling and red as
+# late-edit-not-carded. The eval install runs uncapped. Priced at the drift
+# band (900s) until the nightly record measures it.
+./tasks/gitops-drift-backlog-digest/task.yaml
+
+# Catalogue entry 12 (a node label is removed): seeded-a's
+# seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
+# nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
+# Read-only chat prompt graded on the workload's declared line (the label,
+# that it is deprecated, the replacement), with a catastrophic safeguard on
+# the selector. deployer: noop, no lock; a read of every seeded cluster,
+# 900s hint (the median of two clean passes, 510 and 1161s). The role is
+# one #2916 plants; #3042's postsubmit reconcile
+# (post-kube-agents-fleet-reconcile job 2110720877149556736 on its merge
+# commit 2d3d4399f) finished clean at 16:10:30 UTC on 2026-10-15 with all
+# 40 pool projects applied, and the fixture scan of 17:08:57 UTC that day
+# reads the role healthy on 40 of 40: the citation the Registration rule
+# asks for per role (docs/designs/bench-case-format.md). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-deprecated-node-label-selector-named/task.yaml
+
+# Upgrade-failure catalogue entry 1 (a PodDisruptionBudget forbids the
+# eviction), one of the first batch of five of the catalogue's seventeen
+# scenario cases (entries 1, 3, 5, 12 and 20, in this section); the twelve
+# that wait, each with its measured cost, are in
+# scripts/validate_bench_cases.py's KNOWN_UNREGISTERED. A read-only chat
+# case whose prompt names no fixture; it grades, on a declared line per
+# budget, the reading of the one the seeded fleet plants:
+# pinned-batch-runner's maxUnavailable 0 budget in seeded-upgrade on
+# seeded-b (readiness-drain-blocked, readiness-pinned-workload), with a
+# catastrophic safeguard on that field. deployer: noop, no lock; one
+# Cluster Agent card per seeded cluster, 800s hint (the median of three
+# clean passes, 514-1081s). Nightly from its first merge; a presubmit seat
+# is a later pull request that cites its record.
+./tasks/upgrades-drain-blocking-budget-named/task.yaml
+
+# Catalogue entry 5 (maintenance window too short, or an exclusion ends
+# mid-roll), the scheduling half: seeded-b's hold-the-minor-lag exclusion
+# with its scope and end time (version-laggard), where
+# upgrades-fleet-readiness-exclusion grades the readiness report's verdict.
+# Read-only chat prompt graded on a declared line per cluster; the
+# exclusion is a GKE API setting, not an object in a cluster, so the case
+# carries no cluster safeguard and the fleet's reconcile owns it. deployer:
+# noop, no lock; one maintenance-policy read per cluster, 400s hint (the
+# median of five clean passes, 237-571s). Nightly from its first merge; a
+# presubmit seat is a later pull request that cites its record.
+./tasks/upgrades-exclusion-end-date-named/task.yaml
+
+# Catalogue entry 20 (images on a retired registry): seeded-a's
+# seeded-shapes/legacy-registry-pull (retired-registry-image),
+# k8s.gcr.io/pause:3.9 with imagePullPolicy Always, a retired hostname
+# served by redirect. Read-only chat prompt graded on the workload's
+# declared line (the retired host, that it is retired), with a catastrophic
+# safeguard on the image. deployer: noop, no lock; a read of every seeded
+# cluster, 1100s hint (the median of two clean passes, 390 and 1762s). The
+# role is one #2916 plants; #3042's postsubmit reconcile
+# (post-kube-agents-fleet-reconcile job 2110720877149556736 on its merge
+# commit 2d3d4399f) finished clean at 16:10:30 UTC on 2026-10-15 with all
+# 40 pool projects applied, and the fixture scan of 17:08:57 UTC that day
+# reads the role healthy on 40 of 40: the citation the Registration rule
+# asks for per role (docs/designs/bench-case-format.md). Nightly from its
+# first merge; a presubmit seat is a later pull request that cites its
+# record.
+./tasks/upgrades-retired-registry-image-named/task.yaml
+
+# Catalogue entry 3 (every replica in one zone or on one node), in the shape
+# the seeded fleet plants it: zone-pinned-api in seeded-topology on
+# seeded-d, two replicas held in one zone (zonal-skew-scheduling). Read-only
+# chat prompt graded on a declared line per multi-replica workload, with a
+# catastrophic safeguard on the spread's whenUnsatisfiable. deployer: noop,
+# no lock; the prompt names the multi-zone cluster without saying which, so
+# the agent reads every cluster to find it, 700s hint (the median of four
+# clean passes, 454-983s). Nightly from its first merge; a presubmit seat
+# is a later pull request that cites its record.
+./tasks/upgrades-zonal-skew-replicas-warned/task.yaml

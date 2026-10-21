@@ -31,7 +31,7 @@ The session lands on the front door and cannot land anywhere else. Hermes select
 
 Delivery is the card itself. Hermes subscribes every card to the session it was filed from, and posts a subscribed card's `result` to chat when it turns terminal — so the Cluster Agent finishes with `kanban_complete` and nothing else, and the report reaches the thread the alert was raised in. The body's whole job on that point is to insist the entire report goes in `result`, since `result` is verbatim what the reader sees.
 
-Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those three facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel.
+Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those three facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel (newest first, grouped and bounded to chat relay limits with older cards listed by task ID).
 
 The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged. The hermes-bridge records a route the same way for its `a2a-*` sessions, so a card filed in a gateway conversation reports back to that conversation, and the lookup follows Hermes's compression lineage when the session has since been renamed; [the gateway spec](../../../docs/designs/spec-chatops-gateway.md) has the conversation route.
 
@@ -45,7 +45,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest. A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -58,7 +58,8 @@ Three of the four are severities and the fourth is not; `GitOpsDrift` is what dr
 whatever they display as.
 
 The `GitOpsDrift` default of 20 is a judgment, not a measurement. One apply spends one inject for
-each object, because the detector does not combine records. `install.sh` and `upgrade.sh` enable the
+each object, because the detector does not combine live records (late ones are digested and bill
+nothing; see the drift bullets below). `install.sh` and `upgrade.sh` enable the
 detector by default, so this value applies to the installs that these scripts manage. Only changes by
 people alert, so 20 covers a few hand applies a day. A record that the detector cannot join to a live
 object still sends a card with less detail, unless its cluster is outside the install's scope. That
@@ -115,6 +116,17 @@ What the drift branch does differently:
   `Warning` label reaches no reader: it is the `severity` column of the ledger row and a field of
   the suppressed response, and the chat line names no severity at all.
 - **Its `suppressed` is terminal,** for the reason the bullet above gives.
+- **Late records skip this route.** A record the detector marks as backlog (it queued while no detector was
+  pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
+  route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
+  starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
+  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). A
+  principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
+  claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
+  `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
+  carded from its own columns (summary and cluster). The post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
+  route as `features: ["drift-backlog"]` on `/healthz`; the detector's README has the rule that
+  marks a record late and what it costs.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of
   the fields describing it are chosen by that person: `fieldManager` is a free query parameter and
   `callerSuppliedUserAgent` is whatever the client declared. Both are rendered inside a block the
@@ -147,7 +159,8 @@ separate variables and refuses an apply that sets `enable_drift_detector` withou
 #### Asking whether the dispatch is there
 
 `GET /healthz` answers `inject_kinds`, the list of kinds the dispatch above understands, and the
-detector probes it at startup and refuses to run if `gitops-drift` is not on it.
+detector probes it at startup and refuses to run if `gitops-drift` is not on it. It also answers
+`features`; the detector uses `POST /v1/drift-backlog` only when `drift-backlog` is on it.
 
 The dispatch is an equality test on `kind`, and a daemon predating it cannot say so: the drift
 payload falls into the event path, where the defaults render it as a `Warning` Pod alert named
@@ -379,7 +392,10 @@ CREATE TABLE intercepted_events(
   notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back; 1 when posted to chat; 2 when dispatched on a headless install with no chat platform enabled
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
-  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
+  principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
+  payload     TEXT NOT NULL DEFAULT ''     -- drift backlog rows only: the record, to card it from
 );
 ```
 
@@ -403,17 +419,17 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 ##### Which columns are migrated, and which are not
 
-`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`
-for `session_id` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
-databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` in place on
-startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
+`principal` and `payload` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
+`principal` and `payload` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
 introduced the table (#426), and a migration maintained for a pre-release shape no released
 install has is machinery that outlives its reason.
 
-**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
+**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id`, `backlog`, `principal` and `payload` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
 NOT EXISTS` is a no-op against a pre-0.2.0 table missing those three columns, so they never appear, and how badly that ends depends on
 which column is missing:
 
@@ -421,8 +437,9 @@ which column is missing:
   column in its INSERT, so every write raises `no such column: cluster` into the blanket
   `except Exception` around it, is logged once per event, and is dropped. The table stays empty for
   as long as the shape lasts.
-- **No `object_uid`** — the same, and for the same reason: it is in the INSERT, so nothing is
-  recorded.
+- **No `object_uid`** — the session server does not start. `init_db` creates the partial index
+  `idx_intercepted_events_drift_uid` on `object_uid` at import, which raises
+  `no such column: object_uid`, and the process exits.
 - **No `delivery_error`** — events are still recorded correctly and only the correction fails.
   `mark_delivery_failed` raises `no such column: delivery_error`, the same blanket `except`
   swallows it, and the row keeps `notified = 1`, so the recap counts an alert nobody received as

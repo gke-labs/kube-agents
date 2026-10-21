@@ -51,9 +51,9 @@ func initContainerMemoryLimit(t *testing.T, tmpl corev1.PodTemplateSpec) resourc
 // TestReconcileInvalidAgentAPIAuthResources pins the webhook-off reconciler
 // path for a refused spec.deployment.agentAPIAuth.resources: the sidecar is
 // rendered at the operator's defaults, the CR reports Degraded with the reason,
-// Ready is untouched, and a Warning event names the field — on both the
-// Deployment and the StatefulSet gateway, because the strip sits above the
-// fork. A request above its limit is the refusal the API server would also
+// Ready is untouched, and a Warning event names the field, including for the
+// spec that used to select the StatefulSet gateway, which the replica cap now
+// renders as the Deployment. A request above its limit is the refusal the API server would also
 // reject, so the test proves the operator ignores it rather than writing it.
 func TestReconcileInvalidAgentAPIAuthResources(t *testing.T) {
 	refused := &corev1.ResourceRequirements{
@@ -70,7 +70,10 @@ func TestReconcileInvalidAgentAPIAuthResources(t *testing.T) {
 		{"deployment gateway", false, &agentv1alpha1.DeploymentSpec{
 			AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{Resources: refused},
 		}},
-		{"statefulset gateway", true, &agentv1alpha1.DeploymentSpec{
+		// The spec that used to select the StatefulSet gateway (replicas > 1
+		// over RWO custom storage). The replica cap renders it as the
+		// single-replica Deployment, so that is where the sidecar is read.
+		{"statefulset-shaped spec, capped to a deployment", false, &agentv1alpha1.DeploymentSpec{
 			AgentAPIAuth: &agentv1alpha1.AgentAPIAuthSpec{Resources: refused},
 			Availability: &agentv1alpha1.AvailabilitySpec{Replicas: &two},
 			Storages: []agentv1alpha1.StorageSpec{{

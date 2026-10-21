@@ -3497,3 +3497,65 @@ func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
 		return false
 	})
 }
+
+// TestBareFeedbackAnswersWithTheLinksAndStartsNoTask: a bare /feedback is the
+// gateway's second slash command (docs/designs/chat-feedback-command.md). It
+// posts the two reporting links and submits nothing to the bus.
+func TestBareFeedbackAnswersWithTheLinksAndStartsNoTask(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb1"
+	sessionRigTurn(r, conv, "fb-100", "/feedback")
+	waitFor(t, "notice", postedContaining(r, chattext.FeedbackFormURL))
+	if !postedContaining(r, chattext.FeedbackTrackerURL)() {
+		t.Fatal("the notice must carry the tracker link too")
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
+		t.Fatalf("a bare /feedback submitted %d envelope(s); it must submit none", n)
+	}
+	if rec, _ := r.g.reg.Get(context.Background(), conv); rec != nil && rec.ActiveTask != nil {
+		t.Fatalf("a bare /feedback left an active task: %+v", rec.ActiveTask)
+	}
+}
+
+// TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept: "/feedback <text>" is
+// the agent's to answer, so it becomes a task whose text is what the person
+// typed, prefix included, and no links notice is posted.
+func TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb2"
+	sessionRigTurn(r, conv, "fb-110", "/feedback the status line stuck on working")
+	origin := r.awaitTask(t, "platform")
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "/feedback the status line stuck on working" {
+		t.Fatalf("task text = %q, want the text as typed, prefix included", got)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback with text")
+	}
+}
+
+// TestFeedbackWithTextWhileATaskRunsIsASteer: with a task running, a
+// "/feedback <text>" is a follow-up like any other message, not swallowed by
+// the command branch.
+func TestFeedbackWithTextWhileATaskRunsIsASteer(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb3"
+	sessionRigTurn(r, conv, "fb-120", "start")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "fb-121", "/feedback the answer was wrong")
+	waitFor(t, "steer ack", postedContaining(r, ackSteerQueued))
+	envs := inSubjectEnvelopes(t, r.url, "platform")
+	if steer := envs[len(envs)-1]; steer.TaskID != origin.TaskID {
+		t.Fatalf("the /feedback follow-up minted a new task: %s vs %s", steer.TaskID, origin.TaskID)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback follow-up")
+	}
+}

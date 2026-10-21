@@ -58,6 +58,12 @@
 #                     inert wherever it runs.
 #   RC_TAG            pin a candidate instead of resolving the newest one.
 #                     Passed through to resolve-rc-target.sh.
+#   EVAL_MODE_NEXT    the Prow job config sets it to 1, so the candidate is
+#                     graded under spec.mode: next, the mode a new install
+#                     gets. Read by the candidate's ci-deploy.sh and
+#                     ci-eval-pr.sh, not here. A candidate whose ci-deploy.sh
+#                     does not list this job in EVAL_MODE_NEXT_JOB_NAMES
+#                     refuses the flag at second zero, which reports NOT RUN.
 #   PULL_NUMBER       Prow's. Set = a pull request, which never measures a
 #                     release candidate; skip.
 #   ARTIFACTS         Prow's. When set, receives rc-target.env and the
@@ -100,7 +106,12 @@ set -euo pipefail
 # fan-out is the same work this lane does: three runs that reached a verdict on
 # 2026-09-24 spent 83, 110 and 143 minutes in it. Add the ~20 minutes of lease,
 # build and deploy this lane pays before grading starts and the poller keeps
-# real headroom under 330 even on the slow end. What that does not cover is a
+# real headroom under 330 even on the slow end. Under EVAL_MODE_NEXT=1 the
+# deploy also runs ci-deploy.sh's step 6b, the flip to next and its gates,
+# which the next-mode presubmit pays in front of the same matrix; its waits
+# are bounded there (MODE_NEXT_*_TIMEOUT), and ci-eval-pr.sh skips the
+# report-only rollback round trip on this lane so nothing runs after the
+# verdict. What that does not cover is a
 # run whose cases stall rather than run: #1840's delegation block costs 45
 # minutes per repetition, and enough of those exceed any budget. That failure
 # is unsettled, so it withdraws the nomination and the next night asks again.

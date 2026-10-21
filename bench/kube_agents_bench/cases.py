@@ -77,7 +77,11 @@ NOOP_DEPLOYER = "noop"
 # Recorded per entry NAME, because the report devops-bench writes carries
 # the entry's name and not its check type.
 TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
-WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents"})
+# ``report_times_in_window`` reads the report, but also every tool output in
+# the trajectory, the workers' included, to tell a time the agent read from
+# one it guessed; the inject trace carries calls without their tool
+# outputs, so it is blind the same way.
+WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).

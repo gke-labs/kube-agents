@@ -310,6 +310,8 @@ class UnitNotRunTest(unittest.TestCase):
                 _lift_line(r"^readonly EVAL_TIMING_FILE=.*$", "EVAL_TIMING_FILE"),
                 _lift_line(r"^readonly EVAL_GATEWAY_GONE_RC=.*$", "EVAL_GATEWAY_GONE_RC"),
                 _lift_line(r"^readonly EVAL_INSTALL_GONE_MARKER=.*$", "EVAL_INSTALL_GONE_MARKER"),
+                # run_one_unit writes the rep log here; a private one per run.
+                'EVAL_LOG_DIR="$(mktemp -d)"',
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
                 _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$", "LEDGER_RESET_MINT_ATTEMPTS"),

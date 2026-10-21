@@ -104,6 +104,8 @@ FAILURE = "failure"
 ENABLE = "enable"
 DISABLE = "disable"
 LEFT_OUT = "left out"
+#: What a left-out line says when the removal event carries no reason or actor.
+UNKNOWN_REMOVAL_FIELD = "unknown"
 #: The sweep's own login when `--actor` names no App: `GITHUB_TOKEN`'s, which makes no queue
 #: call. A write run always passes the App's slug, whose own dequeue of a held pull request does
 #: not keep it out; a dry run has no App token, so it may report that dequeue as a removal.
@@ -128,7 +130,7 @@ query($owner: String!, $name: String!, $base: String!, $after: String) {
         autoMergeRequest { enabledAt }
         mergeQueueEntry { id }
         timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-          nodes { ... on RemovedFromMergeQueueEvent { createdAt actor { login } } }
+          nodes { ... on RemovedFromMergeQueueEvent { createdAt reason actor { login } } }
         }
         commits(last: 1) { nodes { commit {
           checkSuites(first: %d) { nodes { createdAt } }
@@ -142,6 +144,8 @@ query($owner: String!, $name: String!, $base: String!, $after: String) {
 }
 """
 ENABLE_MUTATION = "mutation($id: ID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"
+#: The enable call with the pull request's node id written in, for a write user to paste.
+ENABLE_COMMAND_QUERY = 'mutation {{ enablePullRequestAutoMerge(input: {{pullRequestId: "{id}"}}) {{ clientMutationId }} }}'
 DISABLE_MUTATION = "mutation($id: ID!) { disablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"
 DEQUEUE_MUTATION = "mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }"
 #: The GraphQL type name of a commit status in a rollup.
@@ -335,6 +339,32 @@ def removed_since_push(node, actor=SWEEP_ACTOR):
     return parse_time(removals[-1]["createdAt"]) - min(pushed) > PUSH_REMOVAL_WINDOW
 
 
+def last_removal(node):
+    """The last queue removal on a pull request's timeline, or None."""
+    removals = ((node.get("timelineItems") or {}).get("nodes")) or []
+    return removals[-1] if removals else None
+
+
+def left_out_line(pull):
+    """The sweep's line for a pull request it leaves out: why, and the command that puts it back.
+
+    The command is the sweep's own enable call, run on a write user's token: a
+    write user pastes it to turn auto-merge on, which with the queue means
+    "enqueue once the required checks pass". Once auto-merge is on, the next
+    sweep leaves the pull request alone.
+    """
+    removal = pull.get("removal") or {}
+    when = removal.get("createdAt") or UNKNOWN_REMOVAL_FIELD
+    who = ((removal.get("actor")) or {}).get("login") or UNKNOWN_REMOVAL_FIELD
+    why = removal.get("reason") or UNKNOWN_REMOVAL_FIELD
+    enable = ENABLE_COMMAND_QUERY.format(id=pull["id"])
+    return (
+        f"#{pull['number']}: left out, removed {when} by {who} (reason: {why}). "
+        f"To re-add (a write user): gh api graphql -f query='{enable}', "
+        "or push a fix (a push drops lgtm unless the author is in gke-labs/Googlers)."
+    )
+
+
 def parse_time(stamp):
     """A GitHub timestamp, `2026-10-13T20:13:25Z`, as an aware datetime."""
     return datetime.fromisoformat(stamp)
@@ -361,6 +391,7 @@ def graphql_pulls(api, base=BASE, actor=SWEEP_ACTOR):
                 "auto_merge": node["autoMergeRequest"] is not None,
                 "queue_entry": (node["mergeQueueEntry"] or {}).get("id"),
                 "removed_since_push": removed_since_push(node, actor),
+                "removal": last_removal(node),
                 "statuses": rollup_statuses(((rollup or {}).get("contexts") or {}).get("nodes") or []),
             })
         if not page["pageInfo"]["hasNextPage"]:
@@ -396,7 +427,7 @@ def sweep(api, base=BASE, enqueuer=None, actor=SWEEP_ACTOR, dry_run=False):
                     enqueuer.graphql(DISABLE_MUTATION, {"id": pull["id"]})
             if action:
                 if action == LEFT_OUT:
-                    lines.append(f"#{pull['number']}: left out, removed from the queue since its last push")
+                    lines.append(left_out_line(pull))
                 else:
                     verb = {ENABLE: "auto-merge on", DISABLE: "auto-merge off and out of the queue"}[action]
                     lines.append(f"#{pull['number']}: {'would turn ' if dry_run else ''}{verb}")

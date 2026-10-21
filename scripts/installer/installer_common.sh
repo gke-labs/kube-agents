@@ -235,6 +235,21 @@ readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/
 # the same rule. Keep the three in step (docs/README.md lists them; a test
 # checks all three agree).
 readonly SLACK_HOME_CHANNEL_ID_RE='^[CG][A-Z0-9]{2,}$'
+# The prefix of a Google Chat space's resource name, the only home channel
+# form the A2A gateway arms its notify route on (gchat_home_channel_not_a_space_name).
+# The gateway and the operator hold the same rule; keep the three in step
+# (docs/README.md lists them; a test checks all three agree).
+readonly GCHAT_SPACE_PREFIX="spaces/"
+# What Go's strings.TrimSpace strips (unicode.IsSpace), as UTF-8: ASCII
+# whitespace, U+0085, U+00A0, U+1680, U+2000-U+200A, U+2028, U+2029, U+202F,
+# U+205F and U+3000. The operator and the gateway trim a home channel this
+# way, so a value pasted with a no-break space is still the space they use.
+readonly -a GO_TRIMSPACE_CHARS=(
+  $'\t' $'\n' $'\v' $'\f' $'\r' ' ' $'\xc2\x85' $'\xc2\xa0' $'\xe1\x9a\x80'
+  $'\xe2\x80\x80' $'\xe2\x80\x81' $'\xe2\x80\x82' $'\xe2\x80\x83' $'\xe2\x80\x84' $'\xe2\x80\x85'
+  $'\xe2\x80\x86' $'\xe2\x80\x87' $'\xe2\x80\x88' $'\xe2\x80\x89' $'\xe2\x80\x8a'
+  $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
+)
 # What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
 # a field that is not there: a record that carries no platformAgent.mode, or a
 # CR with no spec.mode. Told apart from printing nothing, which means there is
@@ -370,6 +385,9 @@ readonly SCOPE_PROBE_UNDECIDED=2
 # is nothing live to protect, not that the read failed.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="the server doesn't have a resource type|could not find the requested resource"
 readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
+# gcloud's answer for a cluster that does not exist. Any other describe failure
+# (auth expiry, a 403, a network blip) is a cluster that could not be read.
+readonly GKE_CLUSTER_NOT_FOUND_PATTERN="not.?found|404"
 # The two verdicts refuse_apply_over_undeclared_scope's python half prints
 # on its first line.
 readonly SCOPE_VERDICT_OK="ok"
@@ -1008,11 +1026,15 @@ platform_agent_mode_extra_values_caveat() {
 # that applies it names it first. A key the apply cannot bring the CR to,
 # because the CR carries a mode set outside this installer, is named too.
 # Silent when either value is empty (no CR, no release: a first install),
-# and on a re-apply of the same mode. A read that failed is not empty: the
+# and on a re-apply of the same mode. Sets PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
+# to true when it names a switch, so install.sh -y can refuse one nobody chose. A read that failed is not empty: the
 # front-door call says so itself (announce_platform_agent_mode_for_apply).
 # Caller defines print_warning / print_info.
 announce_platform_agent_mode_switch() {
   local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
   [ -n "$record" ] && [ -n "$live" ] || return 0
   from="$(effective_platform_agent_mode "$live")"
   to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
@@ -1024,9 +1046,11 @@ announce_platform_agent_mode_switch() {
     fi
     return 0
   fi
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
   print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
   if [ "$to" = "next" ]; then
-    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, Google Chat moves from the agent to the A2A gateway."
+    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat, or Slack when it is the only chat platform enabled."
   else
     print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
   fi
@@ -1064,6 +1088,14 @@ slack_moves_to_a2a_gateway() {
   [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
 }
 
+# Whether Google Chat is consumed by the A2A gateway after this apply: the
+# operator's a2aChatArmed (k8s-operator platformagent_a2a_manifests.go),
+# spec.mode next with Google Chat enabled. $1 the mode the apply renders, $2
+# GOOGLE_CHAT_ENABLED.
+google_chat_moves_to_a2a_gateway() {
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
+}
+
 # The three checks behind refuse_next_slack_gateway_settings, one per
 # setting, which the install.sh interview also uses to re-ask. Each prints
 # nothing for a setting that passes.
@@ -1078,18 +1110,53 @@ slack_allowlist_emails() {
   printf '%s' "$emails"
 }
 
-# A Slack home channel ($1), trimmed, when it is set and is not a channel id
-# (SLACK_HOME_CHANNEL_ID_RE).
+# A Slack home channel ($1), trimmed as the operator trims it (trim_go_space),
+# when it is set and is not a channel id (SLACK_HOME_CHANNEL_ID_RE).
 slack_home_channel_not_an_id() {
   # The C locale: under a legacy collation (glibc before 2.28) the range
   # A-Z also matches lowercase, which the gateway's rune comparison refuses.
   local LC_ALL=C
-  local home="${1:-}"
-  home="${home#"${home%%[![:space:]]*}"}"
-  home="${home%"${home##*[![:space:]]}"}"
+  local home
+  home="$(trim_go_space "${1:-}")"
   if [ -n "$home" ] && ! [[ "$home" =~ $SLACK_HOME_CHANNEL_ID_RE ]]; then
     printf '%s' "$home"
   fi
+}
+
+# $1 with what Go's strings.TrimSpace strips (GO_TRIMSPACE_CHARS) removed
+# from both ends. Byte-wise, so the result does not depend on the locale.
+trim_go_space() {
+  local LC_ALL=C value="${1:-}" sp trimmed=false
+  until $trimmed; do
+    trimmed=true
+    for sp in "${GO_TRIMSPACE_CHARS[@]}"; do
+      if [[ "$value" == "$sp"* ]]; then value="${value#"$sp"}"; trimmed=false; fi
+      if [[ "$value" == *"$sp" ]]; then value="${value%"$sp"}"; trimmed=false; fi
+    done
+  done
+  printf '%s' "$value"
+}
+
+# A Google Chat home channel ($1), trimmed, when it is set and is not a bare
+# space name: "spaces/" and an id with no further "/". The gateway's
+# gchatIsSpaceName (a2a/gateway/gchat.go) refuses anything else and leaves
+# its notify route unarmed; the operator's a2aGchatHomeSpace holds the same
+# rule.
+gchat_home_channel_not_a_space_name() {
+  local home id
+  home="$(trim_go_space "${1:-}")"
+  [ -n "$home" ] || return 0
+  id="${home#"$GCHAT_SPACE_PREFIX"}"
+  if [ "$id" = "$home" ] || [ -z "$id" ] || [[ "$id" == */* ]]; then
+    printf '%s' "$home"
+  fi
+}
+
+# Whether a Google Chat allowlist ($1) holds no address once split the way
+# hcl_csv_list renders it, which drops blank items: the operator then renders
+# allow-all for the gateway.
+gchat_allowlist_is_empty() {
+  [ -z "$(csv_list_items "${1:-}")" ]
 }
 
 # The number of tokens a Slack bot token ($1) holds, when it is more than
@@ -1144,7 +1211,7 @@ slack_bot_token_has_separator() {
 # returns 0.
 refuse_next_slack_gateway_settings() {
   local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
-  local emails bad_home count refused=false via say=print_error lead=""
+  local emails bad_home count refused=false via keep_today say=print_error lead=""
   slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
@@ -1166,9 +1233,14 @@ refuse_next_slack_gateway_settings() {
   fi
   count="$(slack_bot_token_list_count "$token")"
   if [ -n "$count" ]; then
-    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    via="install.env"; keep_today="PLATFORM_AGENT_MODE=today"
+    if [ "$flags" = "flags" ]; then
+      via="install.env or --slack-bot-token"
+      # A first install is next by default, so the flag is the way to stay on today.
+      keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
+    fi
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on PLATFORM_AGENT_MODE=today."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
@@ -1207,13 +1279,13 @@ next_home_channel_unset_key() {
   [ "${1:-}" = "next" ] || return 0
   if is_truthy "${3:-}"; then
     home="${5:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
     return 0
   fi
   if is_truthy "${2:-}"; then
     home="${4:-}"
-    home="${home//[[:space:]]/}"
+    home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
   fi
   return 0
@@ -1240,8 +1312,9 @@ next_home_channel_unset_remedy() {
   esac
 }
 
-# Set by warn_next_home_channel_unset so the front door's closing summary can
-# say it again where the reader of a non-interactive run's log will see it.
+# Set by warn_next_home_channel_unset, and again by install.sh from the mode
+# after the apply, so the front door's closing summary can say it again where
+# the reader of a non-interactive run's log will see it.
 NEXT_HOME_CHANNEL_UNSET_KEY=""
 
 # Warns when the apply leaves the gateway's chat backend without a home
@@ -1280,6 +1353,13 @@ _platform_agent_mode_unread() {
   print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
 }
 
+# The spec.mode the CR carries after this apply, for the chat checklists that
+# follow it: the key, unless the reads below show a CR the apply leaves on
+# another mode (platform_agent_mode_after_apply). A platformAgent.mode in the
+# composition's extra_helm_values is not followed: the installer cannot read
+# it (platform_agent_mode_extra_values_caveat).
+PLATFORM_AGENT_MODE_AFTER_APPLY=""
+
 # The front door's call, after the scope check beside it: $1 namespace, $2
 # the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
 # confirmation after the notice. Quiet where there is nothing to switch (a cluster the tfvars
@@ -1291,8 +1371,13 @@ _platform_agent_mode_unread() {
 # absent, or a get-credentials that did not land on the --dry-run and
 # --generate-only routes the scope check skips) is a read that did not
 # happen, and is said with the scope check's remedy.
+# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh
 announce_platform_agent_mode_for_apply() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
+  # Read by install.sh's -y refusal.
+  # shellcheck disable=SC2034
+  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$key")"
   if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
     PLATFORM_AGENT_READS_HELD_FOR=""
     return 0
@@ -1322,7 +1407,41 @@ announce_platform_agent_mode_for_apply() {
   else
     record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
   fi
+  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
   announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
+}
+
+# After announce_platform_agent_mode_for_apply, from the reads it left:
+# succeeds unless they show that no install runs next, that is no cluster, no
+# PlatformAgent type, a CR on today, or, with the CR gone, no release or one
+# that records today (the next apply recreates the CR from it). A read that
+# failed or did not happen is not today. upgrade.sh refuses a keyless
+# install.env on this, since such a file renders today.
+platform_agent_install_may_run_next() {
+  local live record
+  [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ] && return 1
+  case "${PLATFORM_AGENT_CR_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+  if [ -n "$live" ]; then
+    [ "$(effective_platform_agent_mode "$live")" = "next" ]
+    return
+  fi
+  case "${PLATFORM_AGENT_RECORD_READ:-}" in
+    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
+    "$PLATFORM_AGENT_READ_OK") ;;
+    *) return 0 ;;
+  esac
+  [ "${PLATFORM_AGENT_SERVED_READ:-}" = "$PLATFORM_AGENT_READ_FAILED" ] && return 0
+  if [ -n "${PLATFORM_AGENT_SERVED_REVISION:-}" ]; then
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
+  else
+    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+  fi
+  [ "$(effective_platform_agent_mode "$record")" = "next" ]
 }
 
 # upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
@@ -4228,6 +4347,13 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
   return 1
 }
 
+# Whether $1, the stderr of a failed `gcloud container clusters describe`,
+# says the cluster does not exist. The tfvars generator and install.sh's mode
+# settle both ask this, so they cannot disagree about what absence is.
+gke_describe_error_is_not_found() {
+  printf '%s' "${1:-}" | grep -qiE "$GKE_CLUSTER_NOT_FOUND_PATTERN"
+}
+
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
@@ -4318,7 +4444,7 @@ write_tfvars_from_state() {
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(name)" 2>&1 >/dev/null || true; })"
-    if ! printf '%s' "$describe_err" | grep -qiE "not.?found|404"; then
+    if ! gke_describe_error_is_not_found "$describe_err"; then
       print_error "Could not probe cluster '${CLUSTER_NAME}': ${describe_err:-unknown gcloud failure}"
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1

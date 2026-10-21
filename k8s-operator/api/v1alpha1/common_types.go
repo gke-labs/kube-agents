@@ -408,6 +408,13 @@ type HarnessSpec struct {
 	// +optional
 	DriftDetector *DriftDetectorSpec `json:"driftDetector,omitempty"`
 
+	// StallWatch tunes the controller stall watch — the stall-watch cron job on the
+	// Platform Agent's roster that sweeps the fleet for controllers that stopped
+	// making progress and raises an alert for each new stall. Absent keeps the
+	// watch's built-in behaviour.
+	// +optional
+	StallWatch *StallWatchSpec `json:"stallWatch,omitempty"`
+
 	// Tuning sets per-persona execution limits. Unset values keep the defaults
 	// baked into the agent image.
 	// +optional
@@ -590,6 +597,56 @@ type DriftDetectorSpec struct {
 	// objects has the same effect as leaving it empty.
 	// +optional
 	GitopsManagers string `json:"gitopsManagers,omitempty"`
+}
+
+// StallWatchSpec configures the stall-watch cron job (stall_watch.py), which
+// runs stall_report.py over every non-system namespace of every cluster with a
+// Cluster Agent profile and raises an alert for each namespace with a new stall.
+//
+// Every field reaches the script through the managed .env, so a change rolls the
+// pod, and the agent cannot override a value through its own .env. Apart from
+// these fields, a namespace or an object with the annotation
+// `kubeagents.x-k8s.io/stall-watch: exempt` is left out of the watch's alerts.
+type StallWatchSpec struct {
+	// ExcludeNamespaces names namespaces the watch never reads, on every cluster,
+	// in addition to the system namespaces it always skips. Matched exactly. An
+	// open alert in a namespace added here is closed with a note that the
+	// namespace was excluded.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	ExcludeNamespaces []string `json:"excludeNamespaces,omitempty"`
+
+	// MinStallAgeMinutes holds a new alert until one of the namespace's stalls has
+	// lasted at least this long. The age is the longer of what stall_report.py
+	// measures on the object and how long the watch has seen it. A stall that is
+	// younger stays in the watch's ledger and is checked again on each run; an
+	// object that joins a namespace with an open alert is not held. Absent or 0
+	// alerts on the first run that sees the stall.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1440
+	// +optional
+	MinStallAgeMinutes *int32 `json:"minStallAgeMinutes,omitempty"`
+
+	// Kinds replaces the watch's default list of resources to scan (Deployments,
+	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
+	// cert-manager Certificates). Each item is a kubectl resource name such as
+	// `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
+	// scans every namespaced kind the cluster serves, one read per kind per
+	// namespace, which is slow on a large fleet. Absent or empty keeps the
+	// default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+	// ControllerRevisions and Leases are refused: the scan reports nothing from
+	// them, and a Secret listing would carry every body.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=20
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k == 'all') || self.size() == 1",message="kinds: all must be the only item"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.split('.')[0] in ['secrets', 'secret', 'configmaps', 'configmap', 'cm', 'events', 'event', 'ev', 'endpoints', 'endpoint', 'ep', 'endpointslices', 'endpointslice', 'controllerrevisions', 'controllerrevision', 'leases', 'lease'])",message="kinds: secrets, configmaps, events, endpoints, endpointslices, controllerrevisions and leases are never scanned"
+	// +optional
+	Kinds []string `json:"kinds,omitempty"`
 }
 
 // TuningSpec carries execution limits per agent persona.
@@ -1066,7 +1123,11 @@ type StorageSpec struct {
 
 // AvailabilitySpec defines high availability and scheduling settings.
 type AvailabilitySpec struct {
-	// Replicas specifies the desired number of pod replicas. If omitted, defaults to 1.
+	// Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1.
+	// The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and
+	// the ReplicasLimited status condition says so. A multi-replica gateway does not start yet,
+	// because its leader election has no in-cluster ServiceAccount token to use and the data
+	// volumes an install creates at one replica are ReadWriteOnce.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
@@ -1343,10 +1404,8 @@ type EgressAllowlistSpec struct {
 	// chose at creation time or at a public address, and the in-cluster
 	// "kubernetes" Service is translated to that address before policy is
 	// evaluated. Leaving this empty is allowed and is the stricter choice. It
-	// costs the agent container its API-server connection, which matters at
-	// spec.deployment.replicas above 1, where the container runs
-	// leader_elect.py and holds a Lease, and to any sidecar or plugin you
-	// added that talks to the API. Find the range with
+	// costs the agent container its API-server connection, which matters to
+	// any sidecar or plugin you added that talks to the API. Find the range with
 	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
 	// On a cluster with a public endpoint that command emits a bare address;
 	// paste it as-is and it is widened to a single-host prefix.
@@ -1591,7 +1650,9 @@ type ForgeSpec struct {
 	// group or project access token, or a dedicated account's personal access
 	// token where the tier offers neither. It is mounted into the credential
 	// broker's pod only, never the agent's or the sandbox's, and read on every
-	// call, so rotating the token is updating the Secret.
+	// call, so rotating the token is updating the Secret. The Secret may also
+	// hold a read-only token under the key `read-token`; the broker presents it
+	// only to clone the forge's context repositories, never on a write.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 
@@ -2059,19 +2120,26 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal,
-// RemediationsProposedTotal, RemediationsMergedTotal,
+// update, and ToolExecutionsTotal, ToolExecutionsBlockedTotal, EventsIngestedTotal,
+// SessionsTotal, RemediationsProposedTotal, RemediationsMergedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's, the event watcher's and the chat
-// plugin's metrics
+// ClustersMonitored from the broker's, the event watcher's, the chat
+// plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status. SessionsTotal and
-// RemediationsAppliedTotal are declared so that the schema names them, but
-// nothing writes them yet, and each is absent (omitempty) until a series
-// exists for it.
+// ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
+// is declared so that the schema names it, but nothing writes it yet, and it
+// is absent (omitempty) until a series exists for it.
 type AgentUsageStatus struct {
-	// SessionsTotal is the cumulative number of interactive sessions handled.
-	// Nothing writes it yet.
+	// SessionsTotal is the cumulative count of sessions the agent opened: the
+	// triage sessions the event watcher opened for events the daemon
+	// delivered (its k8s_event_watcher_triage_sessions_total; a session
+	// whose inject was filtered, suppressed or failed is not counted) plus
+	// the chat conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
+	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// chat conversation that resumes after the session store's retention
+	// window (seven days by default) counts again. Read every five minutes
+	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 
@@ -2091,7 +2159,8 @@ type AgentUsageStatus struct {
 	// it rejected or failed on before running: its success and error outcomes.
 	// Read from the broker's kubeagents_tool_invocations_total every five
 	// minutes and kept monotonic the same way; commands refused by policy,
-	// busy and abandoned are not counted.
+	// busy and abandoned are not counted here but in
+	// ToolExecutionsBlockedTotal.
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
@@ -2146,6 +2215,22 @@ type AgentUsageStatus struct {
 	// +optional
 	ChatMessagesInboundTotal int64 `json:"chatMessagesInboundTotal,omitempty"`
 
+	// ToolExecutionsBlockedTotal is the cumulative count of requests the
+	// credential broker did not run to an exit: its blocked outcome
+	// (a policy refusal), its busy outcome (the broker's command slots or its
+	// child memory budget held the request for the whole wait) and its
+	// abandoned outcome (the caller hung up while the request was queued or
+	// running). Read from the same kubeagents_tool_invocations_total as
+	// ToolExecutionsTotal, over the other three statuses, every five minutes
+	// and kept monotonic the same way; the two together are every request the
+	// broker's exec route took as far as its policy; a request it
+	// rejected as malformed before that reaches neither. A rising share of this against
+	// ToolExecutionsTotal says the agent keeps asking for what its mode or
+	// policy refuses, or that the broker is saturated. Moves LastActiveTime:
+	// a refused command is still the agent at work.
+	// +optional
+	ToolExecutionsBlockedTotal int64 `json:"toolExecutionsBlockedTotal,omitempty"`
+
 	// ClustersRegistered is the number of clusters the event watcher built a
 	// client for at its last start: the management cluster and the Cluster
 	// Agent profiles the GKE API would describe, the management cluster
@@ -2189,8 +2274,9 @@ type AgentUsageStatus struct {
 	ActiveInterfaces []string `json:"activeInterfaces,omitempty"`
 
 	// LastActiveTime is the time of the last poll in which a counter above
-	// moved: a brokered command ran, a proposal was opened or merged, a chat
-	// message reached the gateway, or an event was accepted for triage.
+	// moved: a brokered command ran or was refused, a proposal was opened or
+	// merged, a chat message reached the gateway, or an event was accepted
+	// for triage.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

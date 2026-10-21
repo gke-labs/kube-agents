@@ -151,7 +151,8 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
-   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)).
+   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)), and
+5. the install's `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is not `false` (step 7 below).
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
@@ -312,7 +313,8 @@ Accepted risk: this can close a PR a human was mid-review on. Mitigations, all t
 - The closing comment states plainly that the PR may be reopened, and says **exactly** what happens
   if the finding returns: a manifest finding graded at or above the auto-promotion floor is normally
   re-proposed automatically on this same branch, at most five per run, and anything else is listed on the ledger as awaiting
-  `/remediate <finding-id>`. The comment is not allowed to promise a fresh pull request to every
+  `/remediate <finding-id>`; on an install whose `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is off, that nothing is
+  re-proposed without a `/remediate`. The comment is not allowed to promise a fresh pull request to every
   reader, because auto-promotion does not open one for every reader — and the findings it silently
   would not re-propose are precisely the low-severity ones nobody is watching for.
 - **The branch is not deleted on close.** Branches are cheap and any human fixup pushed to the branch
@@ -557,6 +559,10 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
    five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
    authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
+   An install turns the automatic half off with `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in
+   `spec.deployment.env` (the operator forwards it to the shell sandbox, whose entrypoint writes
+   it to a root-owned file the script reads first): the ledger then lists what the sweep would have
+   opened as awaiting `/remediate`, the only way a pull request opens there. The eval's inject lane runs that way.
 8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.
@@ -743,13 +749,30 @@ headroom for the trailing marker and for anything a later section appends.
   five criticals and three hundred minors publishes all five criticals no matter what. In a
   severity band, selection takes one finding for each target in turn while the band has space: no
   target gets a second row before every target in the band has one. When the band has fewer slots
-  than targets, the targets late in the alphabet still lose their rows. The body still shows the
+  than targets, the targets late in the alphabet lose their full rows first (see the next bullet
+  for the one-line tier). The body still shows the
   selected findings in display order.
+- **A name outranks a full block, except a critical's.** When the full blocks do not all fit, the
+  findings left over are each listed on one line — severity, title, location, id, then any fix
+  state and its pull request — under
+  `### Listed without detail (N)`. Bands are taken most severe first. A non-critical band shows as
+  many full blocks as still leave room to name the rest of it and every finding below it; the
+  critical band keeps room for its own names only, so a critical never loses its evidence to a less
+  severe finding's name. When naming everything below cannot fit even with no full blocks, a
+  non-critical band keeps only its floor of full blocks and spends the rest on names. Every band below the one where full blocks stop is names only,
+  as many as fit, then a count. A listed line is a
+  bullet, never a `####` heading, so the readers that recover a finding's detail from its heading
+  (`FINDING_MARKER_RE`, the Slack card) do not take it for one. Its id rides the delta marker like a
+  full row's, and `parse_finding_locations` reads its row with the full blocks, only between
+  the renderer's `audit-listed:begin`/`end` comments, which model text cannot spell: the ledger names it,
+  so the delta, the collector hold, the clean close and the `carried` list `start` prints all treat
+  it as on the ledger. A listed finding that gains a full block when others resolve is not new, and
+  one that stops reproducing is resolved.
 - **Truncation is stated, counts are not.** When findings are omitted the body says so explicitly,
   and the title's counts remain the **true totals**. The reader is never told there are fewer
   findings than there are.
 - **The delta marker describes what was rendered.** The hidden marker lists exactly the findings the
-  body contains, not the full finding set — and, after them, the collector-held ids the body carries
+  body names, in full or on one line (see the bullet on the one-line tier above), not the full finding set — and, after them, the collector-held ids the body carries
   under their own heading (collector design §3.3). Otherwise the next run would see a truncated finding
   absent from the previous marker, or present in it and absent from the body, and report a finding
   that is very much still reproducing as _resolved_. The marker is itself a size term and was
@@ -762,9 +785,10 @@ headroom for the trailing marker and for anything a later section appends.
   term that grows with the fleet and is invisible in the rendered body is the worst kind to leave
   unbounded.
 - **The two halves of the delta are measured against different sets**, because "appeared" and "was
-  fixed" are different claims and truncation breaks them apart. `new` is _rendered minus previous_:
-  the previous marker records what the last body rendered, so comparing it to anything wider
-  announces every budget-dropped finding as new, every morning, forever. `resolved` is _previous
+  fixed" are different claims and truncation breaks them apart. `new` is _named minus previous_:
+  the previous marker records what the last body named, so comparing it to anything wider
+  announces every budget-dropped finding as new, every morning, forever; and a finding the last run
+  filed (its stored document) is left out of `new` too, whatever the last body showed. `resolved` is _previous
   minus **every** current finding, rendered or not_: a finding cut for space still reproduces, and
   calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
   to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
@@ -774,10 +798,11 @@ headroom for the trailing marker and for anything a later section appends.
   ledger for a finding that sorted last cannot tell "cut for space" from "never found". A body that
   omitted findings therefore carries a second hidden block, `<!-- audit-findings-all: [...] -->`,
   with every current id and the collector-held ids. Nothing joins against it: the delta keeps
-  reading the rendered marker, for the reason the bullet above gives, so a cut finding is announced
-  as new the first run it renders, whatever freed the room. Findings are selected once without the
+  reading the marker, for the reason the bullets above give, and, when the report store holds the last run's
+  document, `new` also leaves out any finding the last
+  run filed (its stored document), so an omitted finding that gains room is not announced as new. Findings are selected once without the
   block and, only if that cut something, again with it charged, so it never truncates a body that
-  would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap: about 3 of 37 rendered findings at 60 ids of 70 characters, about 8 at the cap. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
+  would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap and is paid in full blocks turned into one-line names, and names turned into the omitted count. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
   characters) it is left out rather than truncated, since a partial complete list would be the same
   ambiguity with a different name.
 - **A finding new since the last run is marked where the run knows it.** A `<!-- finding-new -->`
@@ -1361,8 +1386,10 @@ belief is wrong, so raising the constant to 200,000 would keep them all green wh
 422s. One test — and only one — asserts the constant equals the literal.
 
 - A run of 250 findings renders a body at or under the limit.
-- The hidden delta block contains exactly the ids the body rendered — no more, no fewer.
-- A truncated body's `audit-findings-all` block lists every finding id; an untruncated body carries
+- The hidden delta block contains exactly the ids the body names, in full or on one line — no more,
+  no fewer.
+- A body that omitted findings carries an `audit-findings-all` block listing every
+  finding id; an untruncated body carries
   none, and a list over `ALL_FINDINGS_BLOCK_CAP` is left out.
 - 5 critical plus 300 minor findings keeps all 5 criticals.
 - 10 findings render untruncated, with no "omitted" notice and no trimmed command.

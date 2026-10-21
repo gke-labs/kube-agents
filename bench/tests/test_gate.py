@@ -1348,6 +1348,51 @@ def test_rung_6_arms_itself_once_the_store_has_judged_evidence(
     assert doc["baseline_judged"]["OutcomeValidity"] == 1.0
 
 
+def test_rung_6_stays_off_on_the_inject_lane(kanban_task, tmp_path, monkeypatch, make_run, capsys):
+    """Main's judged record is the api transport's under today, at a key that
+    carries neither, so an inject run is not compared with it: the same sour
+    runs that red on rung 6 above are not blocked there, the note says why,
+    and main's mean is still reported."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "agent-kanban-smoke")
+    monkeypatch.setenv(gate.AGENT_TRANSPORT_ENV, gate.TRANSPORT_INJECT)
+
+    def sour(rec):
+        rec["scores"]["OutcomeValidity"]["score"] = 0.1
+
+    runs = [make_run(mutate=sour) for _ in range(3)]
+    seeded = store_with(
+        tmp_path / "seeded",
+        *[
+            baseline_line(
+                "agent-kanban-smoke", runs=3, passes=3,
+                judged={"OutcomeValidity": {"mean": 1.0, "n": 3}},
+                at=f"2026-08-0{i + 1}T00:00:00Z",
+            )
+            for i in range(7)
+        ],
+    )
+    doc = graded_case(kanban_task, runs, tmp_path / "case.json", seeded)
+    assert doc["rung"] != 6 and doc["blocking"] is False
+    assert gate.JUDGED_OFF_ON_INJECT_NOTE in doc["notes"]
+    assert doc["baseline_judged"]["OutcomeValidity"] == 1.0
+    assert gate.JUDGED_OFF_ON_INJECT_NOTE in capsys.readouterr().err
+
+
+def test_rung_6_off_note_is_absent_without_judged_evidence(kanban_task, tmp_path, monkeypatch, make_run):
+    """Nothing to compare against is not a comparison switched off."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    monkeypatch.setenv(gate.AGENT_TRANSPORT_ENV, gate.TRANSPORT_INJECT)
+    doc = graded_case(kanban_task, [make_run()], tmp_path / "case.json", store_with(tmp_path / "empty"))
+    assert gate.JUDGED_OFF_ON_INJECT_NOTE not in (doc.get("notes") or [])
+
+
+def test_the_transport_constants_match_the_harness():
+    from kube_agents_bench import harness
+
+    assert gate.TRANSPORT_INJECT == harness.TRANSPORT_INJECT
+
+
 def test_a_corrupt_store_is_never_read_as_an_empty_one(kanban_task, tmp_path, capsys):
     """Empty means "nothing admitted, aggregate advisory", which is a
     legitimate green. A corrupt file reaching that state would disarm the gate

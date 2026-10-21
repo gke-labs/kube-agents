@@ -57,9 +57,9 @@ install without the interview.
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
   `install.env`; `platform_agent_mode` (default `"today"`, which passes the
   chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
-  `spec.mode`, and `"next"` also renders the NATS bus and the A2A gateway, a
-  development stack. `install.sh` sets it from `PLATFORM_AGENT_MODE` in
-  `install.env`. Changing it on a running install is a mode switch
+  `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
+  the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
+  which a first install records as `"next"`. Changing it on a running install is a mode switch
   ([`docs/designs/spec-mode-switch.md`](../../../docs/designs/spec-mode-switch.md)).
   `alert_daily_limits` (default `{}`) sets the daily alert ceilings, and
   `install.sh` sets it from the `ALERT_DAILY_LIMIT_*` keys in `install.env`.

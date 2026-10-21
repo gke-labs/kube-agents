@@ -104,9 +104,10 @@ A release-candidate run does not append either, and it is the case the sentence
 above does not cover: the candidate is a commit on `main`, and the run measuring
 it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 `RC_COMMIT_SHA` being set is the third condition, enforced in the same two
-places. `EVAL_MODE_NEXT=1` is the fourth, for the same reason: the next lane's
-periodic on `main` is also a periodic with no `PULL_NUMBER`, and `VersionKey`
-has no mode field, so its samples would be today's once written. That one is
+places. `EVAL_MODE_NEXT=1` is the fourth, for the same reason: the next-mode
+nightly and the today lane's periodic on `main` (which deploys `next` and rolls
+it back before its matrix) are also periodics with no `PULL_NUMBER`, and
+`VersionKey` has no mode field, so their samples would be today's once written. That one is
 enforced in `hack/ci-eval-pr.sh` alone, because `bench-gate record` has no
 notion of the mode; it goes when the key gains one. The third has to be,
 because the mistake is not correctable afterwards:
