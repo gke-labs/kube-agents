@@ -266,11 +266,10 @@ times. It rides with the audits stage, whose eval case covers both.
   it end; nothing holds a finding back to meet a target.
 - **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
   audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
-  onboarding report, sent on the first message, names every audit the stage started or adopted and
-  that finished whose summary failed to deliver (`bootstrap_delivery._undelivered_audits`). A held,
-  given-up or skipped audit's scheduled run is not named yet
-  ([#3283](https://github.com/gke-labs/kube-agents/issues/3283)). Posting the report there at T+0
-  when one is set is a separate change.
+  onboarding report, sent on the first message, names every shipped fleet audit that ran since the
+  sweep was filed and whose summary was not posted, whether the stage started it, held it, gave up on
+  it or skipped the chain, with a request that fetches those reports (`bootstrap_delivery._lost_audits`).
+  Posting the summaries themselves after the report is a separate change.
 - **An install self-check.** Not asked for by any issue.
 
 ## 8. Build order and evaluation
