@@ -380,7 +380,9 @@ const (
 //     probe warnings, the crash-loop family, and retryable image pulls.
 //  5. The settle family (settleApplies) has lasted the settle period by the
 //     event's own first and last sighting, so a failure that clears on its
-//     own inside it is never forwarded (gateSettle). Off at --settle=0.
+//     own inside it is not forwarded (gateSettle); the dispatcher measures a
+//     repeat blip from its own start while its memo remembers the first.
+//     Off at --settle=0.
 //  6. FailedScheduling is a stuck pod rather than a scale-up in progress,
 //     read from cluster-autoscaler's verdict on the pod when there is one and
 //     from the repeat count when there is not (failedSchedulingGate). The two

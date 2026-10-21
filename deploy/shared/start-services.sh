@@ -337,7 +337,7 @@ WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-15m}"
 # event's own first and last sighting, before the watcher forwards it. It
 # runs after the count debounces above: a failure has to have repeated AND
 # lasted. A BackOff that clears inside it, kubelet warming its object cache on
-# a fresh Autopilot node, is never forwarded; a real crash loop crosses it on
+# a fresh Autopilot node, is not forwarded; a real crash loop crosses it on
 # its fourth or fifth back-off and is forwarded with its first sighting kept.
 # Never applied to OOMKilled, the image-pull family or FailedScheduling, which
 # have gates of their own. Set to 0 to switch it off.

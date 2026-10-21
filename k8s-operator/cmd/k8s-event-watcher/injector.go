@@ -120,8 +120,8 @@ type injectResponse struct {
 	// that lists it posts a k8s-event-followup into the alert's thread; one
 	// that does not takes that kind down the event path and would post a
 	// second alert, so the dispatcher sends none to it (dedupEntry.
-	// FollowupSupported). Negotiated here rather than on /healthz because the
-	// answer is per inject and this is the channel the watcher already reads.
+	// FollowupSupported). The same feature is read again off /healthz before
+	// each tick's follow-ups (Features), for the daemon of that moment.
 	Features []string `json:"features,omitempty"`
 }
 

@@ -148,7 +148,7 @@ The Go event watcher marshals an `InjectPayload`, wraps it as `{"message": "<esc
 `POST`s it to `/sessions/{id}/inject` (`k8s-operator/cmd/k8s-event-watcher/injector.go`). The watcher
 sends **no prompt** — it sends facts. Noise control lives here too: namespace allow/deny rules, a
 flapping guard, a two-minute settle period for the crash-loop family (a back-off that clears sooner
-is never forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
+is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
 is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
 watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread.
 

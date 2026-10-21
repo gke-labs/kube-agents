@@ -99,14 +99,10 @@ class FollowupInjectTest(unittest.TestCase):
         send.assert_not_called()
         comment.assert_not_called()
 
-    def test_the_message_falls_back_to_the_ledger_row_for_the_object(self):
-        session_kv_server.record_intercepted_event(
-            cluster="prod-a", namespace="payments", workload="api", object_uid="u1", object_kind="Pod",
-            reason="OOMKilled", message="m", severity="Critical", occurrences=1, notified=True,
-            session_id="k8s-evt-ledger",
-        )
-        bare = {"kind": "k8s-event-followup", "last_seen": LAST_SEEN}
-        text = session_kv_server._followup_message("k8s-evt-ledger", bare,
+    def test_the_message_reads_without_stamps_or_object(self):
+        bare = {"kind": "k8s-event-followup", "namespace": "payments", "name": "api", "cluster": "prod-a",
+                "reason": "OOMKilled", "last_seen": LAST_SEEN}
+        text = session_kv_server._followup_message("k8s-evt-bare", bare,
                                                    now=datetime(2026, 8, 10, 15, 45, tzinfo=timezone.utc))
         self.assertIn("`payments/api` on `prod-a` for 16 min", text)
         self.assertIn("Quiet since 15:28 UTC", text)
@@ -165,7 +161,7 @@ class TriageWatchdogTest(unittest.TestCase):
             self.assertEqual(session_kv_server._card_for_alert_session("k8s-evt-locked"), session_kv_server.BOARD_UNREADABLE)
             self.assertFalse(session_kv_server._comment_alert_card("k8s-evt-locked", "x"))
 
-    def test_is_armed_once_the_turn_starts_and_not_for_an_unthreaded_alert(self):
+    def test_arming_takes_the_interval_and_skips_an_unthreaded_alert(self):
         with patch.object(session_kv_server.threading, "Timer") as timer:
             session_kv_server._schedule_triage_watchdog("s1", "slack", "C0HOME", "t4")
             timer.assert_called_once()

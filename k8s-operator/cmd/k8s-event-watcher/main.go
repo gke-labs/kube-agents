@@ -75,6 +75,9 @@ const (
 	// holds and looks for quiet incidents: the dedup snapshot's cadence, so a
 	// follow-up lands within half a minute of its period.
 	sweepInterval = 30 * time.Second
+	// settleClearedFloor is the least time a cleared key's tombstone is kept
+	// (settleClearedTTL): the API server's default event TTL.
+	settleClearedFloor = time.Hour
 	// followupMessage is the Message of a k8s-event-followup payload: what
 	// the watcher knows, and no more.
 	followupMessage = "no new events for this object since the last sighting"
@@ -156,7 +159,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.IntVar(&f.imagePullTransientMinCount, "imagepull-transient-min-count", 3, "Require this many consecutive image-pull failures before firing, when the error looks self-clearing (registry 429/5xx, timeouts). Terminal causes such as a bad tag, and any cause the classifier does not recognize, always fire on the first event. 1 = fire on the first event.")
 	fs.IntVar(&f.failedSchedulingMinCount, "failedscheduling-min-count", defaultFailedSchedulingMinCount, "Require this many consecutive FailedScheduling events before firing, when cluster-autoscaler has recorded no verdict on the pod. A NotTriggerScaleUp on the pod fires at any count; a TriggeredScaleUp holds at any count for --scaleup-hold. Both need their reason in --reason. 1 = fire on the first event.")
 	fs.DurationVar(&f.scaleUpHold, "scaleup-hold", defaultScaleUpHold, "How long a TriggeredScaleUp on a pod holds its FailedScheduling events, measured from the autoscaler's event to the FailedScheduling's own last sighting. Past it the count threshold applies again. Cluster-autoscaler's default node-provision timeout.")
-	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is never forwarded. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
+	fs.DurationVar(&f.settle, "settle", defaultSettle, "How long a failure in the settle family (the crash-loop family, FailedMount, Unhealthy; the reasons kubelet re-emits while they last) has to have lasted, by the event's own first and last sighting, before it is forwarded; a failure that clears inside it is not forwarded, and a repeat blip on the same event object is measured from its own start while the in-process memo remembers the first. Applied after the count thresholds, never to OOMKilled, the image-pull family or FailedScheduling. 0 = off.")
 	fs.DurationVar(&f.quietAfter, "quiet-after", defaultQuietAfter, "How long after its last sighting an incident whose alert went out is reported quiet: the daemon gets one k8s-event-followup inject for it, which it posts into the alert's thread. Silence is read off the events alone; no object is read back. 0 = off.")
 	fs.BoolVar(&f.autopilotScaleToZeroHold, "autopilot-scale-to-zero-hold", true, "Hold FailedScheduling saying 'no nodes available to schedule pods' on an Autopilot cluster with no cluster-autoscaler verdict on the pod: an Autopilot cluster with no user workloads scales to zero and leaves GKE's own system pods Pending by design. =false reports them, on the count backstop as before. Zero nodes on a GKE Standard cluster is a fault and still fires. Requires both TriggeredScaleUp and NotTriggerScaleUp in --reason, without which no verdict can be recorded and 'no verdict' would not distinguish an abandoned pod from a declined one; the hold turns itself off and logs when either is missing, which includes the shipped --reason default.")
 
@@ -199,6 +202,20 @@ func (f *flags) filterThresholds() filterThresholds {
 		disableAutopilotScaleToZeroHold: !f.autopilotScaleToZeroHold,
 		settle:                          settleThreshold(f.settle),
 	}
+}
+
+// settleClearedTTL is how long the settle memo keeps a cleared key's
+// tombstone: the dedup window, past which a repeat is a new incident anyway,
+// but never less than settleClearedFloor, the API server's default event
+// TTL, inside which kubelet's recorder still holds the blip's event object
+// and a repeat arrives with the old first sighting. The binary's own 5m
+// window default would otherwise forget a blip twelve minutes after it
+// cleared and forward its repeat at once.
+func settleClearedTTL(dedupWindow time.Duration) time.Duration {
+	if dedupWindow > settleClearedFloor {
+		return dedupWindow
+	}
+	return settleClearedFloor
 }
 
 // settleThreshold turns the flag's reading into the config's: on the flag 0
@@ -563,7 +580,7 @@ func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
 		scaleUps:    newScaleUpMemo(scaleUpMemoTTL(f.dedupWindow, filter.cfg.scaleUpHold), defaultScaleUpEntries),
-		settles:     newSettleMemo(defaultSettleEntries, f.dedupWindow),
+		settles:     newSettleMemo(defaultSettleEntries, settleClearedTTL(f.dedupWindow)),
 		injector:    inj,
 		metrics:     m,
 		mode:        f.mode,
@@ -718,6 +735,13 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			d.settles.Hold(ev, canonical, d.clock())
 			log.Printf("held %s pod=%s/%s (count=%d, lasted %s of the %s settle period); not forwarded yet",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Count, ev.LastSeen.Sub(ev.FirstSeen).Round(time.Second), d.filter.cfg.settle)
+		}
+		// A settle-family sighting the count gate stopped is a blip the memo
+		// has to remember too: one that clears at two sightings and repeats
+		// inside the event's TTL would otherwise arrive at count three with
+		// the object's old first sighting and no tombstone to measure from.
+		if gate == gateBackoffMinCount && d.filter.cfg.settle > 0 && settleApplies(canonical) {
+			d.settles.Hold(ev, canonical, d.clock())
 		}
 		if gate == gateScaleUpMark {
 			verdict := scaleUpVerdictFor(ev.Key.Reason)
@@ -904,6 +928,16 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 	if len(candidates) == 0 {
 		return
 	}
+	if d.dryRun || d.injector == nil {
+		// Dry-run builds no injector. A candidate reaches it only through a
+		// snapshot a live run wrote; print it as Dispatch prints payloads.
+		for _, q := range candidates {
+			out, _ := json.MarshalIndent(d.followupPayload(q), "", "  ")
+			fmt.Printf("--- dry-run follow-up for session %q ---\n%s\n", q.SessionID, string(out))
+			d.dedup.MarkQuietNotified(q.Key)
+		}
+		return
+	}
 	// The daemon of this moment, not the one that answered the alert: an
 	// agent image rolled back to a build without the follow-up branch would
 	// take the kind down the event path and post a second alert.
@@ -920,29 +954,7 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 	}
 	d.noFollowupLogged.Store(false)
 	for _, q := range candidates {
-		payload := InjectPayload{
-			Kind:         injectKindFollowup,
-			Reason:       q.Key.Reason,
-			Namespace:    q.Namespace,
-			KindOfObject: q.Kind,
-			Name:         q.Name,
-			UID:          q.Key.UID,
-			Message:      followupMessage,
-			Count:        q.Count,
-			FirstSeen:    q.FirstSeen,
-			LastSeen:     q.LastSeen,
-			Cluster:      d.cluster.Name,
-			Project:      d.cluster.ProjectID,
-			Location:     d.cluster.Location,
-			Type:         eventTypeWarning,
-		}
-		if d.dryRun {
-			out, _ := json.MarshalIndent(payload, "", "  ")
-			fmt.Printf("--- dry-run follow-up for session %q ---\n%s\n", q.SessionID, string(out))
-			d.dedup.MarkQuietNotified(q.Key)
-			continue
-		}
-		answer, err := d.injector.InjectDetailed(ctx, q.SessionID, payload)
+		answer, err := d.injector.InjectDetailed(ctx, q.SessionID, d.followupPayload(q))
 		if err != nil {
 			d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, followupOutcomeError).Inc()
 			log.Printf("dispatcher: follow-up for %s/%s (sid=%s): %v", q.Namespace, q.Name, q.SessionID, err)
@@ -964,6 +976,28 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 		d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, outcome).Inc()
 		log.Printf("followup %s pod=%s/%s → sid=%s %s (quiet since %s, %s ago)",
 			q.Key.Reason, q.Namespace, q.Name, q.SessionID, outcome, q.LastSeen.UTC().Format(time.RFC3339), now.Sub(q.LastSeen).Round(time.Second))
+	}
+}
+
+// followupPayload is the k8s-event-followup inject for a quiet incident: the
+// object and the alerted event's own first sighting and count, the last real
+// sighting, and the dispatcher's cluster.
+func (d *dispatcher) followupPayload(q quietIncident) InjectPayload {
+	return InjectPayload{
+		Kind:         injectKindFollowup,
+		Reason:       q.Key.Reason,
+		Namespace:    q.Namespace,
+		KindOfObject: q.Kind,
+		Name:         q.Name,
+		UID:          q.Key.UID,
+		Message:      followupMessage,
+		Count:        q.Count,
+		FirstSeen:    q.FirstSeen,
+		LastSeen:     q.LastSeen,
+		Cluster:      d.cluster.Name,
+		Project:      d.cluster.ProjectID,
+		Location:     d.cluster.Location,
+		Type:         eventTypeWarning,
 	}
 }
 

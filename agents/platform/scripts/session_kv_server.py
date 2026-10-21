@@ -5178,26 +5178,6 @@ def _hhmm_utc(stamp: Any) -> str:
         return ""
 
 
-def _ledger_object_for_session(session_id: str) -> Dict[str, str]:
-    """The newest ledger row written for the session, as the fields a message
-    names, or {} when there is none: the follow-up's payload carries the
-    object too, but an entry restored from an older watcher's snapshot does
-    not, and the row was written when the alert went out."""
-    try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
-            row = conn.execute(
-                "SELECT cluster, namespace, workload, object_kind, reason FROM intercepted_events "
-                "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
-                (session_id,),
-            ).fetchone()
-    except sqlite3.Error as exc:
-        logger.error(f"Failed to read the ledger row for {session_id}: {exc}")
-        return {}
-    if not row:
-        return {}
-    return dict(zip(("cluster", "namespace", "workload", "object_kind", "reason"), (str(v or "") for v in row)))
-
-
 def _thread_has_report(chat_id: str, thread_id: str) -> bool:
     """Whether a triage report has been stored for the thread (``POST /v1/incidents``)."""
     try:
@@ -5248,12 +5228,13 @@ def _comment_alert_card(session_id: str, text: str) -> bool:
 
 def _followup_message(session_id: str, payload: Dict[str, Any], now: Optional[datetime] = None) -> str:
     """The quiet follow-up's one line: what went quiet, since when, and that
-    silence is all the watcher knows."""
-    ledger = _ledger_object_for_session(session_id)
-    namespace = payload.get("namespace") or ledger.get("namespace") or ""
-    name = payload.get("name") or ledger.get("workload") or ""
-    cluster = payload.get("cluster") or ledger.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
-    reason = payload.get("reason") or ledger.get("reason") or "warning"
+    silence is all the watcher knows. The object comes from the payload: the
+    watcher binds it on the entry when the alert goes out, and sends a
+    follow-up for no entry that lacks it."""
+    namespace = payload.get("namespace") or ""
+    name = payload.get("name") or ""
+    cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+    reason = payload.get("reason") or "warning"
     subject = f"`{namespace}/{name}`" if namespace and name else (f"`{name}`" if name else "the object")
     where = f" on `{cluster}`" if cluster else ""
     since = _hhmm_utc(payload.get("last_seen"))

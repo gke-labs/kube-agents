@@ -110,6 +110,12 @@ func (m *settleMemo) Hold(ev TriageEvent, reason string, now time.Time) {
 	defer m.mu.Unlock()
 	key := settleKey(ev, reason)
 	prev, held := m.entries[key]
+	// A sighting that does not postdate a standing tombstone is a replay of
+	// the cleared blip (an informer relist inside the event's TTL): it opens
+	// no hold, or it would expire into a second self_resolved for one blip.
+	if c, ok := m.cleared[key]; ok && !held && c.Reappeared.IsZero() && !ev.LastSeen.After(c.EventLastSeen) {
+		return
+	}
 	if !held && len(m.entries) >= m.max {
 		var oldestKey string
 		var oldest time.Time

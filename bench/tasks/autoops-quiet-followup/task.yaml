@@ -90,8 +90,8 @@ verification_spec:
       type: report_contains
       # session_kv_server._followup_message's opening words. Red on a server
       # that does not handle k8s-event-followup, and on a watcher that never
-      # sends one: the plant would then time out, which is a broken fixture
-      # rather than a red, and the apply's error says which.
+      # sends one: the plant waits out its bound and returns either way, so
+      # the agent reads a card with no follow-up on it and the check reds.
       required_patterns: ['(?i)quiet since \d{2}:\d{2} UTC']
 
   - name: nothing-scaled-the-workload-away

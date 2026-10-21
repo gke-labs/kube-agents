@@ -190,6 +190,9 @@ func TestDispatcherSettleHoldsAndCountsASelfResolvedBlip(t *testing.T) {
 	if *count2 != 0 {
 		t.Errorf("a replayed cleared blip fired %d injects; want 0", *count2)
 	}
+	if got := fresh.settles.Len(); got != 0 {
+		t.Errorf("a replayed cleared blip opened %d hold(s); want none (it would expire into a second self_resolved)", got)
+	}
 	// The replay left the tombstone standing, so the live blip that follows
 	// is measured from its own first sighting and held, not forwarded on the
 	// object's hour-old span.
@@ -250,6 +253,28 @@ func TestDispatcherSettleForwardsALastingFailureWithItsContext(t *testing.T) {
 	}
 }
 
+// TestDispatcherSettleRemembersACountGatedBlip: a blip the count gate stopped
+// at two sightings leaves memo state too, so its repeat inside the event's
+// TTL is measured from its own start rather than forwarded at count three.
+func TestDispatcherSettleRemembersACountGatedBlip(t *testing.T) {
+	disp, _, injectCount, _ := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, settle: 2 * time.Minute})
+	disp.settles = newSettleMemo(0, 0)
+	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
+	now := t0
+	disp.now = func() time.Time { return now }
+	ctx := context.Background()
+	disp.Dispatch(ctx, settleBackoff(t0, 0, 1))
+	now = t0.Add(10 * time.Second)
+	disp.Dispatch(ctx, settleBackoff(t0, 10*time.Second, 2))
+	now = t0.Add(30 * time.Minute)
+	disp.Sweep(ctx) // cleared: a tombstone stands
+	now = t0.Add(40 * time.Minute)
+	disp.Dispatch(ctx, settleBackoff(t0, 40*time.Minute, 3))
+	if *injectCount != 0 {
+		t.Errorf("a repeat of a count-gated blip fired %d injects on its first sighting; want 0", *injectCount)
+	}
+}
+
 func TestSettleMemoEvictsItsOldestHoldWhenFull(t *testing.T) {
 	m := newSettleMemo(2, 0)
 	t0 := time.Now()
@@ -276,8 +301,9 @@ func TestSettleMemoEvictsItsOldestHoldWhenFull(t *testing.T) {
 // TestDispatcherSweepSendsOneQuietFollowUp: an alert goes out, the object is
 // sighted once more, then nothing. At --quiet-after the sweep sends one
 // k8s-event-followup on the alert's own session, naming the object and the
-// last sighting, and never a second one; a sighting inside the period, or an
-// entry whose alert never went out, sends none.
+// last sighting, and never a second one; a sighting inside the period, an
+// informer that has not synced, a cluster silent for the period, --quiet-after
+// 0 and shared mode each send none.
 func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	disp, m, injectCount, injected := newCountingDispatcher(t, filterThresholds{backoffMinCount: 1, settle: -1})
 	disp.quietAfter = 15 * time.Minute
@@ -306,18 +332,18 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	if *injectCount != 1 {
 		t.Fatalf("a sweep 9m after the last sighting sent a follow-up")
 	}
-	// Before the informer's first list has completed, nothing is quiet yet.
-	disp.ready.Store(false)
+	// Before the informer's first list has completed, nothing is quiet yet,
+	// even on a cluster that has just spoken.
 	now = t0.Add(time.Minute + 15*time.Minute)
+	heard := backoffEvent(1)
+	heard.Key.UID, heard.Key.Reason = "pod-heard", "Scheduled" // the cluster speaks inside the quiet period; not a reason on the list, so no alert
+	disp.Dispatch(ctx, heard)
+	disp.ready.Store(false)
 	disp.Sweep(ctx)
 	if *injectCount != 1 {
 		t.Fatalf("a sweep before the informer synced sent a follow-up")
 	}
 	disp.ready.Store(true)
-	now = t0.Add(time.Minute + 15*time.Minute)
-	heard := backoffEvent(1)
-	heard.Key.UID, heard.Key.Reason = "pod-heard", "Scheduled" // the cluster speaks inside the quiet period; not a reason on the list, so no alert
-	disp.Dispatch(ctx, heard)
 	disp.Sweep(ctx)
 	if *injectCount != 2 {
 		t.Fatalf("at quiet-after: %d injects; want 2 (the alert and one follow-up)", *injectCount)
@@ -512,9 +538,14 @@ func TestDispatcherSweepCountsAnUnroutedFollowUp(t *testing.T) {
 // down its event path and post a second alert, so it gets none.
 func TestDispatcherSweepSendsNoFollowUpToAnOlderDaemon(t *testing.T) {
 	injectCount := 0
+	healthzLists := true // flipped below: the daemon of the moment, as /healthz tells it
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == healthzPath {
-			_, _ = w.Write([]byte(`{"status": "ok", "inject_kinds": ["k8s-event", "k8s-event-followup"]}`)) // an older daemon: the kind, no feature
+			if healthzLists {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", injectFeaturesKey: []string{injectFeatureFollowup}})
+			} else {
+				_, _ = w.Write([]byte(`{"status": "ok", "inject_kinds": ["k8s-event", "k8s-event-followup"]}`)) // an older daemon: the kind, no feature
+			}
 			return
 		}
 		if r.URL.Path == "/sessions" {
@@ -524,7 +555,7 @@ func TestDispatcherSweepSendsNoFollowUpToAnOlderDaemon(t *testing.T) {
 		}
 		injectCount++
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status": "injected"}`))
+		_, _ = w.Write([]byte(`{"status": "injected"}`)) // the alert's answer lists no features
 	}))
 	t.Cleanup(server.Close)
 	inj, err := newInjector(injectorConfig{daemonURL: server.URL, bearerToken: "t", httpClient: server.Client()})
@@ -551,14 +582,86 @@ func TestDispatcherSweepSendsNoFollowUpToAnOlderDaemon(t *testing.T) {
 	disp.Dispatch(context.Background(), speaks) // the cluster speaks (a second alert); the first incident is 16m quiet
 	disp.Sweep(context.Background())
 	if injectCount != 2 {
-		t.Errorf("%d injects; want the two alerts alone (the alerts' answers listed no features)", injectCount)
+		t.Errorf("%d injects; want the two alerts alone: /healthz lists the feature but the alerts' answers did not, so no session is marked", injectCount)
 	}
-	// The session-level promise is not enough on its own: a daemon rolled
-	// back since the alert lists no feature on /healthz and gets none either.
+	// The session-level promise is not enough on its own either: a daemon
+	// rolled back since the alert lists no feature on /healthz and gets none.
 	disp.dedup.MarkFollowupSupported(backoffEvent(3).Key, backoffEvent(3).Message)
+	healthzLists = false
 	disp.Sweep(context.Background())
 	if injectCount != 2 {
 		t.Errorf("%d injects; a daemon whose /healthz lists no follow-up feature was sent one", injectCount)
+	}
+	// Both conditions met, the follow-up goes.
+	healthzLists = true
+	disp.Sweep(context.Background())
+	if injectCount != 3 {
+		t.Errorf("%d injects; want the follow-up once both the session's answer and /healthz list the feature", injectCount)
+	}
+}
+
+// TestDispatcherSweepRetriesAFailedFollowUp: an inject the daemon fails is
+// counted error, left unmarked, and sent again on the next sweep.
+func TestDispatcherSweepRetriesAFailedFollowUp(t *testing.T) {
+	injects, failNext := 0, false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == healthzPath {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", injectFeaturesKey: []string{injectFeatureFollowup}})
+			return
+		}
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "sess-r"})
+			return
+		}
+		injects++
+		if failNext {
+			failNext = false
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(injectResponse{Status: "injected", Features: []string{injectFeatureFollowup}})
+	}))
+	t.Cleanup(server.Close)
+	inj, err := newInjector(injectorConfig{daemonURL: server.URL, bearerToken: "t", httpClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
+	now := t0
+	m := newMetrics()
+	disp := &dispatcher{
+		filter: newFilter(newFilterConfig(nil, nil, nil, filterThresholds{backoffMinCount: 1, settle: -1})),
+		dedup:  dedup, pullClasses: newPullClassMemo(0, 0), injector: inj, metrics: m,
+		mode: "per-incident", quietAfter: 15 * time.Minute, now: func() time.Time { return now },
+		cluster: targetCluster{Name: "test-cluster"},
+	}
+	disp.dedup.now = func() time.Time { return now }
+	disp.ready.Store(true)
+	disp.Dispatch(context.Background(), backoffEvent(3)) // inject 1: the alert
+	now = t0.Add(16 * time.Minute)
+	speaks := backoffEvent(1)
+	speaks.Key.UID, speaks.Key.Reason = "pod-other", "Scheduled"
+	disp.Dispatch(context.Background(), speaks)
+	failNext = true
+	disp.Sweep(context.Background()) // inject 2: the follow-up, refused
+	if got := testutil.ToFloat64(m.followups.WithLabelValues("test-cluster", "", "", "CrashLoopBackOff", followupOutcomeError)); got != 1 {
+		t.Errorf("followups_total{outcome=error} = %v; want 1", got)
+	}
+	disp.Sweep(context.Background()) // inject 3: sent
+	if injects != 3 {
+		t.Errorf("%d injects; want the alert, the refused follow-up and its retry", injects)
+	}
+	if got := testutil.ToFloat64(m.followups.WithLabelValues("test-cluster", "", "", "CrashLoopBackOff", followupOutcomeSent)); got != 1 {
+		t.Errorf("followups_total{outcome=sent} = %v; want 1", got)
+	}
+	disp.Sweep(context.Background())
+	if injects != 3 {
+		t.Errorf("a sent follow-up was sent again (%d injects)", injects)
 	}
 }
 

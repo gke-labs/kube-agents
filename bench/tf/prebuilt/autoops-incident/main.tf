@@ -432,14 +432,14 @@ resource "null_resource" "incident" {
       done
       echo "BackOff reached the debounce threshold after $${elapsed}s."
 
-      # watcher_logged: has k8s-event-watcher logged a line of the given
-      # kind (a regex over its first word) for a pod in this namespace since
-      # the plant? The seam step 3 reads, named once for its two callers.
+      # watcher_logged: has k8s-event-watcher logged a line matching the
+      # given regex since the plant? The seam step 3 reads, named once for
+      # its two callers, each of which names this namespace's pods.
       watcher_logged() {
         kubectl logs "deployment/${var.agent_deployment}" \
             -n "${var.agent_namespace}" -c "${var.agent_container}" \
             --since-time="$started_at" --tail=-1 2>/dev/null \
-          | grep -qE "$1 .*pod=${local.ns}/"
+          | grep -qE "$1"
       }
       # ---- 3. Wait for the watcher to hand the event to the daemon ----------
       # Read from the watcher's own log rather than from the gateway's
@@ -466,7 +466,7 @@ resource "null_resource" "incident" {
       # loop is sequential. A leftover namespace on a DIFFERENT watched cluster,
       # which step 0b does not reach, or the concurrency of #637, would.
       elapsed=0
-      until watcher_logged "${local.watcher_handled}"; do
+      until watcher_logged "${local.watcher_handled} .*pod=${local.ns}/"; do
         if [ "$elapsed" -ge 300 ]; then
           echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no '${local.watcher_handled}' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \
@@ -486,7 +486,7 @@ resource "null_resource" "incident" {
         # is the behaviour the case grades, so the apply returns and the
         # agent turn reads a card with no follow-up on it, which is the red.
         elapsed=0
-        until watcher_logged "followup"; do
+        until watcher_logged "followup .*pod=${local.ns}/.* sent "; do
           if [ "$elapsed" -ge 1500 ]; then
             echo "k8s-event-watcher logged no 'followup' for a pod in ${local.ns} within $${elapsed}s (due WATCHER_QUIET_AFTER, 15m, after the pod's last event); returning so the case can grade its absence." >&2
             break
