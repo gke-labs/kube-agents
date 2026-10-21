@@ -235,12 +235,29 @@ and a manifest you add declares its object, so merging it keeps the object.
    find <workspace> -type d -path "*/namespaces/<name>"
    ```
 
-3. **The repository declares it.** The change is `git rm` of that file, plus
-   its line in the directory's `kustomization.yaml` `resources:` list when
-   there is one. For a namespace, everything step 2 found goes in the same
-   pull request, each named in its body: the objects in it, the directory,
-   and the `kustomization.yaml` or `Application` that creates it. Left
-   behind, any of them recreates the namespace. Then continue with Step 3.
+3. **The repository declares it.** A delete needs the user's confirmation
+   first (`SOUL.md`); with it in the request, go ahead. Remove only what
+   declares the object, read document by document, never by file name or by
+   a `grep` hit alone:
+   - A file whose every document is the object (for a namespace: the
+     Namespace or an object in it) is `git rm`'d, and its line comes out of
+     the directory's `kustomization.yaml` `resources:` list.
+   - A file that also holds other documents keeps them: delete only the
+     matching documents from it.
+   - For a namespace, everything step 2 found goes in the same pull request,
+     each named in its body, because any one left behind recreates it: the
+     objects in it, its directory, and the `kustomization.yaml` that lists
+     only them.
+   - **A shared declaration is a stop.** A `kustomization.yaml`, Argo CD
+     `Application` or Flux `Kustomization` that also creates objects outside
+     the request, or a `namespaces/<name>/` directory with namespaces under it
+     (Config Sync's hierarchical abstract namespace), would delete those too.
+     Stop with: "`<file>` also declares `<other objects>`; removing it would
+     delete them as well. I have changed nothing." Never remove an
+     `Application`: with its resources finalizer, deleting it deletes
+     everything it deploys.
+
+   Then continue with Step 3.
 
 4. **The repository does not declare it.** Stop with: "`<repo>` does not
    declare `<kind>/<name>`, so a pull request cannot delete it: removing a
@@ -270,21 +287,36 @@ and a manifest you add declares its object, so merging it keeps the object.
      namespace in place.
    - A Flux `Kustomization` prunes only with `spec.prune: true`.
    - Config Sync deletes the objects it applied when their file goes.
+   - Pruning skips an object that opts out, so read the live object's
+     annotations (`kubectl get <kind> <name> -o yaml`) before saying it will
+     be deleted: `argocd.argoproj.io/sync-options: Prune=false`,
+     `kustomize.toolkit.fluxcd.io/prune: disabled`,
+     `configmanagement.gke.io/managed: disabled` or
+     `client.lifecycle.config.k8s.io/deletion: detach` (which Config Sync sets
+     on a namespace it created only because objects sat in it) each mean
+     merging leaves it in place. An object with no reconciler's labels or
+     annotations was put there some other way, and no prune touches it.
+   - **A reconciler that syncs the path but is failing still counts as
+     present.** A `RootSync` or `RepoSync` with entries under
+     `status.source.errors`, `status.rendering.errors` or `status.sync.errors`,
+     an Application whose sync status is `Unknown` or health `Degraded`, or a
+     Kustomization with `Ready=False`: name it, quote its error, and say
+     merging deletes nothing until it syncs again.
 
    A `Forbidden` is not an absence: say you could not read the reconcilers,
    and fall back to their CRDs, which this agent's role can read:
 
    ```bash
-   kubectl get crd applications.argoproj.io kustomizations.kustomize.toolkit.fluxcd.io rootsyncs.configsync.gke.io
+   kubectl get crd applications.argoproj.io kustomizations.kustomize.toolkit.fluxcd.io rootsyncs.configsync.gke.io reposyncs.configsync.gke.io
    ```
 
    Name a reconciler in the reply or the pull request body only if you found
-   it syncing that directory. When one prunes, say it will delete the object
-   after merge. Otherwise say: "Merging removes the declaration only. I found
+   it syncing that directory. When one prunes, syncs, and the object does
+   not opt out, say it will delete the object after merge. Otherwise say: "Merging removes the declaration only. I found
    nothing on `<cluster>` that deletes what is removed from `<repo>`, so
    `<kind>/<name>` stays until someone deletes it."
 
-6. **Words.** After a confirmation, say "I'll propose this as a pull request",
+6. **Words.** After the confirmation, say "I'll propose this as a pull request",
    and report the pull request you opened and the files it removes. Never
    describe the request as an action under way or done ("deleting",
    "deleted"): the pull request only proposes it.
