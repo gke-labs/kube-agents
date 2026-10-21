@@ -729,6 +729,26 @@ class StaleHomesTest(_HomeFixture):
         self.assertIn("(mtime=2025-10-09T08:53:20Z, not removed)",
                       gc._format_inventory(inv, sweep.stale_homes_removed, sweep.stale_homes_failed)[0])
 
+    def test_the_pod_is_read_again_before_every_rm(self):
+        # The check is per rm, not once for the run: a re-scaffold that lands
+        # while an earlier home's rm is in flight still keeps the later home.
+        rp = self.remote / "profiles"
+        self.tree[str(rp)] += [("cluster-gone2", "1.0", "1", "d")]
+        profiles = self.profiles
+
+        class RescaffoldingDuringRm(FakeSandbox):
+            def __call__(inner, argv, **kwargs):
+                if argv[0] == gc.REMOTE_RM:
+                    (profiles / "cluster-gone2").mkdir(exist_ok=True)
+                return super().__call__(argv, **kwargs)
+
+        fake = RescaffoldingDuringRm(self.tree)
+        inv, sweep = self.sweep(fake)
+        self.assertEqual([argv for argv, _ in self.rms(fake)], [[gc.REMOTE_RM, "-rf", "--", str(rp / "cluster-gone")]])
+        self.assertEqual(sweep.stale_homes_removed, ["cluster-gone"])
+        self.assertEqual(sweep.stale_homes_failed, [])
+        self.assertEqual(sweep.warnings, [])
+
     def test_a_pod_that_lists_no_platform_profile_removes_nothing(self):
         shutil.rmtree(self.profiles / "platform")
         fake = FakeSandbox(self.tree)

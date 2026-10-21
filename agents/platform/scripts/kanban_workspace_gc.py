@@ -89,7 +89,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -336,14 +336,18 @@ def _remove_remote(root: Path, names: list[str], sweep: Sweep) -> None:
     sweep.remote_removed.extend(names)
 
 
-def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep) -> tuple[list[str], list[str]]:
+def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep,
+                           keep: Callable[[str], bool] | None = None) -> tuple[list[str], list[str]]:
     """`_remove_remote` one name at a time up to INVENTORY_LIMIT, then the rest in one call.
 
     One rm per name, so a name the worker made unremovable doesn't hide the
     ones that did go from the log; past INVENTORY_LIMIT the rest go in one
     call, so a worker that planted thousands costs one more exec, not one
-    each.  Returns (removed, failed); the names are left out of
-    ``sweep.remote_removed`` for the caller to account for.
+    each.  *keep*, when given, is asked about each name right before its
+    batch's rm, so a caller's last-moment check is as fresh as the rm it
+    guards rather than one check for the whole run.  A name it refuses is
+    neither removed nor failed.  Returns (removed, failed); the names are
+    left out of ``sweep.remote_removed`` for the caller to account for.
     """
     batches = [[name] for name in names[:INVENTORY_LIMIT]]
     if names[INVENTORY_LIMIT:]:
@@ -351,6 +355,10 @@ def _remove_remote_batched(root: Path, names: list[str], sweep: Sweep) -> tuple[
     removed_all: list[str] = []
     failed_all: list[str] = []
     for batch in batches:
+        if keep is not None:
+            batch = [name for name in batch if keep(name)]
+            if not batch:
+                continue
         before = len(sweep.remote_removed)
         _remove_remote(root, batch, sweep)
         removed = sweep.remote_removed[before:]
@@ -559,10 +567,11 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
     rest, as `sweep_overrides` does: nothing legitimate leaves many stale
     homes, and a worker that planted thousands costs one more exec, not one
     each.  Runs as the model's account, which owns the homes, as
-    `_remove_remote` does.  The pod is read once more right before the ``rm``:
-    the inventory's per-home listings sit between the first pod read and this
-    point, and a cluster re-scaffolded in that window under a name whose old
-    sandbox home is still stale would otherwise lose the home it just got.
+    `_remove_remote` does.  The pod is read once more right before each
+    ``rm``: the inventory's per-home listings and the earlier ``rm`` calls sit
+    between the first pod read and a given home's turn, and a cluster
+    re-scaffolded in that window under a name whose old sandbox home is still
+    stale would otherwise lose the home it just got.
     """
     names = [row[0] for row in inv.stale_homes if _is_stale_cluster_home(row[0])]
     if not names or inv.remote_profiles is None or inv.agent_profiles_path is None:
@@ -585,10 +594,9 @@ def sweep_stale_homes(inv: Inventory, remote_root: Path, sweep: Sweep) -> None:
             + (f": {detail[:STDERR_EXCERPT_CHARS]}" if detail else "")
         )
         return
-    names = [name for name in names if not _pod_home_present(inv.agent_profiles_path / name)]
-    if not names:
-        return
-    removed, failed = _remove_remote_batched(remote_profiles, names, sweep)
+    pod_profiles = inv.agent_profiles_path
+    removed, failed = _remove_remote_batched(
+        remote_profiles, names, sweep, keep=lambda name: not _pod_home_present(pod_profiles / name))
     sweep.stale_homes_removed.extend(removed)
     if failed:
         # One chat bullet for the run that names the homes, with the rm's own
