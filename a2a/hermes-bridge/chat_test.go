@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nuid"
 
@@ -359,6 +360,129 @@ func TestAPI_ATurnThatFiledCardsKeepsItsAsk(t *testing.T) {
 	}
 }
 
+// A turn that filed kanban cards with its route recorded publishes the
+// handoff artifact ahead of its terminal on a Google Chat conversation, where
+// the terminal's cards mark never fires (cardsSettleTheAsk is Slack with
+// KAGE_SLACK_UX on), so a delegating session hears that the work went to a
+// card rather than reading "on it" as the answer (#3258). No card filed, a
+// failed kanban_create or an unrecorded route: none.
+func TestAPI_ATurnThatFiledCardsPublishesTheHandoff(t *testing.T) {
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	for _, tc := range []struct {
+		name, prompt string
+		storeStatus  int
+		want         bool
+	}{
+		{"filed", "diagnose the pod restarts in crash-ns; fan out", http.StatusOK, true},
+		{"failed-call", "diagnose the pod restarts in crash-ns; broken", http.StatusOK, false},
+		{"direct", "is checkout-gateway restarting in seeded-a?", http.StatusOK, false},
+		{"route-refused", "diagnose the pod restarts in crash-ns; fan out", http.StatusBadRequest, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, url := startServer(t)
+			store := newRouteStore(t, tc.storeStatus)
+			var door atomic.Value
+			stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+				u := door.Load().(string)
+				switch {
+				case strings.Contains(tc.prompt, "fan out"):
+					postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+					postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+				case strings.Contains(tc.prompt, "broken"):
+					postDeliveryStatus(t, u, shared, c.sessionID, kanbanCreateTool, "call_1", ActivityStatusError)
+				}
+				writeCompletion(w, c.sessionID, "focusing on memory limits")
+			})
+			b := startAPIBridge(t, url, stub, func(cfg *Config) {
+				cfg.ActivityListen = "127.0.0.1:0"
+				cfg.ActivitySecret = shared
+				cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+			})
+			door.Store(b.ActivityURL())
+			c := gatewayClient(t, url)
+			submitFrom(t, c, "task-"+tc.name, "ctx-"+tc.name, "gchat:spaces/A/threads/B", tc.prompt)
+			task := waitTerminal(t, c, "task-"+tc.name)
+			if task.State != lib.StateCompleted {
+				t.Fatalf("state = %s, want completed", task.State)
+			}
+			art := task.Artifact(lib.ArtifactHandoff)
+			got := art != nil && len(art.Parts) == 1 && art.Parts[0].Text == lib.HandoffCards
+			if got != tc.want {
+				t.Fatalf("handoff artifact = %+v, want present=%v", art, tc.want)
+			}
+		})
+	}
+}
+
+// The handoff is task-wide, like the cards mark: turn 1 files a card and
+// acks, a queued follow-up answers directly as turn 2, and turn 1's card is
+// still going to report into the conversation, so the terminal still carries
+// the handoff. On Slack with KAGE_SLACK_UX on the mark says the same.
+func TestAPI_AFollowUpAfterACardStillReportsTheHandoff(t *testing.T) {
+	t.Setenv(slackUXEnv, "")
+	const shared = "pod-wide-activity-key"
+	_, url := startServer(t)
+	store := newRouteStore(t, http.StatusOK)
+	release := make(chan struct{})
+	var door atomic.Value
+	var turns atomic.Int32
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		if turns.Add(1) == 1 {
+			u := door.Load().(string)
+			postDelivery(t, u, shared, c.sessionID, hookPreToolCall, kanbanCreateTool, "call_1")
+			postDelivery(t, u, shared, c.sessionID, hookPostToolCall, kanbanCreateTool, "call_1")
+			<-release
+			writeCompletion(w, c.sessionID, "on it: a card is checking")
+			return
+		}
+		writeCompletion(w, c.sessionID, "payments-worker exits: DB_URL is not set")
+	})
+	b := startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.ActivityListen = "127.0.0.1:0"
+		cfg.ActivitySecret = shared
+		cfg.RouteURL, cfg.RouteKey = store.srv.URL, "kv-key"
+	})
+	door.Store(b.ActivityURL())
+	c := gatewayClient(t, url)
+	origin := submitFromEnv(t, c, "task-followup", "ctx-followup", "gchat:spaces/A/threads/B", "diagnose crash-ns")
+	waitFor(t, 10*time.Second, "turn 1 in flight", func() bool { return turns.Load() == 1 })
+	sendSteer(t, c, origin, "just tell me why it crashes")
+	waitFor(t, 10*time.Second, "follow-up queued", func() bool { return len(steerNotices(t, url, origin.TaskID)) == 1 })
+	close(release)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted || turns.Load() != 2 {
+		t.Fatalf("state %s after %d turns, want completed after 2", task.State, turns.Load())
+	}
+	if art := task.Artifact(lib.ArtifactHandoff); art == nil {
+		t.Fatal("no handoff for a task whose first turn filed a card that is still to report")
+	}
+}
+
+// submitFromEnv is submitFrom returning the submission, for a test that
+// steers it.
+func submitFromEnv(t *testing.T, c *lib.Client, taskID, contextID, conversation, prompt string) *lib.Envelope {
+	t.Helper()
+	var auth map[string]any
+	if err := json.Unmarshal(authorityFor(t, mintFor(t, c, taskID, "platform")), &auth); err != nil {
+		t.Fatal(err)
+	}
+	auth["audience"] = map[string]any{"conversation": conversation, "kind": "dm"}
+	raw, err := json.Marshal(auth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, contextID, "corr-"+taskID,
+		messagePayload(t, taskID, contextID, prompt), lib.WithTo(lib.Party{Session: "platform"}), lib.WithAuthority(raw))
+	if err != nil {
+		t.Fatalf("submission envelope: %v", err)
+	}
+	if err := c.Publish(testCtx(t), lib.TaskInSubject("platform", taskID), env); err != nil {
+		t.Fatalf("submission publish: %v", err)
+	}
+	return env
+}
+
 // postDeliveryStatus is postDelivery's closing delivery for a call that ended
 // with status, as hermes reports a failed tool call.
 func postDeliveryStatus(t *testing.T, url, key, sessionID, tool, callID, status string) {
@@ -448,5 +572,43 @@ func TestSplitAnswerStaysLinear(t *testing.T) {
 	} {
 		splitAnswer(line)
 		plainLine(line)
+	}
+}
+
+// visibleText takes off every step-shaped line at an answer's end, refused or
+// not: the line is plumbing no surface shows as text.
+func TestVisibleText(t *testing.T) {
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]":                  "Up.",
+		"Up.\n[next: a]\n[next: b]\n":                    "Up.",
+		"Up.\r\n\r\n[next: check seeded-a]\r\n":          "Up.",
+		"Up.\n\n[next: " + strings.Repeat("x", 80) + "]": "Up.",
+		"Up. [next: inline]":                             "Up. [next: inline]",
+		"Up.\n[next: a]\x0c\n[next: b]":                  "Up.",
+		"Up.\n\u00a0[next: b]":                           "Up.",
+		"Up.":                                            "Up.",
+		"[next: check]":                                  "",
+	} {
+		if got := visibleText(in); got != want {
+			t.Errorf("visibleText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// withNote puts a note above a declared step's line, which has to stay last,
+// and after the answer when it declares none.
+func TestWithNote(t *testing.T) {
+	note := "\n\n(note)"
+	for in, want := range map[string]string{
+		"Up.\n\n[next: check seeded-a]": "Up.\n\n(note)\n\n[next: check seeded-a]",
+		"Up.":                           "Up.\n\n(note)",
+	} {
+		got := withNote(in, note)
+		if got != want {
+			t.Errorf("withNote(%q) = %q, want %q", in, got, want)
+		}
+		if _, step := nextStep(got); strings.Contains(in, "[next:") && step != "check seeded-a" {
+			t.Errorf("withNote(%q) lost the step: nextStep = %q", in, step)
+		}
 	}
 }

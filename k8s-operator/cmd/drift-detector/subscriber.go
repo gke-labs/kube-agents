@@ -23,7 +23,10 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/api/option"
 	pubsub "google.golang.org/api/pubsub/v1"
+
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/clusterprofiles"
 )
 
 const (
@@ -145,6 +148,14 @@ const (
 	// duplicate inject is in memory and per-process, so this is the one case it
 	// does not cover: a duplicate inject per non-graceful restart.
 	settleGracePeriod = 10 * time.Second
+
+	// backlogMaxWait is how long a message may wait in the subscription before
+	// its record counts as backlog even though this process was already
+	// pulling. Long enough to sit above a pod roll and Pub/Sub's redelivery
+	// backoff, so a record nacked by a restart is caught by the first-pull
+	// rule rather than this one; what is left for this one is a process that
+	// ran and could not pull.
+	backlogMaxWait = 30 * time.Minute
 )
 
 // ackDeadlineWarning says why a join budget does not fit a subscription's ack
@@ -197,6 +208,10 @@ func ackDeadlinePreflight(ctx context.Context, read func(context.Context) (time.
 type receivedMessage struct {
 	AckID string
 	Data  []byte
+
+	// PublishTime is when Pub/Sub accepted the message, zero when the server
+	// sent none or sent one this process could not parse.
+	PublishTime time.Time
 }
 
 // messageSource is the subset of Pub/Sub the loop needs. An interface so the
@@ -236,9 +251,20 @@ type pubsubSource struct {
 
 // newPubsubSource builds a source for a subscription, using Application
 // Default Credentials -- inside the agent pod, the Workload Identity the
-// drift-pubsub module granted roles/pubsub.subscriber to.
+// drift-pubsub module granted roles/pubsub.subscriber to -- unless
+// clusterprofiles.BrokerFromEnv names the credential proxy, in which case every
+// call (Get, Pull, Acknowledge, ModifyAckDeadline) goes to the proxy's Pub/Sub
+// route with the pod's projected token and no Google credential is read here.
 func newPubsubSource(ctx context.Context, project, subscription string) (*pubsubSource, error) {
-	service, err := pubsub.NewService(ctx)
+	broker, err := clusterprofiles.BrokerFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	var opts []option.ClientOption
+	if broker != nil {
+		opts = broker.GoogleAPIOptions(clusterprofiles.PubsubAPIHost)
+	}
+	service, err := pubsub.NewService(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("pubsub client: %w", err)
 	}
@@ -295,9 +321,24 @@ func (p *pubsubSource) Pull(ctx context.Context, maxMessages int64) ([]receivedM
 			out = append(out, receivedMessage{AckID: rm.AckId})
 			continue
 		}
-		out = append(out, receivedMessage{AckID: rm.AckId, Data: data})
+		out = append(out, receivedMessage{AckID: rm.AckId, Data: data, PublishTime: parsePublishTime(rm.Message)})
 	}
 	return out, nil
+}
+
+// parsePublishTime reads a message's publishTime. Zero on an empty or
+// malformed value, which subscriber.backlog reads as "not backlog": a record
+// whose age is unknown is treated the way it was before the field was read.
+func parsePublishTime(m *pubsub.PubsubMessage) time.Time {
+	if m.PublishTime == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, m.PublishTime)
+	if err != nil {
+		log.Printf("drift-detector: message %s: unparseable publishTime %q: %v", m.MessageId, m.PublishTime, err)
+		return time.Time{}
+	}
+	return t
 }
 
 func (p *pubsubSource) Ack(ctx context.Context, ackIDs []string) error {
@@ -395,6 +436,16 @@ type subscriber struct {
 
 	// now is the clock idleReport is measured against. nil means time.Now.
 	now func() time.Time
+
+	// backlogAge is backlogMaxWait, a field so a test can shorten it.
+	backlogAge time.Duration
+
+	// firstPullAt is when this process issued its first pull that succeeded,
+	// and pulledAt when it issued the one whose batch is being processed.
+	// Both zero until then. In memory on purpose: the first-pull rule is about
+	// this process, so a restart is meant to start it again.
+	firstPullAt time.Time
+	pulledAt    time.Time
 }
 
 // newSubscriber builds the loop. joinBudget is not defaulted when it is zero or
@@ -413,6 +464,7 @@ func newSubscriber(source messageSource, handle recordHandler, maxMessages int64
 		idleWait:    idlePollInterval,
 		idleReport:  idleReportInterval,
 		joinBudget:  joinBudget,
+		backlogAge:  backlogMaxWait,
 	}
 }
 
@@ -439,6 +491,7 @@ func (s *subscriber) Run(ctx context.Context) error {
 			return err
 		}
 
+		pullStart := s.clock()
 		messages, err := s.source.Pull(ctx, s.maxMessages)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -452,6 +505,10 @@ func (s *subscriber) Run(ctx context.Context) error {
 			continue
 		}
 		backoff = pullBackoffInitial
+		if s.firstPullAt.IsZero() {
+			s.firstPullAt = pullStart
+		}
+		s.pulledAt = pullStart
 
 		if len(messages) == 0 {
 			// Reset on report rather than only on delivery, so a subscription
@@ -516,6 +573,8 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 		switch {
 		case err == nil:
 			s.counts.Parsed++
+			record.PublishTime = msg.PublishTime
+			record.Backlog = s.backlog(msg.PublishTime)
 			s.handle(handleCtx, record)
 			ackIDs = append(ackIDs, msg.AckID)
 
@@ -556,6 +615,31 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 	if err := s.source.Nack(settleCtx, nackIDs); err != nil {
 		log.Printf("drift-detector: %v", err)
 	}
+}
+
+// backlog reports whether a message reached this process late enough that
+// its record should be digested rather than triaged one card at a time.
+//
+// Two rules, because they catch different things. Published before this
+// process's first successful pull: everything that queued while no detector
+// was pulling -- an install, a pod roll -- whatever its age. The test is the publish time, not
+// the change time: an install write that reaches the topic after the first
+// pull is live. Waited longer than backlogAge: a process that started
+// and then could not pull for a while (an IAM grant still propagating, a
+// Pub/Sub outage), whose first pull is long past.
+//
+// The cost of the first rule is stated in the README: a record nacked by a
+// restart, or written within the sink's export lag before one, comes back
+// to the next process as backlog. It is still recorded and digested under
+// its principal's name; what it loses is its own triage turn.
+//
+// A zero publish time is never backlog, so a message without one is handled
+// as it was before this rule existed.
+func (s *subscriber) backlog(published time.Time) bool {
+	if published.IsZero() || s.firstPullAt.IsZero() {
+		return false
+	}
+	return published.Before(s.firstPullAt) || s.pulledAt.Sub(published) > s.backlogAge
 }
 
 // settleContext returns the context the ack and nack calls run on. It survives

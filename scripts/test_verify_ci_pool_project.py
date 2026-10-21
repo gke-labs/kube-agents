@@ -241,6 +241,12 @@ class RequiredApisTest(unittest.TestCase):
         # bench/tf/fleet declares google_compute_disk directly.
         self.assertIn("compute.googleapis.com", checker.REQUIRED_APIS)
 
+    def test_cloudtrace_api_is_required(self):
+        # The observability nightly case reads traces through the broker's
+        # relay on roles/cloudtrace.user; a project with the role and the API
+        # off fails it with SERVICE_DISABLED, which this check exists to catch.
+        self.assertIn("cloudtrace.googleapis.com", checker.REQUIRED_APIS)
+
     def test_all_apis_enabled_passes(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
@@ -426,7 +432,13 @@ class GkeAndCmekTest(unittest.TestCase):
         # it says the opposite. Widening the set is a claim about a finding's
         # effect on a run, made here beside the finding that emits it.
         self.assertEqual(checker.FINDING_HOST_OTEL_SCOPE, "gke/host-otel-scope")
-        self.assertEqual(checker.LEASE_SILENT_FINDINGS, frozenset({checker.FINDING_HOST_OTEL_SCOPE}))
+        self.assertEqual(checker.FINDING_COMPUTE_SWEEPER_MISSING, "iam/compute-sweeper/missing")
+        # The Compute plant sweeper holds nothing a leased run uses, so a
+        # missing grant fails only the hourly sweep.
+        self.assertEqual(
+            checker.LEASE_SILENT_FINDINGS,
+            frozenset({checker.FINDING_HOST_OTEL_SCOPE, checker.FINDING_COMPUTE_SWEEPER_MISSING}),
+        )
 
     def test_fleet_clusters_are_not_held_to_the_otel_scope(self):
         # Nothing reads the seeded clusters' traces, and bench/tf/fleet does not
@@ -3279,10 +3291,11 @@ class IamGrantsTest(unittest.TestCase):
         litellm_roles=None,
         bot_roles=None,
         reconciler_roles=None,
+        compute_sweep_role=True,
         conditional_roles=(),
         extra_bindings=(),
     ):
-        """The project's own policy: all five identities holding exactly what they should."""
+        """The project's own policy: all six identities holding exactly what they should."""
         reconciler = checker.FLEET_RECONCILER_ROLES if reconciler_roles is None else reconciler_roles
         prow = checker.PROW_RUNNER_ROLES if prow_roles is None else prow_roles
         nightly = checker.PROW_RUNNER_ROLES if nightly_roles is None else nightly_roles
@@ -3300,6 +3313,9 @@ class IamGrantsTest(unittest.TestCase):
         bindings += [{"role": r, "members": [litellm_member]} for r in sorted(litellm)]
         bindings += [{"role": r, "members": [checker.CI_HEALTH_BOT_MEMBER]} for r in sorted(bot)]
         bindings += [{"role": r, "members": [checker.FLEET_RECONCILER_MEMBER]} for r in sorted(reconciler)]
+        if compute_sweep_role:
+            role = checker.COMPUTE_SWEEP_ROLE_TEMPLATE.format(project_id=project_id)
+            bindings.append({"role": role, "members": [checker.COMPUTE_SWEEP_MEMBER]})
         bindings += [
             {
                 "role": r,
@@ -3330,6 +3346,49 @@ class IamGrantsTest(unittest.TestCase):
             {f.id: f.repair for f in result.findings},
             {"iam/fleet-reconciler/missing/roles/container.admin": checker._project_binding("kube-agents-evals-3", checker.FLEET_RECONCILER_MEMBER, "roles/container.admin")},
         )
+
+    def test_a_missing_compute_sweeper_role_fails_and_names_the_one_off_grant(self):
+        # A project registered before the Compute plant sweep existed has no
+        # custom role and no binding. Re-running the provisioning script is the
+        # wrong repair on a registered project, so the finding carries the role
+        # create and the binding, and nothing else fails.
+        project = "kube-agents-evals-3"
+        role = f"projects/{project}/roles/{checker.COMPUTE_SWEEP_ROLE_ID}"
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy(project)),
+                _ok(self._litellm_wi_policy(project)),
+                _ok(self._project_policy(compute_sweep_role=False)),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts(project, "123456")
+        self.assertFalse(result.passed)
+        named = [d for d in result.details if "Compute plant sweeper" in d]
+        self.assertEqual(len(named), 1, result.details)
+        self.assertIn(role, named[0])
+        self.assertIn("section 5.7", named[0])
+        self.assertEqual([f.id for f in result.findings], ["iam/compute-sweeper/missing"])
+        create, bind = result.findings[0].repair.split("\n")
+        self.assertTrue(create.startswith(f"gcloud iam roles create {checker.COMPUTE_SWEEP_ROLE_ID} --project={project} "), create)
+        self.assertIn(f"--permissions={','.join(sorted(checker.COMPUTE_SWEEP_PERMISSIONS))} ", create)
+        self.assertEqual(bind, checker._project_binding(project, checker.COMPUTE_SWEEP_MEMBER, role))
+
+    def test_the_compute_sweeper_role_must_be_this_projects_own(self):
+        # The custom role is project-level: the same id bound from another
+        # pool project grants nothing here, and a predefined network role is
+        # not the grant this check asks for.
+        foreign = {"role": f"projects/kube-agents-evals-4/roles/{checker.COMPUTE_SWEEP_ROLE_ID}", "members": [checker.COMPUTE_SWEEP_MEMBER]}
+        wide = {"role": "roles/compute.networkAdmin", "members": [checker.COMPUTE_SWEEP_MEMBER]}
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy(compute_sweep_role=False, extra_bindings=(foreign, wide))),
+                _ok(self._fleet_reader_policy()),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertEqual([f.id for f in result.findings], ["iam/compute-sweeper/missing"])
 
     def _both_build_identities(self):
         return self._reader_policy(
@@ -3727,8 +3786,8 @@ class IamGrantsTest(unittest.TestCase):
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertTrue(result.passed, result.details)
         self.assertEqual(
-            "Workload Identity (platform and LiteLLM), the runners', reconciler's, health bot's and platform GSA project roles, "
-            "and the fleet reader's token-creator binding verified",
+            "Workload Identity (platform and LiteLLM), the runners', reconciler's, Compute plant sweeper's, "
+            "health bot's and platform GSA project roles, and the fleet reader's token-creator binding verified",
             result.message,
         )
 
@@ -3851,7 +3910,7 @@ class IamGrantsTest(unittest.TestCase):
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
     """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
 
-    Hardcoding the nine roles is what lets this check run without a Terraform
+    Hardcoding the ten roles is what lets this check run without a Terraform
     toolchain, and it is also how the two drift apart. Without this test,
     narrowing the granted set would leave every correctly-provisioned project
     failing verification weeks later, with nothing pointing at Terraform as the
@@ -4120,6 +4179,67 @@ class FleetReconcilerRolesMatchGrantersTest(unittest.TestCase):
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_LIST_ROLE} --condition=None", page)
         self.assertIn(f"--role={checker.FLEET_RECONCILER_BUCKET_ROLE} \\\n    --condition=", page)
         self.assertIn(f"/objects/{checker.FLEET_RECONCILER_STATE_PREFIX}", page)
+
+
+class ComputeSweeperGrantMatchesGrantersTest(unittest.TestCase):
+    """The Compute plant sweeper's role must be the same in the verifier, the provisioning script and the runbook.
+
+    A permission dropped from one copy leaves projects whose role differs
+    from what the verifier and the runbook describe, and the verifier reads
+    only the binding, so nothing else would notice.
+    """
+
+    def _assigned(self, script, name):
+        found = re.search(rf'^readonly {name}="([^"]+)"$', script, re.MULTILINE)
+        self.assertIsNotNone(found, f"{name} in provision_ci_pool_project.sh")
+        return found.group(1)
+
+    def test_matches_the_provisioning_script(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_SA"), checker.COMPUTE_SWEEP_MEMBER)
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_ROLE_ID"), checker.COMPUTE_SWEEP_ROLE_ID)
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_ROLE_TITLE"), checker.COMPUTE_SWEEP_ROLE_TITLE)
+        self.assertEqual(self._assigned(script, "COMPUTE_SWEEP_ROLE_STAGE"), checker.COMPUTE_SWEEP_ROLE_STAGE)
+        self.assertEqual(set(self._assigned(script, "COMPUTE_SWEEP_PERMISSIONS").split(",")), checker.COMPUTE_SWEEP_PERMISSIONS)
+        self.assertIn('--member="${COMPUTE_SWEEP_SA}" \\\n  --role="projects/${PROJECT_ID}/roles/${COMPUTE_SWEEP_ROLE_ID}"', script)
+        self.assertIn('--permissions="${COMPUTE_SWEEP_PERMISSIONS}"', script)
+
+    def test_matches_the_repair_block_on_the_prerequisites_page(self):
+        page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
+        create = re.search(rf"gcloud iam roles create {checker.COMPUTE_SWEEP_ROLE_ID} (.*?)\n```", page, re.S)
+        self.assertIsNotNone(create, "the hand repair in docs/ci-pool-projects.md section 5.7")
+        block = create.group(1)
+        self.assertEqual(set(re.search(r"--permissions=([\w.,]+)", block).group(1).split(",")), checker.COMPUTE_SWEEP_PERMISSIONS)
+        self.assertIn(f'--title="{checker.COMPUTE_SWEEP_ROLE_TITLE}"', block)
+        self.assertIn(f"--stage={checker.COMPUTE_SWEEP_ROLE_STAGE}", block)
+        self.assertIn(f"--member={checker.COMPUTE_SWEEP_MEMBER}", block)
+        self.assertIn(f'--role="projects/${{PROJECT_ID}}/roles/{checker.COMPUTE_SWEEP_ROLE_ID}"', block)
+
+
+class RequiredApisMatchEnableSitesTest(unittest.TestCase):
+    """REQUIRED_APIS must equal what the two enabling sites enable.
+
+    The APIs are written here, in the provisioning script's `gcloud services
+    enable` block, and in the copy of that block on the pool page, and none
+    reads another. The page says the block and this set must agree, and
+    nothing else holds them to it: an API dropped from the script leaves a
+    project the verifier fails on first run, and one dropped from this set
+    leaves a project the verifier passes with the API off, which for
+    cloudtrace.googleapis.com is a nightly case failing on SERVICE_DISABLED.
+    """
+
+    def _enable_block(self, text, what):
+        blocks = re.findall(r"^gcloud services enable \\\n(.*?)^\s*--project=", text, re.S | re.M)
+        self.assertEqual(len(blocks), 1, f"expected exactly one `gcloud services enable` block in {what}")
+        return set(re.findall(r"[\w-]+\.googleapis\.com", blocks[0]))
+
+    def test_matches_the_block_the_provisioning_script_runs(self):
+        script = (checker._ROOT / "scripts" / "provision_ci_pool_project.sh").read_text()
+        self.assertEqual(self._enable_block(script, "provision_ci_pool_project.sh"), checker.REQUIRED_APIS)
+
+    def test_matches_the_block_on_the_prerequisites_page(self):
+        page = (checker._ROOT / "docs" / "ci-pool-projects.md").read_text()
+        self.assertEqual(self._enable_block(page, "docs/ci-pool-projects.md"), checker.REQUIRED_APIS)
 
 
 class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):

@@ -72,6 +72,6 @@ resource "kubernetes_deployment_v1" "default" {
 ## YAML Samples
 
 GKE cluster configurations and Kubernetes manifests can also be defined using
-YAML for use with `kubectl apply` or Deployment Manager.
+YAML, proposed as a pull request through `submit-suggestion`.
 
 -   [GKE YAML Samples](https://docs.cloud.google.com/docs/samples?product=googlekubernetesengine)

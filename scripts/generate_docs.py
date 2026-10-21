@@ -135,6 +135,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-tpu-metrics-monitoring",
     ],
     "Observability": [
+        "gke-alert-configuration",
         "gke-basics",
         "gke-observability",
         "kube-agents-observability",
@@ -146,6 +147,8 @@ SKILL_GROUPS: dict[str, list[str]] = {
     ],
     "Manifests and remediation": [
         "gcp-config-connector",
+        "gcp-terraform",
+        "gitops-helm-chart",
         "gke-manifest-generation",
         "submit-suggestion",
     ],
@@ -154,6 +157,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "fleet-audit-reports",
         "github-issue-resolver",
         "inspect-repository",
+        "kube-agents-feedback",
         "pr-conversation",
         "version-control",
     ],
@@ -182,6 +186,7 @@ CRON_CADENCE = {
     "0 13 * * *": "Daily 13:00",
     "0 * * * *": "Hourly",
     "11 * * * *": "Hourly at :11",
+    "25 * * * *": "Hourly at :25",
     "*/10 * * * *": "Every 10 minutes",
     "*/30 * * * *": "Every 30 minutes",
     "0 21 * * 1-5": "Weekdays 21:00",

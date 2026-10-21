@@ -1206,6 +1206,69 @@ type fakeSpawner struct {
 	// tests use it to assert the terminal was already on the stream when
 	// the pod went, which "terminal exists and pod deleted" alone cannot.
 	onDelete func(podName string)
+	// reusable names the pods Reusable vouches for; reusableErr fails the
+	// read. Empty, no pod is reusable, which is every pre-#2825 test's
+	// world: each turn a fresh pod.
+	reusable    map[string]bool
+	reusableErr error
+	// sessionPods is what SessionPods lists, the cap eviction's candidates.
+	sessionPods []sessionPod
+	// orphansErr fails TerminalOrphans, the orphan sweep's list.
+	orphansErr error
+	// deleteErr fails Delete (the call is still recorded).
+	deleteErr error
+	// started is each pod's start time for PodStarted; startedErr fails it.
+	started    map[string]time.Time
+	startedErr error
+}
+
+func (s *fakeSpawner) Reusable(_ context.Context, podName string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reusableErr != nil {
+		return false, s.reusableErr
+	}
+	return s.reusable[podName], nil
+}
+
+// PodStarted answers from started; a pod not in it has no start time.
+func (s *fakeSpawner) PodStarted(_ context.Context, podName string) (time.Time, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.startedErr != nil {
+		return time.Time{}, s.startedErr
+	}
+	return s.started[podName], nil
+}
+
+func (s *fakeSpawner) setStarted(pod string, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started == nil {
+		s.started = map[string]time.Time{}
+	}
+	s.started[pod] = at
+}
+
+func (s *fakeSpawner) setReusable(pods ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reusable = map[string]bool{}
+	for _, p := range pods {
+		s.reusable[p] = true
+	}
+}
+
+func (s *fakeSpawner) SessionPods(context.Context) ([]sessionPod, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sessionPod(nil), s.sessionPods...), nil
+}
+
+func (s *fakeSpawner) setSessionPods(p ...sessionPod) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessionPods = p
 }
 
 type fakeSpawn struct {
@@ -1234,13 +1297,19 @@ func (s *fakeSpawner) failSpawns(err error) {
 
 func (s *fakeSpawner) Delete(_ context.Context, podName string) error {
 	s.mu.Lock()
-	hook := s.onDelete
+	hook, err := s.onDelete, s.deleteErr
 	s.deletes = append(s.deletes, podName)
 	s.mu.Unlock()
 	if hook != nil {
 		hook(podName)
 	}
-	return nil
+	return err
+}
+
+func (s *fakeSpawner) setDeleteErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteErr = err
 }
 
 func (s *fakeSpawner) deleted() []string {
@@ -1252,6 +1321,9 @@ func (s *fakeSpawner) deleted() []string {
 func (s *fakeSpawner) TerminalOrphans(context.Context) ([]orphanPod, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.orphansErr != nil {
+		return nil, s.orphansErr
+	}
 	return append([]orphanPod(nil), s.orphans...), nil
 }
 
@@ -1692,6 +1764,10 @@ func TestTaskEndCountsAsActivity(t *testing.T) {
 	if !after.LastTaskActivity.Equal(after.LastActivity) {
 		t.Fatalf("the executor's terminal must move the task's own clock with the session's: task=%v session=%v", after.LastTaskActivity, after.LastActivity)
 	}
+	// Only a user's message moves the reap's idle clock; an answer must not.
+	if !after.LastUserMessage.Equal(before.LastUserMessage) {
+		t.Fatalf("the executor's terminal moved LastUserMessage from %v to %v", before.LastUserMessage, after.LastUserMessage)
+	}
 	held, until, err := r.g.hasSession(ctx, conv)
 	if err != nil || !held || !until.Equal(after.LastTaskActivity.Add(r.g.cfg.IdleTTL)) {
 		t.Fatalf("after the terminal the session must be held until LastTaskActivity+IdleTTL: held=%v until=%v err=%v", held, until, err)
@@ -1894,6 +1970,11 @@ func TestHealedExecutorTerminalCountsAsActivity(t *testing.T) {
 	}
 	if !after.LastTaskActivity.After(stale) {
 		t.Fatalf("the healed executor terminal did not count as activity: %v", after.LastTaskActivity)
+	}
+	// The "stop" stamped LastUserMessage before the heal ran; the heal's own
+	// stamp, later, must leave it there.
+	if !after.LastUserMessage.Before(after.LastTaskActivity) {
+		t.Fatalf("the healed executor terminal moved LastUserMessage to %v (task clock %v)", after.LastUserMessage, after.LastTaskActivity)
 	}
 	if held, _, err := r.g.hasSession(ctx, conv); err != nil || !held {
 		t.Fatalf("after the heal posted the answer the thread must still be a session thread: held=%v err=%v", held, err)
@@ -3382,5 +3463,99 @@ func TestRelayReportsQueuedFollowUpsThatNeverRan(t *testing.T) {
 				t.Fatal("a task-ended refusal posted its own line")
 			}
 		})
+	}
+}
+
+// TestStopAfterTheTurnEndedSaysACardKeepsWorking pins gke-labs#3263's reply.
+// The front door's turn ends seconds after it files a kanban card, so by the
+// time a user says "stop" the conversation holds no active task while the
+// card is still working and will post here. The gateway cannot see or cancel
+// the card, and its reply must say so rather than a bare "nothing is running".
+// The rig models the turn, not the card: what the gateway keys on is that the
+// conversation ran a task and holds none now. A conversation that never ran
+// one gets the plain reply (TestStopWithNothingToStopStartsNoTask).
+func TestStopAfterTheTurnEndedSaysACardKeepsWorking(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-card-stop"
+	ctx := context.Background()
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-1", Text: "check the pods on x"}
+	origin := r.awaitTask(t, "platform")
+	completeTask(t, r.execFor(t, origin, "platform"), "checking the pods on x")
+	waitFor(t, "the turn's terminal to release the conversation", func() bool {
+		rec, err := r.g.reg.Get(ctx, conv)
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "c-2", Text: "stop"}
+	waitFor(t, "the stop to be answered with the card notice", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if p == nothingRunningCardNotice {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestBareFeedbackAnswersWithTheLinksAndStartsNoTask: a bare /feedback is the
+// gateway's second slash command (docs/designs/chat-feedback-command.md). It
+// posts the two reporting links and submits nothing to the bus.
+func TestBareFeedbackAnswersWithTheLinksAndStartsNoTask(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb1"
+	sessionRigTurn(r, conv, "fb-100", "/feedback")
+	waitFor(t, "notice", postedContaining(r, chattext.FeedbackFormURL))
+	if !postedContaining(r, chattext.FeedbackTrackerURL)() {
+		t.Fatal("the notice must carry the tracker link too")
+	}
+	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
+		t.Fatalf("a bare /feedback submitted %d envelope(s); it must submit none", n)
+	}
+	if rec, _ := r.g.reg.Get(context.Background(), conv); rec != nil && rec.ActiveTask != nil {
+		t.Fatalf("a bare /feedback left an active task: %+v", rec.ActiveTask)
+	}
+}
+
+// TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept: "/feedback <text>" is
+// the agent's to answer, so it becomes a task whose text is what the person
+// typed, prefix included, and no links notice is posted.
+func TestFeedbackWithTextIsAnOrdinaryTurnWithThePrefixKept(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb2"
+	sessionRigTurn(r, conv, "fb-110", "/feedback the status line stuck on working")
+	origin := r.awaitTask(t, "platform")
+	var m lib.Message
+	if err := json.Unmarshal(origin.Payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinTextParts(m.Parts); got != "/feedback the status line stuck on working" {
+		t.Fatalf("task text = %q, want the text as typed, prefix included", got)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback with text")
+	}
+}
+
+// TestFeedbackWithTextWhileATaskRunsIsASteer: with a task running, a
+// "/feedback <text>" is a follow-up like any other message, not swallowed by
+// the command branch.
+func TestFeedbackWithTextWhileATaskRunsIsASteer(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/thread-fb3"
+	sessionRigTurn(r, conv, "fb-120", "start")
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "fb-121", "/feedback the answer was wrong")
+	waitFor(t, "steer ack", postedContaining(r, ackSteerQueued))
+	envs := inSubjectEnvelopes(t, r.url, "platform")
+	if steer := envs[len(envs)-1]; steer.TaskID != origin.TaskID {
+		t.Fatalf("the /feedback follow-up minted a new task: %s vs %s", steer.TaskID, origin.TaskID)
+	}
+	if postedContaining(r, chattext.FeedbackFormURL)() {
+		t.Fatal("the links notice was posted for a /feedback follow-up")
 	}
 }

@@ -277,6 +277,10 @@ func (ri *ResolvedIntegration) hostConflicts() map[*ResolvedForge]string {
 	conflicts := map[*ResolvedForge]string{}
 	byHost := map[string]*ResolvedForge{}
 	var github, githubCA *ResolvedForge
+	// The first GitHub forge declared holds the install's GitHub host while
+	// its host can be read, even when another of its fields is refused, so a
+	// typo in it cannot hand the host to a later GitHub forge.
+	heldBy, heldHost := ri.firstGitHubHost()
 	for _, f := range ri.Forges {
 		if !f.valid() {
 			continue
@@ -289,6 +293,11 @@ func (ri *ResolvedIntegration) hostConflicts() map[*ResolvedForge]string {
 			continue
 		}
 		if f.Provider == GitProviderGitHub {
+			if heldBy != nil && heldBy != f && heldHost != host {
+				conflicts[f] = fmt.Sprintf("this install's GitHub host is already %s, declared at %s; an install serves one GitHub host, github.com or one GitHub Enterprise Server",
+					heldHost, ri.forgePath(heldBy, "").String())
+				continue
+			}
 			if github != nil && provider.canonicalHost(github.Host) != host {
 				conflicts[f] = fmt.Sprintf("this install's GitHub host is already %s, declared at %s; an install serves one GitHub host, github.com or one GitHub Enterprise Server",
 					provider.canonicalHost(github.Host), ri.forgePath(github, "").String())
@@ -314,11 +323,52 @@ func (ri *ResolvedIntegration) hostConflicts() map[*ResolvedForge]string {
 	return conflicts
 }
 
+// firstGitHubHost is the first GitHub forge declared and its canonical host,
+// when that host can be read: the provider is named where the host needs it,
+// the host is one the github provider admits, and no forge of another
+// provider declared before it holds the host. The forge may be refused for
+// another field (a namespace typo, a CA bundle name); its host still holds,
+// so the gitops-state key, the broker and the egress stay on it while the
+// declaration is repaired. Nil when no GitHub forge is declared or the first
+// one's host cannot be read.
+func (ri *ResolvedIntegration) firstGitHubHost() (*ResolvedForge, string) {
+	if ri == nil {
+		return nil, ""
+	}
+	for _, f := range ri.Forges {
+		if f.Provider != GitProviderGitHub {
+			continue
+		}
+		provider, _ := f.GitProvider()
+		if f.providerProblem() != nil ||
+			validateDeclaredValue(gitHostField, f.Host, MaxGitHostLength) != nil ||
+			provider.ValidateHost(f.Host) != nil {
+			return nil, ""
+		}
+		host := provider.canonicalHost(f.Host)
+		for _, earlier := range ri.Forges[:slices.Index(ri.Forges, f)] {
+			if earlier.Provider == f.Provider || !earlier.valid() {
+				continue
+			}
+			other, _ := earlier.GitProvider()
+			if other.canonicalHost(earlier.Host) == host {
+				return nil, ""
+			}
+		}
+		return f, host
+	}
+	return nil, ""
+}
+
 // GitHubHost is the install's one GitHub host: the host of the first GitHub
-// forge that can be served, or github.com when no such forge is declared.
-// hostConflicts refuses every GitHub forge at another host, so the first is
-// the answer for all of them.
+// forge declared, while that host can be read (firstGitHubHost); else the
+// host of the first GitHub forge that can be served; else github.com.
+// hostConflicts refuses every GitHub forge at another host, so the answer is
+// the same for all of them.
 func (ri *ResolvedIntegration) GitHubHost() string {
+	if _, host := ri.firstGitHubHost(); host != "" {
+		return host
+	}
 	if f := ri.gitHubForge(); f != nil {
 		provider, _ := f.GitProvider()
 		return provider.canonicalHost(f.Host)
@@ -326,21 +376,22 @@ func (ri *ResolvedIntegration) GitHubHost() string {
 	return gitProviders[GitProviderGitHub].DefaultHost
 }
 
-// GitHubForgeRefused reports that the declaration names a GitHub forge and
-// validation refuses every one of them, so the install's GitHub host cannot
-// be read from it. A caller that holds state derived from the host (the
+// GitHubForgeRefused reports that validation refuses the first GitHub forge
+// declared, the one that decides the install's GitHub host. A caller that holds state derived from the host (the
 // gitops-state key) leaves it as it is while this holds.
 func (ri *ResolvedIntegration) GitHubForgeRefused() bool {
 	if ri == nil {
 		return false
 	}
-	declared := false
+	// The first GitHub forge declared decides the host, so its refusal is
+	// the one that counts: a later GitHub forge that validation admits
+	// does not take the host over (hostConflicts).
 	for _, f := range ri.Forges {
 		if f.Provider == GitProviderGitHub {
-			declared = true
+			return !ri.usable(f)
 		}
 	}
-	return declared && ri.gitHubForge() == nil
+	return false
 }
 
 // gitHubForge is the first GitHub forge that can be served, or nil.
@@ -412,6 +463,12 @@ func (f *ResolvedForge) credentialsProblem(provider *GitProvider) error {
 // ForgeCredentialsTokenKey is the key the operator projects out of a forge's
 // credentialsRef Secret, and the file name the broker reads it from.
 const ForgeCredentialsTokenKey = "token"
+
+// ForgeCredentialsReadTokenKey is the optional key, in the same Secret, that
+// holds a read-only token. The broker uses it only to clone context
+// repositories, never on a write route. A Secret without it keeps the broker
+// as it was: context repositories clone with no credential.
+const ForgeCredentialsReadTokenKey = "read-token"
 
 // ForgeCABundleDefaultKey is the caBundleRef key when none is named, and
 // ForgeCABundleFileName is the file the broker reads the bundle from.
@@ -1001,6 +1058,12 @@ func ForgeEgressPatterns(in *IntegrationSpec) []string {
 			}
 		}
 	}
+	// The install's GitHub host stays reachable while the forge that
+	// declares it is refused for another field, as the broker keeps serving
+	// it (gitHubBrokerForge): a refusal must not take egress away.
+	if host := resolved.GitHubHost(); host != github.DefaultHost && !seen[host] {
+		patterns = append(patterns, host)
+	}
 	return patterns
 }
 
@@ -1018,6 +1081,10 @@ type BrokerForge struct {
 	// the broker, which is handed the file instead.
 	CredentialsSecret string `json:"-"`
 	TokenPath         string `json:"tokenPath,omitempty"`
+	// ReadTokenPath is where the broker reads the forge's read-only token,
+	// set beside TokenPath. The file is there only when the Secret carries
+	// the key; the broker checks for it on each call.
+	ReadTokenPath string `json:"readTokenPath,omitempty"`
 	// CABundleSecret and CABundleKey are the Secret key the CA bundle
 	// is projected from. The broker reads the file at CAFile; it is handed the
 	// two names too, so that a missing file is answered with what to create.
@@ -1050,7 +1117,8 @@ type BrokerForge struct {
 // first one keeps it, rather than crash-looping the broker.
 //
 // tokenDir is where the operator mounts the forge credentials; each forge's
-// token is <tokenDir>/<forge name>/token. caDir is where it mounts the CA
+// token is <tokenDir>/<forge name>/token, and its optional read-only token is
+// <tokenDir>/<forge name>/read-token. caDir is where it mounts the CA
 // bundles; a forge's is <caDir>/<forge name>/ca.crt.
 func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForge {
 	if ri == nil {
@@ -1081,6 +1149,7 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForg
 			Host:              provider.canonicalHost(f.Host),
 			CredentialsSecret: f.CredentialsSecret,
 			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
+			ReadTokenPath:     tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsReadTokenKey,
 			AllowedPaths:      allowed,
 		}
 		if f.CABundleSecret != "" {
@@ -1102,8 +1171,15 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForg
 // one and is what it was before GitHub Enterprise Server.
 func (ri *ResolvedIntegration) gitHubBrokerForge(caDir string) BrokerForge {
 	entry := BrokerForge{Provider: GitProviderGitHub, Host: ri.GitHubHost()}
+	held, _ := ri.firstGitHubHost()
 	for _, f := range ri.Forges {
-		if f.Provider != GitProviderGitHub || f.CABundleSecret == "" || !ri.usable(f) {
+		if f.Provider != GitProviderGitHub || f.CABundleSecret == "" {
+			continue
+		}
+		// The forge that holds the host keeps its CA while another of its
+		// fields is refused, so the broker still trusts the instance.
+		provider, _ := f.GitProvider()
+		if !ri.usable(f) && (f != held || f.caBundleProblem(provider) != nil) {
 			continue
 		}
 		entry.Name = f.Name

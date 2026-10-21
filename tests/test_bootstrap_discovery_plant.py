@@ -608,6 +608,12 @@ class Step1StateQueryTest(unittest.TestCase):
         self.assertEqual(self._state([], markers=[".bootstrap_completed"]), "completed")
         self.assertEqual(self._state(markers=[".user_aligned"]), "aligned")
 
+    def test_a_conversation_marker_reads_as_aligned(self):
+        self.assertEqual(self._state(markers=[".user_aligned_conversation"]), "aligned")
+
+    def test_a_conversation_binding_reads_as_aligned(self):
+        self.assertEqual(self._state(markers=["onboarding_conversation.json"]), "aligned")
+
 
 class SweepIdReadTest(unittest.TestCase):
     """Step 3's sed over the marker, run by sh against a data dir."""

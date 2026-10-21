@@ -10,7 +10,7 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The **drift detector** is a second producer on the watcher's side of that bridge, posting out-of-band cluster changes to the same routes; see [the second producer](#the-second-producer-gitops-drift). The `stall-watch` cron script is a third, posting namespaces whose controllers stopped making progress; see [the third producer](#the-third-producer-controller-stall). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`). No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`) and relays the Slack Home tab's board (`GET /v1/board`). No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -20,7 +20,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context.
 5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
-7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (on Slack, a fleet-audit report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
+7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (for the scheduled delivery of a fleet-audit job the image ships, it posts the report `finish` rendered for each repository, with a line naming any it did not finish, or a notice that the run did not finish, and on Slack a one-repository report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
 
 ### Triage Routing
@@ -31,7 +31,7 @@ The session lands on the front door and cannot land anywhere else. Hermes select
 
 Delivery is the card itself. Hermes subscribes every card to the session it was filed from, and posts a subscribed card's `result` to chat when it turns terminal — so the Cluster Agent finishes with `kanban_complete` and nothing else, and the report reaches the thread the alert was raised in. The body's whole job on that point is to insist the entire report goes in `result`, since `result` is verbatim what the reader sees.
 
-Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those three facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel.
+Two more things travel in that prompt since #656. The call is made without `goal_mode`: a goal-mode card is graded by Hermes's judge against its title and body before `kanban_complete` is allowed through, and a body that is a report template cannot be satisfied that way — on 2026-08-12 a worker whose correct report the judge rejected had no exit but a sticky `needs_input` block with `result = NULL`. And the body states a **Done when** (the root cause with evidence, at least one GitOps option or an explicit no-change finding, the report recorded via `kanban_complete`) and asks for those three facts in the one-line `summary` too, because the judge grades `summary` before `result`; a card graded anyway then has something gradeable and an answer that states it. The backstop for a card that blocks regardless is the `kanban-board-health` job on the Platform Agent's roster (`agents/platform/cron/README.md`), which names any card blocked past a day in the home channel (newest first, grouped and bounded to chat relay limits with older cards listed by task ID).
 
 The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged. The hermes-bridge records a route the same way for its `a2a-*` sessions, so a card filed in a gateway conversation reports back to that conversation, and the lookup follows Hermes's compression lineage when the session has since been renamed; [the gateway spec](../../../docs/designs/spec-chatops-gateway.md) has the conversation route.
 
@@ -45,7 +45,7 @@ Deduplication bounds how often _one_ failure is reported. It does nothing about 
 
 A [`gitops-drift` inject](#the-second-producer-gitops-drift) reaches the ceiling by a different route: it is graded `Warning` unconditionally and skips both the classifier and the gate, because the detector that sent it already decided the record was worth a human's attention. It is billed to a bucket of its own (`GitOpsDrift`) rather than to the `Warning` one its ledger row records it as, because `_claim_alert_quota` keys the table on the string it is handed and the two traffic shapes are not comparable: one `kubectl apply` over a directory is several audit entries and several injects, where the watcher's warnings arrive one incident at a time. Sharing the bucket therefore let routine drift cap-drop a deployed signal. The cost is that the ceilings add up, so a busy day of both posts more total alerts than the single budget allowed; neither ceiling bounds the fan-out itself.
 
-A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound.
+A [`controller-stall` inject](#the-third-producer-controller-stall) claims no allowance at all: the stall watch caps itself at three alerts a tick, and that cap is its only bound. Neither does a drift backlog record that is digested (`POST /v1/drift-backlog`): it starts no turn and is counted in one digest. A late record that is carded instead — a late `kubectl` write, or a late row of a principal with fewer than three in the digest — bills `GitOpsDrift` as a live record does. A refused minority row stays in the digest; a refused late `kubectl` write is suppressed as a live record is.
 
 | Bucket        | Env var                      | Default |
 | ------------- | ---------------------------- | ------- |
@@ -58,7 +58,8 @@ Three of the four are severities and the fourth is not; `GitOpsDrift` is what dr
 whatever they display as.
 
 The `GitOpsDrift` default of 20 is a judgment, not a measurement. One apply spends one inject for
-each object, because the detector does not combine records. `install.sh` and `upgrade.sh` enable the
+each object, because the detector does not combine live records (late ones are digested and bill
+nothing; see the drift bullets below). `install.sh` and `upgrade.sh` enable the
 detector by default, so this value applies to the installs that these scripts manage. Only changes by
 people alert, so 20 covers a few hand applies a day. A record that the detector cannot join to a live
 object still sends a card with less detail, unless its cluster is outside the install's scope. That
@@ -68,7 +69,9 @@ go higher.
 
 `Info` events do arrive — nothing on the path from the kubelet to `inject_message` filters on `Event.Type`, and `BackOff` is on the watcher's default reason list emitted as `type: Normal` for image-pull back-off — but none of them ever bills this bucket, because the [severity gate](#severity-gate) drops every `Info` event before the claim. The `Info` row is kept regardless: deleting it would turn the entry into a `.get(severity, 0)` miss, and `_claim_alert_quota` treats that miss exactly as it treats a limit of `0` — allowed through, uncapped. Narrowing that gate afterwards would therefore send an unbounded `Info` stream to chat rather than restore a ceiling. Setting a limit to `0` turns that severity's cap off entirely, by the same branch.
 
-All four are tunable on the `PlatformAgent` CR without rebuilding the image. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped, and a ceiling left off that allowlist is an override that renders, validates and silently does nothing:
+All four are tunable without rebuilding the image. Set them at install time: the `ALERT_DAILY_LIMIT_*` keys in `install.env`, the chart value `platformAgent.deployment.alertDailyLimits`, or the Terraform variable `alert_daily_limits`. Each route renders the keys that are set into the CR's `spec.deployment.env`. The [site's chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives the routes and a sizing method. They reach the container because they are on the sandbox env allowlist in `safeSandboxEnvOverrides` (`k8s-operator/internal/controller/platformagent_manifests.go`) — `spec.deployment.env` is filtered, so an arbitrary variable set there is dropped, and a ceiling left off that allowlist is an override that renders, validates and silently does nothing.
+
+An entry on the CR itself also works:
 
 ```yaml
 spec:
@@ -79,6 +82,8 @@ spec:
       - name: ALERT_DAILY_LIMIT_WARNING
         value: "0" # uncapped
 ```
+
+On an install that the installer, the chart or Terraform manages, do not edit the CR. Each apply that changes the env list that the chart renders replaces the full list on the CR, and entries added by hand are lost. The [site's chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) tells when this occurs. Use the install-time route for a ceiling, and `platformAgent.deployment.env` for another name.
 
 Behaviour worth knowing before relying on it:
 
@@ -111,6 +116,17 @@ What the drift branch does differently:
   `Warning` label reaches no reader: it is the `severity` column of the ledger row and a field of
   the suppressed response, and the chat line names no severity at all.
 - **Its `suppressed` is terminal,** for the reason the bullet above gives.
+- **Late records skip this route.** A record the detector marks as backlog (it queued while no detector was
+  pulling, or waited over 30 minutes) goes to `POST /v1/drift-backlog` instead, with no session. The
+  route writes a ledger row with `backlog = 1` and the record's `principal`, spends no quota and
+  starts no turn. A worker thread posts one digest per burst, after 60 seconds with no new backlog
+  row or 10 minutes after the oldest, and marks the rows `2` (posted) or `3` (no chat platform). A
+  principal with fewer than three late rows is not digested: each of its rows gets a session, a quota
+  claim and a card, as a live record does, rebuilt from the payload the row stores, and is marked
+  `4`. A row the ceiling refuses stays in the digest. A row without a usable stored payload is
+  carded from its own columns (summary and cluster). The post holds a lease row in `drift_backlog_lease` but no database lock. The daemon advertises the
+  route as `features: ["drift-backlog"]` on `/healthz`; the detector's README has the rule that
+  marks a record late and what it costs.
 - **It defangs the fields it renders.** The record describes a change someone made, and several of
   the fields describing it are chosen by that person: `fieldManager` is a free query parameter and
   `callerSuppliedUserAgent` is whatever the client declared. Both are rendered inside a block the
@@ -143,7 +159,8 @@ separate variables and refuses an apply that sets `enable_drift_detector` withou
 #### Asking whether the dispatch is there
 
 `GET /healthz` answers `inject_kinds`, the list of kinds the dispatch above understands, and the
-detector probes it at startup and refuses to run if `gitops-drift` is not on it.
+detector probes it at startup and refuses to run if `gitops-drift` is not on it. It also answers
+`features`; the detector uses `POST /v1/drift-backlog` only when `drift-backlog` is on it.
 
 The dispatch is an equality test on `kind`, and a daemon predating it cannot say so: the drift
 payload falls into the event path, where the defaults render it as a `Warning` Pod alert named
@@ -375,11 +392,14 @@ CREATE TABLE intercepted_events(
   notified    INTEGER NOT NULL DEFAULT 0,  -- 0 when the gate, the ceiling or a failed send held it back; 1 when posted to chat; 2 when dispatched on a headless install with no chat platform enabled
   delivery_error TEXT NOT NULL DEFAULT '',  -- non-empty when the chat post failed after notified = 1
   session_id  TEXT NOT NULL DEFAULT '',  -- the session the inject arrived on, joining the row to GET /v1/sessions/{id}/tasks
-  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
+  principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
+  payload     TEXT NOT NULL DEFAULT ''     -- drift backlog rows only: the record, to card it from
 );
 ```
 
-For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, and `GET /v1/tasks/{task_id}`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
+For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
 
 ##### Two bounds, not one
 
@@ -399,17 +419,17 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 
 ##### Which columns are migrated, and which are not
 
-`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`
-for `session_id` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
-databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id` in place on
-startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
+`principal` and `payload` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
+`principal` and `payload` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
 introduced the table (#426), and a migration maintained for a pre-release shape no released
 install has is machinery that outlives its reason.
 
-**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
+**If you have such a pre-0.2.0 dev install missing `cluster`, `object_uid` or `delivery_error`, you must drop the table before rolling the image.** (Released 0.2.0+ installs already carry all three columns and migrate `session_id`, `backlog`, `principal` and `payload` automatically on startup; do not drop the table on a released install.) `CREATE TABLE IF
 NOT EXISTS` is a no-op against a pre-0.2.0 table missing those three columns, so they never appear, and how badly that ends depends on
 which column is missing:
 
@@ -417,8 +437,9 @@ which column is missing:
   column in its INSERT, so every write raises `no such column: cluster` into the blanket
   `except Exception` around it, is logged once per event, and is dropped. The table stays empty for
   as long as the shape lasts.
-- **No `object_uid`** — the same, and for the same reason: it is in the INSERT, so nothing is
-  recorded.
+- **No `object_uid`** — the session server does not start. `init_db` creates the partial index
+  `idx_intercepted_events_drift_uid` on `object_uid` at import, which raises
+  `no such column: object_uid`, and the process exits.
 - **No `delivery_error`** — events are still recorded correctly and only the correction fails.
   `mark_delivery_failed` raises `no such column: delivery_error`, the same blanket `except`
   swallows it, and the row keeps `notified = 1`, so the recap counts an alert nobody received as

@@ -30,7 +30,7 @@ only way to close it today is to know to start an audit by hand inside the pod
 (`agents/platform/AGENTS.md`, "Run the `<x>` cron job now"). Before `oobe`, the inventory report
 covered most of what the compliance and reliability audits check (`inventory-findings-queue.md`
 §10), but cost and capacity waited for the schedule, and no pull request opened until the first
-audit. With `oobe` running the audits, the scan leaves their workload checks to them (§4.4).
+audit. With `oobe` running the audits, the scan leaves their workload checks to them (`cluster_inventory_audit_sop.md`, Step 5).
 
 ## 2. What `oobe` is
 
@@ -71,8 +71,10 @@ per sweep, and Hermes retries that card in place; a re-run by hand uses a suffix
 (`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the
 report itself and files no ranking card. The ranking worker writes `/opt/data/INVENTORY.md`, on the
 sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
-(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`) and claims
-`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run five minutes later removes both jobs.
+(`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or under `spec.mode: next`
+`.user_aligned_conversation`) and claims
+`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
+later removes both jobs.
 
 ## 4. First-run audits
 
@@ -176,31 +178,15 @@ that stays unreadable therefore keeps the job ticking without effect until it ca
 
 ### 4.4 No GitOps repository
 
-An audit on an install with no GitOps repository runs without a forge: it keeps its findings in the
-report store and posts a chat summary, with no ledger issue and no pull request (the `fleet-audit`
-skill's "No forge configured"). `oobe.py` still starts none of the four there. It reads the managed repositories
-from `/etc/gitops/managed_repos`, which the operator mounts into the gateway container
-(`platformagent_manifests.go`, `gitopsStateDir`), through `gitops_workspace.get_managed_github_repos`.
-With none, it writes the marker with the reason and starts nothing.
+`oobe.py` reads no repository list: it starts the four audits on every install. An audit on an
+install with no GitOps repository runs without a forge: it keeps its findings in the report store
+and, when the run changed something, posts a chat summary, with no ledger issue and no pull request
+(the `fleet-audit` skill's "No forge configured"). The installer's "GitOps repository connection skipped" line says the same.
 
-The onboarding scan reads the same list (`oobe.managed_repositories`) once, when it files the sweep
-card, and records the answer in `.bootstrap_scan_filed` for the Cluster Agents' cards. With none,
-the cards also run the "Without a GitOps repository" section of `cluster_inventory_audit_sop.md`,
-which carries the workload checks the audits would otherwise own, so the report covers them. A list the scan cannot read
-runs that section too, recorded as `unknown` so the cards and the raw report say the list could not be read rather than
-that there is no repository: the stage retries such a read rather than starting the audits, and a check made twice costs
-less than one nobody makes.
-
-It does not exit non-zero. No repository is a configuration the installer offers, not a fault, and
-a failing per-minute job repeats until something changes. The operator is told instead: the
-interactive installer's "GitOps repository connection skipped" line says the scheduled audits run
-without one but write no ledger issue or pull request,
-and the delivered report closes with a note saying the first-run audits did not run, why, and, when a
-cluster was audited, whether the report covers their workload checks instead. That last part follows what
-`.bootstrap_scan_filed` recorded the cards were told, not the skip's reason, since the list can change between the two
-reads: it covers them for `yes` or `unknown` (the cards ran the section either way), does not for `no`, and the note hedges for a marker with no answer.
-Delivery can run before the stage has recorded the skip; a recorded `yes` then gives the same note. Beside a Slack Block
-Kit card the note is a second message.
+A `managed_repos` value the audits cannot use (one that does not parse, or names a forge type the
+image does not serve), or one that cannot be read at all, is not checked here either. Each audit's
+`start` refuses it and says why, as on a scheduled run, and the chain moves on to the next audit:
+the stage does not wait for a list it no longer reads.
 
 ### 4.5 What the operator sees
 
@@ -233,7 +219,9 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   `origin` from the old delivery job to `oobe` on any boot where `oobe` has no `origin` of its own.
   Without that, the report goes out with `deliver: local` and reaches nobody. The plugin binds
   every delivery job present, the old one included, so a rollback to an image from before the fold
-  finds the link where that image looks for it.
+  finds the link where that image looks for it. Under `spec.mode: next` the link is not a job origin:
+  the plugin records the conversation in `onboarding_conversation.json`, the jobs stay
+  `deliver: local`, and delivery posts into that conversation through the gateway itself.
 - **An install with no `oobe`.** An image from before the fold removed `oobe` as soon as its
   audits stage was done, without waiting for a human, so an install can arrive mid-onboarding with
   `oobe` gone. While no `oobe` job exists, the sync leaves the two old jobs enabled, and they
@@ -244,8 +232,9 @@ claimed within seconds of that, as the old delivery job's was. Behind the scan a
   for the stage), so a failed delivery posts only delivery's own error; an exception in either is
   caught so it neither posts nor blocks delivery. The plugin triggers only the first job it binds,
   because `trigger_job` also enables a job and the old delivery entry ships disabled.
-- **Removal.** Five minutes after the report is claimed (`.bootstrap_completed`), the delivery
-  stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
+- **Removal.** `RETIRE_AFTER_SECONDS` (about 16 minutes) after the report is claimed
+  (`.bootstrap_completed`), and, when the report goes to a recorded conversation, only once its post recorded an outcome
+  (`.bootstrap_conversation_done`), the delivery stage removes the two disabled entries (`bootstrap_delivery._retire_jobs`). Once the first-run
   audits stage is also done, `oobe` removes itself.
   On an install nobody speaks to, the report is never claimed and `oobe` stays, doing nothing.
 - **Finished installs.** Already in step 1: the entrypoint passes `oobe` in `--assume-retired`
@@ -257,15 +246,15 @@ times. It rides with the audits stage, whose eval case covers both.
 
 ## 6. Failure modes
 
-| Situation              | What the operator sees                                                                                    | Recovery                                                                                              |
-| ---------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them       | None needed                                                                                           |
-| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                        | Automatic                                                                                             |
-| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat  | As today                                                                                              |
-| No GitOps repository   | One line in the interactive installer's output; the scan runs the workload checks and the report says why | Re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md), then wait for the schedule |
-| No home channel        | Ledger issues and pull requests appear in the repository with no chat summary                             | Set one (`/sethome`)                                                                                  |
-| Sweep stuck            | Audits start at the fallback                                                                              | As today for the report                                                                               |
-| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                      | As today for the report                                                                               |
+| Situation              | What the operator sees                                                                                   | Recovery                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Audits running         | Nothing in chat until each posts its summary; `hermes cron list` in the platform profile shows them      | None needed                                                                                           |
+| Marking an audit fails | Nothing; `oobe` logs and retries the missing ids each minute, five tries per audit                       | Automatic                                                                                             |
+| An audit run fails     | The audit's own failure path; `chat-delivery-watch` opens a GitHub issue when reports stop reaching chat | As today                                                                                              |
+| No GitOps repository   | Reports stay in the report store; a run that changed something posts a summary saying there is no forge  | None, or for ledger issues, re-run the installer with `--gitops-org` and `--gitops-repo` (INSTALL.md) |
+| No home channel        | Ledger issues and PRs in the repository; the first report names each unposted audit (see §7)             | Set one (`/sethome`)                                                                                  |
+| Sweep stuck            | Audits start at the fallback                                                                             | As today for the report                                                                               |
+| Ranking card blocked   | Audits start at the fallback, unless someone unblocks the card first                                     | As today for the report                                                                               |
 
 ## 7. Not in this design
 
@@ -275,10 +264,13 @@ times. It rides with the audits stage, whose eval case covers both.
 - **[#1866](https://github.com/gke-labs/kube-agents/issues/1866)'s 30, 45 and 60 minute targets for cost, security and reliability findings.** The
   chain starts at scan completion in #1866's order, so each audit lands as soon as the ones before
   it end; nothing holds a finding back to meet a target.
-- **Reaching an install with no home channel.** Audit summaries go to the home channel only.
-  Posting the report there at T+0 when one is set is a separate change.
-- **First-run audits without a GitOps repository.** The audits can run with no forge now; starting
-  them from `oobe` on such an install is a separate change.
+- **Reaching an install with no home channel.** Audit summaries go to the home channel only. An
+  audit that finishes before anyone opens the chat posts nothing, and nothing posts it later; the
+  onboarding report, sent on the first message, names every audit the stage started or adopted and
+  that finished whose summary failed to deliver (`bootstrap_delivery._undelivered_audits`). A held,
+  given-up or skipped audit's scheduled run is not named yet
+  ([#3283](https://github.com/gke-labs/kube-agents/issues/3283)). Posting the report there at T+0
+  when one is set is a separate change.
 - **An install self-check.** Not asked for by any issue.
 
 ## 8. Build order and evaluation
@@ -292,9 +284,8 @@ times. It rides with the audits stage, whose eval case covers both.
    onboarding cases drive `oobe`.
 3. **Later:** drop the disabled ids; T+0 delivery to the home channel.
 
-Eval case `oobe-first-run-audits` (domain `fleet-audits`; parked out of `hack/eval/nightly-cases.txt`
-since 2026-10-09, its `KNOWN_UNREGISTERED` entry in `scripts/validate_bench_cases.py` says why;
-each repetition waits for the previous one's four audits to finish). The stack
+Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,
+off the infra lock; each repetition waits for the previous one's four audits to finish). The stack
 (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
@@ -314,9 +305,9 @@ last run ends. A fresh install's chain is waited on only once it has started, an
 it marks next, which costs a case at most about two audit runs (the one before it, then its own): an audit the chain reaches later, after the case's run holds the
 stream's in-flight note, has its `start` refused, and only between two repositories of a run can
 the install's run take the stream and leave the case's run partial. Waiting out the whole chain
-would hold every audit case on those streams for most of an hour on every CI run. The no-repository skip is unit-tested,
-not evaluated: the shared install has a repository, and removing it mid-run would break concurrent
-cases.
+would hold every audit case on those streams for most of an hour on every CI run. The start with no
+repository is unit-tested, and the case covers it only when run by hand against an install with no
+forge: the shared install has a repository, and removing it mid-run would break concurrent cases.
 
 ## 9. Open questions
 

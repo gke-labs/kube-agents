@@ -390,6 +390,25 @@ const (
 	a2aStrictEventsWriterEnvVar = "A2A_STRICT_EVENTS_WRITER"
 	a2aWorkerImageName          = "a2a-worker"
 
+	// a2aCardStopEnvVar is a third controller-read override, rendered onto
+	// the gateway under the same name: whether a chat `stop` also stops the
+	// kanban cards the conversation filed (gke-labs#3263). Off unless the
+	// operator carries an explicit "true", so the rollout is opt-in per
+	// install: the control it sends needs a hermes-bridge sidecar and an
+	// agent image that answer it, and the operator cannot tell which images
+	// an install runs. An older bridge rejects the control and the gateway
+	// answers that it couldn't confirm the cards stopped, so an early flip
+	// is a hedged reply rather than broken; the default stays off until the
+	// images that answer it ship together. a2aCardStopTimeoutEnvVar is the gateway's wait for the
+	// control, rendered at the gateway's default (a2aCardStopTimeout).
+	a2aCardStopEnvVar        = "A2A_CARD_STOP"
+	a2aCardStopTimeoutEnvVar = "A2A_CARD_STOP_TIMEOUT"
+	// a2aCardStopTimeout is the gateway's default wait for a card-stop
+	// control, rendered explicitly: above the bridge's worst case for one
+	// (about 60 s: its 5 s capability check, 20 s turn wait and 35 s POST;
+	// a2a/hermes-bridge/cardstop.go).
+	a2aCardStopTimeout = "75s"
+
 	// a2aCapabilityRequiredEnvVar is the other controller-read override, and
 	// it defaults the other way round. The capability check is armed unless
 	// an operator explicitly disarms it, because the posture it protects —
@@ -555,10 +574,13 @@ const (
 	a2aSlackMinChannelIDLen = 3
 	// The kanban notifier's half (deploy/docker/patches/kanban_chat_notify.py,
 	// and kanban_event_routing.py, which addresses a card to the conversation):
-	// the platform whose gateway conversations a card reports back to. Its own
+	// the platform whose gateway conversations a card reports back to, and
+	// onboarding's first report too (agents/chat/scripts/bootstrap_delivery.py). Its own
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
-	// and so needs one.
+	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
+	// gateway_platform) reads it too, to name the platform whose home channel
+	// is missing when it refuses a report.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"
@@ -640,14 +662,14 @@ const (
 	a2aProvisionReportOutcomeReported   = "reported"
 	a2aProvisionReportOutcomeClean      = "clean"
 	a2aProvisionReportOutcomeUnreadable = "unreadable"
-	// a2aProvisionReportGrace bounds how long a Complete Job with no
-	// succeeded pod in the cache is read as "the cache has not caught up"
-	// rather than "the pod is gone" (a2aProvisionPodVanished). The pod's
-	// terminated state precedes the Job's Complete condition, and the Job is
-	// read live while the pods come from the cache, so a pass can see the
-	// completion a little before its own cache holds the pod. A minute is
-	// far past any informer lag and far short of the Job's 24h TTL, which is
-	// how long an unbounded wait would re-list and re-log for.
+	// a2aProvisionReportGrace bounds how long a Complete Job whose succeeded
+	// pod a read did not find is treated as "not visible yet" rather than
+	// "the pod is gone" (a2aProvisionPodVanished). Both reads are live — the
+	// Job through a2aReader, the pods through podReader — so the informer lag
+	// this grace was first written for no longer applies; what is left is the
+	// pod deleted in the gap between the two reads. A minute is far past that
+	// and far short of the Job's 24h TTL, which is how long an unbounded wait
+	// would re-list and re-log for.
 	a2aProvisionReportGrace = time.Minute
 	// reasonTasksSubjectCapMissing is the Warning Event's reason when the live
 	// TASKS stream carries no per-subject cap; tasksSubjectCapEventMessage is
@@ -1068,9 +1090,12 @@ const (
 // buildA2AGatewayNetworkPolicy; the chart's PodMonitoring scrapes it by
 // number, held to this one by tests/test_chart_platform_agent_monitoring.py.
 const (
-	a2aGatewayMetricsPort       int32 = 9096
-	a2aGatewayMetricsPortName         = "a2a-metrics"
-	a2aGatewayMetricsPortEnvVar       = "A2A_METRICS_PORT"
+	a2aGatewayMetricsPort     int32 = 9096
+	a2aGatewayMetricsPortName       = "a2a-metrics"
+	// a2aGatewayContainerName is the gateway container, the one that serves
+	// the metrics port; the usage poller names it to find the port.
+	a2aGatewayContainerName     = "gateway"
+	a2aGatewayMetricsPortEnvVar = "A2A_METRICS_PORT"
 )
 
 func a2aNATSImage() string {
@@ -1145,6 +1170,16 @@ func imageRefHasTag(ref string) bool {
 // the tight setting is the one that can refuse legitimate history.
 func a2aStrictEventsWriter() string {
 	if os.Getenv(a2aStrictEventsWriterEnvVar) == "true" {
+		return "true"
+	}
+	return "false"
+}
+
+// a2aCardStop renders "false" for anything but an explicit "true", as
+// a2aStrictEventsWriter does: a typo leaves the card stop off, the reply a
+// stop has always had.
+func a2aCardStop() string {
+	if os.Getenv(a2aCardStopEnvVar) == "true" {
 		return "true"
 	}
 	return "false"
@@ -3316,13 +3351,13 @@ func a2aProvisionJobName(agent *agentv1alpha1.PlatformAgent, spec batchv1.JobSpe
 //
 // Best effort throughout, because nothing here changes what the render did
 // or what the phase says. A report the operator cannot deliver is logged; the
-// Job is left unstamped where a retry can still deliver it (a pod the cache
-// has not caught up with, for a2aProvisionReportGrace after the completion)
-// and stamped where it cannot (a message the script did not write, a pod
-// that is gone, a finding the reader cannot trust). The pods come from the
-// cache, which already watches them for the agent pod's status, so a retry
-// costs no API call; the Job itself came through a2aReader, so the stamp is
-// read back live on the next pass.
+// Job is left unstamped where a retry can still deliver it (a pod not visible
+// yet, for a2aProvisionReportGrace after the completion) and stamped where it
+// cannot (a message the script did not write, a pod that is gone, a finding
+// the reader cannot trust). The pods come through podReader and the Job came
+// through a2aReader, so both the report and the stamp are read live: this
+// runs once per Job, and an informer over every Pod in the cluster is not
+// what it costs.
 func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job) {
 	if job.Annotations[a2aProvisionReportAnnotation] != "" {
 		return
@@ -3334,7 +3369,7 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 	// until the garbage collector reaches them, and a report read off one
 	// of those would be the previous run's.
 	pods := &corev1.PodList{}
-	if err := r.List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{
+	if err := r.podReader().List(ctx, pods, client.InNamespace(job.Namespace), client.MatchingLabels{
 		batchv1.JobNameLabel:       job.Name,
 		batchv1.ControllerUidLabel: string(job.UID),
 	}); err != nil {
@@ -3442,13 +3477,14 @@ func parseA2AProvisionReport(message string) (*tasksSubjectCapFinding, error) {
 	return &tasksSubjectCapFinding{live: live, want: want, hasWant: hasWant}, nil
 }
 
-// a2aProvisionPodVanished says whether a Complete Job with no succeeded
-// provision pod in the cache has lost that pod rather than not shown it yet.
+// a2aProvisionPodVanished says whether a Complete Job whose succeeded
+// provision pod the read did not return has lost that pod rather than not
+// shown it yet.
 // Gone means the Job controller counted the success (Succeeded is its count,
 // written in the same status as Complete) and the completion is older than
-// a2aProvisionReportGrace: past that, a pod the cache has still not
-// delivered is one the pod garbage collector, a Succeeded-pod cleanup or a
-// hand delete has taken. A counted success with no completion time is not a
+// a2aProvisionReportGrace: past that, a pod a live read still does not return
+// is one the pod garbage collector, a Succeeded-pod cleanup or a hand delete
+// has taken. A counted success with no completion time is not a
 // shape the Job controller writes; with nothing to bound the wait on it is
 // read as gone rather than polled for the rest of the Job's TTL.
 func a2aProvisionPodVanished(job *batchv1.Job, now time.Time) bool {
@@ -4283,11 +4319,38 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 	return np
 }
 
+// a2aFenceWithOperatorPeer is a gateway fence as the reconciler applies it:
+// the collector's rule from the builder, and the operator's pods admitted on
+// the metrics port alone, the way credentialProxyNetworkPolicyWithOperatorPeer
+// admits them on the broker's, so the usage poller can read the gateway's
+// chat counter. Every fence on the gateway pod gets the same second rule, so
+// each reads as the complete statement of what reaches the pod. The builders
+// stay collector-only; the conformance fixture is rendered through this.
+func a2aFenceWithOperatorPeer(np *networkingv1.NetworkPolicy, operatorNamespace string) *networkingv1.NetworkPolicy {
+	if rule, ok := operatorMetricsIngressRule(operatorNamespace, a2aGatewayMetricsPort); ok {
+		np.Spec.Ingress = append(np.Spec.Ingress, rule)
+	}
+	return np
+}
+
+func a2aGatewayFencePolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	return a2aFenceWithOperatorPeer(buildA2AGatewayFencePolicy(agent), operatorNamespace)
+}
+
+func a2aDoorNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	return a2aFenceWithOperatorPeer(buildA2ADoorNetworkPolicy(agent), operatorNamespace)
+}
+
+func a2aInjectNetworkPolicyWithOperatorPeer(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
+	return a2aFenceWithOperatorPeer(buildA2AGatewayNetworkPolicy(agent), operatorNamespace)
+}
+
 // buildA2AGatewayNetworkPolicy fences ingress to the gateway pod while the
 // inject backend is armed.
 //
-// PolicyTypes carries Ingress with one rule, and every pod but the one it
-// names is denied. That is the intent rather than an omission: the chat
+// PolicyTypes carries Ingress with one rule from this builder (the applied
+// copy gains the operator's, a2aFenceWithOperatorPeer), and every pod but the
+// ones they name is denied. That is the intent rather than an omission: the chat
 // backends dial out and listen for nothing, so until this door existed no
 // pod had any business reaching the gateway at all, and the inject port must
 // not become the one that does. The one rule is the credential broker's
@@ -4320,8 +4383,9 @@ func buildA2ADoorNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // leave that open. The door fences stay as they are, identical in what they
 // admit; two identical policies on one pod admit exactly what one does, and
 // each door's objects still come and go with its own flag. When an in-cluster
-// caller legitimately needs the gateway, it becomes a peer in this rule, and
-// in every copy of it.
+// caller legitimately needs the gateway, it becomes a rule on every copy, the
+// way a2aFenceWithOperatorPeer admits the operator's poller on the metrics
+// port.
 func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -4643,6 +4707,15 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// own environment rather than the gateway's. Both
 		// routes, one switch.
 		{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
+		// The card stop, rendered explicitly at its
+		// default (off) like the two lines above, so
+		// turning it on for an install is an edit to a
+		// value already in the live Deployment, through
+		// the operator's own environment; and its wait,
+		// at the gateway's default, so a reader sees the
+		// bound beside the switch.
+		{Name: a2aCardStopEnvVar, Value: a2aCardStop()},
+		{Name: a2aCardStopTimeoutEnvVar, Value: a2aCardStopTimeout},
 		// The namespace from the downward API, not a baked
 		// default: the boot-time owner resolution below
 		// reads the gateway's own Deployment in THIS
@@ -4719,7 +4792,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
-						Name:  "gateway",
+						Name:  a2aGatewayContainerName,
 						Image: a2aGatewayImage(),
 						// Same rule as the provision container, caught by the
 						// same pass: the image is distroless nonroot, which
@@ -4910,10 +4983,10 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// over a Service that is gone denies nothing and costs nothing, so the
 	// ordering hazard runs the safe way.
 	if a2aInjectBackendEnabled() {
-		fences = append(fences, buildA2AGatewayNetworkPolicy(agent))
+		fences = append(fences, a2aInjectNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	}
 	if a2aAgentDoorEnabled() {
-		fences = append(fences, buildA2ADoorNetworkPolicy(agent))
+		fences = append(fences, a2aDoorNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
@@ -4928,7 +5001,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	// pass removes; a stale miss skips it for one pass on the refusal path
 	// only (on the render path reconcileA2A picks it up).
 	if err := r.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err == nil {
-		fences = append(fences, buildA2AGatewayFencePolicy(agent))
+		fences = append(fences, a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace))
 		gatewayFenced = true
 	} else if !errors.IsNotFound(err) {
 		return false, err
@@ -5393,7 +5466,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 			// missed and the live read above found it, it is applied
 			// here, ahead of the zero apply, as the ordinary path does.
 			if !gatewayFenced {
-				fence := buildA2AGatewayFencePolicy(agent)
+				fence := a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace)
 				if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
 					return state, err
 				}
@@ -5479,7 +5552,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// pass that applies the Deployment and no fence: either that pass wrote
 	// it or this one does, and both run before the Deployment apply below.
 	if !gatewayFenced {
-		fence := buildA2AGatewayFencePolicy(agent)
+		fence := a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace)
 		if err := ctrl.SetControllerReference(agent, fence, r.Scheme); err != nil {
 			return state, err
 		}
@@ -6057,7 +6130,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Nine reads answer it instead of walking every object
+	// cost for a no-op. Ten reads answer it instead of walking every object
 	// in the teardown sequence:
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an

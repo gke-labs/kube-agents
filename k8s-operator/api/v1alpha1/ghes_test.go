@@ -208,7 +208,7 @@ func TestBrokerForgesPutsGitHubAtTheEnterpriseHostWithItsCA(t *testing.T) {
 	}
 	got, _ := json.Marshal(resolved.BrokerForges("/creds", "/ca"))
 	want := `[{"provider":"github","host":"ghe.example.com","caSecret":"ghe-ca","caKey":"bundle.pem","caFile":"/ca/ghe/ca.crt"},` +
-		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","allowedPaths":["acme"]}]`
+		`{"provider":"gitlab","host":"gitlab.com","tokenPath":"/creds/gl/token","readTokenPath":"/creds/gl/read-token","allowedPaths":["acme"]}]`
 	if string(got) != want {
 		t.Errorf("BrokerForges =\n %s\nexpected\n %s", got, want)
 	}
@@ -325,5 +325,42 @@ func TestAForgeAtAnotherHostNamesItsProvider(t *testing.T) {
 	resolved, _ = (&IntegrationSpec{Forges: []ForgeSpec{{Name: "f", Host: "gitlab.com"}}}).ResolveGit()
 	if paths := problemPaths(resolved); len(paths) != 1 || paths["forges[0].host"] == "" {
 		t.Errorf("Problems() = %v, expected only forges[0].host", paths)
+	}
+}
+
+// The first GitHub forge declared holds the install's GitHub host while its
+// host can be read, even when another of its fields is refused. A later
+// GitHub forge at another host stays refused, and the broker and the egress
+// stay on the held host with its CA, as the gitops-state key does.
+func TestARefusedFirstGitHubForgeHoldsTheHostEverywhere(t *testing.T) {
+	ghe := gheForge("ghe", "ghe.example.com", "acme.ops") // a namespace the schema admits and GitHub refuses
+	ghe.CABundleRef = &ForgeCABundleRef{Name: "ghe-ca"}
+	in := &IntegrationSpec{
+		Forges: []ForgeSpec{ghe, ghForge("upstream", "kubernetes")},
+		Repositories: []RepositorySpec{
+			repo("ghe", "infra", RepositoryRoleGitOps),
+			repo("upstream", "kubernetes/kubernetes", RepositoryRoleContext),
+		},
+	}
+	resolved, err := in.ResolveGit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resolved.GitHubForgeRefused() {
+		t.Error("GitHubForgeRefused() = false while the first GitHub forge is refused")
+	}
+	if got := resolved.GitHubHost(); got != "ghe.example.com" {
+		t.Errorf("GitHubHost() = %q, expected the held ghe.example.com", got)
+	}
+	paths := problemPaths(resolved)
+	if why, ok := paths["forges[1].host"]; !ok || !strings.Contains(why, "already ghe.example.com") {
+		t.Errorf("Problems() = %v, expected the github.com forge refused as a second GitHub host", paths)
+	}
+	got, _ := json.Marshal(resolved.BrokerForges("/creds", "/ca"))
+	if want := `[{"provider":"github","host":"ghe.example.com","caSecret":"ghe-ca","caKey":"ca.crt","caFile":"/ca/ghe/ca.crt"}]`; string(got) != want {
+		t.Errorf("BrokerForges = %s, expected %s", got, want)
+	}
+	if egress := ForgeEgressPatterns(in); !slices.Contains(egress, "ghe.example.com") {
+		t.Errorf("egress = %v, expected the held host", egress)
 	}
 }

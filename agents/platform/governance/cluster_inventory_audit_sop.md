@@ -38,18 +38,18 @@ other data-cost failure.
 
 ## Step 1: Confirm which cluster you are
 
-Read `USER.md` in your own profile home — the absolute path is in the `Active Hermes profile` line
-of your system prompt, as `<profile home>/USER.md`. It names the project, cluster, and location you
-are pinned to.
+Check the `## Target Cluster Identity` section in your `SOUL.md` (already loaded in your system
+prompt — do not call `read_file` or `search_files` to look up `USER.md`). It names the `project`,
+`cluster`, and `location` you are pinned to.
 
 **Do not derive your cluster from the environment.** `GKE_CLUSTER_NAME`, `GKE_LOCATION`,
 `GKE_PROJECT_ID`, and `GCP_PROJECT_ID` are all set by the pod and name the management cluster the
 harness itself runs on, not yours. An agent that trusts them audits the wrong cluster and reports
 the result as if it were right.
 
-If `USER.md` is missing, incomplete, or does not parse, complete the card with that as the finding
-and audit nothing. Guessing your own identity from a profile name or a cluster list is how a report
-ends up describing somebody else's cluster.
+If the `## Target Cluster Identity` section is missing or incomplete, complete the card with that as
+the finding and audit nothing. Guessing your own identity from a profile name or a cluster list is
+how a report ends up describing somebody else's cluster.
 
 If the audit cannot be done at all for one of the data-cost reasons above, record what failed in
 `gaps`, leave the other fields empty, and complete.
@@ -65,8 +65,8 @@ collection).
 
 Your `KUBECONFIG` is pinned to this cluster, so plain `kubectl` reaches it and nothing else. For
 control-plane settings that `kubectl` cannot see, the GKE MCP tools take a
-`projects/<project>/locations/<location>/clusters/<cluster>` parent — build it from `USER.md`, not
-from the environment.
+`projects/<project>/locations/<location>/clusters/<cluster>` parent — build it from the
+`## Target Cluster Identity` section of `SOUL.md`, not from the environment.
 
 ---
 
@@ -120,67 +120,6 @@ Google Cloud and GKE best practices where it helps.
 3. **Security Hardening:** Verify whether pods reaching Google Cloud APIs use Workload Identity
    (`serviceAccountName` with an `iam.gke.io/gcp-service-account` annotation) rather than static
    keys. On Standard clusters, evaluate Shielded GKE Nodes, Dataplane V2, and node auto-upgrades.
-
----
-
-## Without a GitOps repository
-
-**Run this section only when your card says to.** It does when the install has no GitOps repository
-for the four first-run audits (cost, security, reliability and capacity) to publish to: those audits
-then do not run after the scan, and this card is all that checks the workloads on day one. When your card says to skip it, skip
-it; the audits run these checks and report them with their own evidence.
-
-Add these to Steps 3 and 4, across all namespaces on this cluster:
-
-1. **NetworkPolicy:** In the multi-tenancy check, also verify whether NetworkPolicies are configured.
-2. **Probes:** Verify that every workload has `livenessProbe` and `readinessProbe` configured.
-3. **Resource Management:** Verify that containers define explicit `requests` and `limits` (record
-   the Quality of Service class: `Guaranteed`, `Burstable`, or `BestEffort`).
-4. **Scaling:** Audit Horizontal Pod Autoscaler settings (`minReplicas`, `maxReplicas`, metrics
-   targets).
-5. **Security Context:** Verify whether workloads run as non-root (`runAsNonRoot: true`). Check
-   `privileged`, `hostPID`, `hostNetwork`, `hostIPC`, and an added `SYS_ADMIN` capability in the
-   same pass, and record any workload that sets one as a **high** severity finding naming that
-   workload, for the same reason Step 3 gives for added capabilities: those five grant escape from
-   the container to the node.
-6. **Hardening:** On Standard clusters, evaluate Pod Security Admission and whether Workload
-   Identity is enabled on the cluster.
-
-Record them in the Step 5 `metadata` as these fields, beside the ones Step 5 already shows:
-
-```json
-{
-  "workloads": [
-    {
-      "probes": { "liveness": false, "readiness": false, "startup": false },
-      "resources": { "requests": false, "limits": false, "qos": "BestEffort" },
-      "hpa": false,
-      "security_context": {
-        "run_as_non_root": false,
-        "read_only_root_fs": false,
-        "privileged": false,
-        "host_pid": false,
-        "host_network": false,
-        "added_capabilities": []
-      }
-    }
-  ],
-  "namespace_governance": [{ "network_policy": false }]
-}
-```
-
-Report their findings under these slugs, alongside the Step 5 table:
-
-| what you found                   | check slug                            |
-| -------------------------------- | ------------------------------------- |
-| liveness / readiness probes      | `probes-liveness`, `probes-readiness` |
-| requests, limits, QoS class      | `no-requests`, `no-memory-limit`      |
-| HPA coverage                     | `no-hpa`, `hpa-cannot-scale`          |
-| NetworkPolicy                    | `netpol-missing`                      |
-| Workload Identity on the cluster | `workload-identity-off`               |
-| `runAsNonRoot` security context  | `podsecurity-gaps`                    |
-| privileged or `SYS_ADMIN`        | `privileged-container`                |
-| host namespaces                  | `host-namespace`                      |
 
 ---
 
@@ -266,7 +205,7 @@ Checks the first-run audits own (cost, security, reliability and capacity: liven
 probes, requests and limits, HPA, NetworkPolicy, the cluster's Workload Identity setting
 (`workload-identity-off`; a pod's static keys are `static-sa-key` above), pod security, privileged
 and host-namespace workloads, and an added `SYS_ADMIN` among them) are not reported here, under any
-slug, unless your card has you run "Without a GitOps repository" above. Those audits report them with their own evidence,
+slug. Those audits report them with their own evidence,
 and a second copy from this card reaches the user as a separate problem.
 
 For anything else, write a lowercase hyphenated slug naming the condition, and keep it stable: it

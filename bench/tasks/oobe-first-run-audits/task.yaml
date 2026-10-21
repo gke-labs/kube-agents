@@ -1,11 +1,3 @@
-# PARKED -- a KNOWN_UNREGISTERED entry in scripts/validate_bench_cases.py, in
-# no roster file under hack/eval/, since 2026-10-09, until #2806 lands. Its first nightly held the
-# infra lock 140 minutes and the deadline cut the main part; every repetition
-# graded blocked, because the no-tool turn below leaves an empty trajectory and
-# the gate's liveness rung reads that as no agent run (#2699's
-# tool_calls_optional is the open fix). hack/eval/nightly-cases.txt
-# (the 2026-10-09 paragraph) has the night's numbers.
-#
 # Domain: fleet audits. Journey: a fresh install's onboarding inventory scan has
 # settled, and the four fleet audits it would otherwise leave to their schedules
 # (the next 06:20 UTC, the next Monday for cost) start at once.
@@ -36,12 +28,17 @@
 # the run and restores them,
 # files two archived cards, and adds and removes the `oobe` job. The four audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
-# repository and posts its summary wherever the install sends audit reports. The
+# repository (with none, its report in the report store) and, when it changed
+# something, posts its summary wherever the install sends audit reports. The
 # runner holds their four streams' locks for the unit (`audit_streams` below), and
 # every unit on one of those streams first waits up to two hours for a run the
 # install started there, so no audit case runs beside them and the next repetition
-# arms only once they have ended. Other stack-bearing cases are kept apart by the
-# infra lock.
+# arms only once they have ended. The runner does not hold the infra lock for it
+# (hack/ci-eval-pr.sh, infra_lock_exempt): the stack touches no task cluster and
+# reaches the install through a kubeconfig of its own. The onboarding state lock
+# (unit_state_lock) keeps it apart from bootstrap-discovery-fanout and
+# bootstrap-inventory-ranking-delivery, whose stacks rewrite the same markers and
+# the `oobe` job.
 # Eligible tier: nightly -- each repetition runs the four audits one after another,
 # after the previous repetition's have finished (the runner waits for them; run by
 # hand, the stage itself holds its first mark until they end).
@@ -65,8 +62,9 @@ validated: false
 # Slug per docs/designs/domains.yaml: what starts is four of the fleet audits.
 domain: fleet-audits
 
-# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
-owner: maintainers
+# The turn below makes no tool call on purpose, so bench-gate's liveness rung
+# takes its reply as the sign of a real run instead of a tool call.
+tool_calls_optional: true
 
 # The streams whose audits the stack starts. The runner holds their locks for the
 # whole unit (hack/ci-eval-pr.sh: task_streams), so no audit case on one of them

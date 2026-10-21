@@ -10,6 +10,9 @@ Audit, verify, and troubleshoot the logging, metrics, and distributed tracing ob
 > [!TIP]
 > The provided Python scripts in the `scripts/` subdirectory are parameterized reference implementations. When troubleshooting, you can run them directly, customize their parameters, or write custom just-in-time scripts/commands to query more specific metrics, endpoints, or time ranges as required by the task context.
 
+> [!IMPORTANT]
+> The helpers reach Google APIs through the credential broker and never hold a token: the Cloud Trace and Cloud Monitoring reads go through `credential_proxy_client.ApiSession` (see `scripts/google_api.py`), and the Cloud Logging read runs `gcloud logging read` through the broker's shim. Write a just-in-time script the same way. Do not fetch an access token and do not write an `Authorization` header yourself: the shim refuses a `gcloud` token fetch, the metadata server answers the sandbox with an identity IAM grants nothing, and whatever either returns lands in the transcript.
+
 # Workflow
 
 ## Logging
@@ -48,7 +51,7 @@ To determine which users have interacted with the system via Google Chat in the 
 - Run the packaged Python helper script to automatically query and parse the GKE container logs from Google Cloud Logging:
 
   ```bash
-  python3 ./scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>]
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/get_chat_users.py --project-id <PROJECT_ID> [--hours <HOURS>] [--limit <N>]
 
   ```
 
@@ -96,14 +99,14 @@ To determine which users have interacted with the system via Google Chat in the 
 
 - Run the python script to fetch LiteLLM total token metrics from Cloud Monitoring:
   ```bash
-  python3 ./scripts/check_token_usage.py --project-id <project-id>
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/check_token_usage.py --project-id <project-id>
   ```
 
 ### 4. List LiteLLM Metric Descriptors
 
 - Run the python script to list all available metric descriptors for LiteLLM:
   ```bash
-  python3 ./scripts/get_metric_descriptors.py --project-id <project-id>
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/get_metric_descriptors.py --project-id <project-id>
   ```
 
 ## Traces
@@ -153,7 +156,7 @@ To list recent traces or analyze span latency distributions to locate performanc
 - Run the trace latency analyzer script:
 
   ```bash
-  python3 ./scripts/analyze_trace_latency.py --project-id <project-id> [--hours <hours>] [--limit <limit>]
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/analyze_trace_latency.py --project-id <project-id> [--hours <hours>] [--limit <limit>]
   ```
 
   **Example Output:**
@@ -171,7 +174,7 @@ To list recent traces or analyze span latency distributions to locate performanc
 
 - Alternatively, run the raw trace list script:
   ```bash
-  python3 ./scripts/fetch_traces.py --project-id <project-id> --hours 24
+  python3 /opt/data/profiles/platform/skills/kube-agents-observability/scripts/fetch_traces.py --project-id <project-id> --hours 24
   ```
 
 ## Agent Status and Health

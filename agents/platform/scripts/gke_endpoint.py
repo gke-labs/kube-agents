@@ -134,9 +134,11 @@ POD_RANGE_UNKNOWN = "the agent cluster's Pod range"
 #
 # A cluster's endpoint configuration can change under us, and this repository
 # ships the instruction to change it: the `gke-networking` footer
-# (agents/platform/skill-overlays/gke-networking/append.md) tells the agent that `clusters update
-# --enable-dns-access` is the remedy for a closed endpoint, and the reverse is
-# `--no-enable-dns-access`. Two of the three callers are long-lived — the MCP
+# (agents/platform/skill-overlays/gke-networking/append.md) tells the agent that
+# the remedy for a closed endpoint is a pull request setting the cluster's
+# `dnsEndpointConfig.allowExternalTraffic`, which takes effect whenever the
+# GitOps repository applies it, and the reverse can land the same way. Two of
+# the three callers are long-lived — the MCP
 # server and the credential proxy — so an answer kept for the life of the
 # process outlasts the setting it describes: the documented remedy would appear
 # to do nothing, and its reversal would keep the flag pointed at a control plane

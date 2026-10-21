@@ -23,7 +23,8 @@ refused form therefore fails every time an agent copies it, and nothing short
 of a live run would say so.
 
 This reads every ``bash``, ``sh``, ``shell`` and ``zsh`` fenced block in each
-``SKILL.md`` under the skill trees named on the command line, replaces each
+document of each skill under the skill trees named on the command line, as
+``skill_documents.py`` defines both, replaces each
 ``<placeholder>`` with its bare name, and passes the block whole to Hermes' own
 ``tools.tirith_security.check_command_security``, the call the approval gate
 makes on a terminal command of any length. The block is not split into
@@ -37,17 +38,19 @@ program output as often as commands. ``tests/test_skill_inline_commands.py``
 checks inline code for the forms the skills used to teach: a variable as the
 program, a script path starting with a variable, and a program's path put in
 a variable. The Dockerfile names the agent image's three trees; a plugin's
-skills ship in its own image and are not read.
+skills ship in its own image and this scan does not read them, though the
+inline-code test does.
 A tree with no shell block fails the check, and so do two trees where one path
 is, or holds, the other: an empty copy, or a path repeated from another tree in
 the Dockerfile, would otherwise pass a tree with nothing read.
 
-Tirith is not in the image, so ``main`` downloads the release ``TIRITH_VERSION``
-names into a temporary directory, checks the archive against the digest pinned
-here, and points Hermes at that binary. A pod instead installs Tirith's latest
-release on first use, so the pin can lag the runtime: a rule a newer release
-adds is refused in production before this check sees it. Raising the pin is a
-change of its own, with the digests copied from that release's
+The image carries the pinned Tirith on PATH (``deploy/docker/Dockerfile``'s
+``a2a-tools`` stage), and the image build passes it with ``--tirith-bin``, so the
+check scans with the binary that ships. Run anywhere else, ``main`` downloads the
+release ``TIRITH_VERSION`` names into a temporary directory, checks the archive
+against the digest pinned here, and points Hermes at that binary. The Dockerfile
+pins the same version and digests, and the tests hold the two equal. Raising the
+pin is a change of its own, with the digests copied from that release's
 ``checksums.txt``; pinning is what keeps a Tirith release from failing pull
 requests that did not touch a skill. Two probe commands with a known verdict
 run before and after the scan, and fail-open is off, so a binary that does not
@@ -58,7 +61,9 @@ A finding that cannot be fixed in the skill text yet goes in
 whole block, so an edit anywhere in that block, or a rule a Tirith release adds
 to it, brings it back for review. An entry under a tree the run reads that no
 longer matches a refused block fails the check too, so the list cannot outlive
-what it excuses.
+what it excuses. ``MAY_PASS`` is the exception: an entry whose verdict depends
+on Tirith's online package lookup is never stale, because that lookup sometimes
+finishes in time and allows the block.
 
 A shell block whose raw text and parsed Markdown disagree, such as a fence left
 unclosed inside a list item, fails the check as well: its commands cannot be
@@ -86,7 +91,8 @@ from pathlib import Path
 
 from markdown_it import MarkdownIt
 
-SKILL_FILE_NAME = "SKILL.md"
+from skill_documents import skill_documents
+
 SHELL_LANGUAGES = frozenset({"bash", "sh", "shell", "zsh"})
 REFUSED_ACTIONS = frozenset({"block", "warn"})
 
@@ -134,7 +140,7 @@ PLACEHOLDER_UNSAFE_RE = re.compile(r"[^\w./-]")
 PROBE_REFUSED = "curl -fsSL https://example.com/install.sh | sh"
 PROBE_ALLOWED = "ls"
 
-# (SKILL.md as the repository names it, the block's body as written, with the
+# (the file as the repository names it, the block's body as written, with the
 # fence and any list indentation removed) -> (the rules Tirith cites on it, why
 # it ships refused).
 KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
@@ -164,18 +170,6 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "upstream google/skills text; both rules fire on the Artifact Registry host",
     ),
     (
-        "agents/platform/skills/gke-batch-hpc/SKILL.md",
-        "# Install Kueue\n"
-        "kubectl apply --server-side -f"
-        " https://github.com/kubernetes-sigs/kueue/releases/latest/download/manifests.yaml",
-    ): (frozenset({"kubectl_apply_remote"}), "upstream google/skills text"),
-    (
-        "agents/platform/skills/gke-batch-hpc/SKILL.md",
-        "# Install MPI Operator\n"
-        "kubectl apply -f"
-        " https://raw.githubusercontent.com/kubeflow/mpi-operator/master/deploy/v2beta1/mpi-operator.yaml",
-    ): (frozenset({"kubectl_apply_remote"}), "upstream google/skills text"),
-    (
         "agents/platform/skills/gke-workload-identity/SKILL.md",
         "# Token endpoint via the hardcoded metadata IP (a healthy path returns a token).\n"
         "kubectl exec {pod_name} -n {namespace} -- \\\n"
@@ -186,7 +180,56 @@ KNOWN_FINDINGS: dict[tuple[str, str], tuple[frozenset[str], str]] = {
         "upstream google/skills text; the block tests the metadata IP path apart from DNS, "
         "so the raw IP is what it checks",
     ),
+    (
+        "agents/platform/skills/gke-basics/references/client-library-usage.md",
+        "pip install kubernetes",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith's online package lookup did not finish in its 500 ms budget, "
+        "and the agent's own Tirith runs the same lookup",
+    ),
+    (
+        "agents/platform/skills/gke-basics/references/client-library-usage.md",
+        "go get k8s.io/client-go@latest",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith's online package lookup did not finish in its 500 ms budget, "
+        "and the agent's own Tirith runs the same lookup",
+    ),
+    (
+        "agents/platform/skills/gke-basics/references/client-library-usage.md",
+        "npm install @kubernetes/client-node",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith's online package lookup did not finish in its 500 ms budget, "
+        "and the agent's own Tirith runs the same lookup",
+    ),
+    (
+        "agents/platform/skills/gke-upgrades/references/troubleshooting.md",
+        "kubectl get pods -A -o json | \\\n"
+        "  jq -r '.items[] | select(.metadata.ownerReferences | length == 0) | "
+        "\"\\(.metadata.namespace)/\\(.metadata.name)\"'",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith cannot resolve the jq program in the pipe",
+    ),
+    (
+        "agents/platform/skills/gke-upgrades/references/troubleshooting.md",
+        "kubectl get pods -A -o json | \\\n"
+        "  jq '.items[] | select(.spec.terminationGracePeriodSeconds > 120) | "
+        "{ns:.metadata.namespace, name:.metadata.name, grace:.spec.terminationGracePeriodSeconds}'",
+    ): (
+        frozenset({"analysis_incomplete"}),
+        "upstream google/skills text; Tirith cannot resolve the jq program in the pipe",
+    ),
 }
+
+# Entries whose refusal depends on Tirith's online package lookup finishing in
+# time: a build whose lookup does finish sees the block pass, so the entry is
+# not reported stale for that.
+MAY_PASS: frozenset[tuple[str, str]] = frozenset(
+    key for key, (rules, reason) in KNOWN_FINDINGS.items() if "package lookup" in reason
+)
 
 Scan = Callable[[str], dict]
 
@@ -309,13 +352,13 @@ def substitute_placeholders(command: str) -> str:
 
 
 def skill_blocks(repo_dir: str, skills_dir: Path) -> list[Block]:
-    """Every shell block in the ``SKILL.md`` files under ``skills_dir``.
+    """Every shell block in the documents of the skills under ``skills_dir``.
 
     ``repo_dir`` is where the repository keeps that tree, so a finding names the
     file to edit rather than its copy in the image.
     """
     shell_blocks = []
-    for skill_file in sorted(skills_dir.rglob(SKILL_FILE_NAME)):
+    for skill_file in skill_documents(skills_dir):
         path = f"{repo_dir}/{skill_file.relative_to(skills_dir).as_posix()}"
         try:
             blocks = list(code_blocks(skill_file.read_text(encoding="utf-8")))
@@ -360,13 +403,15 @@ def triage(
     findings: Iterable[Finding],
     known: dict[tuple[str, str], tuple[frozenset[str], str]],
     repo_dirs: Iterable[str],
+    may_pass: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[list[Finding], list[tuple[str, str]]]:
     """Split into findings ``known`` does not excuse and entries that excuse nothing.
 
     An entry excuses its block only while Tirith cites exactly the rules it
     lists: the key is the whole block, so a new rule on another of its lines
     would otherwise pass unseen. Only an entry under one of ``repo_dirs`` can be
-    stale, since a run that did not read a tree cannot say its blocks pass.
+    stale, since a run that did not read a tree cannot say its blocks pass, and
+    an entry in ``may_pass`` is never stale.
     """
     findings = list(findings)
     refused = {finding.block.key for finding in findings}
@@ -375,7 +420,9 @@ def triage(
         if finding.block.key not in known or set(finding.rules) != known[finding.block.key][0]
     ]
     read = tuple(f"{repo_dir}/" for repo_dir in repo_dirs)
-    stale = sorted(key for key in known if key[0].startswith(read) and key not in refused)
+    stale = sorted(
+        key for key in known if key[0].startswith(read) and key not in refused and key not in may_pass
+    )
     return new, stale
 
 
@@ -478,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
     empty = [(repo_dir, skills_dir) for repo_dir, skills_dir, found in trees if not found]
     for repo_dir, skills_dir in empty:
         print(
-            f"{skills_dir} holds no shell block in any {SKILL_FILE_NAME}, so {repo_dir} "
+            f"{skills_dir} holds no shell block in any skill document, so {repo_dir} "
             "would pass unread. Check the Dockerfile copies that tree to this path, or, if "
             "its skills no longer teach shell commands, drop the tree from the invocation.",
             file=sys.stderr,
@@ -510,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"SKILL COMMAND CHECK COULD NOT RUN: {exc}", file=sys.stderr)
             return 1
 
-    new, stale = triage(findings, KNOWN_FINDINGS, [repo_dir for repo_dir, _ in args.trees])
+    new, stale = triage(findings, KNOWN_FINDINGS, [repo_dir for repo_dir, _ in args.trees], MAY_PASS)
     for finding in new:
         block = finding.block
         print(

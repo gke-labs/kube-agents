@@ -46,7 +46,10 @@ The dedupe is against people: a human who filed first, with the case names
 (or the node names, or the role names) in the title or body -- or, for the
 deadline kills and the pool findings, in the title -- wins and the bot adopts
 their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
-close it"). The bot never closes an issue -- a green gate is not proof the
+close it"). The four infrastructure shapes -- lost pods, fixture drift, pool
+drift, deadline kills -- are assigned to `infra_owner` in
+docs/designs/domains.yaml and end with a line mentioning `infra_backup`; an
+OUTAGE's issue (a shared break, which may be any case's code) is not. The bot never closes an issue -- a green gate is not proof the
 fixture is fixed, only that three runs passed, and the node events are still
 worth reading after the pool has healed itself.
 
@@ -69,6 +72,24 @@ except ImportError:  # imported with scripts/eval_dashboard/ itself on sys.path
     from health import pool_drift_split
 
 LABEL = "presubmit-gate"
+# Who an infrastructure issue goes to: top-level keys of domains.yaml,
+# line-scanned (this module stays stdlib-only, as post_health.py must).
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
+INFRA_OWNER_KEY = "infra_owner"
+INFRA_BACKUP_KEY = "infra_backup"
+# The login bare or in one pair of quotes, as YAML admits it.
+TOP_LEVEL_KEY_RE = r"""^{key}:\s*(["']?)([A-Za-z0-9-]+)\1\s*(?:#.*)?$"""
+INFRA_ADDRESSEE = "Infra owner: @{owner}{backup} (`infra_owner` in docs/designs/domains.yaml)."
+# The unassigned retry's line: the refused login as code, not a mention --
+# GitHub just said it is outside the project, and a mention still notifies it.
+INFRA_ADDRESSEE_REFUSED = "Unassigned: GitHub refused `{owner}`, the `infra_owner` in docs/designs/domains.yaml, as assignee{backup}."
+INFRA_BACKUP_NOTE = ", backup @{backup}"
+# Bare words YAML reads as null or a boolean, never as a login: a key set
+# to one of them names no owner.
+YAML_NON_LOGINS = frozenset({"null", "none", "true", "false", "yes", "no", "on", "off"})
+# The issue field GitHub names when it will not assign a login.
+ASSIGNEES_FIELD = "assignees"
 JOB_NAME = "pull-kube-agents-smoke-test"
 # Where the bot looks for a human's issue first.
 OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
@@ -100,6 +121,9 @@ TITLE_MAX_CHARS = 256
 # GitHub's issue body limit; a pool-wide drift with a repair block per
 # (project, finding) can pass it, and a body that is refused files nothing.
 ISSUE_BODY_MAX_CHARS = 65536
+# What the pool-drift body leaves under that limit for the infra-owner line
+# Tracker.addressed appends (INFRA_ADDRESSEE with two logins).
+ADDRESSEE_RESERVE_CHARS = 256
 POOL_DRIFT_PROJECTS_OMITTED = "- … and {count} more project(s) omitted to fit the issue; pool-state.json carries every project's repair command (docs/ci-health.md, The pool-state scan)"
 
 TITLE = "Smoke gate outage: {count} {noun} failing on every PR since {since}"
@@ -166,7 +190,7 @@ Filed automatically by the smoke health bot; edit freely. Fix PRs: reference thi
 FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
 PROJECT_NOUN = ("project", "projects")
 FIXTURE_DRIFT_BODY = """\
-The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so the cases that depend on a drifted role run against it and red on every run that leases one of these projects; that red is the fixture's, not the pull request's, and a retest is worth it only after the re-apply below.
+The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. Nothing in the presubmit runs this check and nothing acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so the cases that depend on a drifted role run against it and red on every run that leases one of these projects; that red is the fixture's, not the pull request's, and a retest is worth it only after the repair below.
 
 **Drifted roles**
 
@@ -181,7 +205,7 @@ The seeded fleet's fixture role(s) below are present but not in the state the ca
 
 {evidence}
 
-**Reconcile:** the daily `ci-kube-agents-fleet-reconcile-daily` run re-applies `bench/tf/fleet` in each project named (08:30 UTC; `docs/ci-pool-projects.md` 6.2), and the scan after it confirms. To repair sooner, run `python3 hack/fleet_reconcile.py --project <project>` from a `main` checkout under a Boskos lease (`bench/tf/fleet/README.md`, "State and reconcile"); never apply a branch. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`.)
+**Reconcile:** the daily `ci-kube-agents-fleet-reconcile-daily` run re-applies `bench/tf/fleet` in each project named (08:30 UTC; `docs/ci-pool-projects.md` 6.2), and the scan after it confirms. To repair sooner, run `python3 hack/fleet_reconcile.py --project <project>` from a `main` checkout under a Boskos lease (`bench/tf/fleet/README.md`, "State and reconcile"); never apply a branch. (For `stalled-controller` drift where the workload started during an in-cluster heal, re-apply plans no changes: delete the pod in `seeded-stall` and if the condition reason remains `NewReplicaSetAvailable`, replace the Deployment rather than `rollout restart`. `default-pool-headroom` is the other exception: it reads capacity, not an unapplied stack; while seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, a re-apply changes nothing and the pool's size in `bench/tf/fleet/main.tf`, `seeded_a_default`, is the fix: if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands.)
 
 Incident brief: {brief}
 
@@ -249,6 +273,17 @@ UNKNOWN_NODE = "(node name not recorded)"
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+def infra_addressees(path: pathlib.Path = DOMAINS_FILE) -> tuple[str | None, str | None]:
+    """``(infra_owner, infra_backup)`` from domains.yaml; ``None`` for one
+    the file does not carry, or when it cannot be read."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None, None
+    found = [re.search(TOP_LEVEL_KEY_RE.format(key=key), text, re.MULTILINE) for key in (INFRA_OWNER_KEY, INFRA_BACKUP_KEY)]
+    return tuple(m.group(2) if m and m.group(2).lower() not in YAML_NON_LOGINS else None for m in found)
 
 
 def names_all(text: str, names: list[str]) -> bool:
@@ -475,15 +510,40 @@ def render_pool_drift_body(health: dict, since_text: str, brief_link: str) -> st
     # limit; the findings list, the evidence and the marker always stay.
     kept = list(blocks)
     body = render(kept)
-    while len(body) > ISSUE_BODY_MAX_CHARS and kept:
+    while len(body) > ISSUE_BODY_MAX_CHARS - ADDRESSEE_RESERVE_CHARS and kept:
         kept.pop()
         body = render(kept)
     return body
 
 
 class Tracker:
-    def __init__(self, gh):
+    def __init__(self, gh, infra: tuple[str | None, str | None] | None = None):
         self.gh = gh
+        self.infra_owner, self.infra_backup = infra if infra is not None else infra_addressees()
+
+    def addressed(self, payload: dict, refused: bool = False) -> dict:
+        """An infrastructure issue's payload, assigned to the infra owner and
+        mentioning the backup; unchanged when domains.yaml names no owner.
+        ``refused``: the unassigned retry, which names the owner as refused
+        without pinging them."""
+        if not self.infra_owner:
+            return payload
+        backup = INFRA_BACKUP_NOTE.format(backup=self.infra_backup) if self.infra_backup else ""
+        line = (INFRA_ADDRESSEE_REFUSED if refused else INFRA_ADDRESSEE).format(owner=self.infra_owner, backup=backup)
+        body = f"{payload['body'].rstrip()}\n\n{line}\n"
+        return dict(payload, body=body) if refused else dict(payload, body=body, assignees=[self.infra_owner])
+
+    def file_addressed(self, payload: dict):
+        """POST an infrastructure issue addressed to the infra owner. When
+        GitHub refuses the assignee, POST it once more without one, so a
+        login GitHub will not assign costs the assignment and never the
+        issue. Any other failure files nothing this tick, as before."""
+        addressed = self.addressed(payload)
+        created = self.gh.call("POST", self.gh.path(ISSUES_PATH), addressed)
+        if created is None and "assignees" in addressed and not self.gh.dry_run and self.gh.refused(ASSIGNEES_FIELD):
+            log(f"warning: filing the issue assigned to {self.infra_owner} failed; retrying unassigned")
+            created = self.gh.call("POST", self.gh.path(ISSUES_PATH), self.addressed(payload, refused=True))
+        return created
 
     def existing(self, names: list[str], title_only: bool = False, marker: re.Pattern | None = None) -> dict | None:
         """An open `presubmit-gate` issue whose title or body names every
@@ -545,7 +605,7 @@ class Tracker:
             "body": render_lost_pods_body(health, when_text, window_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_LOST_PODS)
+        created = as_issue(self.file_addressed(payload), CONDITION_LOST_PODS)
         if created:
             log(f"tracking issue: filed #{created['number']} for the cluster owner")
         return created
@@ -560,7 +620,7 @@ class Tracker:
             "body": render_deadline_kill_body(health, since_text, window_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_DEADLINE_KILL)
+        created = as_issue(self.file_addressed(payload), CONDITION_DEADLINE_KILL)
         if created:
             log(f"tracking issue: filed #{created['number']} for the gate's deadline kills")
         return created
@@ -576,7 +636,7 @@ class Tracker:
             "body": render_fixture_drift_body(health, since_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_FIXTURE_DRIFT)
+        created = as_issue(self.file_addressed(payload), CONDITION_FIXTURE_DRIFT)
         if created:
             log(f"tracking issue: filed #{created['number']} for the fleet owner")
         return created
@@ -597,7 +657,7 @@ class Tracker:
             "body": render_pool_drift_body(health, since_text, brief_link),
             "labels": [LABEL],
         }
-        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_POOL_DRIFT)
+        created = as_issue(self.file_addressed(payload), CONDITION_POOL_DRIFT)
         if created:
             log(f"tracking issue: filed #{created['number']} for the pool owner")
         return created

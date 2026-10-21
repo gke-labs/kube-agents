@@ -33,6 +33,7 @@ from tests import test_installer_common as _installer_common
 from tests.testing.common import get_isolated_test_env
 
 _SENTINEL = "glpat-SENTINEL-7d1f0c9e4b2a"
+_READ_SENTINEL = "glpat-READONLY-3a9e5b1c7f20"
 _FULL_INSTALL = _REPO_ROOT / "terraform" / "examples" / "full-install"
 _GOLDEN_DIR = pathlib.Path(__file__).resolve().parent / "testdata" / "gitlab_forge"
 
@@ -42,6 +43,10 @@ _GOLDEN_DIR = pathlib.Path(__file__).resolve().parent / "testdata" / "gitlab_for
 # bytes as given), and keeps what `apply -f -` was sent. With
 # STUB_APPLY_FAIL=1 the apply fails the way a rejected patch does: it echoes
 # the object it was sent to stderr.
+# install.sh reads these from the environment, so a developer's shell that
+# exports one would leak into every test that does not set it.
+_TOKEN_SOURCE_VARS = ("GITLAB_READ_TOKEN_FILE", "GITLAB_TOKEN_FILE", "GITOPS_CA_FILE")
+
 _KUBECTL_STUB = r"""#!/usr/bin/env bash
 log="$STUB_DIR/kubectl.log"
 # $$, not a count: the two halves of a pipeline run at once.
@@ -50,11 +55,25 @@ printf '%s\n' "$@" > "$STUB_DIR/call.$n.argv"
 env > "$STUB_DIR/call.$n.env"
 echo "kubectl $*" >> "$log"
 case "$1 $2" in
-  "get secret") exit "${STUB_SECRET_EXISTS_RC:-1}" ;;
+  "get secret")
+    # An existing Secret holds the write token unless STUB_SECRET_HAS_TOKEN=0
+    # (a Secret with only the read-token key). Each query is answered as a
+    # real kubectl would, so a check that asks for the wrong thing reads the
+    # wrong answer instead of an empty one.
+    if [ "${STUB_SECRET_EXISTS_RC:-1}" = 0 ]; then
+      case "$*" in
+        *'jsonpath={.data.token}'*) [ "${STUB_SECRET_HAS_TOKEN:-1}" != 1 ] || printf 'dG9rZW4=' ;;
+        *'jsonpath={.data}'*)
+          if [ "${STUB_SECRET_HAS_TOKEN:-1}" = 1 ]; then printf '{"token":"dG9rZW4="}'
+          else printf '{"read-token":"cmVhZA=="}'; fi ;;
+      esac
+    fi
+    exit "${STUB_SECRET_EXISTS_RC:-1}" ;;
   "create secret")
     src="" key=""
     for a in "$@"; do case "$a" in
       --from-file=token=*) src="${a#--from-file=token=}" key=token ;;
+      --from-file=read-token=*) src="${a#--from-file=read-token=}" key=read-token ;;
       --from-file=ca.crt=*) src="${a#--from-file=ca.crt=}" key=ca.crt ;;
     esac; done
     printf 'apiVersion: v1\nkind: Secret\ndata:\n  %s: %s\n' "$key" "$(base64 < "$src" | tr -d '\n')"
@@ -163,7 +182,7 @@ class GitLabFlagsTest(unittest.TestCase):
         setup = f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{func_call}\n'
         overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
         overrides.update(env or {})
-        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides))
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides, absent=_TOKEN_SOURCE_VARS))
 
     def test_parse_args_takes_the_four_flags(self):
         proc = self._run_install_func(
@@ -211,6 +230,8 @@ class GitLabFlagsTest(unittest.TestCase):
             (self._gitlab(PARAM_GITOPS_REPO="grp-/proj-"), "grp-/proj-"),
             (self._gitlab(PARAM_GITOPS_REPO="my.group/proj"), "my.group/proj"),
             (self._gitlab(PARAM_GITLAB_TOKEN_FILE="/dev/stdin"), "group/sub/project"),
+            (self._gitlab(PARAM_GITLAB_READ_TOKEN_FILE=str(tok)), "group/sub/project"),
+            (self._gitlab(PARAM_GITLAB_READ_TOKEN_FILE="/dev/stdin"), "group/sub/project"),
         ):
             with self.subTest(case=case):
                 proc = self._validate(case)
@@ -252,14 +273,49 @@ class GitLabFlagsTest(unittest.TestCase):
             self._gitlab(PARAM_GITOPS_HOST="git.corp.example", PARAM_GITOPS_REPO="git.corp.example/grp/proj"),
             self._gitlab(PARAM_GITOPS_REPO="g/" + "p" * 240),
             self._gitlab(PARAM_GITLAB_TOKEN_FILE=str(self._tmp)),
+            self._gitlab(PARAM_GITLAB_READ_TOKEN_FILE=str(self._tmp / "missing")),
+            self._gitlab(PARAM_GITLAB_READ_TOKEN_FILE=str(self._tmp)),
+            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITLAB_READ_TOKEN_FILE": "/etc/hostname"},
         ):
             with self.subTest(case=case):
                 proc = self._validate(case)
                 self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
 
+    def test_one_source_for_both_tokens_is_refused(self):
+        both = self._tmp / "both-tokens"
+        both.write_text(_SENTINEL)
+        # A second name for the same file: only the -ef clause can refuse it.
+        other_name = self._tmp / "both-tokens-link"
+        other_name.symlink_to(both)
+        for case in (
+            self._gitlab(PARAM_GITLAB_TOKEN_FILE=str(both), PARAM_GITLAB_READ_TOKEN_FILE=str(other_name)),
+            self._gitlab(PARAM_GITLAB_TOKEN_FILE="/dev/stdin", PARAM_GITLAB_READ_TOKEN_FILE="/dev/stdin"),
+            self._gitlab(PARAM_GITLAB_TOKEN_FILE="/dev/stdin", PARAM_GITLAB_READ_TOKEN_FILE="/dev/fd/0"),
+            self._gitlab(PARAM_GITLAB_TOKEN_FILE=str(both), PARAM_GITLAB_READ_TOKEN_FILE=str(both)),
+        ):
+            with self.subTest(case=case):
+                proc = self._validate(case)
+                self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+                self.assertIn("name the same source", proc.stdout + proc.stderr)
+
+    def test_two_different_sources_for_the_two_tokens_are_accepted(self):
+        write_tok = self._tmp / "write-tok"
+        write_tok.write_text(_SENTINEL)
+        read_tok = self._tmp / "read-tok-2"
+        read_tok.write_text(_READ_SENTINEL)
+        for case in (
+            self._gitlab(PARAM_GITLAB_TOKEN_FILE=str(write_tok), PARAM_GITLAB_READ_TOKEN_FILE=str(read_tok)),
+            self._gitlab(PARAM_GITLAB_TOKEN_FILE="/dev/stdin", PARAM_GITLAB_READ_TOKEN_FILE=str(read_tok)),
+        ):
+            with self.subTest(case=case):
+                proc = self._validate(case)
+                self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
     def test_install_env_records_the_secret_name_only(self):
         tok = self._tmp / "tok"
         tok.write_text(_SENTINEL)
+        read_tok = self._tmp / "read-tok"
+        read_tok.write_text(_READ_SENTINEL)
         dest = self._tmp / "out.env"
         body = (
             f'source "{_INSTALLER_COMMON}"\n'
@@ -267,13 +323,14 @@ class GitLabFlagsTest(unittest.TestCase):
             'PARAM_DRY_RUN="false"\n'
             "export GITOPS_FORGE=gitlab GITOPS_HOST=gitlab.corp.example GITOPS_REPO=g/p GITLAB_TOKEN_SECRET=gl-tok\n"
             f"PARAM_GITLAB_TOKEN_FILE={shlex.quote(str(tok))}\n"
+            f"PARAM_GITLAB_READ_TOKEN_FILE={shlex.quote(str(read_tok))}\n"
             f'bootstrap_install_env_file "{dest}" 0.5.0\n'
         )
         proc = subprocess.run(
             ["bash", "-c", body],
             capture_output=True,
             text=True,
-            env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}),
+            env=get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}),
             cwd=str(_REPO_ROOT),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
@@ -283,6 +340,8 @@ class GitLabFlagsTest(unittest.TestCase):
         self.assertIn("GITLAB_TOKEN_SECRET=gl-tok", text)
         self.assertNotIn(_SENTINEL, text)
         self.assertNotIn(str(tok), text)
+        self.assertNotIn(_READ_SENTINEL, text)
+        self.assertNotIn(str(read_tok), text)
         self.assertNotIn("TOKEN_FILE", text)
 
     def test_install_env_of_a_github_install_has_no_forge_keys(self):
@@ -298,7 +357,7 @@ class GitLabFlagsTest(unittest.TestCase):
             ["bash", "-c", body],
             capture_output=True,
             text=True,
-            env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}),
+            env=get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}),
             cwd=str(_REPO_ROOT),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
@@ -328,7 +387,7 @@ class GitLabTokenNeverLeaksTest(unittest.TestCase):
             "GITLAB_TOKEN_SECRET": "gitlab-forge-token",
         }
         overrides.update(extra)
-        return get_isolated_test_env(overrides=overrides, bin_dir=self._bin)
+        return get_isolated_test_env(overrides=overrides, bin_dir=self._bin, absent=_TOKEN_SOURCE_VARS)
 
     def _assert_only_in_the_secret(self, *outputs):
         encoded = base64.b64encode(_SENTINEL.encode()).decode()
@@ -476,6 +535,17 @@ class GitLabTokenNeverLeaksTest(unittest.TestCase):
         self.assertIn("Keeping the existing GitLab token Secret", proc.stdout)
         self.assertFalse(self._apply_calls())
 
+    def test_a_secret_with_only_the_read_token_is_not_kept_as_the_write_token(self):
+        proc = self._run_body(
+            'PARAM_NON_INTERACTIVE=true\ncreate_gitlab_token_secret agents ctx1; echo "rc=$?"\n',
+            STUB_SECRET_EXISTS_RC="0",
+            STUB_SECRET_HAS_TOKEN="0",
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("Keeping the existing GitLab token Secret", proc.stdout)
+        self.assertIn("No GitLab token was given", proc.stdout + proc.stderr)
+        self.assertFalse(self._apply_calls())
+
     def test_a_token_file_replaces_an_existing_secret(self):
         tok = self._tmp / "token-file"
         tok.write_text(_SENTINEL)
@@ -538,6 +608,125 @@ class GitLabTokenNeverLeaksTest(unittest.TestCase):
         self._assert_only_in_the_secret(text)
 
 
+class GitLabReadTokenTest(unittest.TestCase):
+    """GITLAB_READ_TOKEN_FILE puts a read-only token into the key read-token
+    of the GitLab token Secret, through its own server-side-apply field
+    manager. A run without it must leave a stored read token in place."""
+
+    setUp = GitLabTokenNeverLeaksTest.setUp
+    _env = GitLabTokenNeverLeaksTest._env
+    _run_body = GitLabTokenNeverLeaksTest._run_body
+
+    _WRITE_MANAGER = "--field-manager=kube-agents-installer"
+    _READ_MANAGER = "--field-manager=kube-agents-installer-read-token"
+
+    def _applies(self):
+        """Each apply as (argv, the object it was sent)."""
+        out = []
+        for f in self._stub_dir.glob("call.*.argv"):
+            argv = f.read_text().split("\n")
+            if argv and argv[0] == "apply":
+                n = f.name[len("call."):-len(".argv")]
+                out.append((argv, (self._stub_dir / f"applied.{n}.yaml").read_text()))
+        return out
+
+    def _files(self, token=_SENTINEL, read_token=_READ_SENTINEL):
+        tok = self._tmp / "token-file"
+        tok.write_text(token + "\n")
+        read_tok = self._tmp / "read-token-file"
+        read_tok.write_text(read_token + "\n")
+        return tok, read_tok
+
+    def _secret_writers(self, assignments, **env):
+        return self._run_body(
+            f"PARAM_NON_INTERACTIVE=true {assignments}\n"
+            "create_gitlab_token_secret agents ctx1 && a=0 || a=$?\n"
+            "create_gitlab_read_token_secret agents ctx1 && b=0 || b=$?\n"
+            'echo "a=$a b=$b"\n',
+            **env,
+        )
+
+    def test_each_key_goes_through_its_own_field_manager(self):
+        tok, read_tok = self._files()
+        proc = self._secret_writers(
+            f"PARAM_GITLAB_TOKEN_FILE={shlex.quote(str(tok))} "
+            f"PARAM_GITLAB_READ_TOKEN_FILE={shlex.quote(str(read_tok))}"
+        )
+        self.assertIn("a=0 b=0", proc.stdout, proc.stderr)
+        applies = self._applies()
+        self.assertEqual(len(applies), 2, applies)
+        by_manager = {}
+        for argv, obj in applies:
+            self.assertIn("--server-side", argv)
+            manager = next(a for a in argv if a.startswith("--field-manager="))
+            by_manager[manager] = obj
+        self.assertEqual(set(by_manager), {self._WRITE_MANAGER, self._READ_MANAGER})
+        write_obj, read_obj = by_manager[self._WRITE_MANAGER], by_manager[self._READ_MANAGER]
+        encoded = base64.b64encode(_SENTINEL.encode()).decode()
+        read_encoded = base64.b64encode(_READ_SENTINEL.encode()).decode()
+        # Each object holds its own key alone. An object that held both keys
+        # would make one manager own both, and its next apply without the
+        # read token would delete it.
+        self.assertIn(f"token: {encoded}", write_obj)
+        self.assertNotIn("read-token", write_obj)
+        self.assertIn(f"read-token: {read_encoded}", read_obj)
+        self.assertNotRegex(read_obj, r"(?m)^\s*token:")
+        log = (self._stub_dir / "kubectl.log").read_text()
+        self.assertIn("--from-file=read-token=/dev/stdin", log)
+        self.assertNotIn(str(read_tok), log)
+        for f in self._stub_dir.glob("call.*"):
+            self.assertNotIn(_READ_SENTINEL, f.read_text(), f.name)
+            self.assertNotIn(read_encoded, f.read_text(), f.name)
+        for out in (proc.stdout, proc.stderr):
+            self.assertNotIn(_READ_SENTINEL, out)
+            self.assertNotIn(read_encoded, out)
+
+    def test_a_run_without_a_read_token_file_leaves_the_read_token_alone(self):
+        # The Secret exists with a read token from an earlier run. A new write
+        # token is applied by the write manager, with no read-token in its
+        # object, and the read manager applies nothing. So server-side apply
+        # removes no field the read manager owns.
+        tok, _ = self._files()
+        proc = self._secret_writers(f"PARAM_GITLAB_TOKEN_FILE={shlex.quote(str(tok))}", STUB_SECRET_EXISTS_RC="0")
+        self.assertIn("a=0 b=0", proc.stdout, proc.stderr)
+        applies = self._applies()
+        self.assertEqual(len(applies), 1, applies)
+        argv, obj = applies[0]
+        self.assertIn(self._WRITE_MANAGER, argv)
+        self.assertNotIn(self._READ_MANAGER, argv)
+        self.assertNotIn("read-token", obj)
+        self.assertNotIn("read-token", (self._stub_dir / "kubectl.log").read_text())
+
+    def test_a_run_with_no_token_files_applies_nothing(self):
+        proc = self._secret_writers("", STUB_SECRET_EXISTS_RC="0")
+        self.assertIn("a=0 b=0", proc.stdout, proc.stderr)
+        self.assertFalse(self._applies())
+
+    def test_a_read_token_alone_leaves_the_write_token_alone(self):
+        _, read_tok = self._files()
+        proc = self._secret_writers(
+            f"PARAM_GITLAB_READ_TOKEN_FILE={shlex.quote(str(read_tok))}", STUB_SECRET_EXISTS_RC="0"
+        )
+        self.assertIn("a=0 b=0", proc.stdout, proc.stderr)
+        applies = self._applies()
+        self.assertEqual(len(applies), 1, applies)
+        argv, obj = applies[0]
+        self.assertIn(self._READ_MANAGER, argv)
+        self.assertNotRegex(obj, r"(?m)^\s*token:")
+
+    def test_an_empty_read_token_source_stores_nothing(self):
+        _, read_tok = self._files(read_token=" \t")
+        proc = self._secret_writers(f"PARAM_GITLAB_READ_TOKEN_FILE={shlex.quote(str(read_tok))}")
+        self.assertIn("b=1", proc.stdout, proc.stderr)
+        self.assertIn("read token source", proc.stdout + proc.stderr)
+        self.assertFalse(self._applies())
+
+    def test_the_variable_is_read_from_the_environment(self):
+        _, read_tok = self._files()
+        proc = self._run_body('echo "r=$PARAM_GITLAB_READ_TOKEN_FILE"\n', GITLAB_READ_TOKEN_FILE=str(read_tok))
+        self.assertIn(f"r={read_tok}", proc.stdout, proc.stderr)
+
+
 _PEM = "-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n"
 
 
@@ -560,10 +749,10 @@ class GitLabPrivateCATest(unittest.TestCase):
         ca = self._tmp / "ca.pem"
         ca.write_text(_PEM)
         proc = self._run_body(
-            # After the source, as the main path sets it: sourcing install.sh
-            # clears an inherited GITOPS_CA_SECRET.
-            f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
-            'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n',
+            # After the source, as the main path sets them: sourcing install.sh
+            # clears an inherited GITOPS_FORGE and GITOPS_CA_SECRET.
+            f"GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+            'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n',
         )
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         log = (self._stub_dir / "kubectl.log").read_text()
@@ -587,8 +776,8 @@ class GitLabPrivateCATest(unittest.TestCase):
                 ca = self._tmp / f"{name}.pem"
                 ca.write_text(content)
                 proc = self._run_body(
-                    f"GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
-                    'create_gitlab_ca_secret agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
+                    f"GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca PARAM_GITOPS_CA_FILE={shlex.quote(str(ca))}\n"
+                    'create_gitops_ca_secret agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"\n',
                 )
                 # A one-shot source is read after the apply has named the
                 # Secret: refused, nothing stored, the way to create it
@@ -599,19 +788,19 @@ class GitLabPrivateCATest(unittest.TestCase):
                 self.assertEqual([], self._ca_secrets())
 
     def test_without_a_file_a_missing_secret_is_named_and_an_existing_one_kept(self):
-        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
-                              'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n')
+        proc = self._run_body('GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca\n'
+                              'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("kubectl create secret generic gitlab-forge-ca", proc.stdout + proc.stderr)
         self.assertEqual([], self._ca_secrets())
-        proc = self._run_body('GITOPS_CA_SECRET=gitlab-forge-ca\n'
-                              'create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n',
+        proc = self._run_body('GITOPS_FORGE=gitlab GITOPS_CA_SECRET=gitlab-forge-ca\n'
+                              'create_gitops_ca_secret agents ctx1; echo "rc=$?"\n',
                               STUB_SECRET_EXISTS_RC="0")
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("does not exist", proc.stdout + proc.stderr)
 
     def test_an_install_without_a_ca_does_nothing(self):
-        proc = self._run_body('create_gitlab_ca_secret agents ctx1; echo "rc=$?"\n')
+        proc = self._run_body('create_gitops_ca_secret agents ctx1; echo "rc=$?"\n')
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertFalse((self._stub_dir / "kubectl.log").exists())
 
@@ -769,7 +958,8 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
 
     def test_a_switch_to_github_drops_the_recorded_secret(self):
         proc = self._validate_ca(
-            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_SECRET": "gitlab-forge-ca"}
+            {"PARAM_GITOPS_FORGE": "github", "PARAM_GITOPS_REPO": "infra", "PARAM_GITOPS_CA_SECRET": "gitlab-forge-ca",
+             "PARAM_GITOPS_RECORDED_FORGE": "gitlab"}
         )
         self.assertIn("rc=0 cm=", proc.stdout, proc.stderr)
         self.assertNotIn("cm=gitlab-forge-ca", proc.stdout)
@@ -790,7 +980,7 @@ class GitLabPrivateCAFlagsTest(unittest.TestCase):
         )
         proc = subprocess.run(
             ["bash", "-c", body], capture_output=True, text=True,
-            env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}),
+            env=get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}),
             cwd=str(_REPO_ROOT),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
@@ -829,7 +1019,7 @@ class GitLabThroughMainTest(unittest.TestCase):
             f"main {' '.join(shlex.quote(a) for a in args)} && rc=0 || rc=$?\n"
             'echo "rc=$rc"\n'
         )
-        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._install_env)})
+        env = get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._install_env)})
         return _run_installer_bash(body, env)
 
     def test_a_github_app_with_gitlab_is_refused_before_step_one(self):
@@ -865,7 +1055,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
         full = f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nPARAM_DRY_RUN=false\n{body}'
         return subprocess.run(
             ["bash", "-c", full], capture_output=True, text=True, cwd=str(_REPO_ROOT),
-            env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._loaded)}),
+            env=get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._loaded)}),
         )
 
     def test_switching_an_existing_github_install_to_gitlab_records_it(self):
@@ -943,7 +1133,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
         return subprocess.run(
             ["bash", "-c", body], capture_output=True, text=True, cwd=str(_REPO_ROOT),
             stdin=subprocess.DEVNULL, start_new_session=True, timeout=60,
-            env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
+            env=get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file)}),
         )
 
     def test_a_recorded_github_app_does_not_block_a_switch_to_gitlab(self):
@@ -965,8 +1155,10 @@ class GitLabInstallEnvTest(unittest.TestCase):
         )
         self.assertIn("rc=0 forge=github host=[]", proc.stdout, proc.stderr)
 
-    def test_a_host_flag_with_github_is_still_refused(self):
-        proc = self._source_with("", "--gitops-forge=github", "--gitops-host=gitlab.example.com")
+    def test_a_gitlab_host_flag_with_github_is_still_refused(self):
+        # Any other host with github is a GitHub Enterprise Server
+        # (test_installer_ghes.py); gitlab.com is never one.
+        proc = self._source_with("", "--gitops-forge=github", "--gitops-host=gitlab.com")
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr)
 
     def test_a_shell_export_does_not_choose_install_sh_s_forge(self):
@@ -978,7 +1170,7 @@ class GitLabInstallEnvTest(unittest.TestCase):
         proc = subprocess.run(
             ["bash", "-c", body], capture_output=True, text=True, cwd=str(_REPO_ROOT),
             stdin=subprocess.DEVNULL, start_new_session=True, timeout=60,
-            env=get_isolated_test_env(overrides={
+            env=get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={
                 "KUBE_AGENTS_INSTALL_ENV": str(env_file), "GITOPS_FORGE": "gitlab",
                 "GITOPS_HOST": "h.example", "GITLAB_TOKEN_SECRET": "x",
             }),
@@ -1061,7 +1253,7 @@ class GitLabTerraformCompositionTest(unittest.TestCase):
         self.assertEqual(sorted(names), ["gitlab_ca_secret_name", "gitlab_repo", "gitlab_token_secret_name"])
 
     def test_gitlab_suppresses_the_github_alias(self):
-        self.assertIn("!local.gitops_is_gitlab && (local.github_org", self.main)
+        self.assertIn("!local.gitops_is_gitlab && !local.gitops_is_ghes && (local.github_org", self.main)
         self.assertIn("credentialsRef = { name = var.gitlab_token_secret_name }", self.main)
         self.assertIn('role = "gitops"', self.main)
 
@@ -1092,7 +1284,7 @@ class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):
             f"{preamble}\n"
             'validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc"\n'
         )
-        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
+        env = get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
         return _run_installer_bash(setup, env)
 
     def _file(self, content):
@@ -1114,6 +1306,14 @@ class GitLabEmptyTokenFileEarlyTest(unittest.TestCase):
         proc = self._validate_with(self._file(_SENTINEL + "\n"))
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn(_SENTINEL, proc.stdout + proc.stderr)
+
+    def test_an_empty_regular_read_token_file_is_refused(self):
+        tok = self._tmp / "read-token-file"
+        tok.write_text(" \n")
+        proc = self._validate_with(f"PARAM_GITLAB_READ_TOKEN_FILE={shlex.quote(str(tok))}")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("GITLAB_READ_TOKEN_FILE", proc.stdout + proc.stderr)
+        self.assertIn("is empty", proc.stdout + proc.stderr)
 
     def test_a_one_shot_source_is_not_read_early(self):
         # The validator must leave a pipe unread: the post-apply read still
@@ -1167,7 +1367,7 @@ class GitOpsSourceIsRereadableTest(unittest.TestCase):
             f"{preamble}\n"
             f'gitops_source_is_rereadable {shlex.quote(path)} && echo "yes" || echo "no"\n'
         )
-        env = get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
+        env = get_isolated_test_env(absent=_TOKEN_SOURCE_VARS, overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
         return _run_installer_bash(setup, env).stdout.strip().splitlines()[-1]
 
     def test_a_regular_file_is_rereadable(self):
@@ -1237,9 +1437,17 @@ class GitLabSecretOrderTest(unittest.TestCase):
         start = source.index('create_gitlab_token_secret "$namespace"') - 400
         block = source[start: source.index('create_gitlab_token_secret "$namespace"') + 400]
         self.assertLess(
-            block.index('create_gitlab_ca_secret "$namespace"'),
+            block.index('create_gitops_ca_secret "$namespace"'),
             block.index('create_gitlab_token_secret "$namespace"'),
         )
+
+    def test_the_read_token_is_written_after_the_token(self):
+        # The token writer decides from whether the Secret exists. Written
+        # first, the read token would make a missing write token look kept.
+        source = _INSTALL_SH.read_text()
+        start = source.index('create_gitlab_token_secret "$namespace"')
+        block = source[start: start + 400]
+        self.assertIn('create_gitlab_read_token_secret "$namespace" "$expected_ctx" || exit 1', block)
 
 
 if __name__ == "__main__":

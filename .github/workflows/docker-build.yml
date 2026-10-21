@@ -35,6 +35,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,8 +43,33 @@ jobs:
       - name: Load tags
         run: cat tags.env >> "$GITHUB_ENV"
 
+      # Every Docker Hub pull this job makes goes through mirror.gcr.io. The
+      # Dockerfile's three Docker Hub bases (hermes-agent, golang, envoy), and the
+      # python base of the sandbox and replay-proxy builds, are otherwise pulled
+      # anonymously, and Docker Hub's anonymous limit is per source
+      # IP, which GitHub-hosted runners share: on 2026-10-09 a burst of pull
+      # requests had every failed run of this job that day, more than thirty, and
+      # five GHCR publishes on main, die on Docker Hub, most within seconds of
+      # starting: most on `429 Too Many Requests` from registry-1.docker.io, the rest on
+      # auth.docker.io timing out, with nothing changed in the tree (#2870).
+      # mirror.gcr.io serves public Docker Hub images without that limit, takes no
+      # credential, so a fork gets the same path, and needs no token exchange.
+      #
+      # Two pulls, two settings. buildkitd-config mirrors docker.io for the builder,
+      # which is where the base images are resolved; a reference the mirror does not
+      # hold falls through to Docker Hub as before, and a floating tag resolves to
+      # the manifest the mirror last refreshed, which can trail Docker Hub by days.
+      # driver-opts points the builder image itself at the mirror: this action pulls
+      # moby/buildkit on the runner's own daemon before the builder exists, and that
+      # pull died in the same burst too. The builder image has no fall-through. A
+      # `docker run` or a job `container:` of a Docker Hub image on the runner's
+      # daemon is covered by neither; none in this job pulls one, and
+      # security-scan.yml names its job container on the mirror for the same reason.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config: .github/buildkitd.toml
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
 
       # platforms: linux/amd64 on every deploy/docker/Dockerfile build: the images
       # deploy to amd64 GKE nodes, and the multi-arch bases otherwise resolve to

@@ -96,6 +96,7 @@ try:
     # By name, not as a module: `health` is the parameter every render_*
     # function here takes, and importing the module would shadow it.
     from eval_dashboard.health import (
+        CAPACITY_ROLES,
         POOL_BREACH,
         POOL_STALE,
         POOL_UNMEASURED,
@@ -112,6 +113,7 @@ except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly, periodics
     from eval_dashboard.health import (
+        CAPACITY_ROLES,
         POOL_BREACH,
         POOL_STALE,
         POOL_UNMEASURED,
@@ -254,6 +256,11 @@ STORM_COOLDOWN = timedelta(minutes=30)
 # message that says the scan is blind.
 FIXTURE_SCAN_DOC = "docs/ci-health.md"
 FIXTURE_RECONCILE_HINT = "The daily reconcile re-applies bench/tf/fleet in the projects named at 08:30 UTC; a hand run of hack/fleet_reconcile.py --project from main does it sooner."
+# For a role in health.CAPACITY_ROLES the re-apply advice would misdirect
+# (#3607: a 10m fixture pod stranded for three days and read as drift on its
+# own role), and so would "edit main.tf" in the hours after a size change has
+# merged, while the postsubmit is still rolling it; the hint covers both.
+FIXTURE_CAPACITY_HINT = "default-pool-headroom reads capacity, not an unapplied stack: seeded-a's default pool is below the 100m headroom margin the scan keeps for the next fixtures, and a re-apply changes nothing. The fix is the pool's size in bench/tf/fleet/main.tf (seeded_a_default): if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands; otherwise the pool needs a larger machine type or node count."
 # A reconcile run older than this is printed with its date in the digest.
 RECONCILE_RUN_DATED_AFTER = timedelta(days=1)
 # The pool-state scan's message: the scan's document carries the command per
@@ -706,6 +713,16 @@ def fixture_drift_sentence(health: dict, since: str) -> str:
     )
 
 
+def fixture_drift_advice(health: dict) -> str:
+    """The retest line and the hint, by what drifted: a re-apply for a planted
+    object out of shape, the pool's size for a capacity role, both when mixed."""
+    roles = set((health.get("incident") or {}).get("roles") or [])
+    if roles and roles <= CAPACITY_ROLES:
+        return f"Retest once the pool has headroom. {FIXTURE_CAPACITY_HINT}"
+    advice = f"Retest once the fleet is re-applied. {FIXTURE_RECONCILE_HINT}"
+    return f"{advice} {FIXTURE_CAPACITY_HINT}" if roles & CAPACITY_ROLES else advice
+
+
 def pool_drift_sentence(health: dict, since: str) -> str:
     incident = health.get("incident") or {}
     findings = list(incident.get("roles") or [])
@@ -801,7 +818,7 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
     elif condition == CONDITION_FIXTURE_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""
-        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Retest once the fleet is re-applied. {FIXTURE_RECONCILE_HINT}{tracking}"]
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} {fixture_drift_advice(health)}{tracking}"]
     elif condition == CONDITION_POOL_DRIFT:
         tag = issue_tag(issue)
         tracking = f" Tracking {tag}." if tag else ""

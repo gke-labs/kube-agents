@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
 # imports it by path. Distinct from the callback's own registration name so
@@ -111,6 +112,12 @@ SOURCES: dict[str, Source] = {
         "agents/platform/skills/fleet-audit/scripts/audit_report.py",
         ("def _ident(", "def _cell(", "def trim_command(", "def trim_excerpt("),
     ),
+    # B2 imports this module and drives `enqueue_action` over the label space,
+    # and greps it for the one allowed auto-merge call.
+    "merge_gate": Source(
+        "scripts/merge_gate.py",
+        ("def enqueue_action(", "enablePullRequestAutoMerge", "HOLD_LABELS"),
+    ),
     "credential_proxy": Source(
         "agents/platform/scripts/credential_proxy.py",
         (
@@ -130,6 +137,18 @@ SOURCES: dict[str, Source] = {
     "mcp_policy": Source(
         "agents/platform/scripts/mcp_policy.py",
         ("GKE_READ_TOOLS", "MCP_SERVERS", "def evaluate(", "MCP_RELAY_PREFIX"),
+    ),
+    # C1 imports this module: what the broker relays for the gateway's
+    # watchers under the watcher role.
+    "watcher_policy": Source(
+        "agents/platform/scripts/watcher_policy.py",
+        ("def evaluate_k8s(", "def evaluate_gcp(", "REFUSED_RESOURCES", "WATCHER_K8S_PREFIX", "def project_cluster("),
+    ),
+    # C1 holds the operator's copy of the drift detector's default
+    # subscription to the detector's own.
+    "drift_detector_main_go": Source(
+        "k8s-operator/cmd/drift-detector/main.go",
+        ("defaultSubscriptionName =",),
     ),
     "session_kv_server": Source(
         "agents/platform/scripts/session_kv_server.py",
@@ -169,7 +188,8 @@ SOURCES: dict[str, Source] = {
     ),
     "broker_split_go": Source(
         "k8s-operator/internal/controller/platformagent_broker_split.go",
-        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath ="),
+        ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
+         "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
@@ -239,15 +259,24 @@ SOURCES: dict[str, Source] = {
         "platformagent-tagged.yaml",
         ("kind: Deployment",),
     ),
-    # The above-one-replica shape. Its anchor is the leader Role's pods rule,
-    # because that rule is the only reason the fixture is registered here:
-    # every other golden is single-replica and renders it away, so without
-    # this key group C bounds the leader Role only in the shape where it holds
-    # no write verb on pods at all.
+    # The CR that asks for availability.replicas: 3. The operator caps the
+    # gateway at one replica, so this renders the single-replica shape: the
+    # gateway Deployment on Recreate and a leader Role holding leases only.
+    # No golden renders the leader Role's pods rule any more, because no
+    # install does. It stays registered so group C's bounds keep reading the
+    # one CR that would render that rule if the cap were lifted. The last
+    # anchor is the cap: it is the gateway Deployment's own selector label
+    # followed by its strategy, because a bare `type: Recreate` also matches
+    # the credential-proxy Deployment, which is always on Recreate. Losing it
+    # means the multi-replica shape is back and this key's comment is wrong.
     "golden_ha": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
         "platformagent-ha.yaml",
-        ("kind: Deployment", "kubeagents:leader:", "- pods"),
+        (
+            "kind: Deployment",
+            "kubeagents:leader:",
+            "app: platformagent-gateway\n  strategy:\n    type: Recreate",
+        ),
     ),
     # C1's cross-module pair. The session fence is rendered by the operator
     # (Go module k8s-operator) and its selector has to match the labels the
@@ -287,24 +316,12 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/gchat.go",
         ("func (g *Gateway) resolveInjectPrincipal", "injectEvalPrincipalPrefix"),
     ),
-    # D1's identity-table check reads the two Roles the next stack mints that
-    # no golden renders (every golden is `mode: today`): the gateway's and the
-    # callout's. Anchored on the rule each one grants, so the extractor that
-    # reads them cannot return an empty body and pass.
-    "a2a_gateway_role": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
-        ("func buildA2AGatewayRole(", '[]string{"deployments"},', "a2aSlackPrincipalMapSecretName ="),
-    ),
     # The operator-rendered Hermes bridge: built from the agent container, so
     # what it drops from that copy is the whole of what keeps it a separate
     # principal from the agent beside it.
     "a2a_bridge_render": Source(
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
         ("func buildA2ABridgeContainer(", "func a2aBridgeOwnEnv(", "var a2aBridgeDroppedAgentEnv"),
-    ),
-    "a2a_callout_role": Source(
-        "k8s-operator/internal/controller/platformagent_a2a_callout.go",
-        ("func buildA2ACalloutRole(", '[]string{"configmaps"},'),
     ),
     # The A2A door is the inject door's sibling for an agent caller, gated and
     # resolved the same way; A3 reads the same two seams for it.
@@ -354,6 +371,10 @@ SOURCES: dict[str, Source] = {
     "operator_labels": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("labelPartOf",),
+    ),
+    "operator_metrics_peer": Source(
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("operatorPodNameLabel", "operatorPodNameValue"),
     ),
     "a2a_spawner": Source(
         "a2a/gateway/spawn.go",
@@ -617,6 +638,28 @@ SOURCES: dict[str, Source] = {
     "cluster_config": Source(
         "agents/cluster/config.yaml",
         ("mcp_servers:", "KUBE_AGENTS_MCP_RELAY_URL"),
+    ),
+    # --- the tool-call audit ---------------------------------------------
+    # D1 reads that every profile config enables tool_call_audit. The Planning
+    # Agent's config is the one the image ships as the default profile. A
+    # Cluster Agent profile copies the shared plugins tree when it is
+    # scaffolded, and the image fills that tree from agents/chat/defaults/, so
+    # these anchors pin that the plugin a Cluster Agent enables is there to load.
+    "chat_config": Source("agents/chat/config.yaml", ("plugins:",)),
+    "tool_call_audit_manifest": Source(
+        "agents/chat/defaults/plugins/tool_call_audit/plugin.yaml",
+        ("name: tool_call_audit",),
+    ),
+    "cluster_agent_profile": Source(
+        "agents/platform/scripts/cluster_agent_profile.py",
+        (
+            'SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))',
+            "overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR",
+        ),
+    ),
+    "dockerfile_shared_plugins": Source(
+        "deploy/docker/Dockerfile",
+        ("COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/",),
     ),
     "merge_configs": Source("deploy/docker/merge_configs.py", ("def merge(",)),
     "dockerfile_profile_configs": Source(

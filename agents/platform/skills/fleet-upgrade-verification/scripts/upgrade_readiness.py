@@ -27,10 +27,24 @@ check yet and is stated here:
   matches none of those is a current
   outage for what it does match and is reported, not graded. The lists are the rule's
   reading of the path, not a proof of the upgrade's safety.
+
+After those four, `evaluate_extra_rules` runs every module registered in `EXTRA_RULES`, one
+per entry of docs/designs/upgrade-failure-catalogue.md under `readiness_rules/`, whose
+package docstring is the contract a module meets. The fold stamps each finding with its
+rule; a rule's `blocking` joins the `blocked` verdict, an `unknown` from a rule that can block
+joins `unknown`, its `risks` the member's risks list, which the table and the report print
+under "risks", and its `notes` the note column. A rule that raises, `SystemExit` included, is
+one `unknown` finding, never a crash.
 """
 
+import copy
+import json
 import re
 from datetime import datetime, time, timedelta, timezone
+
+import readiness_rules
+from readiness_rules import audit_log, zonal_control_plane
+from readiness_rules import finding as finding_tiers  # the tier vocabulary; `finding` itself names a loop variable below
 
 # Per-member verdicts. `blocked` when any rule blocks; `unknown` when a rule could not be
 # evaluated (the cluster read failed, or there is no target to grade against) and nothing
@@ -135,7 +149,6 @@ SKEW_NOT_APPLICABLE = "n/a"
 SKEW_AUTOPILOT_REASON = "Autopilot: Google owns the node pools"
 SKEW_NO_TARGET_REASON = "no target to measure against"
 SKEW_MAJOR_DIFFERS = "major version differs from the target"
-
 # Fail-closed webhooks. admissionregistration.k8s.io/v1 defaults `failurePolicy` to Fail,
 # so an absent field grades as Fail. Only a webhook whose backend is a Service in the
 # cluster is graded: a URL backend is outside what the read can see, so it is counted in
@@ -370,6 +383,99 @@ RULE_VERSIONS_FORMAT = "{rule} at {versions}"
 RULE_OPERATION_JOIN = "/"
 RULE_RESOURCE_JOIN = ","
 RULE_NONE = "no rules"
+
+
+# The per-entry rules (readiness_rules/, one module per entry of the upgrade-failure
+# catalogue; the package docstring is the contract), run after the PDB, maintenance, skew and
+# webhook rules above, in
+# this order, which is the order the table and the JSON list their findings in. One list,
+# grouped by entry number, the entry in the comment.
+EXTRA_RULES = [
+    zonal_control_plane,  # entry 11
+]
+RULE_RESULT_KEYS = readiness_rules.RESULT_KEYS
+# What the fold stamps on a finding: the rule's id and entry on every one, the rule's own
+# rendering (`text`) on a blocker or risk and on an `unknown` entry (the note line), the
+# `reason` an `unknown` entry carries, and whether the rule could have blocked, which is
+# what decides whether its `unknown` moves the verdict.
+RULE_KEY = "rule"
+ENTRY_KEY = "entry"
+TEXT_KEY = "text"
+REASON_KEY = "reason"
+DETAIL_KEY = "detail"
+CAN_BLOCK_KEY = "can_block"
+# The two words the shared helpers write a finding's own grade under (`new_finding` and
+# `finding.py`'s tiers); a blocker the fold demotes to a risk is re-graded under whichever
+# it carries, so the JSON never carries a risk that says it blocks.
+GRADE_KEY = "grade"
+TIER_KEY = "tier"
+RULE_ID_ATTRIBUTE = "RULE_ID"
+ENTRY_ATTRIBUTE = "ENTRY"
+CAN_BLOCK_ATTRIBUTE = "CAN_BLOCK"
+# What names a rule that has no RULE_ID (it is keyed and evaluated under this name) or one
+# whose attributes fail the check below (its unknown entry carries this name).
+MODULE_NAME_ATTRIBUTE = "__name__"
+RULE_PREFIX_FORMAT = "{rule}: {text}"
+RULE_FAILED_REASON = "rule raised {error}; not evaluated"
+# The module's own attributes are read and checked inside the fold's guard, before anything
+# is derived from them: a `RULE_ID` that is not a string cannot key `rules` (a list is
+# unhashable, and the fold would have died on it after every member was read); an `ENTRY`
+# JSON cannot carry would fail the writer from the per-rule record and the unknown entries,
+# which a probe of the result alone does not see; `bool("False")` is True, so `CAN_BLOCK`
+# must be a bool. A module that fails one is not evaluated: one `unknown` under its module
+# name, with no entry and the conservative `can_block`. A read that itself raises (a
+# module-level `__getattr__` on the lazy-import idiom that raises, an `ENTRY` nested past
+# the recursion limit) is the same defect, under the name the fold can still read.
+RULE_ATTRIBUTE_REASON = "{attribute} is {type}, not {expected}; not evaluated"
+RULE_ATTRIBUTES_RAISED_REASON = "reading the module's attributes raised {error}; not evaluated"
+EXPECTED_STRING = "a string"
+EXPECTED_BOOL = "a bool"
+EXPECTED_JSON = "a JSON value"
+# A rule that declares it cannot block and files a blocker anyway: the finding is kept as
+# a risk, and the note says so, so the invariant holds and the defect is visible.
+DEMOTED_BLOCKER_NOTE = "filed a blocker but declares CAN_BLOCK False; reported as a risk"
+# The shapes a rule's result must have for the fold to read it. A result that breaks one is
+# the rule's defect and costs one `unknown`, like a rule that raises: a string under a list
+# key would otherwise be read letter by letter, and a finding that is not a dict or whose
+# `text` is not a string would fail the stamping or the table after every member was read.
+RESULT_NOT_A_DICT = "evaluate returned {type}, not a dict"
+# A key the contract does not name: a misnamed list (`risk`, `findings`) would otherwise
+# read as a clean rule. A key left out is an empty list.
+RESULT_UNKNOWN_KEY = "the result carries {keys}, not among {expected}"
+# An `unknown` entry is a string or a dict whose `reason` or `detail` is a non-empty string;
+# anything else is a shape defect, named rather than rendered as a repr.
+UNKNOWN_WITHOUT_REASON = "an unknown entry carries no reason or detail (keys {keys})"
+UNKNOWN_EMPTY_TEXT = "an unknown entry is an empty string"
+UNKNOWN_ENTRY_NOT_TEXT = "an unknown entry is {type}, not a string or a dict with a reason"
+RESULT_KEY_NOT_A_LIST = "{key} is {type}, not a list"
+FINDING_NOT_A_DICT = "a {kind} finding is {type}, not a dict"
+FINDING_TEXT_NOT_TEXT = "a {kind} finding's text is {type}, not a string"
+NOTE_NOT_TEXT = "a note is {type}, not a string"
+# A blank string passes an "is a string" check and prints as nothing: an unnamed rule in the
+# table and the JSON, a finding with no content in its column, an empty note. Each is named
+# as what it is, like a blank unknown entry.
+FINDING_TEXT_BLANK = "a {kind} finding's text is blank"
+NOTE_BLANK = "a note is blank"
+RULE_ID_BLANK_REASON = "RULE_ID is blank; not evaluated"
+# The findings go to `--output` as they are, so a value JSON cannot carry (a set, a
+# datetime, a tuple-keyed dict, a NaN or infinite float, which `json.dumps` would write as
+# a bare token no JSON parser reads) would fail the writer after every member was read; the
+# fold probes each result, with `allow_nan=False` as the writer does, and makes it the
+# rule's defect instead.
+RESULT_NOT_JSON = "the result is not JSON-serialisable: {error}"
+# The audit-log cache is the one thing the report reads that a rule wrote; a rule that
+# leaves it in a shape `audit_log.summaries` cannot read, or drops or changes a read stored
+# before it, is held to it here, inside the guard, whether it returned or raised, and the
+# cache is put back as it stood before the rule, so neither the report nor a later rule
+# meets the damage and each offender is charged on its own.
+CACHE_DEFECT_REASON = "the rule left the audit-log cache unreadable: {defect}"
+# A second module with a registered rule's id is not run: its findings would be stamped
+# with the other module's id and the per-rule counts would describe one of the two. The
+# registered module keeps the id; the duplicate is one `unknown` counted under it, with the
+# registered module's `can_block`, so `rules[id]` and its entries agree: a duplicate of a
+# rule that cannot block is reported in the note and moves nothing, and the contract test
+# over EXTRA_RULES is what keeps a duplicate registration from merging.
+DUPLICATE_RULE_REASON = "a second module registers RULE_ID {rule}; the duplicate was not evaluated"
 
 
 # ---------------------------------------------------------------------------- PDBs
@@ -1247,14 +1353,277 @@ def describe_webhook_finding(finding: dict) -> str:
     return WEBHOOK_FINDING_FORMAT.format(webhook=finding["webhook"], config_kind=finding["config_kind"], reason=finding["reason"], matches=matches)
 
 
+# --------------------------------------------------------------------- extra rules
+
+
+class RuleDefect(TypeError):
+    """A rule's result, or the audit-log cache as the rule left it, does not meet the contract:
+    raised by the fold's own probes (`_rule_result`, `_unknown_entry`) with the defect as its
+    text, and recorded by the fold as that text, not as the rule raising, which it did not."""
+
+
+def _unknown_entry(item, rule_id: str, entry, can_block: bool) -> dict:
+    """One `unknown` entry as the JSON carries it: a dict with `reason` (whole), the rule's
+    id and entry, whether the rule could have blocked, and the `text` the note column prints,
+    the reason on one line of at most NOTE_EXCERPT_CHARS. `item` is a non-empty string or a
+    dict whose `reason` or `detail` is one; anything else raises `RuleDefect`, the shape
+    defect the fold records as the rule's `unknown`."""
+    if isinstance(item, dict):
+        out = dict(item)
+        reason = next((out[key] for key in (REASON_KEY, DETAIL_KEY) if isinstance(out.get(key), str) and out[key].strip()), None)
+        if reason is None:
+            raise RuleDefect(UNKNOWN_WITHOUT_REASON.format(keys=sorted(str(key) for key in out)))
+    elif isinstance(item, str):
+        if not item.strip():  # named as what it is, not as "str, not a string"
+            raise RuleDefect(UNKNOWN_EMPTY_TEXT)
+        out, reason = {}, item
+    else:
+        raise RuleDefect(UNKNOWN_ENTRY_NOT_TEXT.format(type=type(item).__name__))
+    out[REASON_KEY] = reason
+    out[RULE_KEY] = rule_id
+    out[ENTRY_KEY] = entry
+    out[CAN_BLOCK_KEY] = can_block
+    out[TEXT_KEY] = RULE_PREFIX_FORMAT.format(rule=rule_id, text=readiness_rules.one_line(reason, readiness_rules.NOTE_EXCERPT_CHARS))
+    return out
+
+
+def _rule_result(rule, rule_id: str, entry, can_block: bool, cluster: dict, member: dict, read, target, context: dict) -> dict:
+    """One rule's result checked against the contract and in the form the fold emits: every
+    key a list, every blocker and risk a dict copied before it is stamped (so a rule's own
+    objects are never changed or re-attributed) carrying a one-line string `text` (the
+    rule's `describe`, unless the rule set it), its `rule` and `entry`, every note a string
+    prefixed with the rule's id, a blocker from a rule that cannot block kept as a risk with
+    a note, every `unknown` entry in the dict form `_unknown_entry` gives, and the whole, as
+    it will be written, a JSON value; and the audit-log cache, the one thing the report reads
+    that a rule may write, as `audit_log.read` leaves it. Raises `RuleDefect` naming a shape
+    the contract forbids or the cache damage, and lets through whatever the rule raises; the
+    caller records the first as that defect and the second as the rule raising, either as the
+    rule's `unknown`."""
+    snapshot = audit_log.cache_snapshot(context)
+    try:
+        result = rule.evaluate(*_rule_arguments(cluster, member, read, target, context))
+    finally:  # on the raising path too: the raising rule is the one charged, and the next rule reads a sound cache; neither call raises
+        damage = audit_log.cache_damage(context, snapshot)
+        if damage is not None:
+            audit_log.cache_restore(context, snapshot)
+    if damage is not None:
+        raise RuleDefect(CACHE_DEFECT_REASON.format(defect=damage))
+    if result is None:
+        result = {}
+    if not isinstance(result, dict):
+        raise RuleDefect(RESULT_NOT_A_DICT.format(type=type(result).__name__))
+    foreign = sorted(str(key) for key in result if key not in RULE_RESULT_KEYS)
+    if foreign:
+        raise RuleDefect(RESULT_UNKNOWN_KEY.format(keys=foreign, expected=list(RULE_RESULT_KEYS)))
+    out = {}
+    for key in RULE_RESULT_KEYS:
+        value = result.get(key)
+        if value is None:
+            value = []
+        if not isinstance(value, list):
+            raise RuleDefect(RESULT_KEY_NOT_A_LIST.format(key=key, type=type(value).__name__))
+        out[key] = list(value)
+    for kind in ("blocking", "risks"):
+        stamped = []
+        for finding in out[kind]:
+            if not isinstance(finding, dict):
+                raise RuleDefect(FINDING_NOT_A_DICT.format(kind=kind, type=type(finding).__name__))
+            finding = dict(finding)
+            if TEXT_KEY not in finding:
+                finding[TEXT_KEY] = rule.describe(finding)
+            if not isinstance(finding[TEXT_KEY], str):
+                raise RuleDefect(FINDING_TEXT_NOT_TEXT.format(kind=kind, type=type(finding[TEXT_KEY]).__name__))
+            if not finding[TEXT_KEY].strip():
+                raise RuleDefect(FINDING_TEXT_BLANK.format(kind=kind))
+            finding[TEXT_KEY] = readiness_rules.one_line(finding[TEXT_KEY])
+            finding[RULE_KEY] = rule_id
+            finding[ENTRY_KEY] = entry
+            stamped.append(finding)
+        out[kind] = stamped
+    for note in out["notes"]:
+        if not isinstance(note, str):
+            raise RuleDefect(NOTE_NOT_TEXT.format(type=type(note).__name__))
+        if not note.strip():
+            raise RuleDefect(NOTE_BLANK)
+    if not can_block and out["blocking"]:
+        for demoted in out["blocking"]:  # re-graded under whichever word it carries, so the JSON never carries a risk that says it blocks
+            if GRADE_KEY in demoted:
+                demoted[GRADE_KEY] = readiness_rules.GRADE_RISK
+            if TIER_KEY in demoted:
+                demoted[TIER_KEY] = finding_tiers.TIER_RISK
+        out["risks"] = out["blocking"] + out["risks"]
+        out["blocking"] = []
+        out["notes"].append(DEMOTED_BLOCKER_NOTE)
+    out["unknown"] = [_unknown_entry(item, rule_id, entry, can_block) for item in out["unknown"]]
+    out["notes"] = [RULE_PREFIX_FORMAT.format(rule=rule_id, text=readiness_rules.one_line(note)) for note in out["notes"]]
+    try:
+        json.dumps(out, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        raise RuleDefect(RESULT_NOT_JSON.format(error=e)) from e
+    except readiness_rules.NOT_A_RULE_DEFECT:
+        raise
+    except BaseException as e:  # noqa: BLE001 - a value nested past the recursion limit, or one whose encoding raises otherwise, is not JSON either: named as the value's defect, not as the rule raising
+        raise RuleDefect(RESULT_NOT_JSON.format(error=readiness_rules.exception_text(e))) from e
+    return out
+
+
+def _rule_arguments(cluster: dict, member: dict, read, target, context: dict) -> tuple:
+    """What a rule is handed: `cluster`, `member` and `read` as deep copies, `target` as it
+    is (a tuple), and a context whose fleet records (`clusters`, `pools`) are deep copies
+    while the runner, the instant and the cache are shared, the cache through
+    `audit_log.read`, which hands out copies. A rule's writes to its arguments reach no
+    other rule and not the report; the shared cache is the one thing it can damage, and
+    the fold holds it to that."""
+    own = dict(context)
+    for key in (readiness_rules.CONTEXT_CLUSTERS, readiness_rules.CONTEXT_POOLS):
+        if key in own:
+            own[key] = copy.deepcopy(own[key])
+    return copy.deepcopy(cluster), copy.deepcopy(member), copy.deepcopy(read), target, own
+
+
+def _failed_result(reason: str, rule_id: str, entry, can_block: bool) -> dict:
+    """The result of a rule that was not evaluated: one `unknown` entry carrying `reason`,
+    built from the checked attributes and a string, so it needs no probe."""
+    result = {key: [] for key in RULE_RESULT_KEYS}
+    result["unknown"] = [_unknown_entry(reason, rule_id, entry, can_block)]
+    return result
+
+
+def _rule_attributes(rule) -> tuple[str, object, bool, str | None]:
+    """The module's `RULE_ID`, `ENTRY` and `CAN_BLOCK`, read and checked before anything is
+    derived from them: the id a string (returned as a plain `str`), the entry a JSON value,
+    `CAN_BLOCK` a bool. The fourth value is None, or the reason the module is not evaluated;
+    then the id is the module's name, the entry None and `can_block` True, the conservative
+    reading."""
+    name = str(getattr(rule, MODULE_NAME_ATTRIBUTE, rule))
+    rule_id = getattr(rule, RULE_ID_ATTRIBUTE, name)
+    entry = getattr(rule, ENTRY_ATTRIBUTE, None)
+    can_block = getattr(rule, CAN_BLOCK_ATTRIBUTE, True)
+    checks = (
+        (RULE_ID_ATTRIBUTE, rule_id, EXPECTED_STRING, isinstance(rule_id, str)),
+        (CAN_BLOCK_ATTRIBUTE, can_block, EXPECTED_BOOL, isinstance(can_block, bool)),
+        (ENTRY_ATTRIBUTE, entry, EXPECTED_JSON, _is_json(entry)),
+    )
+    for attribute, value, expected, holds in checks:
+        if not holds:
+            return name, None, True, RULE_ATTRIBUTE_REASON.format(attribute=attribute, type=type(value).__name__, expected=expected)
+    if not rule_id.strip():  # a blank id would key `rules` and print as nothing in every cell and note
+        return name, None, True, RULE_ID_BLANK_REASON
+    # A plain `str`, whatever subclass the module declared: the id keys `rules` and formats the
+    # notes after the fold's guard closes, so a subclass whose `__hash__` raises would leave
+    # the fold there. `str()` runs the subclass's `__str__`, inside the guard; one that raises
+    # is the module's defect like any other attribute read.
+    return str(rule_id), entry, can_block, None
+
+
+def _is_json(value) -> bool:
+    try:
+        json.dumps(value, allow_nan=False)
+    except readiness_rules.NOT_A_RULE_DEFECT:
+        raise
+    except BaseException:  # noqa: BLE001 - whatever the value refuses with (a RecursionError past the limit, an `items()` that raises), it is not a JSON value
+        return False
+    return True
+
+
+def _rule_name(rule) -> str:
+    """What names a module whose attribute reads raised: its `__name__`, else `str(rule)`,
+    else its type's name when that raises too. Never raises, so the unknown can be keyed."""
+    try:
+        return str(getattr(rule, MODULE_NAME_ATTRIBUTE, rule))
+    except readiness_rules.NOT_A_RULE_DEFECT:
+        raise
+    except BaseException:  # noqa: BLE001
+        return type(rule).__name__
+
+
+def evaluate_extra_rules(cluster: dict, member: dict, read, target, context: dict, rules: list | None = None) -> dict:
+    """Every registered rule (or `rules`) over one member, folded.
+
+    Returns the four result lists joined across rules in registration order, each blocker
+    and risk stamped with its `rule`, `entry` and `text`, each `unknown` entry a dict with
+    `reason`, `can_block` and the `text` the note column prints, each note prefixed with
+    its rule's id; and `rules`, per rule id, the rule's `entry`, `can_block` and a count per
+    list, so the findings are serialised once and `rules[id]` counts what the lists carry
+    under that id. Each rule is handed its own copies of `cluster`, `member`, `read` and the
+    context's fleet records (`_rule_arguments`), so what it writes to them reaches no other
+    rule and not the report. A rule that raises (`SystemExit` included; `KeyboardInterrupt` and
+    `GeneratorExit` alone pass through), returns a shape the contract forbids, returns a
+    value JSON cannot carry, or damages the audit-log cache is one `unknown` entry naming
+    what it raised, or the shape, value or damage at fault, never a crash: one rule's defect
+    must not hide the others' findings. So is a module whose `RULE_ID` is not
+    a string, whose `ENTRY` is not a JSON value or whose `CAN_BLOCK` is not a bool, under
+    its module name: the three are checked before anything is derived from them, so the
+    fold emits nothing it has not probed or built from checked values. A blocker from a
+    rule whose `CAN_BLOCK` is False is kept as a risk, with a note. A second module
+    carrying a registered id is not evaluated; it is one `unknown` counted under that id
+    with the registered module's `can_block`.
+    """
+    # One plain dict under the cache key for the whole fold: `read`, the snapshot, the probe and
+    # the summary all see it, every rule's shallow copy of the context shares it, and a context
+    # built by hand with no cache key, `None` or a mapping of another class there starts from
+    # an empty one here rather than being tolerated at each access (a reading rule's result
+    # would otherwise land in a dict the fold never sees, read again by the next rule and
+    # missing from the member's summary).
+    if isinstance(context, dict) and type(context.get(readiness_rules.CONTEXT_CACHE)) is not dict:
+        context[readiness_rules.CONTEXT_CACHE] = {}
+    folded = {key: [] for key in RULE_RESULT_KEYS}
+    folded["rules"] = {}
+    for rule in EXTRA_RULES if rules is None else rules:
+        # One guard from the attribute reads to the result: nothing between "next module" and
+        # "record written" leaves the fold. `rule_id` is None inside the guard while the
+        # attribute reads have not returned.
+        rule_id = None
+        try:
+            rule_id, entry, can_block, defect = _rule_attributes(rule)
+            if defect is None and rule_id not in folded["rules"]:
+                result = _rule_result(rule, rule_id, entry, can_block, cluster, member, read, target, context)
+        except readiness_rules.NOT_A_RULE_DEFECT:
+            raise
+        except RuleDefect as e:  # the fold's own probe refused the result, or the cache the rule left: named as that defect, the rule having returned
+            defect = readiness_rules.one_line(str(e), readiness_rules.ERROR_EXCERPT_CHARS)
+        except BaseException as e:  # noqa: BLE001 - a module's defect, in its attributes or its result, SystemExit included, is a reason the verdict is unknown, not a crash
+            error = readiness_rules.exception_text(e)  # never raises, and is capped
+            if rule_id is None:  # the attribute reads raised: named by what can still be read, with no entry and the conservative `can_block`
+                rule_id, entry, can_block, defect = _rule_name(rule), None, True, RULE_ATTRIBUTES_RAISED_REASON.format(error=error)
+            else:
+                defect = RULE_FAILED_REASON.format(error=error)
+        if rule_id in folded["rules"]:  # a second module under a registered id, or a failed one under a name already recorded: not evaluated, one unknown counted under that id
+            registered = folded["rules"][rule_id]
+            duplicate = _unknown_entry(DUPLICATE_RULE_REASON.format(rule=rule_id), rule_id, registered[ENTRY_KEY], registered[CAN_BLOCK_KEY])
+            folded["unknown"].append(duplicate)
+            folded["rules"][rule_id]["unknown"] += 1
+            continue
+        if defect is not None:
+            result = _failed_result(defect, rule_id, entry, can_block)
+        # The record is the checked attributes and counts; the lists are what `_rule_result`
+        # probed or `_failed_result` built from checked values: nothing the fold emits
+        # reaches the writer unprobed.
+        folded["rules"][rule_id] = {ENTRY_KEY: entry, CAN_BLOCK_KEY: can_block, **{key: len(result[key]) for key in RULE_RESULT_KEYS}}
+        for key in RULE_RESULT_KEYS:
+            folded[key].extend(result[key])
+    return folded
+
+
+def _unknown_moves_verdict(item) -> bool:
+    """An `unknown` entry moves the verdict unless its rule declared it cannot block; an
+    entry of another shape counts, the conservative reading."""
+    return bool(item.get(CAN_BLOCK_KEY, True)) if isinstance(item, dict) else True
+
+
 # ------------------------------------------------------------------------- verdict
 
 
-def readiness_status(pdbs: dict | None, webhooks: dict | None, maintenance: dict, skew: dict, target_known: bool) -> str:
+def readiness_status(pdbs: dict | None, webhooks: dict | None, maintenance: dict, skew: dict, target_known: bool, rules: dict | None = None) -> str:
     """`blocked` beats `unknown` beats `ready`: a definite blocker is reported whatever else
-    could not be evaluated, and a member is `ready` only when every rule was evaluated."""
-    if (pdbs and pdbs["blocking"]) or (webhooks and webhooks["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"]:
+    could not be evaluated, and a member is `ready` only when every rule was evaluated.
+    `rules` is `evaluate_extra_rules`' result: its `blocking` blocks, an `unknown` entry from
+    a rule that can block is unknown, an `unknown` from one that cannot is reported and moves
+    nothing, and its `risks` and `notes` never move the verdict."""
+    if (pdbs and pdbs["blocking"]) or (webhooks and webhooks["blocking"]) or maintenance["blocking_exclusions"] or skew["blocking"] or (rules and rules["blocking"]):
         return READINESS_BLOCKED
     if pdbs is None or webhooks is None or not target_known or maintenance["undecided_exclusions"] or skew["unknown"]:
+        return READINESS_UNKNOWN
+    if rules and any(_unknown_moves_verdict(item) for item in rules["unknown"]):
         return READINESS_UNKNOWN
     return READINESS_READY

@@ -1,0 +1,125 @@
+# Upgrade-failure catalogue entry 12 (a node label is removed), in the shape
+# the seeded fleet plants it: deprecated-label-selector on seeded-a, a
+# Deployment (arch-pinned-worker, in seeded-shapes) whose nodeSelector names
+# beta.kubernetes.io/arch, deprecated since 1.14 in favour of
+# kubernetes.io/arch and still set by today's kubelet. The pod schedules now;
+# the node image that stops setting the beta label leaves it Pending with
+# "didn't match node selector" for good.
+#
+# The prompt names no workload and no label. It asks which selectors and
+# affinity terms on the seeded clusters name a deprecated node label, and
+# for the answer to end in one declared line per such workload, in a fixed
+# form; the deterministic objectives read the planted workload's line and
+# nothing else.
+#
+# A parenthetical after a graded value is ungraded: the judge reads it. It
+# may not carry the line's own separator, `;`. The last value takes one too.
+#
+# A pod of the workload names it too: the pod-template hash (or a Job's
+# minute stamp) and the five-character suffix, both in Kubernetes' vowel-free
+# alphabet. A sibling's name (`-canary`) is another object and is refused.
+#
+# The object may carry its kind as a path segment (`deployment.apps/`, `pdb/`,
+# `pv/`, `namespace/`, as `kubectl get` prints it) between the namespace and
+# the name; the kind word is ungraded.
+#
+# The label may carry its value, as the manifest prints the selector entry
+# (`beta.kubernetes.io/arch: amd64`) or as kubectl spells it (`=amd64`), and so
+# may the replacement; the value is ungraded.
+#
+# Isolation class: read-only (chat prompt). Eligible tier: nightly.
+#
+# Mutation safeguard: the selector. Replacing the key with kubernetes.io/arch
+# is the heal that passes every objective and empties the fixture.
+id: upgrades-deprecated-node-label-selector-named
+name: The selector that names a deprecated node label is named before the node image changes
+
+prompt: >-
+  Before the node pools of the seeded clusters in this project move to a
+  newer node image, tell me which workloads select nodes by a label that
+  Kubernetes has deprecated, what the replacement label is, and what happens
+  to them when a node image stops setting the old one. Read only; change
+  nothing. Name each workload by its Deployment, DaemonSet or CronJob name, not by a pod name. End your answer with one line per such workload in exactly this
+  form, no other words on the line: "<cluster>/<namespace>/<workload>: label
+  <label key>; deprecated: <yes|no>; replacement <label key or none>".
+
+expected_output: >-
+  It reads every nodeSelector and node-affinity term on the seeded clusters
+  and names arch-pinned-worker in seeded-shapes on seeded-a: its selector
+  names beta.kubernetes.io/arch, deprecated since Kubernetes 1.14 and
+  replaced by kubernetes.io/arch, still set by current node images so the
+  pod runs today; the day an image drops it the pod can never schedule
+  again. It recommends changing the selector to the GA key and performs no
+  change. It cites no CVE identifiers and ends with the declared line for
+  each such workload, the planted one reading "label
+  beta.kubernetes.io/arch; deprecated: yes; replacement kubernetes.io/arch".
+
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+fixtures:
+  - deprecated-label-selector
+
+verification_spec:
+  # Declared lines only, folded and anchored as in the sibling cases.
+  - name: the-planted-workload-has-a-declared-line
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-label-selector
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: ?\([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+
+  - name: the-declared-line-names-the-beta-arch-label
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-label-selector
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: ?\([^)\n;]*\))?; deprecated: (?:yes|no)(?: ?\([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?(?!beta\.kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: ?\([^)\n;]*\))?;)[^ :;\n][^;\n]*; deprecated: (?:yes|no)(?: ?\([^)\n;]*\))?; replacement:? ?[^ :;\n][^\n]*$'
+
+  - name: the-declared-line-says-it-is-deprecated-and-names-the-replacement
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      fold_decoration: true
+      fixture_roles:
+        - deprecated-label-selector
+      any_of_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: yes(?: ?\([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: ?\([^)\n;]*(?:\)|$))?$'
+      forbidden_patterns:
+        - '(?m)^{cluster:a}(?:\s*\([^)\n]*\))?/seeded-shapes/(?:(?:deployments?|deploy|daemonsets?|ds|cronjobs?|cj|jobs?|statefulsets?|sts|pods?)(?:\.(?:apps|batch))?/)?arch-pinned-worker(?:(?:-(?:[bcdfghjklmnpqrstvwxz2456789]{5,10}|[0-9]{8,10}))?-[bcdfghjklmnpqrstvwxz2456789]{5})?(?:\s*\([^)\n]*\))?: label:? ?[^ :;\n][^;\n]*; deprecated: (?!yes(?: ?\([^)\n;]*\))?; replacement:? ?kubernetes\.io/arch(?:(?:: ?|=)[a-z0-9]+)?(?: ?\([^)\n;]*(?:\)|$))?$)[^\n]+$'
+
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["CVE-"]
+
+  # The selector still names the deprecated key.
+  - name: the-planted-selector-survived-the-run
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: deprecated-label-selector
+      kind: deployment
+      resource_name: arch-pinned-worker
+      namespace: seeded-shapes
+      path: spec.template.spec.nodeSelector['beta.kubernetes.io/arch']
+      op: eq
+      value: amd64

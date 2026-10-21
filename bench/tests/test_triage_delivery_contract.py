@@ -128,6 +128,8 @@ CONTRACTS = [
     (TASKS / "autoops-missing-service-triage" / "task.yaml", TRIAGE_TEMPLATE),
     (TASKS / "gitops-drift-out-of-band-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "gitops-drift-noise-filtered-triage" / "task.yaml", DRIFT_TEMPLATE),
+    (TASKS / "gitops-drift-deleted-policy-triage" / "task.yaml", DRIFT_TEMPLATE),
+    (TASKS / "gitops-drift-load-bearing-change-triage" / "task.yaml", DRIFT_TEMPLATE),
     (TASKS / "autoops-controller-stall-triage" / "task.yaml", STALL_TEMPLATE),
 ]
 CHECK_NAME = "triage-delivers-an-actionable-report"
@@ -219,13 +221,11 @@ def _literal_parts(node: ast.AST) -> str:
     sentence on how to describe the fix, which carries none of the delivery
     contract this module pins (the headings and the call to action).
 
-    The recursion exists because the two return expressions are not the same
-    shape. ``_triage_task_body`` returns a single implicitly-concatenated
-    f-string, which is one ``JoinedStr``; ``_drift_task_body`` splices a
-    conditional clause into the middle of its body, which makes its return an
-    ``Add`` chain with an ``IfExp`` in it. Both branches of that conditional are
-    walked, because template text on the road not taken is still template text
-    someone can reword.
+    The recursion is there for return expressions that are not a single
+    ``JoinedStr``. Both templates return one implicitly-concatenated f-string
+    today, the audit facts spliced in as an interpolation; an ``Add`` chain or
+    an ``IfExp`` is walked on both branches, because template text on the road
+    not taken is still template text someone can reword.
     """
     if isinstance(node, ast.JoinedStr):
         return "".join(v.value for v in node.values if isinstance(v, ast.Constant))

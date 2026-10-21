@@ -1,0 +1,45 @@
+# Domain: chat and routing. Journey: ask the fleet a question on an install
+# whose spec.scope.exclude.clusters names a cluster; the answer must leave the
+# excluded cluster out (#3081).
+#
+# Parked (FIXTURE_NOT_READY, #3213): the precondition is the install's own
+# PlatformAgent, whose scope must exclude seeded-b with seeded-a and seeded-c
+# in scope. No pool install declares that yet and the case format cannot patch
+# the CR for a run.
+#
+# Red before #3100: the 2026-10-14 rehearsal answered "which clusters can you
+# see" with every cluster in the project, and on 2026-10-15 a dev lane with the
+# same exclusion shape listed five excluded clusters with versions and node
+# counts. #3100's live run on that lane was red once on main and green three
+# times on the branch (its description holds the table).
+#
+# The exact check is that the in-scope clusters are named. Whether the answer
+# reports on seeded-b is the judged score against expected_output: neither the
+# report (normalized before any pattern runs) nor the worker commands (one log
+# line can hold several shell segments, and the leak needs no command naming
+# seeded-b) can be graded exactly yet (decided 2026-10-15 on #3100, "a) Trim";
+# a structure-aware report check is #3242). Naming seeded-b to say it is
+# excluded and was not checked is what SOUL.md asks for.
+id: scope-excluded-cluster-not-listed
+name: A fleet answer leaves the clusters the install excludes out
+prompt: >-
+  Which GKE clusters can you see, and is anything unhealthy?
+expected_output: >-
+  The answer lists seeded-a and seeded-c with their health and does not report
+  on seeded-b, which the install's spec.scope.exclude.clusters excludes; where
+  it names seeded-b, it says it is excluded and was not checked.
+infrastructure:
+  deployer: noop
+fixtures: []
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's routing journey.
+domain: chat-and-routing
+
+verification_spec:
+  - name: the-in-scope-clusters-are-named
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["seeded-a", "seeded-c"]

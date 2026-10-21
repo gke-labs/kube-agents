@@ -38,7 +38,7 @@ const (
 	// AnnotationDNSClusterIP overrides the Cluster DNS Service ClusterIP used for NetworkPolicy DNS egress.
 	AnnotationDNSClusterIP = "kubeagents.x-k8s.io/dns-cluster-ip"
 
-	// AnnotationMetadataDaemonIP overrides the Workload Identity metadata daemon IP used for NetworkPolicy egress (rule 3).
+	// AnnotationMetadataDaemonIP overrides the Workload Identity metadata daemon IP used in the LiteLLM policy's egress (the gateway policy opens no metadata path).
 	AnnotationMetadataDaemonIP = "kubeagents.x-k8s.io/metadata-daemon-ip"
 
 	// defaultDNSClusterIP is the standard fallback DNS VIP when kube-dns cannot be discovered.
@@ -66,7 +66,7 @@ type netpolProfile struct {
 	Generated            bool
 	DNSClusterIPs        []string
 	DNSSource            string
-	MetadataDaemonIP     string // "" == suppress rule 3
+	MetadataDaemonIP     string // "" == suppress the LiteLLM policy's daemon rule
 	MetadataDaemonPort   int32
 	MetadataDaemonSource string
 	AdditionalEgress     []networkingv1.NetworkPolicyEgressRule
@@ -186,7 +186,7 @@ func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agen
 	if p.MetadataDaemonSource == "" && agent != nil && agent.Spec.NetworkPolicy != nil && agent.Spec.NetworkPolicy.MetadataDaemon != nil {
 		ep := strings.TrimSpace(agent.Spec.NetworkPolicy.MetadataDaemon.Endpoint)
 		if ep == "" {
-			// Explicit empty string suppresses rule 3 entirely
+			// Explicit empty string suppresses litellm-policy's post-NAT metadata rule entirely
 			p.MetadataDaemonIP = ""
 			p.MetadataDaemonPort = 0
 			p.MetadataDaemonSource = netpolSourceSuppressed

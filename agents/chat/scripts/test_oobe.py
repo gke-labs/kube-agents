@@ -2,15 +2,15 @@
 
 Run: python3 -m unittest agents/chat/scripts/test_oobe.py
 
-oobe imports gitops_workspace from agents/platform/scripts, which the image copies
-beside the chat scripts; the tests stand in for its repository list rather than
-reading this machine's /etc/gitops.
+The stage reads no repository list; the no-repository test stands in an empty one so a
+check that came back would be seen.
 """
 
 import contextlib
 import io
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +35,6 @@ NOW_SETTLED = FILED_AT + 600
 FALLBACK_SECONDS = oobe.bootstrap_handoff.DEADLINE_SECONDS + oobe.RANKING_ALLOWANCE_SECONDS
 NOW_PAST_FALLBACK = FILED_AT + FALLBACK_SECONDS
 RANKING_ID = "t_rank"
-REPOS = ["acme/gitops"]
 FIRST = [oobe.FIRST_RUN_AUDITS[0]]
 MINUTE = 60
 
@@ -68,7 +67,6 @@ class StageTest(unittest.TestCase):
         self.board = self.d / "kanban.db"
         self.started: list[tuple[list[str], dict]] = []
         self.failing: set[str] = set()
-        self.repos: list[str] | Exception = list(REPOS)
         self._roster([{"id": job_id, "enabled": True, "state": "scheduled"} for job_id in oobe.FIRST_RUN_AUDITS])
         # The scan and delivery stages are their own modules, tested beside them; here they are stubs.
         self.scan = mock.Mock(return_value=0)
@@ -76,7 +74,6 @@ class StageTest(unittest.TestCase):
         patches = [
             mock.patch.object(oobe, "board_path", lambda _d: self.board),
             mock.patch.object(oobe.subprocess, "run", self._run),
-            mock.patch.object(oobe, "managed_repositories", self._repos),
             mock.patch.object(oobe.bootstrap_scan_gate, "main", self.scan),
             mock.patch.object(oobe.bootstrap_delivery, "main", self.deliver),
         ]
@@ -91,11 +88,6 @@ class StageTest(unittest.TestCase):
         self.started.append((argv, env))
         code = 1 if argv[-1] in self.failing else 0
         return subprocess.CompletedProcess(argv, code, stdout="", stderr="no such job" if code else "")
-
-    def _repos(self):
-        if isinstance(self.repos, Exception):
-            raise self.repos
-        return self.repos
 
     def _roster(self, jobs: list[dict]) -> None:
         cron = self.d / "profiles" / "platform" / "cron"
@@ -861,26 +853,20 @@ class StageTest(unittest.TestCase):
 
     # --- no GitOps repository -------------------------------------------------
 
-    def test_no_repository_skips_and_finishes(self):
+    def test_the_audits_start_on_an_install_with_no_repository(self):
+        """With no repository the audits run without a forge, so the chain starts as it would with one."""
         self._file_scan()
         _board(self.board, [_ranking("done")])
-        self.repos = []
-        self._main()
-        self.assertEqual(self.started, [])
-        state = oobe.read_state(self.d)
-        self.assertTrue(state[oobe.STATE_DONE])
-        self.assertEqual(state[oobe.STATE_REASON], oobe.SKIP_NO_REPOSITORY)
-
-    def test_an_unreadable_repository_list_is_retried(self):
-        self._file_scan()
-        _board(self.board, [_ranking("done")])
-        self.repos = RuntimeError("kubectl binary not found in PATH")
-        self._main()
-        self.assertEqual(self.started, [])
-        self.assertFalse((self.d / oobe.AUDITS_MARKER).exists())
-        self.repos = list(REPOS)
-        self._main()
+        # Every reader the stage has used answers empty, so a repository check that came back
+        # would take its skip branch here rather than fail on a missing name.
+        empty = types.ModuleType("gitops_workspace")
+        for reader in ("get_managed_github_repo_names", "get_managed_github_repos", "get_managed_repos"):
+            setattr(empty, reader, lambda: [])
+        empty.managed_repos_registered = lambda: False
+        with mock.patch.dict(sys.modules, {"gitops_workspace": empty}):
+            self._main()
         self.assertEqual(self._started_ids(), FIRST)
+        self.assertFalse(oobe.read_state(self.d).get(oobe.STATE_SKIPPED))
 
     # --- once only ------------------------------------------------------------
 
@@ -1109,22 +1095,22 @@ class RosterTest(unittest.TestCase):
         jobs = {job["id"]: job for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
         entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
         seeded = next(line for line in entrypoint.splitlines() if line.strip().startswith('ASSUME_RETIRED="bootstrap'))
-        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery", "first-run-quick-value-audit"):
+        for job_id in ("bootstrap-inventory-scan", "bootstrap-inventory-delivery"):
             if job_id in jobs:
                 self.assertIs(jobs[job_id].get("enabled"), False, job_id)
                 self.assertIn(job_id, seeded.split('"')[1].split(","), job_id)
 
-
-class ManagedRepositoriesTest(unittest.TestCase):
-    def test_a_github_enterprise_server_repository_is_named_with_its_host(self):
-        # The bare-slug reader is empty on such an install, so the first-run
-        # audits would skip with no repository.
-        import gitops_workspace
-
-        with mock.patch.object(gitops_workspace, "get_managed_github_repo_names",
-                               return_value=["ghe.example.com/acme/infra"]), \
-                mock.patch.object(gitops_workspace, "get_managed_github_repos", return_value=[]):
-            self.assertEqual(["ghe.example.com/acme/infra"], oobe.managed_repositories())
+    def test_the_retired_first_run_gate_is_deleted_from_volumes(self):
+        # oobe runs the first-run audits. A volume can still hold the gate
+        # enabled, and only the default profile's --cron-retire removes it.
+        roster = Path(__file__).resolve().parent.parent / "defaults" / "cron" / "jobs.json"
+        ids = {job["id"] for job in json.loads(roster.read_text(encoding="utf-8"))["jobs"]}
+        self.assertNotIn("first-run-quick-value-audit", ids)
+        entrypoint = (Path(__file__).resolve().parents[3] / "deploy" / "shared" / "docker-entrypoint.sh").read_text()
+        # The default profile's call is the one that also forces profile-cron-tick.
+        block = re.search(r'--cron-jobs "profile-cron-tick".*?--cron-retire "([^"]*)"', entrypoint, re.S)
+        self.assertIsNotNone(block, "the default profile's --cron-retire call was not found")
+        self.assertIn("first-run-quick-value-audit", block.group(1).split())
 
 
 if __name__ == "__main__":

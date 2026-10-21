@@ -3,7 +3,9 @@
 // subject, publishes the lifecycle events, drives the harness over the
 // headless stream-json contract, forwards steering and follow-ups onto the
 // harness stdin, and exits with a code matching the terminal state. One task
-// per process; the pod exists because the message is already durable.
+// per process, unless the pod is a reused session pod (Config.SessionReuse),
+// which runs each turn of its conversation in turn; either way the pod exists
+// because the message is already durable.
 package workeradapter
 
 import (
@@ -12,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -20,6 +23,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // DefaultHarnessPath is where the worker image carries the harness: the
@@ -28,6 +33,11 @@ import (
 const DefaultHarnessPath = "/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude"
 
 const (
+	// harnessResumeFlag continues an earlier harness session by id. The
+	// pinned binary takes it with --print (`claude -p --resume <id>`), and
+	// the agent SDK passes it alongside --input-format stream-json, the
+	// shape harnessCommand builds.
+	harnessResumeFlag = "--resume"
 	// stderrTailBytes is how much of the harness's stderr is kept for a
 	// failure message. A tail rather than the whole stream: the useful part
 	// of a crash is its end, and the value rides a status event onto the bus.
@@ -58,6 +68,25 @@ const (
 	// stderrTailHeading introduces the stderr tail in a failure reason. The
 	// tail is multi-line and read by a person, so it goes on its own lines.
 	stderrTailHeading = "\nstderr tail:\n"
+	// containerInitPID is the adapter's pid when it is the worker
+	// container's entrypoint (Dockerfile.worker's ENTRYPOINT, and the
+	// spawner sets no shareProcessNamespace), which is when killLeftovers
+	// may signal every other process in the pid namespace.
+	containerInitPID = 1
+	// leftoverReapBound caps how long killLeftovers polls for the processes
+	// it killed to exit, so it reaps them rather than leaving zombies.
+	leftoverReapBound = 2 * time.Second
+	// leftoverReapPoll is the interval between those polls.
+	leftoverReapPoll = 10 * time.Millisecond
+)
+
+// The namespace-wide half of killLeftovers, as variables so a test can stand
+// in for being the container's init without signalling every process the
+// test's user owns.
+var (
+	adapterPID         = os.Getpid
+	killEveryoneButMe  = func() { _ = syscall.Kill(-1, syscall.SIGKILL) }
+	reapKilledChildren = reapChildren
 )
 
 // harnessEvent is one stream-json line from the harness stdout. Only the
@@ -73,8 +102,107 @@ type harnessEvent struct {
 	// type:"result" fields.
 	Result  string `json:"result,omitempty"`
 	IsError bool   `json:"is_error,omitempty"`
+	// What the turn cost, on a result line: the harness's own token counts
+	// for the turn, the turn's wall time, and the harness's running price
+	// for the whole process. Usage and DurationMs are per turn;
+	// TotalCostUSD is cumulative across every result line the process has
+	// emitted, plus what a resumed session had already spent, so the
+	// adapter publishes the difference between consecutive lines
+	// (adapter.turnCost), never the figure itself. Each is optional, and
+	// each is held raw and decoded on its own (telemetry, model): telemetry
+	// in a shape the adapter does not expect is dropped field by field,
+	// never the result line that carries the deliverable. The adapter
+	// publishes what decodes as the usage artifact (payload spec "Reserved
+	// artifact names") and nothing when nothing does.
+	Usage        json.RawMessage `json:"usage,omitempty"`
+	TotalCostUSD json.RawMessage `json:"total_cost_usd,omitempty"`
+	DurationMs   json.RawMessage `json:"duration_ms,omitempty"`
 	// type:"system" subtype:"init".
 	SessionID string `json:"session_id,omitempty"`
+	// Model is the model the harness runs, named once on the init line and
+	// carried onto every turn's usage. Raw for the same reason.
+	Model json.RawMessage `json:"model,omitempty"`
+}
+
+// harnessUsage is a result line's token counts. The three prompt figures
+// are what the model read for the turn, split by cache state; the usage
+// artifact sums them as inputTokens, since a cached read is still a read.
+// float64 so a count written with a fraction still decodes; the part
+// carries whole tokens.
+type harnessUsage struct {
+	InputTokens              float64 `json:"input_tokens,omitempty"`
+	OutputTokens             float64 `json:"output_tokens,omitempty"`
+	CacheCreationInputTokens float64 `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     float64 `json:"cache_read_input_tokens,omitempty"`
+}
+
+// model is the init line's model name, and whether the line carried one in
+// a shape the adapter reads; an absent model is "" and not dropped.
+func (ev harnessEvent) model() (name string, dropped bool) {
+	if len(ev.Model) == 0 {
+		return "", false
+	}
+	if json.Unmarshal(ev.Model, &name) != nil {
+		return "", true
+	}
+	return name, false
+}
+
+// resultTelemetry is one result line's figures for the usage artifact, read
+// field by field so one off-shape field costs that field alone: the
+// per-turn usage (model from the init line, every prompt token as input, the
+// wall time as the harness reported it; zero where the line had nothing),
+// the running total and whether the line carried one, and the names of the
+// fields that were present but did not decode, for the one warning the
+// adapter logs per line. The cost is not in the usage: it is the running
+// total's difference, which the adapter keeps.
+type resultTelemetry struct {
+	usage    lib.Usage
+	total    float64
+	hasTotal bool
+	dropped  []string
+}
+
+func (ev harnessEvent) telemetry(model string) resultTelemetry {
+	t := resultTelemetry{usage: lib.Usage{Model: model}}
+	// Each figure passes lib.UsageFigure: a negative or overflowing number
+	// is that field dropped and named, never a refused part or a wrapped
+	// value, so the line's other figures still reach the bus.
+	var ms float64
+	var ok bool
+	switch {
+	case len(ev.DurationMs) == 0:
+	case json.Unmarshal(ev.DurationMs, &ms) != nil:
+		t.dropped = append(t.dropped, "duration_ms")
+	default:
+		if t.usage.DurationMs, ok = lib.UsageFigure(ms); !ok {
+			t.dropped = append(t.dropped, "duration_ms")
+		}
+	}
+	var counts harnessUsage
+	switch {
+	case len(ev.Usage) == 0:
+	case json.Unmarshal(ev.Usage, &counts) != nil:
+		t.dropped = append(t.dropped, "usage")
+	default:
+		if t.usage.InputTokens, ok = lib.UsageFigure(counts.InputTokens + counts.CacheCreationInputTokens + counts.CacheReadInputTokens); !ok {
+			t.dropped = append(t.dropped, "usage.input_tokens")
+		}
+		if t.usage.OutputTokens, ok = lib.UsageFigure(counts.OutputTokens); !ok {
+			t.dropped = append(t.dropped, "usage.output_tokens")
+		}
+	}
+	// A null total is a line that carried none, not a total of zero: a zero
+	// would read as the total going down and rebase the baseline.
+	var total *float64
+	switch {
+	case len(ev.TotalCostUSD) == 0:
+	case json.Unmarshal(ev.TotalCostUSD, &total) != nil:
+		t.dropped = append(t.dropped, "total_cost_usd")
+	case total != nil:
+		t.total, t.hasTotal = *total, true
+	}
+	return t
 }
 
 type harnessMessage struct {
@@ -396,6 +524,15 @@ func (p *harnessProc) closeStdin() {
 // grace. Timers are retained so the reaper can stop them before the pgid is
 // recycled — the Hermes bridge hit exactly that, killing an unrelated process.
 func (p *harnessProc) kill(grace time.Duration) {
+	// Reaped already (a cancel or eviction that wins the select after the
+	// reap): killLeftovers has emptied the group, so its id may be free for
+	// reuse, and a signal now could reach an unrelated process.
+	p.mu.Lock()
+	reaped := p.reapedAt
+	p.mu.Unlock()
+	if reaped {
+		return
+	}
 	pid := p.cmd.Process.Pid
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	if grace <= 0 {
@@ -417,6 +554,64 @@ func (p *harnessProc) kill(grace time.Duration) {
 		return
 	}
 	p.killTimers = append(p.killTimers, t)
+}
+
+// killLeftovers SIGKILLs whatever is left in the harness's process group once
+// the harness itself has been reaped, after a clean exit as much as after a
+// kill. A process the model started in the background (the Bash tool's `&`)
+// stays in the group and outlives the harness otherwise, and in a reused pod
+// it would still be running, with the pod's credentials and its scratch
+// directory, during the next turn, which can be another requester's. The
+// escalation timers do not cover it: reaped stops them, and a clean exit arms
+// none.
+//
+// Called right after the reap and before the next turn can start, from the
+// goroutine that reaped. The group's id is the harness's pid, and the kernel
+// does not hand out an id still in use as a live process group's, so while
+// anything is left in the group this reaches only that; with nothing left it
+// finds nothing (ESRCH).
+//
+// The group is not enough for the real harness: its Bash tool spawns every
+// command detached (its own session and process group), so a background
+// command leaves the group at birth. In a worker container the adapter is
+// pid 1, the namespace's init, so it also SIGKILLs every other process in the
+// namespace (kill(-1) skips the caller) and reaps them: between turns
+// nothing but the adapter should be running there. That includes a debug
+// container attached with --target, which shares the namespace. Outside a
+// container (a local run, a test) only the group is signalled: kill(-1)
+// there would reach every process the user owns.
+func (p *harnessProc) killLeftovers() {
+	_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+	if adapterPID() == containerInitPID {
+		killEveryoneButMe()
+		reapKilledChildren(leftoverReapBound)
+	}
+}
+
+// reapChildren waits, for at most bound, for this process's exited children:
+// as pid 1 the adapter inherits every orphan killLeftovers kills, and an
+// unreaped one stays a zombie. It runs only between turns, after the
+// harness's own Wait, when the adapter has no child of its own that os/exec
+// is waiting on, so waiting on any child takes nothing from os/exec.
+func reapChildren(bound time.Duration) {
+	deadline := time.Now().Add(bound)
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+		switch {
+		case errors.Is(err, syscall.EINTR):
+			continue
+		case err != nil:
+			// ECHILD: no children left at all.
+			return
+		case pid > 0:
+			continue
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(leftoverReapPoll)
+	}
 }
 
 // reaped stops any armed escalation timers; called after Wait so a recycled
@@ -476,4 +671,31 @@ func truncate(s string, n int) string {
 		cut = i
 	}
 	return s[:cut] + "…"
+}
+
+// removeUserSettings deletes the harness's user settings file before a turn
+// in a reused pod (Config.HarnessUserSettings). A file that is not there is
+// the normal case. Anything that cannot be removed (a directory planted at
+// the path, a permission error) is an error, and the turn does not run over
+// it.
+func removeUserSettings(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the harness's user settings %s: %w", path, err)
+	}
+	return nil
+}
+
+// withResume is argv continuing harness session id, or argv unchanged when
+// there is none. It copies rather than appending in place: argv is the pod's
+// shared Config value, and every task builds its own from it.
+func withResume(argv []string, id string) []string {
+	if id == "" {
+		return argv
+	}
+	out := make([]string, 0, len(argv)+2)
+	out = append(out, argv...)
+	return append(out, harnessResumeFlag, id)
 }

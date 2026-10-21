@@ -548,7 +548,10 @@ class A3TheGatewaysSlackPrincipalComesFromSlackOrTheMap(unittest.TestCase):
 
     def test_A3_another_workspaces_member_is_not_a_turn(self) -> None:
         source = h.text("a2a_slack_ingress")
-        inbound = h.go_function_body(source, "inbound")
+        # inbound is a wrapper; the event pump and it both reach inboundEvent,
+        # which carries the admission rule (gke-labs/kube-agents#3246).
+        self.assertIn('return s.inboundEvent(ctx, m, "")', h.go_function_body(source, "inbound"))
+        inbound = h.go_function_body(source, "inboundEvent")
         self.assertRegex(
             inbound,
             r"if s\.foreignSender\(m\) \{\s*return InboundMessage\{\}, false",
@@ -1033,6 +1036,30 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             self._session_publish_derivation(),
             r"chat\.notify|Notify(Subject|Reply)",
             "the callout derives a session a publish grant on the notify route",
+        )
+
+    BOARD_PROBE = "chat.board"
+    BOARD_REPLY_PROBE = "chat.board.reply.gateway.r1"
+
+    def test_A3_a_board_request_has_one_writer_and_its_answer_has_one(self) -> None:
+        """The board route: only the gateway asks, only the bridge answers.
+
+        The gateway draws the Slack Home tab from the answer, so a second
+        writer on the reply namespace can put words on it; a second writer on
+        the request can make the bridge read session-kv on its behalf. The
+        session pods' grants are derived per connection and must not reach
+        either subject.
+        """
+        grants = self._rendered_publish_grants()
+        for probe, want in ((self.BOARD_PROBE, ["gateway"]), (self.BOARD_REPLY_PROBE, ["bridge"])):
+            writers = sorted(
+                builder for builder, allow in grants.items() if any(self._subject_matches(g, probe) for g in allow)
+            )
+            self.assertEqual(want, writers, f"principals whose publish grants reach {probe}")
+        self.assertNotRegex(
+            self._session_publish_derivation(),
+            r"chat\.board|Board(Subject|Reply)",
+            "the callout derives a session a publish grant on the board route",
         )
 
     def test_A3_the_supervisor_holds_no_publish_on_the_executors_events_subject(self) -> None:

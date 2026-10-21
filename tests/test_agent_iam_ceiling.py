@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -43,6 +44,7 @@ TERRAFORM_DIR = REPO_ROOT / "terraform"
 FULL_INSTALL = TERRAFORM_DIR / "examples" / "full-install"
 TF_MAIN = FULL_INSTALL / "main.tf"
 TF_VARIABLES = FULL_INSTALL / "variables.tf"
+PLATFORM_SCRIPTS = REPO_ROOT / "agents" / "platform" / "scripts"
 
 # The exact set the composition grants for `read-only`. Written out rather than
 # derived so that widening it is a visible diff here too.
@@ -52,6 +54,7 @@ READ_ONLY_ROLES = [
     "roles/compute.viewer",
     "roles/monitoring.viewer",
     "roles/logging.viewer",
+    "roles/cloudtrace.user",
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
@@ -71,6 +74,16 @@ FORBIDDEN_ROLES = {
     "roles/owner",
     "roles/editor",
     "roles/iam.serviceAccountTokenCreator",
+}
+
+# Roles whose grant buys nothing unless the composition also enables the API
+# they read: the observability helpers reach these three services through the
+# credential broker's relay, and a fresh install with the role bound and the
+# API off answers every read with SERVICE_DISABLED.
+ROLE_APIS = {
+    "roles/cloudtrace.user": "cloudtrace.googleapis.com",
+    "roles/monitoring.viewer": "monitoring.googleapis.com",
+    "roles/logging.viewer": "logging.googleapis.com",
 }
 
 # Values a human or a stale vars.sh might plausibly carry. Everything here that
@@ -327,6 +340,24 @@ class TerraformRoleBundlesTest(unittest.TestCase):
             "read_only_roles", self.lists, "the read-only role bundle moved or was renamed"
         )
         self.assertEqual(READ_ONLY_ROLES, self.lists["read_only_roles"])
+
+    def test_every_read_role_has_its_api_enabled(self):
+        self.assertIn("base_apis", self.lists, "the composition's API list moved or was renamed")
+        for role, api in ROLE_APIS.items():
+            with self.subTest(role=role):
+                # A key the bundle does not carry would otherwise skip the
+                # assertion, and the API behind it could leave base_apis
+                # with the suite green.
+                self.assertIn(
+                    role,
+                    self.lists["read_only_roles"],
+                    f"ROLE_APIS names {role}, which local.read_only_roles does not grant",
+                )
+                self.assertIn(
+                    api,
+                    self.lists["base_apis"],
+                    f"local.read_only_roles grants {role} but local.base_apis does not enable {api}",
+                )
 
     def test_no_role_bundle_in_the_composition_grants_a_forbidden_role(self):
         for name, roles in self.lists.items():
@@ -637,6 +668,35 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
             "a shipped install path still treats `gke-admin` as a value rather than "
             "as something to refuse",
         )
+
+
+class RuntimeRoleWatchTest(unittest.TestCase):
+    """The runtime check carries its own copy of the read-only set.
+
+    `agents/platform/scripts/sa_role_watch.py` runs in the agent pod, where no
+    Terraform is, and reports any role the agent's GSA holds beyond the set. A
+    copy that lagged this one would call a granted read-only role drift, or
+    worse, wave a role through that the composition no longer grants. Imported
+    rather than read as text, so a renamed or moved constant fails here instead
+    of matching nothing.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(PLATFORM_SCRIPTS))
+        self.addCleanup(sys.path.remove, str(PLATFORM_SCRIPTS))
+        import sa_role_watch  # noqa: PLC0415 - the path above is what makes it importable
+
+        self.watch = sa_role_watch
+
+    def test_the_watch_checks_against_the_read_only_bundle(self):
+        self.assertEqual(READ_ONLY_ROLES, list(self.watch.READ_ONLY_ROLES))
+        self.assertEqual(
+            _terraform_list_locals(TF_MAIN.read_text(encoding="utf-8"))["read_only_roles"],
+            list(self.watch.READ_ONLY_ROLES),
+        )
+
+    def test_the_watch_allows_no_role_the_ceiling_forbids(self):
+        self.assertEqual(set(), set(self.watch.READ_ONLY_ROLES) & FORBIDDEN_ROLES)
 
 
 if __name__ == "__main__":

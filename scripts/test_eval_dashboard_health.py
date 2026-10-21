@@ -1191,7 +1191,10 @@ class SlowGate(unittest.TestCase):
         # above, today) is not. A literal floor of 15 would never see a full
         # run and the rule would go silent; a literal of any size would need
         # an edit here on every admission or demotion.
-        n = len(health.eval_rosters.presubmit_cases())
+        # The presubmit grades next on the inject lane, so the cases it runs
+        # are the file's less that lane's exclusions.
+        excluded = health.eval_rosters.inject_lane_exclusions()
+        n = len([case for case in health.eval_rosters.presubmit_cases() if case not in excluded])
         self.assertGreaterEqual(n, 3)
         full = [task(f"case-{k}", "ppp") for k in range(n)]
         self.assertIsNotNone(adjudicate(self.week([200] * 5, tasks=full), T0)["slow"])
@@ -2740,6 +2743,26 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((block["projects"], block["checked"], block["drifted"], block["unknown"], block["stale"]), (30, 30, {project(1): [DRIFT_ROLE]}, False, False))
         self.assertEqual(block["scanned_at"], health.iso(T0 - timedelta(minutes=5)))
 
+    def test_a_capacity_role_advises_the_pool_size_not_a_re_apply(self):
+        role = "default-pool-headroom"
+
+        def with_capacity_role(doc, drifted_on):
+            # scan() writes the two planted roles; the capacity role is healthy everywhere but `drifted_on`.
+            for name, entry in doc["projects"].items():
+                entry["roles"][role] = {"state": "drifted", "detail": ['node?cloud.google.com/gke-nodepool=default-pool node_cpu_spare_ge 100: observed {"n": 4}']} if name in drifted_on else {"state": "healthy", "detail": []}
+            return doc
+
+        result = self.judge(with_capacity_role(scan(previous={project(1): [role]}), {project(1)}))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertEqual(result["advice"], health.ADVICE_FIXTURE_CAPACITY.format(roles=role, projects=project(1)))
+        self.assertNotIn("re-applied", result["advice"])
+        # Mixed with a planted role (the usual shape: a full pool strands a fixture, whose own role
+        # drifts too), the advice carries the re-apply line for the planted role and the capacity line.
+        mixed = self.judge(with_capacity_role(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [role, DRIFT_ROLE]}), {project(1)}))
+        self.assertEqual(mixed["condition"], "fixture_drift")
+        self.assertIn("re-applied", mixed["advice"])
+        self.assertIn(health.ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=role), mixed["advice"])
+
     def test_the_same_role_on_the_same_project_two_scans_running_degrades(self):
         result = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [DRIFT_ROLE]}))
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
@@ -2869,7 +2892,7 @@ OTHER_FINDING = "apis/cloudkms.googleapis.com"
 FAILED_FINDING = "iam/failed"
 GKE_FAILED_FINDING = "gke_and_state/failed"
 GKE_FINDING = "gke/cluster/seeded-b"
-# The one finding a leased run passes with (the verifier's LEASE_SILENT_FINDINGS).
+# A finding a leased run passes with (one of the verifier's LEASE_SILENT_FINDINGS).
 SILENT_FINDING = "gke/host-otel-scope"
 FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state", SILENT_FINDING: "gke_and_state"}
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"

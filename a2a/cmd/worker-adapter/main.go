@@ -1,6 +1,9 @@
 // worker-adapter is the session-pod entry point: the thin shim between the
 // bus and the harness (spec-subagent-profiles.md, "The adapter"). One task
-// per process; the terminal state is the exit code.
+// per process, and its terminal state is the exit code, unless the spawner
+// sets A2A_SESSION_REUSE=true: then the process serves every turn of its
+// session's conversation until SIGTERM, and the exit code is the last task's
+// (0 when the SIGTERM found it idle).
 //
 // Env contract, matching what the gateway's spawner sets: TASK_ID, PROFILE,
 // NATS_URL are the spec trio; A2A_SESSION carries the session addressee for
@@ -28,6 +31,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -83,6 +87,27 @@ const (
 	// answering; there is nothing there to find. Not for an AgentProfile's
 	// pod (lib.EnvProfileExecutor), which reaches clusters its own way.
 	noClusterPrompt = "You have no access to any cluster or the fleet on this turn, and this pod's files and environment hold no cluster credentials or tools, so don't search them for any. When an ask needs a cluster, delegate it if you can; otherwise say plainly that you can't reach it from here."
+
+	// strictMCPConfigFlag makes the harness load MCP servers from
+	// --mcp-config only, ignoring .mcp.json in the cwd and the user config's
+	// servers. Without --mcp-config it means no MCP servers at all. Every
+	// argv carries it: in a reused pod the cwd (/scratch) and the config dir
+	// have hosted an earlier turn's harness, which had Write.
+	strictMCPConfigFlag = "--strict-mcp-config"
+	// settingSourcesFlag and adapterSettingSources: the harness reads
+	// settings only from the user source ($CLAUDE_CONFIG_DIR, where the image
+	// puts the persona's CLAUDE.md and skills, which load under that source
+	// and no other) plus the flag and managed sources it always reads. The
+	// project and local sources, .claude/ under the cwd, are where an earlier
+	// turn's Write could leave hooks, permissions or env for the next turn's
+	// harness; the adapter puts nothing there.
+	settingSourcesFlag    = "--setting-sources"
+	adapterSettingSources = "user"
+	// The user source's file (harnessUserSettings): the harness reads
+	// settings.json in $CLAUDE_CONFIG_DIR, which defaults to ~/.claude.
+	claudeConfigDirEnv     = "CLAUDE_CONFIG_DIR"
+	claudeDefaultConfigDir = ".claude"
+	claudeUserSettingsFile = "settings.json"
 
 	// delegateToolID is the MCP-qualified tool name the harness's
 	// --allowedTools expects: "mcp__" + server name + "__" + tool name
@@ -254,9 +279,19 @@ func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 		OriginSeqStated:    originSeqStated,
 		HarnessCommand:     harnessCommand(),
 		HarnessEnv:         harnessEnv(),
-		TaskDeadline:       envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
-		KillGrace:          envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
-		Logger:             log,
+		// Removed before each turn of a reused pod; see the field's comment.
+		HarnessUserSettings: harnessUserSettings(),
+		TaskDeadline:        envDuration("A2A_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds),
+		KillGrace:           envDuration("A2A_KILL_GRACE_SECONDS", defaultKillGraceSeconds),
+		Logger:              log,
+
+		// The same argv with the delegate tool off, for a task that runs
+		// without it whatever the pod was started with (a wake in a reused
+		// pod; workeradapter's delegateOffForTask).
+		HarnessCommandNoDelegate: harnessCommandWithoutDelegate(),
+		// Literal "true" only, like EnvClusterView; a profile pod never
+		// serves a second task, and validate refuses the pair.
+		SessionReuse: os.Getenv(lib.EnvSessionReuse) == "true",
 	}, true
 }
 
@@ -334,24 +369,30 @@ func harnessCommand() []string {
 		"--max-turns", maxTurns,
 		"--allowedTools", allowed,
 		"--disallowedTools", disallowed,
+		settingSourcesFlag, adapterSettingSources,
+		// With or without the delegate tool: a wake's argv has no
+		// --mcp-config, and without this flag it would load whatever MCP
+		// config an earlier turn in the same pod left on disk.
+		strictMCPConfigFlag,
 	}
 	if delegateTool {
 		// The harness launches this same binary as `mcp` (worker-adapter/mcp.go)
-		// and speaks MCP to it over stdio; --strict-mcp-config keeps a stray
-		// project or user MCP config from adding tools the gateway never vetted.
+		// and speaks MCP to it over stdio; strictMCPConfigFlag above keeps a
+		// stray project or user MCP config from adding tools the gateway
+		// never vetted.
 		self, err := os.Executable()
 		if err != nil || self == "" {
 			self = "/usr/local/bin/worker-adapter"
 		}
 		sock := workeradapter.DelegateSocketPath()
-		mcpCfg, _ := json.Marshal(map[string]any{"mcpServers": map[string]any{
+		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
 			workeradapter.DelegateMCPServer: map[string]any{
-				"command": self,
-				"args":    []string{"mcp"},
-				"env":     map[string]string{workeradapter.EnvDelegateSocket: sock},
+				"command":               self,
+				"args":                  []string{"mcp"},
+				workeradapter.MCPEnvKey: map[string]string{workeradapter.EnvDelegateSocket: sock},
 			},
 		}})
-		argv = append(argv, "--mcp-config", string(mcpCfg), "--strict-mcp-config")
+		argv = append(argv, workeradapter.MCPConfigFlag, string(mcpCfg))
 	}
 	if len(prompts) > 0 {
 		argv = append(argv, "--append-system-prompt", strings.Join(prompts, "\n\n"))
@@ -368,7 +409,38 @@ func harnessCommand() []string {
 // else, so A2A_DELEGATE_TOOL=off is one decision rather than three that could
 // drift apart.
 func delegateToolEnabled() bool {
-	return os.Getenv(lib.EnvDelegateTool) != "off"
+	return os.Getenv(lib.EnvDelegateTool) != "off" && !delegateToolSuppressed
+}
+
+// delegateToolSuppressed is set only while harnessCommandWithoutDelegate
+// builds its argv, so harnessCommand stays the one place the harness flags are
+// assembled. configFromEnv runs once, before anything else is started, so
+// nothing reads it concurrently.
+var delegateToolSuppressed bool
+
+// harnessCommandWithoutDelegate is harnessCommand as it would be under
+// A2A_DELEGATE_TOOL=off: no delegate tool on the allowlist, no MCP config, no
+// delegate prompt. It keeps --strict-mcp-config, so the harness runs with no
+// MCP servers at all.
+func harnessCommandWithoutDelegate() []string {
+	delegateToolSuppressed = true
+	defer func() { delegateToolSuppressed = false }()
+	return harnessCommand()
+}
+
+// harnessUserSettings is the settings file the harness reads for its user
+// source: settings.json in $CLAUDE_CONFIG_DIR, else in ~/.claude. "" when
+// neither is known.
+func harnessUserSettings() string {
+	dir := os.Getenv(claudeConfigDirEnv)
+	if dir == "" {
+		home := os.Getenv("HOME")
+		if home == "" {
+			return ""
+		}
+		dir = filepath.Join(home, claudeDefaultConfigDir)
+	}
+	return filepath.Join(dir, claudeUserSettingsFile)
 }
 
 // allowsBash reports whether a harness --allowedTools value names Bash, bare
