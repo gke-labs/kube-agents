@@ -44,7 +44,15 @@ def _verify(check: dict, command: str, status: str = "completed"):
     """Grade one worker command with the verifier; return the VerificationResult."""
     assert "\n" not in command, command
     traj = [
-        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": command}, "result": "done", "status": status, "at": 1.0}
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": command},
+            "result": '{"output": "done", "exit_code": %d}' % (0 if status == "completed" else 1),
+            "status": status,
+            "at": 1.0,
+        }
     ]
     transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": command}])
     try:
@@ -55,9 +63,9 @@ def _verify(check: dict, command: str, status: str = "completed"):
     return result
 
 
-def _passes(check: dict, command: str, status: str = "completed") -> bool:
+def _passes(check: dict, command: str) -> bool:
     """Grade one worker command with the verifier; True when the check passes."""
-    return _verify(check, command, status).success
+    return _verify(check, command).success
 
 
 def _collector_ran(command: str) -> bool:
@@ -210,7 +218,7 @@ def test_collector_run_with_no_trajectory_is_error():
 def test_collector_run_with_gaps_passes_when_completed():
     cmd = f"python3 {COLLECT} compliance-audit --scope-projects fuxiaogao-gkedemos > /opt/data/scratch/chat_manifest_compliance-audit.json"
     traj = [
-        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": cmd}, "result": "done", "status": "completed", "at": 1.0}
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": cmd}, "result": '{"output": "done", "exit_code": 0}', "status": "completed", "at": 1.0}
     ]
     transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": cmd}], worker_capture_gaps=["card_2 unread session store"])
     try:
