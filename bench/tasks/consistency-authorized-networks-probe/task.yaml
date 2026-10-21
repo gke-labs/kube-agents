@@ -100,10 +100,12 @@ verification_spec:
       # agent may quote once the question routes there (#3609).
       any_of_phrases:
         ["authorized network", "authorizednetworks", "authorized-networks"]
-  # The route (#3605, #3609): the comparison is the drift collector's run, so
-  # a worker that reads the clusters itself and misreads seeded-c's leftover
-  # block fails here even when its reply names the facet. Same check shape as
-  # drift-chat-request-runs-collector's the-drift-collector-ran.
+  # The route (#3605, #3609): the comparison is the drift collector's run.
+  # Graded on api-lane runs (the nightly, the -today presubmit); the blocking
+  # presubmit runs the inject lane since #3156, where worker_commands checks
+  # are set aside as not applicable (#2039), so there the reply check alone
+  # gates. Same shape as drift-chat-request-runs-collector's
+  # the-drift-collector-ran.
   - name: the-comparison-ran-the-drift-collector
     role: objective
     mode: assert
