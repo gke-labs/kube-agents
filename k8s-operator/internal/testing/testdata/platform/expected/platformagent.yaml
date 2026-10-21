@@ -323,7 +323,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 10Gi
+      storage: 50Gi
 status: {}
 ---
 apiVersion: v1
@@ -853,7 +853,7 @@ spec:
           - ReadWriteOnce
         resources:
           requests:
-            storage: 10Gi
+            storage: 50Gi
       status: {}
     - metadata:
         name: sshd

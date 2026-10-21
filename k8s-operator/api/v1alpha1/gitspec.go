@@ -464,6 +464,12 @@ func (f *ResolvedForge) credentialsProblem(provider *GitProvider) error {
 // credentialsRef Secret, and the file name the broker reads it from.
 const ForgeCredentialsTokenKey = "token"
 
+// ForgeCredentialsReadTokenKey is the optional key, in the same Secret, that
+// holds a read-only token. The broker uses it only to clone context
+// repositories, never on a write route. A Secret without it keeps the broker
+// as it was: context repositories clone with no credential.
+const ForgeCredentialsReadTokenKey = "read-token"
+
 // ForgeCABundleDefaultKey is the caBundleRef key when none is named, and
 // ForgeCABundleFileName is the file the broker reads the bundle from.
 const (
@@ -1075,6 +1081,10 @@ type BrokerForge struct {
 	// the broker, which is handed the file instead.
 	CredentialsSecret string `json:"-"`
 	TokenPath         string `json:"tokenPath,omitempty"`
+	// ReadTokenPath is where the broker reads the forge's read-only token,
+	// set beside TokenPath. The file is there only when the Secret carries
+	// the key; the broker checks for it on each call.
+	ReadTokenPath string `json:"readTokenPath,omitempty"`
 	// CABundleSecret and CABundleKey are the Secret key the CA bundle
 	// is projected from. The broker reads the file at CAFile; it is handed the
 	// two names too, so that a missing file is answered with what to create.
@@ -1107,7 +1117,8 @@ type BrokerForge struct {
 // first one keeps it, rather than crash-looping the broker.
 //
 // tokenDir is where the operator mounts the forge credentials; each forge's
-// token is <tokenDir>/<forge name>/token. caDir is where it mounts the CA
+// token is <tokenDir>/<forge name>/token, and its optional read-only token is
+// <tokenDir>/<forge name>/read-token. caDir is where it mounts the CA
 // bundles; a forge's is <caDir>/<forge name>/ca.crt.
 func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForge {
 	if ri == nil {
@@ -1138,6 +1149,7 @@ func (ri *ResolvedIntegration) BrokerForges(tokenDir, caDir string) []BrokerForg
 			Host:              provider.canonicalHost(f.Host),
 			CredentialsSecret: f.CredentialsSecret,
 			TokenPath:         tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsTokenKey,
+			ReadTokenPath:     tokenDir + pathSeparator + f.Name + pathSeparator + ForgeCredentialsReadTokenKey,
 			AllowedPaths:      allowed,
 		}
 		if f.CABundleSecret != "" {
