@@ -287,6 +287,10 @@ SITE_CONVENTION_PAGES = frozenset({"404.md"})
 # document in one of these directories needs no link; a new family needs a line
 # here, argued in the pull request.
 LINK_EXEMPT_FAMILY_GLOBS = (
+    # Persona fixtures and adapter goldens: test inputs and outputs a test reads, named
+    # as a harness names them (CLAUDE.md, SKILL.md); a reader reaches the package README.
+    "a2a/lib/persona/testdata/**",
+    "a2a/lib/persona/*/testdata/**",
     "agents/chat/defaults/onboarding/*.md",
     "agents/cluster/*.md",
     "agents/cluster/skills/*/SKILL.md",

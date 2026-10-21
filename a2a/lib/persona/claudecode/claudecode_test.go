@@ -1,0 +1,213 @@
+package claudecode
+
+import (
+	"encoding/json"
+	"flag"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/persona"
+)
+
+var update = flag.Bool("update", false, "rewrite the golden files")
+
+const (
+	exampleDir = "../testdata/example"
+	goldenDir  = "testdata/golden"
+)
+
+// relay is the shape the profile worker passes in: the broker's relay
+// reached through mcp-remote, as agents/cluster/config.yaml reaches it.
+var relay = persona.Relay{
+	URL:     "http://credential-proxy:8765/mcp/",
+	Command: "node",
+	Args:    []string{"/opt/mcp-remote/dist/proxy.js", "{url}", "--allow-http", "--transport", "http-only"},
+	Env:     map[string]string{"MCP_REMOTE_BEARER_FILE": "/var/run/secrets/credential-proxy/token"},
+}
+
+func load(t *testing.T, dir string) *persona.Persona {
+	t.Helper()
+	p, err := persona.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func render(t *testing.T, p *persona.Persona, target persona.Target) persona.Output {
+	t.Helper()
+	out, err := Adapter{}.Render(p, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// golden is what the golden directory holds besides the files: the flags,
+// with --mcp-config decoded so a diff reads, and the warnings.
+type golden struct {
+	Args      []string       `json:"args"`
+	MCPConfig map[string]any `json:"mcpConfig"`
+	Model     string         `json:"model"`
+	Warnings  []string       `json:"warnings"`
+}
+
+func goldenOf(t *testing.T, out persona.Output) golden {
+	g := golden{Model: out.Model, Warnings: out.Warnings}
+	for i := 0; i < len(out.Args); i++ {
+		if out.Args[i] == MCPConfigFlag {
+			if err := json.Unmarshal([]byte(out.Args[i+1]), &g.MCPConfig); err != nil {
+				t.Fatalf("--mcp-config is not JSON: %v", err)
+			}
+			g.Args = append(g.Args, MCPConfigFlag, "<mcpConfig>")
+			i++
+			continue
+		}
+		g.Args = append(g.Args, out.Args[i])
+	}
+	return g
+}
+
+func TestRenderMatchesTheGolden(t *testing.T) {
+	out := render(t, load(t, exampleDir), persona.Target{Relay: relay})
+	files := filepath.Join(goldenDir, "files")
+	meta := filepath.Join(goldenDir, "output.json")
+	got, _ := json.MarshalIndent(goldenOf(t, out), "", "  ")
+	if *update {
+		_ = os.RemoveAll(goldenDir)
+		for _, f := range out.Files {
+			p := filepath.Join(files, filepath.FromSlash(f.Path))
+			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, f.Data, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(meta, append(got, '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(want)) != string(got) {
+		t.Errorf("output differs from %s (go test -update to rewrite):\n%s", meta, got)
+	}
+	var wantPaths []string
+	_ = filepath.WalkDir(files, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			rel, _ := filepath.Rel(files, p)
+			wantPaths = append(wantPaths, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	var gotPaths []string
+	for _, f := range out.Files {
+		gotPaths = append(gotPaths, f.Path)
+		data, err := os.ReadFile(filepath.Join(files, filepath.FromSlash(f.Path)))
+		if err != nil || string(data) != string(f.Data) {
+			t.Errorf("%s differs from the golden file: %v", f.Path, err)
+		}
+	}
+	slices.Sort(gotPaths)
+	if !slices.Equal(gotPaths, wantPaths) {
+		t.Errorf("files = %v, golden has %v", gotPaths, wantPaths)
+	}
+}
+
+func TestEveryArgvCarriesTheHardeningFlags(t *testing.T) {
+	bare := load(t, exampleDir)
+	bare.Manifest.Tools = nil
+	bare.MCP = persona.MCP{}
+	for name, out := range map[string]persona.Output{
+		"example":           render(t, load(t, exampleDir), persona.Target{Relay: relay}),
+		"no tools, no mcp":  render(t, bare, persona.Target{}),
+		"servers but relay": render(t, load(t, exampleDir), persona.Target{}),
+	} {
+		args := strings.Join(out.Args, " ")
+		if !slices.Contains(out.Args, StrictMCPConfigFlag) {
+			t.Errorf("%s: no %s in %s", name, StrictMCPConfigFlag, args)
+		}
+		i := slices.Index(out.Args, SettingSourcesFlag)
+		if i < 0 || i+1 >= len(out.Args) || out.Args[i+1] != UserSettingSource {
+			t.Errorf("%s: no %s %s in %s", name, SettingSourcesFlag, UserSettingSource, args)
+		}
+	}
+	if slices.Contains(render(t, bare, persona.Target{}).Args, AllowedToolsFlag) {
+		t.Errorf("a persona granting nothing still got %s", AllowedToolsFlag)
+	}
+}
+
+func TestToolsMapToClaudeCodeNames(t *testing.T) {
+	out := render(t, load(t, exampleDir), persona.Target{Relay: relay})
+	i := slices.Index(out.Args, AllowedToolsFlag)
+	if i < 0 {
+		t.Fatalf("no %s in %v", AllowedToolsFlag, out.Args)
+	}
+	want := "Read,Glob,Grep,mcp__gke__get_cluster,mcp__gke__list_clusters,mcp__docs__search"
+	if out.Args[i+1] != want {
+		t.Errorf("%s = %s, want %s", AllowedToolsFlag, out.Args[i+1], want)
+	}
+}
+
+// One warning for each thing Claude Code cannot take, and none for what
+// belongs to another harness.
+func TestEachDroppedPartIsAWarning(t *testing.T) {
+	out := render(t, load(t, exampleDir), persona.Target{})
+	wants := []string{
+		"harness.claude-code.maxTurns: not supported",
+		"skills/triage/scripts/events.sh: dropped",
+		"servers.docs: dropped, the worker gave no broker MCP relay",
+		"servers.gke: dropped, the worker gave no broker MCP relay",
+		"servers.unused: dropped, the worker gave no broker MCP relay",
+		`tools: "gke" dropped with its server`,
+		`tools: "docs.search" dropped with its server`,
+	}
+	for _, w := range wants {
+		if !slices.ContainsFunc(out.Warnings, func(s string) bool { return strings.Contains(s, w) }) {
+			t.Errorf("no warning containing %q in %q", w, out.Warnings)
+		}
+	}
+	granted := render(t, load(t, exampleDir), persona.Target{Relay: relay})
+	if !slices.ContainsFunc(granted.Warnings, func(s string) bool {
+		return strings.Contains(s, "servers.unused: dropped, no tools entry grants")
+	}) {
+		t.Errorf("an ungranted server was not dropped with a warning: %q", granted.Warnings)
+	}
+	if len(out.Warnings) != len(wants) {
+		t.Errorf("got %d warnings, want %d: %q", len(out.Warnings), len(wants), out.Warnings)
+	}
+	for _, w := range out.Warnings {
+		if strings.Contains(w, string(persona.Antigravity)) {
+			t.Errorf("warned about another harness's hint: %s", w)
+		}
+	}
+}
+
+func TestAShellKeepsSkillScripts(t *testing.T) {
+	p := load(t, exampleDir)
+	p.Manifest.Tools = append(p.Manifest.Tools, persona.ToolShell)
+	out := render(t, p, persona.Target{Relay: relay})
+	i := slices.IndexFunc(out.Files, func(f persona.File) bool { return f.Path == "skills/triage/scripts/events.sh" })
+	if i < 0 || !out.Files[i].Executable {
+		t.Fatalf("the script is missing or lost its mode with %s granted: %+v", persona.ToolShell, out.Files)
+	}
+}
+
+func TestOutputStaysInTheConfigDir(t *testing.T) {
+	out := render(t, load(t, exampleDir), persona.Target{Relay: relay})
+	for _, f := range out.Files {
+		if !persona.LocalPath(f.Path) {
+			t.Errorf("output path %q leaves the config directory", f.Path)
+		}
+		if f.Path != MemoryFile && !strings.HasPrefix(f.Path, SkillsDir+"/") {
+			t.Errorf("output path %q is neither %s nor under %s/", f.Path, MemoryFile, SkillsDir)
+		}
+	}
+}
