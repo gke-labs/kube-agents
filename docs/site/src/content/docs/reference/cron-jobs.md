@@ -61,6 +61,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `stall-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `stall_watch.py` |
 | `upgrade-readiness-watch` | Platform Agent | `10 10 * * *` | Daily 10:10 | yes | `upgrade_readiness_watch.py` |
 | `sa-role-watch` | Platform Agent | `25 * * * *` | Hourly at :25 | yes | `sa_role_watch.py` |
+| `leeway-watch` | Platform Agent | `30 8 * * *` | Daily 08:30 | yes | `leeway_watch.py` |
 | `chat-delivery-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `chat_delivery_watch.py` |
 
 <!-- prettier-ignore-end -->
