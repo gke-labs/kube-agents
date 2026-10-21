@@ -2632,7 +2632,7 @@ _SUDO_VAL_OPTS = {
     "--user", "--group", "--prompt", "--close-from", "--chdir", "--chroot",
     "--command-timeout", "--other-user", "--host", "--role", "--type",
 }
-_SUDO_VAL_LESS_FLAGS = set("AbEHiKklnPSsVv")
+_SUDO_VAL_LESS_FLAGS = set("AbBEHiKklnNPSsVv")
 _SETSID_VAL_LESS_FLAGS = set("cwf")
 
 
@@ -2683,7 +2683,7 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                             if not rest:
                                 prev_opt_takes_val = True
                             break
-                        break
+                        continue
                     if saw_b:
                         return True
                     if val_opt_end:

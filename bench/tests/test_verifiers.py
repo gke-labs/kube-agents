@@ -8635,6 +8635,15 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("sudo -bgbin python3 f.py --readiness") == [
         (["sudo", "-bgbin", "python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("sudo -Nb python3 f.py --readiness") == [
+        (["sudo", "-Nb", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Bb python3 f.py --readiness") == [
+        (["sudo", "-Bb", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -Nbu hermes python3 f.py --readiness") == [
+        (["sudo", "-Nbu", "hermes", "python3", "f.py", "--readiness"], False),
+    ]
     assert _shell_argvs_with_exit_propagation("setsid -fw python3 f.py --readiness") == [
         (["setsid", "-fw", "python3", "f.py", "--readiness"], True),
     ]
@@ -8800,6 +8809,7 @@ def test_worker_commands_required_run_succeeded_flag():
         f'python3 {_SCRIPT_PATH} --readiness || echo "failed"',
         f"python3 {_SCRIPT_PATH} --readiness ; echo done",
         f"python3 {_SCRIPT_PATH} --readiness 2>&1 | tee /tmp/log",
+        f"python3 {_SCRIPT_PATH} --readiness |& tee /tmp/log",
         f"python3 {_SCRIPT_PATH} --readiness > /tmp/out &",
         f"python3 {_SCRIPT_PATH} --readiness\necho done",
         f"test -f /tmp/m.json || python3 {_SCRIPT_PATH} --readiness",
@@ -8836,7 +8846,8 @@ def test_worker_commands_required_run_succeeded_flag():
     assert res_failed_then_clipped.status == "error"
     assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_failed_then_clipped.reason
 
-    # The same clipped head passes under succeeded: false as it always has.
+    # The same clipped head passes under succeeded: false as it always has (tested with empty card log so only trajectory clipped head satisfies it).
+    transcript.set("ok", traj_arg_clipped, worker_commands=[])
     v_succeeded_false = WorkerCommandsVerifier(type="worker_commands", required_runs=[WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=False)])
     res_succeeded_false = v_succeeded_false.verify(5.0)
     assert res_succeeded_false.status == "pass"
