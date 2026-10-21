@@ -105,12 +105,20 @@ class GateAndReportingTests(unittest.TestCase):
             {
                 watch.WATCH_HOME_ENV: str(self.home),
                 watch.PROJECTS_ENV: "p1",
+                watch.CLUSTERS_ENV: "",
+                watch.REFRESH_DAYS_ENV: "",
+                watch.NATS_URL_ENV: "",
+                watch.MANAGEMENT_PROJECT_ENV: "",
+                "PLATFORM_AGENT_HOME": str(self.home),
             },
             clear=False,
         )
         self.env_patch.start()
+        self.roster_patch = mock.patch.object(watch, "roster_clusters_by_project", return_value={})
+        self.roster_patch.start()
 
     def tearDown(self) -> None:
+        self.roster_patch.stop()
         self.env_patch.stop()
         self.tmp.cleanup()
 
@@ -387,6 +395,8 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertEqual(norm_r["max_domain_share"], 0.0)
         self.assertEqual(norm_r["contributing_factors"], ["factor-a"])
         self.assertEqual(watch._float("Infinity", 0.0), 0.0)
+        self.assertEqual(watch._float(1e308, 0.0), 0.0)
+        self.assertEqual(watch._int(float("inf"), 0), 0)
 
     def test_failing_project_at_full_timeout_is_stamped_so_tail_projects_rotate(self) -> None:
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
@@ -428,7 +438,7 @@ class GateAndReportingTests(unittest.TestCase):
     def test_retires_resolved_finding_in_clusters_mode_and_with_bare_cluster_names(self) -> None:
         with mock.patch.dict(
             os.environ,
-            {watch.CLUSTERS_ENV: "p1/us-central1/seeded-d", watch.PROJECTS_ENV: ""},
+            {watch.CLUSTERS_ENV: "p1/us-central1/seeded-d,p1/us-east1/other", watch.PROJECTS_ENV: ""},
             clear=False,
         ):
             # Day 0: report uses bare cluster name "seeded-d" with a finding.
@@ -437,15 +447,32 @@ class GateAndReportingTests(unittest.TestCase):
                 "status": "ok",
                 "topology_findings": [make_topology_finding()],
             }
-            self.run_tick(lambda *a, **kw: completed_json(make_report([c_skewed], T0)), now=T0)
+            c_other_ok = {"cluster": "p1/us-east1/other", "status": "ok", "topology_findings": []}
+            self.run_tick(lambda *a, **kw: completed_json(make_report([c_skewed, c_other_ok], T0)), now=T0)
 
-            # Day 1: clean scan in --clusters mode returning full triple retires bare ledger entry.
+            # Day 1: clean scan of `p1/us-central1/seeded-d` while `p1/us-east1/other` errors
+            # retires the bare "seeded-d" ledger entry specifically via `bare_cluster in ok_bare`.
             t1 = T0 + timedelta(days=1)
             c_clean = {"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": []}
-            code, out = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], t1)), now=t1)
+            c_other_err = {"cluster": "p1/us-east1/other", "status": "error", "error": "timeout"}
+            code, out = self.run_tick(
+                lambda *a, **kw: completed_json(make_report([c_clean, c_other_err], t1)), now=t1
+            )
             self.assertEqual(code, 0)
             self.assertIn("retired from the watch", out)
 
+        # Verify an explicitly requested target omitted from `report.clusters` is retained (not retired).
+        self.assertFalse(
+            watch.can_retire_finding(
+                "p1/us-central1/seeded-d/ns/Deployment/app/topology.kubernetes.io/zone/leeway.placement_drift",
+                {"cluster": "p1/us-central1/seeded-d"},
+                ok_clusters=set(),
+                cluster_errors={},
+                scanned_projects={"p1"},
+                scan_errors={},
+                explicit_targets={"p1/us-central1/seeded-d"},
+            )
+        )
         # Also verify cross-project same-bare-name safety: p1/us-central1/prod ok does NOT retire
         # p2/us-east1/prod when p2 failed to scan.
         self.assertFalse(

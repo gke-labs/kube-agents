@@ -117,6 +117,7 @@ jobs:
         continue-on-error: ${{ github.event_name == 'pull_request_target' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMOKE_PIN_NOT_BEFORE: ${{ vars.SMOKE_PIN_NOT_BEFORE }}
           ENQUEUE_TOKEN: ${{ steps.enqueue-token.outputs.token }}
           ACTOR: ${{ steps.enqueue-token.outputs.app-slug }}
           DRY_RUN: ${{ inputs.dry_run }}

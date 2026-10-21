@@ -140,6 +140,7 @@ ERROR_KIND_CLUSTER_ERROR = "cluster_error"
 SCHEMA_VERSION_VALUE = "leeway.report/v1alpha1"
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
+GKE_SOURCE_PREFIX = "gke:"
 CLUSTER_KEY_SEPARATOR = "/"
 CLUSTER_WIDE_NAMESPACE = "_cluster"
 DEFAULT_SUBJECT_KIND_CLUSTER = "Cluster"
@@ -170,6 +171,7 @@ SEVERITY_RANKS: dict[str, int] = {
 REASON_NEW = "new finding"
 REASON_CHANGED = "cause/severity change"
 REASON_REFRESH = "scheduled refresh"
+REASON_ALL_RESOLVED = "all findings resolved"
 
 # Ledger keys.
 FINDINGS_KEY = "findings"
@@ -352,8 +354,8 @@ def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_S
 def canonical_cluster_name(cr: dict[str, Any]) -> str:
     """Return `<project>/<location>/<cluster>` from `cr['source']` when present, else `cr['cluster']`."""
     raw_source = str(cr.get("source") or "").strip()
-    if raw_source.startswith("gke:"):
-        triple = raw_source[len("gke:") :].strip()
+    if raw_source.startswith(GKE_SOURCE_PREFIX):
+        triple = raw_source[len(GKE_SOURCE_PREFIX) :].strip()
         if triple.count(CLUSTER_KEY_SEPARATOR) == 2:
             return triple
     return str(cr.get("cluster") or "").strip()
@@ -423,7 +425,7 @@ def _int(value: object, default: int = 0) -> int:
         return default
     try:
         return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -432,9 +434,9 @@ def _float(value: object, default: float = 0.0) -> float:
         return default
     try:
         parsed = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
-    return parsed if math.isfinite(parsed) else default
+    return parsed if math.isfinite(parsed) and math.isfinite(parsed * 100.0) else default
 
 
 def _str_list(value: object) -> list[str]:
@@ -651,7 +653,9 @@ def render_markdown_report(
     reasons_counts: dict[str, int] = {}
     for reason in due_reasons.values():
         reasons_counts[reason] = reasons_counts.get(reason, 0) + 1
-    reasons_summary = ", ".join(f"{count} {reason}" for reason, count in sorted(reasons_counts.items()))
+    reasons_summary = (
+        ", ".join(f"{count} {reason}" for reason, count in sorted(reasons_counts.items())) or REASON_ALL_RESOLVED
+    )
 
     lines: list[str] = [
         "# Topology Skew & Leeway Report",
@@ -851,7 +855,7 @@ def sweep_fleet(
     error_kinds: dict[str, str] = {}
     reports: list[dict[str, Any]] = []
     scanned_projects: set[str] = set()
-    explicit_targets: set[str] = set(clusters)
+    requested_clusters: set[str] = set(clusters)
 
     if clusters:
         target_label = ",".join(clusters)
@@ -860,7 +864,14 @@ def sweep_fleet(
             raise RuntimeError(BUDGET_EXHAUSTED_DETAIL.format(target=target_label))
         rep = run_leeway_report(CLUSTERS_FLAG, target_label, timeout=min(PROJECT_TIMEOUT_SECONDS, remaining))
         reports.append(rep)
-        return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, explicit_targets
+        return (
+            merge_reports(reports, now),
+            project_runs,
+            scan_errors,
+            error_kinds,
+            scanned_projects,
+            requested_clusters,
+        )
 
     known_triples_by_proj = roster_clusters_by_project()
     target_projects = order_by_least_recent(projects(), project_runs)
@@ -872,6 +883,8 @@ def sweep_fleet(
             continue
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
         triples = known_triples_by_proj.get(proj) or []
+        if triples:
+            requested_clusters.update(triples)
         flag = CLUSTERS_FLAG if triples else CLUSTERS_FROM_FLAG
         value = ",".join(triples) if triples else proj
         try:
@@ -899,7 +912,7 @@ def sweep_fleet(
         reasons = format_name_list([f"{k}: {v}" for k, v in sorted(scan_errors.items())])
         raise RuntimeError(reasons)
 
-    return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, explicit_targets
+    return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, requested_clusters
 
 
 def can_retire_finding(
@@ -922,7 +935,12 @@ def can_retire_finding(
     if cluster in ok_clusters or (is_bare_ledger_cluster and bare_cluster in ok_bare):
         return True
     targets = explicit_targets or set()
-    if targets:
+    target_bare = {c.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for c in targets}
+    if cluster in targets or (is_bare_ledger_cluster and bare_cluster in target_bare):
+        # The cluster was explicitly requested via `--clusters` and omitted from
+        # `report.clusters` (neither ok nor error); retain until cleanly read.
+        return False
+    if targets and not scanned_projects:
         return not scan_errors and not cluster_errors
     # If the cluster was not in the report at all, retire when its project was
     # cleanly scanned or when the entire sweep succeeded with zero scan/cluster errors.
@@ -942,7 +960,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
 
     try:
         ledger = load_ledger(home)
-        report, project_runs, scan_errors, error_kinds, scanned_projects, explicit_targets = sweep_fleet(
+        report, project_runs, scan_errors, error_kinds, scanned_projects, requested_clusters = sweep_fleet(
             ledger, moment, deadline
         )
     except Exception as exc:  # noqa: BLE001
@@ -952,7 +970,6 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         return 0
 
     lines: list[str] = []
-    lines.extend(clear_tick_failure(home, dry_run=dry_run))
 
     active_findings, ok_clusters, cluster_errors = extract_findings(report)
     all_errors: dict[str, str] = {**scan_errors, **cluster_errors}
@@ -1032,7 +1049,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         if key in active_findings or not isinstance(prior, dict):
             continue
         if can_retire_finding(
-            key, prior, ok_clusters, cluster_errors, scanned_projects, scan_errors, explicit_targets
+            key, prior, ok_clusters, cluster_errors, scanned_projects, scan_errors, requested_clusters
         ):
             retired_labels.append(short_finding_label(prior))
         else:
@@ -1110,6 +1127,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
         if announced:
             updated_ledger[ANNOUNCED_KEY] = announced
         save_ledger(home, updated_ledger)
+        lines = clear_tick_failure(home, dry_run=dry_run) + lines
     except WriteFailed as exc:
         print(FAILED_LINE.format(prefix=LINE_PREFIX, what=FAILED_WHAT_WRITE, detail=str(exc)))
         return WRITE_FAILED_EXIT
