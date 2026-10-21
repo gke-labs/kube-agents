@@ -8501,6 +8501,21 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("OUT='$(python3 f.py --readiness)'") == [
         (["OUT=$(python3 f.py --readiness)"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("OUT=<(python3 f.py --readiness)") == [
+        (["OUT=<(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -c "OUT=$(python3 f.py --readiness)"') == [
+        (["bash", "-c", "OUT=$(python3 f.py --readiness)"], True),
+        (["OUT=$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("bash -c 'OUT=$(python3 f.py --readiness)'") == [
+        (["bash", "-c", "OUT=$(python3 f.py --readiness)"], True),
+        (["OUT=$(python3 f.py --readiness)"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs("KC=/tmp/kc\nkubectl get pods") == [
         ["KC=/tmp/kc"],
         ["kubectl", "get", "pods"],
@@ -8792,6 +8807,16 @@ def test_worker_commands_required_run_succeeded_flag():
     res_arg_clipped = v.verify(5.0)
     assert res_arg_clipped.status == "error"
     assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_arg_clipped.reason
+
+    # A clipped exit-0 match beside an earlier failed unclipped match remains inconclusive (error status, not conclusive fail).
+    traj_failed_then_clipped = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": raw_clipped_arg}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_failed_then_clipped, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_failed_then_clipped = v.verify(5.0)
+    assert res_failed_then_clipped.status == "error"
+    assert "the call's command was clipped in the pod, so what followed the run on the line is unknown (fleet_upgrade_report.py --readiness)" in res_failed_then_clipped.reason
 
     # The same clipped head passes under succeeded: false as it always has.
     v_succeeded_false = WorkerCommandsVerifier(type="worker_commands", required_runs=[WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=False)])

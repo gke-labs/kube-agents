@@ -2387,8 +2387,10 @@ class WorkerRun(BaseModel):
     to ensure the call's exit status faithfully reflects the command, the command segment must be
     the last segment on the line or every segment following it must be ``&&``-joined; a following
     ``||``, ``;``, ``|``, ``&``, or newline hands the line's exit to another command and is not credited as
-    succeeded; a preceding ``&&`` or ``;`` is accepted; preceding ``||``, inverting ``!``, non-lone
-    command substitutions, a detaching wrapper (such as ``setsid -f`` or ``sudo -b``), or a trailing background ``&`` do not credit exit; a required run with
+    succeeded; the connective immediately before the segment at its own parenthesis depth decides:
+    ``&&``, ``;``, newline, ``&`` or the line start credit; ``||`` or ``!`` do not, and a group inherits
+    its own preceding connective; non-lone command substitutions, a detaching wrapper (such as
+    ``setsid -f`` or ``sudo -b``), or a trailing background ``&`` do not credit exit; a required run with
     ``succeeded: true`` and no worker trajectory to read is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
@@ -2679,7 +2681,9 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
     return False
 
 
-def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bool]]:
+def _shell_argvs_with_exit_propagation(
+    command: str, outer_spans: tuple[str, ...] | list[str] = ()
+) -> list[tuple[list[str], bool]]:
     """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
     shell line's final exit code faithfully reflects this segment's success or failure.
     A segment's failure is preserved (short-circuiting subsequent execution) if and only if
@@ -2788,11 +2792,22 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
 
         if len(seg) == 1 and _SHELL_ASSIGNMENT_RE.match(seg[0]):
             _, _, val = seg[0].partition("=")
-            inner = _substitution_commands(val) if val in spans else None
+            inner = (
+                _substitution_commands(val)
+                if val in spans
+                and val.startswith(("$", "`"))
+                and not val.startswith(_SHELL_ARITHMETIC_OPENER)
+                else None
+            )
             if inner is not None:
                 handled_spans.append(val)
-                for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(inner):
-                    results.append((inner_argv, carries_exit and inner_carries))
+                is_outer = val in outer_spans
+                for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
+                    inner, outer_spans=outer_spans
+                ):
+                    results.append(
+                        (inner_argv, False if is_outer else (carries_exit and inner_carries))
+                    )
 
         index = _command_word_index(seg)
         if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
@@ -2800,7 +2815,9 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
                 flag = seg[flag_index]
                 if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
                     inner_cmd = seg[flag_index + 1]
-                    for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(inner_cmd):
+                    for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
+                        inner_cmd, outer_spans=(*outer_spans, *spans)
+                    ):
                         results.append((inner_argv, carries_exit and inner_carries))
                     break
 
@@ -2811,7 +2828,9 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
     for span in remaining_spans:
         inner = _substitution_commands(span)
         if inner is not None:
-            for inner_argv, _ in _shell_argvs_with_exit_propagation(inner):
+            for inner_argv, _ in _shell_argvs_with_exit_propagation(
+                inner, outer_spans=outer_spans
+            ):
                 results.append((inner_argv, False))
 
     return results
@@ -2928,7 +2947,7 @@ def _extract_exit_code(result: Any) -> int | None:
 
 
 def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool, bool]]:
-    """``(card, at, command, result, succeeded)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
+    """``(card, at, command, result, succeeded, is_clipped)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
     recorded): the worker the call belongs to. The workers' entries reach
@@ -3102,7 +3121,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     a non-zero or unrecorded exit does not count; graded from the worker
     trajectory only, and a required run with ``succeeded: true`` and no worker
     trajectory to read is not credited).
-    ``forbidden_runs``: the same shape, and no segment may run it. An argv tells a quoted mention of the
+    ``forbidden_runs``: the same shape without ``succeeded`` (which it rejects), and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
@@ -3179,7 +3198,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     typed, so a route behind a shell variable or an alias is not read; no tagged
     worker call at all, or no readable one (every code-tool call's argument
     withheld), is ``status="error"``, a withheld argument beside a readable call
-    is skipped, a worker whose tagged calls are all MCP calls grades as zero
+    is skipped (unless an uncredited ``succeeded: true`` run cannot be verified, which is ``status="error"``), a worker whose tagged calls are all MCP calls grades as zero
     commands, and a capture with gaps that found no forbidden command is
     ``status="error"``. Fails closed like its siblings -- a run with no captured
     worker commands is ``status="error"``, not a pass.
@@ -3389,11 +3408,14 @@ class WorkerCommandsVerifier(BaseVerifier):
                 matched_any = False
                 matched_masked = False
                 matched_clipped = False
+                matched_clipped_ok = False
                 succeeded = False
                 for argv, call_succeeded, carries_exit, is_clipped in traj_argv_entries:
                     if _argv_runs(argv, run):
                         if is_clipped:
                             matched_clipped = True
+                            if call_succeeded:
+                                matched_clipped_ok = True
                             continue
                         matched_any = True
                         if call_succeeded and carries_exit:
@@ -3402,7 +3424,9 @@ class WorkerCommandsVerifier(BaseVerifier):
                         elif call_succeeded and not carries_exit:
                             matched_masked = True
                 if not succeeded:
-                    if matched_any:
+                    if matched_clipped_ok:
+                        unrun_clipped.append(run)
+                    elif matched_any:
                         if matched_masked:
                             unrun_masked.append(run)
                         else:
@@ -3422,7 +3446,6 @@ class WorkerCommandsVerifier(BaseVerifier):
         # patterns or missing required items inconclusive; on the standard path,
         # card-log misses are conclusive (fail), credited runs pass, and capture
         # gaps make only an uncredited succeeded: true run inconclusive (error).
-        has_succeeded_runs = any(r.succeeded for r in self.required_runs)
         uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *unrun_masked, *traj_missing, *unrun_clipped] if run.succeeded]
         gaps = list(snap.worker_capture_gaps or ())
         if withheld and uncredited_succeeded:
