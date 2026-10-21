@@ -36,7 +36,7 @@ cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 With the flag on, a Slack origin and the credential proxy's Slack relay in the
 environment, the report goes out as Block Kit instead (a headline with the
 total, the top two rows, the rest folded, and "Fix the first one" and "See all N"
-buttons; for a report that lists no item, the short card ``_selection`` decides), posted here through ``slack_blocks_post`` because the scheduler's delivery
+buttons), posted here through ``slack_blocks_post`` because the scheduler's delivery
 takes text only. Under ``spec.mode: next``, on an install whose job was linked to a Slack chat before
 the switch and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
 (``_posted_through_gateway``).
@@ -592,9 +592,7 @@ def _no_ranking(data_dir: Path) -> bool | None:
         return None
 
 
-def _register_findings(
-    data_dir: Path, in_sandbox: bool, no_ranking: bool | None
-) -> tuple[set[str], list | None, dict | None]:
+def _register_findings(data_dir: Path, in_sandbox: bool, no_ranking: bool | None) -> set[str]:
     """Register every finding the sweep extracted in the findings queue, as
     ``inventory_findings.py register`` does, from this pod.
 
@@ -614,9 +612,7 @@ def _register_findings(
 
     Returns the ids the queue answered ``suppressed``: rows the user
     dismissed. With the shell sandbox on, ``select`` never learned them, so
-    the report may list one; ``_mark_shown`` leaves them unmarked. Also the
-    items and scores it read, for ``_selection``, or ``None`` for each when
-    they were not read or the queue did not take all of them.
+    the report may list one; ``_mark_shown`` leaves them unmarked.
 
     Never raises. Runs before the claim, so it adds nothing to the claimed
     run's work (``RETIRE_AFTER_SECONDS``), and the nudge holds until the claim.
@@ -625,75 +621,49 @@ def _register_findings(
     try:
         if no_ranking is None:
             sys.stderr.write("bootstrap_delivery: the hand-off marker could not be read; registering nothing\n")
-            return suppressed, None, None
+            return suppressed
         if no_ranking:
             sys.stderr.write(
                 "bootstrap_delivery: the hand-off filed no prioritization card, so any "
                 f"{ITEMS_NAME} is an earlier sweep's; registering nothing\n"
             )
-            return suppressed, None, None
+            return suppressed
         extracted = _read_json_beside(data_dir, in_sandbox, ITEMS_NAME)
         if extracted is None:
             sys.stderr.write(f"bootstrap_delivery: no {ITEMS_NAME}; registering nothing\n")
-            return suppressed, None, None
+            return suppressed
         items = extracted[ITEMS_KEY]
         if not items:
-            return suppressed, items, {}  # a clean fleet: nothing to register, and no scores file
+            return suppressed  # a clean fleet: nothing to register, and no scores file
         raw_scores = _read_json_beside(data_dir, in_sandbox, SCORES_NAME)
         if raw_scores is None:
             sys.stderr.write(f"bootstrap_delivery: no {SCORES_NAME}; registering nothing\n")
-            return suppressed, None, None
+            return suppressed
         payloads = inventory_findings.build_payloads(items, raw_scores[SCORES_KEY])
         batches = inventory_findings.cluster_batches(payloads, inventory_findings.complete_clusters(raw_scores))
     except Exception as e:
         detail = "; ".join(getattr(e, "errors", None) or [str(e)])
         sys.stderr.write(f"bootstrap_delivery: could not read the sweep's findings; registering nothing: {detail}\n")
-        return suppressed, None, None
+        return suppressed
     endpoint = _findings_endpoint()
-    # A batch the queue did not take is not "queued": the short card then claims nothing.
-    complete = True
     for where, batch, scope in batches:
         try:
             result = inventory_findings.post_batch(endpoint, batch, scope)
         except urllib.error.HTTPError as e:
             # This cluster only.
             sys.stderr.write(f"bootstrap_delivery: the findings queue refused {where}'s findings: {e.code}\n")
-            complete = False
             continue
         except Exception as e:
             sys.stderr.write(
                 f"bootstrap_delivery: the findings queue at {endpoint} did not answer ({e}); "
                 "not registering the rest\n"
             )
-            return suppressed, None, None
+            return suppressed
         outcomes = result.get("results") if isinstance(result, dict) else None
         for entry in outcomes if isinstance(outcomes, list) else []:
             if isinstance(entry, dict) and entry.get("outcome") == SUPPRESSED:
                 suppressed.add(str(entry.get("id")))
-    return (suppressed, items, raw_scores[SCORES_KEY]) if complete else (suppressed, None, None)
-
-
-def _selection(items: list | None, scores: dict | None, suppressed: set[str]) -> dict | None:
-    """What ``select`` chose for this batch, scored here as it scores it, for the short card.
-
-    ``{"listed": n, "held": k, "queued": m}``: the items the report lists, the criticals the
-    limit held back, and every item left for the queue. ``None`` when the batch was not read
-    (no prioritization card, a file missing or bad), and the report then goes as written.
-    Never raises; runs before the claim.
-    """
-    if items is None or scores is None:
-        return None
-    try:
-        limit = inventory_findings.fq.pacing_limits(os.environ).first_report_criticals
-        shown, held, others = inventory_findings.select_items(items, scores, limit, frozenset(suppressed))
-    except Exception as e:
-        sys.stderr.write(f"bootstrap_delivery: cannot tell what the report selected: {e}\n")
-        return None
-    return {
-        inventory_findings.SELECTION_LISTED: len(shown),
-        inventory_findings.SELECTION_HELD: held,
-        inventory_findings.SELECTION_QUEUED: held + others,
-    }
+    return suppressed
 
 
 def _post_surfaced(endpoint: str, finding_id: str, body: dict) -> None:
@@ -830,7 +800,7 @@ def _origin_platform() -> str | None:
     return _origin().get(PLATFORM_KEY)
 
 
-def _presented(content: str, platform: str | None = None, selection: dict | None = None) -> str:
+def _presented(content: str, platform: str | None = None) -> str:
     """The report as delivered: reshaped when ``KAGE_SLACK_UX`` is on and the
     job is bound to Slack (or ``platform`` is), as written otherwise.
 
@@ -845,7 +815,7 @@ def _presented(content: str, platform: str | None = None, selection: dict | None
             return content
         import inventory_presenter
 
-        return inventory_presenter.present(content, selection)
+        return inventory_presenter.present(content)
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: delivering verbatim: {e}\n")
         return content
@@ -1027,7 +997,7 @@ def _with_note(report: str, note: str) -> str:
     return report.rstrip("\n") + "\n\n" + note + "\n"
 
 
-def _posted_as_blocks(content: str, selection: dict | None = None) -> bool:
+def _posted_as_blocks(content: str) -> bool:
     """Whether the report was posted to Slack as Block Kit; False posts nothing.
 
     False, and the caller prints the text, unless the flag is on, the origin is
@@ -1048,13 +1018,13 @@ def _posted_as_blocks(content: str, selection: dict | None = None) -> bool:
         import chat_notify
 
         if chat_notify.routes(PRESENTED_PLATFORM):
-            return _posted_through_gateway(content, channel, str(origin.get(THREAD_ID_KEY) or ""), selection)
+            return _posted_through_gateway(content, channel, str(origin.get(THREAD_ID_KEY) or ""))
         import inventory_presenter
         import slack_blocks_post
 
         if not slack_blocks_post.configured():
             return False
-        built = inventory_presenter.blocks(content, selection)
+        built = inventory_presenter.blocks(content)
         if built is None:
             return False
         blocks, text = built
@@ -1069,7 +1039,7 @@ def _posted_as_blocks(content: str, selection: dict | None = None) -> bool:
     return False
 
 
-def _posted_through_gateway(content: str, channel: str, thread: str, selection: dict | None = None) -> bool:
+def _posted_through_gateway(content: str, channel: str, thread: str) -> bool:
     """Under ``spec.mode: next``, whether the card posted as a chat message through the gateway.
 
     The gateway holds Slack there and the broker's relay is gone, so the card
@@ -1083,7 +1053,7 @@ def _posted_through_gateway(content: str, channel: str, thread: str, selection: 
     import chat_notify
     import inventory_presenter
 
-    built = inventory_presenter.chat(content, selection) if thread else None
+    built = inventory_presenter.chat(content) if thread else None
     if built is None:
         return False
     chat, text = built
@@ -1175,7 +1145,7 @@ def _notify_conversation(conversation: dict, text: str, chat: dict | None = None
 
 
 def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note: str,
-                          mark_shown, selection: dict | None = None) -> tuple[str, str, bool]:
+                          mark_shown) -> tuple[str, str, bool]:
     """Post the report and the audits note: the card then the note, or one text message.
 
     The card goes only when ``KAGE_SLACK_UX`` is on, the conversation is Slack's
@@ -1194,11 +1164,11 @@ def _post_to_conversation(data_dir: Path, conversation: dict, content: str, note
         if platform == PRESENTED_PLATFORM and slack_presenter.enabled():
             import inventory_presenter
 
-            card = inventory_presenter.chat(content, selection)
+            card = inventory_presenter.chat(content)
     except Exception as e:
         sys.stderr.write(f"bootstrap_delivery: posting the report as text: {e}\n")
     if card is None:
-        outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, platform, selection), note))
+        outcome, reason = _notify_conversation(conversation, _with_note(_presented(content, platform), note))
         if outcome == NOT_POSTED:
             return outcome, reason, False
         _record_outcome(data_dir, outcome)
@@ -1223,7 +1193,7 @@ def _record_outcome(data_dir: Path, outcome: str) -> None:
 
 
 def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dict, content: str,
-                             no_ranking: bool | None, suppressed: set[str], selection: dict | None = None) -> None:
+                             no_ranking: bool | None, suppressed: set[str]) -> None:
     """After the claim: post into the conversation, and release the claim unless the report is out.
 
     The findings are marked shown only once the claim is kept (posted, or on
@@ -1232,7 +1202,7 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
     """
     note = _audits_note(data_dir, no_ranking is True, home=bool(chat_notify.routed_platform()))
     outcome, reason, shown = _post_to_conversation(
-        data_dir, conversation, content, note, lambda: _mark_shown(data_dir, in_sandbox, suppressed), selection
+        data_dir, conversation, content, note, lambda: _mark_shown(data_dir, in_sandbox, suppressed)
     )
     if outcome == NOT_POSTED:
         # Recorded first, so the released claim is retried only after the wait.
@@ -1303,8 +1273,7 @@ def main(data_dir: Path | None = None) -> int:
     # Before the claim, which ends the nudge's hold, so the rows exist when
     # the marks below are sent.
     no_ranking = _no_ranking(data_dir)
-    suppressed, items, scores = _register_findings(data_dir, in_sandbox, no_ranking)
-    selection = _selection(items, scores, suppressed)
+    suppressed = _register_findings(data_dir, in_sandbox, no_ranking)
 
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
@@ -1312,7 +1281,7 @@ def main(data_dir: Path | None = None) -> int:
         return 0  # another run is delivering this report — stay silent
 
     if conversation is not None:
-        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, no_ranking, suppressed, selection)
+        _deliver_to_conversation(data_dir, in_sandbox, conversation, content, no_ranking, suppressed)
         return 0
 
     # Right after the claim, which ends the nudge's hold, so a nudge run has
@@ -1320,10 +1289,10 @@ def main(data_dir: Path | None = None) -> int:
     shown = _mark_shown(data_dir, in_sandbox, suppressed)
 
     note = _audits_note(data_dir, no_ranking is True)
-    if _posted_as_blocks(content, selection):
+    if _posted_as_blocks(content):
         sys.stdout.write(note + "\n")
     else:
-        sys.stdout.write(_with_note(_presented(content, selection=selection), note))
+        sys.stdout.write(_with_note(_presented(content), note))
     sys.stdout.flush()
 
     # Cleanup runs only after the report is posted or safely on stdout (already

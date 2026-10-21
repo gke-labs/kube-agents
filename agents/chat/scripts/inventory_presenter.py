@@ -66,36 +66,16 @@ The closing lines are left out too: "See all N" asks for the rest. ``chat``
 is the same card as a ``kube-agents.chat/v1`` message, which
 ``bootstrap_delivery`` sends through the A2A gateway under ``spec.mode: next``.
 
-A report that lists no item, opened with the scan counts and the posture line
-as Step 6 fixes them, gets its own card (``_quiet``): "First look at your
-fleet: done", the counts with "no critical item in this scan's 9 checks", any
-gap sentence, a queue line from the selection's queued count and the install's
-pace (no delivery hour), the scan's checks folded under "What this scan checked", and a
-"See all N findings" button when items are queued. It is built only when the
-delivery job's selection (what ``select`` chose) listed nothing and held no
-critical back; any other report goes as written. Its other lines are only what
-``gap_parts`` finds in the report's prose, as on the item card. The text layout keeps the closing lines under it; the card leaves them
-to its button.
-
 The report is model-written to the format in
 ``agents/platform/governance/inventory_prioritize_sop.md`` (Step 6). A report
 that does not parse to that shape is returned unchanged.
 """
 
-import os
 import re
 from typing import NamedTuple
 
-from inventory_findings import (
-    SCAN_CHECKS,
-    SCAN_SCOPE_LINE,
-    SCAN_SCOPE_SENTENCES,
-    SELECTION_HELD,
-    SELECTION_LISTED,
-    SELECTION_QUEUED,
-    fq,
-)
-from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, sentence_starts, severity_row
+from inventory_findings import SCAN_SCOPE_LINE, SCAN_SCOPE_SENTENCES
+from slack_presenter import as_line, blocks_report, fallback_text, gap_parts, severity_row
 
 BOLD_MARK = "**"
 PARAGRAPH_BREAK = "\n\n"
@@ -138,20 +118,6 @@ CARD_NEUTRAL_LEAD_ONE = "Start with this one:"
 FIX_FIRST = "Fix the first one"
 FIX_ONLY = "Fix it"
 SEE_ALL = "See all {count}"
-#: A report that lists no item (no critical finding among the scan's checks):
-#: its own card, since the headline above counts things to look at.
-QUIET_HEADLINE = "First look at your fleet: done"
-QUIET_COUNTS = "{scanned} · no critical item in this scan's {checks} checks"
-QUIET_COUNTS_JOIN = " · "
-QUIET_QUEUE = "{count} smaller {items} queued. I'll bring up to {daily} a day."
-QUIET_QUEUE_ASK = "{count} smaller {items} queued. Ask me when you want them."
-QUIET_ITEMS = ("item is", "items are")
-SEE_ALL_FINDINGS = ("See the {count} finding", "See all {count} findings")
-#: The scan's checks, folded under the card's lines, so the card answers what it covered.
-CHECKS_FOLD_TITLE = "What this scan checked"
-#: Any list: an item written outside the numbered list Step 6 asks for is not a report with no
-#: item, so it goes as written.
-NOT_QUIET = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|\*\*\d+[.)])", re.MULTILINE)
 #: The card shows this many of the listed findings as rows; the rest fold under FOLD_TITLE.
 CARD_ROWS = 2
 FOLD_TITLE = "{count} more worth a look"
@@ -735,14 +701,10 @@ def _shape(report: str) -> _Shape | None:
     return None if parsed is None else _Shape(*parsed)
 
 
-def present(report: str, selection: dict | None = None) -> str:
+def present(report: str) -> str:
     """The report as the card's headline, the top findings and the closing lines or the ask; unchanged if it does not parse."""
     # A NUL inside a gap ("could not\0 be scanned") hides it from _split_gap.
     report = report.replace("\0", "")
-    quiet = _quiet(report, selection)
-    if quiet is not None:
-        head = f"{BOLD_MARK}{QUIET_HEADLINE}{BOLD_MARK}\n" + "\n".join([quiet.counts, *quiet.after])
-        return PARAGRAPH_BREAK.join([head, *quiet.closing]) + "\n"
     shape = _shape(report)
     if shape is None:
         return report
@@ -811,13 +773,13 @@ def card_headline(
     return headline + (LEADS_ON if lead else ROWS_FOLLOW), lead, ""
 
 
-def blocks(report: str, selection: dict | None = None) -> tuple[list[dict], str] | None:
+def blocks(report: str) -> tuple[list[dict], str] | None:
     """The Block Kit report's ``(blocks, text)``, or None when the report does not parse.
 
     ``text`` is the message's mrkdwn ``text`` field: the headline, the gap and
-    lead, then the top rows, and for the short card its lines.
+    lead, then the top rows.
     """
-    card = _card(report, selection)
+    card = _card(report)
     if card is None:
         return None
     built = blocks_report(
@@ -832,14 +794,10 @@ def blocks(report: str, selection: dict | None = None) -> tuple[list[dict], str]
         fold_rows=card.folded,
     )
     lead = " ".join(part for part in (card.headline, card.note, card.detail) if part)
-    # The short card's fold is the scan's checks, not findings, so the fallback leaves it out.
-    folded = [] if card.fold_title == CHECKS_FOLD_TITLE else card.folded
-    # Only the short card's lines join its fallback: the gap there would otherwise read clean.
-    after = card.after if card.fold_title == CHECKS_FOLD_TITLE else ""
-    return built, fallback_text(lead, rows=card.rows + folded, after_rows=after)
+    return built, fallback_text(lead, rows=card.rows + card.folded)
 
 
-def chat(report: str, selection: dict | None = None) -> tuple[dict, str] | None:
+def chat(report: str) -> tuple[dict, str] | None:
     """The card as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
 
     The same headline, rows, fold and buttons as :func:`blocks`, composed by
@@ -848,7 +806,7 @@ def chat(report: str, selection: dict | None = None) -> tuple[dict, str] | None:
     """
     import chat_message
 
-    card = _card(report, selection)
+    card = _card(report)
     if card is None:
         return None
     message = chat_message.report_message(
@@ -861,7 +819,7 @@ def chat(report: str, selection: dict | None = None) -> tuple[dict, str] | None:
         fold_title=card.fold_title,
         fold_rows=card.folded,
     )
-    return message, present(report, selection)
+    return message, present(report)
 
 
 class _Card(NamedTuple):
@@ -876,74 +834,10 @@ class _Card(NamedTuple):
     after: str
 
 
-class _Quiet(NamedTuple):
-    counts: str
-    #: The report's gaps on one line, then the queue line.
-    after: list[str]
-    #: Closing lines, which the text layout keeps and the card leaves to its buttons.
-    closing: list[str]
-    queued: int
-
-
-def _quiet(report: str, selection: dict | None) -> _Quiet | None:
-    """A report that lists no item, opened as SOP Step 6 fixes it; None for any other report.
-
-    Everything the card claims comes from the scorer or from readers this module already
-    shares with the item card. ``selection`` is what ``select`` chose (from
-    ``bootstrap_delivery``): the card is built only when it listed no item and held no critical
-    back, so "no critical item" and the queued count are the scorer's answer. The counts are
-    the first sentence (``sentence_starts``) of the paragraphs before the exact
-    ``SCAN_SCOPE_LINE``; every other paragraph, roll-up and closing lines included, gives the
-    card only what ``gap_parts`` finds in it, as the item card does. With no selection, a list
-    anywhere, or no exact posture line, the report goes as written. The queue line uses the
-    install's pace (``FINDINGS_NONCRITICAL_MAX``), so the card carries no delivery hour.
-    """
-
-    lines = report.splitlines()
-    if not selection or selection.get(SELECTION_LISTED) or selection.get(SELECTION_HELD) or NOT_QUIET.search(report):
-        return None
-    paragraphs = [" ".join(p.split()) for p in _paragraphs([line for line in lines if not HEADING.match(line)])]
-    paragraphs = [p for p in paragraphs if p and not _is_title(p)]
-    if SCAN_SCOPE_LINE not in paragraphs:
-        return None
-    at = paragraphs.index(SCAN_SCOPE_LINE)
-    posture, tail = paragraphs[:at], paragraphs[at + 1 :]
-    if not posture:
-        return None
-    cut = (sentence_starts(posture[0]) or [len(posture[0])])[0]
-    first, rest = posture[0][:cut].strip(), posture[0][cut:].strip()
-    scanned = [
-        _counted(count, nouns)
-        for count, nouns in ((_stated(CLUSTER_COUNT, [first]), CLUSTERS_NOUN), (_stated(WORKLOAD_COUNT, [first]), WORKLOADS_NOUN))
-        if count is not None
-    ]
-    if not scanned:
-        return None
-    counts = QUIET_COUNTS.format(scanned=QUIET_COUNTS_JOIN.join(scanned), checks=len(SCAN_CHECKS))
-    rollup = next((p for p in tail if _rollup_count(p, 0) is not None), None)
-    closing = [p for p in tail if p is not rollup]
-    gaps = _gap_line([gap_parts(p) for p in [rest, *posture[1:], *tail] if p])
-    queued = int(selection.get(SELECTION_QUEUED) or 0)
-    if queued:
-        daily = fq.pacing_limits(os.environ).noncritical_max
-        items = QUIET_ITEMS[queued != 1]
-        queue = (QUIET_QUEUE.format(count=queued, items=items, daily=daily) if daily
-                 else QUIET_QUEUE_ASK.format(count=queued, items=items))
-    else:
-        queue = ""
-    # One gap line and one queue line, so the gateway's five-line cap never drops the queue line.
-    return _Quiet(counts, [line for line in (gaps, queue) if line], closing, queued)
-
-
-def _card(report: str, selection: dict | None = None) -> _Card | None:
+def _card(report: str) -> _Card | None:
     """The card both layouts draw: the top :data:`CARD_ROWS` rows, the rest folded; None when the report does not parse."""
     # A NUL inside a gap ("could not\0 be scanned") hides it from _split_gap.
     report = report.replace("\0", "")
-    quiet = _quiet(report, selection)
-    if quiet is not None:
-        choices = [SEE_ALL_FINDINGS[quiet.queued != 1].format(count=quiet.queued)] if quiet.queued else []
-        checks = [{"text": words} for _, words in SCAN_CHECKS]
-        return _Card(QUIET_HEADLINE, "", quiet.counts, [], checks, CHECKS_FOLD_TITLE, choices, "\n".join(quiet.after))
     shape = _shape(report)
     if shape is None:
         return None

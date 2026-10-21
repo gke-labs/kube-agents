@@ -357,18 +357,6 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertNotIn("--update", note)
         self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note[note.index("--") + 1])
 
-    def test_the_card_is_given_the_selection_of_the_batch_it_registered(self):
-        import inventory_presenter
-
-        (self.d / ITEMS).write_text(json.dumps(EXTRACTED), encoding="utf-8")
-        (self.d / SCORES).write_text(json.dumps(SCORED), encoding="utf-8")
-        card = ({"schema": "kube-agents.chat/v1", "headline": "done"}, "done")
-        with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true"}), \
-                mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}), \
-                mock.patch.object(inventory_presenter, "chat", return_value=card) as chat:
-            self._run()
-        self.assertEqual(chat.call_args.args[1:], ({"listed": 0, "held": 0, "queued": 2},))
-
     def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
         import inventory_presenter
 
@@ -882,32 +870,6 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
                 (["api", "web"], {"project": "acme", "cluster": "prod", "complete": True}, False),
             ],
         )
-
-    def test_the_batch_it_registered_is_what_the_presenter_is_given(self):
-        # The short card decides "no critical item" from this, not from the report's words.
-        self._write()
-        with (
-            mock.patch.object(bootstrap_delivery, "_posted_as_blocks", return_value=False) as blocks,
-            mock.patch.object(bootstrap_delivery, "_presented", side_effect=lambda c, *a, **k: c) as presented,
-        ):
-            rc, _, _ = self._run()
-        self.assertEqual(rc, 0)
-        expected = {"listed": 0, "held": 0, "queued": 2}
-        self.assertEqual(blocks.call_args.args[1:], (expected,))
-        self.assertEqual(presented.call_args.kwargs["selection"], expected)
-
-    def test_a_batch_the_queue_did_not_take_gives_no_selection(self):
-        # The short card would say the items are queued when they are in no queue.
-        self._write()
-        for failure in (urllib.error.URLError("connection refused"),
-                        urllib.error.HTTPError("http://q", 500, "refused", {}, None)):
-            with self.subTest(failure=type(failure).__name__):
-                self.post.stop()
-                with mock.patch.object(inventory_findings, "post_batch", side_effect=failure), \
-                        contextlib.redirect_stderr(io.StringIO()):
-                    _, items, scores = bootstrap_delivery._register_findings(self.d, False, False)
-                self.post.start()
-                self.assertIsNone(bootstrap_delivery._selection(items, scores, set()))
 
     def test_a_hand_off_that_filed_no_ranking_card_registers_nothing(self):
         # A no-coverage sweep writes the report itself; the items and scores are the last sweep's.
@@ -2128,28 +2090,6 @@ class ScopeGapParagraphTest(unittest.TestCase):
         self.assertIn("`locked` (denied)", body)
         # It sits between the roster caveat and Step 2, which lists the roster.
         self.assertLess(body.index("`locked` (denied)"), body.index("**Step 2"))
-
-
-class SelectionTest(unittest.TestCase):
-    """The short card's facts: what `select` chose, scored from the batch the registration read."""
-
-    def test_a_batch_with_no_critical_lists_nothing_and_queues_every_item(self):
-        # SCORE is major; f001 and f002 share a check on acme/prod, so they are one item.
-        selection = bootstrap_delivery._selection(EXTRACTED["items"], SCORED["scores"], set())
-        self.assertEqual(selection, {"listed": 0, "held": 0, "queued": 2})
-
-    def test_criticals_held_back_by_a_limit_of_zero_are_counted(self):
-        critical = dict(SCORE, rubric={"B": 8, "L": 6, "detect": 3, "recover": 3, "C": 1.0})
-        scores = {"f001": critical, "f002": SCORE, "f003": SCORE}
-        with mock.patch.dict(os.environ, {"FINDINGS_FIRST_REPORT_CRITICALS": "0"}):
-            selection = bootstrap_delivery._selection(EXTRACTED["items"], scores, set())
-        self.assertEqual(selection["listed"], 0)
-        self.assertEqual(selection["held"], 1)
-
-    def test_an_unread_or_bad_batch_is_unknown(self):
-        self.assertIsNone(bootstrap_delivery._selection(None, None, set()))
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.assertIsNone(bootstrap_delivery._selection(EXTRACTED["items"], {}, set()))
 
 
 class FirstRunAuditsTest(unittest.TestCase):
