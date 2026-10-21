@@ -57,10 +57,13 @@ started with (`claude-code` or `antigravity`).
 - **`claude-code`** (`claudecode`): `CLAUDE.md` and `skills/` for the
   worker to write into a per-task `CLAUDE_CONFIG_DIR`, and the flags to
   pass:
-  - `--allowedTools` for what the persona grants;
+  - `--allowedTools` for what the persona grants, plus `Skill` when it has
+    skills, since headless Claude Code refuses the Skill tool off the
+    allowlist;
   - `--disallowedTools` for every Claude Code built-in it does not grant,
     on every argv. The worker unions its own hard-deny list with this one,
-    and a deny wins over an allow;
+    and a deny wins over an allow. `Output.Allowed` and `Output.Disallowed`
+    carry the same two lists, so the worker need not parse the flags;
   - `--mcp-config`, each server a stdio proxy to the relay the worker
     names. With no relay, every broker server is dropped with a warning;
   - `--strict-mcp-config` and `--setting-sources user`, on every argv.

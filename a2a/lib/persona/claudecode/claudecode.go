@@ -30,6 +30,8 @@ const (
 
 	AllowedToolsFlag    = "--allowedTools"
 	DisallowedToolsFlag = "--disallowedTools"
+	// skillTool is the tool Claude Code loads a skill with.
+	skillTool           = "Skill"
 	MCPConfigFlag       = "--mcp-config"
 	StrictMCPConfigFlag = "--strict-mcp-config"
 	SettingSourcesFlag  = "--setting-sources"
@@ -95,6 +97,12 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 		warn("mcp.yaml: servers.%s: dropped, the worker gave no broker MCP relay", name)
 	}
 	allowed := allowedTools(p, dropped, warn)
+	// Claude Code loads a skill through its Skill tool, which headless mode
+	// refuses unless it is on the allowlist; a persona's own skills are
+	// what it is for.
+	if len(p.Skills) > 0 {
+		allowed = append(allowed, skillTool)
+	}
 	// A server no tools entry grants is not configured at all. The
 	// allowlist only pre-approves; it does not fence what is off it, so not
 	// starting the server is what withholds its tools.
@@ -109,7 +117,8 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 	if len(allowed) > 0 {
 		out.Args = append(out.Args, AllowedToolsFlag, strings.Join(allowed, ","))
 	}
-	out.Args = append(out.Args, DisallowedToolsFlag, strings.Join(disallowedTools(allowed), ","))
+	out.Allowed, out.Disallowed = allowed, disallowedTools(allowed)
+	out.Args = append(out.Args, DisallowedToolsFlag, strings.Join(out.Disallowed, ","))
 	if len(servers) > 0 {
 		cfg, err := json.Marshal(map[string]any{mcpServersKey: servers})
 		if err != nil {

@@ -157,6 +157,11 @@ type Output struct {
 	Files []File
 	// Args are the flags the worker adds to the harness argv.
 	Args []string
+	// Allowed and Disallowed are the harness tool names the Args grant and
+	// deny, for a worker that merges its own lists rather than parse Args.
+	// A worker that adds a deny list of its own unions it with Disallowed.
+	Allowed    []string
+	Disallowed []string
 	// Model is the manifest's model hint, for the worker to honour or not.
 	Model string
 	// Warnings name each part of the persona the harness cannot express.

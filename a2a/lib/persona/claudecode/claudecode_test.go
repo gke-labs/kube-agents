@@ -125,6 +125,7 @@ func TestEveryArgvCarriesTheHardeningFlags(t *testing.T) {
 	bare := load(t, exampleDir)
 	bare.Manifest.Tools = nil
 	bare.MCP = persona.MCP{}
+	bare.Skills = nil
 	for name, out := range map[string]persona.Output{
 		"example":           render(t, load(t, exampleDir), persona.Target{Relay: relay}),
 		"no tools, no mcp":  render(t, bare, persona.Target{}),
@@ -159,7 +160,7 @@ func TestToolsMapToClaudeCodeNames(t *testing.T) {
 	if i < 0 {
 		t.Fatalf("no %s in %v", AllowedToolsFlag, out.Args)
 	}
-	want := "Read,Glob,Grep,mcp__gke__get_cluster,mcp__gke__list_clusters,mcp__docs__search"
+	want := "Read,Glob,Grep,mcp__gke__get_cluster,mcp__gke__list_clusters,mcp__docs__search,Skill"
 	if out.Args[i+1] != want {
 		t.Errorf("%s = %s, want %s", AllowedToolsFlag, out.Args[i+1], want)
 	}
@@ -263,5 +264,30 @@ func TestAnUpperCaseMarkdownFileShipsWithoutAShell(t *testing.T) {
 	out := render(t, p, persona.Target{})
 	if !slices.ContainsFunc(out.Files, func(f persona.File) bool { return f.Path == "skills/notes/NOTES.MD" }) {
 		t.Errorf("NOTES.MD was dropped as a script")
+	}
+}
+
+// Allowed and Disallowed are the lists the flags carry, so a worker can
+// union its own deny list without parsing Args.
+func TestTheToolListsMatchTheFlags(t *testing.T) {
+	out := render(t, load(t, exampleDir), persona.Target{Relay: relay})
+	if got := flagValue(t, out.Args, AllowedToolsFlag); !slices.Equal(got, out.Allowed) {
+		t.Errorf("Allowed = %v, the flag says %v", out.Allowed, got)
+	}
+	if got := flagValue(t, out.Args, DisallowedToolsFlag); !slices.Equal(got, out.Disallowed) {
+		t.Errorf("Disallowed = %v, the flag says %v", out.Disallowed, got)
+	}
+}
+
+// A persona with skills grants the Skill tool, which headless Claude Code
+// refuses off the allowlist; one with none does not.
+func TestSkillsGrantTheSkillTool(t *testing.T) {
+	p := load(t, exampleDir)
+	if !slices.Contains(render(t, p, persona.Target{}).Allowed, skillTool) {
+		t.Errorf("a persona with skills does not grant %s", skillTool)
+	}
+	p.Skills = nil
+	if slices.Contains(render(t, p, persona.Target{}).Allowed, skillTool) {
+		t.Errorf("a persona with no skills grants %s", skillTool)
 	}
 }
