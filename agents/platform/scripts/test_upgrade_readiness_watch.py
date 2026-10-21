@@ -2537,7 +2537,7 @@ class Projects(unittest.TestCase):
 
     def test_the_roster_reads_each_profile_s_identity_and_skips_the_reserved_ones(self) -> None:
         with tempfile.TemporaryDirectory() as home:
-            for name in ("default", "platform", "cluster-x", "cluster-y", "cluster-broken"):
+            for name in ("default", "platform", "cluster-x", "cluster-y", "cluster-z", "cluster-blank", "cluster-broken"):
                 (Path(home) / "profiles" / name).mkdir(parents=True)
 
             def identity(path: Path):
@@ -2545,12 +2545,17 @@ class Projects(unittest.TestCase):
                     return {"project": "tenant-a", "cluster": "x", "location": "l"}
                 if path.name == "cluster-y":
                     return {"project": "tenant-b", "cluster": "y", "location": "l"}
+                if path.name == "cluster-z":
+                    # A hand-edited quoted scalar: stripped as every other roster source is.
+                    return {"project": " tenant-c\n", "cluster": "z", "location": "l"}
+                if path.name == "cluster-blank":
+                    return {"project": "  ", "cluster": "b", "location": "l"}
                 raise OSError("unreadable")
 
             with mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home), mock.patch(
                 "cluster_agent_profile.read_cluster_identity", side_effect=identity
             ):
-                self.assertEqual(watch.roster_projects(), {"tenant-a", "tenant-b"})
+                self.assertEqual(watch.roster_projects(), {"tenant-a", "tenant-b", "tenant-c"})
 
 
 class Loader(unittest.TestCase):
