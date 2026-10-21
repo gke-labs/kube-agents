@@ -519,6 +519,12 @@ func (c *Client) SubscribeDurable(ctx context.Context, cfg SubscribeConfig, hand
 // envelope off `…events` is the executor's (CheckSubjectAgreement has
 // already held the envelope to the subject by the time the handler sees it).
 func (c *Client) SubscribeDurableAttributed(ctx context.Context, cfg SubscribeConfig, handler func(subject string, env *Envelope)) (Subscription, error) {
+	return c.subscribe(ctx, cfg, func(s *durableSub) { s.handler = handler })
+}
+
+// subscribe validates cfg, registers a durableSub that set has finished
+// configuring (the auto-ack handler, or the held mode), and binds it.
+func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*durableSub)) (Subscription, error) {
 	switch {
 	case cfg.Stream == "":
 		return nil, fmt.Errorf("SubscribeConfig.Stream is required")
@@ -533,7 +539,8 @@ func (c *Client) SubscribeDurableAttributed(ctx context.Context, cfg SubscribeCo
 		// silently delivering other sessions' envelopes is non-conforming.
 		return nil, fmt.Errorf("SubscribeConfig.Session is required")
 	}
-	s := &durableSub{c: c, cfg: cfg, handler: handler, seen: newDedupSet(dedupWindow)}
+	s := &durableSub{c: c, cfg: cfg, seen: newDedupSet(dedupWindow)}
+	set(s)
 	// Register before starting so a rebuild racing this call cannot snapshot
 	// c.subs without it and leave its consumer bound to a dead connection.
 	c.mu.Lock()
@@ -592,6 +599,8 @@ type durableSub struct {
 	handler func(subject string, env *Envelope)
 	seen    *dedupSet
 	stopped atomic.Bool
+	// held is the held-delivery mode (held.go); nil for auto-ack.
+	held *heldState
 
 	mu sync.Mutex
 	cc jetstream.ConsumeContext
@@ -601,6 +610,14 @@ type durableSub struct {
 // Called at subscribe time and again by rebuild with a fresh js; it holds no
 // reference to any prior connection's objects.
 func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
+	if s.held != nil {
+		// Held mode binds and never creates (held.go).
+		cons, err := s.held.bind(ctx, js, s.cfg)
+		if err != nil {
+			return err
+		}
+		return s.consume(cons)
+	}
 	consCfg := jetstream.ConsumerConfig{
 		Durable:   s.cfg.Durable,
 		AckPolicy: jetstream.AckExplicitPolicy,
@@ -614,6 +631,11 @@ func (s *durableSub) start(ctx context.Context, js jetstream.JetStream) error {
 	if err != nil {
 		return fmt.Errorf("consumer %s on %s: %w", s.cfg.Durable, s.cfg.Stream, err)
 	}
+	return s.consume(cons)
+}
+
+// consume starts delivery from cons, displacing any earlier consume context.
+func (s *durableSub) consume(cons jetstream.Consumer) error {
 	cc, err := cons.Consume(s.deliver)
 	if err != nil {
 		return fmt.Errorf("consume %s: %w", s.cfg.Durable, err)
@@ -662,6 +684,12 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 		_ = msg.Ack()
 		return
 	}
+	if s.held != nil {
+		// Held mode: the handler disposes of the delivery itself, and a
+		// redelivery is expected, so the envelopeId dedup does not apply.
+		s.held.dispatch(msg, env)
+		return
+	}
 	// Assertion 5: at most once per envelopeId across redeliveries.
 	if !s.seen.add(env.EnvelopeID) {
 		_ = msg.Ack()
@@ -687,8 +715,13 @@ func (s *durableSub) Stop() {
 func (s *durableSub) stopLocal() {
 	s.stopped.Store(true)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cc != nil {
 		s.cc.Stop()
+	}
+	s.mu.Unlock()
+	if s.held != nil {
+		// After the consume context stops, so no new handler starts while
+		// the running ones are told to wind down.
+		s.held.stop()
 	}
 }
