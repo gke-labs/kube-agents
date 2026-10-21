@@ -150,6 +150,15 @@ class CronJobMaxTurnsTest(unittest.TestCase):
             with self.subTest(value=lifting):
                 self.assertEqual(helper({"max_turns": lifting}, {"agent": {"max_turns": 90}}), 90)
 
+    def test_a_job_value_below_the_profiles_does_not_lower_the_budget(self):
+        # The entry raises its job above the profile, never under it: an operator's
+        # larger tuning.platform.maxTurns still reaches every job.
+        self.apply_quietly()
+        helper = self.namespace()[HELPER_NAME]
+        self.assertEqual(helper({"max_turns": 100}, {"agent": {"max_turns": 150}}), 150)
+        self.assertEqual(helper({"max_turns": 250}, {"agent": {"max_turns": 300}}), 300)
+        self.assertEqual(helper({"max_turns": 250}, {"agent": {"max_turns": 150}}), 250)
+
     def test_a_profile_with_no_budget_is_still_unlimited_when_the_job_names_none(self):
         self.apply_quietly()
         helper = self.namespace()[HELPER_NAME]

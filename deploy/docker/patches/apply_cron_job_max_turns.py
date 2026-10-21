@@ -21,12 +21,15 @@ patch drops out on the tag bump that carries it: a helper,
 ``_resolve_cron_max_iterations``, that reads ``job["max_turns"]`` first and
 falls back to the profile's ``agent.max_turns`` (then the legacy root key),
 and the call to it where ``_resolve_cron_agent_setup`` used to read the
-profile alone. A job with no ``max_turns`` behaves exactly as before. One
-departure from upstream: a job value Hermes would read as unlimited (0, a
+profile alone. A job with no ``max_turns`` behaves exactly as before. Two
+departures from upstream. A job value Hermes would read as unlimited (0, a
 negative number, a bool, a non-numeric string) is ignored and the profile's
 value stands, so an entry the image does not ship (an operator's own job on
 the volume, which the roster lint never sees) cannot run a cron turn with no
-budget at all.
+budget at all. And a job value never lowers the budget below the profile's:
+the entry raises its job above the profile, so an operator who sets
+``spec.harness.tuning.platform.maxTurns`` above the audits' 250 still raises
+the audits, and an install already above 250 keeps that headroom on upgrade.
 
 With this the audits declare 250 on their roster entries
 (``agents/platform/cron/jobs.json``) and the profile default drops to 150,
@@ -61,22 +64,26 @@ SETUP_DEF_PATCHED = (
     "\n"
     f"    {BUILD_MARKER} (gke-labs/kube-agents#1947), mirroring\n"
     "    NousResearch/hermes-agent#134059. A job's own ``max_turns`` bounds its run;\n"
-    "    a job without one keeps the profile's ``agent.max_turns`` as before. One\n"
-    "    departure from upstream: a job value that would lift the cap altogether\n"
+    "    a job without one keeps the profile's ``agent.max_turns`` as before. Two\n"
+    "    departures from upstream: a job value that would lift the cap altogether\n"
     "    (0, a negative number, a bool, a non-numeric string, which\n"
-    "    ``resolve_turn_limit`` reads as unlimited) is ignored, so a roster entry\n"
-    "    can never run with no budget while the profile has one.\n"
+    "    ``resolve_turn_limit`` reads as unlimited) is ignored, and a job value\n"
+    "    below the profile's does not lower it -- the entry raises its job above\n"
+    "    the profile, never under it, so an operator's larger\n"
+    "    ``tuning.platform.maxTurns`` still reaches every job.\n"
     '    """\n'
     "    from hermes_cli.config import TURN_LIMIT_UNLIMITED, resolve_turn_limit as _resolve_turn_limit\n"
+    '    profile = cfg.get("agent", {}).get("max_turns")\n'
+    "    if profile is None:\n"
+    '        profile = cfg.get("max_turns")\n'
+    "    profile_cap = _resolve_turn_limit(profile)\n"
     '    value = job.get("max_turns")\n'
-    "    if value is not None:\n"
-    "        cap = _resolve_turn_limit(value)\n"
-    "        if cap < TURN_LIMIT_UNLIMITED:\n"
-    "            return cap\n"
-    '    value = cfg.get("agent", {}).get("max_turns")\n'
     "    if value is None:\n"
-    '        value = cfg.get("max_turns")\n'
-    "    return _resolve_turn_limit(value)\n"
+    "        return profile_cap\n"
+    "    cap = _resolve_turn_limit(value)\n"
+    "    if cap >= TURN_LIMIT_UNLIMITED:\n"
+    "        return profile_cap\n"
+    "    return max(cap, profile_cap)\n"
     "\n"
     "\n" + SETUP_DEF
 )

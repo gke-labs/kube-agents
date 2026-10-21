@@ -3326,9 +3326,10 @@ class WorkerBudgetVerifier(BaseVerifier):
     delegation ceiling, which closes the run ``reclaimed``; a crash; an attempt
     still open) is ``status="error"``: none of those says what cap was in force.
     A notice past the capture's per-result clip is not read, which a card of
-    short tool outputs never reaches; a result the pod withheld or never
-    recorded is unreadable, and with nothing named it is ``status="error"``
-    too.
+    short tool outputs never reaches; a capture in which every result was
+    withheld or never recorded is unreadable, and with nothing named it is
+    ``status="error"`` too, while a single missing result among readable ones
+    does not turn a plain failure into one.
     """
 
     type: Literal["worker_budget"]
@@ -3358,15 +3359,18 @@ class WorkerBudgetVerifier(BaseVerifier):
             if match:
                 named.append((str(row.get("task") or ""), int(match["used"]), int(match["cap"]), "exhausted"))
         calls: dict[str, int] = {}
-        # A result the pod withheld (its redactor failed to load) or never
-        # recorded could have carried the notice: with nothing named, that is
-        # an unreadable cap, not evidence of a larger one.
-        unreadable = 0
+        # A pod whose redactor failed to load withholds every result, and the
+        # notice with them: with nothing named, that is an unreadable cap, not
+        # evidence of a larger one. One call with no result row (a worker
+        # killed mid-call, an orphaned result) among readable ones is not: the
+        # notice would have landed on one of the others.
+        unreadable = tagged = 0
         for entry in snap.trajectory:
             if not entry.get("agent"):
                 continue
             task = str(entry.get("task") or "")
             calls[task] = calls.get(task, 0) + 1
+            tagged += 1
             result = entry.get("result")
             if result is None or result == worker_trajectory.WITHHELD:
                 unreadable += 1
@@ -3390,11 +3394,12 @@ class WorkerBudgetVerifier(BaseVerifier):
                         f"card, so the cap in force cannot be read (runs: {outcomes or ['no run rows']}; {seen})"
                     ),
                 )
-            if snap.worker_capture_gaps or unreadable:
+            all_unreadable = tagged > 0 and unreadable == tagged
+            if snap.worker_capture_gaps or all_unreadable:
                 why = (
                     "; ".join(snap.worker_capture_gaps)
                     if snap.worker_capture_gaps
-                    else f"{unreadable} worker result(s) have no readable text (none recorded, or withheld in the pod)"
+                    else f"all {unreadable} worker result(s) have no readable text (none recorded, or withheld in the pod)"
                 )
                 return VerificationResult(
                     success=False,

@@ -741,8 +741,7 @@ def runs(summary: dict[str, Any] | None) -> list[dict[str, Any]] | None:
 
     ``None`` when the read did not run. Each row is the card's ``run_outcomes``
     entry (``profile``, ``status``, ``outcome``, ``error``) plus ``task``; a
-    summary that lists card ids rather than card records (the inject
-    transport's) yields an empty list. ``worker_budget`` reads the rows for the
+    summary without card records yields an empty list. ``worker_budget`` reads the rows for the
     turn budget a worker ran out of.
     """
     if not isinstance(summary, dict):

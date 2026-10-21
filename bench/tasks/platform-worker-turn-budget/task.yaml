@@ -71,5 +71,9 @@ verification_spec:
       type: worker_budget
       # agents/platform/config.yaml `agent.max_turns`, the budget every kanban
       # worker spawned under the platform profile runs with. The audits' 250
-      # sits on their roster entries and must not reach a card.
+      # sits on their roster entries and must not reach a card. The image's
+      # value, not an install's: a CR that sets tuning.platform.maxTurns (the
+      # stockout plugin's chart overlay sets 200) raises every worker to that
+      # number, and this case then fails naming it. Run it where the knob is
+      # unset, as the CI pool is.
       budget: 150

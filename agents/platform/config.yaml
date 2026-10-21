@@ -272,8 +272,9 @@ toolsets:
 # reads ahead of this value (deploy/docker/patches/apply_cron_job_max_turns.py);
 # before that patch this value was 250 and every worker ran with it (#1947).
 #
-# The operator's `spec.harness.tuning.platform.maxTurns` overlays this value, not
-# a roster entry's. The Chat Agent and the Cluster Agents leave the key unset,
+# The operator's `spec.harness.tuning.platform.maxTurns` overlays this value; a
+# roster entry's own `max_turns` raises its job above whichever is in force and
+# never lowers it. The Chat Agent and the Cluster Agents leave the key unset,
 # so their gateway turns run uncapped and their workers at the CLI's 500.
 agent:
   max_turns: 150

@@ -363,8 +363,9 @@ kanban workers run under, and the nine fleet audits carry their own `max_turns: 
 entries, which the scheduler reads ahead of the profile value;
 [Config reference](/kube-agents/reference/config/#agent) is canonical for why. Setting
 `tuning.platform.maxTurns` here still wins over the profile value — the overlay is merged after the
-image force-sync — but not over a roster entry's own `max_turns`, and removing it restores the
-image's value rather than Hermes'.
+image force-sync — and a roster entry's own `max_turns` only ever raises its job above whichever of
+the two is in force, never lowers it, so a value above 250 raises the audits too; removing it
+restores the image's value rather than Hermes'.
 
 **`maxInProgress` is not.** Unset renders `6`, because the untuned case is the one that cannot
 absorb the alternative — see [Why dispatch is capped by default](#why-dispatch-is-capped-by-default)

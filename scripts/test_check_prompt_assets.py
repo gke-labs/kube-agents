@@ -535,7 +535,7 @@ class SyntheticProfileTests(unittest.TestCase):
         self.assertEqual(["cron-max-turns"], [f.rule for f in findings])
         self.assertIn("has max_turns=None", findings[0].message)
 
-    def test_cron_job_max_turns_that_resolves_to_unlimited_is_reported(self):
+    def test_cron_job_max_turns_hermes_would_read_as_unlimited_is_reported(self):
         for value in ("0", "-1", "true", '"250"', "null"):
             with self.subTest(value=value):
                 self.fixture.write(

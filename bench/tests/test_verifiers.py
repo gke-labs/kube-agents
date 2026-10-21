@@ -1666,7 +1666,21 @@ def test_worker_budget_withheld_results_are_unreadable_not_a_wrong_cap():
                    worker_runs=[{"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
     res = _budget(150).verify(5.0)
     assert res.status == "error"
-    assert "withheld" in res.reason
+    assert "withheld" in res.reason and res.reason.startswith("no delegated worker")
+
+
+def test_worker_budget_one_missing_result_among_readable_ones_keeps_the_fail():
+    # A worker killed mid-call leaves one call with no result row; the notice
+    # would have landed on one of the other 200 readable results, so the plain
+    # failure (the regression the case exists for) stands.
+    worker = ([{"name": "terminal", "args": {}, "result": None, "agent": "platform", "task": "t_1"}]
+              + [{"name": "terminal", "args": {}, "result": "turn-n", "agent": "platform", "task": "t_1"}] * 200)
+    transcript.set("ok", _TRAJECTORY + worker,
+                   worker_runs=[{"task": "t_1", "profile": "platform", "status": "crashed", "outcome": "crashed", "error": "worker exited 137"},
+                                {"task": "t_1", "profile": "platform", "status": "done", "outcome": "completed", "error": None}])
+    res = _budget(150).verify(5.0)
+    assert not res.success and res.status != "error"
+    assert "larger than 150" in res.reason
 
 
 def test_worker_budget_withheld_results_do_not_mask_an_exhaustion_row():
