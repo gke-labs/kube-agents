@@ -539,8 +539,12 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 		// silently delivering other sessions' envelopes is non-conforming.
 		return nil, fmt.Errorf("SubscribeConfig.Session is required")
 	}
-	s := &durableSub{c: c, cfg: cfg, seen: newDedupSet(dedupWindow)}
+	s := &durableSub{c: c, cfg: cfg}
 	set(s)
+	if s.held == nil {
+		// The held mode skips the envelopeId dedup (see deliver).
+		s.seen = newDedupSet(dedupWindow)
+	}
 	// Register before starting so a rebuild racing this call cannot snapshot
 	// c.subs without it and leave its consumer bound to a dead connection.
 	c.mu.Lock()
