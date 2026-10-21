@@ -64,7 +64,8 @@
 # are frozen in the order they landed.
 
 # ── The four full audits recast out of the presubmit on 2026-08-26 ──────────
-# Spec-ready, each domain covered in the presubmit by its probe:
+# Spec-ready, each domain covered in the presubmit by its probe (upgrades'
+# probe nightly since 2026-10-16, #3269; consistency's since 2026-10-21, #3598):
 #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
 #      (build 2092638061140643840); too slow for a presubmit seat.
 #   -- stockout-pinned-pool: same full-audit shape and cost band; its
@@ -178,7 +179,8 @@
 # the same SOP-faithful shape and 900s band as consistency-drift-outlier
 # above, grading the collector-only `no-environment-label` check (SOP §4.14)
 # against the install's own unlabelled host cluster beside the labelled
-# seeded trio. Its domain's presubmit seat stays with the probe.
+# seeded trio. Its domain's presubmit seat stayed with the probe (nightly
+# since 2026-10-21, #3598).
 ./tasks/consistency-no-environment-label/task.yaml
 
 # The third tofu-provisioned case, and the drift half of incident triage
@@ -803,11 +805,11 @@
 # A plain chat request for the clusters that differ from their peers runs the
 # drift audit's collector (#2386), and answers in chat without publishing.
 # deployer: noop; reads the seeded fleet's drift-outlier role (slot c).
-# Nightly rather than presubmit: consistency-authorized-networks-probe holds
-# the domain's presubmit seat. Red on main: no SOUL.md row routes the question
-# to fleet_drift.py. Marked expected_fail: true, so the nightly records it as
-# EXPECTED_FAIL and also records whether the outlier and facet reply checks
-# pass on seeded-c. The follow-up that adds the drift row removes the marker.
+# Nightly rather than presubmit: consistency-authorized-networks-probe held
+# the domain's presubmit seat (nightly too since 2026-10-21, #3598). Red on
+# main: no SOUL.md row routes the question to fleet_drift.py. Marked
+# expected_fail: true, so the nightly records it as EXPECTED_FAIL and also
+# records whether the outlier and facet reply checks pass on seeded-c. The follow-up that adds the drift row removes the marker.
 ./tasks/drift-chat-request-runs-collector/task.yaml
 
 # A plain chat request about the security of the fleet's AI and
@@ -905,6 +907,19 @@
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
+
+# #3598: consistency-authorized-networks-probe demoted 2026-10-21. On the
+# Gemini setup it failed about 30% of repetitions on unrelated pull requests
+# and on main's eval-next (37 of 126 across 42 runs; the store's record
+# 18/21, would-demote). 15 of the 37 were Vertex 429s (#3399, fix open in
+# #3448); 22 were real misses: the agent read seeded-c's leftover
+# masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
+# `enabled`) as configured or open and said seeded-c matches its peers, or
+# named the wrong facet, or (once) a tool error. The Claude nightlies pass
+# it. Back on the roster once #3448 has merged, the agent-side fix (#3605)
+# lands, and the case passes the roster's bar, 90% over 20 runs, on the
+# Gemini nightly (#3598).
+./tasks/consistency-authorized-networks-probe/task.yaml
 
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The

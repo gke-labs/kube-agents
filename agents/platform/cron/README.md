@@ -438,12 +438,19 @@ script; see `feedback-prompt` below.)
 The same log gets an inventory of the sandbox's profile homes, so that loose
 files a worker leaves there can be seen without exec'ing into the sandbox: each
 home's top-level entries that the product doesn't create, and any home the agent
-pod no longer has a profile for, such as a cluster dropped from scope. That's an
-inventory only: nothing is moved or deleted, and a failure to take it is logged
-there too rather than posted.
+pod no longer has a profile for. The inventory itself moves and deletes nothing;
+what the job removes is below. A
+`cluster-*` home the agent pod has no profile for is removed: a cluster dropped
+from scope or deleted loses its home on the agent pod, and the sandbox's copy,
+kubeconfig included, had nothing else to remove it. The agent pod's profile
+list is the authority, read after the sandbox is listed, and the job removes
+no stale home when that list lacks the platform profile. A stale home whose
+`rm` fails reaches chat, as the two guards do when they hold: one bullet
+naming it, each night until it goes. A failure to take the inventory is logged there too
+rather than posted.
 
-Two things in a profile home are removed, in every home the agent pod has a
-profile for, on the agent pod and in the sandbox. Cron run directories
+Inside a home the agent pod does have a profile for, two things are removed,
+on the agent pod and in the sandbox. Cron run directories
 (`cron/runs/<job>_<execution>`, each cron run's working directory) go after
 seven days, logged as a count. Override trees go the first night, logged by
 name: a top-level directory named `<something>_override`, such as a worker's

@@ -94,7 +94,7 @@ whose own rule is that the project is registered last.
 
 ## The roles
 
-Thirty-three fixtures: thirty across the four cluster slots and three project-scoped. Most in-cluster
+Thirty-four fixtures: thirty-one across the four cluster slots and three project-scoped. Most in-cluster
 fixtures are on slot `a`, across the eleven seeded namespaces `seeded-debug`,
 `seeded-reliability`, `seeded-security`, `seeded-capacity`, `seeded-deprecation`, `seeded-intent`, `seeded-token`, `seeded-headroom`, `seeded-stall`, `seeded-shapes` and `seeded-defaults`, plus both
 defect node pools. Slot `c` carries a GKE-level defect only and no workloads at all: it is the
@@ -121,6 +121,7 @@ its roles are never published.
 | `hpa-saturated`                 | a       | 0   | `pinned-inference-pool` at min = max = 1 under an HPA that wants more                                                                                                                                                             |
 | `deprecated-api-caller`         | a       | 0   | `cronjob/legacy-endpoints-writer` in `seeded-deprecation`, patching Endpoints v1 every ten minutes; each write audit-stamped `k8s.io/deprecated=true`, no removal, no insight                                                     |
 | `idle-nodepool`                 | a       | 7   | `idle-batch-pool`, zero non-system pods, held by a NoSchedule taint                                                                                                                                                               |
+| `default-pool-headroom`         | a       | 0   | seeded-a's default pool itself, two e2-standard-2 nodes asserted to keep 100m CPU unrequested each for the next planted fixture; not a defect, the room the slot's fixtures schedule into                                         |
 | `orphan-disks`                  | project | 30  | `orphan-pd-1` and `orphan-pd-2`, unattached, 10GB, in `var.zone`                                                                                                                                                                  |
 | `startup-fail-vm`               | project | 0   | `startup-fail-<prefix>`, a standalone e2-micro in `var.zone` whose startup script exits 1 on every boot                                                                                                                           |
 | `world-open-ingress`            | project | 0   | `world-open-2379-<prefix>`, tcp:2379 open to the internet on `world-open-<prefix>`, a VM with an external IP in `var.zone`; nothing listens on 2379, and a deny rule blocks tcp:22 and tcp:3389                                   |
@@ -165,7 +166,7 @@ neither is going to be obvious from a slug.
 **A role slug is not the `seeded-role` label.** `bench/tf/fleet/main.tf` carries
 `seeded-role=pinned-inference` on the pinned pool's node label and taint, and
 `seeded-role=idle-batch` on the idle pool's taint, and `bench/tf/fleet/defects-b.tf`
-`seeded-role=no-surge` on the no-surge pool's — so three of the thirty roles are called one
+`seeded-role=no-surge` on the no-surge pool's — so three of the thirty-one roles are called one
 thing by the catalogue and another by the Terraform that plants them. They are
 different mechanisms and both are load-bearing: the label and taint are scheduling
 constraints that keep other workloads off those pools, and the role slug is what the
@@ -260,13 +261,13 @@ provisioning — it is the SOPs' own age rules. A collector that filters on
 `creationTimestamp` returns nothing for a fixture younger than its window, so the audit
 correctly reports no finding and a case asserting one correctly fails.
 
-Twenty-eight of the thirty are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
+Twenty-nine of the thirty-one are assertable on apply day: `rbac-overgrant`, `no-pdb-workload`,
 `declared-no-pdb-workload`, `declared-token-workload`, `declared-overrequest-workload`, `stalled-controller`, `crashloop-workload`, `hpa-saturated`, `version-laggard`, `deprecated-api-caller`, the four
 `readiness-*` roles on slot `b`, the three `zonal-skew-*` roles on slot `d` and the eleven
 upgrade-failure shapes, ten in `seeded-shapes` and one in `seeded-defaults` (`node-local-state`, `deprecated-label-selector`,
 `containerd-socket-agent`, `intree-pd-volume`, `retired-registry-image`, `moving-admission-default`,
 `stale-client-skew`, `cgroup-blind-runtime`, `multi-process-container`, `node-image-coupled-agent`,
-`cuda-pinned-gpu-job`), covering
+`cuda-pinned-gpu-job`) and `default-pool-headroom`, covering
 security, reliability, cluster debugging, remediation, capacity, cost, upgrades, upgrade readiness,
 API deprecation, zonal skew and the upgrade-failure shapes between them. A corpus that leans on these can go green the day the fleet
 applies; the caller's first run is a Job the apply itself waits on, so its audit trail

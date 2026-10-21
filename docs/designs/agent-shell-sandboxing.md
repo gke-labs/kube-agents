@@ -2145,8 +2145,14 @@ placeholders in the platform home; the identity and kubeconfig in a cluster home
 by name and type, goes to `logs/kanban_workspace_gc.log` on the
 agent pod with its mtime and size, as does any sandbox profile home the agent pod has no
 profile for: the volume has no owner, so a cluster dropped from scope keeps its home and
-kubeconfig there. Inventory only, no moves: whether to move anything waits for data from
-the test fleet after cron runs get a working directory of their own. The listing runs as
+kubeconfig there. The inventory moves nothing: whether to move loose files waits for data
+from the test fleet now that cron runs have a working directory of their own. A stale
+`cluster-*` home itself is removed, as `delete_profile` removes the agent pod's: the sandbox
+is listed before the pod's profile list is read, so a profile scaffolded between the two
+reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
+platform profile, and only under a profiles root that `find -P` reports as a real directory,
+by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
+is named in one chat bullet each night until it goes. The listing runs as
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
@@ -2159,8 +2165,9 @@ worker's copy of a shipped skill or script, patched to run in place of the origi
 the literal paths it reads in shipped import-path calls, shell `PYTHONPATH` and configs
 off them. That test is a guard on the obvious forms, not a proof; the prune is the
 enforcement. Both
-prunes cover the homes the agent pod has a profile for, so a stale sandbox home is left
-to the inventory. Neither follows a symlink the model planted: the home, `cron` and
+prunes cover the homes the agent pod has a profile for; a sandbox home the pod has no
+profile for goes to the stale-home removal above when it is a cluster home, and stays in
+the inventory otherwise. Neither follows a symlink the model planted: the home, `cron` and
 `cron/runs` must be real directories for the runs prune, a symlinked home is left alone
 by the override prune, and a symlinked override entry is unlinked rather than followed.
 

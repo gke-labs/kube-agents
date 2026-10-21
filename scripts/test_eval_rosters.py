@@ -283,6 +283,7 @@ HELD_OUT_IN_PRESUBMIT = [
 DEMOTED_AFTER_THE_SPLIT = [
     ("upgrades-lagging-master-probe", "fleet-cost-idle-pool"),  # 2026-10-16, #3269 (agent reads upgradeTargetVersion)
     ("pdb-remediation-pr", "upgrades-lagging-master-probe"),  # 2026-10-17, #3120 (worker declines a pull request into an -infra repo with no manifest; #3145)
+    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the

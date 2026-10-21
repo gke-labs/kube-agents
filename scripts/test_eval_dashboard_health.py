@@ -2743,6 +2743,26 @@ class FixtureDrift(unittest.TestCase):
         self.assertEqual((block["projects"], block["checked"], block["drifted"], block["unknown"], block["stale"]), (30, 30, {project(1): [DRIFT_ROLE]}, False, False))
         self.assertEqual(block["scanned_at"], health.iso(T0 - timedelta(minutes=5)))
 
+    def test_a_capacity_role_advises_the_pool_size_not_a_re_apply(self):
+        role = "default-pool-headroom"
+
+        def with_capacity_role(doc, drifted_on):
+            # scan() writes the two planted roles; the capacity role is healthy everywhere but `drifted_on`.
+            for name, entry in doc["projects"].items():
+                entry["roles"][role] = {"state": "drifted", "detail": ['node?cloud.google.com/gke-nodepool=default-pool node_cpu_spare_ge 100: observed {"n": 4}']} if name in drifted_on else {"state": "healthy", "detail": []}
+            return doc
+
+        result = self.judge(with_capacity_role(scan(previous={project(1): [role]}), {project(1)}))
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
+        self.assertEqual(result["advice"], health.ADVICE_FIXTURE_CAPACITY.format(roles=role, projects=project(1)))
+        self.assertNotIn("re-applied", result["advice"])
+        # Mixed with a planted role (the usual shape: a full pool strands a fixture, whose own role
+        # drifts too), the advice carries the re-apply line for the planted role and the capacity line.
+        mixed = self.judge(with_capacity_role(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [role, DRIFT_ROLE]}), {project(1)}))
+        self.assertEqual(mixed["condition"], "fixture_drift")
+        self.assertIn("re-applied", mixed["advice"])
+        self.assertIn(health.ADVICE_FIXTURE_CAPACITY_MIXED.format(roles=role), mixed["advice"])
+
     def test_the_same_role_on_the_same_project_two_scans_running_degrades(self):
         result = self.judge(scan(drifted={project(1): [DRIFT_ROLE]}, previous={project(1): [DRIFT_ROLE]}))
         self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "fixture_drift"))
