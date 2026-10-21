@@ -2277,9 +2277,10 @@ _TRAJ_MISSING_NO_TRAJ_REASON = (
     "no card was delegated or the worker-trajectory capture did not run, so {named} could not be verified"
 )
 _UNRUN_MASKED_REASON = (
-    "{named} ran, but an operator on the line (a preceding || or !, a following |/;/||/&, "
+    "{named} ran, but the dictated form is the command alone on its line (or followed only by &&); "
+    "an operator on the line (a preceding || or !, a following |/;/||/&, "
     "a following newline, a background &, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) "
-    "means that exit 0 is not the command's own"
+    "means its exit is not credited"
 )
 _UNRUN_CLIPPED_REASON = (
     "the call's command was clipped in the pod, so what followed the run on the line is unknown ({named})"
@@ -2643,7 +2644,14 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
         base = os.path.basename(word)
         if base == "setsid":
             saw_f = False
-            for w in seg[idx + 1:]:
+            redirect_target = False
+            for i, w in enumerate(seg[idx + 1:], start=idx + 1):
+                if redirect_target:
+                    redirect_target = False
+                    continue
+                if _is_redirect(w) or (w.isdigit() and i + 1 < len(seg) and _is_redirect(seg[i + 1])):
+                    redirect_target = not w.isdigit()
+                    continue
                 if w == "--":
                     break
                 if w in ("-w", "--wait"):
@@ -2658,13 +2666,23 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                             break
                         if "f" in w[1:]:
                             saw_f = True
-                if not w.startswith("-") and not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
+                if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
                     break
             if saw_f:
                 return True
         elif base == "sudo":
             prev_opt_takes_val = False
-            for w in seg[idx + 1:]:
+            redirect_target = False
+            for i, w in enumerate(seg[idx + 1:], start=idx + 1):
+                if redirect_target:
+                    redirect_target = False
+                    continue
+                if prev_opt_takes_val:
+                    prev_opt_takes_val = False
+                    continue
+                if _is_redirect(w) or (w.isdigit() and i + 1 < len(seg) and _is_redirect(seg[i + 1])):
+                    redirect_target = not w.isdigit()
+                    continue
                 if w == "--":
                     break
                 if w in ("-b", "--background"):
@@ -2691,10 +2709,7 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                 if w.startswith("-"):
                     prev_opt_takes_val = w in _SUDO_VAL_OPTS
                     continue
-                if not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
-                    if prev_opt_takes_val:
-                        prev_opt_takes_val = False
-                        continue
+                if not _SHELL_ASSIGNMENT_RE.match(w):
                     break
     return False
 

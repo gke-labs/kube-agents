@@ -8644,6 +8644,27 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("sudo -Nbu hermes python3 f.py --readiness") == [
         (["sudo", "-Nbu", "hermes", "python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("sudo 2>/dev/null -b python3 f.py --readiness") == [
+        (["sudo", "2", ">", "/dev/null", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo > log -b python3 f.py --readiness") == [
+        (["sudo", ">", "log", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -u hermes 2>&1 -b python3 f.py --readiness") == [
+        (["sudo", "-u", "hermes", "2", ">&", "1", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null -f python3 f.py --readiness") == [
+        (["setsid", "2", ">", "/dev/null", "-f", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid > log -f python3 f.py --readiness") == [
+        (["setsid", ">", "log", "-f", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo 2>/dev/null python3 f.py --readiness") == [
+        (["sudo", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid 2>/dev/null python3 f.py --readiness") == [
+        (["setsid", "2", ">", "/dev/null", "python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("setsid -fw python3 f.py --readiness") == [
         (["setsid", "-fw", "python3", "f.py", "--readiness"], True),
     ]
@@ -8823,7 +8844,7 @@ def test_worker_commands_required_run_succeeded_flag():
         ]
         transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
         res_joined = v.verify(5.0)
-        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but an operator on the line (a preceding || or !, a following |/;/||/&, a following newline, a background &, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) means that exit 0 is not the command's own" in res_joined.reason
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line (or followed only by &&); an operator on the line (a preceding || or !, a following |/;/||/&, a following newline, a background &, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) means its exit is not credited" in res_joined.reason
 
     # Trajectory entry whose arguments were clipped in the pod (falling back to head regex)
     # is inconclusive under succeeded: true (error status, not pass).
