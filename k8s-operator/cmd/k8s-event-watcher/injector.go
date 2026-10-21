@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -185,6 +186,13 @@ const injectStatusFiltered = "filtered"
 // injected event and a triage session.
 const injectStatusFolded = "folded"
 
+// sessionIDPattern is the shape of a session id the daemon issues
+// (`k8s-evt-<hex>`, and the operator's own id in shared mode): letters,
+// digits, dot, underscore and hyphen. A session id reaches the inject URL
+// from the daemon's own answer or from the dedup snapshot on disk, and the
+// check keeps a hand-edited snapshot from steering the POST anywhere else.
+var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+
 // injectStatusUnrouted is the daemon's answer to a k8s-event-followup for a
 // session no chat thread is routed to: accepted, nothing posted, nothing to
 // retry (session_kv_server, _inject_followup).
@@ -207,11 +215,12 @@ const (
 // a build without the follow-up branch is never sent one (it would take the
 // kind down the event path and post a second alert).
 func (i *injector) Features(ctx context.Context) ([]string, error) {
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, not a request's input
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, i.cfg.daemonURL+healthzPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("injector: build GET healthz: %w", err)
 	}
-	resp, err := i.client.Do(req)
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
 	if err != nil {
 		return nil, fmt.Errorf("injector: GET healthz: %w", err)
 	}
@@ -274,6 +283,9 @@ func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload
 	if sessionID == "" {
 		return none, errors.New("injector: Inject: sessionID is required")
 	}
+	if !sessionIDPattern.MatchString(sessionID) {
+		return none, fmt.Errorf("injector: Inject: session id %q is not one the daemon issues", sessionID)
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return none, fmt.Errorf("injector: marshal payload: %w", err)
@@ -283,6 +295,7 @@ func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload
 		return none, fmt.Errorf("injector: wrap inject envelope: %w", err)
 	}
 	url := i.cfg.daemonURL + "/sessions/" + sessionID + "/inject"
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, and the session id matched sessionIDPattern above
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(wrapped))
 	if err != nil {
 		return none, fmt.Errorf("injector: build POST inject: %w", err)
@@ -293,7 +306,7 @@ func (i *injector) InjectDetailed(ctx context.Context, sessionID string, payload
 	if i.cfg.assertedCaller != "" {
 		req.Header.Set("X-Asserted-Caller", i.cfg.assertedCaller)
 	}
-	resp, err := i.client.Do(req)
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
 	if err != nil {
 		return none, fmt.Errorf("injector: POST inject: %w", err)
 	}
