@@ -735,6 +735,12 @@
 # noop, transcript-only, one delegation round trip.
 ./tasks/alert-config-terraform-promql-probe/task.yaml
 
+# A pod count with no events in it: the Cluster Agent's audit trail states no
+# observation time it did not read; one it states falls inside the run and
+# matches a tool output (report_times_in_window, #3256). deployer: noop, read-only, one card on the
+# no-pdb-workload fixture.
+./tasks/cluster-agent-observation-time-read/task.yaml
+
 # A plain chat request to check the fleet's security posture runs the
 # compliance audit's collector (#2386), and answers in chat without
 # publishing. deployer: noop; reads the seeded fleet's rbac-overgrant role.

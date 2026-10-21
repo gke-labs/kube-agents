@@ -192,6 +192,7 @@ ADDED_AFTER_THE_MOVE = [
     "stop-on-permission-refusal",  # retry after a command-policy refusal, #1948
     "not-found-target-stops-as-failure",  # a missing target stops its card on a hard wall, mock 06
     "alert-config-terraform-promql-probe",  # the gke-alert-configuration skill sync
+    "cluster-agent-observation-time-read",  # an audit trail states no time it did not read, #3256
     "security-chat-request-runs-collector",  # a plain security-posture request runs the compliance collector, #2386
     "compute-class-canary-active-migration-pdb-probe",  # the gke-compute-classes skill sync
     "observability-trace-latency-brokered",  # the trace latency helper through the broker, unparked 2026-10-16 (#2244)
