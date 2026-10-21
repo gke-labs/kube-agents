@@ -291,7 +291,7 @@ class Registration(unittest.TestCase):
         self.assertEqual(claimed, set())
         self.assertEqual(set(outcomes.values()), {review.REGISTRATION_FAILED})
         self.assertEqual(len(problems), 2)
-        self.assertTrue(all(review.CLAIM_FAILED_MARK in p and "without a result" in p for p in problems), problems)
+        self.assertTrue(all(review.CLAIM_FAILED_MARK in p and "no list of results" in p and "no count of the rows" in p for p in problems), problems)
 
         # Results for some rows only, or a claim answered without the count it lowered, are refused too.
         def partial_answer(path, body):
@@ -306,10 +306,16 @@ class Registration(unittest.TestCase):
         # sent: neither answer is that batch's, so neither claim lands.
         self.assertEqual(claimed, set())
         self.assertEqual([p.split(":")[0] for p in problems], [f"{PROJECT}/seeded-b", f"{PROJECT}/seeded-c"])
+        # Each line names its own cause: rows short of a result, or a result for a row never sent.
+        self.assertIn(f"{len(findings) - 1} of {len(findings)} row(s) without a result", problems[0])
+        self.assertNotIn("no count of the rows", problems[0])
+        self.assertIn("1 result(s) for row(s) the batch never sent", problems[1])
+        self.assertNotIn("without a result", problems[1])
         with mock.patch.object(review, "kv_request", no_count):
             _outcomes, problems, claimed = review.register(members, [], findings)
         self.assertEqual(claimed, set())
         self.assertEqual(len(problems), 2)
+        self.assertTrue(all("no count of the rows the claim lowered" in p and "without a result" not in p for p in problems), problems)
 
         # A result for an id the batch never sent is not this batch's answer, whatever else it holds.
         def extra_id(path, body):
@@ -320,6 +326,7 @@ class Registration(unittest.TestCase):
             _outcomes, problems, claimed = review.register(members, [], findings)
         self.assertEqual(claimed, set())
         self.assertEqual(len(problems), 2)
+        self.assertTrue(all("1 result(s) for row(s) the batch never sent" in p and "without a result" not in p and "no count" not in p for p in problems), problems)
 
     def test_a_cluster_past_the_batch_limit_is_sent_in_pieces_without_a_claim(self):
         calls = []

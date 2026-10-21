@@ -339,11 +339,16 @@ MAX_NAMES_IN_LINE = 6  # projects named in the partial line
 OVERFLOW_NOTE = "and {count} more in the record"
 OVERFLOW_NOTE_PLAIN = "and {count} more"  # for the line of a run that wrote no record
 CLAIM_FAILED_MARK = "the completeness claim did not reach the queue"
-# A 200 answer that does not acknowledge the batch: a result for every row sent, and for a
-# claim the count it lowered. Anything else is not the findings route answering (a redirect
-# urllib turned into a GET answers the findings list), so nothing in the batch is counted.
-UNACKNOWLEDGED_DETAIL = "the queue's answer does not acknowledge the batch ({missing} of {sent} row(s) without a result{claim})"
-UNACKNOWLEDGED_CLAIM = ", no count of the rows the claim lowered"
+# A 200 answer that does not acknowledge the batch: a list of results naming exactly the rows
+# sent, and for a claim the count it lowered. Anything else is not the findings route
+# answering this batch (a redirect urllib turned into a GET answers the findings list, a
+# replaying front another batch), so nothing in it is counted; the detail names each cause.
+UNACKNOWLEDGED_DETAIL = "the queue's answer does not acknowledge the batch ({reasons})"
+UNACKNOWLEDGED_NOT_A_LIST = "no list of results"
+UNACKNOWLEDGED_MISSING = "{count} of {sent} row(s) without a result"
+UNACKNOWLEDGED_EXTRA = "{count} result(s) for row(s) the batch never sent"
+UNACKNOWLEDGED_CLAIM = "no count of the rows the claim lowered"
+UNACKNOWLEDGED_SEPARATOR = ", "
 ANSWER_RESULTS_KEY = "results"
 ANSWER_DOWNGRADED_KEY = "downgraded"
 DUPLICATE_DETAIL_SEPARATOR = " | also: "  # two rows of one member that derive one queue id
@@ -966,11 +971,17 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
                 sent = {item_id(item) for item in chunk}
                 results = answer.get(ANSWER_RESULTS_KEY)
                 acknowledged = {str(r["id"]) for r in results if isinstance(r, dict) and r.get("id")} if isinstance(results, list) else set()
-                missing = sent - acknowledged
                 # Exactly the ids sent: a result for an id the batch never carried is
                 # not this batch's answer, and acknowledges neither its rows nor its claim.
-                if not isinstance(results, list) or acknowledged != sent or (claims and not isinstance(answer.get(ANSWER_DOWNGRADED_KEY), int)):
-                    raise ValueError(UNACKNOWLEDGED_DETAIL.format(missing=len(missing), sent=len(sent), claim=UNACKNOWLEDGED_CLAIM if claims else ""))
+                if not isinstance(results, list):
+                    reasons = [UNACKNOWLEDGED_NOT_A_LIST]
+                else:
+                    missing, extra = sent - acknowledged, acknowledged - sent
+                    reasons = ([UNACKNOWLEDGED_MISSING.format(count=len(missing), sent=len(sent))] if missing else []) + ([UNACKNOWLEDGED_EXTRA.format(count=len(extra))] if extra else [])
+                if claims and not isinstance(answer.get(ANSWER_DOWNGRADED_KEY), int):
+                    reasons.append(UNACKNOWLEDGED_CLAIM)
+                if reasons:
+                    raise ValueError(UNACKNOWLEDGED_DETAIL.format(reasons=UNACKNOWLEDGED_SEPARATOR.join(reasons)))
             except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as exc:
                 # A batch that carried the claim lost it with its rows, whatever
                 # the rows: the line counts it, since last week's rows for the
@@ -1173,7 +1184,9 @@ def write_record(home: Path, stamp: str, report_md: str, report_json: dict, find
     (run_dir / REPORT_MD_NAME).write_text(report_md, encoding="utf-8")
     (run_dir / REPORT_JSON_NAME).write_text(json.dumps(report_json, indent=1, sort_keys=True), encoding="utf-8")
     (run_dir / FINDINGS_JSON_NAME).write_text(json.dumps(findings_json, indent=1, sort_keys=True), encoding="utf-8")
-    # The two latest files are replaced together, after both are written.
+    # The two latest files are replaced one after the other, after both are
+    # written: no half-written file, and a mixed pair only if this process dies
+    # between the two renames.
     latest = {LATEST_MD_NAME: report_md, LATEST_JSON_NAME: json.dumps(summary_doc, indent=1, sort_keys=True)}
     for name, text in latest.items():
         (home / (name + TMP_SUFFIX)).write_text(text, encoding="utf-8")
@@ -1215,9 +1228,11 @@ def sandbox_copy_program(files: dict[str, str]) -> str:
             "os.chmod(DIR, OPEN)",
             "try:",
             # Both files land beside their names and are renamed over them only
-            # once both are complete, so a reader never sees this week's report
-            # beside last week's summary, or a half-written file; the directory
-            # is closed again whatever happened.
+            # once both are complete, so a reader never meets a half-written
+            # file. The two renames are separate steps: a process that dies
+            # between them, the one gap left, leaves this week's report beside
+            # last week's summary, with the second temporary as its trace. The
+            # directory is closed again whatever happened.
             "    for name, text in FILES.items():",
             "        tmp = os.path.join(DIR, name + TMP)",
             "        if os.path.exists(tmp):",  # a run that failed between the write and the rename

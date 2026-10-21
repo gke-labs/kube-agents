@@ -2503,6 +2503,7 @@ class TestAuditCatalogue(unittest.TestCase):
         # it has no stream in `AUDITS` to pair with. Named here so that adding
         # a second one stays a deliberate act.
         non_audit_prompt_jobs = {"upgrade-readiness-weekly-brief"}
+        self.assertLessEqual(non_audit_prompt_jobs, prompted, "the Saturday brief is on this roster as a prompt job")
         self.assertEqual(non_audit_prompt_jobs & set(audit_report.AUDITS), set())
         self.assertEqual(
             set(audit_report.AUDITS),
