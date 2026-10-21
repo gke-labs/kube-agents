@@ -19,23 +19,23 @@ Noticing that replicas sit in one zone is only the first half of the diagnosis. 
 - Before or after a cluster upgrade, node-pool resize, or incident to verify that multi-replica workloads (`replicas > 1`) are spread across zones.
 - Triaging a workload whose replicas are all in one zone or partially `Pending` across a multi-zonal cluster.
 
-## Step 1: Check Cached Watch Reports or Run `leeway report`
+## Step 1: Run `leeway report`
 
-If a recent daily topology watch report exists on disk at `/opt/data/leeway/reports/<cluster>/latest.json`, read it first to inspect the latest fleet snapshot.
-
-To collect live topology distribution evidence against a cluster from the sandbox, authenticate kubeconfig for the target cluster and run `leeway report` (passing `--kubeconfig` when targeting a named kubeconfig file or `--clusters <project>/<location>/<cluster>` when targeting a GKE cluster identifier, since `--clusters` takes `<project>/<location>/<cluster>` triples rather than kubeconfig context names):
+To collect live topology distribution evidence against a target cluster from the sandbox, pin a per-target `KUBECONFIG` under `$HERMES_HOME/.kubeconfigs/` per `AGENTS.md` (or pass `--clusters <project>/<location>/<cluster>` directly to `leeway report`, since `--clusters` takes `<project>/<location>/<cluster>` triples rather than kubeconfig context names):
 
 ```bash
-gcloud container clusters get-credentials <cluster_name> --location <cluster_location> --project <project_id>
+PROJECT="$GKE_PROJECT_ID"   # CLUSTER and LOCATION come from the request
+export KUBECONFIG="$HERMES_HOME/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
+gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT"
 
-# Scan a specific namespace in the current kubeconfig context:
+# Scan a specific namespace on the target cluster:
 leeway report --namespace <namespace> --format json
 
-# Scan all non-system namespaces in a specific cluster kubeconfig file:
-leeway report --kubeconfig "$HERMES_HOME/.kubeconfigs/<cluster>.yaml" --format json
+# Scan all non-system namespaces on the target cluster:
+leeway report --format json
 
 # Or target a GKE cluster triple directly (invokes gcloud get-credentials under the hood):
-leeway report --clusters <project_id>/<cluster_location>/<cluster_name> --namespace <namespace> --format json
+leeway report --clusters "${PROJECT}/${LOCATION}/${CLUSTER}" --namespace <namespace> --format json
 ```
 
 If `leeway` is not installed in the current sandbox image (`! command -v leeway >/dev/null 2>&1`), collect the equivalent node-zone, pod-placement, controller-constraint, PVC, and scheduler-event evidence directly with read-only `kubectl` commands:

@@ -2,8 +2,9 @@
 
 **Status:** partly built. Steps 1, 2, and 3 of the [order of work](#order-of-work) — slot `d`, its
 three zonal-skew fixtures, and the [`topology-zonal-skew-probe`](../../bench/tasks/topology-zonal-skew-probe/task.yaml)
-eval case — are in `bench/tf/fleet/` and `bench/tasks/` and catalogued in
-[`bench-fleet-catalog.md`](bench-fleet-catalog.md); the rest is plan. It says what the seeded fleet
+eval case — are in `bench/tf/fleet/` and `bench/tasks/` (with the slot `d` fixtures catalogued in
+[`bench-fleet-catalog.md`](bench-fleet-catalog.md) and the eval case in
+[`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)); the rest is plan. It says what the seeded fleet
 must grow for the fleet anomaly-detection checks to be developed test-first, and which of those
 checks the fleet cannot serve at all.
 

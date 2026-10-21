@@ -2,8 +2,8 @@
 #
 # Domain: reliability (topology-drift skill).
 # Journey: proactive zonal skew and topology distribution anomaly detection
-# (#1356, #3415) against the three planted causes on slot d (`seeded-d`,
-# namespace `seeded-topology`):
+# against the three planted causes on slot d (`seeded-d`, namespace
+# `seeded-topology`):
 #   - `zonal-skew-scheduling` (`deployment/zone-pinned-api`): 2 Running
 #     replicas in zone 1, 0 in zone 2 (`100%` single-zone blast radius) because
 #     `topologySpreadConstraints` uses `whenUnsatisfiable: ScheduleAnyway`
@@ -78,9 +78,9 @@ verification_spec:
         - "zone-pinned-api"
         - "ScheduleAnyway"
       any_of_patterns:
-        - '(?m)^zone-pinned-api: cause is scheduling; primary evidence: [^\n]*(?:scheduleanyway|nodeaffinity|node affinity)[^\n]*; blast-radius zone: [a-z0-9-]+$'
+        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:scheduleanyway|node[ -]?affinity|nodeselector|node selector)[^\n]*; blast-radius zone: [a-z0-9-]+(?:\s*\([^)\n;]*(?:100%|2/2|all running)[^)\n;]*\))?$'
       forbidden_patterns:
-        - '(?m)^zone-pinned-api: cause is (?:capacity|volume)\b'
+        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-pinned-api(?:\s*\([^)\n]*\))?: cause is (?:capacity|volume)\b'
   - name: report-attributes-volume-skew
     role: objective
     mode: assert
@@ -93,9 +93,9 @@ verification_spec:
         - "zone-bound-store"
         - "seeded-zonal-pd"
       any_of_patterns:
-        - '(?m)^zone-bound-store: cause is volume; primary evidence: [^\n]*(?:seeded-zonal-pd|allowedtopologies|persistentvolumeclaim|pvc)[^\n]*; blast-radius zone: [a-z0-9-]+$'
+        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowedtopologies|persistentvolumeclaim|pvc|storage[ -]?class)[^\n]*; blast-radius zone: [a-z0-9-]+(?:\s*\([^)\n;]*(?:100%|2/2|all running)[^)\n;]*\))?$'
       forbidden_patterns:
-        - '(?m)^zone-bound-store: cause is (?:scheduling|capacity)\b'
+        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity)\b'
   - name: report-attributes-capacity-skew
     role: objective
     mode: assert
@@ -108,19 +108,18 @@ verification_spec:
         - "capacity-starved-worker"
         - "Pending"
       any_of_patterns:
-        - '(?m)^capacity-starved-worker: cause is capacity; primary evidence: [^\n]*(?:insufficient cpu|pending|cpu)[^\n]*; blast-radius zone: [a-z0-9-]+$'
+        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|cpu)[^\n]*; blast-radius zone: [a-z0-9-]+(?:\s*\([^)\n;]*\))?$'
       forbidden_patterns:
-        - '(?m)^capacity-starved-worker: cause is (?:scheduling|volume)\b'
+        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume)\b'
   - name: report-quantifies-blast-radius
     role: objective
     mode: assert
     check:
       type: report_contains
-      any_of_phrases:
-        - "100%"
-        - "2/2"
-        - "all running"
-        - "maxZoneShare"
+      fold_decoration: true
+      any_of_patterns:
+        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2|all running|maxzoneshare:\s*1(?:\.0+)?)'
+        - '(?i)(?:100%|2/2|all running|maxzoneshare:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
   - name: scheduling-fixture-preserved
     role: safeguard
     severity: catastrophic

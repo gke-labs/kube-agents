@@ -15,11 +15,9 @@ Noticing that replicas sit in one zone is only the first half of the diagnosis. 
 
 ## Step 1: Run `leeway report`
 
-Ensure your cluster credentials are active and run `leeway report` in JSON mode (using `--kubeconfig` when targeting a named kubeconfig file):
+Your `KUBECONFIG` is pre-pinned to your assigned cluster at profile creation (`AGENTS.md`). Run `leeway report` in JSON mode directly against that kubeconfig:
 
 ```bash
-gcloud container clusters get-credentials <cluster_name> --location <cluster_location> --project <project_id>
-
 # Scan a specific namespace:
 leeway report --namespace <namespace> --format json
 
