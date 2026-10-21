@@ -65,6 +65,7 @@ const (
 	usageCounterRemediationsProposed = "remediationsProposedTotal"
 	usageCounterRemediationsMerged   = "remediationsMergedTotal"
 	usageCounterChatMessagesInbound  = "chatMessagesInboundTotal"
+	usageCounterBrokerFailures       = "brokerFailuresTotal"
 	// sessionsTotal is two document counters, because its halves aggregate
 	// differently (usageAggregationFor): the sessions the watcher opens for
 	// triage, read on every gateway replica over the same event stream, and
@@ -90,9 +91,14 @@ var (
 	// samples out.
 	usageGatewayCounters = []string{usageCounterEventsIngested, usageCounterSessionsTriage}
 	usageChatCounters    = []string{usageCounterChatMessagesInbound, usageCounterSessionsChat}
-	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked}
+	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound, usageCounterSessionsTriage, usageCounterSessionsChat, usageCounterToolExecutionsBlocked, usageCounterBrokerFailures}
+	// usageQuietCounters are the counters whose advance is not activity and
+	// leaves LastMoved alone: the broker's failures, which a watcher retrying
+	// an unreachable fleet cluster through the relay produces every poll on
+	// an install nobody is using.
+	usageQuietCounters = map[string]bool{usageCounterBrokerFailures: true}
 	// usageSessionsCounters is the pair that projects to usageStatusFieldSessions.
 	usageSessionsCounters = []string{usageCounterSessionsTriage, usageCounterSessionsChat}
 )
@@ -552,7 +558,7 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 				}
 				if taken && (i == best || c.delta == list[best].delta) {
 					c.entry.Marker = stamp
-					moved = true
+					moved = moved || !usageQuietCounters[counter]
 				}
 			}
 		default:
@@ -562,7 +568,7 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 				}
 				if addUsageTotal(doc, counter, c.delta) {
 					c.entry.Marker = stamp
-					moved = true
+					moved = moved || !usageQuietCounters[counter]
 				}
 			}
 		}

@@ -140,9 +140,15 @@ memory:
 web:
   backend: "ddgs"
 
+# tool_call_audit writes each tool call, with its task, to the profile's
+# logs/audit.jsonl. The fluent-bit sidecar ships that file to Cloud Logging.
+# The credential proxy records a terminal command by tool and verb, and a gke
+# MCP call by server and method. Neither record has the arguments or the task,
+# so this record is the only one that shows what the Cluster Agent ran.
 plugins:
   enabled:
     - hermes_otel
+    - tool_call_audit
 
 # This template is copied verbatim into /opt/cluster-template rather than merged
 # with deploy/shared/defaults/config.yaml, so the probe has to be turned off
