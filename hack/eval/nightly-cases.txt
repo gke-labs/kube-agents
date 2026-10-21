@@ -936,6 +936,12 @@
 # band (900s) until the nightly record measures it.
 ./tasks/gitops-drift-backlog-digest/task.yaml
 
+# Topology drift and zonal skew attribution probe (#1356, #3415): grades
+# root-cause attribution across the three planted zonal-skew roles on slot d
+# (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
+# seeded-topology). deployer: noop, read-only, off the infra lock.
+./tasks/topology-zonal-skew-probe/task.yaml
+
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.

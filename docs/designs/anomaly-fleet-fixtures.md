@@ -1,8 +1,11 @@
 # Seeded-fleet fixtures for the anomaly-detection checks
 
 **Status:** partly built. Steps 1 and 2 of the [order of work](#order-of-work) — slot `d` and its
-three zonal-skew fixtures — are in `bench/tf/fleet/` and catalogued in
-[`bench-fleet-catalog.md`](bench-fleet-catalog.md); the rest is plan. It says what the seeded fleet
+three zonal-skew fixtures — are in `bench/tf/fleet/` (catalogued in
+[`bench-fleet-catalog.md`](bench-fleet-catalog.md)); step 3's
+[`topology-zonal-skew-probe`](../../bench/tasks/topology-zonal-skew-probe/task.yaml) eval case is
+defined in `bench/tasks/` (`validated: false` pending live fleet red/green runs; see
+[`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)); the rest is plan. It says what the seeded fleet
 must grow for the fleet anomaly-detection checks to be developed test-first, and which of those
 checks the fleet cannot serve at all.
 
@@ -152,8 +155,10 @@ gate is a case that fails for the environment rather than the agent.
    [`fleet-fixtures.yaml`](fleet-fixtures.yaml), and the fixture counts in
    [`bench-fleet-catalog.md`](bench-fleet-catalog.md).
 2. Done: the three zonal-skew fixtures on `seeded-d`, their roles, probes and catalogue entries.
-3. The first failing eval case: skew with a stockout cause, asserting the agent names the zone,
-   the cause and the blast radius. Red against `main` before any behaviour changes.
+3. Case defined (`validated: false` pending live fleet red/green validation):
+   [`topology-zonal-skew-probe`](../../bench/tasks/topology-zonal-skew-probe/task.yaml),
+   asserting the agent names the zone, the cause (`scheduling`, `volume`, `capacity`) and the blast
+   radius for all three planted workloads on `seeded-d`.
 4. Tier 1 fixtures and their cases, one at a time, in the same red-then-green order.
 5. Tier 3 project fixtures last: they are the slowest to become assertable and the least
    informative about the checks' hard part, which is attribution.

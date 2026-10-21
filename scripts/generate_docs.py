@@ -144,6 +144,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "fleet-upgrade-verification",
         "gke-reliability",
         "gke-upgrades",
+        "topology-drift",
     ],
     "Manifests and remediation": [
         "gcp-config-connector",
