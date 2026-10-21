@@ -268,12 +268,18 @@ and a manifest you add declares its object, so merging it keeps the object.
 5. **Say what merging will do, from what you read.** Removing the file deletes
    the object only if a reconciler syncs that directory and prunes. Read the
    reconciler objects on the target cluster, and on the hub that deploys to it
-   when your kubeconfig reaches one (Argo CD usually runs on a hub). An answer
-   of `the server doesn't have a resource type` means that reconciler is not
-   installed there. Match each object's source against `<repo>` and the
-   file's directory:
+   when your kubeconfig reaches one (Argo CD usually runs on a hub). Your
+   default context is the cluster this agent runs on, not the target: pin a
+   per-target `KUBECONFIG` and fetch the target's credentials first
+   (**gke-basics**, "Cluster Credentials"), and read there. An answer of
+   `the server doesn't have a resource type` means that reconciler is not
+   installed on the context you read, and on this agent's own cluster it
+   says nothing about the target. Match each object's source against
+   `<repo>` and the file's directory:
 
    ```bash
+   export KUBECONFIG="${HERMES_HOME:-/opt/data}/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"
+   gcloud container clusters get-credentials "$CLUSTER" --location="$LOCATION" --project="$PROJECT" --quiet
    kubectl get applications.argoproj.io -A -o yaml
    kubectl get kustomizations.kustomize.toolkit.fluxcd.io -A -o yaml
    kubectl get rootsyncs.configsync.gke.io -A -o yaml
@@ -312,7 +318,8 @@ and a manifest you add declares its object, so merging it keeps the object.
 
    Name a reconciler in the reply or the pull request body only if you found
    it syncing that directory. When one prunes, syncs, and the object does
-   not opt out, say it will delete the object after merge. Otherwise say: "Merging removes the declaration only. I found
+   not opt out, say it will delete the object after merge. Never write that
+   merging "triggers" a delete you have not read a healthy reconciler for. Otherwise say: "Merging removes the declaration only. I found
    nothing on `<cluster>` that deletes what is removed from `<repo>`, so
    `<kind>/<name>` stays until someone deletes it."
 
