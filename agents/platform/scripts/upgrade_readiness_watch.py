@@ -502,7 +502,8 @@ TABLE_ERRORS_KEY = "table_errors"
 # else; it holds only while the declaration names no container it did not,
 # since a container just gained carries no members when its lookup fails.
 # Saved even when the tick fails (``keep_standing``), at whichever step after
-# a hop filed it, since a failed tick writes nothing else of the ledger: the
+# a hop filed it, since a failed tick writes nothing else of the ledger but the
+# ids it learned: the
 # failure line is keyed on the refused projects and their causes
 # (``refused_tick_signature``), and the hold is what keeps that key the same.
 STANDING_OUTSIDE_KEY = "standing_outside"

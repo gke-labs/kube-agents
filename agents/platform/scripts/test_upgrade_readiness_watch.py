@@ -92,6 +92,7 @@ class FakeSandbox:
         table_timeout_projects: set | None = None,
         aliases: dict | None = None,
         describe_down: set | None = None,
+        scope_declared: bool = False,
     ):
         self.versions = versions
         self.readiness = readiness or versions
@@ -105,6 +106,8 @@ class FakeSandbox:
         self.aliases = aliases or {}
         # Spellings whose `projects describe` is down: the report keys the run by the spelling itself.
         self.describe_down = describe_down or set()
+        # The operator's marker on the sandbox (`sandbox_declares_scope`), set at its start.
+        self.scope_declared = scope_declared
         self.calls: list[tuple[str, list[str], float]] = []
 
     def run(self, argv, *, timeout, check, stdin=None):
@@ -125,12 +128,14 @@ class FakeSandbox:
         if any(p in (self.timeout_projects if wanted else self.table_timeout_projects) for p in asked):
             raise subprocess.TimeoutExpired(argv, timeout)
         flags = {report_argv[i]: report_argv[i + 1] for i, flag in enumerate(report_argv[:-1]) if flag in (fleet_scope_targets.SCOPE_PROJECTS_FLAG, fleet_scope_targets.SCOPE_UNREAD_FLAG)}
-        if flags:
-            # The reporter's own rule decides, from the handed argv (`DeclaredScope.override_error`):
-            # the fake refuses what the script refuses and reads what it reads, so a scoped tick
-            # test cannot stage a read or a refusal the reporter would not make.
+        if flags or self.scope_declared:
+            # The reporter's own rule decides, from the handed argv and the sandbox's marker
+            # (`DeclaredScope.set`, `override_error`): the fake refuses what the script refuses and
+            # reads what it reads, so a scoped tick test cannot stage a read or a refusal the
+            # reporter would not make, a marked sandbox's refusal of the bare flag included.
             scope = fleet_scope_args.DeclaredScope()
-            scope.set(flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG), flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG))
+            with mock.patch.object(fleet_scope_args, "sandbox_declares_scope", return_value=self.scope_declared):
+                scope.set(flags.get(fleet_scope_targets.SCOPE_PROJECTS_FLAG), flags.get(fleet_scope_targets.SCOPE_UNREAD_FLAG))
             # On the id the report resolves, as `get_target_projects` checks it: a number
             # resolves through `projects describe` (the aliases) unless describe is down, when
             # the digits reach the rule, which refuses them.
@@ -1582,6 +1587,24 @@ class DeclaredScope(Base):
         # The report refuses p2 from that argv, so only p1's cluster is pending and the line names the refusal.
         self.assertIn("does not list p2; it lists p1", out)
         self.assertNotIn("p2/us-central1-a/b", json.dumps(self.ledger()))
+
+    def test_a_sandbox_still_marked_after_the_scope_is_gone_refuses_the_bare_flag_through_the_tick(self) -> None:
+        """The fourth refusal, driven through a tick: this pod reads no declaration and hands the
+        bare flag, and the sandbox, marked scoped at its start, refuses it. With a render named and
+        declaring nothing, the remedy is the restart; with no render to read, the run's environment."""
+        render = Path(self.tmp.name) / "scope.json"
+        render.write_text(json.dumps({fleet_scope_targets.RENDER_PRESENT_KEY: False}), encoding="utf-8")
+        for scope_file, remedy in ((str(render), watch.REMEDY_SANDBOX_RESTART), ("", watch.REMEDY_SCOPE_UNSEEN)):
+            with self.subTest(scope_file=scope_file):
+                self.marker().unlink(missing_ok=True)
+                sandbox = FakeSandbox(envelope([]), scope_declared=True)
+                with mock.patch.dict(os.environ, {fleet_scope_targets.SCOPE_FILE_ENV: scope_file}):
+                    code, out = self.run_tick(sandbox)
+                self.assertEqual(code, 0)
+                self.assertEqual([argv for kind, argv, _ in sandbox.calls if kind == "versions"], [[watch.PROJECT_FLAG, "p1"]])
+                self.assertIn("the sandbox says the install declares a scope, but this pod reads no declaration", out)
+                self.assertIn(remedy, out)
+                self.assertEqual(json.loads(self.marker().read_text()), [watch.FAILURE_KEY_REFUSED, [["p1", watch.REFUSAL_SANDBOX]]])
 
     def test_an_all_refused_tick_names_every_refusal_it_is_keyed_on(self) -> None:
         """Every roster project refused, for two causes: the failure line names each
