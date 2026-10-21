@@ -10,6 +10,8 @@ import (
 	"time"
 
 	natsserver "github.com/nats-io/nats-server/v2/server"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // heldHarness is a TASKS stream, a requester and a held subscription on one
@@ -148,7 +150,7 @@ func TestHeldDeliveryIsKeptAlivePastAckWait(t *testing.T) {
 	h, worker := newHeldHarness(t, "beat")
 	var starts atomic.Int32
 	release := make(chan struct{})
-	h.ensure(1, time.Second)
+	h.ensure(1, 3*time.Second)
 	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
 		starts.Add(1)
 		select {
@@ -164,7 +166,7 @@ func TestHeldDeliveryIsKeptAlivePastAckWait(t *testing.T) {
 
 	h.submit("task-long")
 	waitFor(t, 5e9, "the task delivered", func() bool { return starts.Load() == 1 })
-	time.Sleep(3500 * time.Millisecond) // three and a half AckWaits
+	time.Sleep(7 * time.Second) // more than two AckWaits
 	if got := starts.Load(); got != 1 {
 		t.Fatalf("delivered %d times while its holder was alive, want 1", got)
 	}
@@ -306,7 +308,7 @@ func TestHeldDeliveryKeepsTheSessionFilter(t *testing.T) {
 	}
 }
 
-// Stop cancels every running handler's context and waits for them.
+// Stop cancels every running handler's context; Wait waits for them.
 func TestHeldDeliveryStopCancelsHandlers(t *testing.T) {
 	h, worker := newHeldHarness(t, "stop")
 	var started, ended atomic.Int32
@@ -323,8 +325,13 @@ func TestHeldDeliveryStopCancelsHandlers(t *testing.T) {
 	h.submit("task-two")
 	waitFor(t, 5e9, "both tasks held", func() bool { return started.Load() == 2 })
 	sub.Stop()
+	wctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+	defer cancel()
+	if err := sub.Wait(wctx); err != nil {
+		t.Fatalf("Wait after Stop: %v", err)
+	}
 	if n := ended.Load(); n != 2 {
-		t.Errorf("%d handlers returned by the time Stop did, want 2", n)
+		t.Errorf("%d handlers returned by the time Wait did, want 2", n)
 	}
 }
 
@@ -398,7 +405,8 @@ func TestSubscribeHeldLeavesTheConsumerAsTheOperatorMadeIt(t *testing.T) {
 // The bind-only grant set is enough, and nothing more is needed: a worker
 // whose user may only look up the durable, fetch from it and ack binds, takes
 // a task and acks it, and cannot create a consumer. This is the grant the
-// callout's profile narrowing gives a worker on its profile's durable.
+// callout's profile narrowing will give a worker on its profile's durable
+// (a later #3655 pull request; today it grants per-pod ack-none consumers).
 func TestHeldDeliveryWorksWithOnlyTheBindGrants(t *testing.T) {
 	const durable = "profile-perm"
 	allow := func(subjects ...string) *natsserver.SubjectPermission {
@@ -457,5 +465,183 @@ func TestHeldDeliveryWorksWithOnlyTheBindGrants(t *testing.T) {
 		Stream: c.Stream, Durable: c.Durable, FilterSubject: c.Subject, MaxAckPending: 5,
 	}); err == nil {
 		t.Error("a worker holding only the bind grants updated the operator's consumer")
+	}
+}
+
+// Close never waits on a handler, so a handler that publishes on its way out
+// can't hang the process (the publish fails once the connection is closed,
+// which is why a worker drains before it closes).
+func TestCloseDoesNotWaitForAHeldHandler(t *testing.T) {
+	h, worker := newHeldHarness(t, "closing")
+	h.ensure(1, 0)
+	started := make(chan struct{})
+	_, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		close(started)
+		<-ctx.Done()
+		env, _ := NewMessageEnvelope(Party{Session: "closing"}, "task-x", "ctx-x", "corr-x", validMessagePayload())
+		_ = worker.Publish(context.Background(), "a2a.tasks.closing.task-x.events", env)
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	h.submit("task-x")
+	<-started
+	done := make(chan struct{})
+	go func() { worker.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung on a handler that publishes after its context is cancelled")
+	}
+}
+
+// A handler may stop its own subscription without deadlocking on itself.
+func TestStopFromInsideAHeldHandlerReturns(t *testing.T) {
+	h, worker := newHeldHarness(t, "selfstop")
+	h.ensure(1, 0)
+	var sub HeldSubscription
+	ready := make(chan struct{})
+	returned := make(chan struct{})
+	var err error
+	sub, err = worker.SubscribeHeld(h.ctx, h.cfg(), func(_ context.Context, d Delivery) {
+		<-ready
+		sub.Stop()
+		_ = d.Ack()
+		close(returned)
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	close(ready)
+	h.submit("task-self")
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop called from inside a handler did not return")
+	}
+}
+
+// StopIntake drains: the running handler finishes and acks, and nothing new
+// is taken.
+func TestHeldStopIntakeLetsRunningWorkFinish(t *testing.T) {
+	h, worker := newHeldHarness(t, "drain")
+	h.ensure(2, 0)
+	release := make(chan struct{})
+	var started, acked atomic.Int32
+	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		started.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return
+		}
+		if d.Ack() == nil {
+			acked.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	h.submit("task-running")
+	waitFor(t, 5e9, "the first task running", func() bool { return started.Load() == 1 })
+	sub.StopIntake()
+	h.submit("task-late")
+	time.Sleep(500 * time.Millisecond)
+	close(release)
+	wctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+	defer cancel()
+	if err := sub.Wait(wctx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if s, a := started.Load(), acked.Load(); s != 1 || a != 1 {
+		t.Errorf("after StopIntake: %d handler(s) started and %d acked, want 1 and 1 (drained, nothing new taken)", s, a)
+	}
+}
+
+// A held task survives a server restart that outlasts AckWait: the
+// redelivery to this process is adopted by the handler already running it,
+// no second handler starts, and that handler's Ack on the new connection
+// settles it.
+func TestHeldDeliverySurvivesARebuild(t *testing.T) {
+	dir := t.TempDir()
+	s1 := runJetStreamServer(t, -1, dir, nil)
+	port := serverPort(s1)
+	provisionTasksStream(t, clientURL(s1))
+	ctx := testCtx(t)
+	op, err := Connect(ctx, clientURL(s1), WithName("operator"))
+	if err != nil {
+		t.Fatalf("Connect operator: %v", err)
+	}
+	defer op.Close()
+	h := &heldHarness{t: t, ctx: ctx, req: op, profile: "rebuild"}
+	h.ensure(1, 2*time.Second)
+	worker, err := Connect(ctx, clientURL(s1), WithName("worker"),
+		WithNATSOptions(nats.MaxReconnects(-1), nats.ReconnectWait(100*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect worker: %v", err)
+	}
+	defer worker.Close()
+
+	var starts atomic.Int32
+	release := make(chan struct{})
+	ackErr := make(chan error, 1)
+	sub, err := worker.SubscribeHeld(ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		starts.Add(1)
+		select {
+		case <-release:
+			ackErr <- d.Ack()
+		case <-ctx.Done():
+		}
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	defer sub.Stop()
+	h.submit("task-survivor")
+	waitFor(t, 5e9, "the task held", func() bool { return starts.Load() == 1 })
+
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	time.Sleep(3 * time.Second) // longer than AckWait
+	s2 := runJetStreamServer(t, port, dir, nil)
+	t.Cleanup(s2.Shutdown)
+	time.Sleep(6 * time.Second) // reconnect, rebind, and let any redelivery arrive
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("%d handlers started for one task across a rebuild, want 1", n)
+	}
+	close(release)
+	if err := <-ackErr; err != nil {
+		t.Fatalf("Ack after the rebuild: %v", err)
+	}
+	time.Sleep(5 * time.Second) // two AckWaits: an unsettled ack would bring it back
+	if n := starts.Load(); n != 1 {
+		t.Errorf("the task came back after its Ack (%d starts)", n)
+	}
+}
+
+// Binding refuses a durable without the cap this mode depends on, and a
+// session that isn't the intake's addressee.
+func TestSubscribeHeldRefusesADurableItCannotGate(t *testing.T) {
+	h, worker := newHeldHarness(t, "uncapped")
+	h.req.mu.Lock()
+	js := h.req.js
+	h.req.mu.Unlock()
+	c := h.cfg()
+	if _, err := js.CreateOrUpdateConsumer(h.ctx, c.Stream, jetstream.ConsumerConfig{
+		Durable: c.Durable, FilterSubject: c.Subject, AckPolicy: jetstream.AckExplicitPolicy, MaxAckPending: -1,
+	}); err != nil {
+		t.Fatalf("create uncapped consumer: %v", err)
+	}
+	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
+	defer cancel()
+	if _, err := worker.SubscribeHeld(short, c, func(context.Context, Delivery) {}); err == nil ||
+		!strings.Contains(err.Error(), "MaxAckPending") {
+		t.Errorf("bound a durable with no MaxAckPending cap: %v", err)
+	}
+
+	other := h.cfg()
+	other.Session = "some-pod"
+	if _, err := worker.SubscribeHeld(h.ctx, other, func(context.Context, Delivery) {}); err == nil {
+		t.Error("accepted a Session that the session filter would use to drop every task")
 	}
 }

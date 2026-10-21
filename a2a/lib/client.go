@@ -643,7 +643,13 @@ func (s *durableSub) consume(cons jetstream.Consumer) error {
 	s.mu.Lock()
 	old := s.cc
 	s.cc = cc
+	stopped := s.stopped.Load()
 	s.mu.Unlock()
+	if stopped {
+		// A Stop landed while this (re)bind was in flight: it saw the old
+		// context, so this one is nobody's to stop but ours.
+		cc.Stop()
+	}
 	if old != nil {
 		// Usually already dead with its connection; stopping is a no-op then,
 		// and prevents double delivery if a start ever displaces a live one.
@@ -702,6 +708,10 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 // Stop ends the subscription and removes it from the rebuild registry.
 func (s *durableSub) Stop() {
 	s.stopLocal()
+	s.unregister()
+}
+
+func (s *durableSub) unregister() {
 	s.c.mu.Lock()
 	defer s.c.mu.Unlock()
 	for i, sub := range s.c.subs {
@@ -712,16 +722,25 @@ func (s *durableSub) Stop() {
 	}
 }
 
+// stopLocal stops intake and, in the held mode, cancels running handlers. It
+// never waits for a handler: Close calls it under the client lock, and a
+// handler may be the caller.
 func (s *durableSub) stopLocal() {
+	s.stopIntake()
+	if s.held != nil {
+		s.held.cancel()
+	}
+}
+
+// stopIntake stops taking deliveries.
+func (s *durableSub) stopIntake() {
 	s.stopped.Store(true)
+	if s.held != nil {
+		s.held.stopIntake()
+	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.cc != nil {
 		s.cc.Stop()
-	}
-	s.mu.Unlock()
-	if s.held != nil {
-		// After the consume context stops, so no new handler starts while
-		// the running ones are told to wind down.
-		s.held.stop()
 	}
 }
