@@ -49,6 +49,8 @@ const (
 	a2aNATSConfigSuffix  = "-config"
 	a2aCalloutNameSuffix = "-a2a-callout"
 	a2aCalloutKeysSuffix = "-keys"
+	a2aNATSTLSSuffix     = "-tls"
+	a2aNATSCASuffix      = "-ca"
 )
 
 // A2ANATSName is the name of the NATS objects the operator renders for a
@@ -77,6 +79,18 @@ func A2ACalloutKeysSecretName(agentName string) string {
 	return A2ACalloutName(agentName) + a2aCalloutKeysSuffix
 }
 
+// A2ANATSTLSSecretName is the Secret holding the bus's serving certificate
+// and key, which the NATS pod mounts for its client and websocket listeners.
+func A2ANATSTLSSecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSTLSSuffix
+}
+
+// A2ANATSCASecretName is the Secret holding the CA the operator signs the
+// bus's serving certificate with, private key included.
+func A2ANATSCASecretName(agentName string) string {
+	return A2ANATSName(agentName) + a2aNATSCASuffix
+}
+
 // A2ACredentialSecretNames is every Secret the operator renders with a bus
 // credential in it, for a PlatformAgent of that name. It is the set
 // BusCredentialRoutes refuses a user volume for; a Secret added to the bus
@@ -87,6 +101,11 @@ func A2ACredentialSecretNames(agentName string) []string {
 		A2ACredsSecretName(agentName),
 		A2ANATSConfigSecretName(agentName),
 		A2ACalloutKeysSecretName(agentName),
+		// Not passwords, but a key either way: the serving key lets a pod
+		// impersonate the bus to every client, and the CA key lets it mint
+		// a certificate that does the same.
+		A2ANATSTLSSecretName(agentName),
+		A2ANATSCASecretName(agentName),
 	}
 }
 

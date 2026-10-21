@@ -224,6 +224,7 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 		nats.MaxReconnects(-1),
 		nats.Timeout(dialTimeout),
 	}
+	opts = append(opts, TLSOptions()...)
 	opts = append(opts, c.opts.natsOpts...)
 	opts = append(opts,
 		// NR-6: jittered backoff on every reconnection attempt, library-owned

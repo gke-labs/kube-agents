@@ -2066,6 +2066,17 @@ server_name: ` + a2aNATSName(agent) + `
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 
+# TLS on the client listener, required of every connection: the server
+# advertises tls_required, so a client that dials nats:// is told to upgrade
+# and one that cannot verify this certificate is refused. The serving pair is
+# the operator-minted one in the ` + agentv1alpha1.A2ANATSTLSSecretName(agent.Name) + ` Secret,
+# mounted as a directory (platformagent_a2a_tls.go). The monitoring port above
+# stays plain HTTP: it carries health and stats, not payloads or tokens.
+tls {
+  cert_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCertKey + `"
+  key_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSKeyKey + `"
+}
+
 # A ServiceAccount token travels inside the client's CONNECT frame, and the
 # default max_control_line of 4096 bounds that whole frame - measured, the
 # usable room for the token itself is around 3920 bytes once the rest of the
@@ -2277,11 +2288,18 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // (stampSecretEnvHash in reconcileA2A), which moves when its password's value
 // does, within secretEnvReprobeInterval. The provision Job holds no password: it
 // authenticates with its projected bus token (a2aBusTokenVolumeSource).
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
+//
+// The serving certificate's fingerprint is the third input, for the same
+// reason as the conf: nats-server reads its certificate at boot, so a renewed
+// one that the kubelet has already written into the mounted directory is not
+// served until the pod restarts. Until a reloader sends the reload signal
+// instead, a renewal rolls the bus once a year.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
 	}, keys)
-	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion))
+	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
+		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
 }
 
@@ -2351,6 +2369,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
+							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
 							{Name: a2aNATSDataClaim, MountPath: "/data"},
 						},
 						SecurityContext: hardenedSecurityContext(),
@@ -2365,6 +2384,11 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
 							Secret: &corev1.SecretVolumeSource{SecretName: a2aNATSConfigSecretName(agent)},
+						},
+					}, {
+						Name: a2aNATSTLSVolume,
+						VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{SecretName: agentv1alpha1.A2ANATSTLSSecretName(agent.Name)},
 						},
 					}},
 				},
@@ -5035,6 +5059,14 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
 	}
 
+	// Before the config and every client: the server mounts the serving pair
+	// and each client mounts the bundle, and a pod started against a Secret
+	// or ConfigMap that does not exist yet waits in ContainerCreating.
+	natsTLS, err := r.ensureA2ANATSTLS(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure A2A NATS TLS: %w", err)
+	}
+
 	// The identity map before the server that will be authorizing against
 	// it: the callout refuses connections until it is serving a map, so
 	// rendering the map first shortens the window in which a restarting bus
@@ -5066,7 +5098,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys))
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 		return state, err
 	}
@@ -6100,6 +6132,13 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// wait this reconcile has no reason to block on.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// The TLS material goes with the bus, unlike the creds Secret: a CA
+		// reissued on the next flip to next costs nothing, since every client
+		// is re-rendered with the new bundle in the same pass, while a CA key
+		// left behind is a signing key for a bus that no longer exists.
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSCASecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}}, r.Client},
 		// ResourceQuota is not a watched kind, so the read goes through
 		// a2aReader like the Secrets. Deleting it here is safe even with
 		// session pods still draining (see the function comment): a quota
