@@ -101,6 +101,8 @@ def _ledger_flagged(command: str) -> bool:
         "./skills/fleet-audit/scripts/collect.py compliance-audit --workspace w",
         f'python3 "{COLLECT}" compliance-audit',
         f'bash -c "python3 {COLLECT} compliance-audit"',
+        f"! (test -f /opt/data/scratch/m.json) && python3 {COLLECT} compliance-audit",
+        f"! A |& B && python3 {COLLECT} compliance-audit",
     ],
 )
 def test_collector_run_is_credited(command):
@@ -132,8 +134,11 @@ def test_collector_run_is_credited(command):
         f"time ! {COLLECT} compliance-audit",
         f"! (python3 {COLLECT} compliance-audit)",
         f"! cat scope.json | python3 {COLLECT} compliance-audit",
+        f"! cat scope.json |& python3 {COLLECT} compliance-audit",
         f"setsid -f python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
         f"sudo -b python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
+        f"sudo -h box -b python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
+        f"sudo -r role -b python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
     ],
 )
 def test_mention_help_or_other_script_is_not_credited(command):

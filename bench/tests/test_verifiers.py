@@ -8542,11 +8542,28 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["python3", "f.py", "--readiness"], False),
         (["echo", "DONE"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("! (test -f /x) && python3 f.py --readiness") == [
+        (["test", "-f", "/x"], False),
+        (["python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("! cat scope.json | python3 f.py --readiness") == [
         (["!", "cat", "scope.json"], False),
         (["python3", "f.py", "--readiness"], False),
     ]
+    assert _shell_argvs_with_exit_propagation("! cat scope.json |& python3 f.py --readiness") == [
+        (["!", "cat", "scope.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! cat scope.json |&\npython3 f.py --readiness") == [
+        (["!", "cat", "scope.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
     assert _shell_argvs_with_exit_propagation("! A | B && python3 f.py --readiness") == [
+        (["!", "A"], False),
+        (["B"], False),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("! A |& B && python3 f.py --readiness") == [
         (["!", "A"], False),
         (["B"], False),
         (["python3", "f.py", "--readiness"], True),
@@ -8562,6 +8579,12 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     ]
     assert _shell_argvs_with_exit_propagation("sudo -u hermes -b python3 f.py --readiness") == [
         (["sudo", "-u", "hermes", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -h box -b python3 f.py --readiness") == [
+        (["sudo", "-h", "box", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -r role -b python3 f.py --readiness") == [
+        (["sudo", "-r", "role", "-b", "python3", "f.py", "--readiness"], False),
     ]
     assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
         (["sudo", "python3", "f.py", "--readiness"], True),

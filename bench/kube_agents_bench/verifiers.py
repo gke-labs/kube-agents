@@ -2638,7 +2638,7 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                 if w in ("-b", "--background") or (w.startswith("-") and not w.startswith("--") and "b" in w[1:]):
                     return True
                 if w.startswith("-"):
-                    prev_opt_takes_val = w in ("-u", "-g", "-p", "-C", "-D", "-R", "-T", "-U")
+                    prev_opt_takes_val = w in ("-u", "-g", "-p", "-C", "-D", "-R", "-T", "-U", "-h", "-r")
                     continue
                 if not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
                     if prev_opt_takes_val:
@@ -2678,7 +2678,7 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
                     argv = []
                     current_ops = [op_str]
             else:
-                if op_str == _SHELL_LINE_END and current_ops and current_ops[-1] in ("&&", "||", "|"):
+                if op_str == _SHELL_LINE_END and current_ops and current_ops[-1] in ("&&", "||", "|", "|&"):
                     continue
                 current_ops.append(op_str)
             continue
@@ -2707,7 +2707,7 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
             while pipeline_start_idx > 0:
                 prev_ops = ops_after[pipeline_start_idx - 1]
                 connective_ops = [op for op in prev_ops if op not in ("(", ")")]
-                if connective_ops == ["|"]:
+                if connective_ops in (["|"], ["|&"]):
                     pipeline_start_idx -= 1
                 else:
                     break
@@ -2718,7 +2718,7 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
             depth = 0
             min_depth = 0
             depth0_resolved = False
-            preceding_groups = [*ops_after[:i], leading_ops] if leading_ops else ops_after[:i]
+            preceding_groups = [leading_ops, *ops_after[:i]] if leading_ops else ops_after[:i]
             for prev_ops in reversed(preceding_groups):
                 for op in reversed(prev_ops):
                     if op == ")":
