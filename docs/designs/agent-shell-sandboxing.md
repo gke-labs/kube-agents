@@ -1991,8 +1991,8 @@ build fails if anything under it is not owned by root or is writable by group or
 
 #### Cron scripts stay in the agent pod and reach into the sandbox from there
 
-A `no_agent` cron job — one carrying a `script` rather than a `prompt` — is unaffected
-by the terminal backend. The scheduler's `_run_job_script` resolves the script against
+A cron job's `script` — the whole of a `no_agent` job, or a prompt job's pre-run step — is
+unaffected by the terminal backend. The scheduler's `_run_job_script` resolves the script against
 `HERMES_HOME/scripts`, rejects anything resolving outside it, picks `/bin/bash` or
 `sys.executable` by extension, and calls `subprocess.run` with an environment from
 `build_subprocess_env` — imported from `tools.environments.local`, hardcoded. There is

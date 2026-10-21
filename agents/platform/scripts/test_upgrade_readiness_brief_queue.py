@@ -164,6 +164,7 @@ class TheBriefEntry(unittest.TestCase):
         self.assertIn("platform_control", servers)
         self.assertEqual({t.removeprefix("mcp-") for t in toolsets} & servers, set())
         self.assertNotIn("hermes-cli", toolsets, "the composite toolset carries delegate_task and the kanban tools")
+        self.assertNotIn("file", toolsets, "write_file and patch are not held to the risk: high command policy")
 
 
 if __name__ == "__main__":

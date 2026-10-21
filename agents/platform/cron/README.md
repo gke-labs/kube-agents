@@ -22,7 +22,7 @@ that store which runs `hermes cron tick` against every named profile with work d
 [`autonomous-watchdogs.md`](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md)).
 
 An enabled entry here therefore fires in its own process, with this profile's
-persona, toolsets, `skills`, `model` and `max_turns` — which is the whole reason
+persona, toolsets (unless the entry's `enabled_toolsets` replaces them), `skills`, `model` and `max_turns` — which is the whole reason
 the watchdogs live here rather than as kanban cards filed from the Chat Agent's
 roster. A card is not a cron run, and that indirection is what stopped `skills`,
 `model` and `deliver` reaching the thing that ran.
@@ -353,9 +353,10 @@ quiet one in three lines. If the review's summary is missing or older than two d
 did not run, the hour cut it short, or its copy did not land), the brief says so in its headline and
 composes **Decide now** from the queue alone. The entry declares `risk: high`: a prompt job over
 tenant-written names, so its terminal is held to read-only inspection commands. For the same
-reason the turn holds no queue tool: the entry's `enabled_toolsets` gives it the file and terminal
-tools and no MCP server (`no_mcp`), so nothing a name says can make it register or decide a
-finding through `platform_control`. The queue reads are made before the turn by the entry's
+reason the turn holds no queue tool and no file-writing tool: the entry's `enabled_toolsets` gives
+it the terminal tool alone and no MCP server (`no_mcp`), so nothing a name says can make it
+register or decide a finding through `platform_control`, or write a file the command policy would
+refuse. The queue reads are made before the turn by the entry's
 pre-run `script`, `upgrade_readiness_brief_queue.py`, whose JSON the scheduler puts above the
 prompt; a queue it cannot read is said there, and the brief says so in its headline. The `deliver: "chat"` relay posts it as written and stores it against the
 thread, so a reply with an id and `dismiss`, `snooze until <date>` or `accept` reaches the agent
