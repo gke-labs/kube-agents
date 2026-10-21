@@ -147,10 +147,15 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
     def test_the_namespace_the_run_used_wins_over_install_env(self):
         applied = {"SLACK_STEPS_SLACK_ENABLED": "true", "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
                    "SLACK_STEPS_HOME_CHANNEL": "", "SLACK_STEPS_NAMESPACE": "custom-ns"}
-        out = self._run(self._env(mode="today"), {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"})
+        out = self._run(self._env(mode="today") + "NAMESPACE=file-ns\n",
+                        {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"})
         self.assertIn("-n custom-ns -- hermes pairing approve slack", out)
-        out = self._run(self._env(mode="next"), {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "next"})
+        out = self._run(self._env(mode="next") + "NAMESPACE=file-ns\n",
+                        {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "next"})
         self.assertIn("-c gateway -n custom-ns", out)
+        out = self._run(self._env(mode="today") + "NAMESPACE=file-ns\n",
+                        {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today", "SLACK_STEPS_NAMESPACE": ""})
+        self.assertIn("-n file-ns -- hermes pairing approve slack", out)
 
     def test_next_with_google_chat_keeps_slack_on_the_today_steps(self):
         self._assert_today(self._run(self._env(mode="next", gchat=True)))
@@ -351,11 +356,12 @@ class GchatStepsFollowTheModeTest(unittest.TestCase):
         self.assertNotIn('bash "${repo_dir}/scripts/installer/print_instructions_', source)
 
     def test_the_namespace_the_run_used_wins_over_install_env(self):
-        out = self._run(self._env(mode="today"), {"GCHAT_STEPS_PLATFORM_AGENT_MODE": "today",
-                                                  "GCHAT_STEPS_GOOGLE_CHAT_ENABLED": "true",
-                                                  "GCHAT_STEPS_TOPIC_NAME": "t", "GCHAT_STEPS_SUB_NAME": "t-sub",
-                                                  "GCHAT_STEPS_NAMESPACE": "custom-ns"})
+        applied = {"GCHAT_STEPS_PLATFORM_AGENT_MODE": "today", "GCHAT_STEPS_GOOGLE_CHAT_ENABLED": "true",
+                   "GCHAT_STEPS_TOPIC_NAME": "t", "GCHAT_STEPS_SUB_NAME": "t-sub", "GCHAT_STEPS_NAMESPACE": "custom-ns"}
+        out = self._run(self._env(mode="today") + "NAMESPACE=file-ns\n", applied)
         self.assertIn("-n custom-ns -- hermes pairing approve google_chat", out)
+        out = self._run(self._env(mode="today") + "NAMESPACE=file-ns\n", {**applied, "GCHAT_STEPS_NAMESPACE": ""})
+        self.assertIn("-n file-ns -- hermes pairing approve google_chat", out)
 
     def test_an_empty_subscription_name_is_the_one_the_generator_derives(self):
         # What install.env holds after the Day-2 menu turned Google Chat on.

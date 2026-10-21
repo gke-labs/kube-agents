@@ -2577,8 +2577,8 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         base = (f'{_SOURCE_INSTALLER_COMMON}\nPROJECT_ID="test-proj"\nCLUSTER_NAME="test-cluster"\n'
                 'INSTALL_ENV_FILE="/tmp/test/install.env"\n')
         ghes = 'GITOPS_HOST=ghe.example.com GITOPS_CA_SECRET=ghe-ca\n'
-        gchat = "bash /tmp/test-repo/scripts/installer/print_instructions_gchat.sh"
-        slack = "bash /tmp/test-repo/scripts/installer/print_instructions_slack.sh"
+        gchat = "KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash /tmp/test-repo/scripts/installer/print_instructions_gchat.sh"
+        slack = "KUBE_AGENTS_INSTALL_ENV=/tmp/test/install.env bash /tmp/test-repo/scripts/installer/print_instructions_slack.sh"
         for keys, step, shown in (
             ("GOOGLE_CHAT_ENABLED=yes SLACK_ENABLED=false\n", "4.", (gchat,)),
             ("GOOGLE_CHAT_ENABLED=true SLACK_ENABLED=true\n" + ghes, "5.", (gchat, slack)),

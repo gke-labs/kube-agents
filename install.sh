@@ -3938,12 +3938,15 @@ print_generate_only_handoff() {
 
 # The commands that print the chat setup checklist for each chat platform
 # install.env turns on, for a route that ends before the apply: $1 repo_dir.
+# They name this run's install.env, which need not be the checkout's.
 print_chat_checklist_commands() {
+  local env_file
+  env_file="$(printf '%q' "$INSTALL_ENV_FILE")"
   if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
-    echo -e "    bash ${1}/scripts/installer/print_instructions_gchat.sh"
+    echo -e "    KUBE_AGENTS_INSTALL_ENV=${env_file} bash ${1}/scripts/installer/print_instructions_gchat.sh"
   fi
   if is_truthy "${SLACK_ENABLED:-}"; then
-    echo -e "    bash ${1}/scripts/installer/print_instructions_slack.sh"
+    echo -e "    KUBE_AGENTS_INSTALL_ENV=${env_file} bash ${1}/scripts/installer/print_instructions_slack.sh"
   fi
   return 0
 }
