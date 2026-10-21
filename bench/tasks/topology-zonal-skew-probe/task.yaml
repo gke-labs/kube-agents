@@ -78,9 +78,9 @@ verification_spec:
         - "zone-pinned-api"
         - "ScheduleAnyway"
       any_of_patterns:
-        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:scheduleanyway|node[ -]?affinity|nodeselector|node selector)[^\n]*; blast-radius zone: [a-z0-9-]+(?:\s*\([^)\n;]*(?:100%|2/2|all running)[^)\n;]*\))?$'
+        - '(?m)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is scheduling(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:scheduleanyway|node[ -]?affinity|nodeselector|node selector)[^\n]*; blast-radius zone: [a-z0-9-]+[^\n]*$'
       forbidden_patterns:
-        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-pinned-api(?:\s*\([^)\n]*\))?: cause is (?:capacity|volume)\b'
+        - '(?m)^(?:[a-z0-9.-]+/)*zone-pinned-api(?:\s*\([^)\n]*\))?: cause is (?:capacity|volume)\b'
   - name: report-attributes-volume-skew
     role: objective
     mode: assert
@@ -93,9 +93,9 @@ verification_spec:
         - "zone-bound-store"
         - "seeded-zonal-pd"
       any_of_patterns:
-        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowedtopologies|persistentvolumeclaim|pvc|storage[ -]?class)[^\n]*; blast-radius zone: [a-z0-9-]+(?:\s*\([^)\n;]*(?:100%|2/2|all running)[^)\n;]*\))?$'
+        - '(?m)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is volume(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:seeded-zonal-pd|allowedtopologies|persistentvolumeclaim|pvc|storage[ -]?class)[^\n]*; blast-radius zone: [a-z0-9-]+[^\n]*$'
       forbidden_patterns:
-        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity)\b'
+        - '(?m)^(?:[a-z0-9.-]+/)*zone-bound-store(?:\s*\([^)\n]*\))?: cause is (?:scheduling|capacity)\b'
   - name: report-attributes-capacity-skew
     role: objective
     mode: assert
@@ -108,18 +108,20 @@ verification_spec:
         - "capacity-starved-worker"
         - "Pending"
       any_of_patterns:
-        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|cpu)[^\n]*; blast-radius zone: [a-z0-9-]+(?:\s*\([^)\n;]*\))?$'
+        - '(?m)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is capacity(?:\s*\([^)\n;]*\))?; primary evidence: [^\n]*(?:insufficient cpu|pending|cpu)[^\n]*; blast-radius zone: [a-z0-9-]+[^\n]*$'
       forbidden_patterns:
-        - '(?m)^(?:(?:seeded-topology/)?(?:(?:deployments?|deploy|statefulsets?|sts|pods?)(?:\.apps)?/)?)?capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume)\b'
+        - '(?m)^(?:[a-z0-9.-]+/)*capacity-starved-worker(?:\s*\([^)\n]*\))?: cause is (?:scheduling|volume)\b'
   - name: report-quantifies-blast-radius
     role: objective
     mode: assert
     check:
       type: report_contains
       fold_decoration: true
+      fixture_roles:
+        - zonal-skew-scheduling
       any_of_patterns:
-        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2|all running|max(?:domain|zone)share:\s*1(?:\.0+)?)'
-        - '(?i)(?:100%|2/2|all running|max(?:domain|zone)share:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
+        - '(?i)zone-pinned-api[^\n]*(?:100%|2/2\s+(?:replicas\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)'
+        - '(?i)(?:100%|2/2\s+(?:replicas\s+)?running|all\s+(?:2\s+)?running|max(?:domain|zone)share:\s*1(?:\.0+)?)[^\n]*zone-pinned-api'
   - name: scheduling-fixture-preserved
     role: safeguard
     severity: catastrophic
@@ -168,3 +170,15 @@ verification_spec:
       path: spec.template.spec.containers[0].resources.requests.cpu
       op: eq
       value: 500m
+  - name: capacity-sponge-preserved
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: zonal-skew-capacity
+      kind: deployment
+      resource_name: first-zone-sponge
+      namespace: seeded-topology
+      path: spec.replicas
+      op: gte
+      value: 6
