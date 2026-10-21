@@ -8,8 +8,8 @@ week, said once, in plain words. It changes nothing: it registers no finding, de
 user's behalf, and upgrades nothing.
 
 **Data sources:** the review's copy in the sandbox, `/opt/data/upgrade-readiness/weekly/latest.json`
-and `latest.md`, and the findings queue through `get_ranked_findings` and `get_findings`. Nothing
-else is read, and nothing is run.
+and `latest.md`, and the findings queue as this job's pre-run script reads it (on request, through
+`get_ranked_findings` and `get_findings`). Nothing else is read, and nothing is run.
 
 **Cron id:** `upgrade-readiness-weekly-brief` — `0 7 * * 6` (Saturdays, 07:00 UTC), an hour after
 `upgrade-readiness-weekly-review` starts. The review grades every cluster in scope and registers what
@@ -58,21 +58,32 @@ shape; the model chooses the emphasis.
 
 ### 2. Read the queue
 
-Two `platform_control` tools, because the queue's open backlog and its decided rows are read
-differently; keep from both only the rows whose `check` starts with `upgrade-` (every row the
-review registers carries that prefix; `source` is `upgrade-readiness`). The queue is the authority on
-**state**: the summary says what was found, the queue says what the user has decided.
+The queue is the authority on **state**: the summary says what was found, the queue says what the
+user has decided. Only the rows whose `check` starts with `upgrade-` count (every row the review
+registers carries that prefix; `source` is `upgrade-readiness`).
 
-- `get_ranked_findings` returns the open backlog, worst first: **undecided** rows (`state` is
-  `queued` or `surfaced`), which still need the user, and `accepted` ones (being worked on).
-- `get_findings` with `state=snoozed`, then with `state=dismissed`, returns the other decided rows:
-  snoozed (back on `snoozed_until`) and dismissed (won't fix; the review will keep finding it and
-  the queue will keep it silent). The open backlog never carries them. Call it with `limit=1000`
-  and `project=<id>` for each project in the summary's `projects`: the default page is 200 rows
-  across every source, which a mature install exceeds. A page of exactly 1000 rows is cut; say
-  "at least" before that count.
+- The open backlog, worst first, holds the **undecided** rows (`state` is `queued` or `surfaced`),
+  which still need the user, and the `accepted` ones (being worked on).
+- The decided rows the backlog never carries are read by state, per project: snoozed (back on
+  `snoozed_until`) and dismissed (won't fix; the review will keep finding it and the queue will
+  keep it silent). One page holds at most 1000 rows, so a page of exactly 1000 is cut; say "at
+  least" before that count.
 - A row in the summary with outcome `suppressed` is a dismissed finding seen again. Never name it
   as new.
+
+On the Saturday run the reads are already made. The job's pre-run script
+(`upgrade_readiness_brief_queue.py`) reads the queue before your turn starts, and its JSON is above
+the prompt under **Script Output**: `open` is the open backlog, `snoozed` and `dismissed` are the
+decided rows of each project in `projects`, all of them `upgrade-` rows, and `cut` names each page
+that came back full. This turn holds no `platform_control` tool, so it cannot read the queue
+again. When the output carries `error`, or the scheduler reports a script error, say in the
+headline that the queue was not read, and compose from the summary alone, without **Decided
+earlier**.
+
+On request, make the reads yourself with two `platform_control` tools: `get_ranked_findings` for
+the open backlog, and `get_findings` with `state=snoozed`, then with `state=dismissed`, each with
+`limit=1000` and `project=<id>` for each project in the summary's `projects` (the default page is
+200 rows across every source, which a mature install exceeds).
 
 ### 3. Compose the brief
 

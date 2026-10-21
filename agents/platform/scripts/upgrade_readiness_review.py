@@ -396,13 +396,15 @@ def kv_endpoint() -> str:
     return (os.environ.get(KV_ENDPOINT_ENV) or DEFAULT_KV_ENDPOINT).rstrip("/")
 
 
-def kv_request(path: str, body: dict) -> dict:
-    data = json.dumps(body).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
+def kv_request(path: str, body: dict | None = None) -> dict:
+    """POST ``body`` to the queue, or GET ``path`` when there is no body."""
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    headers = {} if body is None else {"Content-Type": "application/json"}
     token = (os.environ.get(KV_AUTH_VARIABLE) or "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(f"{kv_endpoint()}{path}", data=data, headers=headers, method="POST")
+    method = "GET" if body is None else "POST"
+    req = urllib.request.Request(f"{kv_endpoint()}{path}", data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=KV_TIMEOUT_SECONDS) as resp:
             answer = json.loads(resp.read().decode("utf-8"))

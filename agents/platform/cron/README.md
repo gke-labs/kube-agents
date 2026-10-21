@@ -336,9 +336,9 @@ on the next clean run. The entry declares `risk: high` as the watch does: the bu
 budget) is the model turn, and the reason the pair is not one job: the review can rank by rubric
 but cannot tell that two criticals on one cluster are one problem, or that a critical whose clock
 ends next week outranks one with no date. Its SOP (`governance/upgrade_readiness_brief_sop.md`) has it
-read the review's summary, the queue's open backlog (`get_ranked_findings`, the rows whose `check`
-starts with `upgrade-`) and its snoozed and dismissed rows (`get_findings` by state, which the
-backlog never carries), and compose a brief of at most twenty-five lines: the week's headline, the
+read the review's summary, the queue's open backlog (the rows whose `check` starts with `upgrade-`)
+and its snoozed and dismissed rows (read by state, since the backlog never carries them), and
+compose a brief of at most twenty-five lines: the week's headline, the
 undecided criticals that need a decision (one line per cluster, at most ten, with one clause of
 why and one action each), the rest of the week as counts, what was decided earlier, any project the review could not
 read, and where the full report is with the sentence that opens it in chat. It never registers,
@@ -346,8 +346,12 @@ never decides, never runs the report, and is never `[SILENT]`: the brief is owed
 quiet one in three lines. If the review's summary is missing or older than two days (the review
 did not run, the hour cut it short, or its copy did not land), the brief says so in its headline and
 composes **Decide now** from the queue alone. The entry declares `risk: high`: a prompt job over
-tenant-written names, so its terminal is held to read-only inspection commands, and it needs
-nothing else. The `deliver: "chat"` relay posts it as written and stores it against the
+tenant-written names, so its terminal is held to read-only inspection commands. For the same
+reason the turn holds no queue tool: the entry's `enabled_toolsets` gives it the file and terminal
+tools and no MCP server (`no_mcp`), so nothing a name says can make it register or decide a
+finding through `platform_control`. The queue reads are made before the turn by the entry's
+pre-run `script`, `upgrade_readiness_brief_queue.py`, whose JSON the scheduler puts above the
+prompt; a queue it cannot read is said there, and the brief says so in its headline. The `deliver: "chat"` relay posts it as written and stores it against the
 thread, so a reply with an id and `dismiss`, `snooze until <date>` or `accept` reaches the agent
 with the brief attached.
 
