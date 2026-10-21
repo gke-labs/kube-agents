@@ -981,6 +981,13 @@
 # closed. Its first nightly is its first observation outside a dev install.
 ./tasks/gitops-drift-load-bearing-change-triage/task.yaml
 
+# Twenty image-pull Warnings at once: every alert the daemon admits gets a
+# Hermes gateway session, graded by the triage_starts check on the session
+# store (#3583). A tofu stack on the infra lock that plants in its own
+# namespace on the install's cluster; needs the Warning alert limit off, which
+# hack/ci-deploy.sh sets. Each repetition files twenty triage cards.
+./tasks/triage-start-burst/task.yaml
+
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
