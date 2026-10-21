@@ -219,6 +219,11 @@ class TheMapping(unittest.TestCase):
         )
         readme = Path(__file__).resolve().parents[1] / "cron" / "README.md"
         skill = Path(__file__).resolve().parents[1] / "skills" / "upgrade-readiness-brief" / "SKILL.md"
+        by_entry = {entry: review.severity_of({"rubric": review.rubric(v)}) for entry, v in review.ENTRY_RISK_RUBRIC.items()}
+        self.assertEqual(review.severity_of({"rubric": review.rubric(review.DEFAULT_RISK_RUBRIC)}), "major")
+        self.assertEqual(set(by_entry.values()), {"minor", "major"})
+        minors = [str(entry) for entry in sorted(by_entry) if by_entry[entry] == "minor"]
+        split = f"its risk is minor for catalogue entries {', '.join(minors[:-1])} and {minors[-1]} and major for every other entry"
         for document in (SOP, readme, skill):
             text = " ".join(document.read_text(encoding="utf-8").split())
             critical, rest = text.split("are critical", 1)
@@ -231,9 +236,10 @@ class TheMapping(unittest.TestCase):
             self.assertIn("at the ceiling", major[-240:], document.name)
             self.assertIn("matches today", major[-240:], document.name)
             self.assertIn("covering exclusion", minor[-80:], document.name)
-            # The eighth kind, a readiness rule's blocker, and the risk rule beside it.
+            # The eighth kind, a readiness rule's blocker, and the split of its risks by entry:
+            # the worker on the live route cannot read the script's table, so the prose carries it.
             self.assertIn("blocker is critical", text, document.name)
-            self.assertIn("risk takes the severity", text, document.name)
+            self.assertIn(split, text, document.name)
 
     def test_the_rubric_table_covers_the_queue_anchors(self):
         for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:

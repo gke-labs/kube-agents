@@ -62,7 +62,8 @@ queue refused, or whose sandbox copy failed, prints one line for each, since
 both leave the week where the brief cannot act on it; a run that fails prints
 one line saying so, once per distinct failure, and the next clean run prints
 the recovery line; the exit is 0 throughout, and 1 only when the record could
-not be written. ``--dry-run`` runs the
+not be written, a failure said every time it happens, since the marker that
+holds a failure back sits beside the record it could not write. ``--dry-run`` runs the
 reports and prints the summary without registering or writing anything.
 
 ``UPGRADE_READINESS_PROJECTS``, ``UPGRADE_READINESS_WATCH_HOME``,

@@ -317,8 +317,8 @@ what it registered. The queue's identity rule makes next Saturday's run an updat
 its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
 webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
 and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
-readiness rule's blocker is critical, and its risk takes the severity the rubric gives its
-catalogue entry); a row
+readiness rule's blocker is critical, and its risk is minor for catalogue entries 9, 10, 11, 13 and 16 and major for every other entry, as the rubric's
+entry table sets it); a row
 the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
 family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week
@@ -326,7 +326,10 @@ no longer reports loses confidence and stops being reminded without touching ano
 on that cluster, or the `upgrade-` rows another writer filed there. Three kinds of cluster claim nothing: one
 with more findings than one batch holds (500), sent in pieces; two of one name in one project, whose
 claims the queue could not tell apart; and one with a row the queue would refuse, since the claim
-would book that finding's row absent. On an install with no declared scope, a roster that names one
+would book that finding's row absent. A cluster with no upgrade target (no release channel, or a
+server config that did not answer) is never read in full, since the grader cannot judge its pools'
+skew, so it claims nothing either: a budget or webhook row there that is fixed stays on the queue
+until the user decides it. On an install with no declared scope, a roster that names one
 project both by number and by id runs it twice until the daily watch has learned the number's id,
 and on a Saturday `gcloud projects describe` fails, the number's run is booked as a project not
 read; name the project by its id alone to avoid both. The script writes the technical report under `upgrade-readiness/weekly/` beside the
