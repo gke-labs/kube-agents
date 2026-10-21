@@ -91,6 +91,9 @@ resource "null_resource" "burst" {
   triggers = {
     # Destroy-time provisioners may read only `self`.
     namespace     = local.ns
+    agent_ns      = var.agent_namespace
+    agent_deploy  = var.agent_deployment
+    cli_container = var.agent_cli_container
     host_cluster  = var.host_cluster_name
     host_location = var.host_cluster_location
     host_project  = var.project_id
@@ -248,6 +251,14 @@ resource "null_resource" "burst" {
 
       gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
         --location "${self.triggers.host_location}" --project "$project" --quiet
+
+      # The burst's triage cards run on for minutes after the check, and the
+      # next case would share the gateway with them: archive the unfinished
+      # ones. Best effort; the namespace delete below runs either way.
+      kubectl exec -n "${self.triggers.agent_ns}" "deployment/${self.triggers.agent_deploy}" \
+        -c "${self.triggers.cli_container}" -- sh -c \
+        'for t in $(hermes kanban list 2>/dev/null | grep "${self.triggers.namespace}/" | grep -E " (todo|ready|running|triage) " | grep -o "t_[0-9a-f]*"); do hermes kanban reclaim "$t" >/dev/null 2>&1; hermes kanban archive "$t" >/dev/null 2>&1; done' \
+        || echo "Could not archive the burst's cards; they finish on their own." >&2
 
       kubectl delete namespace "${self.triggers.namespace}" --ignore-not-found --wait=false
     EOT

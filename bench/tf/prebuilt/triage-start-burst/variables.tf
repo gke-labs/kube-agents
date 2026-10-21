@@ -103,6 +103,12 @@ variable "fire_wait_seconds" {
   default     = 300
 }
 
+variable "agent_cli_container" {
+  type        = string
+  description = "Container inside agent_deployment that carries the hermes CLI, for archiving the burst's cards at destroy"
+  default     = "platform-agent"
+}
+
 variable "start_settle_seconds" {
   type        = number
   description = "Seconds to wait after the last fire, so the daemon's triage starts can finish before the agent turn"
