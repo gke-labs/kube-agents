@@ -63,7 +63,12 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      any_of_phrases: ["Decide now", "decide now", "DECIDE NOW"]
+      fold_decoration: true
+      any_of_patterns:
+        # The section's label on a line of its own, as the stops below are
+        # anchored: the phrase inside a sentence ("nothing you must decide now")
+        # is not the section.
+        - "(?im)^decide now"
   - name: the-decide-now-section-names-the-singleton-budget-on-slot-b
     role: objective
     mode: assert
@@ -77,7 +82,7 @@ verification_spec:
         # is, so a budget named only under "Also this week" is not a pass. The
         # block's end is the next label, not a character count: ten lines of
         # three ids each run past any count a short brief would suggest.
-        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?pinned-batch-runner"
+        - "(?ism)^decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?pinned-batch-runner"
       required_phrases: ["pinned-batch-runner"]
   - name: the-webhook-outage-is-not-a-decision
     role: objective
@@ -90,8 +95,8 @@ verification_spec:
         # webhook's name under "Also this week" is where the SOP puts it, not a hit.
         # The harness strips emphasis marks before matching and, with
         # fold_decoration, a bullet, heading or indent in front of a label, so
-        # the labels are anchored on their line start.
-        - "(?is)decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?seeded-fail-closed-gate"
+        # the labels, the opening one included, are anchored on their line start.
+        - "(?ism)^decide now(?:(?!\\nalso this week|\\ndecided earlier|\\nnot read this week|\\nfull report:).)*?seeded-fail-closed-gate"
   - name: the-brief-says-where-the-full-report-is-and-how-to-open-it
     role: objective
     mode: assert

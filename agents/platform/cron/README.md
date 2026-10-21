@@ -310,7 +310,9 @@ uses. Each project is registered as soon as its run returns, so a run the hour c
 what it registered. The queue's identity rule makes next Saturday's run an update of the same row;
 its rubric sets the severity (a budget over a single replica, a pool past the skew ceiling and a
 webhook in the upgrade's path are critical; a budget over several replicas, a pool at the ceiling
-and a webhook refusing only what it matches today are major; a covering exclusion is minor); a row
+and a webhook refusing only what it matches today are major; a covering exclusion is minor; a
+readiness rule's blocker is critical, and its risk takes the severity the rubric gives its
+catalogue entry); a row
 the user dismissed stays dismissed; and the hourly nudge paces what is named and reminds daily of
 undecided criticals. A cluster read in full sends its batch with a `scope` naming the job's check
 family (`upgrade-`) and its own source, an empty batch when nothing was found, so a finding the week
@@ -318,7 +320,10 @@ no longer reports loses confidence and stops being reminded without touching ano
 on that cluster, or the `upgrade-` rows another writer filed there. Three kinds of cluster claim nothing: one
 with more findings than one batch holds (500), sent in pieces; two of one name in one project, whose
 claims the queue could not tell apart; and one with a row the queue would refuse, since the claim
-would book that finding's row absent. The script writes the technical report under `upgrade-readiness/weekly/` beside the
+would book that finding's row absent. On an install with no declared scope, a roster that names one
+project both by number and by id runs it twice until the daily watch has learned the number's id,
+and on a Saturday `gcloud projects describe` fails, the number's run is booked as a project not
+read; name the project by its id alone to avoid both. The script writes the technical report under `upgrade-readiness/weekly/` beside the
 watch's ledger, keeps the newest eight runs, and places a copy of `latest.md` and `latest.json` in
 the sandbox at `/opt/data/upgrade-readiness/weekly/` so the agent can read it when asked. It prints
 nothing on success: the brief speaks for the week and the queue for each finding. A project it could

@@ -231,6 +231,9 @@ class TheMapping(unittest.TestCase):
             self.assertIn("at the ceiling", major[-240:], document.name)
             self.assertIn("matches today", major[-240:], document.name)
             self.assertIn("covering exclusion", minor[-80:], document.name)
+            # The eighth kind, a readiness rule's blocker, and the risk rule beside it.
+            self.assertIn("blocker is critical", text, document.name)
+            self.assertIn("risk takes the severity", text, document.name)
 
     def test_the_rubric_table_covers_the_queue_anchors(self):
         for values in list(review.RUBRIC.values()) + list(review.ENTRY_RISK_RUBRIC.values()) + [review.DEFAULT_RISK_RUBRIC]:
@@ -344,6 +347,27 @@ class Registration(unittest.TestCase):
         self.assertEqual([len(c["findings"]) for c in calls], [review.KV_BATCH_LIMIT, 1])
         self.assertTrue(all("scope" not in c for c in calls))
         self.assertEqual(len(outcomes), review.KV_BATCH_LIMIT + 1)
+
+    def test_a_cluster_sent_in_pieces_anyway_counts_no_withheld_claim_for_a_refused_row(self):
+        """A refused row withholds a claim only where one would have been sent: a cluster
+        past the batch limit claims nothing either way, so no lost claim is counted."""
+        def fake_request(path, body):
+            return {"results": [{"id": fq.derive_finding_id(f["check"], f["project"], f["cluster"], f["namespace"], f["object"]), "outcome": "created"} for f in body["findings"]], "downgraded": 0}
+
+        big = member("seeded-z", "blocked", pdbs={"blocking": [budget(name=f"b{i}") for i in range(3)]})
+        findings = review.member_findings(big)
+        real = fq.validate_finding
+
+        def strict(raw):
+            if raw.get("object") == "b0":
+                raise fq.FindingError("refused for the test")
+            return real(raw)
+
+        with mock.patch.object(review, "KV_BATCH_LIMIT", 2), mock.patch.object(review, "kv_request", fake_request), mock.patch.object(review.findings_queue, "validate_finding", strict):
+            _outcomes, problems, claimed = review.register([big], [], findings)
+        self.assertEqual(claimed, set())
+        self.assertEqual(len(problems), 1, problems)
+        self.assertNotIn(review.CLAIM_FAILED_MARK, problems[0])
 
     def test_same_named_clusters_in_two_locations_are_two_batches_and_no_claim(self):
         # Through the real queue: the queue keys rows and claims by project and
@@ -910,10 +934,7 @@ class TheTick(unittest.TestCase):
         """The daily watch learned that the number is the id's project: the review reads the id
         and runs nothing for the number, rather than a second full readiness run it drops."""
         numbered = "123456789012"
-        ledger = watch.empty_ledger()
-        ledger[watch.PROJECT_IDS_KEY] = {numbered: PROJECT}
-        self.home.mkdir(parents=True, exist_ok=True)
-        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps(ledger), encoding="utf-8")
+        self.learn_ids({numbered: PROJECT})
         calls = []
 
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):
@@ -932,10 +953,7 @@ class TheTick(unittest.TestCase):
         """Last week's budget put the number ahead of the id: the number runs first, asked for
         by the id the watch learned, and the id spelling is the same project, already read."""
         numbered = "123456789012"
-        ledger = watch.empty_ledger()
-        ledger[watch.PROJECT_IDS_KEY] = {numbered: PROJECT}
-        self.home.mkdir(parents=True, exist_ok=True)
-        (self.home / watch.LEDGER_FILE_NAME).write_text(json.dumps(ledger), encoding="utf-8")
+        self.learn_ids({numbered: PROJECT})
         calls = []
 
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):
@@ -1082,9 +1100,10 @@ class TheTick(unittest.TestCase):
         with mock.patch.object(watch, "projects", return_value=[PROJECT, numbered]), mock.patch.object(watch, "run_report", side_effect=run_report):
             code, out = self.run_main()
         self.assertEqual(code, 0)
-        self.assertIn(f"1 project(s) not read this week: {numbered}: clusters list: PERMISSION_DENIED", out)
+        # Booked under the id the report resolved, as its table and its read errors are.
+        self.assertIn("1 project(s) not read this week: acme-dev: clusters list: PERMISSION_DENIED", out)
         latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
-        self.assertEqual(latest["project_failures"], {numbered: "clusters list: PERMISSION_DENIED"})
+        self.assertEqual(latest["project_failures"], {"acme-dev": "clusters list: PERMISSION_DENIED"})
 
     def test_a_clean_project_with_no_clusters_beside_a_failed_one_is_a_partial_run(self):
         def run_report(names, readiness, *, scope, outside_stands, timeout=None):

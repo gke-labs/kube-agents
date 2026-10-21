@@ -885,8 +885,10 @@ def run_projects(names: list[str], scope, on_project=None) -> tuple[list[dict], 
             # and returns no member for it. One project runs at a time, so any
             # such row is this project's, keyed by the spelling the roster gave
             # or by the id the report resolved a number to. A project not read,
-            # as the watch counts it, not a clean project with no clusters.
-            failures[key] = next(
+            # as the watch counts it, not a clean project with no clusters; booked
+            # under the id the report resolved, as its table is, so a number and
+            # its id that both fail here are one project.
+            failures[next(iter(resolved)) if len(resolved) == 1 else key] = next(
                 (str(e.get(watch.MESSAGE_KEY) or LISTING_FAILED_DETAIL) for e in read_errors if e.get(watch.MEMBER_ID_KEYS[0]) in unlisted and not e.get(watch.MEMBER_ID_KEYS[1])),
                 LISTING_FAILED_DETAIL,
             )
@@ -948,7 +950,7 @@ def register(members: list[dict], errors: list[dict], findings: list[dict]) -> t
             # did not reach the queue where one would have been sent, since last week's rows
             # on the cluster keep their confidence all the same.
             complete = False
-            if len(batch) <= KV_BATCH_LIMIT:
+            if len(rows) <= KV_BATCH_LIMIT:
                 problems.append(f"{project}/{cluster}: {CLAIM_FAILED_MARK}: {CLAIM_WITHHELD_DETAIL.format(count=len(rows) - len(batch))}")
         if not batch and not complete:
             continue
