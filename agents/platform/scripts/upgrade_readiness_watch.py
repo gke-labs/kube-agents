@@ -2017,9 +2017,9 @@ def clear_failure_marker(home: Path) -> bool:
 
 def tick(dry_run: bool = False) -> list[str]:
     """One tick: the ledger loaded, the sweep run on it, and the standing-outside
-    record kept when the sweep fails (``keep_standing``), at whichever step it
-    failed, since the hops file the record as they go and a failed tick writes
-    nothing else of the ledger. A dry run changes nothing."""
+    record and the ids it learned kept when the sweep fails (``keep_standing``),
+    at whichever step it failed, since the hops file the record as they go and
+    a failed tick writes nothing else of the ledger. A dry run changes nothing."""
     started = time.monotonic()
     home = watch_home()
     ledger_path = home / LEDGER_FILE_NAME
@@ -2072,7 +2072,10 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     signature = partial_signature(read_errors) if not complete else None
     already = announced(ledger).get(ANNOUNCED_PARTIAL_KEY)
     if signature and signature != already:
-        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=len(read_errors), code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
+        # Counted by project, as the key and the reasons are: both spellings of one project,
+        # run on the tick its id is learned, are one read error.
+        errors = len({str(e.get(MEMBER_ID_KEYS[0]) or NONE_WORD) for e in read_errors})
+        lines.append(PARTIAL_LINE.format(prefix=LINE_PREFIX, errors=errors, code=versions.get(ENVELOPE_EXIT_KEY), reasons=error_reasons(read_errors)))
     elif complete and already:
         lines.append(PARTIAL_CLEARED_LINE.format(prefix=LINE_PREFIX))
     announced(ledger)[ANNOUNCED_PARTIAL_KEY] = signature

@@ -1785,6 +1785,7 @@ class DeclaredScope(Base):
             self.assertEqual(code, 0)
             outs.append(out)
         self.assertIn("does not list legacy-proj", outs[0])
+        self.assertIn("(1 read error(s),", outs[0], "one refused project is one read error, whichever spellings ran")
         self.assertEqual(outs[1], "", "the same refusal, keyed once, posts nothing the next day")
 
     def test_an_all_refused_tick_names_a_project_once_when_both_its_spellings_ran(self) -> None:
