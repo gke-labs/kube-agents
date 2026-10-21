@@ -2278,7 +2278,8 @@ _TRAJ_MISSING_NO_TRAJ_REASON = (
 )
 _UNRUN_MASKED_REASON = (
     "{named} ran, but an operator on the line (a preceding || or !, a following |/;/||/&, "
-    "a following newline, a background &, or a command substitution) means that exit 0 is not the command's own"
+    "a following newline, a background &, a command substitution, or a detaching wrapper such as setsid -f or sudo -b) "
+    "means that exit 0 is not the command's own"
 )
 _UNRUN_CLIPPED_REASON = (
     "the call's command was clipped in the pod, so what followed the run on the line is unknown ({named})"
@@ -2654,11 +2655,21 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                 if w == "--":
                     break
                 if w in ("-b", "--background") or (
-                    w.startswith("-") and not w.startswith("--") and "b" in w[1:] and all(c in _SUDO_VAL_LESS_FLAGS for c in w[1:])
+                    w.startswith("-") and not w.startswith("--") and "b" in w[1:]
+                    and all(c in _SUDO_VAL_LESS_FLAGS for c in w[1:-1])
+                    and (w[-1] in _SUDO_VAL_LESS_FLAGS or "-" + w[-1] in _SUDO_VAL_OPTS)
                 ):
                     return True
                 if w.startswith("-"):
-                    prev_opt_takes_val = w in _SUDO_VAL_OPTS
+                    prev_opt_takes_val = (
+                        w in _SUDO_VAL_OPTS
+                        or (
+                            not w.startswith("--")
+                            and len(w) > 1
+                            and "-" + w[-1] in _SUDO_VAL_OPTS
+                            and all(c in _SUDO_VAL_LESS_FLAGS for c in w[1:-1])
+                        )
+                    )
                     continue
                 if not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
                     if prev_opt_takes_val:
@@ -2766,7 +2777,7 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
 
         if carries_exit and i < len(segments) - 1:
             for ops in ops_after[i:]:
-                connective_ops = [op for op in ops if op not in ("(", ")")]
+                connective_ops = [op for op in ops if op not in ("(", ")", "!")]
                 if connective_ops:
                     if connective_ops[0] == "&&" and all(op in ("&&", _SHELL_LINE_END) for op in connective_ops):
                         continue

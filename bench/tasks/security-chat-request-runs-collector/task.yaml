@@ -84,7 +84,8 @@ verification_spec:
   # collect.py must be the command word, by any path, or follow an
   # interpreter (python3, /usr/bin/env python3, uv run). VAR=value, an exec
   # wrapper such as timeout or env, a && or ; before it, a trailing && chain,
-  # and bash -c are accepted (a trailing ||, ;, |, &, or newline masks failure and is
+  # and bash -c are accepted (a trailing ||, ;, |, &, or newline, or a detaching wrapper
+  # such as setsid -f or sudo -b, masks failure and is
   # not credited under succeeded: true). compliance-audit must be a later word,
   # scripts/eval_dashboard/collect.py do not count. The basename must be
   # collect.py, so test_collect.py does not count. A -h or --help call,
