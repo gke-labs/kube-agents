@@ -114,6 +114,41 @@ spec:
     driftDetector:
       {{- . | nindent 6 }}
     {{- end }}
+    {{- $stallWatch := .Values.platformAgent.harness.stallWatch | default dict }}
+    {{- /*
+      Rendered only when an install sets a field: the operator pins an empty
+      value for each knob when the block is absent, which is the watch's own
+      default. An empty list is no value, so `default nil` lets compactFields
+      drop it; `minStallAgeMinutes: 0` is a value and stays.
+    */}}
+    {{- $stallWatchFields := include "kube-agents.compactFields" (dict
+          "excludeNamespaces" ($stallWatch.excludeNamespaces | default nil)
+          "minStallAgeMinutes" $stallWatch.minStallAgeMinutes
+          "kinds" ($stallWatch.kinds | default nil)) }}
+    {{- /*
+      The same CRD guard as credentialProxy's below: `helm upgrade` never
+      applies crds/, and an API server serving a CRD from before
+      spec.harness.stallWatch admits the CR with the block pruned, so the
+      watch keeps reading what the release record says it excludes. `lookup`
+      is empty under `helm template`, so the guard fires only against a live
+      install.
+    */}}
+    {{- if $stallWatchFields }}
+    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $crd }}
+    {{- $harnessProps := dict }}
+    {{- range $crd.spec.versions }}
+    {{- if .storage }}
+    {{- $harnessProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $harnessProps "stallWatch") }}
+    {{- fail "platformAgent.harness.stallWatch is set, but the installed PlatformAgent CRD predates spec.harness.stallWatch and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+    {{- end }}
+    {{- end }}
+    stallWatch:
+      {{- $stallWatchFields | nindent 6 }}
+    {{- end }}
     {{- $tuning := deepCopy (.Values.platformAgent.harness.tuning | default dict) }}
     {{- if and .Values.plugins (and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled) }}
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}

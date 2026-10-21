@@ -778,6 +778,18 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The controller stall watch, the stall-watch cron job that alerts on
+    # controllers that stopped making progress. Empty omits the block and
+    # keeps the watch's defaults. A change rolls the agent pod. The
+    # annotation kubeagents.x-k8s.io/stall-watch: exempt on a namespace or an
+    # object works without any value here.
+    stallWatch: {}
+      # Namespaces never read, on every cluster, as exact names.
+      # excludeNamespaces: ["load-test", "payments-canary"]
+      # Hold a new alert until a stall has lasted this many minutes (0-1440).
+      # minStallAgeMinutes: 30
+      # Replaces the default kind list; ["all"] scans every namespaced kind.
+      # kinds: ["deployments", "statefulsets", "gateways.gateway.networking.k8s.io"]
     # Unsupported switches. Nothing under here carries a compatibility promise:
     # a field may change meaning, change default, or be removed between
     # releases, and an install that sets one is expected to re-check it at every

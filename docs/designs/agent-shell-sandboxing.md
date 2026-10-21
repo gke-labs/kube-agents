@@ -2151,6 +2151,19 @@ the test fleet after cron runs get a working directory of their own. The listing
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
 
+Two shapes are removed rather than inventoried. A cron run's working directory
+(`<home>/cron/runs/<run>`) is pruned after seven days. An override tree, a top-level
+directory named `<something>_override`, is removed the first night (#3551): it is a
+worker's copy of a shipped skill or script, patched to run in place of the original
+(#3444). No product code writes one, and `scripts/test_shipped_import_paths.py` keeps
+the literal paths it reads in shipped import-path calls, shell `PYTHONPATH` and configs
+off them. That test is a guard on the obvious forms, not a proof; the prune is the
+enforcement. Both
+prunes cover the homes the agent pod has a profile for, so a stale sandbox home is left
+to the inventory. Neither follows a symlink the model planted: the home, `cron` and
+`cron/runs` must be real directories for the runs prune, a symlinked home is left alone
+by the override prune, and a symlinked override entry is unlinked rather than followed.
+
 #### The agent pod gives up cluster tooling entirely
 
 Sandboxing the shell does not, by itself, take `kubectl` away from the agent. The

@@ -2092,6 +2092,29 @@ class C3UntrustedByDefault(unittest.TestCase):
                 self.assertNotEqual(pinned[0], "GKE_PROJECT_ID=", f"{fixture}: pinned empty, which reads as unset")
         self.assertGreater(checked, 0, "no golden renders a managed.env; this test would be vacuous")
 
+    def test_C3_the_stall_watch_knobs_cannot_come_from_the_agents_env_file(self) -> None:
+        """The stall watch's knobs are pinned where the agent cannot outrank them.
+
+        stall_watch.py reads STALL_WATCH_EXCLUDE_NAMESPACES, STALL_WATCH_MIN_AGE_MINUTES
+        and STALL_WATCH_KINDS from the environment it inherits after the agent-writable
+        PVC .env is applied, and each one changes what the watch reads or when it alerts.
+        Only the managed .env beats the PVC .env, so all three are pinned there on every
+        golden, empty when the CR's spec.harness.stallWatch does not set them.
+        """
+        keys = ("STALL_WATCH_EXCLUDE_NAMESPACES", "STALL_WATCH_MIN_AGE_MINUTES", "STALL_WATCH_KINDS")
+        checked = 0
+        for fixture, documents in h.golden_documents().items():
+            for document in documents:
+                managed = (document.get("data") or {}).get("managed.env") if document.get("kind") == "ConfigMap" else None
+                if managed is None:
+                    continue
+                checked += 1
+                lines = managed.splitlines()
+                for key in keys:
+                    pinned = [line for line in lines if line.startswith(f"{key}=")]
+                    self.assertEqual(len(pinned), 1, f"{fixture}: {key} is not pinned in managed.env")
+        self.assertGreater(checked, 0, "no golden renders a managed.env; this test would be vacuous")
+
     def test_C3_the_policy_decision_reads_nothing_but_its_argv(self) -> None:
         """The strongest form of "untrusted content cannot reach the decision".
 
