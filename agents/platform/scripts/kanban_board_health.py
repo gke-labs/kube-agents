@@ -328,15 +328,6 @@ def stuck_card_line(task_id: str, diag: dict, context: dict, entry: dict) -> str
     return head
 
 
-def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home: Path) -> list:
-    """One stuck card with its own operator commands (legacy / standalone format)."""
-    return [
-        stuck_card_line(task_id, diag, context, entry),
-        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=task_id)}",
-        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=task_id)}",
-    ]
-
-
 def _card_age_hours(diag: dict) -> float:
     try:
         val = (diag.get("data") or {}).get("age_hours")
@@ -345,12 +336,6 @@ def _card_age_hours(diag: dict) -> float:
     except (TypeError, ValueError, AttributeError):
         pass
     return float("inf")
-
-
-def _format_id_list(ids: list, max_chars: int = MAX_GROUP_IDS_CHARS) -> str:
-    """Format task IDs comma-separated, truncating with ', and N more' if exceeding max_chars."""
-    text, _ = _format_id_list_with_dropped(ids, max_chars)
-    return text
 
 
 def _format_id_list_with_dropped(ids: list, max_chars: int = MAX_GROUP_IDS_CHARS) -> tuple[str, list]:
