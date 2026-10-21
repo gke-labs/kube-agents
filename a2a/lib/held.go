@@ -3,7 +3,6 @@ package lib
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,10 +30,11 @@ import (
 //
 // Acks, Naks and heartbeats are published to the delivery's reply subject on
 // whatever connection the client holds at that moment, not on the one that
-// delivered the message, so a held delivery survives a connection rebuild.
-// If the rebuild outlasts AckWait and the server redelivers the message to
-// this process, the redelivery is adopted by the handler already running it
-// (matched by stream sequence) instead of starting a second one.
+// delivered the message, so a held delivery survives a connection rebuild
+// shorter than AckWait. A longer one, like a dead holder, means the server
+// redelivers: every redelivery starts a handler, with NumDelivered above 1,
+// and recognising a task that is still running or already settled is the
+// caller's job, by task id.
 //
 // SubscribeDurable's auto-ack mode is unchanged: it creates its own consumer
 // and acks when the handler returns, and every existing caller keeps that.
@@ -43,10 +43,7 @@ import (
 // sign of life before it redelivers. The holder renews it every third of that,
 // so a live handler never loses its delivery and a dead one gives it back
 // inside this window. A worker paces its heartbeat from the AckWait it bound
-// at, so EnsureHeldConsumer refuses to shorten a live durable's AckWait to a
-// third of its current value or less: bound workers' beats would lapse and
-// every running task would be redelivered. A bigger cut is made in steps, or
-// after rolling the workers.
+// at, so EnsureHeldConsumer never changes an existing durable's AckWait.
 const DefaultHeldAckWait = 2 * time.Minute
 
 // abandonedNakDelay is how long a delivery whose handler returned without
@@ -87,8 +84,12 @@ func (h HeldConsumerConfig) ackWait() time.Duration {
 	return h.AckWait
 }
 
-// EnsureHeldConsumer creates the held durable, or updates it in place to
-// cfg. It is the operator's call; workers only bind (SubscribeHeld).
+// EnsureHeldConsumer creates the held durable, or updates an existing one's
+// MaxAckPending. It is the operator's call; workers only bind (SubscribeHeld).
+// It refuses to change an existing durable's FilterSubject or AckWait: bound
+// workers checked the filter and took their heartbeat pace from AckWait when
+// they bound, and nothing tells them it moved. Changing either means rolling
+// the workers off the durable and re-creating it.
 func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig) error {
 	switch {
 	case cfg.Stream == "" || cfg.Durable == "" || cfg.FilterSubject == "":
@@ -101,11 +102,14 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 		return fmt.Errorf("EnsureHeldConsumer: not connected")
 	}
 	if existing, err := js.Consumer(ctx, cfg.Stream, cfg.Durable); err == nil {
-		// Workers beat at the AckWait they bound at, a third of it; a new
-		// AckWait at or under that would lapse every running task.
-		if old := existing.CachedInfo().Config.AckWait; old > 0 && cfg.ackWait() <= old/3 {
-			return fmt.Errorf("held consumer %s: AckWait %v is a third or less of the current %v, so bound workers' heartbeats would lapse; shorten it in steps, or roll the workers first",
-				cfg.Durable, cfg.ackWait(), old)
+		old := existing.CachedInfo().Config
+		switch {
+		case old.FilterSubject != cfg.FilterSubject || len(old.FilterSubjects) > 0:
+			return fmt.Errorf("held consumer %s filters %q%v; refusing to move it to %q under bound workers (re-create it)",
+				cfg.Durable, old.FilterSubject, old.FilterSubjects, cfg.FilterSubject)
+		case old.AckWait != cfg.ackWait():
+			return fmt.Errorf("held consumer %s has AckWait %v; refusing to change it to %v under bound workers, whose heartbeats keep the old pace (re-create it)",
+				cfg.Durable, old.AckWait, cfg.ackWait())
 		}
 	}
 	_, err := js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
@@ -134,12 +138,14 @@ type Delivery interface {
 	// measures against. Zero if the server sent no metadata.
 	Received() time.Time
 	// NumDelivered counts deliveries of this message, 1 the first time. More
-	// than 1 on a handler's first look means an earlier holder died or let it
-	// go; the caller decides what that means by task id (the spec: a task
-	// that had already started is failed, never re-run). A redelivery to the
-	// process already running it is adopted, not handed to a second handler.
+	// than 1 means an earlier holder died, let it go, or lost its connection
+	// for longer than AckWait and may still be running it; the caller decides
+	// what that means by task id.
 	NumDelivered() uint64
-	// Ack disposes of the delivery: the work is done or settled.
+	// Ack disposes of the delivery: the work is done or settled. An error
+	// means the server may not have it: the delivery stays held while the
+	// handler runs, so retry. Once the handler returns, the lib's fallback
+	// Nak is best effort and a redelivery is the caller's to recognise.
 	Ack() error
 	// Nak gives the delivery back for redelivery after delay (0: at once).
 	Nak(delay time.Duration) error
@@ -170,10 +176,12 @@ type HeldSubscription interface {
 // filtering cfg.Subject with a real MaxAckPending, is an error (a missing
 // one is retried for the bind window first, in case the operator has not
 // created it yet). The heartbeat is paced from the durable's own AckWait.
-// Envelope-subject agreement and the session filter apply as in
-// SubscribeDurable, and cfg.Session must be the intake's addressee, so the
-// filter can't silently drop every task. The envelopeId dedup does not apply:
-// a redelivery is expected and is the caller's to recognise by task id.
+// The intake is one profile's, `a2a.tasks.<profile>.*.in`, the shape
+// ParseTaskSubject and the publisher know, so envelope-subject agreement and
+// the session filter apply as in SubscribeDurable; cfg.Session must be that
+// profile, so the filter can't silently drop every task. The envelopeId dedup
+// does not apply: a redelivery is expected and is the caller's to recognise
+// by task id.
 //
 // Shutting down: StopIntake, then Wait, then Close. Close alone cancels the
 // handlers but doesn't wait for them, and anything they publish after the
@@ -185,40 +193,24 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 	if len(cfg.Subjects) > 0 {
 		return nil, fmt.Errorf("SubscribeHeld binds one intake subject; set Subject, not Subjects")
 	}
-	// A held durable is one profile's intake (`a2a.tasks.<profile>.….in`; how
-	// many tokens sit between is the deployment's choice), and the session
-	// filter acks away anything addressed elsewhere. On a durable every worker
-	// shares, that ack consumes the task for all of them, so the addressee
-	// must be a literal equal to Session, and no `>` may widen the filter.
-	if addressee := intakeAddressee(cfg.Subject); addressee == "" || strings.ContainsAny(addressee, "*>") {
-		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.….in, no >)", cfg.Subject)
-	} else if cfg.Session != addressee {
+	// A held durable is one profile's intake, and the session filter acks
+	// away anything addressed elsewhere. On a durable every worker shares,
+	// that ack consumes the task for all of them, so the addressee must be a
+	// literal equal to Session.
+	addressee, task, class, ok := ParseTaskSubject(cfg.Subject)
+	if !ok || class != TaskClassIn || task != "*" || !validDNS1123Label(addressee) {
+		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.*.in)", cfg.Subject)
+	}
+	if cfg.Session != addressee {
 		return nil, fmt.Errorf("SubscribeHeld: Session %q is not the intake's addressee %q; the session filter would ack every task away", cfg.Session, addressee)
 	}
 	hctx, cancel := context.WithCancel(context.Background())
-	h := &heldState{c: c, handler: handler, ctx: hctx, cancel: cancel,
-		live: map[uint64]*heldDelivery{}, changed: make(chan struct{})}
+	h := &heldState{c: c, handler: handler, ctx: hctx, cancel: cancel, changed: make(chan struct{})}
 	sub, err := c.subscribe(ctx, cfg, func(s *durableSub) { s.held = h })
 	if err != nil {
 		return nil, err
 	}
 	return &heldSubscription{s: sub.(*durableSub), h: h}, nil
-}
-
-// intakeAddressee is the addressee token of an intake subject,
-// `a2a.tasks.<addressee>.….in` with at least a task token between, or "" for
-// a subject of another shape or one with a `>` anywhere.
-func intakeAddressee(subject string) string {
-	parts := strings.Split(subject, ".")
-	if len(parts) < 5 || parts[0] != "a2a" || parts[1] != "tasks" || parts[len(parts)-1] != "in" {
-		return ""
-	}
-	for _, p := range parts {
-		if p == ">" {
-			return ""
-		}
-	}
-	return parts[2]
 }
 
 type heldSubscription struct {
@@ -240,7 +232,6 @@ type heldState struct {
 	mu      sync.Mutex
 	ackWait time.Duration // the bound durable's, read at each bind
 	closed  bool          // intake stopped: late deliveries are given back
-	live    map[uint64]*heldDelivery
 	running int
 	changed chan struct{} // closed and replaced whenever running drops
 }
@@ -280,28 +271,16 @@ func (h *heldState) beat() time.Duration {
 	return h.ackWait / 3
 }
 
-// dispatch hands one delivery to the handler on its own goroutine, or adopts
-// it into the handler already running that message, or gives it back once
-// intake has stopped. The server will not deliver more than MaxAckPending
-// unacknowledged messages, and a redelivery of one this process holds starts
-// no second handler, so a process never runs more handlers than that.
+// dispatch hands one delivery to the handler on its own goroutine, or gives
+// it back once intake has stopped. The server will not deliver more than
+// MaxAckPending unacknowledged messages, so that bounds the handlers running.
 func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
-	var seq, delivered uint64
+	var delivered uint64
 	var received time.Time
 	if md, err := msg.Metadata(); err == nil && md != nil {
-		seq, delivered, received = md.Sequence.Stream, md.NumDelivered, md.Timestamp
+		delivered, received = md.NumDelivered, md.Timestamp
 	}
 	h.mu.Lock()
-	// A redelivery of a message this process still holds is adopted, even
-	// while draining: the handler is running and will dispose of it. One whose
-	// holder Nak'd it is a new delivery, since this process let it go.
-	if d, ok := h.live[seq]; ok && seq != 0 && !d.released() {
-		// Release h.mu first: adopt takes d.mu, and a heartbeat holding d.mu
-		// can be waiting on the client lock behind Close, which waits on h.mu.
-		h.mu.Unlock()
-		d.adopt(msg.Reply(), delivered)
-		return
-	}
 	if h.closed {
 		h.mu.Unlock()
 		_ = msg.Nak()
@@ -309,14 +288,11 @@ func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
 	}
 	d := &heldDelivery{c: h.c, subject: msg.Subject(), reply: msg.Reply(), env: env,
 		received: received, delivered: delivered}
-	if seq != 0 {
-		h.live[seq] = d
-	}
 	h.running++
 	h.mu.Unlock()
 
 	go func() {
-		defer h.done(seq, d)
+		defer h.done()
 		stopBeat := d.heartbeat(h.beat)
 		defer stopBeat()
 		h.handler(h.ctx, d)
@@ -328,14 +304,9 @@ func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
 	}()
 }
 
-func (h *heldState) done(seq uint64, d *heldDelivery) {
+func (h *heldState) done() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// Only if it is still this delivery's: after a Nak a redelivery of the
-	// same sequence may have started a new handler under that key.
-	if seq != 0 && h.live[seq] == d {
-		delete(h.live, seq)
-	}
 	h.running--
 	close(h.changed)
 	h.changed = make(chan struct{})
@@ -372,30 +343,17 @@ type heldDelivery struct {
 	env      *Envelope
 	received time.Time
 
-	mu        sync.Mutex
-	reply     string // the latest delivery's ack subject
+	reply     string
 	delivered uint64
-	disposed  bool   // a disposition reached the connection
-	last      []byte // that disposition, re-sent if an Ack or Term is lost
-	nakd      bool   // the disposition was a Nak: this process let it go
-}
 
-// released reports whether the holder gave the message back with a Nak, so
-// a redelivery of it is a new delivery rather than one to adopt.
-func (d *heldDelivery) released() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.nakd
+	mu       sync.Mutex
+	disposed bool // a disposition reached the connection
 }
 
 func (d *heldDelivery) Envelope() *Envelope { return d.env }
 func (d *heldDelivery) Subject() string     { return d.subject }
 func (d *heldDelivery) Received() time.Time { return d.received }
-func (d *heldDelivery) NumDelivered() uint64 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.delivered
-}
+func (d *heldDelivery) NumDelivered() uint64 { return d.delivered }
 func (d *heldDelivery) Ack() error  { return d.dispose([]byte("+ACK")) }
 func (d *heldDelivery) Term() error { return d.dispose([]byte("+TERM")) }
 func (d *heldDelivery) Nak(delay time.Duration) error {
@@ -403,21 +361,6 @@ func (d *heldDelivery) Nak(delay time.Duration) error {
 		return d.dispose([]byte("-NAK"))
 	}
 	return d.dispose([]byte(fmt.Sprintf(`-NAK {"delay": %d}`, delay.Nanoseconds())))
-}
-
-// adopt points the delivery at a redelivery of the same message, so its next
-// heartbeat and its disposition reach the server under the current reply. If
-// the handler had already disposed of it, the redelivery means the server
-// didn't get that disposition, so it is sent again under the new reply.
-func (d *heldDelivery) adopt(reply string, delivered uint64) {
-	nc, _ := d.c.conn()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.reply = reply
-	d.delivered = delivered
-	if d.disposed && d.last != nil && !d.nakd {
-		_ = d.publish(nc, d.last) // an Ack or Term the server never got
-	}
 }
 
 // dispose sends a disposition. Only one that reaches the connection counts:
@@ -434,8 +377,7 @@ func (d *heldDelivery) dispose(body []byte) error {
 	if err := d.publish(nc, body); err != nil {
 		return err
 	}
-	d.disposed, d.last = true, body
-	d.nakd = strings.HasPrefix(string(body), "-NAK")
+	d.disposed = true
 	return nil
 }
 
@@ -452,9 +394,7 @@ func (d *heldDelivery) publish(nc *nats.Conn, body []byte) error {
 }
 
 // heartbeat sends an in-progress ack every interval() until the delivery is
-// disposed of or the returned stop is called. The interval is read each time,
-// so a rebind that shortened the durable's AckWait speeds up deliveries
-// already running.
+// disposed of or the returned stop is called. The interval is read each tick.
 func (d *heldDelivery) heartbeat(interval func() time.Duration) (stop func()) {
 	next := func() time.Duration {
 		if iv := interval(); iv > 0 {

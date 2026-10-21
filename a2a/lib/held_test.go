@@ -151,9 +151,11 @@ func TestHeldDeliveryIsKeptAlivePastAckWait(t *testing.T) {
 	h, worker := newHeldHarness(t, "beat")
 	var starts atomic.Int32
 	release := make(chan struct{})
+	got := make(chan Delivery, 4)
 	h.ensure(1, 3*time.Second)
 	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
 		starts.Add(1)
+		got <- d
 		select {
 		case <-release:
 			_ = d.Ack()
@@ -168,8 +170,11 @@ func TestHeldDeliveryIsKeptAlivePastAckWait(t *testing.T) {
 	h.submit("task-long")
 	waitFor(t, 5e9, "the task delivered", func() bool { return starts.Load() == 1 })
 	time.Sleep(7 * time.Second) // more than two AckWaits
-	if got := starts.Load(); got != 1 {
-		t.Fatalf("delivered %d times while its holder was alive, want 1", got)
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("delivered %d times while its holder was alive, want 1", n)
+	}
+	if d := <-got; d.NumDelivered() != 1 {
+		t.Errorf("NumDelivered = %d, want 1", d.NumDelivered())
 	}
 	close(release)
 }
@@ -279,16 +284,21 @@ func TestHeldDeliveryCarriesTheIngestTime(t *testing.T) {
 	}
 }
 
-// A held durable is one profile's intake. A wildcard or `>` addressee is
-// refused: the session filter would ack other addressees' tasks off the
-// durable every worker shares, consuming them for all.
+// A held durable is one profile's intake, `a2a.tasks.<profile>.*.in`. A
+// wildcard or `>` addressee is refused: the session filter would ack other
+// addressees' tasks off the durable every worker shares, consuming them for
+// all. So is a longer subject the publisher and envelope-subject agreement
+// don't know.
 func TestSubscribeHeldRefusesAnIntakeThatIsNotOneProfiles(t *testing.T) {
 	h, worker := newHeldHarness(t, "mine")
-	for _, subject := range []string{"a2a.tasks.*.*.in", "a2a.tasks.mine.>", "a2a.tasks.>", "a2a.tasks.mine.task.events", "a2a.tasks.mine.>.in", "a2a.tasks.*.read.top.*.in"} {
+	h.ensure(1, 0)
+	for _, subject := range []string{"a2a.tasks.*.*.in", "a2a.tasks.mine.>", "a2a.tasks.>", "a2a.tasks.mine.*.events",
+		"a2a.tasks.mine.>.in", "a2a.tasks.mine.task-1.in", "a2a.tasks.mine.read.top.*.in"} {
 		cfg := h.cfg()
 		cfg.Subject = subject
-		if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil {
-			t.Errorf("SubscribeHeld accepted %q, which is not one profile's intake", subject)
+		if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil ||
+			!strings.Contains(err.Error(), "not one profile's intake") {
+			t.Errorf("SubscribeHeld(%q) = %v, want it refused as not one profile's intake", subject, err)
 		}
 	}
 }
@@ -334,8 +344,9 @@ func TestHeldConfigIsRefusedWhenIncomplete(t *testing.T) {
 	}
 	multi := c
 	multi.Subject, multi.Subjects = "", []string{c.Subject, "a2a.tasks.x.*.in"}
-	if _, err := worker.SubscribeHeld(h.ctx, multi, func(context.Context, Delivery) {}); err == nil {
-		t.Error("SubscribeHeld accepted several filter subjects")
+	if _, err := worker.SubscribeHeld(h.ctx, multi, func(context.Context, Delivery) {}); err == nil ||
+		!strings.Contains(err.Error(), "one intake subject") {
+		t.Errorf("SubscribeHeld with several filter subjects = %v, want it refused for that", err)
 	}
 }
 
@@ -378,12 +389,14 @@ func TestSubscribeHeldLeavesTheConsumerAsTheOperatorMadeIt(t *testing.T) {
 			cc.MaxAckPending, cc.AckWait)
 	}
 
+	// Otherwise valid, so it is bind's filter check that refuses it.
 	wrong := h.cfg()
-	wrong.Subject = "a2a.tasks.someone-else.*.in"
+	wrong.Subject, wrong.Session = "a2a.tasks.someone-else.*.in", "someone-else"
 	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
 	defer cancel()
-	if _, err := worker.SubscribeHeld(short, wrong, func(context.Context, Delivery) {}); err == nil {
-		t.Error("bound a durable whose filter is not the requested intake")
+	if _, err := worker.SubscribeHeld(short, wrong, func(context.Context, Delivery) {}); err == nil ||
+		!strings.Contains(err.Error(), "filters") {
+		t.Errorf("binding a durable whose filter is not the requested intake = %v, want it refused for its filter", err)
 	}
 }
 
@@ -543,11 +556,11 @@ func TestHeldStopIntakeLetsRunningWorkFinish(t *testing.T) {
 	}
 }
 
-// A held task survives a server restart that outlasts AckWait: the
-// redelivery to this process is adopted by the handler already running it,
-// no second handler starts, and that handler's Ack on the new connection
-// settles it.
-func TestHeldDeliverySurvivesARebuild(t *testing.T) {
+// A server restart that outlasts AckWait gives the task back: the
+// redelivery starts a second handler, which sees NumDelivered above 1 (the
+// caller's signal to look the task up by id), and its Ack settles it. The
+// lib doesn't adopt a redelivery into a handler it thinks is still running.
+func TestHeldDeliveryOutlastingAckWaitIsRedelivered(t *testing.T) {
 	dir := t.TempDir()
 	s1 := runJetStreamServer(t, -1, dir, nil)
 	port := serverPort(s1)
@@ -568,15 +581,14 @@ func TestHeldDeliverySurvivesARebuild(t *testing.T) {
 	defer worker.Close()
 
 	var starts atomic.Int32
-	release := make(chan struct{})
-	ackErr := make(chan error, 1)
+	second := make(chan uint64, 1)
 	sub, err := worker.SubscribeHeld(ctx, h.cfg(), func(ctx context.Context, d Delivery) {
-		starts.Add(1)
-		select {
-		case <-release:
-			ackErr <- d.Ack()
-		case <-ctx.Done():
+		if starts.Add(1) == 1 {
+			<-ctx.Done() // the holder that lost the task
+			return
 		}
+		second <- d.NumDelivered()
+		_ = d.Ack()
 	})
 	if err != nil {
 		t.Fatalf("SubscribeHeld: %v", err)
@@ -590,17 +602,17 @@ func TestHeldDeliverySurvivesARebuild(t *testing.T) {
 	time.Sleep(3 * time.Second) // longer than AckWait
 	s2 := runJetStreamServer(t, port, dir, nil)
 	t.Cleanup(s2.Shutdown)
-	time.Sleep(6 * time.Second) // reconnect, rebind, and let any redelivery arrive
-	if n := starts.Load(); n != 1 {
-		t.Fatalf("%d handlers started for one task across a rebuild, want 1", n)
-	}
-	close(release)
-	if err := <-ackErr; err != nil {
-		t.Fatalf("Ack after the rebuild: %v", err)
+	select {
+	case n := <-second:
+		if n < 2 {
+			t.Errorf("the redelivery's NumDelivered = %d, want more than 1", n)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("no redelivery after a restart that outlasted AckWait")
 	}
 	time.Sleep(5 * time.Second) // two AckWaits: an unsettled ack would bring it back
-	if n := starts.Load(); n != 1 {
-		t.Errorf("the task came back after its Ack (%d starts)", n)
+	if n := starts.Load(); n != 2 {
+		t.Errorf("%d handler starts, want 2 (the holder, then the redelivery that acked)", n)
 	}
 }
 
@@ -626,14 +638,16 @@ func TestSubscribeHeldRefusesADurableItCannotGate(t *testing.T) {
 
 	other := h.cfg()
 	other.Session = "some-pod"
-	if _, err := worker.SubscribeHeld(h.ctx, other, func(context.Context, Delivery) {}); err == nil {
-		t.Error("accepted a Session that the session filter would use to drop every task")
+	if _, err := worker.SubscribeHeld(h.ctx, other, func(context.Context, Delivery) {}); err == nil ||
+		!strings.Contains(err.Error(), "is not the intake's addressee") {
+		t.Errorf("SubscribeHeld with a Session the filter would use to drop every task = %v, want it refused for that", err)
 	}
 }
 
-// The same, across the lib's own rebuild (NR-2): the connection is closed for
-// good and replaced, so the delivering connection and the current one differ.
-// The task still starts once, and its Ack on the new connection settles it.
+// A held task survives the lib's own rebuild (NR-2) inside AckWait: the
+// connection is closed for good and replaced, so the delivering connection
+// and the current one differ. Heartbeats resume on the new one, the task
+// starts once, and its Ack on the new connection settles it.
 func TestHeldDeliverySurvivesTheLibsRebuild(t *testing.T) {
 	dir := t.TempDir()
 	s1 := runJetStreamServer(t, -1, dir, nil)
@@ -646,7 +660,7 @@ func TestHeldDeliverySurvivesTheLibsRebuild(t *testing.T) {
 	}
 	defer op.Close()
 	h := &heldHarness{t: t, ctx: ctx, req: op, profile: "nr2"}
-	h.ensure(1, 2*time.Second)
+	h.ensure(1, 10*time.Second)
 	capture := &logCapture{}
 	worker, err := Connect(ctx, clientURL(s1), WithName("worker"), WithLogger(slog.New(capture)),
 		WithNATSOptions(nats.MaxReconnects(1), nats.ReconnectWait(50*time.Millisecond)))
@@ -676,14 +690,13 @@ func TestHeldDeliverySurvivesTheLibsRebuild(t *testing.T) {
 	s1.Shutdown()
 	s1.WaitForShutdown()
 	waitFor(t, 10e9, "the terminal close", func() bool { return capture.contains("nats connection closed") })
-	time.Sleep(2500 * time.Millisecond) // past AckWait, so the server redelivers
 	s2 := runJetStreamServer(t, port, dir, nil)
 	t.Cleanup(s2.Shutdown)
 	waitFor(t, 20e9, "the lib's rebuild", func() bool { return capture.contains("nats rebuild complete") })
 	if n := worker.rebuilds.Load(); n != 1 {
 		t.Fatalf("rebuilds = %d, want 1: the test must cross the lib's rebuild, not a nats.go reconnect", n)
 	}
-	time.Sleep(4 * time.Second) // rebind, and let the redelivery arrive
+	time.Sleep(12 * time.Second) // past AckWait: only the heartbeat on the new connection keeps it
 	if n := starts.Load(); n != 1 {
 		t.Fatalf("%d handlers started for one task across the lib's rebuild, want 1", n)
 	}
@@ -691,7 +704,7 @@ func TestHeldDeliverySurvivesTheLibsRebuild(t *testing.T) {
 	if err := <-ackErr; err != nil {
 		t.Fatalf("Ack on the rebuilt connection: %v", err)
 	}
-	time.Sleep(5 * time.Second) // two AckWaits
+	time.Sleep(12 * time.Second) // past AckWait: an unsettled ack would bring it back
 	if n := starts.Load(); n != 1 {
 		t.Errorf("the task came back after its Ack (%d starts)", n)
 	}
@@ -771,139 +784,27 @@ func TestCloseCancelsAStragglerAfterStopIntake(t *testing.T) {
 	}
 }
 
-// fakeMsg is a jetstream.Msg with a chosen stream sequence, for driving
-// dispatch directly; it records what the lib did with it.
-type fakeMsg struct {
-	seq, delivered uint64
-	reply          string
-	naks           atomic.Int32
-}
-
-func (m *fakeMsg) Metadata() (*jetstream.MsgMetadata, error) {
-	return &jetstream.MsgMetadata{Sequence: jetstream.SequencePair{Stream: m.seq}, NumDelivered: m.delivered}, nil
-}
-func (m *fakeMsg) Data() []byte                     { return nil }
-func (m *fakeMsg) Headers() nats.Header             { return nil }
-func (m *fakeMsg) Subject() string                  { return "a2a.tasks.p.t.in" }
-func (m *fakeMsg) Reply() string                    { return m.reply }
-func (m *fakeMsg) Ack() error                       { return nil }
-func (m *fakeMsg) DoubleAck(context.Context) error  { return nil }
-func (m *fakeMsg) Nak() error                       { m.naks.Add(1); return nil }
-func (m *fakeMsg) NakWithDelay(time.Duration) error { m.naks.Add(1); return nil }
-func (m *fakeMsg) InProgress() error                { return nil }
-func (m *fakeMsg) Term() error                      { return nil }
-func (m *fakeMsg) TermWithReason(string) error      { return nil }
-
-func newBareHeld(t *testing.T, handler func(context.Context, Delivery)) *heldState {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	return &heldState{c: &Client{}, handler: handler, ctx: ctx, cancel: cancel,
-		live: map[uint64]*heldDelivery{}, changed: make(chan struct{}), ackWait: time.Minute}
-}
-
-// A redelivery of a message a handler is still running is adopted even after
-// intake stops: the drain's handler will dispose of it, so giving it back
-// would let another worker fail a task this one completes.
-func TestARedeliveryDuringTheDrainIsAdoptedNotGivenBack(t *testing.T) {
-	var starts atomic.Int32
-	release := make(chan struct{})
-	h := newBareHeld(t, func(_ context.Context, _ Delivery) { starts.Add(1); <-release })
-	defer close(release)
-	h.dispatch(&fakeMsg{seq: 7, delivered: 1, reply: "r1"}, &Envelope{})
-	waitFor(t, 2e9, "the handler running", func() bool { return starts.Load() == 1 })
-	h.stopIntake()
-	redelivery := &fakeMsg{seq: 7, delivered: 2, reply: "r2"}
-	h.dispatch(redelivery, &Envelope{})
-	if n := redelivery.naks.Load(); n != 0 {
-		t.Fatalf("the redelivery of a running task was Nak'd during the drain (%d)", n)
-	}
-	h.mu.Lock()
-	d := h.live[7]
-	h.mu.Unlock()
-	if d == nil || d.reply != "r2" || d.NumDelivered() != 2 {
-		t.Errorf("the redelivery was not adopted by the running handler")
-	}
-	if n := starts.Load(); n != 1 {
-		t.Errorf("%d handlers started, want 1", n)
-	}
-}
-
-// After a holder Naks its message, a redelivery of it is a new delivery: it
-// starts a handler, and the first handler's exit doesn't clear the new one's
-// entry. (Nak publishes on the client's connection, so this needs a real one.)
-func TestARedeliveryAfterANakStartsAHandler(t *testing.T) {
-	s := startServer(t)
-	c, err := Connect(testCtx(t), clientURL(s))
-	if err != nil {
-		t.Fatalf("Connect: %v", err)
-	}
-	t.Cleanup(c.Close)
-	var starts atomic.Int32
-	nakd := make(chan struct{})
-	release := make(chan struct{})
-	h := newBareHeld(t, func(_ context.Context, d Delivery) {
-		if starts.Add(1) == 1 {
-			_ = d.Nak(0)
-			close(nakd)
-			<-release // still running after its Nak
-		}
-	})
-	h.c = c
-	h.dispatch(&fakeMsg{seq: 9, delivered: 1, reply: "r1"}, &Envelope{})
-	<-nakd
-	h.dispatch(&fakeMsg{seq: 9, delivered: 2, reply: "r2"}, &Envelope{})
-	waitFor(t, 2e9, "a second handler after the Nak", func() bool { return starts.Load() == 2 })
-	close(release)
-	waitFor(t, 2e9, "both handlers gone", func() bool {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		return h.running == 0
-	})
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.live) != 0 {
-		t.Errorf("%d live entries left after both handlers returned", len(h.live))
-	}
-}
-
-// The operator can't shorten a live durable's AckWait to where bound workers'
-// heartbeats (a third of the AckWait they bound at) would lapse; a smaller
-// cut is fine, and the bigger one is made in steps.
-func TestEnsureHeldConsumerRefusesAnAckWaitCutWorkersCantKeepUpWith(t *testing.T) {
-	h, _ := newHeldHarness(t, "shrink")
+// The operator can change a live durable's MaxAckPending, and nothing else
+// bound workers depend on: not its AckWait (their heartbeat pace), in either
+// direction, and not its filter (the intake they checked at bind).
+func TestEnsureHeldConsumerOnlyChangesMaxAckPendingInPlace(t *testing.T) {
+	h, _ := newHeldHarness(t, "inplace")
 	h.ensure(1, 90*time.Second)
 	c := h.cfg()
-	cut := func(w time.Duration) error {
+	ensure := func(filter string, maxAckPending int, ackWait time.Duration) error {
 		return h.req.EnsureHeldConsumer(h.ctx, HeldConsumerConfig{
-			Stream: c.Stream, Durable: c.Durable, FilterSubject: c.Subject, MaxAckPending: 1, AckWait: w,
+			Stream: c.Stream, Durable: c.Durable, FilterSubject: filter, MaxAckPending: maxAckPending, AckWait: ackWait,
 		})
 	}
-	if err := cut(30 * time.Second); err == nil {
-		t.Error("cut a 90s AckWait to 30s (a third), which lapses workers beating every 30s")
+	for _, w := range []time.Duration{60 * time.Second, 120 * time.Second, 0} {
+		if err := ensure(c.Subject, 1, w); err == nil || !strings.Contains(err.Error(), "AckWait") {
+			t.Errorf("changing a live durable's 90s AckWait to %v = %v, want it refused for AckWait", w, err)
+		}
 	}
-	if err := cut(45 * time.Second); err != nil {
-		t.Errorf("refused a cut workers keep up with (90s to 45s): %v", err)
+	if err := ensure("a2a.tasks.other.*.in", 1, 90*time.Second); err == nil || !strings.Contains(err.Error(), "filters") {
+		t.Errorf("moving a live durable to another intake = %v, want it refused for its filter", err)
 	}
-	if err := cut(20 * time.Second); err != nil {
-		t.Errorf("refused the next step (45s to 20s): %v", err)
+	if err := ensure(c.Subject, 4, 90*time.Second); err != nil {
+		t.Errorf("refused a MaxAckPending change: %v", err)
 	}
-}
-
-// The intake check is about the addressee, not the subject's length: a
-// deployment that puts tier and kind between profile and task binds too.
-func TestSubscribeHeldAcceptsALongerIntakeOfOneProfile(t *testing.T) {
-	h, worker := newHeldHarness(t, "tiered")
-	cfg := h.cfg()
-	cfg.Subject = "a2a.tasks.tiered.read.top.*.in"
-	if err := h.req.EnsureHeldConsumer(h.ctx, HeldConsumerConfig{
-		Stream: cfg.Stream, Durable: cfg.Durable, FilterSubject: cfg.Subject, MaxAckPending: 1,
-	}); err != nil {
-		t.Fatalf("EnsureHeldConsumer: %v", err)
-	}
-	sub, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {})
-	if err != nil {
-		t.Fatalf("SubscribeHeld refused a tiered intake of one profile: %v", err)
-	}
-	sub.Stop()
 }
