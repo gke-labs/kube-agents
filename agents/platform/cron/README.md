@@ -145,11 +145,16 @@ working directory, off the module path, so a `json.py` the model dropped there i
 not the code that runs. The per-cluster kubeconfigs stay in
 `/home/hermes/.kubeconfigs`, where `platform_mcp_server.py` keeps its own, under a
 prefix of their own. The kind list is `DEFAULT_KINDS` in the script, cut per
-cluster to what `kubectl api-resources` says it serves, and is not
-operator-configurable on this release: `STALL_WATCH_KINDS` replaces it for a run
-started by hand in the pod (`all` hands `stall_report.py` its every-kind
-default), but the operator's env allowlist does not carry it, so a value on the
-CR's `spec.deployment.env` never reaches the script. The k8s-event-watcher and
+cluster to what `kubectl api-resources` says it serves. The CR's
+`spec.harness.stallWatch` sets three knobs, which the operator pins in the
+managed `.env` on every install (empty when unset, which is the default):
+`STALL_WATCH_EXCLUDE_NAMESPACES` names namespaces never read,
+`STALL_WATCH_MIN_AGE_MINUTES` holds a new alert until a stall in the namespace
+has lasted that long, and `STALL_WATCH_KINDS` replaces the kind list (`all`
+hands `stall_report.py` its every-kind default). The annotation
+`kubeagents.x-k8s.io/stall-watch: exempt` leaves a namespace unread, or an
+object's rows out of the alerts; `stall_report.py` marks such a row `exempt`
+in its `--json` output and its table is unchanged. The k8s-event-watcher and
 this job split the work by signal: a Warning whose reason is on the watcher's
 list is the watcher's within seconds; a condition, a reference or an event the
 list never names is this job's within the half hour. It declares `risk: high`

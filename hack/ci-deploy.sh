@@ -221,14 +221,15 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 
 # EVAL_MODE_NEXT=1 flips the eval install to `spec.mode: next` once the
 # today-mode install has passed step 6, so the matrix can be run against the
-# next stack: the presubmit's on demand, or the next lane's periodic and
-# nightly on main (#1686, measuring #1661). Unset, or set to
+# next stack: the merge-blocking presubmit's, the next-mode nightly's on main,
+# and the today lane's, which rolls the next install back to today before its
+# matrix (EVAL_ROLLBACK_LANE=1, hack/ci-eval-pr.sh) (#1686, #2007). Unset, or set to
 # anything but "1", is today: every line the flag guards is skipped and the
 # script behaves exactly as it did before the flag existed.
 #
 # What the flag has to do, and where:
 #   - section 2b refuses it on a Prow
-#     run that is neither a pull request's nor one of the next-lane jobs
+#     run that is neither a pull request's nor one of the jobs
 #     named below (a mis-set variable on the nightly or another postsubmit would
 #     otherwise run that job in next mode, recording and publishing nothing,
 #     so main's window and dashboard would silently miss it), and refuses a
@@ -256,7 +257,8 @@ readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
 #     sidecar the operator rendered into the agent pod to log that it is
 #     consuming `platform` tasks.
 # hack/ci-eval-pr.sh then runs the matrix through the door (AGENT_TRANSPORT=
-# inject) under the same flag. The flip goes through the chart value rather
+# inject) under the same flag, or, on the today lane, rolls the install back
+# and runs it over the agent API. The flip goes through the chart value rather
 # than a patch on the CR so that the next lane exercises the value an
 # installer-driven next install sets (install.sh --mode, the composition's
 # platform_agent_mode), and it is still a second release after the today-mode
@@ -279,24 +281,29 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
-# The next lane's Prow jobs: its on-demand presubmit, its six-hourly periodic
-# on main, its daily full-catalog nightly on main (the agent on Claude,
-# compared with a today-mode nightly on the same model), and the GitLab
-# lane's nightly under next (EVAL_FORGE=gitlab, hack/eval/gitlab-cases.txt,
-# beside the today-mode GitLab nightly), and the release-candidate eval's
-# postsubmit, which grades a candidate in the mode a new install gets (#2007,
-# "The cutover itself"; hack/ci-eval-rc.sh). Section 2b admits
-# the flag on a run whose JOB_NAME is one of these (space-separated, matched
-# whole) or that carries a PULL_NUMBER -- the presubmit is admitted by the
-# second on a pull request and by the first on a Tide batch, the periodic, the
-# nightlies and the RC postsubmit only by the first -- and refuses it on any
-# other Prow run, so the flag leaking into the today nightly's or another postsubmit's environment
+# The Prow jobs that deploy under the flag with no PULL_NUMBER: the
+# merge-blocking presubmit in a Tide batch (it grades next since next became
+# the mode new installs get, #2007, "The cutover itself"); the today lane's
+# six-hourly periodic on main, which deploys next and rolls it back to today
+# before its matrix (EVAL_ROLLBACK_LANE=1); the daily full-catalog next-mode
+# nightly on main (the agent on Claude, compared with a today-mode nightly on
+# the same model); the GitLab lane's nightly under next (EVAL_FORGE=gitlab,
+# hack/eval/gitlab-cases.txt, beside the today-mode GitLab nightly); and the
+# release-candidate eval's postsubmit, which grades a candidate in the mode a
+# new install gets (hack/ci-eval-rc.sh). The today lane's on-demand presubmit
+# is optional, so Tide never batches it, and a pull request's run of it
+# carries a PULL_NUMBER. Section 2b admits the flag on a run whose JOB_NAME is
+# one of these (space-separated, matched whole) or that carries a PULL_NUMBER
+# -- a presubmit is admitted by the second on a pull request and the blocking
+# one by the first on a Tide batch, the periodic, the nightlies and the RC
+# postsubmit only by the first -- and refuses it on any other Prow run, so
+# the flag leaking into the today nightly's or another postsubmit's environment
 # still stops the deploy at second zero. The names are the jobs' own in
 # oss-test-infra (prow/prowjobs/gke-labs/kube-agents/); a rename there is a
 # one-line edit here. hack/ci-eval-pr.sh keeps such a run out of the baseline
 # recorder on the flag alone, so admitting a job here never lets it write
 # main's window.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test-next ci-kube-agents-eval-next ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-today ci-kube-agents-eval-nightly-next-claude ci-kube-agents-eval-nightly-gitlab-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The first change: the mode, and the maxSessions section 2b sizes for the
@@ -896,8 +903,10 @@ else
   IS_PROW_RUN="false"
 fi
 
-# The mode flip exists for the next lane's runs: a pull request's, or one of
-# the jobs EVAL_MODE_NEXT_JOB_NAMES lists (its periodic and nightlies on main, and the release-candidate eval).
+# The mode flip exists for the runs that grade next or roll it back: a pull
+# request's, or one of the jobs EVAL_MODE_NEXT_JOB_NAMES lists (the today
+# lane's periodic and the next-mode nightlies on main, the blocking presubmit
+# in a Tide batch, and the release-candidate eval).
 # A flagged run appends nothing to main's baseline and publishes no dashboard
 # (hack/ci-eval-pr.sh keeps it out of both on the flag alone; bench-gate
 # separately refuses a pull request's sample, bench/baselines/README.md), so
@@ -918,15 +927,24 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${IS_PROW_RUN}" = "true" ] && [ -z "${P
     fi
   done
   if [ "${MODE_NEXT_JOB_ADMITTED}" = "true" ]; then
-    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a next-lane job with no PULL_NUMBER; the baseline store is read, never written)"
+    echo "EVAL_MODE_NEXT=1: accepted on ${JOB_NAME} (a job named in EVAL_MODE_NEXT_JOB_NAMES with no PULL_NUMBER; the baseline store is read, never written)"
   else
     echo "ERROR: EVAL_MODE_NEXT=1 is set on a Prow run with no PULL_NUMBER (JOB_NAME=${JOB_NAME:-})." >&2
-    echo "       The flag is for a pull request's presubmit or a next-lane job named in" >&2
+    echo "       The flag is for a pull request's presubmit or a job named in" >&2
     echo "       EVAL_MODE_NEXT_JOB_NAMES (${EVAL_MODE_NEXT_JOB_NAMES}); any other periodic or" >&2
     echo "       postsubmit under it would run in next mode and record nothing to main's" >&2
     echo "       baseline or dashboard, leaving that run silently missing from both." >&2
     exit 1
   fi
+fi
+
+# The today lane rolls a next install back to today before its matrix
+# (EVAL_ROLLBACK_LANE=1, hack/ci-eval-pr.sh's run_rollback_lane), so it needs
+# the flag that brings the install up under next. Refused here, at second
+# zero, rather than after the build and the install it would otherwise spend.
+if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+  echo "ERROR: EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane rolls a next install back to today, and without the flag this deploy installs today with nothing to roll back." >&2
+  exit 1
 fi
 
 # The bridge sidecar's concurrency is the matrix's fan-out, read from the same

@@ -642,7 +642,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and one of the five pins here that are not about chat. Every chat key
+	// UNCONDITIONAL, and one of the pins here that are not about chat. Every chat key
 	// below exists because the agent could otherwise write a competing value into the PVC
 	// .env; this one exists because something already does, on every boot, without being
 	// asked.
@@ -720,6 +720,26 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	if harness := agent.Spec.Harness; harness != nil && !harnessOnKind(harness) {
 		add(gkeProjectEnvKey, harness.ProjectID)
 	}
+
+	// The stall watch's three knobs (spec.harness.stallWatch), pinned on every install and
+	// empty when the CR does not set them; stall_watch.py reads an empty value as its
+	// default. The watch is a cron script that inherits the gateway's environment after
+	// the PVC .env is applied, and each knob changes what it reads or when it alerts. Unpinned, one
+	// `STALL_WATCH_EXCLUDE_NAMESPACES=payments` line written by the agent would silence
+	// the alerts for a namespace nobody excluded; pinned, save_env_value refuses the keys
+	// and the CR stays the only answer. Not in the container env: one delivery path means
+	// one answer, as for the mode key.
+	var stallWatch agentv1alpha1.StallWatchSpec
+	if harness := agent.Spec.Harness; harness != nil && harness.StallWatch != nil {
+		stallWatch = *harness.StallWatch
+	}
+	stallWatchMinAge := ""
+	if stallWatch.MinStallAgeMinutes != nil {
+		stallWatchMinAge = strconv.FormatInt(int64(*stallWatch.MinStallAgeMinutes), 10)
+	}
+	add(stallWatchExcludeNamespacesEnvKey, strings.Join(stallWatch.ExcludeNamespaces, stallWatchListSeparator))
+	add(stallWatchMinAgeEnvKey, stallWatchMinAge)
+	add(stallWatchKindsEnvKey, strings.Join(stallWatch.Kinds, stallWatchListSeparator))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -994,6 +1014,14 @@ const (
 	// gkeProjectEnvKey is the management project the reconcile reads, rendered on the
 	// container and pinned in the managed .env (see renderManagedEnv).
 	gkeProjectEnvKey = "GKE_PROJECT_ID"
+	// stallWatchExcludeNamespacesEnvKey, stallWatchMinAgeEnvKey and stallWatchKindsEnvKey
+	// carry spec.harness.stallWatch to stall_watch.py. They are pinned in the managed .env
+	// only (see renderManagedEnv), and the script names the same keys.
+	stallWatchExcludeNamespacesEnvKey = "STALL_WATCH_EXCLUDE_NAMESPACES"
+	stallWatchMinAgeEnvKey            = "STALL_WATCH_MIN_AGE_MINUTES"
+	stallWatchKindsEnvKey             = "STALL_WATCH_KINDS"
+	// stallWatchListSeparator joins a list field into one env value; the script splits on it.
+	stallWatchListSeparator = ","
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.

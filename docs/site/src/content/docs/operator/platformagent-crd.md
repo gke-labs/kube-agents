@@ -43,29 +43,32 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                          | Type   | Purpose                                                                                                                                                                                                                           |
-| ---------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                              |
-| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                              |
-| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                                                                                          |
-| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                                             |
-| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                               |
-| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                                          |
-| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the gateway pod's `agent-api-auth` sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile). |
-| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                                      |
-| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                                          |
-| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                                                                                             |
-| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
-| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
-| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
-| `driftDetector.enabled`                        | bool   | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below. |
-| `driftDetector.subscription`                   | string | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
-| `driftDetector.gitopsManagers`                 | string | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
-| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
-| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
-| `tuning.maxSessions`                           | int    | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.              |
-| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                  |
+| Field                                          | Type     | Purpose                                                                                                                                                                                                                           |
+| ---------------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clusterName`                                  | string   | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                              |
+| `location`                                     | string   | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                              |
+| `projectId`                                    | string   | GCP Project ID of the cluster. Required.                                                                                                                                                                                          |
+| `hermes.dashboardEnabled`                      | bool     | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                                             |
+| `hermes.pluginsDebug`                          | bool     | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                               |
+| `hermes.agentHome`                             | string   | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                                          |
+| `hermes.apiServerSecretRef.name` + `key`       | string   | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the gateway pod's `agent-api-auth` sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile). |
+| `hermes.sessionKVApiKeySecretRef.name` + `key` | string   | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                                      |
+| `hermes.sessionKVSaltSecretRef.name` + `key`   | string   | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                                          |
+| `memory.memoryEnabled`                         | bool     | Toggle framework memory persistence. Default `false`.                                                                                                                                                                             |
+| `memory.provider`                              | string   | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
+| `memory.userProfileEnabled`                    | bool     | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
+| `eventWatcher.enabled`                         | bool     | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
+| `driftDetector.enabled`                        | bool     | Start the `drift-detector`. Default `false`, because it needs a Pub/Sub subscription a hand-written CR or a Helm-only install does not create; `install.sh` creates one and sets this to `true` unless told otherwise. See below. |
+| `driftDetector.subscription`                   | string   | Pub/Sub subscription the detector pulls audit records from. Unset takes the detector's own default, which is the name the Terraform module creates.                                                                               |
+| `driftDetector.gitopsManagers`                 | string   | Comma-separated `managedFields` field managers belonging to your GitOps controller, matched exactly — `argocd-controller`, `flux`. Unset means no card is ever annotated as possibly already reconciled.                          |
+| `stallWatch.excludeNamespaces`                 | []string | Namespaces the stall watch never reads, on every cluster, as exact names. Unset = the system namespaces and annotated namespaces are skipped. See below.                                                                          |
+| `stallWatch.minStallAgeMinutes`                | int      | Minutes a stall must last before the stall watch raises a new alert for it (0–1440). Unset = `0`, alert on the first sweep that sees it.                                                                                          |
+| `stallWatch.kinds`                             | []string | Resources the stall watch scans, replacing its default list; `[all]` scans every namespaced kind. Unset = the default list.                                                                                                       |
+| `tuning.<persona>.apiMaxRetries`               | int      | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
+| `tuning.<persona>.maxTurns`                    | int      | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
+| `tuning.maxInProgress`                         | int      | Board-wide cap on concurrent kanban workers. Unset = operator default `6`.                                                                                                                                                        |
+| `tuning.maxSessions`                           | int      | Install-wide cap on concurrent A2A session pods (1–10000). Unset = operator default `10`. Inert under `mode: today`; a separate lane from `maxInProgress`. A stream too small for it makes the provision Job refuse.              |
+| `experimental.platformFrontDoor`               | bool     | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                  |
 
 `dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
 dashboard` binds `127.0.0.1`, so a request arriving over the pod network gets connection refused.
@@ -267,6 +270,76 @@ ownership is still read and reported, and you get the same cards without the ann
 Nothing else about the detector is exposed here. Which principals count as human, and which calls
 are dropped as failed or non-declarative, are compiled into the binary; what reaches it at all is
 set by the Terraform module's log sinks, not by the CR.
+
+### `spec.harness.stallWatch`
+
+The controller stall watch is the `stall-watch` cron job on the Platform Agent's roster. Every 30
+minutes it runs `stall_report.py` over the namespaces of each cluster that has a Cluster Agent
+profile, and raises one alert for each namespace with a new stall
+([autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/)). This block tunes what it
+reads and when it alerts. Absent, the watch skips the system namespaces and annotated namespaces,
+alerts on the first sweep that sees a stall, and scans its default list of kinds.
+
+```yaml
+spec:
+  harness:
+    stallWatch:
+      excludeNamespaces: [load-test, payments-canary]
+      minStallAgeMinutes: 30
+      kinds: [deployments, statefulsets, gateways.gateway.networking.k8s.io]
+```
+
+`excludeNamespaces` names namespaces the watch never reads, on every cluster. Each item is an exact
+namespace name; there is no wildcard. If a namespace has an open alert when you exclude it, the
+watch completes the alert's card with a note that the namespace was excluded, and the chat line says
+the same. Up to 100 names.
+
+`minStallAgeMinutes` holds a new alert until at least one stall in the namespace has lasted that
+long. A stall's age is the longer of two values: the age `stall_report.py` measures on the object
+(from its condition, its last spec write, or its warning events), and the time since the watch first
+saw the object stall. A spec write does not restart that second value, as long as the watch saw
+the object stall on one of its last two sweeps. A younger stall is not dropped: the watch keeps it in its ledger and checks it again on each
+sweep, so the alert follows on the first sweep after the stall is old enough. An object that starts
+to stall in a namespace with an open alert is added to that alert's card at once. The range is 0 to
+1440; unset or `0` alerts on the first sweep that sees the stall.
+
+`kinds` replaces the default list of resources the watch scans: Deployments, StatefulSets,
+DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and cert-manager Certificates. Write each
+item as kubectl names the resource, in lower case: `deployments`,
+`gateways.gateway.networking.k8s.io`. The single item `all` scans every namespaced kind the cluster
+serves, with one read per kind in each namespace, which is slow on a large fleet; the API server
+refuses `all` next to another item, and refuses Secrets, ConfigMaps, Events, Endpoints,
+EndpointSlices, ControllerRevisions and Leases, which the scan reports nothing from. Up to 20
+items. A kind a cluster does not serve is left out on
+that cluster.
+
+Separate from this block, the annotation `kubeagents.x-k8s.io/stall-watch: exempt` opts out
+without a CR change. On a namespace, the watch does not read the namespace, as if
+`excludeNamespaces` named it. On an object that `stall_report.py` reports (a Deployment, a Gateway,
+or any other kind the watch scans), the watch leaves that object's rows out of its alerts. If that
+leaves an open alert with no stall, the watch completes the alert's card with a note that names the
+annotation. The annotation is checked on each object alone: an exempt Deployment does not exempt the Gateway or the
+HTTPRoute in front of it. A Cluster Agent that runs the `gke-stall-detection` skill by hand still
+reports an exempt object.
+
+The operator delivers the three values through the agent's managed `.env` (see
+[How config reaches each profile](#how-config-reaches-each-profile)), so a change rolls the agent
+pod, and the agent cannot override a value from its own `.env`.
+
+The chart sets this block from `platformAgent.harness.stallWatch`. On an install made with
+`install.sh`, put the block in the `TF_VAR_extra_helm_values` line in `install.env`, which a
+full-mode `install.sh` or `upgrade.sh` run applies; a `helm upgrade --set` value is dropped by the
+next full-mode run, and the watch then goes back to its defaults. `install.env` holds one such
+line, so if it already has a `platformAgent` key, put `harness={stallWatch={...}}` inside that key
+([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) says how the line
+works):
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={harness={stallWatch={excludeNamespaces=["load-test"],minStallAgeMinutes=30}}}}'
+```
+
+On a hand-driven Terraform apply, set `extra_helm_values` in `terraform.tfvars` instead; on a bare
+Helm install, set the block in your values file.
 
 ### `spec.harness.tuning`
 
@@ -1082,7 +1155,7 @@ from chat. The platform credentials and endpoints that have no `config.yaml` equ
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
 
-That file also pins five values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
+That file also pins values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
 the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
 because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
 file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
@@ -1110,6 +1183,17 @@ project ahead of the metadata server, and a management project that changes iden
 old one's profiles, so a line the agent wrote into the PVC `.env` could otherwise re-point it and
 have two clean runs delete every profile of the real management project. Nothing in the operator
 or the chart sets the variable; the script treats the empty value as unset.
+
+On GKE, `GKE_PROJECT_ID` is also pinned, to `spec.harness.projectID`. The reconcile reads it as the
+management project when `RECONCILE_PROJECT` is empty, so it is pinned for the same reason. A kind
+install does not pin it, because the container env there carries no project.
+
+The stall watch's three knobs from [`spec.harness.stallWatch`](#specharnessstallwatch) are pinned too:
+`STALL_WATCH_EXCLUDE_NAMESPACES` (a comma list), `STALL_WATCH_MIN_AGE_MINUTES` and
+`STALL_WATCH_KINDS` (a comma list, or `all`). They are pinned on every install, empty when the CR
+does not set them, and the watch reads an empty value as its default. Each one changes what the
+watch reads or when it alerts, so a line the agent wrote into the PVC `.env` could otherwise silence
+alerts for a namespace nobody excluded. They are not in the container env.
 
 One consequence of the render is worth knowing: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than

@@ -408,6 +408,13 @@ type HarnessSpec struct {
 	// +optional
 	DriftDetector *DriftDetectorSpec `json:"driftDetector,omitempty"`
 
+	// StallWatch tunes the controller stall watch — the stall-watch cron job on the
+	// Platform Agent's roster that sweeps the fleet for controllers that stopped
+	// making progress and raises an alert for each new stall. Absent keeps the
+	// watch's built-in behaviour.
+	// +optional
+	StallWatch *StallWatchSpec `json:"stallWatch,omitempty"`
+
 	// Tuning sets per-persona execution limits. Unset values keep the defaults
 	// baked into the agent image.
 	// +optional
@@ -590,6 +597,56 @@ type DriftDetectorSpec struct {
 	// objects has the same effect as leaving it empty.
 	// +optional
 	GitopsManagers string `json:"gitopsManagers,omitempty"`
+}
+
+// StallWatchSpec configures the stall-watch cron job (stall_watch.py), which
+// runs stall_report.py over every non-system namespace of every cluster with a
+// Cluster Agent profile and raises an alert for each namespace with a new stall.
+//
+// Every field reaches the script through the managed .env, so a change rolls the
+// pod, and the agent cannot override a value through its own .env. Apart from
+// these fields, a namespace or an object with the annotation
+// `kubeagents.x-k8s.io/stall-watch: exempt` is left out of the watch's alerts.
+type StallWatchSpec struct {
+	// ExcludeNamespaces names namespaces the watch never reads, on every cluster,
+	// in addition to the system namespaces it always skips. Matched exactly. An
+	// open alert in a namespace added here is closed with a note that the
+	// namespace was excluded.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=100
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	ExcludeNamespaces []string `json:"excludeNamespaces,omitempty"`
+
+	// MinStallAgeMinutes holds a new alert until one of the namespace's stalls has
+	// lasted at least this long. The age is the longer of what stall_report.py
+	// measures on the object and how long the watch has seen it. A stall that is
+	// younger stays in the watch's ledger and is checked again on each run; an
+	// object that joins a namespace with an open alert is not held. Absent or 0
+	// alerts on the first run that sees the stall.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1440
+	// +optional
+	MinStallAgeMinutes *int32 `json:"minStallAgeMinutes,omitempty"`
+
+	// Kinds replaces the watch's default list of resources to scan (Deployments,
+	// StatefulSets, DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and
+	// cert-manager Certificates). Each item is a kubectl resource name such as
+	// `deployments` or `gateways.gateway.networking.k8s.io`. The single item `all`
+	// scans every namespaced kind the cluster serves, one read per kind per
+	// namespace, which is slow on a large fleet. Absent or empty keeps the
+	// default list. Secrets, ConfigMaps, Events, Endpoints, EndpointSlices,
+	// ControllerRevisions and Leases are refused: the scan reports nothing from
+	// them, and a Secret listing would carry every body.
+	// +listType=set
+	// +kubebuilder:validation:MaxItems=20
+	// +kubebuilder:validation:items:MaxLength=253
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k == 'all') || self.size() == 1",message="kinds: all must be the only item"
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k.split('.')[0] in ['secrets', 'secret', 'configmaps', 'configmap', 'cm', 'events', 'event', 'ev', 'endpoints', 'endpoint', 'ep', 'endpointslices', 'endpointslice', 'controllerrevisions', 'controllerrevision', 'leases', 'lease'])",message="kinds: secrets, configmaps, events, endpoints, endpointslices, controllerrevisions and leases are never scanned"
+	// +optional
+	Kinds []string `json:"kinds,omitempty"`
 }
 
 // TuningSpec carries execution limits per agent persona.
