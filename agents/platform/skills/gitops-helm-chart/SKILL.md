@@ -161,16 +161,18 @@ ahead without it."
 - **Source.** Take the chart repository URL and chart name from the
   project's own install guide, read in full, in this order:
   1. the Developer Knowledge MCP, for anything Google documents:
-     `mcp__developer_knowledge__search_documents(query=...)`, then
-     `mcp__developer_knowledge__get_documents(names=[...])` for the page
-     behind a chunk (never `answer_query`);
+     `mcp__developer_knowledge__search_documents(query=...)` finds the page,
+     `mcp__developer_knowledge__get_documents(names=[...])` reads it, and the
+     page is the source (never `answer_query`);
   2. the project's own repository through **inspect-repository** (its
      README, install docs and chart directory), for a third-party chart;
   3. `web_extract`, only where it returns page text: on an install whose
      web backend is search-only it never does.
 
   A search result is never a source: its snippets name forks, mirrors and
-  personal repositories as readily as the project. A chart found by search
+  personal repositories as readily as the project. It may point you to the
+  project's repository or guide; read that through one of the tools above,
+  never the snippet. A chart found by search
   on a mirror, a fork or a personal registry is not the project's chart;
   when the guide and other sources disagree, the guide wins, and the PR body
   says which sources you read. No guide you could read that names a chart:
@@ -185,15 +187,17 @@ ahead without it."
   substitute (for Substrate, `ghcr.io/kagent-dev` is a fork with different
   images and snapshot storage).
 - **Version.** The version the user named. Otherwise the highest semantic
-  version with no `-rc`, `-alpha` or `-beta` suffix, from the project's
-  repository (its chart's `Chart.yaml` and release tags, through
-  **inspect-repository**) or the chart repository's index. Compare versions, not
+  version with no `-rc`, `-alpha` or `-beta` suffix that the guide names, or
+  the chart's `Chart.yaml` at a release branch the guide names
+  (**inspect-repository** `--ref`). Never the default branch's `Chart.yaml`:
+  it can carry an unreleased version. No released version you could read:
+  ask the user for it. Compare versions, not
   dates: a backport patch to an older minor is often published last. Never a range, `latest`, or
   an empty version: a reconciler re-resolves those and upgrades on its own.
 - **Values.** Read the chart's `values.yaml` at that version and set only
   what the request or Step 4 needs. A copied default becomes a value someone
   has to own.
-- Record each URL you read; the PR body cites them.
+- Record each document, repository path or URL you read; the PR body cites them.
 
 ### Step 4: Name what the chart needs outside the cluster
 
