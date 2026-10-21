@@ -933,6 +933,14 @@
 # Gemini nightly (#3598).
 ./tasks/consistency-authorized-networks-probe/task.yaml
 
+# A user asks for the fleet audits' summaries that never reached the chat by
+# naming them; this sends that request for every shipped fleet audit and
+# grades the reply audit by audit against the report store
+# (report_store_reply), with fleet-audit-reports-past-run's route objective
+# and safeguards. deployer: noop, read-only, no fixture; three units at the
+# 200s default.
+./tasks/fleet-audit-request-line/task.yaml
+
 # gitops-drift-backlog-digest (#3387): records that queue while the drift
 # detector is not pulling are digested, not triaged one card each. The
 # fixture stops the detector process, publishes, and kills it, so the

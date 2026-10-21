@@ -93,7 +93,7 @@ the contract for why.
 
 A case whose spec reads live cluster state must declare it. A check that reads the
 agent's own install rather than the seeded fleet (the `bootstrap_*` checks,
-`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`) is not a fixture read, and a case carrying only those needs
+`sandbox_tree_matches_image`, `findings_item_state`, `oobe_audits_started`, `relay_posted_as_written`, `audit_chat_report_posted`, `audit_report_stored`, `report_store_reply`) is not a fixture read, and a case carrying only those needs
 no `fixtures:`. `fixtures: []` is the declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it. A
@@ -313,7 +313,13 @@ is in `state`. A listed row the queue does not hold is `status: "error"`, since 
 case's plant is missing. `audit_report_stored` reads the fleet-audit report store in the shell
 sandbox, then in the agent container, and passes when a `latest.json` for its `audit` finished since
 the run started, with `status` when it gives one and, for each `required_finding_phrases` entry, a
-finding in its `document` whose id contains it. `oobe_audits_started`, in its own module
+finding in its `document` whose id contains it. `report_store_reply`, in its own module
+(`bench/kube_agents_bench/report_store_reply.py`), reads the same store after the reply with the
+install's own `report_status.py`, and passes when each of its `audits` is mentioned in `final_message`
+and the reply carries the ledger URL of one of the audit's envelopes written before the turn (the
+newest, per repository store) or during it. An audit whose stores need no URL (a clean run with no
+open ledger, or no record before the turn) passes on the mention alone; which audit a URL is given
+to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
 of the four first-run audits as marked due and each has a run claimed since the stage marked it
