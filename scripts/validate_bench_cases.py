@@ -302,6 +302,9 @@ FIXTURE_NOT_READY = {
     "terraform-node-pool-autoscaling-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
+    "terraform-new-cluster-pr": (
+        "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "
