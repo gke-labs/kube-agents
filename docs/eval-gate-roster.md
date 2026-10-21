@@ -362,10 +362,11 @@ which made several cases a little worse without making any one of them fail thre
 version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
 presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
 the today lane's `today` only with today's; a case with no line at its key contributes nothing to
-`main`'s side. The next-mode nightly, the one next-mode run on `main` that records, runs a
-different agent model from the presubmit and so files under another key: until a next-mode run on
-`main` records at the presubmit's model, the presubmit prints the rate as advisory, with no
-baseline. The verdict prints it on every run:
+`main`'s side, with one exception below. The next-mode nightly, the one next-mode run on `main` that records, runs a
+different agent model from the presubmit and so files under another key. A case with no line at its
+next key falls back, for this number only, to its today-mode lines at the same key otherwise, and
+the verdict names those cases in a note; rung 6 never falls back. The verdict prints it on every
+run:
 
 ```
 Admitted-case pass rate: 91.7% (main: 92.4%, margin 10.0%)

@@ -1347,6 +1347,54 @@ def test_an_explicit_baseline_rate_still_overrides_the_store(tmp_path):
     ]) == 0
 
 
+def test_the_aggregate_falls_back_to_today_for_a_next_case_with_no_next_window(tmp_path, capsys):
+    """Rung 6 reads same-mode history only, but the admitted-case aggregate
+    is one advisory number for the whole run: a next-mode case with nothing
+    at its next key keeps main's today lines on main's side, as it had before
+    the mode was on the key, and the verdict says so."""
+    store = store_with(tmp_path, baseline_line("a", runs=20, passes=20))
+    doc = case_file(tmp_path, "a", version_key=NEXT_KEY, passes=3, scored=3)
+    out = tmp_path / "suite.json"
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store),
+        "--json-out", str(out),
+    ]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["baseline_rate"] == 1.0
+    printed = capsys.readouterr().out
+    assert "aggregate compared with today-mode history" in printed
+    assert "`a`" in printed
+
+
+def test_the_aggregate_prefers_same_mode_history(tmp_path, capsys):
+    """Where a next window exists the aggregate reads it, not today's, and
+    no fallback is reported."""
+    store = store_with(
+        tmp_path,
+        baseline_line("a", runs=20, passes=20),
+        baseline_line("a", runs=4, passes=1, key=NEXT_KEY, at="2026-08-02T00:00:00Z"),
+    )
+    doc = case_file(tmp_path, "a", version_key=NEXT_KEY, passes=3, scored=3)
+    out = tmp_path / "suite.json"
+    assert main([
+        "suite", "--case-result", str(doc), "--baseline-dir", str(store),
+        "--json-out", str(out),
+    ]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["baseline_rate"] == 0.25
+    assert "today-mode history" not in capsys.readouterr().out
+
+
+def test_the_mode_is_read_off_the_run_without_the_environment(kanban_task, tmp_path, monkeypatch, make_run):
+    """A next run regraded by hand with no AGENT_TRANSPORT exported still
+    files under next: its record carries the inject transport's task marker."""
+    monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+
+    def injected(rec):
+        rec.setdefault("trajectory", []).append({"name": "inject.task"})
+
+    doc = graded_case(kanban_task, [make_run(mutate=injected)], tmp_path / "case.json", store_with(tmp_path / "empty"))
+    assert doc["version_key"] == NEXT_KEY
+
+
 def test_an_unadmitted_case_contributes_nothing_to_either_side(tmp_path):
     """It failed everything and main passed everything, and the suite is still
     green: an unscreened case's rate is not yet a number worth comparing, and
@@ -1484,6 +1532,11 @@ def test_a_today_run_is_not_compared_with_next_history(kanban_task, tmp_path, mo
     doc = graded_case(kanban_task, runs, tmp_path / "case.json", _judged_history(tmp_path / "next", key=NEXT_KEY))
     assert doc["version_key"] == KEY
     assert doc["rung"] != 6 and doc["baseline_judged"] is None
+
+
+def test_an_inject_record_is_next_whatever_the_environment():
+    assert gate.graded_mode({}, inject_run=True) == "next"
+    assert gate.graded_mode({"AGENT_TRANSPORT": "api"}, inject_run=True) == "next"
 
 
 @pytest.mark.parametrize(

@@ -226,21 +226,26 @@ they cannot go stale:
 | `judge_model`     | `$JUDGE_MODEL`                 | The judge, pinned independently of the agent |
 | `fleet`           | `VERSIONS.json`                | The `bench/tf/fleet` state a task audits     |
 | `verifiers`       | `VERSIONS.json`                | `kube_agents_bench/verifiers.py` behaviour   |
-| `mode`            | `$AGENT_TRANSPORT`             | The `spec.mode` graded: `inject` is next     |
+| `mode`            | run, `$AGENT_TRANSPORT`        | The `spec.mode` graded: `inject` is next     |
 
 `mode` is `today` or `next`. `setupId` names the same agent model and harness
 under either, so without it a next-mode run would be compared with today's
 history, which is what redded the inject lane on rung 6 before the component
 existed. It is read off the transport rather than off `EVAL_MODE_NEXT`, because
 the today lane deploys under that flag and grades a rolled-back install over
-the api transport; `hack/ci-eval-pr.sh` exports `AGENT_TRANSPORT=inject` exactly
-when it grades a next install. `today` is the default and is never written: a
+the api transport: `next` when any repetition's record carries the inject
+transport's task marker (`inject.task` in its trajectory), else when
+`AGENT_TRANSPORT=inject` is set, which `hack/ci-eval-pr.sh` exports exactly when
+it grades a next install. `today` is the default and is never written: a
 key with no `mode` reads as `today`, so every line recorded before the component
 existed still matches today's key, and on GCS a `next` key's last directory
 segment gains a `-next` suffix while every `today` directory stays as it was.
 Rung 6 and admission therefore read only same-mode history; a `next` key with
 nothing recorded at it is the empty window (rung 6 quiet, nothing admitted by
 the record), and a partial one is compared like any other `collecting` window.
+The suite aggregate is the one exception: for a case graded at a `next` key with
+nothing recorded there, main's side uses the case's `today` lines at the same
+key otherwise, and the verdict names those cases in a note.
 
 The judge model is a component of its own, and is pinned independently of the
 agent model, because a judge that tracks whatever the agent is running cannot

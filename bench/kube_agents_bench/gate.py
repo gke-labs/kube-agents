@@ -103,6 +103,7 @@ from kube_agents_bench.scoring import (
     Rung,
     grade_case,
     grade_suite,
+    is_inject_record,
     load_run,
 )
 
@@ -129,8 +130,10 @@ TRANSPORT_INJECT = "inject"
 ROLLBACK_LANE_ENV = "EVAL_ROLLBACK_LANE"
 
 
-def graded_mode(env: dict[str, str] | None = None) -> str:
-    """The ``spec.mode`` the matrix graded: next under ``AGENT_TRANSPORT=inject``,
+def graded_mode(env: dict[str, str] | None = None, *, inject_run: bool = False) -> str:
+    """The ``spec.mode`` the matrix graded: next when a repetition's record is
+    the inject transport's (``inject_run``, read off the run like the other
+    run-derived components) or, failing that, under ``AGENT_TRANSPORT=inject``;
     today otherwise.
 
     Read off the transport rather than off ``EVAL_MODE_NEXT``, because the
@@ -138,8 +141,13 @@ def graded_mode(env: dict[str, str] | None = None) -> str:
     under it and grades a rolled-back install over the api transport.
     ``hack/ci-eval-pr.sh`` exports the inject transport exactly when it
     grades a next install (``EVAL_MODE_NEXT=1`` without
-    ``EVAL_ROLLBACK_LANE=1``), and the inject door exists only on one.
+    ``EVAL_ROLLBACK_LANE=1``), and the inject door exists only on one. The
+    record comes first so a next run regraded by hand without the variable
+    still files under next; the environment covers a run whose records carry
+    no trajectory to read the marker from.
     """
+    if inject_run:
+        return MODE_NEXT
     src = env if env is not None else os.environ
     return MODE_NEXT if src.get(AGENT_TRANSPORT_ENV, "") == TRANSPORT_INJECT else MODE_TODAY
 
@@ -412,8 +420,11 @@ def _cmd_case(args: argparse.Namespace) -> int:
         print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
         return 2
 
-    for run_dir in run_dirs:
-        record = load_run(run_dir) if run_dir else None
+    # The mode is the one component read across every repetition: any record
+    # carrying the inject transport's marker makes the run next's.
+    loaded = [load_run(d) if d else None for d in run_dirs]
+    inject_run = any(r is not None and is_inject_record(r.trajectory) for r in loaded)
+    for record in loaded:
         if record is None or record.empty_record:
             continue
         key = VersionKey.from_run(
@@ -421,7 +432,7 @@ def _cmd_case(args: argparse.Namespace) -> int:
             scoring_version=record.scoring_version,
             judge_model=args.judge_model or os.environ.get("JUDGE_MODEL"),
             versions=versions,
-            mode=graded_mode(),
+            mode=graded_mode(inject_run=inject_run),
         )
         if key is not None:
             break
@@ -642,7 +653,7 @@ def _read_case_results(paths: list[str]) -> list[dict[str, Any]] | str:
 
 def _baseline_rate(
     cases: list[dict[str, Any]], store: BaselineStore, bar: AdmissionBar
-) -> float | None:
+) -> tuple[float | None, list[str]]:
     """Main's pass rate over the same admitted cases this run graded.
 
     Pooled across cases rather than averaged over them, so a case with twenty
@@ -666,8 +677,19 @@ def _baseline_rate(
     -- and is left out of main's side here for the same reason: whatever
     main holds for it at this key would be pooled against a run that graded
     nothing of it, moving the comparison for nothing.
+
+    A case graded at a next key with nothing recorded there falls back to
+    the today key that differs from it only in mode, and is returned in the
+    second element so the verdict says so. Rung 6 never does this; the
+    aggregate does, because it is one advisory number over the whole run
+    (armed only by ``EVAL_AGGREGATE_ARMED``) and going dark until a next-mode
+    window exists at the presubmit's agent model would leave the merge gate
+    with no whole-suite comparison at all, where before the mode was on the
+    key it compared with today's history. Same-mode evidence wins wherever
+    it exists.
     """
     passes = runs = 0
+    fallback: list[str] = []
     for case in cases:
         if not case.get("admitted"):
             continue
@@ -676,16 +698,20 @@ def _baseline_rate(
         raw_key = case.get("version_key")
         if not isinstance(raw_key, dict):
             continue
-        evidence = store.evidence_for(
-            str(case.get("case") or ""),
-            VersionKey.from_dict(raw_key),
-            min_runs=bar.min_runs,
-        )
+        case_id = str(case.get("case") or "")
+        key = VersionKey.from_dict(raw_key)
+        evidence = store.evidence_for(case_id, key, min_runs=bar.min_runs)
+        if evidence is None and key.mode != MODE_TODAY:
+            evidence = store.evidence_for(
+                case_id, dataclasses.replace(key, mode=MODE_TODAY), min_runs=bar.min_runs
+            )
+            if evidence is not None:
+                fallback.append(case_id)
         if evidence is None:
             continue
         passes += evidence.passes
         runs += evidence.runs
-    return (passes / runs) if runs else None
+    return ((passes / runs) if runs else None), sorted(fallback)
 
 
 def _cmd_suite(args: argparse.Namespace) -> int:
@@ -707,8 +733,9 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # the number comes from the store, which is the whole point: the aggregate
     # rule was a flag nothing supplied, and so never fired.
     baseline_rate = args.baseline_rate
+    cross_mode: list[str] = []
     if baseline_rate is None:
-        baseline_rate = _baseline_rate(cases, store, AdmissionBar.from_env())
+        baseline_rate, cross_mode = _baseline_rate(cases, store, AdmissionBar.from_env())
 
     verdict = grade_suite(
         cases,
@@ -768,6 +795,14 @@ def _cmd_suite(args: argparse.Namespace) -> int:
             f"`{'`, `'.join(unknown)}` matched nothing this run graded. If "
             "that is a typo, the case it was meant to keep blocking is not "
             "blocking."
+        )
+    if cross_mode:
+        banners.append(
+            "> **NOTE — aggregate compared with today-mode history.** "
+            f"`{'`, `'.join(cross_mode)}` graded `next` with nothing recorded at "
+            "the next key, so main's side of the admitted-case rate uses its "
+            "today-mode lines at the same key otherwise. Rung 6 compares "
+            "same-mode history only."
         )
     for note in case_notes:
         print(f"WARNING: {note}", file=sys.stderr)
