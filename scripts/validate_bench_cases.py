@@ -287,6 +287,12 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs a GitOps repository that a reconciler is configured to sync to the
+    # target cluster; no pool project has one. Run by hand on the GitOps-wired
+    # dev lane (gitops-target-1, sackheads/kage-fleet-dev).
+    "helm-chart-gitops-pr": (
+        "#3576: needs a reconciler-synced GitOps path in the pool GitOps repositories"
+    ),
     "scope-excluded-cluster-not-listed": (
         "#3213: needs an eval install whose PlatformAgent spec.scope.exclude.clusters "
         "names seeded-b (seeded-a and seeded-c in scope); no pool install declares a "

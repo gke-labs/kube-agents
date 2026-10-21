@@ -119,6 +119,15 @@ for Config Sync) against `<repo>`, and its destination against the cluster.
 Argo CD usually runs on a hub, so its `spec.destination` (`server` or `name`)
 names the target, not the cluster the object sits on.
 
+Presence is decided by the spec, not the status. A reconciler object whose
+source and destination match counts even when it is failing: a `RootSync` or
+`RepoSync` with entries under `status.source.errors`,
+`status.rendering.errors` or `status.sync.errors`, an Application whose sync
+status is `Unknown` or health `Degraded`, a Kustomization with `Ready=False`.
+Use its form. Quote its error in the PR body's **After merge** line and in
+your reply: it installs nothing until it syncs again, and fixing it is the
+repository owner's step, not part of this request.
+
 | What you found                                                                                                            | Form                   |
 | ------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | An Argo CD `Application` or `ApplicationSet` deploying a directory of `<repo>` to the cluster                             | Argo CD                |
@@ -241,7 +250,7 @@ header:
   declared in this PR at <path>>, or "none".
 - **Not run here:** `helm template` and any dry-run. The agent has no route to the chart
   repository; the reconciler renders the chart after merge.
-- **After merge:** <reconciler> installs the release; check its status in <where>.
+- **After merge:** <reconciler> installs the release; check its status in <where>. Or, for a failing reconciler: <reconciler> reports `<error>` and installs nothing until it syncs again.
 ```
 
 Record the PR URL for the user. On a kanban card, a stop from Steps 1 to 4
