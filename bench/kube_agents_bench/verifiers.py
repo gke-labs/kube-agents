@@ -6421,14 +6421,20 @@ class BootstrapReportCriticalsVerifier(_OnboardingPollVerifier):
 
 
 # A title written as a bold line rather than a heading, as the Slack presenter also drops it.
-_BOLD_TITLE_RE = re.compile(r"^\s*\*\*[^*\n]+\*\*\s*$")
+# The report's one title line: a heading, or a bold line with no sentence end, as the Slack
+# presenter's title rule reads it. Only the first line can be the title.
+_TITLE_RE = re.compile(r"^\s*(?:#{1,6}\s.*|\*\*[^*\n]*[^*\n.!?\s]\s*\*\*)\s*$")
 
 
 def _report_body(text: str) -> str:
-    """The report with its heading lines and a leading bold title dropped, every run of whitespace one space."""
-    lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    """The report with its first line dropped when that line is its title, every run of whitespace one space.
+
+    Any other heading or bold line stays in the text, so a verdict written as a second heading
+    or as a bold sentence before the counts fails the opening check.
+    """
+    lines = text.splitlines()
     first = next((i for i, line in enumerate(lines) if line.strip()), None)
-    if first is not None and _BOLD_TITLE_RE.match(lines[first]):
+    if first is not None and _TITLE_RE.match(lines[first]):
         del lines[first]
     return " ".join(" ".join(lines).split())
 
@@ -6446,7 +6452,7 @@ class BootstrapReportPostureVerifier(_OnboardingPollVerifier):
     worker wrote, delivered copy first.
 
     ``posture``: the paragraphs the report opens with, after its heading, in
-    order. Passes when the report's text, headings dropped and whitespace
+    order. Passes when the report's text, its title line dropped and whitespace
     collapsed, starts with them, so a sentence added before or between them is
     a fail, and when none of ``forbidden_patterns`` (case-insensitive) matches
     anywhere in the report, headings included. No report, or one that cannot be read, is a fail; an

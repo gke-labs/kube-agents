@@ -193,7 +193,8 @@ def test_a_verdict_in_a_heading_fails(sandbox: Path) -> None:
     (sandbox / "INVENTORY.delivered.md").write_text(report)
     result = _verify(forbidden_patterns=VERDICTS)
     assert result.status == "fail"
-    assert "judges the fleet" in result.reason
+    # The second heading is report text, so the opening check fails first.
+    assert "does not open with the posture the SOP fixes" in result.reason
 
 
 def test_a_bold_title_counts_as_the_heading(sandbox: Path) -> None:
@@ -210,6 +211,19 @@ def test_a_roll_up_that_counts_no_critical_findings_judges_nothing(sandbox: Path
     (sandbox / "INVENTORY.delivered.md").write_text(report)
     result = _verify()
     assert result.status == "pass", result.reason
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["## Fleet status: healthy, no active outages", "**No critical vulnerabilities or active outages were detected.**"],
+)
+def test_a_verdict_heading_or_bold_sentence_before_the_counts_fails_the_opening(sandbox: Path, line: str) -> None:
+    # Only the first line can be the title; a second heading or a bold sentence is report text.
+    report = _report(*_objective()["posture"]).replace("# GKE Environment Scan", f"# GKE Environment Scan\n\n{line}")
+    (sandbox / "INVENTORY.delivered.md").write_text(report)
+    result = _verify()
+    assert result.status == "fail"
+    assert "does not open with the posture the SOP fixes" in result.reason
 
 
 def test_a_word_that_contains_a_verdict_is_not_one(sandbox: Path) -> None:
