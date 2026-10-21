@@ -352,20 +352,21 @@ class GateAndReportingTests(unittest.TestCase):
             "kind": None,
             "computeClass": None,
             "activeRank": "bad",
-            "floorShare": "bad",
+            "floorShare": "NaN",
             "contributingFactors": [None, "factor-a"],
         }
         norm_r = watch.normalize_rank_finding("p1/us-central1/c1", weird_rank)
         self.assertEqual(norm_r["observed_skew"], 0)
         self.assertEqual(norm_r["max_domain_share"], 0.0)
         self.assertEqual(norm_r["contributing_factors"], ["factor-a"])
+        self.assertEqual(watch._float("Infinity", 0.0), 0.0)
 
     def test_failing_project_at_full_timeout_is_stamped_so_tail_projects_rotate(self) -> None:
         with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "p1,p2"}, clear=False):
             def fake_run(argv, **kw):
                 target = argv[-1]
                 if target == "p1":
-                    return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="p1 broken")
+                    raise subprocess.TimeoutExpired(cmd=argv, timeout=watch.PROJECT_TIMEOUT_SECONDS)
                 return completed_json(make_report([{"cluster": "p2/us-central1/c2", "status": "ok"}], T0))
 
             code, out = self.run_tick(fake_run, now=T0)
@@ -411,12 +412,37 @@ class GateAndReportingTests(unittest.TestCase):
             }
             self.run_tick(lambda *a, **kw: completed_json(make_report([c_skewed], T0)), now=T0)
 
-            # Day 1: clean scan in --clusters mode with empty topology_findings retires the finding.
+            # Day 1: clean scan in --clusters mode returning full triple retires bare ledger entry.
             t1 = T0 + timedelta(days=1)
-            c_clean = {"cluster": "seeded-d", "status": "ok", "topology_findings": []}
+            c_clean = {"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": []}
             code, out = self.run_tick(lambda *a, **kw: completed_json(make_report([c_clean], t1)), now=t1)
             self.assertEqual(code, 0)
             self.assertIn("retired from the watch", out)
+
+        # Also verify cross-project same-bare-name safety: p1/us-central1/prod ok does NOT retire
+        # p2/us-east1/prod when p2 failed to scan.
+        self.assertFalse(
+            watch.can_retire_finding(
+                "p2/us-east1/prod/ns/Deployment/app/topology.kubernetes.io/zone/leeway.placement_drift",
+                {"cluster": "p2/us-east1/prod"},
+                ok_clusters={"p1/us-central1/prod"},
+                cluster_errors={},
+                scanned_projects={"p1"},
+                scan_errors={"p2": "scan failed"},
+            )
+        )
+        # And verify a de-scoped cluster in explicit_targets mode is retired when the sweep is clean.
+        self.assertTrue(
+            watch.can_retire_finding(
+                "p2/us-east1/old/ns/Deployment/app/topology.kubernetes.io/zone/leeway.placement_drift",
+                {"cluster": "p2/us-east1/old"},
+                ok_clusters={"p1/us-central1/seeded-d"},
+                cluster_errors={},
+                scanned_projects=set(),
+                scan_errors={},
+                explicit_targets={"p1/us-central1/seeded-d"},
+            )
+        )
 
 
 class DiscoveryTests(unittest.TestCase):

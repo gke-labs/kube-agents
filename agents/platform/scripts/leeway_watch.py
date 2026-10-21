@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -415,9 +416,10 @@ def _float(value: object, default: float = 0.0) -> float:
     if value is None or isinstance(value, bool):
         return default
     try:
-        return float(value)  # type: ignore[arg-type]
+        parsed = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+    return parsed if math.isfinite(parsed) else default
 
 
 def _str_list(value: object) -> list[str]:
@@ -879,7 +881,7 @@ def sweep_fleet(
         project_runs[proj] = iso(now)
 
     if not reports and scan_errors:
-        reasons = "; ".join(f"{k}: {v}" for k, v in sorted(scan_errors.items()))
+        reasons = format_name_list([f"{k}: {v}" for k, v in sorted(scan_errors.items())])
         raise RuntimeError(reasons)
 
     return merge_reports(reports, now), project_runs, scan_errors, error_kinds, scanned_projects, explicit_targets
@@ -896,23 +898,23 @@ def can_retire_finding(
 ) -> bool:
     """Return True when a prior finding's absence is backed by a clean read."""
     cluster = str(prior_entry.get("cluster") or key.split(CLUSTER_KEY_SEPARATOR, 1)[0])
+    is_bare_ledger_cluster = CLUSTER_KEY_SEPARATOR not in cluster
     bare_cluster = cluster.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1]
     error_bare = {c.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for c in cluster_errors}
-    if cluster in cluster_errors or bare_cluster in error_bare:
+    if cluster in cluster_errors or (is_bare_ledger_cluster and bare_cluster in error_bare):
         return False
     ok_bare = {c.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for c in ok_clusters}
-    if cluster in ok_clusters or bare_cluster in ok_bare:
+    if cluster in ok_clusters or (is_bare_ledger_cluster and bare_cluster in ok_bare):
         return True
     targets = explicit_targets or set()
-    target_bare = {c.rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1] for c in targets}
-    if targets and (cluster in targets or bare_cluster in target_bare) and not scan_errors:
-        return True
+    if targets:
+        return not scan_errors and not cluster_errors
     # If the cluster was not in the report at all, retire when its project was
     # cleanly scanned or when the entire sweep succeeded with zero scan/cluster errors.
-    proj = cluster.split(CLUSTER_KEY_SEPARATOR, 1)[0] if CLUSTER_KEY_SEPARATOR in cluster else ""
+    proj = cluster.split(CLUSTER_KEY_SEPARATOR, 1)[0] if not is_bare_ledger_cluster else ""
     if proj and proj in scanned_projects and proj not in scan_errors:
         return True
-    if not targets and scanned_projects and not scan_errors and not cluster_errors:
+    if scanned_projects and not scan_errors and not cluster_errors:
         return True
     return False
 
@@ -950,7 +952,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
     partial_sig = sorted(set(all_error_kinds.values()))
     if partial_sig:
         if announced.get(ANNOUNCED_PARTIAL_KEY) != partial_sig:
-            reasons = "; ".join(f"{k}: {v}" for k, v in sorted(all_errors.items()))
+            reasons = format_name_list([f"{k}: {v}" for k, v in sorted(all_errors.items())])
             lines.append(
                 PARTIAL_LINE.format(
                     prefix=LINE_PREFIX,
