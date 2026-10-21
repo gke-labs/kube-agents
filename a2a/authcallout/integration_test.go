@@ -212,18 +212,11 @@ func startHarness(t *testing.T, identityMap string, tokens map[string]Attested, 
 	opts.HTTPPort = -1
 	opts.StoreDir = t.TempDir()
 
-	srv, err := natsserver.NewServer(opts)
+	// startNatsServer keeps the server's own log, so a server that never
+	// becomes ready fails the test with its reason rather than a timeout.
+	srv, err := startNatsServer(opts, 10*time.Second)
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	// A listener the server cannot bind is reported through Fatalf before
-	// Start returns, and NoLog leaves it with no logger to report to, so the
-	// server's own lines are kept for the failure below.
-	startup := &startupLog{}
-	srv.SetLoggerV2(startup, false, false, false)
-	go srv.Start()
-	if !srv.ReadyForConnections(10 * time.Second) {
-		t.Fatalf("nats-server not ready; its log:\n%s", startup.String())
+		t.Fatal(err)
 	}
 	t.Cleanup(srv.Shutdown)
 

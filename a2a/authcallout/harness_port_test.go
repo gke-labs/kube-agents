@@ -3,6 +3,7 @@ package authcallout
 import (
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -13,27 +14,33 @@ import (
 // nats.conf and moves every port that render pins to a free one. A port it
 // forgets is a port the test shares with everything else on the host, and
 // nats-server reports a listener it cannot bind through Fatalf and returns
-// from Start, so the only symptom is the ReadyForConnections timeout: the
-// bare "nats-server not ready" the flaky-check issues quote.
+// from Start, so without the log startNatsServer keeps the only symptom is
+// the ReadyForConnections timeout: the bare "nats-server not ready" the
+// flaky-check issues quote.
 
 // renderedMonitorPort is the monitoring port the fixture pins (`http: 8222`).
 // The test holds it for its duration and asserts the harness does not need it.
-const renderedMonitorPort = "8222"
+const renderedMonitorPort = 8222
 
 func TestTheHarnessStartsWhileTheRenderedMonitorPortIsTaken(t *testing.T) {
 	rendered, err := os.ReadFile("testdata/rendered-nats.conf")
 	if err != nil {
 		t.Fatalf("reading the operator's rendered nats.conf: %v", err)
 	}
-	if !strings.Contains(string(rendered), "http: "+renderedMonitorPort) {
-		t.Fatalf("the rendered nats.conf no longer pins http: %s; move this test's holder to the port it pins now", renderedMonitorPort)
+	if !strings.Contains(string(rendered), "http: "+strconv.Itoa(renderedMonitorPort)) {
+		t.Fatalf("the rendered nats.conf no longer pins http: %d; move this test's holder to the port it pins now", renderedMonitorPort)
 	}
 
-	holder, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", renderedMonitorPort))
+	// Whoever holds the port stages the collision. When another process on
+	// the host already has it, that process is the holder and the test runs
+	// the same; a listener on any address of the port refuses the render's
+	// wildcard bind.
+	holder, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(renderedMonitorPort)))
 	if err != nil {
-		t.Skipf("port %s is already taken on this host, so the collision cannot be staged: %v", renderedMonitorPort, err)
+		t.Logf("port %d is already held on this host, which stages the collision without this test's own holder: %v", renderedMonitorPort, err)
+	} else {
+		t.Cleanup(func() { _ = holder.Close() })
 	}
-	t.Cleanup(func() { _ = holder.Close() })
 
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 
@@ -41,8 +48,8 @@ func TestTheHarnessStartsWhileTheRenderedMonitorPortIsTaken(t *testing.T) {
 	if monitor == nil {
 		t.Fatal("the harness started with no monitor listener; the render has one and the fixture should keep its shape")
 	}
-	if got := monitor.Port; got == holder.Addr().(*net.TCPAddr).Port {
-		t.Fatalf("the monitor reports port %d, the one this test is holding", got)
+	if monitor.Port == renderedMonitorPort {
+		t.Fatalf("the monitor reports port %d, the one the render pins and this test holds", monitor.Port)
 	}
 
 	nc, _ := h.connectAs(t, "gateway", gatewayToken)

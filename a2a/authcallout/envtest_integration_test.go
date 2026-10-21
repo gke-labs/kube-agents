@@ -188,15 +188,9 @@ func startLiveHarness(t *testing.T) *liveHarness {
 	// see startHarness.
 	opts.Port, opts.Websocket.Port, opts.HTTPPort = -1, -1, -1
 	opts.StoreDir = t.TempDir()
-	srv, err := natsserver.NewServer(opts)
+	srv, err := startNatsServer(opts, 20*time.Second)
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	startup := &startupLog{}
-	srv.SetLoggerV2(startup, false, false, false)
-	go srv.Start()
-	if !srv.ReadyForConnections(20 * time.Second) {
-		t.Fatalf("nats-server not ready; its log:\n%s", startup.String())
+		t.Fatal(err)
 	}
 	t.Cleanup(srv.Shutdown)
 
