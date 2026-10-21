@@ -101,11 +101,10 @@ verification_spec:
       any_of_phrases:
         ["authorized network", "authorizednetworks", "authorized-networks"]
   # The route (#3605, #3609): the comparison is the drift collector's run.
-  # Graded on api-lane runs (the nightly, the -today presubmit); the blocking
-  # presubmit runs the inject lane since #3156, where worker_commands checks
-  # are set aside as not applicable (#2039), so there the reply check alone
-  # gates. Same shape as drift-chat-request-runs-collector's
-  # the-drift-collector-ran.
+  # Graded on api-lane runs (the nightly, where this case lives since #3598);
+  # an inject-lane run sets worker_commands checks aside as not applicable
+  # (#2039), so there the reply check alone grades. Same shape as
+  # drift-chat-request-runs-collector's the-drift-collector-ran.
   - name: the-comparison-ran-the-drift-collector
     role: objective
     mode: assert
