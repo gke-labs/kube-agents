@@ -273,6 +273,48 @@ environment knobs (`UPGRADE_READINESS_REFRESH_DAYS`, `_PROJECTS`,
 `_WATCH_HOME`) are for a run started by hand in the pod; the operator's
 `spec.deployment.env` allowlist does not carry them.
 
+## `sa-role-watch` says when the agent's account holds more than `read-only`
+
+The install grants the agent's Google service account the `read-only`
+permission set, and the installer warns about an admin role in a `custom` set,
+but only when the set is chosen. A role granted afterwards, by hand or by
+another tool, is what the Google-hosted GKE MCP server acts with when the agent
+container calls it on that account's credentials, and nothing in the product
+said so. `sa_role_watch.py` is that check.
+
+Each tick reads, through the shell sandbox and so through the credential
+broker, the `PlatformAgent` in the agent's namespace and the ServiceAccount it
+runs the agent and broker pods as. The ServiceAccount's
+`iam.gke.io/gcp-service-account` annotation is the account the agent
+container's own credentials resolve to; the CR's
+`spec.security.workloadIdentityFederation`, when both its fields are set, is the
+one the broker impersonates instead, and both are checked. With federation
+armed, an absent annotation is said once, since the agent container then has no
+Google credential of its own; with neither, there is no account to check and the
+job reports a check failure, once. A role bound to the ServiceAccount's own
+Workload Identity principal is not checked (#3450). Then `gcloud projects get-iam-policy` runs for the management project and
+each project in the resolved `spec.scope` (`fleet_scope_targets`), four at a
+time, and every role bound to one of those accounts that is not in the script's
+`READ_ONLY_ROLES` is a finding. `tests/test_agent_iam_ceiling.py` holds that
+list equal to `read_only_roles` in the full-install composition.
+
+It keeps a ledger at `profiles/platform/cron/sa_role_watch.json`, the way
+`stall-watch` does, so chat hears a role on the tick it first appears and again
+when it goes. A role still held is said again once a day, on the first tick from
+12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats: a
+grant said once in a busy channel can be missed, and nothing else would raise it
+again. Any other tick on an unchanged account prints nothing. That is why it can run
+hourly: a fresh install or a new grant is named within the hour, and a quiet
+hour costs one `kubectl` pair and one policy read per project, no model turn. A
+project whose policy cannot be read keeps its last answer and its failure is
+said once. So does a project missing from a scope the tick could read only in part (the
+render unreadable, or members the reconcile has not resolved), and the partial
+scope is said once. Losing the shell sandbox mid-tick is one failure line, not
+one per project. It reads project-level bindings only: a role granted on a folder,
+the organisation or a group is not in that answer, and reading those needs
+verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
+is reported like any other grant, and repeated daily like one.
+
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
 The third shape, and the reason it is here rather than anywhere else: it is
@@ -415,12 +457,13 @@ concurrently with itself, writing its ledger issue twice. The per-job lock
 ## `deliver` is `"local"` on exactly one job
 
 Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
-values, with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
+values (`"chat"` alone for a fleet-audit job, see below), with one exception below. `cron/scheduler_delivery.py::_resolve_delivery_targets`
 returns an **empty target list** for `"local"` — the outcome is written to
 `last_output` and delivered nowhere. A watchdog whose run failed would then be
 indistinguishable from a quiet fleet. Both audible values carry a failure: the
 scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
-on the same leg.
+on the same leg, and the relay posts that line as written for a fleet-audit job
+too.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
@@ -455,18 +498,26 @@ child can address every enabled channel itself, both copies land
 ([design](../../../docs/designs/cron-report-relay.md)).
 
 `deliver: "chat"` hands the run's report to the relay instead, which posts it as
-written (on Slack, a fleet-audit report is replaced by a headline linking its
-ledger issue) and stores the full report against its thread, so the user's reply there reaches the
-Chat Agent with the report attached. It is a delivery mode, not a
+written and stores the full report against its thread, so the user's reply there reaches the
+Chat Agent with the report attached. A fleet-audit job the image ships is the
+exception: its scheduled delivery posts the report the run's `finish` rendered,
+not the final message,
+which holds whatever else the model wrote in its last turn. A run over several
+repositories posts each finished repository's report, then a line naming any it
+did not finish. A failed run posts the scheduler's failure line, which says why,
+and a run that finished no repository without failing posts a one-line notice
+that it did not finish. On Slack the report is then replaced by a headline linking its
+ledger issue when the run covered one repository; a message with that line, or
+with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
 dual-platform install whose cron child can address both, a job left on `"all"`
-is heard twice on _each_ of them rather than twice in one place. Two entries here name `"all"`
-(`gcp-networking-fabric-audit` and `gce-compute-fleet-audit`) and accept that;
-the rest name `"chat"`.
+is heard twice on _each_ of them rather than twice in one place. Under `"all"`
+the scheduler also posts the final message itself, past the relay's choice of
+report, so every entry here names `"chat"`.
 
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
@@ -481,7 +532,7 @@ instruction, and what the plugin route costs — is
 
 ## Moving the roster onto `"chat"` needed no migration
 
-Every report-producing job here names `"chat"` or `"all"`, and getting there was an edit to this file alone
+Every report-producing job here names `"chat"`, and getting there was an edit to this file alone
 — no script, no one-off Job, nothing run against a live volume. `deliver` is an
 image-owned key on this profile: `merge_cron_store` gives the image every key it
 ships and leaves the volume only the keys it does not, so the next pod start
@@ -596,7 +647,7 @@ rule outlives the memory of why:
   Platform Agent marks the job due for the next tick instead of running the SOP
   itself. The one run that does happen in a session (#1876, #1887): a card that
   delegates exactly one stream per its SOP is run by that worker through
-  `audit_report.py start … finish` (`skills/fleet-audit/SKILL.md`, "Running a
+  `audit_report.py start … finish` (`skills/fleet-audit/references/on-demand.md`, "Running a
   stream on demand"); several streams still queue.
   Such a run holds no per-job lock, so `start` keeps its own guard: an
   in-flight note per stream on the sandbox pod's own volume, at

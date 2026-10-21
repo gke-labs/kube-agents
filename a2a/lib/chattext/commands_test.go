@@ -118,3 +118,45 @@ func TestIsSessionCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestIsFeedbackCommand(t *testing.T) {
+	yes := map[string]string{
+		"/feedback":                          "",
+		"/FEEDBACK":                          "",
+		"  /feedback  ":                      "",
+		"/feedback\n":                        "",
+		"/feedback the report posted twice":  "the report posted twice",
+		"/feedback\nthe status line stuck":   "the status line stuck",
+		"/Feedback\tbutton labels are wrong": "button labels are wrong",
+	}
+	for in, want := range yes {
+		got, ok := IsFeedbackCommand(in)
+		if !ok || got != want {
+			t.Errorf("IsFeedbackCommand(%q) = (%q, %v), want (%q, true)", in, got, ok, want)
+		}
+	}
+	no := []string{"/feedbacks", "/feedbackform", "feedback", "/ feedback", "please /feedback", "/session feedback", "/", ""}
+	for _, in := range no {
+		if got, ok := IsFeedbackCommand(in); ok {
+			t.Errorf("IsFeedbackCommand(%q) = (%q, true), want false", in, got)
+		}
+	}
+}
+
+func TestIsCommandCountsOnlyTheBareFeedbackForm(t *testing.T) {
+	if !IsCommand("/feedback") {
+		t.Error("a bare /feedback is a gateway command; a button must not carry it")
+	}
+	if IsCommand("/feedback the report posted twice") {
+		t.Error("/feedback <text> is an ordinary turn; a button may carry it")
+	}
+}
+
+func TestFeedbackLinksAreTheOnesThePersonasHandOut(t *testing.T) {
+	if FeedbackTrackerURL != "https://github.com/gke-labs/kube-agents/issues" {
+		t.Errorf("tracker = %q", FeedbackTrackerURL)
+	}
+	if FeedbackFormURL != "https://gke-labs.github.io/kube-agents/feedback" {
+		t.Errorf("form short link = %q", FeedbackFormURL)
+	}
+}

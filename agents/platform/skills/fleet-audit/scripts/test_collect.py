@@ -8291,6 +8291,8 @@ class TestIsAiWorkload(unittest.TestCase):
             "GEMINI_API_KEY",
             "COHERE_API_KEY",
             "MISTRAL_API_KEY",
+            # LiteLLM's hosted_vllm handler: the gateway's only key under openai_compatible.
+            "HOSTED_VLLM_API_KEY",
             "HF_TOKEN",
             "HUGGING_FACE_HUB_TOKEN",
             "REPLICATE_API_TOKEN",
@@ -11971,8 +11973,11 @@ class TestNamespaceDirectories(unittest.TestCase):
 
     def test_the_excluded_root_still_answers_for_its_own_namespace(self):
         """The exclusion is scoped to the cluster arm's count. The namespace
-        the overlay renders into still resolves to it, which is what
-        `audit_report.wire_kustomize_additions` then wires.
+        the overlay renders into still resolves to it. A new object there
+        renders only if the overlay's kustomization lists its file, and a
+        remediation carries one file. So the SOPs make that fix `manual`, and
+        `audit_report.degrade_unlisted_kustomize_additions` makes a `manifest`
+        fix that adds an unlisted file `manual` too.
         """
         found = self.resolve(
             self.overlaid(

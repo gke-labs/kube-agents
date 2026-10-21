@@ -168,6 +168,10 @@ check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTR
 # (hermes-bridge), published by the release workflow beside the A2A images,
 # and the operator renders it under next (check 2 holds its compiled name).
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
+# The GHES proxy, an eval fixture (hack/ghes-proxy/README.md): built and
+# deployed by hand or by an eval lane, never by an install.
+check_base_image golang hack/ghes-proxy/Dockerfile GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static hack/ghes-proxy/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 
 # The agent plugin images pin their base with a literal `FROM repo:tag@digest`
 # rather than an ARG pair, so the ARG check above never reaches them. This
@@ -290,6 +294,7 @@ check_go_directive a2a/Dockerfile.verifier GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.hermes-bridge GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.console GOLANG_VERSION a2a/go.mod
+check_go_directive hack/ghes-proxy/Dockerfile GOLANG_VERSION hack/ghes-proxy/go.mod
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
@@ -511,7 +516,7 @@ check_mirror_prefix() {
     [ -n "$image" ] || continue
     case "$image" in
     "$MIRROR"/*) ;;
-    *) fail "$label: with global.imageRegistry set, the chart still renders '$image' outside the mirror." ;;
+    *) fail "$label: with global.imageRegistry and global.thirdPartyImageRegistry set, the chart still renders '$image' outside the mirror." ;;
     esac
   done <<<"$images"
 }
@@ -539,7 +544,7 @@ check_mirror_names() {
     split_ref "$image"
     segment="${ref_repo##*/}"
     grep -qxF "$segment" <<<"$inventory_names" ||
-      fail "$label: with global.imageRegistry set, the chart renders '$image', but no $INVENTORY entry is named '${segment}' — 'make mirror-images' pushes each image to <prefix>/<name>, so nothing ever pushed there. Either rename the entry or pass the real name to kube-agents.thirdPartyImage."
+      fail "$label: with global.imageRegistry and global.thirdPartyImageRegistry set, the chart renders '$image', but no $INVENTORY entry is named '${segment}' — 'make mirror-images' pushes each image to <prefix>/<name>, so nothing ever pushed there. Either rename the entry or pass the real name to kube-agents.thirdPartyImage."
   done <<<"$images"
 }
 
@@ -573,7 +578,7 @@ check_toggle() {
   shift
   local rendered mirrored_rendered added mirrored_added
   rendered="$(render_chart "$@")" || exit 1
-  mirrored_rendered="$(render_chart "$@" --set "global.imageRegistry=$MIRROR")" || exit 1
+  mirrored_rendered="$(render_chart "$@" --set "global.imageRegistry=$MIRROR,global.thirdPartyImageRegistry=$MIRROR")" || exit 1
   added="$(added_images "$(image_refs <<<"$rendered")" "$default_images")"
   mirrored_added="$(added_images "$(image_refs <<<"$mirrored_rendered")" "$mirrored_images")"
   [ -n "$added" ] || {
@@ -586,7 +591,7 @@ check_toggle() {
 }
 
 default_render="$(render_chart)" || exit 1
-mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR")" || exit 1
+mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR,global.thirdPartyImageRegistry=$MIRROR")" || exit 1
 default_images="$(image_refs <<<"$default_render")"
 mirrored_images="$(image_refs <<<"$mirrored_render")"
 

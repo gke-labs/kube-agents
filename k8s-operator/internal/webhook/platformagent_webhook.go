@@ -284,6 +284,13 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 				fmt.Sprintf("binding to privileged service account %q is forbidden", sa),
 			))
 		}
+		// The name the broker and its Workload Identity binding run as must not
+		// be one the operator mints for another workload: the gateway, the A2A
+		// session pods and the rest would then share the broker's cloud
+		// identity, and two reconcilers would fight over one ServiceAccount.
+		if msg := controller.ReservedServiceAccountOverride(platformAgent); msg != "" {
+			allErrs = append(allErrs, field.Forbidden(field.NewPath("spec", "security", "serviceAccountName"), msg))
+		}
 	}
 
 	// 4. Validate the forge integration. Each forge and each repository on it is

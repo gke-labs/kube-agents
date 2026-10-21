@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -56,6 +57,13 @@ const (
 	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
 	// the heap approaches it; it does not cap live heap.
 	memoryLimitFraction = 0.5
+	// defaultGatewayWait outlasts two of the agent container's startup probe
+	// budgets (agentAPIProbe(10, 90) in platformagent_manifests.go, 905s)
+	// plus the kill grace period and restart backoff between them. A boot
+	// that overruns one budget is restarted, and the restarted entrypoint
+	// redoes its profile steps before the gateway binds, so a single budget
+	// would give up on exactly the slowest boots.
+	defaultGatewayWait = 35 * time.Minute
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -93,6 +101,8 @@ type flags struct {
 	dryRun           bool
 	metricsAddr      string
 	snapshotInterval time.Duration
+	gatewayURL       string
+	gatewayWait      time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -135,6 +145,8 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.dryRun, "dry-run", false, "Print inject payloads to stdout without calling the daemon.")
 	fs.StringVar(&f.metricsAddr, "metrics-addr", "", "Prometheus /metrics + /healthz listener address (host:port). Empty = disabled.")
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
+	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
+	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -195,6 +207,20 @@ func (f *flags) validate() error {
 	}
 	if f.snapshotInterval < 0 {
 		return errors.New("--snapshot-interval must be >= 0")
+	}
+	if f.gatewayURL != "" && f.gatewayWait <= 0 {
+		return errors.New("--gateway-wait must be > 0 when --gateway-url is set")
+	}
+	if strings.HasSuffix(f.gatewayURL, "/") {
+		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
+	}
+	// Checked here because a URL the probe cannot use fails every attempt the
+	// way a gateway that is not up yet does, and would hold the informers for
+	// the whole wait.
+	if f.gatewayURL != "" {
+		if u, err := url.Parse(f.gatewayURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("--gateway-url must be an http:// or https:// URL with a host (got %q)", f.gatewayURL)
+		}
 	}
 	// Cluster sources are additive, not exclusive: --profiles-dir contributes
 	// every Cluster Agent profile, and --in-cluster / --kubeconfig contributes
@@ -629,7 +655,10 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		result = reopened
 	}
 	// Create or reuse a troubleshooter session, then inject event telemetry.
+	// opened says this dispatch created the session, which is what
+	// triageSessions counts once the inject below is delivered.
 	sid := d.targetSid
+	opened := false
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
@@ -644,6 +673,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			return
 		}
 		sid = newSid
+		opened = true
 		d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "ok").Inc()
 		d.dedup.BindSession(ev.Key, ev.Message, sid)
 	}
@@ -721,6 +751,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		return
 	}
 	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+	if opened {
+		d.metrics.triageSessions.WithLabelValues(ev.Cluster, ev.Project, ev.Location).Inc()
+	}
 	log.Printf("fire %s pod=%s/%s → sid=%s (mode=%s)",
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
@@ -848,6 +881,22 @@ func realMain(argv []string) error {
 	clusters, err := buildWatchSet(ctx, f, m)
 	if err != nil {
 		return err
+	}
+
+	// After buildWatchSet, so a watch set that cannot be built still exits
+	// at once and counts as a failed start to the entrypoint's supervisor;
+	// before any dedup cache, so nothing is restored or snapshotted while
+	// the process may yet be a standby. cluster_up is published at 0 first,
+	// so the wait reads as "registered, not yet watching" rather than as no
+	// watcher at all.
+	if f.gatewayURL != "" && !f.dryRun {
+		for _, tc := range clusters {
+			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+		}
+		waitForGateway(ctx, f.gatewayURL, f.gatewayWait, gatewayProbeInterval)
+		if ctx.Err() != nil {
+			return nil
+		}
 	}
 	if f.dryRun {
 		log.Printf("k8s-event-watcher: running in --dry-run mode; watching %d cluster(s) without calling the daemon", len(clusters))

@@ -20,6 +20,7 @@ from chat_metrics import metrics  # noqa: E402
 from chat_metrics import plugin  # noqa: E402
 
 _SERIES_LINE = re.compile(r'^kubeagents_chat_messages_inbound_total\{platform="([a-z]+)"\} (\d+)$', re.M)
+_SESSIONS_LINE = re.compile(r'^kubeagents_chat_sessions_total\{platform="([a-z]+)"\} (\d+)$', re.M)
 
 
 def _event(platform="google_chat", text="hi"):
@@ -50,9 +51,24 @@ class RegistryTest(unittest.TestCase):
         self.assertEqual("3", got["other"])
         self.assertNotIn("telegram", self.registry.render())
 
+    def test_a_new_session_counts_under_its_platform(self):
+        self.registry.record_session("google_chat")
+        self.registry.record_session("slack")
+        self.registry.record_session("slack")
+        self.registry.record_session("telegram")
+        self.assertEqual({"googlechat": "1", "slack": "2", "other": "1"}, dict(_SESSIONS_LINE.findall(self.registry.render())))
+        self.assertEqual({}, self.series(), "a session is not a message")
+
+    def test_the_module_holds_the_one_registry_the_listener_serves(self):
+        # session_store counts sessions on it from its own hook, so it must
+        # be the object plugin.py serves rather than one of its own.
+        self.assertIs(metrics.REGISTRY, plugin.REGISTRY)
+        self.assertIsInstance(metrics.REGISTRY, metrics.ChatMetrics)
+
     def test_the_exposition_names_the_family_and_the_start_time_once(self):
         text = self.registry.render()
         self.assertIn("# TYPE kubeagents_chat_messages_inbound_total counter", text)
+        self.assertIn("# TYPE kubeagents_chat_sessions_total counter", text)
         self.assertEqual(1, text.count("# TYPE process_start_time_seconds gauge"))
         self.assertRegex(text, r"(?m)^process_start_time_seconds \d+\.\d+$")
         self.assertEqual(text, self.registry.render(), "two renders of an idle registry differ")

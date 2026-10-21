@@ -129,6 +129,7 @@ exit 0
                 f"--gcp-region={MOCK_GCP_REGION} "
                 f"--gke-cluster-name={MOCK_GKE_CLUSTER_NAME} "
                 f"--image-tag={MOCK_IMAGE_TAG_SHA} "
+                f"--mode=today "
                 f"--enable-google-chat "
                 f"--google-chat-mode={MOCK_GOOGLE_CHAT_MODE} "
                 f"--google-chat-home-channel=spaces/TEST12345 "
@@ -1066,7 +1067,8 @@ class PlatformAgentModeTest(unittest.TestCase):
                 self.assertTrue(calls[1].startswith("install: "), calls)
                 for call in calls:
                     self.assertIn("[PLATFORM_AGENT_MODE=<absent>]", call)
-                self.assertNotIn("--mode", calls[1])
+                # Named: install.sh's own first-install default is next.
+                self.assertIn(" --mode=today ", calls[1])
 
     def test_next_installs_with_todays_arguments_then_patches_and_gates(self):
         _, today_calls = self._run({})
@@ -1079,7 +1081,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             calls[0], today_calls[0].replace("<absent>", "next")
         )
         self.assertEqual(
-            calls[1], today_calls[1].replace("<absent>", "next")
+            calls[1], today_calls[1].replace("<absent>", "next").replace(" --mode=today ", " --mode=next ")
         )
         self.assertEqual(calls[2:], self._expected_gate())
 

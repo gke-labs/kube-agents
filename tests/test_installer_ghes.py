@@ -736,6 +736,120 @@ class GhesHostMoveTest(_Tmp):
         self.assertIn("rc=0 app=77", proc.stdout, proc.stderr + proc.stdout)
 
 
+class GhesPemPathTest(_Tmp):
+    """GITHUB_PEM_PATH, the path of the App's private key, survives the rewrite
+    of the GitHub forge keys while it is this install's App, and a switch to
+    GitLab, which has no App, drops it. Only the path is written."""
+
+    _bash = GhesInstallEnvTest._bash
+    _run_install_func = GhesFlagsTest._run_install_func
+
+    _RECORDED = (f"GITOPS_FORGE=github\nGITOPS_HOST={_HOST}\nGITOPS_CA_SECRET=github-forge-ca\n"
+                 "GITOPS_ORG=platform\nGITOPS_REPO=infra\nGITHUB_APP_ID=12\nGITHUB_PEM_PATH=/keys/ghes-app.pem\n"
+                 "KMS_KEY=ghes-key\n")
+
+    def _record(self, exports):
+        dest = self._tmp / "install.env"
+        dest.write_text(self._RECORDED)
+        proc = self._bash(f'export {exports}\nrecord_gitops_forge_keys "{dest}"\n')
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        return dest.read_text()
+
+    def test_a_ca_secret_change_keeps_the_recorded_path(self):
+        text = self._record(f"GITOPS_FORGE=github GITOPS_HOST={_HOST} GITOPS_CA_SECRET=other-ca GITOPS_ORG=platform "
+                            "GITOPS_REPO=infra GITHUB_APP_ID=12 KMS_KEY=ghes-key GITHUB_PEM_PATH=/keys/ghes-app.pem")
+        self.assertIn("GITOPS_CA_SECRET=other-ca\n", text)
+        self.assertIn("GITHUB_PEM_PATH=/keys/ghes-app.pem\n", text)
+
+    def test_a_host_move_records_the_new_path(self):
+        text = self._record("GITOPS_FORGE=github GITOPS_HOST=ghe2.acme.corp GITOPS_CA_SECRET=github-forge-ca "
+                            "GITOPS_ORG=platform GITOPS_REPO=infra GITHUB_APP_ID=34 KMS_KEY=ghe2-key "
+                            "GITHUB_PEM_PATH=/keys/ghe2-app.pem")
+        self.assertIn("GITOPS_HOST=ghe2.acme.corp\n", text)
+        self.assertIn("GITHUB_PEM_PATH=/keys/ghe2-app.pem\n", text)
+        self.assertNotIn("/keys/ghes-app.pem", text)
+
+    def test_a_move_back_to_github_com_keeps_the_path_it_is_given(self):
+        text = self._record("GITOPS_FORGE=github GITOPS_HOST= GITOPS_CA_SECRET= GITOPS_ORG=acme GITOPS_REPO=infra "
+                            "GITHUB_APP_ID=1 KMS_KEY=gh-key GITHUB_PEM_PATH=/keys/github-app.pem")
+        self.assertNotIn("GITOPS_HOST", text)
+        self.assertIn("GITHUB_PEM_PATH=/keys/github-app.pem\n", text)
+
+    def test_no_path_writes_no_line(self):
+        text = self._record(f"GITOPS_FORGE=github GITOPS_HOST={_HOST} GITOPS_CA_SECRET=other-ca GITOPS_ORG=platform "
+                            "GITOPS_REPO=infra GITHUB_APP_ID=12 KMS_KEY=ghes-key GITHUB_PEM_PATH=")
+        self.assertNotIn("GITHUB_PEM_PATH", text)
+
+    def test_only_the_path_is_written(self):
+        pem = self._tmp / "app.pem"
+        pem.write_text("-----BEGIN RSA PRIVATE KEY-----\nSENTINEL-KEY-BODY\n-----END RSA PRIVATE KEY-----\n")
+        text = self._record(f"GITOPS_FORGE=github GITOPS_HOST={_HOST} GITOPS_CA_SECRET=other-ca GITOPS_ORG=platform "
+                            f"GITOPS_REPO=infra GITHUB_APP_ID=12 KMS_KEY=ghes-key GITHUB_PEM_PATH={pem}")
+        self.assertIn(f"GITHUB_PEM_PATH={pem}\n", text)
+        self.assertNotIn("SENTINEL-KEY-BODY", text)
+
+    def test_a_switch_to_gitlab_drops_the_path(self):
+        text = self._record("GITOPS_FORGE=gitlab GITOPS_HOST=gitlab.example.com GITOPS_REPO=g/p "
+                            "GITLAB_TOKEN_SECRET=gl GITOPS_CA_SECRET= GITHUB_PEM_PATH=/keys/ghes-app.pem")
+        self.assertIn("GITOPS_FORGE=gitlab\n", text)
+        self.assertNotIn("GITHUB_PEM_PATH", text)
+
+    def _validate_move(self, *flags):
+        return self._run_install_func(
+            f"parse_args {' '.join(shlex.quote(f) for f in flags)}\n"
+            "validate_gitops_forge_flags && rc=0 || rc=$?\n"
+            'echo "rc=$rc pem=[$PARAM_GITHUB_PEM_PATH]"',
+            install_env=self._RECORDED,
+        )
+
+    def test_a_host_move_drops_the_old_apps_path_unless_a_new_one_is_given(self):
+        # The recorded path is the old App's key; imported into the new key,
+        # it would sign as the old App.
+        moved = ("--gitops-host=ghe2.acme.corp", "--gitops-org=platform", "--github-app-id=34", "--kms-key=ghe2-key")
+        proc = self._validate_move(*moved)
+        self.assertIn("rc=0 pem=[]", proc.stdout, proc.stderr + proc.stdout)
+        self.assertIn("Dropping the recorded GITHUB_PEM_PATH", proc.stdout)
+        proc = self._validate_move(*moved, "--github-pem-path=/keys/ghe2-app.pem")
+        self.assertIn("rc=0 pem=[/keys/ghe2-app.pem]", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_a_path_exported_in_the_shell_is_this_runs_on_a_move(self):
+        # The file records no path (the state after an import), and the
+        # operator exports one for this run: it is given, like the flag, and
+        # the move keeps it.
+        recorded = self._RECORDED.replace("GITHUB_PEM_PATH=/keys/ghes-app.pem\n", "")
+        env_file = self._tmp / "recorded.env"
+        env_file.write_text(recorded)
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "parse_args --gitops-host=ghe2.acme.corp --gitops-org=platform --github-app-id=34 --kms-key=ghe2-key\n"
+            "validate_gitops_forge_flags && rc=0 || rc=$?\n"
+            'echo "rc=$rc pem=[$PARAM_GITHUB_PEM_PATH]"'
+        )
+        proc = _run_installer_bash(body, get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(env_file), "GITHUB_PEM_PATH": "/keys/ghe2-app.pem"}))
+        self.assertIn("rc=0 pem=[/keys/ghe2-app.pem]", proc.stdout, proc.stderr + proc.stdout)
+        self.assertNotIn("Dropping the recorded GITHUB_PEM_PATH", proc.stdout)
+
+    def test_a_recorded_path_beats_an_export_and_is_still_dropped_on_a_move(self):
+        # The file's value wins over the shell's (the file is sourced last),
+        # so it is the recorded one, and a move drops it.
+        env_file = self._tmp / "recorded.env"
+        env_file.write_text(self._RECORDED)
+        body = (
+            f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            "parse_args --gitops-host=ghe2.acme.corp --gitops-org=platform --github-app-id=34 --kms-key=ghe2-key\n"
+            "validate_gitops_forge_flags && rc=0 || rc=$?\n"
+            'echo "rc=$rc pem=[$PARAM_GITHUB_PEM_PATH]"'
+        )
+        proc = _run_installer_bash(body, get_isolated_test_env(overrides={
+            "KUBE_AGENTS_INSTALL_ENV": str(env_file), "GITHUB_PEM_PATH": "/keys/other.pem"}))
+        self.assertIn("rc=0 pem=[]", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_the_same_host_keeps_the_recorded_path(self):
+        proc = self._validate_move()
+        self.assertIn("rc=0 pem=[/keys/ghes-app.pem]", proc.stdout, proc.stderr + proc.stdout)
+
+
 class GhesForgeQuestionTest(_Tmp):
     """The forge question: each choice, and a bad host asked again."""
 

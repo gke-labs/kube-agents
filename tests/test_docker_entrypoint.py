@@ -981,6 +981,18 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template_dir.mkdir()
             shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
             (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
             profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
             profile.mkdir(parents=True)
             scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
@@ -1023,12 +1035,74 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
             template["context_file_max_chars"],
             "a cluster profile from before the context-file cap was pinned did not take it",
         )
-        self.assertEqual(persona, "persona\n", "the persona copy beside the repair stopped running")
+        self.assertEqual(
+            persona,
+            "persona\n\n---\n\n## Target Cluster Identity\n\n- project: p\n- cluster: c\n- location: us-central1\n",
+            "the persona copy and identity stamp beside the repair stopped running",
+        )
         self.assertIn("config backfill", proc.stdout)
         # The shipped template's remote servers go through the credential proxy,
         # so the repair syncs their whole argv and says so.
         self.assertIn("MCP relay repair", proc.stdout)
         self.assertNotIn("WARN", proc.stderr)
+
+    def test_the_shipped_cluster_loop_stamps_target_cluster_identity_into_soul_md(self):
+        """When the real cluster SOUL.md template is synced onto a cluster profile,
+        the startup loop stamps the target cluster identity from config.yaml."""
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        script = "set -e\n"
+        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+            script += _extract_shell_function(name) + "\n"
+        script += block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shutil.copy(_REPO / "agents" / "cluster" / "SOUL.md", template_dir / "SOUL.md")
+            scripts_dir = root / "data" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            for script_name in (
+                "cluster_agent_profile.py",
+                "sandbox_exec.py",
+                "gke_endpoint.py",
+                "profile_scaffold.py",
+            ):
+                shutil.copy(
+                    _REPO / "agents" / "platform" / "scripts" / script_name,
+                    scripts_dir / script_name,
+                )
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            profile.mkdir(parents=True)
+            scaffolded = self._scaffolded_cluster_profile(self._OLD_HEADER)
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(scaffolded, sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            persona = (profile / "SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("## Target Cluster Identity", persona)
+        self.assertIn(f"- project: {self._IDENTITY['project']}", persona)
+        self.assertIn(f"- cluster: {self._IDENTITY['cluster']}", persona)
+        self.assertIn(f"- location: {self._IDENTITY['location']}", persona)
+        self.assertEqual(persona.count("## Target Cluster Identity"), 1)
 
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):
         """The call sites, read off the source: the cluster loop and the front-door fill.
@@ -2238,6 +2312,114 @@ class TerminalEnvPinGateTest(unittest.TestCase):
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
         opener = lines.index(_TERMINAL_PIN_OPENER)
         self.assertEqual(lines[opener - 1], _TERMINAL_PIN_ASSIGNMENT)
+
+
+_TIRITH_CLEANUP_OPENER = (
+    'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ "$(command -v tirith 2>/dev/null)" = "$IMAGE_TIRITH" ]; then'
+)
+
+
+def _entrypoint_readonly(name):
+    """The value of a top-of-file `readonly NAME=value` in the shipped entrypoint."""
+    match = re.search(rf"^readonly {name}=(\S+)$", _ENTRYPOINT.read_text(encoding="utf-8"), re.M)
+    if not match:
+        raise AssertionError(f"no `readonly {name}=` in {_ENTRYPOINT}")
+    return match.group(1)
+
+
+class TirithCleanupTest(unittest.TestCase):
+    """Step 4.4 removes the tirith copies Hermes downloaded into each home.
+
+    Gated on the image's copy being what PATH resolves, which no host has, so every other
+    entrypoint test skips it. The block runs extracted, with IMAGE_TIRITH pointed at a stub
+    first on PATH. It must never execute a candidate: the files sit on a volume the agent's
+    workers can write.
+    """
+
+    ELF = b"\x7fELF\x02\x01\x01" + b"\x00" * 57
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_TIRITH_CLEANUP_OPENER)
+        cls._ELF_MAGIC_HEX = _entrypoint_readonly("ELF_MAGIC_HEX")
+
+    def _run(self, seed, primary="1", image_on_path=True):
+        """Seed $TARGET_DIR via `seed(target, tmp)`, run the block, return (proc, target, tmp)."""
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        target = tmp / "data"
+        image = tmp / "image" / "tirith"
+        image.parent.mkdir(parents=True)
+        image.write_text("#!/bin/sh\necho tirith 0.4.2\n", encoding="utf-8")
+        image.chmod(0o755)
+        seed(target, tmp)
+        path = f"{image.parent}:{os.environ['PATH']}" if image_on_path else os.environ["PATH"]
+        proc = subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "PATH": path,
+                "TARGET_DIR": str(target),
+                "IS_BOOTSTRAP_PRIMARY": primary,
+                "IMAGE_TIRITH": str(image),
+                "ELF_MAGIC_HEX": self._ELF_MAGIC_HEX,
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        return proc, target, tmp
+
+    def _plant(self, path, content, mode=0o755):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        path.chmod(mode)
+        return path
+
+    def _seed_copies(self, target, tmp):
+        self._plant(target / "bin" / "tirith", self.ELF)
+        self._plant(target / "profiles" / "cluster-a" / "bin" / "tirith", self.ELF)
+
+    def test_the_downloaded_copies_are_removed_and_logged(self):
+        proc, target, _ = self._run(self._seed_copies)
+        self.assertFalse((target / "bin" / "tirith").exists())
+        self.assertFalse((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
+        self.assertEqual(proc.stdout.count("Reclaimed a per-profile tirith copy:"), 2, proc.stdout)
+
+    def test_a_non_primary_replica_leaves_them(self):
+        _, target, _ = self._run(self._seed_copies, primary="0")
+        self.assertTrue((target / "bin" / "tirith").exists())
+        self.assertTrue((target / "profiles" / "cluster-a" / "bin" / "tirith").exists())
+
+    def test_without_the_image_copy_on_path_they_stay(self):
+        """Hermes would still need them: with nothing on PATH it falls back to the home copy."""
+        _, target, _ = self._run(self._seed_copies, image_on_path=False)
+        self.assertTrue((target / "bin" / "tirith").exists())
+
+    def test_a_file_that_is_not_an_elf_binary_stays_and_is_never_run(self):
+        def seed(target, tmp):
+            marker = tmp / "executed"
+            self._plant(
+                target / "profiles" / "cluster-b" / "bin" / "tirith",
+                f'#!/bin/sh\ntouch "{marker}"\necho tirith 0.3.3\n'.encode(),
+            )
+
+        _, target, tmp = self._run(seed)
+        self.assertTrue((target / "profiles" / "cluster-b" / "bin" / "tirith").exists())
+        self.assertFalse((tmp / "executed").exists(), "the cleanup executed a file from the volume")
+
+    def test_a_symlink_and_its_target_stay(self):
+        def seed(target, tmp):
+            real = self._plant(tmp / "elsewhere" / "tirith", self.ELF)
+            link = target / "profiles" / "cluster-c" / "bin" / "tirith"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(real)
+
+        _, target, tmp = self._run(seed)
+        self.assertTrue((target / "profiles" / "cluster-c" / "bin" / "tirith").is_symlink())
+        self.assertTrue((tmp / "elsewhere" / "tirith").exists())
 
 
 class A2AModeProbeTest(unittest.TestCase):

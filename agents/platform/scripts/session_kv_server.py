@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 import os
 import hashlib
 import re
@@ -12,6 +13,7 @@ import sqlite3
 import subprocess
 import tempfile
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +28,7 @@ import logging
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
+import board_snapshot
 import chat_notify
 import findings_queue
 import gitops_workspace
@@ -114,6 +117,10 @@ FEED_STATUS_INJECTED = "injected"
 FEED_STATUS_FILTERED = "filtered"
 FEED_STATUS_SUPPRESSED = "suppressed"
 FEED_STATUS_UNDELIVERED = "undelivered"
+# A drift backlog row that is digested or owed a digest. Checked before the
+# others, because its `notified` is 0 and would otherwise read as suppressed. A
+# carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
+FEED_STATUS_BACKLOG = "backlog"
 # The severity the inject route filters out of chat (see `inject_message`).
 FEED_FILTERED_SEVERITY = "Info"
 # `notified` value stamped on a ledger row when the alert was admitted and
@@ -196,6 +203,51 @@ MANAGED_DOTENV_PATH = os.path.join(
 MANAGED_CONFIG_PATH = os.path.join(
     os.environ.get("HERMES_MANAGED_DIR", "").strip() or "/etc/hermes", "config.yaml"
 )
+
+
+# The report a fleet-audit run's `finish` leaves for the relay, in the
+# directory the run's shell writes to (`audit_report.SCRATCH_DIR`, in the shell
+# sandbox when there is one). The relay posts it in place of the job's final
+# message, which holds whatever else the model wrote in its last turn.
+FLEET_AUDIT_SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
+CHAT_REPORT_FILE = "chat_report_{audit}.json"
+# `audit_report.CHAT_REPORT_*_KEY`.
+CHAT_REPORT_RUN_KEY = "run"
+CHAT_REPORT_UPDATED_KEY = "updated_at"
+CHAT_REPORT_PARTS_KEY = "parts"
+CHAT_REPORT_REPO_KEY = "repo"
+CHAT_REPORT_TEXT_KEY = "text"
+# The scheduler's run ledger under a profile home, and the status its row holds
+# from the run's start until after its delivery.
+RUN_LEDGER = ("cron", "executions.db")
+RUN_LEDGER_RUNNING = "running"
+# Above the relay's own report ceiling, so a long report is clipped with its
+# notice by `_truncate_report`; a record past it posts the unreadable notice.
+CHAT_REPORT_MAX_BYTES = 1024 * 1024
+# The roster the image ships for the Platform Agent. Only a job in it runs under
+# its audit stream's id, which is the name `finish` gives the record; a job
+# created at runtime keeps posting its final message.
+IMAGE_PLATFORM_ROSTER = "/opt/platform-template/cron/jobs.json"
+# The field the relay plugin (deploy/docker/plugins/chat/adapter.py) sends on
+# every scheduled delivery and `report_to_chat` never does.
+SCHEDULER_LEG_KEY = "also_delivered_to"
+# deploy/docker/plugins/chat/adapter.py: SCHEDULER_FAILURE_FIELD, set when the
+# delivery is the scheduler's failure line for the run.
+SCHEDULER_FAILURE_KEY = "scheduler_failure"
+AUDIT_REPOS_SUMMARY_LINE = "{label}: {count} repositories reported in this run."
+# `audit_report.CHAT_REPORT_LEDGER_LINE`, read back for a truncation notice.
+AUDIT_LEDGER_LINE_RE = re.compile(r"^Ledger: (\S+)$", re.MULTILINE)
+CHAT_REPORT_READ_TIMEOUT_S = 20
+# `audit_report.INFLIGHT_TTL_SECONDS`: no step of a run outlives its stream's
+# lease, so a record whose last step is older than that is an earlier run's.
+CHAT_REPORT_MAX_AGE_S = 2 * 60 * 60
+CHAT_REPORT_PARTS_SEPARATOR = "\n\n"
+AUDIT_NOT_FINISHED_NOTICE = "{label} did not finish, so it has no report. See the run log for job `{job}`."
+AUDIT_UNREADABLE_NOTICE = "{label}: the relay could not read the run's report ({why}). See the run log for job `{job}`."
+AUDIT_UNFINISHED_REPOS_LINE = "{label} did not finish for {repos}. See the run log for job `{job}`."
+# Busy timeout for the audit-run bookkeeping below, as for every other
+# connection this server opens.
+AUDIT_RUNS_DB_TIMEOUT_S = 5.0
 
 
 def _dotenv_value(path: str, name: str) -> str:
@@ -572,6 +624,22 @@ DRIFT_ALERT_EMOJI = "🔀"
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
 
+# What a drift card says when the install has no usable GitOps repository
+# registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
+# that are all unusable). The object may well be synced from a repository by a
+# GitOps tool; what the install lacks is a repository it can open a pull
+# request against. So the card asks for an explanation only: no options, no
+# "To authorize:" line, and so no buttons a reader could click for an action
+# that can only block (gke-labs#3313). The registration paths are
+# gitops_preflight.REGISTRATION_STEPS'; test_session_kv_server holds the two
+# to the same field and flag.
+DRIFT_NO_GITOPS_LINE = (
+    "No usable GitOps repository is registered with this install, so the agent cannot open a pull request to "
+    "revert or codify this change. Register one, or fix the existing entry, in the PlatformAgent's "
+    "spec.integration.repositories (or re-run the installer with --gitops-repo) to get those options on later "
+    "drift alerts."
+)
+
 # The `join` value the detector sends when it actually read the live object's
 # `managedFields` (`joinEnriched` in k8s-operator/cmd/drift-detector/join.go).
 # Any other value means ownership is absent because the lookup did not happen,
@@ -651,6 +719,70 @@ _DRIFT_UNSAFE_CHARS_RE = re.compile(r"[`\r\n]")
 # the list was cut rather than that the manager owns only twelve; the full set
 # is in the inject payload for anything that needs it.
 DRIFT_MAX_RENDERED_PATHS = 12
+
+# The drift backlog: records the detector marks as having reached it late
+# (published before its process first pulled, or after waiting longer than its
+# max wait; `subscriber.backlog` in the detector). They arrive on
+# `POST /v1/drift-backlog` and write a ledger row with `backlog` set. Most spend
+# no quota, start no turn, and are posted as one digest; the late rows of a
+# principal with few of them are carded instead (DRIFT_BACKLOG_CARD_BELOW). An install queues such a
+# burst under the installer's own account, and triaging it one card at a time
+# spent the day's drift budget on kube-agents' own objects. A pod roll queues
+# whatever was published while it restarted.
+#
+# Advertised in `/healthz` `features`, so a detector reading an older daemon
+# keeps sending every record as a card.
+DRIFT_BACKLOG_FEATURE = "drift-backlog"
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE]
+# `intercepted_events.backlog`. Zero for every row that is not backlog, which
+# includes every row written before the column existed. A pending row is owed a
+# digest or a card; the other three are terminal.
+DRIFT_BACKLOG_NONE = 0
+DRIFT_BACKLOG_PENDING = 1
+DRIFT_BACKLOG_DIGESTED = 2
+DRIFT_BACKLOG_HEADLESS = 3
+# Carded instead of digested (DRIFT_BACKLOG_CARD_BELOW). Its `notified` and
+# `session_id` then say what a live drift row's would.
+DRIFT_BACKLOG_CARDED = 4
+# A principal with fewer late rows than this in one digest gets a card for each
+# instead. The burst the digest exists for is one principal's install, tens of
+# rows; one or two late rows are far more likely a person's edit made just
+# before a detector restart, which on main gets its triage.
+DRIFT_BACKLOG_CARD_BELOW = 3
+# The stored payload a carded row is rebuilt from. A backlog payload carries no
+# field ownership (the join is skipped), so it is small; one past this is
+# stored empty and its card is built from the row's columns.
+DRIFT_BACKLOG_PAYLOAD_MAX_CHARS = 16384
+# The digest waits for the burst to stop (no new pending row for the quiet
+# period) so one install is one message, but no longer than the max wait after
+# its oldest row, so a slow trickle is still reported.
+DRIFT_BACKLOG_QUIET_SECONDS = 60
+DRIFT_BACKLOG_MAX_WAIT_SECONDS = 600
+# After a failed post, the worker waits this long before it tries again.
+DRIFT_BACKLOG_RETRY_SECONDS = 300
+# The send timeout for a platform chat_notify does not route; the routed one
+# gets chat_notify's own, which is longer. Never None: the digest holds a lease
+# across the send, and a send with no timeout could hold it forever.
+DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS = 60
+# Added to the sum of the send timeouts to make the lease, so the lease cannot
+# expire under a send that is still inside its own timeout.
+DRIFT_BACKLOG_LEASE_MARGIN_SECONDS = 30
+# The one row of `drift_backlog_lease`.
+DRIFT_BACKLOG_LEASE_NAME = "digest"
+# Principals and objects the digest names before it counts the rest.
+DRIFT_BACKLOG_MAX_PRINCIPALS = 8
+DRIFT_BACKLOG_MAX_OBJECTS = 5
+DRIFT_BACKLOG_EMOJI = "🗂️"
+# How many times the digest tries to mark its rows after a post, and the pause
+# between tries. The mark is idempotent, and a mark that never lands after a
+# delivered post would let the lease lapse under pending rows and post the same
+# digest again.
+DRIFT_BACKLOG_FINISH_ATTEMPTS = 3
+DRIFT_BACKLOG_FINISH_RETRY_SECONDS = 1.0
+SECONDS_PER_DAY = 86400.0
+# The max wait as the digest words it. The detector owns the number
+# (`backlogMaxWait` in subscriber.go); this text has to change with it.
+DRIFT_BACKLOG_MAX_WAIT_TEXT = "30 minutes"
 
 # A stall's ledger row is graded Warning, on the watcher's scale, and claims no
 # alert quota: the producer's own per-tick cap is the only bound, by decision
@@ -757,9 +889,20 @@ def init_db() -> None:
             # `ALTER TABLE` to preserve existing ledger rows (additive and
             # defaulted, so earlier rows read back with '').
             ledger_columns = {row[1] for row in conn.execute("PRAGMA table_info(intercepted_events)")}
-            if "session_id" not in ledger_columns:
+            # `backlog` and `principal` arrived with the drift backlog digest,
+            # added the same way. `principal` is written on backlog rows only,
+            # for the digest's per-principal count; a live drift row names its
+            # principal in `message`, and an event row has none.
+            for column, ddl in (
+                ("session_id", "session_id TEXT NOT NULL DEFAULT ''"),
+                ("backlog", f"backlog INTEGER NOT NULL DEFAULT {DRIFT_BACKLOG_NONE}"),
+                ("principal", "principal TEXT NOT NULL DEFAULT ''"),
+                ("payload", "payload TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column in ledger_columns:
+                    continue
                 try:
-                    conn.execute("ALTER TABLE intercepted_events ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
+                    conn.execute(f"ALTER TABLE intercepted_events ADD COLUMN {ddl}")
                 except sqlite3.OperationalError as exc:
                     if _SQLITE_DUPLICATE_COLUMN_SUBSTR not in str(exc).lower():
                         raise
@@ -787,6 +930,34 @@ def init_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_intercepted_events_created_at "
                 "ON intercepted_events (created_at)"
             )
+            # Partial, so they cost nothing on the rows they do not cover:
+            # the first holds drift rows only, the second pending backlog rows
+            # only. The queries that use them spell the value as a literal,
+            # because SQLite matches a partial index's WHERE against the
+            # query's text and a bound parameter never matches.
+            conn.execute("DROP INDEX IF EXISTS idx_intercepted_events_backlog_uid")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_drift_uid "
+                f"ON intercepted_events (object_uid) WHERE reason = '{DRIFT_LEDGER_REASON}'"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_backlog_pending "
+                f"ON intercepted_events (id) WHERE backlog = {DRIFT_BACKLOG_PENDING}"
+            )
+            # Who holds the drift backlog digest, so two workers (a restart
+            # that overlaps the old process, or a second replica on the same
+            # volume) do not both post it. One row, claimed and released in
+            # short transactions; the send happens between them, outside any
+            # transaction, so the database is never locked across a chat post.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS drift_backlog_lease (
+                    name       TEXT PRIMARY KEY,
+                    holder     TEXT NOT NULL,
+                    expires_at REAL NOT NULL
+                )
+                """
+            )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
             # the session server goes down with its container, and an in-memory
@@ -806,6 +977,20 @@ def init_db() -> None:
                 )
                 """
             )
+            # The fleet-audit run whose report each audit job last posted, so a
+            # run's report is posted once and a later run that never reached
+            # `finish` gets the not-finished notice instead of it.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS audit_report_runs (
+                    profile   TEXT NOT NULL,
+                    job_id    TEXT NOT NULL,
+                    run       TEXT NOT NULL,
+                    posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (profile, job_id)
+                )
+                """
+            )
             findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
@@ -817,6 +1002,15 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
+        # Said before the deletes, because after them nothing says it: a
+        # pending backlog row this old is one whose digest never posted.
+        undigested = conn.execute(
+            f"SELECT COUNT(*) FROM intercepted_events WHERE backlog = {DRIFT_BACKLOG_PENDING} AND "
+            "(created_at < datetime('now', ?) OR id <= (SELECT MAX(id) - ? FROM intercepted_events))",
+            (param, LEDGER_MAX_ROWS),
+        ).fetchone()[0]
+        if undigested:
+            logger.warning(f"Ledger cleanup is removing {undigested} drift backlog row(s) that were never digested")
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM intercepted_events WHERE created_at < datetime('now', ?)", (param,))
@@ -986,8 +1180,10 @@ def healthz() -> Dict[str, Any]:
     it starts. See INJECT_KINDS_SUPPORTED for what a caller is expected to do
     with it and why the key's absence is the interesting case. It names what
     this route's dispatch understands, not what the daemon can do generally.
+    `features` names routes a producer may use beyond the inject, for the same
+    reason (DRIFT_BACKLOG_FEATURE).
     """
-    return {"status": "ok", "inject_kinds": INJECT_KINDS_SUPPORTED}
+    return {"status": "ok", "inject_kinds": INJECT_KINDS_SUPPORTED, "features": DAEMON_FEATURES}
 
 
 @app.post("/sessions", status_code=201, dependencies=[Depends(verify_api_key)])
@@ -1116,6 +1312,17 @@ _CHAT_ENV_SIGNALS: Dict[str, tuple[str, ...]] = {
 # here did before any of this existed, so an install this cannot read is no
 # worse off than it was and no send is addressed to the empty string.
 DEFAULT_CHAT_PLATFORM = "google_chat"
+
+# Where each platform's home channel is set, named in the relay's refusal when
+# the gateway holds that platform's backend with no home channel: the CR field,
+# then the install.env key the installer turns into it.
+HOME_CHANNEL_SETTINGS: Dict[str, str] = {
+    "google_chat": "spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
+    "slack": "spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",
+}
+# The refusal when no platform can be named: no chat at all, a malformed home
+# channel the gateway refuses, or a backend this file has no route for.
+NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
 
 
 def _mapping(value: object) -> dict:
@@ -1320,6 +1527,23 @@ def _chat_platforms_disabled() -> bool:
     """
     resolved, explicit = _resolve_chat_platforms()
     return not resolved and bool(explicit) and not any(explicit.values())
+
+
+def _no_chat_route_error() -> str:
+    """Why a report was not sent on an install with no chat route.
+
+    It reaches `last_delivery_error` through the relay adapter and the 502, and
+    from there the dashboard, `hermes cron list`, the cronjob tool's reply in
+    chat and the `chat_delivery_watch` ledger issue. The gateway names its
+    backend whether or not a home channel is set, so with one named the cause is
+    the missing home channel; without one this cannot tell no chat from a
+    misconfigured one, so it guesses at neither.
+    """
+    platform = chat_notify.gateway_platform()
+    setting = HOME_CHANNEL_SETTINGS.get(platform)
+    if setting:
+        return f"composed but not delivered to {platform} (no home channel: set {setting})"
+    return NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -2004,28 +2228,8 @@ def _drift_ownership_block(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _drift_task_body(payload: Dict[str, Any]) -> str:
-    """The kanban card body for an out-of-band change to a live object.
-
-    The event path's equivalent is `_triage_task_body`, and its docstring is the
-    canonical explanation of the parts these two share: the `kanban_complete`
-    delivery, the three `##` sections SOUL.md §7 permits, the **Done when**
-    line, and the `To authorize:` bullet that `kanban_notifier.actionable_report`
-    keys on to decide which completions earn an `incidents` row — which is what
-    makes the offer to reply `apply` honourable. Those literals are load-bearing
-    in both bodies for the same reasons; read that docstring before rewording
-    either. This body has its own third reader as well —
-    bench/tasks/gitops-drift-out-of-band-triage/task.yaml's delivery objective
-    keys on the same literals — and bench/tests/test_triage_delivery_contract.py
-    holds this template against both that case and the notifier gate.
-
-    What is not shared is the question. An event says Kubernetes is unhappy and
-    asks for a root cause. This says a person or a tool changed a live object
-    outside git, and asks whether the declared state or the live state is the
-    one that should win. That is a decision the reader makes, not a defect the
-    agent diagnoses, so the report's job is to establish what changed, whether
-    it still stands, and what each answer would cost.
-    """
+def _drift_audit_facts(payload: Dict[str, Any]) -> str:
+    """The audit record a drift card opens with, and whether it was reconciled since."""
     resource_path = _drift_resource_path(payload)
     cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
     principal = _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD
@@ -2051,8 +2255,6 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         )
 
     return (
-        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
-        f"through git, and the audit log is how we know about it.\n\n"
         f"**What the audit log recorded:**\n"
         f"- **Object:** {resource_path}\n"
         f"- **Cluster / project:** {cluster_name} / {project}\n"
@@ -2063,17 +2265,132 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"- **When:** {timestamp}\n"
         f"- **Audit entry:** `insertId={insert_id}` — search Cloud Logging for this to read the entry itself\n"
         f"{_drift_ownership_block(payload)}\n"
-        f"{reconcile_line}\n\n"
+        f"{reconcile_line}"
+    )
+
+
+def _gitops_repo_registered() -> Optional[bool]:
+    """Whether the install has a usable GitOps repository: True, False, or None when unknown.
+
+    Asks gitops_preflight, the check a PR-writing worker runs first, so the
+    drift card and the worker that would act on it cannot disagree about
+    whether there is a repository. A registry that cannot be read is None,
+    and the card then keeps its options: the worker's own preflight still
+    stops an action that cannot be carried out.
+    """
+    try:
+        import gitops_preflight
+
+        code, _ = gitops_preflight.preflight()
+    except Exception:  # noqa: BLE001 - an unknown answer keeps upstream's card
+        return None
+    if code == gitops_preflight.EXIT_REGISTERED:
+        return True
+    if code == gitops_preflight.EXIT_NO_REGISTERED_REPO:
+        return False
+    return None
+
+
+def _drift_task_body_without_gitops(payload: Dict[str, Any]) -> str:
+    """The drift card for an install with no GitOps repository: explain, offer nothing.
+
+    The same audit facts and the same delivery as :func:`_drift_task_body`,
+    but the report's 'What to do' is :data:`DRIFT_NO_GITOPS_LINE` and nothing
+    else. Without a 'To authorize:' line kanban_notifier.actionable_report
+    files no incidents row, and the Slack presenter draws no option buttons.
+    """
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}', and the audit log "
+        f"recorded it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
         f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
         f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
         f"use it.\n\n"
+        f"**{DRIFT_NO_GITOPS_LINE}** So this report explains the change and proposes nothing: no revert, no "
+        f"codify, no other fix, and no call to action.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
+        f"the alert was raised, and `result` is what gets posted there.\n\n"
+        f"**Done when:** the report says who changed what, what the live object looks like now, whether the change "
+        f"still stands, and what it affects. Nothing else is a condition of finishing.\n\n"
+        f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it.** "
+        f"**Do not judge the change by who made it**, and change nothing in the cluster.\n\n"
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
+        f"these three `##` sections are the only ones:\n\n"
+        f"## What's wrong\n\n"
+        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"## Why\n\n"
+        f"- <What the live object shows now, with the evidence>\n"
+        f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
+        f"## What to do\n\n"
+        f"- {DRIFT_NO_GITOPS_LINE}\n\n"
+        f"Every <...> above is a placeholder: fill each one in. Write the 'What to do' bullet exactly as given."
+    )
+
+
+def _drift_task_body(payload: Dict[str, Any]) -> str:
+    """The kanban card body for an out-of-band change to a live object.
+
+    The event path's equivalent is `_triage_task_body`, and its docstring is the
+    canonical explanation of the parts these two share: the `kanban_complete`
+    delivery, the three `##` sections SOUL.md §7 permits, the **Done when**
+    line, and the `To authorize:` bullet that `kanban_notifier.actionable_report`
+    keys on to decide which completions earn an `incidents` row — which is what
+    makes the offer to reply `apply` honourable. Those literals are load-bearing
+    in both bodies for the same reasons; read that docstring before rewording
+    either. This body has its own further readers as well — every
+    bench/tasks/gitops-drift-*/task.yaml delivery objective keys on the same
+    literals — and bench/tests/test_triage_delivery_contract.py holds this
+    template against each of those cases and against the notifier gate. The
+    count is deliberately not written out here: the list that decides it is
+    CONTRACTS in that test, which is where a new case is added.
+
+    What is not shared is the question. An event says Kubernetes is unhappy and
+    asks for a root cause. This says a person or a tool changed a live object
+    outside git, and asks whether the declared state or the live state is the
+    one that should win. That is a decision the reader makes, not a defect the
+    agent diagnoses, so the report's job is to establish what changed, whether
+    it still stands, and what each answer would cost.
+
+    The body names `gke-load-bearing-change` outright for the reason
+    `_stall_task_body` names its skill: the Cluster Agent reaches this text as a
+    verbatim presentation template and follows its format faithfully, and a
+    skill is not picked up by ambient relevance while it is doing that. What the
+    skill carries is the step a report can skip while looking complete —
+    establishing whether the state git declares still runs before proposing that
+    the change be undone.
+
+    On an install with no usable GitOps repository the card is
+    :func:`_drift_task_body_without_gitops` instead: an explanation with no
+    options. The bench contract above binds only this, the registered path.
+    """
+    if _gitops_repo_registered() is False:
+        return _drift_task_body_without_gitops(payload)
+    cluster_name = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+
+    return (
+        f"An out-of-band change was made to a live object on GKE cluster '{cluster_name}'. It did not come "
+        f"through git, and the audit log is how we know about it.\n\n"
+        f"{_drift_audit_facts(payload)}\n\n"
+        f"**Read the live object before you conclude anything.** Everything above describes a change as it was "
+        f"made; only the cluster can tell you whether it is still there. You have read access to this cluster — "
+        f"use it.\n\n"
+        f"**Run the `gke-load-bearing-change` skill before you propose undoing the change.** Reading the live "
+        f"object tells you whether the change still stands. It does not tell you whether the state git declares "
+        f"would run if you put it back — and a change that is the only reason this object's workload is up is "
+        f"one a revert would take down, while a change nothing depends on is one a codify would write somebody's "
+        f"accident into git. The skill says where the evidence for that lives for each kind of change, and "
+        f"whichever way it comes out belongs in the report.\n\n"
         f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
         f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where "
         f"the alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` "
         f"delivers one line to the person waiting for it.\n\n"
         f"**Done when:** the report says what the live object looks like now compared with what the change did; "
         f"says whether the change still stands or was already reconciled away, with the evidence; and proposes "
-        f"either reverting it to the declared state or codifying it in git, with the consequence of each. "
+        f"either reverting it to the declared state or codifying it in git, with the consequence of each — a "
+        f"revert's consequence being whether the state git declares would still run, read off this cluster or "
+        f"reported as not established. "
         f"Nothing else is a condition of finishing. State those three things in `summary`'s one line as well: "
         f"a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate it to another agent, and do not open child cards for it** — "
@@ -2638,7 +2955,7 @@ def _sanitize_label(value: str) -> str:
     return neutralised
 
 
-def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
+def _truncate_report(report: str, profile: str, job_id: str, audit_record: bool = False) -> tuple[str, str]:
     """Cut an oversized report to the cap. Returns `(report, notice)`.
 
     `notice` is `""` for a report that fits, and otherwise the line that says so,
@@ -2654,8 +2971,9 @@ def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
     cap.
 
     A cut report is worse than a whole one and much better than none. The head
-    survives, and the notice names the directory the scheduler saved the full
-    text to, so nothing is only in the truncated copy.
+    survives, and the notice names where the full text is: the directory the
+    scheduler saved it to, or for a fleet-audit record (`audit_record`) the
+    record and the ledger issues the report links.
 
     Not a link: the file lives on the agent's PVC under
     `$HERMES_HOME/cron/output/<job_id>/<timestamp>.md` and the run's own
@@ -2665,11 +2983,24 @@ def _truncate_report(report: str, profile: str, job_id: str) -> tuple[str, str]:
     if len(report) <= CRON_REPORT_MAX_CHARS:
         return report, ""
 
+    # A fleet-audit report is the record `finish` left, not the final message
+    # the scheduler saved, so the notice names the record.
+    # The ledger lines are what a reader can open; the cut keeps the head and
+    # drops each report's last line, which is where `finish` puts them.
+    ledgers = sorted(set(AUDIT_LEDGER_LINE_RE.findall(report))) if audit_record else []
+    saved = (
+        f"The whole report is in `{CHAT_REPORT_FILE.format(audit=job_id)}` in the "
+        f"shell's scratch directory, and its findings are on the ledger issue"
+        + (": " + ", ".join(ledgers) if ledgers else "")
+        + "."
+        if audit_record
+        else f"The whole report was saved by the scheduler under "
+        f"`cron/output/{job_id}/` in the {profile} profile's home."
+    )
     notice = (
         f"[truncated] This report was {len(report)} characters, over the "
         f"{CRON_REPORT_MAX_CHARS}-character chat limit, so what follows is the "
-        f"beginning of it. The whole report was saved by the scheduler under "
-        f"`cron/output/{job_id}/` in the {profile} profile's home.\n\n"
+        f"beginning of it. {saved}\n\n"
     )
     logger.warning(
         f"Relay for {profile}/{job_id}: report is {len(report)} chars, truncating to "
@@ -2943,6 +3274,11 @@ def _is_fleet_audit_job(profile: str, job_id: str) -> bool:
     except Exception as exc:
         logger.warning(f"Audit headline skipped: {profile} cron roster unreadable: {exc}")
         return False
+    return _roster_runs_fleet_audit(store, job_id)
+
+
+def _roster_runs_fleet_audit(store: Any, job_id: str) -> bool:
+    """Whether `job_id` in a cron roster's parsed JSON runs the fleet-audit skill."""
     jobs = store.get("jobs") if isinstance(store, dict) else store
     for job in jobs if isinstance(jobs, list) else []:
         if isinstance(job, dict) and str(job.get("id") or "") == job_id:
@@ -3166,6 +3502,203 @@ def _failed_audit_line(platform: str, report: str, chat_id: str, profile: str, j
     return line
 
 
+class ChatReportUnreadable(Exception):
+    """The record may exist, but the read did not return it."""
+
+
+def _read_chat_report_record(job_id: str) -> dict | None:
+    """The chat report record `finish` left for `job_id`, or None when there is none.
+
+    Raises ChatReportUnreadable when the read itself failed, which says
+    nothing about whether the run finished.
+    """
+    path = os.path.join(FLEET_AUDIT_SCRATCH_DIR, CHAT_REPORT_FILE.format(audit=job_id))
+    try:
+        import sandbox_exec
+
+        # One byte past the cap, so a record over it is told from one at it.
+        if sandbox_exec.sandbox_enabled():
+            raw = sandbox_exec.read_bytes(
+                path, max_bytes=CHAT_REPORT_MAX_BYTES + 1, timeout=CHAT_REPORT_READ_TIMEOUT_S
+            )
+        else:
+            with open(path, "rb") as handle:
+                raw = handle.read(CHAT_REPORT_MAX_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning(f"Relay for {job_id}: chat report unreadable: {exc!r}")
+        raise ChatReportUnreadable(type(exc).__name__) from exc
+    if raw is None:
+        return None
+    if len(raw) > CHAT_REPORT_MAX_BYTES:
+        logger.warning(f"Relay for {job_id}: chat report is over {CHAT_REPORT_MAX_BYTES} bytes")
+        raise ChatReportUnreadable(f"over {CHAT_REPORT_MAX_BYTES} bytes")
+    try:
+        record = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
+        logger.warning(f"Relay for {job_id}: chat report is not JSON")
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _last_posted_run(profile: str, job_id: str) -> str:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            row = conn.execute(
+                "SELECT run FROM audit_report_runs WHERE profile = ? AND job_id = ?",
+                (profile, job_id),
+            ).fetchone()
+        return str(row[0]) if row else ""
+    except Exception as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: last posted run unreadable: {exc!r}")
+        return ""
+
+
+def _mark_run_posted(profile: str, job_id: str, run: str) -> None:
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO audit_report_runs (profile, job_id, run) VALUES (?, ?, ?)",
+                    (profile, job_id, run),
+                )
+    except Exception as exc:
+        logger.error(f"Relay for {profile}/{job_id}: run {run} not marked posted: {exc!r}")
+
+
+def _is_shipped_audit_job(job_id: str) -> bool:
+    """Whether the image's Platform Agent roster ships `job_id` as a fleet-audit job."""
+    try:
+        with open(IMAGE_PLATFORM_ROSTER, encoding="utf-8") as handle:
+            store = json.load(handle)
+    except (OSError, ValueError) as exc:
+        logger.warning(f"Relay for {job_id}: image roster unreadable: {exc}")
+        return False
+    return _roster_runs_fleet_audit(store, job_id)
+
+
+def _delivering_run_start(profile: str, job_id: str) -> float | None:
+    """When the run now delivering `job_id` started, from the scheduler's ledger; None when unknown.
+
+    The scheduler keeps the run's row `running` until after its delivery and
+    allows one live run per job. `claimed` rows are left out: a tick writes one
+    at submit and may lose the claim. Read-only, and any failure is None.
+    """
+    from gitops_workspace import agent_home
+
+    base = agent_home() if profile == DEFAULT_PROFILE else os.path.join(agent_home(), PROFILES_DIR, profile)
+    path = os.path.join(base, *RUN_LEDGER)
+    if not os.path.exists(path):
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=AUDIT_RUNS_DB_TIMEOUT_S)) as conn:
+            rows = conn.execute(
+                "SELECT started_at FROM executions WHERE job_id = ? AND status = ?",
+                (job_id, RUN_LEDGER_RUNNING),
+            ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning(f"Relay for {profile}/{job_id}: run ledger unreadable: {exc}")
+        return None
+    starts = []
+    for (started,) in rows:
+        try:
+            stamp = datetime.fromisoformat(str(started)).timestamp()
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(stamp):
+            starts.append(stamp)
+    return max(starts) if starts else None
+
+
+def _record_written_by_this_run(profile: str, job_id: str) -> bool:
+    """Whether the delivering run finished a repository into the record on disk.
+
+    True when the record holds a finished part and its last step is at or after
+    the run's start in the scheduler's ledger. Unknown (no ledger row, no
+    record) is False, and the failure line is posted as on main.
+    """
+    started = _delivering_run_start(profile, job_id)
+    if started is None:
+        return False
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return False
+    if not record:
+        return False
+    try:
+        updated = float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        return False
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    finished = any(
+        isinstance(part, dict) and str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip()
+        for part in (parts if isinstance(parts, list) else [])
+    )
+    return finished and math.isfinite(updated) and updated >= started
+
+
+def _record_run(job_id: str) -> str:
+    """The run id of the chat record on disk for `job_id`, or "" when there is none to read."""
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable:
+        return ""
+    return str((record or {}).get(CHAT_REPORT_RUN_KEY) or "")
+
+
+def audit_chat_report(profile: str, job_id: str, title: str) -> tuple[str, str]:
+    """What a fleet-audit job posts, and the run it is for: `(report, run)`.
+
+    The reports `finish` left for each repository of this job's latest run,
+    followed by a line naming any repository the run started and did not
+    finish, when that run has not been posted and its last step is within
+    `CHAT_REPORT_MAX_AGE_S`. A run with no finished repository posts
+    `AUDIT_NOT_FINISHED_NOTICE`, as does one already posted or too old, with no
+    run. The final message is never posted: it is what the model wrote, and
+    posting it is how a channel got working notes in place of a report.
+    """
+    label = title or job_id
+    notice = AUDIT_NOT_FINISHED_NOTICE.format(label=label, job=job_id)
+    try:
+        record = _read_chat_report_record(job_id)
+    except ChatReportUnreadable as exc:
+        return AUDIT_UNREADABLE_NOTICE.format(label=label, why=exc, job=job_id), ""
+    if record is None:
+        return notice, ""
+    run = str(record.get(CHAT_REPORT_RUN_KEY) or "")
+    parts = record.get(CHAT_REPORT_PARTS_KEY)
+    parts = [part for part in (parts if isinstance(parts, list) else []) if isinstance(part, dict)]
+    texts = [str(part.get(CHAT_REPORT_TEXT_KEY) or "").strip() for part in parts]
+    finished = [text for text in texts if text]
+    unfinished = [
+        str(part.get(CHAT_REPORT_REPO_KEY) or "")
+        for part, text in zip(parts, texts)
+        if not text
+    ]
+    try:
+        age = time.time() - float(record.get(CHAT_REPORT_UPDATED_KEY))
+    except (TypeError, ValueError):
+        age = None
+    if age is not None and not math.isfinite(age):
+        age = None
+    if not run or not finished or age is None or age > CHAT_REPORT_MAX_AGE_S:
+        return notice, ""
+    if run == _last_posted_run(profile, job_id):
+        return notice, ""
+    # A closing line after several reports, or after the unfinished line, so
+    # the message does not end with a ledger link and Slack posts it whole: a
+    # headline card shows one repository's ledger and drops the rest.
+    if unfinished:
+        finished.append(
+            AUDIT_UNFINISHED_REPOS_LINE.format(label=label, repos=", ".join(unfinished), job=job_id)
+        )
+    elif len(finished) > 1:
+        finished.append(AUDIT_REPOS_SUMMARY_LINE.format(label=label, count=len(finished)))
+    return CHAT_REPORT_PARTS_SEPARATOR.join(finished), run
+
+
 def relay_cron_report(
     session_id: str,
     profile: str,
@@ -3221,6 +3754,13 @@ def relay_cron_report(
     `also_delivered_to` are not in it: the scheduler is posting there itself, so
     they are skipped rather than missed.
 
+    An install with no chat route gets no send at all, where the fallback to
+    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): a
+    `next` install whose gateway holds Slack with no home channel. The error
+    names the platform and the setting that arms it, in the wording
+    `chat_delivery_watch` reads the platform from; see
+    :func:`_no_chat_route_error`.
+
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line
     about a kanban card it had filed) that were then posted and recorded as
@@ -3228,6 +3768,11 @@ def relay_cron_report(
     in its thread: that comes from the incident row stored below, which
     `incident_context` replays, not from a session the turn left behind.
     """
+    if _chat_platforms_disabled():
+        error = _no_chat_route_error()
+        logger.error(f"Relay for {profile}/{job_id}: report not sent: {error}")
+        return error, []
+
     posts_deadline = time.monotonic() + CRON_RELAY_POSTS_BUDGET_S
     blocks_deadline = posts_deadline - AUDIT_TEXT_SEND_RESERVE_S
     # Floored at the full set, so a wrong sibling list cannot silence the report:
@@ -3452,7 +3997,24 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=400, detail="job_id field is required")
     if not report:
         raise HTTPException(status_code=400, detail="report field is required")
-    report, truncation_notice = _truncate_report(report, profile, job_id)
+    audit_run = ""
+    # Only the scheduler's delivery leg sends `also_delivered_to`; a mid-run
+    # `report_to_chat` does not, and its text is posted as written.
+    from_scheduler = SCHEDULER_LEG_KEY in request_data
+    failure_run = ""
+    if from_scheduler and _is_fleet_audit_job(profile, job_id) and _is_shipped_audit_job(job_id):
+        if request_data.get(SCHEDULER_FAILURE_KEY) is True and not _record_written_by_this_run(profile, job_id):
+            # The scheduler's line for a failed run, posted as written, as on
+            # main: it says why the run failed, and the record on disk is an
+            # earlier run's. Marking that record posted keeps a later run that
+            # never reached `start` from posting it as its own.
+            failure_run = _record_run(job_id)
+        else:
+            # The flag is read off the text, which the model can also write:
+            # a run that wrote its own record reached `finish`, so its report
+            # is posted whatever its last message says.
+            report, audit_run = audit_chat_report(profile, job_id, title)
+    report, truncation_notice = _truncate_report(report, profile, job_id, audit_record=bool(audit_run))
 
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     session_id = _cron_report_session_id(profile, job_id, day)
@@ -3466,6 +4028,8 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {type(exc).__name__}") from exc
     if error:
         raise HTTPException(status_code=502, detail=f"chat relay failed: {error}")
+    if audit_run or failure_run:
+        _mark_run_posted(profile, job_id, audit_run or failure_run)
     # 200, because the report is in the channel and the run did its job. `relay`
     # and `relay_detail` reported a degraded delivery, which only a failed Chat
     # Agent turn produced; no turn runs now, so they always read ok, and they
@@ -3583,16 +4147,431 @@ def _inject_drift(
             "suppressed_today": str(suppressed_today),
         }
 
-    # Standard markdown, not Slack mrkdwn, for the reason the event path's
-    # alert gives: SlackAdapter.format_message reads a single `*...*` as italic.
-    alert_msg = (
-        f"{DRIFT_ALERT_EMOJI} **Drift:** {summary}\n"
-        f"🌱 _Checking what the cluster looks like now..._"
-    )
-
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload, event_row_id)
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, _drift_alert_message(summary), payload, event_row_id)
 
     return {"status": "injected"}
+
+
+def _drift_alert_message(summary: str) -> str:
+    """The chat line a drift card opens with.
+
+    Standard markdown, not Slack mrkdwn, for the reason the event path's alert
+    gives: SlackAdapter.format_message reads a single `*...*` as italic.
+    """
+    return f"{DRIFT_ALERT_EMOJI} **Drift:** {summary}\n🌱 _Checking what the cluster looks like now..._"
+
+@app.post("/v1/drift-backlog", dependencies=[Depends(verify_api_key)])
+def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
+    """Record one drift backlog record and owe it the next digest or a card.
+
+    The detector posts here, with no session, a record it marked as having
+    reached it late (DRIFT_BACKLOG_FEATURE). Nothing here spends quota or starts
+    a turn: the burst this exists for is an install's or a pod roll's own
+    writes, and one card each is what spent the drift budget on them.
+
+    One drift row per insert id, backlog or live. The detector retries a failed
+    post once and loses its seen set on a restart, so the same record can
+    arrive twice; and a record carded by a process that died before it acked
+    comes back to the next one as backlog. A second row would count the record
+    in the digest, once more or for the first time, though it was already sent.
+    """
+    if payload.get("kind") != INJECT_KIND_DRIFT:
+        raise HTTPException(status_code=400, detail=f"a drift backlog record needs kind {INJECT_KIND_DRIFT!r}")
+    resource = _drift_resource(payload)
+    insert_id = payload.get("insert_id") or ""
+    if not isinstance(insert_id, str):
+        raise HTTPException(status_code=400, detail="insert_id must be a string")
+    cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+    stored_payload = json.dumps(payload)
+    if len(stored_payload) > DRIFT_BACKLOG_PAYLOAD_MAX_CHARS:
+        stored_payload = ""
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO intercepted_events "
+                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
+                    "occurrences, notified, session_id, backlog, principal, payload) "
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, '', ?, ?, ? "
+                    "WHERE ? = '' OR NOT EXISTS "
+                    f"(SELECT 1 FROM intercepted_events WHERE object_uid = ? AND reason = '{DRIFT_LEDGER_REASON}')",
+                    (
+                        _defang_drift_field(cluster),
+                        _defang_drift_field(resource.get("namespace")),
+                        _defang_drift_field(resource.get("name")) or DRIFT_UNKNOWN_FIELD,
+                        insert_id,
+                        _defang_drift_field(resource.get("resource")) or DRIFT_UNKNOWN_FIELD,
+                        DRIFT_LEDGER_REASON,
+                        _drift_summary(payload)[:LEDGER_MESSAGE_MAX_CHARS],
+                        DRIFT_SEVERITY_LABEL,
+                        DRIFT_BACKLOG_PENDING,
+                        _defang_drift_field(payload.get("principal")) or DRIFT_UNKNOWN_FIELD,
+                        stored_payload,
+                        insert_id,
+                        insert_id,
+                    ),
+                )
+    except sqlite3.Error as exc:
+        # A 5xx, so the detector retries once and then logs the record by its
+        # insert id. Unlike the inject's ledger write this one is the whole of
+        # what the route does, so it is not best-effort.
+        logger.error(f"Failed to record drift backlog record {insert_id or '(no insert id)'}: {exc}")
+        raise HTTPException(status_code=503, detail="the drift backlog record could not be written") from exc
+    _arm_drift_backlog_digest()
+    return {"status": "backlog"}
+
+
+# The digest worker. One daemon thread, started by the first pending row and
+# gone once none are left; the rows are the state, so a restart loses nothing
+# but the wait (see _arm_drift_backlog_digest_if_pending at the bottom of the
+# file). A thread rather than BackgroundTasks because the wait is minutes long,
+# and a background task that sleeps holds a thread of the pool the sync routes
+# run on.
+_drift_backlog_lock = threading.Lock()
+_drift_backlog_wake = threading.Event()
+_drift_backlog_thread: Optional[threading.Thread] = None
+
+
+def _arm_drift_backlog_digest() -> None:
+    """Wake the digest worker, starting it if it is not running."""
+    global _drift_backlog_thread
+    with _drift_backlog_lock:
+        _drift_backlog_wake.set()
+        if _drift_backlog_thread is not None and _drift_backlog_thread.is_alive():
+            return
+        _drift_backlog_thread = threading.Thread(
+            target=_drift_backlog_digest_loop, name="drift-backlog-digest", daemon=True
+        )
+        _drift_backlog_thread.start()
+
+
+def _drift_backlog_wait_seconds(oldest_age: float, newest_age: float, retry_in: float) -> float:
+    """How long the worker sleeps before it posts, given the pending rows' ages.
+
+    The quiet period runs from the newest row and the max wait from the oldest,
+    and whichever ends first ends the wait; a failed post pushes it back.
+    """
+    due_in = min(DRIFT_BACKLOG_QUIET_SECONDS - newest_age, DRIFT_BACKLOG_MAX_WAIT_SECONDS - oldest_age)
+    return max(due_in, retry_in, 0.0)
+
+
+def _drift_backlog_pending_ages() -> Optional[tuple[float, float]]:
+    """(oldest, newest) age in seconds of the pending backlog rows, or None for none."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            f"(julianday('now') - julianday(MIN(created_at))) * {SECONDS_PER_DAY}, "
+            f"(julianday('now') - julianday(MAX(created_at))) * {SECONDS_PER_DAY} "
+            f"FROM intercepted_events WHERE backlog = {DRIFT_BACKLOG_PENDING}"
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    return float(row[1]), float(row[2])
+
+
+def _drift_backlog_digest_loop() -> None:
+    global _drift_backlog_thread
+    retry_at = 0.0
+    while True:
+        _drift_backlog_wake.clear()
+        try:
+            ages = _drift_backlog_pending_ages()
+        except Exception as exc:
+            logger.error(f"Drift backlog digest could not read the ledger; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s: {exc}")
+            _drift_backlog_wake.wait(timeout=DRIFT_BACKLOG_RETRY_SECONDS)
+            continue
+        if ages is None:
+            # Exit under the lock, so a row armed between the read above and
+            # here starts a new worker rather than finding this one alive.
+            with _drift_backlog_lock:
+                if not _drift_backlog_wake.is_set():
+                    _drift_backlog_thread = None
+                    return
+            continue
+        wait = _drift_backlog_wait_seconds(ages[0], ages[1], retry_at - time.monotonic())
+        if wait > 0:
+            _drift_backlog_wake.wait(timeout=wait)
+            continue
+        try:
+            posted = _post_drift_backlog_digest()
+        except Exception as exc:
+            # The worker is the only thing that digests; an error it does not
+            # survive leaves every pending row until the next backlog record.
+            logger.error(f"Drift backlog digest failed; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s: {exc}")
+            posted = False
+        if posted:
+            retry_at = 0.0
+        else:
+            retry_at = time.monotonic() + DRIFT_BACKLOG_RETRY_SECONDS
+
+
+def _drift_backlog_send_timeout(platform: str) -> float:
+    return chat_notify.subprocess_timeout(platform, DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS) or DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS
+
+
+def _claim_drift_backlog(holder: str, lease_seconds: float) -> Optional[list[Dict[str, Any]]]:
+    """Take the digest lease and return the pending rows, or None when another
+    holder's lease is still live. A short transaction: the post happens after it."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            lease = conn.execute(
+                "SELECT expires_at FROM drift_backlog_lease WHERE name = ?", (DRIFT_BACKLOG_LEASE_NAME,)
+            ).fetchone()
+            now = time.time()
+            if lease and lease["expires_at"] > now:
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute(
+                "INSERT OR REPLACE INTO drift_backlog_lease (name, holder, expires_at) VALUES (?, ?, ?)",
+                (DRIFT_BACKLOG_LEASE_NAME, holder, now + lease_seconds),
+            )
+            rows = conn.execute(
+                "SELECT id, cluster, namespace, workload, object_kind, principal, created_at, message, payload "
+                f"FROM intercepted_events WHERE backlog = {DRIFT_BACKLOG_PENDING} ORDER BY id"
+            ).fetchall()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return [dict(row) for row in rows]
+
+
+def _finish_drift_backlog(holder: str, max_id: Optional[int], outcome: Optional[int]) -> None:
+    """Mark the claimed rows with outcome (none when the post failed) and release the lease.
+
+    `id <= max_id` is exactly the claimed set: ids only grow, so a row that
+    arrived during the send is above it and stays pending for the next digest.
+    """
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with conn:
+            if outcome is not None and max_id is not None:
+                conn.execute(
+                    f"UPDATE intercepted_events SET backlog = ? WHERE backlog = {DRIFT_BACKLOG_PENDING} AND id <= ?",
+                    (outcome, max_id),
+                )
+            conn.execute(
+                "DELETE FROM drift_backlog_lease WHERE name = ? AND holder = ?", (DRIFT_BACKLOG_LEASE_NAME, holder)
+            )
+
+
+def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
+    """The digest: how many, by whom, a few of what, and where the rest are."""
+    by_principal: Dict[str, int] = {}
+    for row in rows:
+        principal = row["principal"] or DRIFT_UNKNOWN_FIELD
+        by_principal[principal] = by_principal.get(principal, 0) + 1
+    ranked = sorted(by_principal.items(), key=lambda item: (-item[1], item[0]))
+    principals = ", ".join(f"{_defang_drift_field(p)} ({n})" for p, n in ranked[:DRIFT_BACKLOG_MAX_PRINCIPALS])
+    if len(ranked) > DRIFT_BACKLOG_MAX_PRINCIPALS:
+        principals += f", and {len(ranked) - DRIFT_BACKLOG_MAX_PRINCIPALS} more"
+    objects = ", ".join(
+        f"{_defang_drift_field('/'.join(part for part in (row['namespace'], row['object_kind'], row['workload']) if part))}"
+        f" on {_defang_drift_field(row['cluster']) or DRIFT_UNKNOWN_FIELD}"
+        for row in rows[:DRIFT_BACKLOG_MAX_OBJECTS]
+    )
+    if len(rows) > DRIFT_BACKLOG_MAX_OBJECTS:
+        objects += f", and {len(rows) - DRIFT_BACKLOG_MAX_OBJECTS} more"
+    noun = "change" if len(rows) == 1 else "changes"
+    return (
+        f"{DRIFT_BACKLOG_EMOJI} **Drift backlog:** {len(rows)} {noun} reached drift detection late "
+        f"(they queued before it started pulling, or waited over "
+        f"{DRIFT_BACKLOG_MAX_WAIT_TEXT}), so they are listed here instead of triaged one card each.\n"
+        f"By principal: {principals}\n"
+        f"Including: {objects}\n"
+        f"Recorded {rows[0]['created_at']} to {rows[-1]['created_at']} UTC. The full list is the "
+        f"`{FEED_STATUS_BACKLOG}` rows of `GET /v1/intercepted-events` on the Session KV server."
+    )
+
+
+def _refund_alert_quota(severity: str) -> None:
+    """Give back one of today's alerts for `severity`, claimed for a post that
+    never happened. Best-effort: a failed refund costs one unit of the day's
+    budget, which is what it cost before the refund existed."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE alert_quota SET sent = sent - 1 WHERE day = ? AND severity = ? AND sent > 0",
+                    (day, severity),
+                )
+    except sqlite3.Error as exc:
+        logger.error(f"Could not refund a {severity} alert claimed for a post that did not happen: {exc}")
+
+
+def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Card the rows of every principal with fewer than DRIFT_BACKLOG_CARD_BELOW
+    rows, and return the rest for the digest.
+
+    A carded row gets what a live drift record gets, less field ownership (its
+    join was skipped): a quota claim, a session, the alert and the triage turn.
+    A row the ceiling refuses stays in the digest, so the change is still named
+    in chat. The row is marked DRIFT_BACKLOG_CARDED before the turn starts, so a
+    crash after it cannot card it twice; a turn that fails after that is lost as
+    a live one would be. A row whose session or mark cannot be written goes to
+    the digest too, so it is named and marked with the rest rather than left
+    pending under a range mark that would stamp it digested unnamed. The turn runs on a thread of its own, so a slow
+    gateway does not hold the digest's lease.
+    """
+    counts: Dict[str, int] = {}
+    for row in rows:
+        counts[row["principal"]] = counts.get(row["principal"], 0) + 1
+    digest: list[Dict[str, Any]] = []
+    for row in rows:
+        if counts[row["principal"]] >= DRIFT_BACKLOG_CARD_BELOW:
+            digest.append(row)
+            continue
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except ValueError:
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("kind") != INJECT_KIND_DRIFT:
+            payload = {"kind": INJECT_KIND_DRIFT, "summary": row["message"], "cluster": row["cluster"]}
+        allowed, suppressed_today = _claim_alert_quota(DRIFT_QUOTA_KEY)
+        if not allowed:
+            logger.warning(
+                f"Late record {row['id']} stays in the digest: daily limit of "
+                f"{ALERT_DAILY_LIMITS[DRIFT_QUOTA_KEY]} drift alerts reached, {suppressed_today} suppressed today"
+            )
+            digest.append(row)
+            continue
+        try:
+            session_id = create_session()["sessionID"]
+            with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+                with conn:
+                    conn.execute(
+                        "UPDATE intercepted_events SET backlog = ?, notified = 1, session_id = ? WHERE id = ?",
+                        (DRIFT_BACKLOG_CARDED, session_id, row["id"]),
+                    )
+        except sqlite3.Error as exc:
+            logger.error(f"Late record {row['id']} could not be carded and goes to the digest: {exc}")
+            _refund_alert_quota(DRIFT_QUOTA_KEY)
+            digest.append(row)
+            continue
+        logger.info(f"Drift backlog: carding late record {row['id']} (its principal has {counts[row['principal']]} late row(s))")
+        threading.Thread(
+            target=trigger_agent_troubleshooter,
+            args=(session_id, _drift_alert_message(_drift_summary(payload)), payload, row["id"]),
+            name=f"drift-backlog-card-{row['id']}",
+            daemon=True,
+        ).start()
+    return digest
+
+
+def _send_drift_backlog_digest(platform: str, message: str) -> bool:
+    """Post the digest to one platform. True when it was, or may have been, delivered.
+
+    A timeout and `a2a notify`'s outcome-unknown exit both count as delivered
+    here, unlike on the alert path: a second digest for the same rows is worse
+    than one the reader may not have seen, and the rows are in the ledger.
+    """
+    try:
+        subprocess.run(
+            chat_notify.command(platform, message),
+            check=True,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=_run_env(),
+            timeout=_drift_backlog_send_timeout(platform),
+        )
+        return True
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Drift backlog digest to '{platform}' timed out; treating it as sent")
+        return True
+    except subprocess.CalledProcessError as exc:
+        if chat_notify.outcome_unknown(exc.returncode):
+            logger.warning(f"Drift backlog digest to '{platform}' got no answer in time; treating it as sent")
+            return True
+        logger.error(f"Drift backlog digest to '{platform}' failed (exit {exc.returncode}): {exc.stderr}")
+    except Exception as exc:
+        logger.error(f"Drift backlog digest to '{platform}' failed: {exc}")
+    return False
+
+
+# A mark that did not land after a delivered post: (holder, max_id, outcome).
+# Only the worker thread reads or writes it. The next digest attempt finishes
+# this one first, so the rows it covers are never claimed and posted again.
+_drift_backlog_unfinished: Optional[tuple[str, int, int]] = None
+
+
+def _finish_drift_backlog_with_retries(holder: str, max_id: Optional[int], outcome: Optional[int]) -> bool:
+    """_finish_drift_backlog, tried DRIFT_BACKLOG_FINISH_ATTEMPTS times. True when it landed."""
+    for attempt in range(DRIFT_BACKLOG_FINISH_ATTEMPTS):
+        if attempt:
+            time.sleep(DRIFT_BACKLOG_FINISH_RETRY_SECONDS)
+        try:
+            _finish_drift_backlog(holder, max_id, outcome)
+            return True
+        except sqlite3.Error as exc:
+            logger.error(f"Drift backlog digest could not mark its rows or release its lease (try {attempt + 1}): {exc}")
+    return False
+
+
+def _post_drift_backlog_digest() -> bool:
+    """Claim the pending rows, post one digest for them, and mark them.
+
+    Returns False when the post failed or another holder has the lease, so the
+    worker waits DRIFT_BACKLOG_RETRY_SECONDS. A headless install marks the rows
+    with no post, as the alert path does for its own rows.
+    """
+    global _drift_backlog_unfinished
+    if _drift_backlog_unfinished is not None:
+        if not _finish_drift_backlog_with_retries(*_drift_backlog_unfinished):
+            return False
+        _drift_backlog_unfinished = None
+        return True
+    platforms = enabled_chat_platforms()
+    headless = platforms == [DEFAULT_CHAT_PLATFORM] and _chat_platforms_disabled()
+    lease_seconds = DRIFT_BACKLOG_LEASE_MARGIN_SECONDS + sum(_drift_backlog_send_timeout(p) for p in platforms)
+    holder = uuid.uuid4().hex
+    try:
+        rows = _claim_drift_backlog(holder, lease_seconds)
+    except sqlite3.Error as exc:
+        logger.error(f"Drift backlog digest could not claim its rows: {exc}")
+        return False
+    if rows is None:
+        return False
+    max_id = rows[-1]["id"] if rows else None
+    outcome: Optional[int] = None
+    try:
+        rows = _card_drift_backlog_minorities(rows)
+        if not rows:
+            return True
+        if headless:
+            outcome = DRIFT_BACKLOG_HEADLESS
+            logger.info(f"Drift backlog: {len(rows)} record(s) recorded with no digest posted (no chat platform enabled)")
+            return True
+        message = _drift_backlog_digest_text(rows)
+        active = get_active_platform(platforms)
+        for candidate in [active] + [p for p in platforms if p != active]:
+            if _send_drift_backlog_digest(candidate, message):
+                outcome = DRIFT_BACKLOG_DIGESTED
+                logger.info(f"Drift backlog digest for {len(rows)} record(s) posted to '{candidate}'")
+                return True
+        logger.error(
+            f"Drift backlog digest for {len(rows)} record(s) was not delivered to any enabled platform "
+            f"({', '.join(platforms)}); retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s"
+        )
+        return False
+    finally:
+        if not _finish_drift_backlog_with_retries(holder, max_id, outcome) and outcome is not None and max_id is not None:
+            _drift_backlog_unfinished = (holder, max_id, outcome)
+
+
+def _arm_drift_backlog_digest_if_pending() -> None:
+    """Start the digest worker when the ledger holds pending rows, so rows a
+    previous process recorded and never digested are not left until the next
+    backlog record arrives."""
+    try:
+        pending = _drift_backlog_pending_ages()
+    except Exception as exc:
+        logger.error(f"Could not check for pending drift backlog rows at startup: {exc}")
+        return
+    if pending is not None:
+        _arm_drift_backlog_digest()
 
 
 def _inject_stall(
@@ -4146,7 +5125,7 @@ def _validate_non_negative_int64(value: int, name: str) -> int:
     return value
 
 
-def _feed_status(notified: int, severity: str, delivery_error: str) -> str:
+def _feed_status(notified: int, severity: str, delivery_error: str, backlog: int = DRIFT_BACKLOG_NONE) -> str:
     """What became of a ledger row, in the inject route's own words.
 
     Derived rather than stored, from the three columns that already decide it:
@@ -4155,7 +5134,10 @@ def _feed_status(notified: int, severity: str, delivery_error: str) -> str:
     skips chat delivery) only for an alert admitted past the severity gate and
     daily quota, an Info row is the one the severity gate filters, and
     `delivery_error` is written only when a chat post was attempted and failed.
+    A backlog row that is not carded is `backlog` whatever the other three say.
     """
+    if backlog and backlog != DRIFT_BACKLOG_CARDED:
+        return FEED_STATUS_BACKLOG
     if notified:
         return FEED_STATUS_INJECTED
     if delivery_error:
@@ -4183,7 +5165,7 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message"
+        "reason, severity, notified, delivery_error, message, backlog"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -4207,7 +5189,7 @@ def list_intercepted_events(
             "name": row["workload"],
             "reason": row["reason"],
             "severity": row["severity"],
-            "status": _feed_status(row["notified"], row["severity"], row["delivery_error"]),
+            "status": _feed_status(row["notified"], row["severity"], row["delivery_error"], row["backlog"]),
             "message": row["message"],
         }
         for row in rows[:limit]
@@ -4405,6 +5387,24 @@ def register_findings(body: Dict[str, Any]) -> Dict[str, Any]:
     return _findings_write(findings_queue.register_findings, body.get("findings"), body.get("scope"))
 
 
+@app.get("/v1/board", dependencies=[Depends(verify_api_key)])
+def get_board() -> Dict[str, Any]:
+    """The Slack Home tab's snapshot (`board_snapshot.py`), relayed by the Hermes bridge.
+
+    A source that cannot be read is a 503, never an empty board: the gateway
+    then says it could not read the board rather than drawing a clean fleet.
+    """
+    board = _kanban_db_path()
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as session_db:
+            if not os.path.isfile(board):
+                return board_snapshot.snapshot(session_db, None, datetime.now(timezone.utc))
+            with closing(_read_only(board)) as kanban:
+                return board_snapshot.snapshot(session_db, kanban, datetime.now(timezone.utc))
+    except Exception as exc:  # noqa: BLE001 — a source that cannot be read is a 503, whatever raised
+        raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
+
+
 @app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])
 def get_ranked_findings() -> Dict[str, Any]:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -4493,3 +5493,4 @@ def put_queue_publication(publisher: str, body: Dict[str, Any]) -> Dict[str, Any
 
 
 init_db()
+_arm_drift_backlog_digest_if_pending()

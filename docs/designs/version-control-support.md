@@ -2674,14 +2674,21 @@ What a clone presents follows the forge's credential:
   presents nothing, as on GitHub.
 
 **A context repository never receives the write token.** It gets the forge's
-read-only credential when the forge offers one, and GitLab's stored token has no
-read-only variant here, so a GitLab context repository is cloned with no
-credential. That reads a public project and refuses a private one at the clone,
-with a log line saying why. A read-only GitLab token for context repositories
-would lift that: a second Secret and a second `Credential`, with nothing here
-depending on its absence. The write gate is unchanged: `commit` and `push`
-resolve the repository's own forge and refuse anything that forge's managed list
-does not hold.
+read-only credential when the forge offers one. On GitLab that is a second stored
+token, under the optional key `read-token` in the Secret the forge's
+`credentialsRef` already names. There is no new field, and "one forge per host"
+stays. The operator projects the key, when present, beside `token`, and names
+the file to the broker as `readTokenPath`. `read_credential` checks the file on
+each call and returns a `StaticFileCredential` on it, with the same host, header
+and username as the write credential. With no path, no file, an unreadable or empty one,
+or one that does not hold one line of printable ASCII (the rule the git helper applies), it
+returns `NoCredential`, and the clone presents nothing. That reads a public project and
+refuses a private one at the clone, with a log line saying why. The
+recommended token is a project or group access token with the Reporter role and
+only the `read_repository` scope. The write gate is unchanged: `commit`, `push`,
+the API routes and the refresh route resolve the repository's own forge, refuse
+anything that forge's managed list does not hold, and present only the write
+credential.
 
 ### GitLab errors
 
@@ -3050,8 +3057,11 @@ cannot be obtained falls back to the credential-less clone, with the ambient
 helper cleared in that same layer so the write token is never tried in its
 place. On GitHub it is a `contents: read` App installation token minted from the
 repository's own minter policy, which the operator renders per context
-repository; a forge without a read-only credential answers `NoCredential` and
-the clone proceeds as before.
+repository. On GitLab it is the stored `read-token` beside the write token
+(§7, "GitLab in the content workspace"). It is not minted per repository: GitLab
+sets its reach, a project or a group. The broker still presents it only for a
+registered context repository inside the forge's `allowedPaths`. A forge without a read-only
+credential answers `NoCredential` and the clone proceeds as before.
 The write gate does not consult the role, so a context repository stays refused
 by every `/v1/vcs` verb but `capabilities`, by `commit` and `push`, and by the
 refresh route; the verbs' credential-less read path for public repositories
