@@ -257,7 +257,7 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "presubmit"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn(f"EVAL_FORGE=gitlab: the GitLab lane runs {len(self.lane_entries())} case(s) on the presubmit tier", result.stdout)
+        self.assertIn(f"EVAL_FORGE=gitlab: the gitlab lane runs {len(self.lane_entries())} case(s) on the presubmit tier (eval/gitlab-cases.txt)", result.stdout)
         self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
         # pdb-remediation-pr was the lane's one roster case from 2026-10-14
         # (#2016) until its demotion to the nightly on 2026-10-17 (#3120), so
@@ -320,7 +320,7 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn(f"the GitLab lane runs {len(self.lane_entries())} case(s) on the nightly tier", result.stdout)
+        self.assertIn(f"the gitlab lane runs {len(self.lane_entries())} case(s) on the nightly tier (eval/gitlab-cases.txt)", result.stdout)
         self.assertNotIn("nightly-only task(s) join the matrix", result.stdout)
         self.assertEqual(lines_tagged(result, "ROSTER"), [""])
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
@@ -331,7 +331,7 @@ class GitLabLaneTest(unittest.TestCase):
         body = "\n".join([f'SCRIPT_DIR="{HACK_DIR}"', roster_constants(), section, part_switch, 'echo "PART_OK"'])
         refused = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("is the GitHub nightly's split; the GitLab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
+        self.assertIn("is the GitHub nightly's split; the gitlab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
         allowed = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "all"})
         self.assertIn("PART_OK", allowed.stdout, allowed.stderr)
         github = run_bash(body, {"EVAL_FORGE": "github", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
