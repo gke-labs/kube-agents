@@ -962,7 +962,9 @@ def test_record_counts_a_whole_set_aside_repetition_as_neither_at_the_next_key(t
         reps=[{"outcome": "not_applicable", "not_applicable_checks": ["card"]}] * 3,
     )
     assert run_record(store, doc) == 0
-    assert "no repetition produced a pass or a fail" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "no repetition produced a pass or a fail (3 not applicable on this transport)" in printed
+    assert "blocked or hit infrastructure" not in printed
     assert list(store.glob("*.jsonl")) == []
 
     mixed = case_file(

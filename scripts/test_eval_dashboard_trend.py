@@ -778,7 +778,7 @@ class TrendPageTest(unittest.TestCase):
         self.assertIn("this page shows the last good read, Thu 10:09 AM ET", stale)
         self.assertEqual(stale.count('class="tcard"'), 4, "the last good read is still drawn")
         empty = dom_text(self.empty / "trend.html")
-        self.assertIn("holds no record inside its 90-day window yet", empty)
+        self.assertIn("holds no today-mode record inside its 90-day window yet", empty)
         self.assertNotIn('class="tcard"', empty)
 
     def test_the_page_carries_its_data_inline_and_the_nav_tab(self):

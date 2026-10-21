@@ -886,10 +886,15 @@ def _record_for_case(
         )
     scored = [r for r in reps if r.get("outcome") in ("pass", "fail")]
     if not scored:
-        return (
-            f"{case_id}: no repetition produced a pass or a fail "
-            f"({len(reps)} repetition(s) blocked or hit infrastructure)"
-        )
+        # At a next key a repetition set aside whole reaches here too; it was
+        # neither blocked nor lost to infrastructure, so it is counted apart.
+        whole = sum(1 for r in reps if r.get("outcome") == REP_OUTCOME_NOT_APPLICABLE)
+        causes = []
+        if whole:
+            causes.append(f"{whole} {NOT_APPLICABLE_PHRASE}")
+        if len(reps) - whole or not whole:
+            causes.append(f"{len(reps) - whole} repetition(s) blocked or hit infrastructure")
+        return f"{case_id}: no repetition produced a pass or a fail ({', '.join(causes)})"
 
     return case_id, BaselineRecord(
         key=key,
