@@ -1071,6 +1071,12 @@ FORGE_CA_FILE="${EVAL_FORGE_STATE_DIR}/ca.crt"
 GITLAB_FORGE_CA_SECRET_NAME="gitlab-forge-ca"
 GITHUB_FORGE_CA_SECRET_NAME="github-forge-ca"
 FORGE_CA_SECRET_KEY="ca.crt"
+# On a per-run GitLab there is no table to map: the lane step seeds the group
+# and the project the pool's gitlab.com layout has, `gke-agentic/<PROJECT_ID>-infra`,
+# which is also what hack/ci_gitlab_forge.py's project guard accepts (GROUP,
+# PROJECT_SUFFIX there; scripts/test_ci_gitlab_forge.py pins the pair equal).
+GITLAB_FORGE_GROUP="gke-agentic"
+GITLAB_FORGE_PROJECT_SUFFIX="-infra"
 # The Secret the forge's credentialsRef names, and the key the token sits
 # under. The key is this deploy's choice: the operator reads only the Secret's
 # name today, and the GitLab provider, when it lands, fixes the key it reads.
@@ -1103,7 +1109,9 @@ GITLAB_FORGE_HOST="${EVAL_FORGE_HOST}"
 case "${EVAL_FORGE_KIND}" in
   github) ;;
   gitlab)
-    if ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
+    if [ "${EVAL_FORGE_SELF_MANAGED}" = "yes" ]; then
+      GITLAB_PROJECT="${GITLAB_FORGE_GROUP}/${PROJECT_ID}${GITLAB_FORGE_PROJECT_SUFFIX}"
+    elif ! GITLAB_PROJECT="$(gitlab_project_for_project "${PROJECT_ID}")"; then
       echo "ERROR: EVAL_FORGE=${EVAL_FORGE} but no GitLab project is mapped for PROJECT_ID=${PROJECT_ID}." >&2
       echo "       Add it to gitlab_project_for_project() in hack/ci-deploy.sh once the project" >&2
       echo "       exists and the bot is a Developer on it (docs/ci-pool-projects.md 5.6)." >&2
@@ -1143,6 +1151,13 @@ if [ -n "${EVAL_GITOPS_REPO:-}" ]; then
   echo "GitOps repo: ${GITOPS_REPO} (from EVAL_GITOPS_REPO)"
 elif GITOPS_REPO="$(gitops_repo_for_project "${PROJECT_ID}")"; then
   echo "GitOps repo: ${GITOPS_REPO} (mapped from PROJECT_ID=${PROJECT_ID})"
+elif [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  # The GitHub repository is not read under the gitlab kind (the GitLab
+  # project is the gitops repository and the alias is set empty below), so a
+  # project with no GitHub row, a per-run GitLab on an unmapped project, is
+  # not a refusal here.
+  GITOPS_REPO=""
+  echo "GitOps repo: none on GitHub (EVAL_FORGE=${EVAL_FORGE}; the GitLab project ${GITLAB_PROJECT} is the gitops repository)"
 elif [ "${IS_PROW_RUN}" = "true" ]; then
   echo "ERROR: no GitOps repo is mapped for PROJECT_ID=${PROJECT_ID}." >&2
   echo "       Every project in the kube-agents-evals-project Boskos pool needs its own" >&2
@@ -1167,6 +1182,8 @@ fi
 if [ "${GITOPS_REPO}" = "none" ]; then
   echo "GitHub integration: disabled for this deploy (EVAL_GITOPS_REPO=none)"
   GITOPS_REPO=""
+elif [ -z "${GITOPS_REPO}" ] && [ "${EVAL_FORGE_KIND}" = "gitlab" ]; then
+  : # resolved above: no GitHub repository under the gitlab kind
 elif ! printf '%s' "${GITOPS_REPO}" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
   echo "ERROR: GitOps repo '${GITOPS_REPO}' is not in owner/repo form." >&2
   echo "       The minty rule ConfigMap is keyed on the org and repo separately, so the" >&2

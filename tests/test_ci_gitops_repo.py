@@ -423,6 +423,18 @@ class CiDeployGitopsRepoTest(unittest.TestCase):
         self.assertIn("platformAgent.integration.forges[0].caBundleRef.key=ca.crt", args)
         self.assertIn("platformAgent.integration.repositories[0].repository=https://gitlab.eval.internal/gke-agentic/kube-agents-evals-2-infra", args)
 
+    def test_gitlab_ce_derives_the_project_from_the_lease_and_needs_no_mapping_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = _script_dir_with_chart(pathlib.Path(tmp), crd_lists_gitlab=True)
+            rc, out, err = self._resolve(
+                _NEVER_MAPPED_PROJECT, PULL_NUMBER="123", JOB_NAME="pull-eval", EVAL_FORGE="gitlab-ce",
+                SCRIPT_DIR=script_dir, EVAL_FORGE_STATE_DIR=self._state_dir(tmp),
+            )
+        self.assertEqual(rc, 0, err)
+        args = self._forge_args(out)
+        self.assertIn("platformAgent.integration.forges[0].namespace=gke-agentic", args)
+        self.assertIn(f"platformAgent.integration.repositories[0].repository=https://gitlab.eval.internal/gke-agentic/{_NEVER_MAPPED_PROJECT}-infra", args)
+
     def test_a_self_managed_host_can_be_a_developers_own(self):
         with tempfile.TemporaryDirectory() as tmp:
             rc, out, err = self._resolve(

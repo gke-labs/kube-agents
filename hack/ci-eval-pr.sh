@@ -1282,9 +1282,19 @@ eval_gitops_repo() { # <project-id>
 }
 
 eval_gitlab_project() { # <project-id>
-  # The GitLab table beside it, lifted the same way; under EVAL_FORGE=gitlab
-  # this is the repository the resets and the inject lane name.
+  # The GitLab table beside it, lifted the same way; under the gitlab kind
+  # this is the repository the resets and the inject lane name. On a per-run
+  # instance there is no table: the project is the one the lane step seeded,
+  # the pool layout's `<group>/<PROJECT_ID><suffix>` (the deploy's constants,
+  # lifted too).
   local body
+  if [ "${EVAL_FORGE_SELF_MANAGED:-no}" = "yes" ]; then
+    # Two expressions, not one alternation: BSD sed has no \| in a basic regex.
+    eval "$(sed -n -e 's/^\(GITLAB_FORGE_GROUP=.*\)$/\1/p' -e 's/^\(GITLAB_FORGE_PROJECT_SUFFIX=.*\)$/\1/p' "${SCRIPT_DIR}/ci-deploy.sh")"
+    [ -n "${GITLAB_FORGE_GROUP:-}" ] && [ -n "${GITLAB_FORGE_PROJECT_SUFFIX:-}" ] || return 1
+    echo "${GITLAB_FORGE_GROUP}/$1${GITLAB_FORGE_PROJECT_SUFFIX}"
+    return 0
+  fi
   body="$(sed -n '/^gitlab_project_for_project() {$/,/^}$/p' "${SCRIPT_DIR}/ci-deploy.sh")"
   [ -n "${body}" ] || return 1
   eval "${body}"

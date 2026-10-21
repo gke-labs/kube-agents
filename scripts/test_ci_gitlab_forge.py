@@ -1429,6 +1429,14 @@ class EvalScriptGitLabTest(unittest.TestCase):
         self.assertIn("Ledger probe (lease): skipped, PROJECT_ID=kube-agents-evals-2 maps to no GitLab project", proc.stdout)
         self.assertNotIn("PROBE ", (self.dir / "whoami.log").read_text())
 
+    def test_the_per_run_project_layout_equals_the_guards(self):
+        # The deploy derives a per-run GitLab's project from the lease with these two
+        # constants; the helper's project guard accepts exactly that shape.
+        self.assertEqual(literal(CI_DEPLOY, "GITLAB_FORGE_GROUP"), gitlab.GROUP)
+        self.assertEqual(literal(CI_DEPLOY, "GITLAB_FORGE_PROJECT_SUFFIX"), gitlab.PROJECT_SUFFIX)
+        proc = run_bash(lifted("eval_gitlab_project") + '\nEVAL_FORGE_SELF_MANAGED="yes"; eval_gitlab_project some-leased-project\n', env={"SCRIPT_DIR": str(HACK)})
+        self.assertEqual(proc.stdout.strip(), "gke-agentic/some-leased-project-infra")
+
     def test_the_secret_names_equal_the_deploys(self):
         for name in ("GITLAB_SECRETS_PROJECT", "GITLAB_AGENT_SM_SECRET"):
             with self.subTest(name=name):
