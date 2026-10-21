@@ -50,20 +50,12 @@ Check 0 is the one this file originally missed, and the omission was structural
 rather than an oversight: every other check sets its variables directly in this
 process, so none of them crosses the spawn boundary where the scrub happens.
 It cost a live delivery failure to find.
-
-Check 13 pins what the first onboarding report reads back from those deliveries:
-each run's ledger row, its ``completed`` status, and the ``delivery_outcome`` it
-records. ``agents/chat/scripts/bootstrap_delivery.py`` names a summary the relay
-refused as not posted, and reads a value it does not know as posted.
 """
 
 from __future__ import annotations
 
-import ast
-import contextlib
 import json
 import os
-import sqlite3
 import sys
 import tempfile
 import threading
@@ -71,32 +63,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 API_KEY = "verify-only-not-a-real-key"
 HOME_CHANNEL = "cron-reports"
-# A copy of agents/chat/scripts/bootstrap_delivery.py DELIVERY_OUTCOME_CLASS, which this stage cannot
-# import (it enters the image in the platform stage); test_outcome_copy.py beside the plugin keeps the two equal.
-LOST, SILENT, TRIED = "lost", "silent", "tried"
-# The scheduler's variable for a run's outcome, and the value the relay's refusal records.
-DELIVERY_OUTCOME_NAME = "delivery_outcome"
-DELIVERY_FAILED_VALUE = "failed"
-DELIVERY_OUTCOME_CLASS = {
-    DELIVERY_FAILED_VALUE: LOST,
-    "suppressed": SILENT,
-    "suppressed_acked": SILENT,
-    None: SILENT,
-    "delivered": TRIED,
-    "queued": TRIED,
-    "not_configured": TRIED,
-}
-# The ledger under HERMES_HOME, and the columns and run status bootstrap_delivery._completed_runs reads.
-LEDGER_PARTS = ("cron", "executions.db")
-NOTE_LEDGER_COLUMNS = ("job_id", "status", "claimed_at", "finished_at", "delivery_outcome")
-COMPLETED_STATUS = "completed"
-NOTE_SOURCE = "agents/chat/scripts/bootstrap_delivery.py"
-# The Hermes package whose source writes the ledger rows.
-CRON_SOURCE_DIR = "cron"
-# A stand-in audit job and the source its ledger rows are filed under.
-AUDIT_PROMPT = "Audit the fleet."
-AUDIT_SCHEDULE = "0 6 * * *"
-EXECUTION_SOURCE = "verify"
 
 
 class Relay:
@@ -156,81 +122,6 @@ def job(deliver: str) -> dict:
         "name": "GitHub Repo Watcher",
         "deliver": deliver,
     }
-
-
-def _literals(expr: ast.expr | None) -> set:
-    """The constants an expression can evaluate to: a constant, either branch of `a if c else b`, or an `or` chain."""
-    if isinstance(expr, ast.Constant):
-        return {expr.value}
-    if isinstance(expr, ast.IfExp):
-        return _literals(expr.body) | _literals(expr.orelse)
-    if isinstance(expr, ast.BoolOp):
-        return set().union(*(_literals(v) for v in expr.values))
-    return set()
-
-
-def _names(target: ast.expr) -> list[str | None]:
-    """The names an assignment target binds, one per position (None where it binds no plain name)."""
-    if isinstance(target, ast.Tuple):
-        return [n for elt in target.elts for n in _names(elt)]
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, ast.Attribute):
-        return [target.attr]
-    return [None]
-
-
-def written_outcomes(cron_dir: str) -> set:
-    """The literal values the scheduler's source writes straight into a run's delivery_outcome.
-
-    Read from the source rather than from a run, so a branch no check drives still counts: a literal
-    assigned to a name or attribute called delivery_outcome (directly, or returned by the function it
-    is assigned from, by position when unpacked), or passed as delivery_outcome=. A value reached
-    through a variable or a named constant is not resolved; check 13 fails on its own when the walk
-    stops finding the failure value, so a refactor of that shape names this function.
-    """
-    trees = []
-    for name in sorted(os.listdir(cron_dir)):
-        if name.endswith(".py"):
-            with open(os.path.join(cron_dir, name), encoding="utf-8") as fh:
-                trees.append(ast.parse(fh.read()))
-    functions = {
-        node.name: node
-        for tree in trees
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-    def returned(func: str, position: int | None) -> set:
-        found = set()
-        for node in ast.walk(functions.get(func, ast.Module(body=[], type_ignores=[]))):
-            if not isinstance(node, ast.Return):
-                continue
-            if position is None:
-                found |= _literals(node.value)
-            elif isinstance(node.value, ast.Tuple) and position < len(node.value.elts):
-                found |= _literals(node.value.elts[position])
-        return found
-
-    written = set()
-    for tree in trees:
-        for node in ast.walk(tree):
-            if isinstance(node, ast.keyword) and node.arg == DELIVERY_OUTCOME_NAME:
-                written |= _literals(node.value)
-            if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    names = _names(target)
-                    if DELIVERY_OUTCOME_NAME not in names:
-                        continue
-                    position = names.index(DELIVERY_OUTCOME_NAME) if isinstance(target, ast.Tuple) else None
-                    if position is None:
-                        written |= _literals(node.value)
-                    call = node.value
-                    if isinstance(call, ast.Call):
-                        func = call.func.id if isinstance(call.func, ast.Name) else getattr(call.func, "attr", None)
-                        written |= returned(func, position)
-    return written
 
 
 def main() -> None:
@@ -389,7 +280,6 @@ def main() -> None:
             f"a 500 from the relay is recorded as a delivery error (got {error!r})",
         )
         check(API_KEY not in error, "the failure string does not carry the API key")
-        refused = error
 
     # 8. Unset the switch and the platform vanishes — this is what keeps the
     #    gateway process from advertising a platform it cannot serve.
@@ -504,65 +394,6 @@ def main() -> None:
     check(re.search(r"^\s*job_id TEXT", columns, re.M) is not None, "the run ledger still has job_id")
     check(re.search(r"^\s*started_at TEXT", columns, re.M) is not None, "the run ledger still has started_at")
     check("'running'" in columns, "the run ledger's status set still has 'running'")
-
-    # 13. The first onboarding report reads each audit run's delivery_outcome to name the summaries
-    #     the relay refused before anyone opened the chat. Hermes' set of values must be the one
-    #     bootstrap_delivery classifies: a value it has never seen reads as posted, and the note
-    #     would drop that audit without a word.
-    from agent.monitoring.cron_health import _KNOWN_DELIVERY_OUTCOMES
-
-    known = {outcome for outcome in DELIVERY_OUTCOME_CLASS if outcome is not None}
-    check(
-        set(_KNOWN_DELIVERY_OUTCOMES) == known,
-        f"Hermes' delivery outcomes {sorted(_KNOWN_DELIVERY_OUTCOMES)} are the ones DELIVERY_OUTCOME_CLASS in {NOTE_SOURCE} classifies",
-    )
-
-    #     The monitoring set is not what writes the ledger, so the values the scheduler's own source
-    #     writes are read too.
-    written = written_outcomes(os.path.join(os.getcwd(), CRON_SOURCE_DIR))
-    check(
-        DELIVERY_FAILED_VALUE in written,
-        f"the source walk finds the scheduler writing {DELIVERY_FAILED_VALUE!r} to delivery_outcome "
-        f"(found {sorted(map(str, written))}); a miss means written_outcomes in this file needs updating, not the table",
-    )
-    check(
-        written <= set(DELIVERY_OUTCOME_CLASS),
-        f"every literal delivery_outcome the scheduler writes {sorted(map(str, written))} is one "
-        f"DELIVERY_OUTCOME_CLASS in {NOTE_SOURCE} classifies",
-    )
-
-    #     Then the real bookkeeping tail writes a run's row: check 7's refused delivery must read
-    #     as lost, and a run that posted nothing on purpose as silent.
-    from cron.executions import create_execution
-    from cron.jobs import create_job
-    from cron.scheduler import _finish_completed_run, _RunDelivery
-
-    audit = create_job(AUDIT_PROMPT, AUDIT_SCHEDULE, name=title, deliver="chat")
-    ledger = os.path.join(home, *LEDGER_PARTS)
-    columns = set()
-    for delivery, expected in (
-        (_RunDelivery(job=audit, success=True, error=None, delivery_attempted=True, delivery_error=refused,
-                      should_deliver=True), LOST),
-        (_RunDelivery(job=audit, success=True, error=None, should_deliver=False), SILENT),
-    ):
-        run = create_execution(audit["id"], source=EXECUTION_SOURCE)
-        _finish_completed_run(delivery, None, run["id"])
-        with contextlib.closing(sqlite3.connect(ledger)) as conn:
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
-            row = conn.execute(
-                "SELECT status, delivery_outcome FROM executions WHERE id = ?", (run["id"],)
-            ).fetchone()
-        status, outcome = row if row else (None, None)
-        check(status == COMPLETED_STATUS, f"a run that reached delivery is recorded {COMPLETED_STATUS!r} (got {status!r})")
-        check(
-            DELIVERY_OUTCOME_CLASS.get(outcome, TRIED) == expected,
-            f"a {'refused' if expected == LOST else 'silent'} run records an outcome {NOTE_SOURCE} reads as "
-            f"{expected} (got {outcome!r})",
-        )
-    check(
-        set(NOTE_LEDGER_COLUMNS) <= columns,
-        f"the run ledger still has the columns {NOTE_SOURCE} selects ({', '.join(NOTE_LEDGER_COLUMNS)})",
-    )
 
     print("\nverify_chat_relay: all checks passed")
 

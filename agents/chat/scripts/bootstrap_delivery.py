@@ -264,9 +264,8 @@ OUTCOME_LOST = "lost"
 OUTCOME_SILENT = "silent"
 OUTCOME_TRIED = "tried"
 DELIVERY_FAILED = "failed"
-# Every value Hermes records there, and None for a run with none recorded.
-# deploy/docker/plugins/verify_chat_relay.py keeps a copy and fails the image build when Hermes' known
-# outcomes, or the values its scheduler writes, are not all in it.
+# Every value Hermes records there, and None for a run with none recorded. A value not in the table reads as
+# lost: naming a summary that did post costs the user one question, dropping one that did not loses it.
 DELIVERY_OUTCOME_CLASS: dict[str | None, str] = {
     DELIVERY_FAILED: OUTCOME_LOST,
     # Posted nothing on purpose.
@@ -961,7 +960,7 @@ def _completed_runs(data_dir: Path, jobs: list[str]) -> dict[str, list[tuple[flo
 
 
 def _undelivered_audits(audits: list[str], runs: dict[str, list[tuple[float, float | None, str | None]]]) -> list[str]:
-    """The audits whose latest run that tried to post its summary failed.
+    """The audits whose latest run that tried to post its summary failed, or recorded an unknown outcome.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
     it, and nothing posts it later; this delivery is the first message that user reads. Any other
@@ -971,7 +970,7 @@ def _undelivered_audits(audits: list[str], runs: dict[str, list[tuple[float, flo
     """
     out = []
     for audit in audits:
-        classes = [DELIVERY_OUTCOME_CLASS.get(run[2], OUTCOME_TRIED) for run in runs.get(audit, ())]
+        classes = [DELIVERY_OUTCOME_CLASS.get(run[2], OUTCOME_LOST) for run in runs.get(audit, ())]
         tried = [c for c in classes if c != OUTCOME_SILENT]
         if tried and tried[-1] == OUTCOME_LOST:
             out.append(f"`{audit}`")

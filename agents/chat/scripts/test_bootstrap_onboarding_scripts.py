@@ -2329,13 +2329,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertNotIn("`compliance-audit`", unposted)
         self.assertIn("`stockout-prevention`", unposted)
 
-    def test_every_hermes_outcome_is_classified(self):
-        self.assertEqual(
-            set(bootstrap_delivery.DELIVERY_OUTCOME_CLASS),
-            {"failed", "suppressed", "suppressed_acked", None, "delivered", "queued", "not_configured"},
-        )
-
-    def test_each_outcome_lists_the_audit_as_it_did_before_the_classes(self):
+    def test_each_outcome_lists_the_audit_by_its_class(self):
         # (listed when it is the only run, listed when it follows a refused run)
         expected = {
             "failed": (True, True),
@@ -2345,7 +2339,8 @@ class FirstRunAuditsTest(unittest.TestCase):
             "delivered": (False, False),
             "queued": (False, False),
             "not_configured": (False, False),
-            "a-value-hermes-added-later": (False, False),
+            # A value Hermes does not write today reads as lost, so a renamed failure still names the audit.
+            "a-value-hermes-added-later": (True, True),
         }
         for outcome, (alone, after_failed) in expected.items():
             with self.subTest(outcome=outcome):
