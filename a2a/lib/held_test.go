@@ -284,7 +284,7 @@ func TestHeldDeliveryCarriesTheIngestTime(t *testing.T) {
 // durable every worker shares, consuming them for all.
 func TestSubscribeHeldRefusesAnIntakeThatIsNotOneProfiles(t *testing.T) {
 	h, worker := newHeldHarness(t, "mine")
-	for _, subject := range []string{"a2a.tasks.*.*.in", "a2a.tasks.mine.>", "a2a.tasks.>", "a2a.tasks.mine.task.events"} {
+	for _, subject := range []string{"a2a.tasks.*.*.in", "a2a.tasks.mine.>", "a2a.tasks.>", "a2a.tasks.mine.task.events", "a2a.tasks.mine.>.in", "a2a.tasks.*.read.top.*.in"} {
 		cfg := h.cfg()
 		cfg.Subject = subject
 		if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil {
@@ -865,4 +865,45 @@ func TestARedeliveryAfterANakStartsAHandler(t *testing.T) {
 	if len(h.live) != 0 {
 		t.Errorf("%d live entries left after both handlers returned", len(h.live))
 	}
+}
+
+// The operator can't shorten a live durable's AckWait to where bound workers'
+// heartbeats (a third of the AckWait they bound at) would lapse; a smaller
+// cut is fine, and the bigger one is made in steps.
+func TestEnsureHeldConsumerRefusesAnAckWaitCutWorkersCantKeepUpWith(t *testing.T) {
+	h, _ := newHeldHarness(t, "shrink")
+	h.ensure(1, 90*time.Second)
+	c := h.cfg()
+	cut := func(w time.Duration) error {
+		return h.req.EnsureHeldConsumer(h.ctx, HeldConsumerConfig{
+			Stream: c.Stream, Durable: c.Durable, FilterSubject: c.Subject, MaxAckPending: 1, AckWait: w,
+		})
+	}
+	if err := cut(30 * time.Second); err == nil {
+		t.Error("cut a 90s AckWait to 30s (a third), which lapses workers beating every 30s")
+	}
+	if err := cut(45 * time.Second); err != nil {
+		t.Errorf("refused a cut workers keep up with (90s to 45s): %v", err)
+	}
+	if err := cut(20 * time.Second); err != nil {
+		t.Errorf("refused the next step (45s to 20s): %v", err)
+	}
+}
+
+// The intake check is about the addressee, not the subject's length: a
+// deployment that puts tier and kind between profile and task binds too.
+func TestSubscribeHeldAcceptsALongerIntakeOfOneProfile(t *testing.T) {
+	h, worker := newHeldHarness(t, "tiered")
+	cfg := h.cfg()
+	cfg.Subject = "a2a.tasks.tiered.read.top.*.in"
+	if err := h.req.EnsureHeldConsumer(h.ctx, HeldConsumerConfig{
+		Stream: cfg.Stream, Durable: cfg.Durable, FilterSubject: cfg.Subject, MaxAckPending: 1,
+	}); err != nil {
+		t.Fatalf("EnsureHeldConsumer: %v", err)
+	}
+	sub, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {})
+	if err != nil {
+		t.Fatalf("SubscribeHeld refused a tiered intake of one profile: %v", err)
+	}
+	sub.Stop()
 }

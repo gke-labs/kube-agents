@@ -42,8 +42,11 @@ import (
 // DefaultHeldAckWait is how long the server waits for a held delivery's next
 // sign of life before it redelivers. The holder renews it every third of that,
 // so a live handler never loses its delivery and a dead one gives it back
-// inside this window. A worker binds at the durable's AckWait; if the operator
-// later shortens it, workers pick the new value up when they next bind.
+// inside this window. A worker paces its heartbeat from the AckWait it bound
+// at, so EnsureHeldConsumer refuses to shorten a live durable's AckWait to a
+// third of its current value or less: bound workers' beats would lapse and
+// every running task would be redelivered. A bigger cut is made in steps, or
+// after rolling the workers.
 const DefaultHeldAckWait = 2 * time.Minute
 
 // abandonedNakDelay is how long a delivery whose handler returned without
@@ -96,6 +99,14 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 	_, js := c.conn()
 	if js == nil {
 		return fmt.Errorf("EnsureHeldConsumer: not connected")
+	}
+	if existing, err := js.Consumer(ctx, cfg.Stream, cfg.Durable); err == nil {
+		// Workers beat at the AckWait they bound at, a third of it; a new
+		// AckWait at or under that would lapse every running task.
+		if old := existing.CachedInfo().Config.AckWait; old > 0 && cfg.ackWait() <= old/3 {
+			return fmt.Errorf("held consumer %s: AckWait %v is a third or less of the current %v, so bound workers' heartbeats would lapse; shorten it in steps, or roll the workers first",
+				cfg.Durable, cfg.ackWait(), old)
+		}
 	}
 	_, err := js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
 		Durable:       cfg.Durable,
@@ -174,12 +185,13 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 	if len(cfg.Subjects) > 0 {
 		return nil, fmt.Errorf("SubscribeHeld binds one intake subject; set Subject, not Subjects")
 	}
-	// A held durable is one profile's intake, `a2a.tasks.<profile>.*.in`, and
-	// the session filter acks away anything addressed elsewhere. On a durable
-	// every worker shares, that ack consumes the task for all of them, so the
-	// addressee must be a literal equal to Session: no wildcard, no `>`.
+	// A held durable is one profile's intake (`a2a.tasks.<profile>.….in`; how
+	// many tokens sit between is the deployment's choice), and the session
+	// filter acks away anything addressed elsewhere. On a durable every worker
+	// shares, that ack consumes the task for all of them, so the addressee
+	// must be a literal equal to Session, and no `>` may widen the filter.
 	if addressee := intakeAddressee(cfg.Subject); addressee == "" || strings.ContainsAny(addressee, "*>") {
-		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.*.in)", cfg.Subject)
+		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.….in, no >)", cfg.Subject)
 	} else if cfg.Session != addressee {
 		return nil, fmt.Errorf("SubscribeHeld: Session %q is not the intake's addressee %q; the session filter would ack every task away", cfg.Session, addressee)
 	}
@@ -193,12 +205,18 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 	return &heldSubscription{s: sub.(*durableSub), h: h}, nil
 }
 
-// intakeAddressee is the addressee token of `a2a.tasks.<addressee>.<task>.in`,
-// or "" for a subject of another shape.
+// intakeAddressee is the addressee token of an intake subject,
+// `a2a.tasks.<addressee>.….in` with at least a task token between, or "" for
+// a subject of another shape or one with a `>` anywhere.
 func intakeAddressee(subject string) string {
 	parts := strings.Split(subject, ".")
-	if len(parts) != 5 || parts[0] != "a2a" || parts[1] != "tasks" || parts[4] != "in" {
+	if len(parts) < 5 || parts[0] != "a2a" || parts[1] != "tasks" || parts[len(parts)-1] != "in" {
 		return ""
+	}
+	for _, p := range parts {
+		if p == ">" {
+			return ""
+		}
 	}
 	return parts[2]
 }
