@@ -13,12 +13,11 @@
 # reads every cluster in scope at once, builds the cohorts and votes the
 # baseline from the live fleet.
 #
-# Green since the drift row (#3398): the audit-stream table in
+# Green on the drift row (#3398, #3609): the audit-stream table in
 # agents/platform/SOUL.md routes this question to fleet_drift.py. Until then
-# the case ran marked `expected_fail: true` (#3135); the greens that took the
-# marker off came from a dev fleet carrying the full seeded fleet, seeded-c
-# included, because the collector's baseline ladder and outlier checks need
-# the 4-cluster cohort.
+# the case ran marked `expected_fail: true` (#3135). The green that took the
+# marker off is a pool-project run, where the collector's baseline ladder and
+# outlier checks have the 4-cluster cohort; its nightly record starts at merge.
 #
 # Domain: consistency (docs/designs/domains.yaml). Its journey row is the
 # targeted probe (one named cluster against its live peers); this case is the
@@ -41,8 +40,10 @@
 # cluster labelled environment=seeded: an extra seeded cluster with the facet
 # off makes the vote 3 ON / 2 OFF and the collector reaches no baseline, and
 # a fleet without seeded-c makes the-answer-names-the-outlier error. The
+# full green is the pool measuring run (#3609: 9/9, every check graded); the
 # 2026-10-21 dev loop on such a fleet, on the presubmit's agent model, was
-# red on 0.13.0 (collector never ran) and green 3/3 on the row (#3609).
+# red on 0.13.0 (collector never ran) and 3/3 on the graded checks, the
+# outlier check unevaluated because the fleet kubeconfigs were not written.
 #
 # Not this route, and left to their own cases: a request that names the SOP
 # (consistency-drift-outlier, consistency-no-environment-label), which runs
