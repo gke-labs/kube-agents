@@ -3041,12 +3041,14 @@ fi
 # TOPICS-STATE older than this render: check that topology-skew is in its subject list.
 # Provisioning is create-only convergence, so an existing TOPICS-STATE stream keeps
 # the subject list it was created with.
-topics_state_json="$($NATS stream info TOPICS-STATE --json 2>/dev/null | tr -d ' \t\r\n' || true)"
-if printf '%s' "${topics_state_json}" | grep -q '"subjects":\[' && \
-   ! printf '%s' "${topics_state_json}" | grep -q '"a2a\.topics\.agent\.platform\.topology-skew"'; then
+topics_state_json="$($NATS stream info TOPICS-STATE --json | tr -d ' \t\r\n')"
+topics_state_subjects="$(printf '%s' "${topics_state_json}" \
+  | grep -o '"subjects":\[[^]]*\]' | head -n1 | sed 's/^"subjects":\[//;s/\]$//;s/"//g' || true)"
+if [ -n "${topics_state_subjects}" ] && \
+   ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|platform\.(>|\*|topology-skew)))"'; then
   echo "NOTE: TOPICS-STATE does not carry subject a2a.topics.agent.platform.topology-skew." >&2
-  echo "  Provisioning does not edit an existing stream; to add the subject on an existing install:" >&2
-  echo "    nats stream edit TOPICS-STATE --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe'" >&2
+  echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
+  echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\"" >&2
 fi
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully
