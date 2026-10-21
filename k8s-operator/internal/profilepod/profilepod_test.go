@@ -123,6 +123,14 @@ func TestWithoutImageVolumesEachImageIsStagedIntoAnEmptyDir(t *testing.T) {
 func runStage(t *testing.T, c corev1.Container, mountPath string, payload map[string]string) (string, error) {
 	t.Helper()
 	root := t.TempDir()
+	// A sibling of files/ the way a busybox base ships one: it must never
+	// reach the mount.
+	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "sh"), []byte("shell"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if payload != nil {
 		if err := os.MkdirAll(filepath.Join(root, "files"), 0o755); err != nil {
 			t.Fatal(err)
@@ -157,12 +165,33 @@ func runStage(t *testing.T, c corev1.Container, mountPath string, payload map[st
 func TestStagingCopiesOnlyTheFilesPayload(t *testing.T) {
 	r := RenderPersonaAndTools(profile(agentv1alpha1.AgentProfileTool{Name: "jq", Image: "registry.example/jq:1"}), false)
 	tool := r.InitContainers[1]
-	dst, err := runStage(t, tool, "/opt/tools/jq", map[string]string{"bin/jq": "binary"})
+	payload := map[string]string{"bin/jq": "binary", ".config/jq.rc": "dotfile"}
+	dst, err := runStage(t, tool, "/opt/tools/jq", payload)
 	if err != nil {
 		t.Fatalf("staging a well-formed tools image failed: %v %s", err, dst)
 	}
-	if b, err := os.ReadFile(filepath.Join(dst, "bin", "jq")); err != nil || string(b) != "binary" {
-		t.Errorf("files/bin/jq did not land at <mount>/bin/jq: %v %q", err, b)
+	// The mount holds exactly the payload: every file under files/, dotfiles
+	// included, and nothing else (runStage plants a bin/sh beside files/, the
+	// way a busybox base does, so a second copy source would show here).
+	var got []string
+	_ = filepath.Walk(dst, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			rel, _ := filepath.Rel(dst, p)
+			got = append(got, rel)
+		}
+		return nil
+	})
+	if len(got) != len(payload) {
+		t.Errorf("mount holds %v, want exactly the payload %v", got, payload)
+	}
+	for name, body := range payload {
+		if b, err := os.ReadFile(filepath.Join(dst, name)); err != nil || string(b) != body {
+			t.Errorf("files/%s did not land at <mount>/%s: %v %q", name, name, err, b)
+		}
+	}
+	script := tool.Command[2]
+	if strings.Contains(script, `"$src"/.`+" ") || strings.Contains(script, `"$src"/. `) {
+		t.Errorf("the script copies the /files directory itself onto the mount, which re-applies its mode to the kubelet-owned root: %s", script)
 	}
 
 	persona := r.InitContainers[0]

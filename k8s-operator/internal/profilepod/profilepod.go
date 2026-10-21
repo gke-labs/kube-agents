@@ -129,7 +129,10 @@ func (r *Rendered) add(volume, image string, policy *corev1.PullPolicy, mountPat
 	r.Mounts = append(r.Mounts, mount)
 }
 
-// stagingContainer copies an image's PayloadDir into its emptyDir. It fails
+// stagingContainer copies an image's PayloadDir into its emptyDir, entry by
+// entry. It never copies the directory itself onto the mount: cp -a would then
+// re-apply /files's mode and times to the kubelet-owned mount root, which GNU
+// cp treats as an error when the container is not root. It fails
 // when the image has no PayloadDir or the copy is empty, so a mis-built image
 // stops the pod instead of starting a harness with an empty mount. It copies
 // nothing else from the image: unlike AgentPlugin's staging there is no
@@ -140,7 +143,10 @@ func stagingContainer(volume, image string, pullPolicy corev1.PullPolicy, mountP
 src=/%s
 dst=%q
 [ -d "$src" ] || { echo "image has no $src directory; a persona or tools image keeps its payload there" >&2; exit 1; }
-cp -a "$src"/. "$dst"/
+for item in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+  [ -e "$item" ] || [ -L "$item" ] || continue
+  cp -a "$item" "$dst"/
+done
 [ -n "$(ls -A "$dst")" ] || { echo "$src is empty" >&2; exit 1; }`, PayloadDir, mountPath)
 	return corev1.Container{
 		Name:            stagePrefix + volume,
