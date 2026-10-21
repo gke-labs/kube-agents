@@ -121,6 +121,13 @@ def test_collector_run_is_credited(command):
         "python3 scripts/eval_dashboard/collect.py",
         f"python3 {COLLECT} obtainability-audit --scope-projects fuxiaogao-gkedemos",
         f"python3 {COLLECT} ai-security-audit --scope-projects fuxiaogao-gkedemos",
+        # Trailing operators that mask failure (||, ;, |, &) are not credited under succeeded: true.
+        f"python3 {COLLECT} compliance-audit > out.json || true",
+        f'python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json || echo "collector failed"',
+        f"python3 {COLLECT} compliance-audit > out.json ; echo done",
+        f"python3 {COLLECT} compliance-audit 2>&1 | tee /opt/data/scratch/collect.log",
+        f"python3 {COLLECT} compliance-audit 2>&1 | head -n 5",
+        f"python3 {COLLECT} compliance-audit > out.json &",
     ],
 )
 def test_mention_help_or_other_script_is_not_credited(command):

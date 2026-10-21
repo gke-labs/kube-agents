@@ -8443,6 +8443,38 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     # an escaped character never opens a word, so a `#` after an escaped space is part of it
     assert _shell_argvs("python3 f.py --output r\\ #1.json --readiness") == [["python3", "f.py", "--output", "r #1.json", "--readiness"]]
     assert _shell_argvs("echo \\ #x") == [["echo", " #x"]]
+    # _shell_argvs_with_exit_propagation tracks whether subsequent operators propagate exit failure
+    from kube_agents_bench.verifiers import _shell_argvs_with_exit_propagation
+
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness") == [(["python3", "f.py", "--readiness"], True)]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness && echo DONE") == [
+        (["python3", "f.py", "--readiness"], True),
+        (["echo", "DONE"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("mkdir -p /tmp && python3 f.py --readiness") == [
+        (["mkdir", "-p", "/tmp"], True),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness || echo failed") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "failed"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness ; echo done") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "done"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness | tee /tmp/log") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["tee", "/tmp/log"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("python3 f.py --readiness &") == [
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation('bash -c "python3 f.py --readiness || true"') == [
+        (["bash", "-c", "python3 f.py --readiness || true"], True),
+        (["python3", "f.py", "--readiness"], False),
+        (["true"], True),
+    ]
     # a script is a bare name and a flag one word, refused at case load otherwise
     for bad in ({"script": "scripts/f.py"}, {"script": ""}, {"script": "f.py", "flags": ["--a b"]}):
         with pytest.raises(ValueError):
@@ -8574,6 +8606,33 @@ def test_worker_commands_required_run_succeeded_flag():
     transcript.set("ok", traj_called, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
     res_called = v.verify(5.0)
     assert res_called.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_called.reason
+
+    # Trajectory entry where the command is joined with trailing ||, ;, |, or & is not credited even if exit_code is 0.
+    for joined_cmd in [
+        f"python3 {_SCRIPT_PATH} --readiness || true",
+        f'python3 {_SCRIPT_PATH} --readiness || echo "failed"',
+        f"python3 {_SCRIPT_PATH} --readiness ; echo done",
+        f"python3 {_SCRIPT_PATH} --readiness 2>&1 | tee /tmp/log",
+        f"python3 {_SCRIPT_PATH} --readiness > /tmp/out &",
+    ]:
+        traj_joined = [
+            {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": joined_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
+        ]
+        transcript.set("ok", traj_joined, worker_commands=[{"task": "t_1", "command": joined_cmd}])
+        res_joined = v.verify(5.0)
+        assert res_joined.status == "fail" and "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded)" in res_joined.reason
+
+    # Trajectory entry where the command is followed by && chains or preceded by commands IS credited when the call exited 0.
+    for valid_cmd in [
+        f'python3 {_SCRIPT_PATH} --readiness && echo "DONE"',
+        f"mkdir -p /tmp && python3 {_SCRIPT_PATH} --readiness",
+        f"cd /tmp ; python3 {_SCRIPT_PATH} --readiness",
+    ]:
+        traj_valid = [
+            {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": valid_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
+        ]
+        transcript.set("ok", traj_valid, worker_commands=[{"task": "t_1", "command": valid_cmd}])
+        assert v.verify(5.0).status == "pass"
 
     # Card log only (no worker trajectory) yields status="error" under succeeded: true.
     transcript.set("ok", [], worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])

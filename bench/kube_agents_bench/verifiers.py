@@ -2376,11 +2376,11 @@ class WorkerRun(BaseModel):
     whole, and a quoted mention of the whole command is one word that is no command), and
     ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (graded from
     the worker trajectory's terminal call exit status; a non-zero or unrecorded exit does not count;
-    the call's exit is the whole shell line's, so anything joined on the line before (``||``, ``!``)
-    or after (``|``, ``;``, ``||``, substitution) the script decides it -- a guard that succeeds
-    skips the script and exits 0 -- and the dictated form is a bare command or redirection with
-    nothing else on the line; a required run with ``succeeded: true`` and no worker trajectory to read
-    is not credited)."""
+    to ensure the call's exit status faithfully reflects the command, the command segment must be
+    the last segment on the line or every segment following it must be ``&&``-joined; a following
+    ``||``, ``;``, ``|``, or ``&`` hands the line's exit to another command and is not credited as
+    succeeded; a preceding ``&&`` or ``;`` is accepted; a required run with ``succeeded: true`` and
+    no worker trajectory to read is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2599,6 +2599,66 @@ def _is_control_operator(word: str) -> bool:
     return isinstance(word, _ShellOperator) and (word == _SHELL_LINE_END or set(word) <= _SHELL_OPERATOR_CHARS)
 
 
+def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bool]]:
+    """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
+    shell line's final exit code faithfully reflects this segment's success or failure.
+    A segment's failure is preserved (short-circuiting subsequent execution) if and only if
+    it is the last segment on the line or every control operator following it is ``&&``.
+    A following ``||``, ``;``, or ``|`` hands the exit status to another command and may mask failure."""
+    words, spans = _shell_words_and_spans(command)
+    segments: list[list[str]] = []
+    ops_after: list[list[str]] = []
+    argv: list[str] = []
+    current_ops: list[str] = []
+
+    for word in words:
+        if _is_control_operator(word):
+            if argv:
+                segments.append(argv)
+                argv = []
+                current_ops = [str(word)]
+            else:
+                current_ops.append(str(word))
+            continue
+        if current_ops and segments:
+            ops_after.append(current_ops)
+            current_ops = []
+        argv.append(word)
+
+    if argv:
+        segments.append(argv)
+
+    results: list[tuple[list[str], bool]] = []
+    trailing_bg = any(op == "&" for op in current_ops)
+    for i, seg in enumerate(segments):
+        carries_exit = not trailing_bg if i == len(segments) - 1 else True
+        if i < len(segments) - 1:
+            for ops in ops_after[i:]:
+                connective_ops = [op for op in ops if op not in ("(", ")")]
+                if connective_ops and connective_ops != ["&&"]:
+                    carries_exit = False
+                    break
+        results.append((seg, carries_exit))
+
+        index = _command_word_index(seg)
+        if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+            for flag_index in range(index + 1, len(seg) - 1):
+                flag = seg[flag_index]
+                if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
+                    inner_cmd = seg[flag_index + 1]
+                    for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(inner_cmd):
+                        results.append((inner_argv, carries_exit and inner_carries))
+                    break
+
+    for span in spans:
+        inner = _substitution_commands(span)
+        if inner is not None:
+            for inner_argv in _shell_argvs(inner):
+                results.append((inner_argv, False))
+
+    return results
+
+
 def _shell_argvs(command: str) -> list[list[str]]:
     """Each segment of a command line as an argv: comments come off and the line is tokenised
     first, so a quoted path is one word and a quoted sentence one word whatever it contains,
@@ -2607,30 +2667,7 @@ def _shell_argvs(command: str) -> list[list[str]]:
     after its ``-c``-style flag, which is read the same way and yields its own argvs; so does
     each command or process substitution and each backtick pair on the line (``OUT=$(python3
     ... --readiness)``, ``cat <(...)``), whose commands the shell runs."""
-    words, spans = _shell_words_and_spans(command)
-    argvs: list[list[str]] = []
-    argv: list[str] = []
-    for word in [*words, _ShellOperator(";")]:
-        if _is_control_operator(word):
-            if argv:
-                argvs.append(argv)
-            argv = []
-            continue
-        argv.append(word)
-    for argv in list(argvs):
-        index = _command_word_index(argv)
-        if index is None or os.path.basename(argv[index]) not in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
-            continue
-        for flag_index in range(index + 1, len(argv) - 1):
-            flag = argv[flag_index]
-            if flag.startswith("-") and not flag.startswith("--") and "c" in flag[1:]:
-                argvs.extend(_shell_argvs(argv[flag_index + 1]))
-                break
-    for span in spans:
-        inner = _substitution_commands(span)
-        if inner is not None:
-            argvs.extend(_shell_argvs(inner))
-    return argvs
+    return [argv for argv, _ in _shell_argvs_with_exit_propagation(command)]
 
 
 def _command_word_index(argv: list[str], script: str | None = None) -> int | None:
@@ -3168,9 +3205,9 @@ class WorkerCommandsVerifier(BaseVerifier):
 
         traj_eligible = [(cmd, succ) for _, _, cmd, _, succ in traj_calls if self._without_exempt_text(cmd) == cmd]
         traj_argv_entries = [
-            (argv, call_succeeded)
+            (argv, call_succeeded and carries_exit)
             for cmd_text, call_succeeded in traj_eligible
-            for argv in _shell_argvs(cmd_text)
+            for argv, carries_exit in _shell_argvs_with_exit_propagation(cmd_text)
         ]
 
         unrun_missing: list[WorkerRun] = []
