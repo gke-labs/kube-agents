@@ -560,6 +560,16 @@ ADVICE_FIXTURE_DRIFT = (
     "A red on a case that depends on {roles} from a run that leased {projects} is the fixture, not your change;"
     " retest after the daily reconcile has re-applied bench/tf/fleet there (08:30 UTC) and the scan that follows reads it healthy."
 )
+# A role that reads seeded-a's default-pool capacity rather than a planted
+# object's shape: a re-apply changes nothing while the pool is full, so the
+# advice names the pool's size instead. post_health.py and gate_issue.py carry
+# the same split for the Chat message and the tracking issue.
+CAPACITY_ROLES = frozenset({"default-pool-headroom"})
+ADVICE_FIXTURE_CAPACITY = (
+    "A red on a case that needs a pod placed on seeded-a's default pool from a run that leased {projects} is the pool being full, not your change;"
+    " {roles} reads capacity, a re-apply changes nothing, and the pool's size in bench/tf/fleet/main.tf (seeded_a_default) is the fix:"
+    " if a size change has just merged, the postsubmit reconcile is rolling it project by project and the scans clear as it lands."
+)
 ADVICE_POOL_DRIFT = (
     "A 403 or a missing-resource red from a run that leased {projects} is the pool project's shape, not your change"
     " ({findings}); retest once the pool owner has run the repair, which pool-state.json names per project for every named finding."
@@ -1967,7 +1977,9 @@ def advice_for(
         )
     if condition == FIXTURE_DRIFT:
         incident = incident or {}
-        return ADVICE_FIXTURE_DRIFT.format(
+        roles = list(incident.get("roles") or [])
+        template = ADVICE_FIXTURE_CAPACITY if roles and set(roles) <= CAPACITY_ROLES else ADVICE_FIXTURE_DRIFT
+        return template.format(
             roles=", ".join(incident.get("roles") or []) or "the drifted fixture roles",
             projects=_project_list(list(incident.get("projects") or [])) or "the drifted projects",
         )
