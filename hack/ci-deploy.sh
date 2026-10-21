@@ -72,6 +72,20 @@ readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
 # here; #2491 tracks it.
 readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 
+# Folds a workload's repeat events into one incident (INCIDENT_WORKLOAD_DEDUP_SECONDS
+# in agents/platform/scripts/session_kv_server.py), on so that
+# incident-triage-workload-fold can see three replicas become one incident.
+# Like the ceilings above it is install-wide, so it reaches every case, and the
+# value is bounded on both sides by that. It must outlast the spread of one
+# Deployment's replicas crossing the watcher's BackOff debounce together, which
+# is seconds. And it must stay shorter than the gap between two repetitions of
+# a case that re-plants the same workload in the same namespace
+# (autoops-warning-event-triage, autoops-crashloop-config-triage): a repetition
+# is a stack apply plus a triage turn of several minutes, and a window longer
+# than that folds repetition 2's incident into repetition 1's, so the case
+# waits out its timeout for a card nobody files.
+readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="300"
+
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
 # enable_drift_pubsub in the full-install tfvars, and terraform/modules/
@@ -657,8 +671,8 @@ A2A_OPERATOR_ENV_ARGS=()
 MODE_NEXT_ENV_ARGS=()
 if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
-    --set-string "platformAgent.deployment.env[2].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
-    --set-string "platformAgent.deployment.env[2].value=false"
+    --set-string "platformAgent.deployment.env[3].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+    --set-string "platformAgent.deployment.env[3].value=false"
   )
 fi
 
@@ -1708,6 +1722,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
     --set-string "platformAgent.deployment.env[1].name=ALERT_DAILY_LIMIT_DRIFT" \
     --set-string "platformAgent.deployment.env[1].value=${EVAL_ALERT_DAILY_LIMIT_DRIFT}" \
+    --set-string "platformAgent.deployment.env[2].name=INCIDENT_WORKLOAD_DEDUP_SECONDS" \
+    --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \

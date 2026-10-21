@@ -5315,6 +5315,7 @@ def list_intercepted_events(
                 row["notified"], row["severity"], row["delivery_error"], row["backlog"], row["duplicate_of"]
             ),
             "message": row["message"],
+            "duplicate_of": row["duplicate_of"],
         }
         for row in rows[:limit]
     ]

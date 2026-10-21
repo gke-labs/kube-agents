@@ -557,6 +557,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # case planted. The rows it names are the assertion; with none it could
     # only pass.
     "findings_item_state": ("finding_ids",),
+    # This repository, agent-pod-reading: how many of a workload's events the
+    # session daemon folded into its newest incident. The count is the
+    # assertion; min_folded is at least 1, so it cannot pass on nothing folded.
+    "workload_incident_folded": ("min_folded",),
     # This repository, agent-pod-reading. No field: whether every post a planted
     # report produced is that report, exactly, is the whole assertion.
     "relay_posted_as_written": (),

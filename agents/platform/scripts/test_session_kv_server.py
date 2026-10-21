@@ -2242,10 +2242,12 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
             self._inject("feed-api-6cfdb6b98b-aaaaa")
             self._inject("feed-api-6cfdb6b98b-bbbbb")
-        events = self.client.get("/v1/intercepted-events", params={"limit": 200}).json()["events"]
-        self.assertEqual(
-            [e["status"] for e in events if e["name"] == "feed-api"], ["folded", "injected"]
-        )
+        events = [
+            e for e in self.client.get("/v1/intercepted-events", params={"limit": 200}).json()["events"]
+            if e["name"] == "feed-api"
+        ]
+        self.assertEqual([e["status"] for e in events], ["folded", "injected"])
+        self.assertEqual([e["duplicate_of"] for e in events], [events[1]["id"], None])
 
 
 class TestSessionKvServerQueryBuilding(unittest.TestCase):

@@ -92,6 +92,7 @@ _INTERPOLATIONS = {
     "var.agent_container": "agent-api-auth",
     "var.allocate_mib": "96",
     "var.memory_limit_mib": "64",
+    "var.replicas": "1",
 }
 
 #: The label step 1 writes, and the value step 0b requires before it will

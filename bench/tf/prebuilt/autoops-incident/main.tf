@@ -126,6 +126,7 @@ resource "null_resource" "incident" {
       local.workload,
       tostring(var.memory_limit_mib),
       tostring(var.allocate_mib),
+      tostring(var.replicas),
       var.host_cluster_name,
     ]))
   }
@@ -325,7 +326,7 @@ resource "null_resource" "incident" {
         labels:
           app: ${local.workload}
       spec:
-        replicas: 1
+        replicas: ${var.replicas}
         selector:
           matchLabels:
             app: ${local.workload}

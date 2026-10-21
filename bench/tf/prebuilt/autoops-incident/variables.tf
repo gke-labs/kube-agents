@@ -125,6 +125,15 @@ variable "allocate_mib" {
   default     = 96
 }
 
+# More than one is incident-triage-workload-fold's scenario: every replica
+# crash-loops the same way at once, so the watcher opens one incident per pod
+# and the daemon has to fold them into one.
+variable "replicas" {
+  type        = number
+  description = "Replicas of the OOM-killed Deployment"
+  default     = 1
+}
+
 # Identify the CI run that planted this, so a janitor can find what a run killed
 # before teardown left behind. Both are empty outside CI.
 variable "prow_build_id" {
