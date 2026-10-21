@@ -72,3 +72,9 @@ def test_a_reply_that_promises_a_delete_on_merge_misses_the_error():
         "the-reply-names-the-sync-error",
         "I opened PR #12. Config Sync syncs that directory, so merging deletes the namespace.",
     )
+    # A failure that is not the reconciler's, beside a promised delete.
+    for report in (
+        "I could not read the cluster's events; Config Sync deletes the namespace after merge.",
+        "If anything fails, Config Sync will retry the sync. Merging deletes the namespace.",
+    ):
+        assert not _passes("the-reply-names-the-sync-error", report), report

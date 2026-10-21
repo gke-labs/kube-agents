@@ -112,7 +112,7 @@ verification_spec:
     check:
       type: report_contains
       any_of_patterns:
-        - '\b(?:errors?|erroring|failing|fails|failed|failure|cannot|can''t|could\s+not|unable)\b[^.\n]{0,80}\b(?:fetch|sync|pull|clone|read|reach|access|authenticat)\w*'
+        - '\b(?:root-?sync|repo-?sync|config\s*sync|reconciler)\b[^.\n]{0,60}\b(?:errors?|erroring|failing|fails|failed|failure|cannot|can''t|could\s+not|unable)\b[^.\n]{0,60}\b(?:fetch|sync|pull|clone|read|reach|access|authenticat)\w*'
         - '\brepository\s+not\s+found\b'
         - '\bauthentication\s+failed\b'
         - '\bknv2004\b'
