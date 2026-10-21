@@ -78,6 +78,11 @@ const (
 	// followupMessage is the Message of a k8s-event-followup payload: what
 	// the watcher knows, and no more.
 	followupMessage = "no new events for this object since the last sighting"
+	// The outcomes of k8s_event_watcher_followups_total: the daemon posted
+	// the line, it had no thread to post into, or the inject failed.
+	followupOutcomeSent     = "sent"
+	followupOutcomeUnrouted = "unrouted"
+	followupOutcomeError    = "error"
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -482,16 +487,18 @@ const initialSyncGrace = 2 * time.Minute
 
 // dispatcher coordinates the filter, deduplication, HTTP injector, and metrics for streamed events.
 // One dispatcher is built per watched cluster, each owning that cluster's dedup
-// cache; filter, injector, and metrics are shared across all of them. The source
-// cluster is still read off each TriageEvent rather than stored here, so the
-// payload is correct regardless of how dispatchers are wired.
+// cache and memos; filter, injector, and metrics are shared across all of them.
+// An event's payload reads its cluster off the TriageEvent; the dispatcher also
+// keeps the cluster (set by main) for the sweep, which has no event in hand.
 //
 // Dispatch holds no dispatcher-wide lock, and does not need one. Each
 // cluster's watcher delivers from a single goroutine of its own (see Run in
-// watcher.go), so a given dispatcher is only ever entered by its own cluster's
-// watcher, one event at a time. Across clusters the dispatchers share nothing
-// mutable. A lock here would have served only to make one cluster's slow daemon
-// round-trip stall every other cluster.
+// watcher.go), so Dispatch is only ever entered by its own cluster's watcher,
+// one event at a time; the sweep (runSweepLoop) is the one other goroutine
+// that enters a dispatcher, and everything the two share — the dedup cache,
+// the memos, the metrics — carries its own lock. Across clusters the
+// dispatchers share nothing mutable. A lock here would have served only to make
+// one cluster's slow daemon round-trip stall every other cluster.
 type dispatcher struct {
 	filter *filter
 	dedup  *dedupCache
@@ -516,11 +523,11 @@ type dispatcher struct {
 	cluster    targetCluster
 	// now is the sweep's clock, overridable in tests.
 	now func() time.Time
-	// ready is set once the cluster's informer has completed its first list
-	// (main's onWatching). Until then the sweep sends no follow-up: after a
-	// restart the snapshot's entries are as old as the outage, and the replay
-	// that would move LastSeen for a failure still going arrives with that
-	// first list, so a sweep that ran before it would call the failure quiet.
+	// ready is set while the cluster's informer is delivering (main's
+	// onWatching: set once the first list has completed, cleared while a 403
+	// holds the watch). While it is not, the sweep sends no follow-up: an
+	// entry's LastSeen moves only on a sighting the informer delivers, so a
+	// watcher that is not listening would call every open incident quiet.
 	ready atomic.Bool
 }
 
@@ -546,7 +553,7 @@ func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
 		scaleUps:    newScaleUpMemo(scaleUpMemoTTL(f.dedupWindow, filter.cfg.scaleUpHold), defaultScaleUpEntries),
-		settles:     newSettleMemo(defaultSettleEntries),
+		settles:     newSettleMemo(defaultSettleEntries, f.dedupWindow),
 		injector:    inj,
 		metrics:     m,
 		mode:        f.mode,
@@ -686,6 +693,14 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		ev.ScaleUp = d.scaleUps.Lookup(ev.Namespace, ev.Key.UID)
 	}
 	canonical := canonicalizeReason(ev.Key.Reason, ev.Message)
+	// A repeat blip on an event object kubelet kept from an earlier one
+	// carries that one's first sighting; the memo knows where this blip
+	// began, and the gate measures the span from there (settleMemo.BlipStart).
+	if settleApplies(canonical) {
+		if start, ok := d.settles.BlipStart(ev, canonical, d.clock()); ok && start.After(ev.FirstSeen) {
+			ev.FirstSeen = start
+		}
+	}
 	if gate := d.filter.Decide(ev); gate != gateAccepted {
 		if gate == gateSettle {
 			d.settles.Hold(ev, canonical, d.clock())
@@ -843,13 +858,6 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
 
-// deriveMemoryLimit decides the Go soft memory limit from the two variables
-// that can set it. It returns the limit in bytes and true when
-// memoryLimitEnv should be applied, or zero, false and the reason when the
-// runtime's own setting should stand: GOMEMLIMIT already set (the runtime
-// applied it and it wins), the container limit absent (running outside the
-// operator's Deployment), or unparseable or non-positive (the value is not a
-// byte count, so nothing is derived from it).
 // Sweep ages the settle holds and sends the quiet follow-ups, as of now. It
 // runs every sweepInterval per cluster (runSweepLoop) and is safe to call
 // from tests with a fixed clock.
@@ -897,15 +905,28 @@ func (d *dispatcher) Sweep(ctx context.Context) {
 			d.dedup.MarkQuietNotified(q.Key)
 			continue
 		}
-		if _, err := d.injector.Inject(ctx, q.SessionID, payload); err != nil {
-			d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, "error").Inc()
+		answer, err := d.injector.InjectDetailed(ctx, q.SessionID, payload)
+		if err != nil {
+			d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, followupOutcomeError).Inc()
 			log.Printf("dispatcher: follow-up for %s/%s (sid=%s): %v", q.Namespace, q.Name, q.SessionID, err)
 			continue
 		}
+		// Marked, then written out at once: the snapshot loop's next tick is
+		// up to 30s away, and a process killed before it would restore the
+		// entry unmarked and post the line a second time.
 		d.dedup.MarkQuietNotified(q.Key)
-		d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, "sent").Inc()
-		log.Printf("followup %s pod=%s/%s → sid=%s (quiet since %s, %s ago)",
-			q.Key.Reason, q.Namespace, q.Name, q.SessionID, q.LastSeen.UTC().Format(time.RFC3339), now.Sub(q.LastSeen).Round(time.Second))
+		if err := d.dedup.Snapshot(); err != nil {
+			log.Printf("dedup snapshot after follow-up: %v", err)
+		}
+		outcome := followupOutcomeSent
+		if answer.Status == injectStatusUnrouted {
+			// The daemon had no thread for the session (the alert never
+			// reached chat), so it posted nothing; there is nothing to retry.
+			outcome = followupOutcomeUnrouted
+		}
+		d.metrics.followups.WithLabelValues(d.cluster.Name, d.cluster.ProjectID, d.cluster.Location, q.Key.Reason, outcome).Inc()
+		log.Printf("followup %s pod=%s/%s → sid=%s %s (quiet since %s, %s ago)",
+			q.Key.Reason, q.Namespace, q.Name, q.SessionID, outcome, q.LastSeen.UTC().Format(time.RFC3339), now.Sub(q.LastSeen).Round(time.Second))
 	}
 }
 
@@ -923,6 +944,13 @@ func runSweepLoop(ctx context.Context, d *dispatcher, interval time.Duration) {
 	}
 }
 
+// deriveMemoryLimit decides the Go soft memory limit from the two variables
+// that can set it. It returns the limit in bytes and true when
+// memoryLimitEnv should be applied, or zero, false and the reason when the
+// runtime's own setting should stand: GOMEMLIMIT already set (the runtime
+// applied it and it wins), the container limit absent (running outside the
+// operator's Deployment), or unparseable or non-positive (the value is not a
+// byte count, so nothing is derived from it).
 func deriveMemoryLimit(goMemLimit, containerLimit string) (int64, bool, string) {
 	if goMemLimit != "" {
 		return 0, false, fmt.Sprintf("%s=%s is set and takes precedence", goMemLimitEnv, goMemLimit)
@@ -1116,6 +1144,8 @@ func realMain(argv []string) error {
 			onWatching := func(watching bool) {
 				if !watching {
 					m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+					// Blind again: nothing it does not see can be called quiet.
+					disp.ready.Store(false)
 					log.Printf("k8s-event-watcher: [%s] events forbidden, no longer watching until the next successful attempt", tc.Name)
 					return
 				}

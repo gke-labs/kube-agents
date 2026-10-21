@@ -621,17 +621,6 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 		strings.TrimSpace(ev.Message) == noNodesAvailableMessage
 }
 
-// belowMinCount reports whether an event's repeat count falls short of a debounce
-// threshold, treating a non-positive count as "this emitter does not populate
-// Event.Count" and passing it through.
-//
-// Failing open matters because these gates are purely subtractive: they exist to
-// delay a signal that is expected to arrive again, so the worst case for firing too
-// early is one noisy alert, while the worst case for holding is a crash loop nobody
-// is ever told about. kubelet populates Count on the events this watcher forwards,
-// but the core/v1 Event shape also carries events.k8s.io series events, whose count
-// lives on a different field and can surface here as zero. A blind spot on the
-// primary failure signal is not an acceptable price for suppressing noise.
 // settleApplies reports whether the canonical reason is in the settle family:
 // the reasons Autopilot's node churn emits routinely, that clear on their own
 // more often than not, and that are re-emitted while they last. The
@@ -665,6 +654,17 @@ func settled(ev TriageEvent, settle time.Duration) bool {
 	return ev.LastSeen.Sub(ev.FirstSeen) >= settle
 }
 
+// belowMinCount reports whether an event's repeat count falls short of a debounce
+// threshold, treating a non-positive count as "this emitter does not populate
+// Event.Count" and passing it through.
+//
+// Failing open matters because these gates are purely subtractive: they exist to
+// delay a signal that is expected to arrive again, so the worst case for firing too
+// early is one noisy alert, while the worst case for holding is a crash loop nobody
+// is ever told about. kubelet populates Count on the events this watcher forwards,
+// but the core/v1 Event shape also carries events.k8s.io series events, whose count
+// lives on a different field and can surface here as zero. A blind spot on the
+// primary failure signal is not an acceptable price for suppressing noise.
 func belowMinCount(count, min int) bool {
 	return count > 0 && count < min
 }

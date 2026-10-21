@@ -119,8 +119,8 @@ func TestFilterDecideSettle(t *testing.T) {
 // session, no dedup entry, four held sightings, and once the pod has been
 // quiet for the period plus the slack the sweep counts one self_resolved.
 func TestDispatcherSettleHoldsAndCountsASelfResolvedBlip(t *testing.T) {
-	disp, m, injectCount, _ := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, settle: 2 * time.Minute})
-	disp.settles = newSettleMemo(0)
+	disp, m, injectCount, injected := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, settle: 2 * time.Minute})
+	disp.settles = newSettleMemo(0, 0)
 	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
 	now := t0
 	disp.now = func() time.Time { return now }
@@ -157,6 +157,39 @@ func TestDispatcherSettleHoldsAndCountsASelfResolvedBlip(t *testing.T) {
 	if got := disp.settles.Len(); got != 0 {
 		t.Errorf("settle memo still holds %d keys after the sweep; want 0", got)
 	}
+
+	// The same pod blips again forty minutes on. kubelet kept the event
+	// object, so the sighting arrives with the old first sighting and a count
+	// past the threshold; measured from the blip's own start it is held, and
+	// a blip that lasts the period is forwarded with that start as first_seen.
+	for i, lasted := range []time.Duration{40 * time.Minute, 40*time.Minute + 20*time.Second, 40*time.Minute + 70*time.Second} {
+		now = t0.Add(lasted)
+		disp.Dispatch(ctx, settleBackoff(t0, lasted, 5+i))
+	}
+	if *injectCount != 0 {
+		t.Fatalf("a repeat blip 70s long fired %d injects; want 0", *injectCount)
+	}
+	now = t0.Add(40*time.Minute + 150*time.Second)
+	disp.Dispatch(ctx, settleBackoff(t0, 40*time.Minute+150*time.Second, 8))
+	if *injectCount != 1 {
+		t.Fatalf("a repeat blip past the period fired %d injects; want 1", *injectCount)
+	}
+	if got := (*injected)[0].FirstSeen; !got.Equal(t0.Add(40 * time.Minute)) {
+		t.Errorf("repeat blip forwarded with first_seen=%s; want the blip's own start %s", got, t0.Add(40*time.Minute))
+	}
+	// A replay of the cleared blip (nothing newer than the tombstone) adjusts
+	// nothing and is held on its own short span, as before.
+	fresh, _, count2, _ := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, settle: 2 * time.Minute})
+	fresh.settles = newSettleMemo(0, 0)
+	fresh.now = func() time.Time { return now }
+	now = t0
+	fresh.Dispatch(ctx, settleBackoff(t0, 40*time.Second, 3))
+	now = t0.Add(time.Hour)
+	fresh.Sweep(ctx)
+	fresh.Dispatch(ctx, settleBackoff(t0, 40*time.Second, 3))
+	if *count2 != 0 {
+		t.Errorf("a replayed cleared blip fired %d injects; want 0", *count2)
+	}
 }
 
 // TestDispatcherSettleForwardsALastingFailureWithItsContext: the same pod
@@ -165,7 +198,7 @@ func TestDispatcherSettleHoldsAndCountsASelfResolvedBlip(t *testing.T) {
 // forwarded and no self_resolved however long the sweep runs after.
 func TestDispatcherSettleForwardsALastingFailureWithItsContext(t *testing.T) {
 	disp, m, injectCount, injected := newCountingDispatcher(t, filterThresholds{backoffMinCount: 3, settle: 2 * time.Minute})
-	disp.settles = newSettleMemo(0)
+	disp.settles = newSettleMemo(0, 0)
 	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
 	now := t0
 	disp.now = func() time.Time { return now }
@@ -205,7 +238,7 @@ func TestDispatcherSettleForwardsALastingFailureWithItsContext(t *testing.T) {
 }
 
 func TestSettleMemoEvictsItsOldestHoldWhenFull(t *testing.T) {
-	m := newSettleMemo(2)
+	m := newSettleMemo(2, 0)
 	t0 := time.Now()
 	for i, uid := range []string{"a", "b", "c"} {
 		ev := backoffEvent(3)
@@ -283,7 +316,7 @@ func TestDispatcherSweepSendsOneQuietFollowUp(t *testing.T) {
 	if fu.Cluster != "test-cluster" || fu.Project != "p" || fu.Location != "us-central1" {
 		t.Errorf("follow-up cluster labels = %s/%s/%s; want the dispatcher's", fu.Cluster, fu.Project, fu.Location)
 	}
-	if got := testutil.ToFloat64(m.followups.WithLabelValues("test-cluster", "p", "us-central1", "CrashLoopBackOff", "sent")); got != 1 {
+	if got := testutil.ToFloat64(m.followups.WithLabelValues("test-cluster", "p", "us-central1", "CrashLoopBackOff", followupOutcomeSent)); got != 1 {
 		t.Errorf("followups_total{outcome=sent} = %v; want 1", got)
 	}
 	now = t0.Add(2 * time.Hour)
@@ -359,6 +392,60 @@ func TestQuietIncidentsSurviveASnapshot(t *testing.T) {
 	again.BindSession(older, msg, "sess-4") // a daemon that listed no features
 	if got := again.QuietIncidents(t0.Add(time.Hour), 15*time.Minute); len(got) != 0 {
 		t.Errorf("unalerted entries, or one on an older daemon, reported quiet: %+v", got)
+	}
+}
+
+// TestDispatcherSweepCountsAnUnroutedFollowUp: a daemon that answers the
+// follow-up `unrouted` posted nothing; the incident is marked (there is no
+// thread to tell) and the outcome says so rather than `sent`.
+func TestDispatcherSweepCountsAnUnroutedFollowUp(t *testing.T) {
+	injects := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sessions" {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(createSessionResponse{SessionID: "sess-u"})
+			return
+		}
+		injects++
+		w.WriteHeader(http.StatusOK)
+		if injects == 1 {
+			_ = json.NewEncoder(w).Encode(injectResponse{Status: "injected", Features: []string{injectFeatureFollowup}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(injectResponse{Status: injectStatusUnrouted})
+	}))
+	t.Cleanup(server.Close)
+	inj, err := newInjector(injectorConfig{daemonURL: server.URL, bearerToken: "t", httpClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dedup, err := newDedupCache(24*time.Hour, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 8, 10, 15, 27, 0, 0, time.UTC)
+	now := t0
+	m := newMetrics()
+	disp := &dispatcher{
+		filter: newFilter(newFilterConfig(nil, nil, nil, filterThresholds{backoffMinCount: 1, settle: -1})),
+		dedup:  dedup, pullClasses: newPullClassMemo(0, 0), injector: inj, metrics: m,
+		mode: "per-incident", quietAfter: 15 * time.Minute, now: func() time.Time { return now },
+		cluster: targetCluster{Name: "test-cluster"},
+	}
+	disp.dedup.now = func() time.Time { return now }
+	disp.ready.Store(true)
+	disp.Dispatch(context.Background(), backoffEvent(3))
+	now = t0.Add(time.Hour)
+	disp.Sweep(context.Background())
+	disp.Sweep(context.Background())
+	if injects != 2 {
+		t.Errorf("%d injects; want the alert and one follow-up", injects)
+	}
+	if got := testutil.ToFloat64(m.followups.WithLabelValues("test-cluster", "", "", "CrashLoopBackOff", followupOutcomeUnrouted)); got != 1 {
+		t.Errorf("followups_total{outcome=unrouted} = %v; want 1", got)
+	}
+	if got := testutil.ToFloat64(m.followups.WithLabelValues("test-cluster", "", "", "CrashLoopBackOff", followupOutcomeSent)); got != 0 {
+		t.Errorf("followups_total{outcome=sent} = %v; want 0", got)
 	}
 }
 

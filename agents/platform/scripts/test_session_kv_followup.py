@@ -131,7 +131,8 @@ class TriageWatchdogTest(unittest.TestCase):
             session_kv_server._triage_watchdog("k8s-evt-lost", "slack", "C0HOME", "t1")
         platform, text, chat_id, thread_id = send.call_args.args
         self.assertEqual((platform, chat_id, thread_id), ("slack", "C0HOME", "t1"))
-        self.assertIn("No triage has started for this alert in 60 min", text)
+        self.assertIn("No triage for this alert in 60 min", text)
+        self.assertNotIn("log says why", text)
 
     def test_stays_quiet_when_a_card_was_filed(self):
         with patch.object(session_kv_server, "_card_for_alert_session", return_value="t_1"), \
@@ -171,18 +172,28 @@ class TriageWatchdogTest(unittest.TestCase):
             session_kv_server._schedule_triage_watchdog("s3", "slack", "C0HOME", "t5")
             timer.assert_not_called()
 
-    def test_the_troubleshooter_arms_it_after_the_turn(self):
-        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]), \
-             patch.object(session_kv_server, "get_active_platform", return_value="slack"), \
-             patch.object(session_kv_server, "_post_initial_alert", return_value="1760000000.000200"), \
-             patch.object(session_kv_server, "_slack_home_channel", return_value="C0HOME"), \
-             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
-             patch.object(session_kv_server, "_start_agent_turn") as turn, \
-             patch.object(session_kv_server, "_schedule_triage_watchdog") as arm:
-            session_kv_server._ensure_session_row("k8s-evt-arm", "platform", "")
-            session_kv_server.trigger_agent_troubleshooter("k8s-evt-arm", "alert", {"reason": "BackOff"}, None)
-        turn.assert_called_once()
-        arm.assert_called_once_with("k8s-evt-arm", "slack", "C0HOME", "1760000000.000200")
+    def test_the_troubleshooter_arms_it_once_the_alert_is_routed(self):
+        for session_created in (True, False):
+            with self.subTest(session_created=session_created), \
+                 patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]), \
+                 patch.object(session_kv_server, "get_active_platform", return_value="slack"), \
+                 patch.object(session_kv_server, "_post_initial_alert", return_value="1760000000.000200"), \
+                 patch.object(session_kv_server, "_slack_home_channel", return_value="C0HOME"), \
+                 patch.object(session_kv_server, "_create_gateway_session", return_value=session_created), \
+                 patch.object(session_kv_server, "_start_agent_turn") as turn, \
+                 patch.object(session_kv_server, "_schedule_triage_watchdog") as arm:
+                session_kv_server._ensure_session_row("k8s-evt-arm", "platform", "")
+                session_kv_server.trigger_agent_troubleshooter("k8s-evt-arm", "alert", {"reason": "BackOff"}, None)
+            # Armed whether or not the gateway accepted the session: a turn that
+            # never starts is the case the watchdog exists for.
+            arm.assert_called_once_with("k8s-evt-arm", "slack", "C0HOME", "1760000000.000200")
+            self.assertEqual(turn.call_count, 1 if session_created else 0)
+
+    def test_a_non_integer_watchdog_knob_falls_back_instead_of_failing_the_import(self):
+        with patch.dict(os.environ, {"TRIAGE_WATCHDOG_SECONDS": "1h"}):
+            self.assertEqual(session_kv_server._alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", 3600), 3600)
+        with patch.dict(os.environ, {"TRIAGE_WATCHDOG_SECONDS": "0"}):
+            self.assertEqual(session_kv_server._alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", 3600), 0)
 
 
 class TriagePromptStampTest(unittest.TestCase):

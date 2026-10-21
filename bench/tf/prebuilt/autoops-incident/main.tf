@@ -466,10 +466,7 @@ resource "null_resource" "incident" {
       # loop is sequential. A leftover namespace on a DIFFERENT watched cluster,
       # which step 0b does not reach, or the concurrency of #637, would.
       elapsed=0
-      until kubectl logs "deployment/${var.agent_deployment}" \
-              -n "${var.agent_namespace}" -c "${var.agent_container}" \
-              --since-time="$started_at" --tail=-1 2>/dev/null \
-            | grep -qE "${local.watcher_handled} .*pod=${local.ns}/"; do
+      until watcher_logged "${local.watcher_handled}"; do
         if [ "$elapsed" -ge 300 ]; then
           echo "ERROR: the workload is crash-looping past the debounce, but k8s-event-watcher logged no '${local.watcher_handled}' for a pod in ${local.ns} within $${elapsed}s. The incident was detected by Kubernetes and not by the watcher, so nothing downstream will run. Its recent log follows." >&2
           kubectl logs "deployment/${var.agent_deployment}" -n "${var.agent_namespace}" \

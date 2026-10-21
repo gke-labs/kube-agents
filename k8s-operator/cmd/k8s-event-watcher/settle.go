@@ -32,17 +32,40 @@ const (
 	// sighted again inside the period plus the slack.
 	settleOutcomeForwarded    = "forwarded"
 	settleOutcomeSelfResolved = "self_resolved"
+	// defaultSettleClearedTTL bounds how long a cleared key's tombstone is
+	// kept when the caller passes none: the dispatcher passes the dedup
+	// window, past which a repeat is a new incident anyway.
+	defaultSettleClearedTTL = 24 * time.Hour
 )
 
 // settleHold is one key the settle gate is holding: the event's canonical
-// reason, where it was seen (the metric's labels), and the watcher's clock at
-// the last sighting, which the sweep ages.
+// reason, where it was seen (the metric's labels), the watcher's clock at the
+// last sighting, which the sweep ages, the event's own last sighting, which a
+// tombstone keeps, and Start, the event time this blip began at when it is
+// not the event object's first sighting (see settleCleared).
 type settleHold struct {
-	Reason   string
-	Cluster  string
-	Project  string
-	Location string
-	LastSeen time.Time
+	Reason        string
+	Cluster       string
+	Project       string
+	Location      string
+	LastSeen      time.Time
+	EventLastSeen time.Time
+	Start         time.Time
+}
+
+// settleCleared is the tombstone of a key the gate held and then counted
+// self-resolved. kubelet keeps one BackOff event object per container for as
+// long as the API server's TTL is renewed, so a pod that blips again inside
+// it brings the old first sighting and a count already past the threshold:
+// measured on the object alone, the second blip's very first sighting would
+// span the gap and be forwarded at once. The tombstone remembers the event
+// time the cleared blip ended at; the first sighting after it is the new
+// blip's start, and the gate measures from there.
+type settleCleared struct {
+	EventLastSeen time.Time
+	Reappeared    time.Time
+	// At is the watcher's clock at expiry, which the TTL ages.
+	At time.Time
 }
 
 // settleMemo remembers the keys the settle gate is holding so the dispatcher
@@ -53,16 +76,21 @@ type settleHold struct {
 // than assumed, which the issue asked for. Per cluster, as the dedup cache
 // is. Safe on a nil receiver, for a dispatcher built without one in tests.
 type settleMemo struct {
-	mu      sync.Mutex
-	entries map[string]settleHold
-	max     int
+	mu         sync.Mutex
+	entries    map[string]settleHold
+	cleared    map[string]settleCleared
+	max        int
+	clearedTTL time.Duration
 }
 
-func newSettleMemo(max int) *settleMemo {
+func newSettleMemo(max int, clearedTTL time.Duration) *settleMemo {
 	if max <= 0 {
 		max = defaultSettleEntries
 	}
-	return &settleMemo{entries: make(map[string]settleHold), max: max}
+	if clearedTTL <= 0 {
+		clearedTTL = defaultSettleClearedTTL
+	}
+	return &settleMemo{entries: make(map[string]settleHold), cleared: make(map[string]settleCleared), max: max, clearedTTL: clearedTTL}
 }
 
 // settleKey is the memo's key: the namespace and UID the dedup key would use,
@@ -72,7 +100,8 @@ func settleKey(ev TriageEvent, reason string) string {
 }
 
 // Hold records a sighting the gate held, at now. A full memo drops its oldest
-// hold first, which costs one self-resolved count and nothing else.
+// hold first, which costs one self-resolved count and nothing else. A hold
+// that follows a tombstone takes the blip's start from it.
 func (m *settleMemo) Hold(ev TriageEvent, reason string, now time.Time) {
 	if m == nil {
 		return
@@ -80,7 +109,8 @@ func (m *settleMemo) Hold(ev TriageEvent, reason string, now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := settleKey(ev, reason)
-	if _, ok := m.entries[key]; !ok && len(m.entries) >= m.max {
+	prev, held := m.entries[key]
+	if !held && len(m.entries) >= m.max {
 		var oldestKey string
 		var oldest time.Time
 		first := true
@@ -91,7 +121,48 @@ func (m *settleMemo) Hold(ev TriageEvent, reason string, now time.Time) {
 		}
 		delete(m.entries, oldestKey)
 	}
-	m.entries[key] = settleHold{Reason: reason, Cluster: ev.Cluster, Project: ev.Project, Location: ev.Location, LastSeen: now}
+	start := prev.Start
+	if c, ok := m.cleared[key]; ok {
+		start = c.Reappeared
+		delete(m.cleared, key)
+	}
+	m.entries[key] = settleHold{Reason: reason, Cluster: ev.Cluster, Project: ev.Project, Location: ev.Location,
+		LastSeen: now, EventLastSeen: ev.LastSeen, Start: start}
+}
+
+// BlipStart reports the event time the current blip of key began at, when it
+// is later than the event object's own first sighting: the Start a hold
+// carries, or, for a key whose last blip cleared, the first sighting after
+// the tombstone's last one, recorded on this call. A sighting that does not
+// postdate the tombstone is a replay of the cleared blip and adjusts nothing.
+// Dispatch sets the event's FirstSeen to it before the gate reads the span,
+// so a repeat blip is held like a first one.
+func (m *settleMemo) BlipStart(ev TriageEvent, reason string, now time.Time) (time.Time, bool) {
+	if m == nil {
+		return time.Time{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := settleKey(ev, reason)
+	if h, ok := m.entries[key]; ok {
+		return h.Start, !h.Start.IsZero()
+	}
+	c, ok := m.cleared[key]
+	if !ok {
+		return time.Time{}, false
+	}
+	if now.Sub(c.At) > m.clearedTTL {
+		delete(m.cleared, key)
+		return time.Time{}, false
+	}
+	if !ev.LastSeen.After(c.EventLastSeen) {
+		return time.Time{}, false
+	}
+	if c.Reappeared.IsZero() {
+		c.Reappeared = ev.LastSeen
+		m.cleared[key] = c
+	}
+	return c.Reappeared, true
 }
 
 // Release forgets a hold whose event has now passed the gate, and reports
@@ -109,7 +180,9 @@ func (m *settleMemo) Release(ev TriageEvent, reason string) bool {
 }
 
 // Expire drops every hold unsighted for quiet or longer, as of now, and
-// returns them: each is a failure that cleared before the gate let it through.
+// returns them: each is a failure that cleared before the gate let it
+// through. Each leaves a tombstone (settleCleared), and tombstones older
+// than the memo's TTL go with them; the cap is shared with the holds.
 func (m *settleMemo) Expire(now time.Time, quiet time.Duration) []settleHold {
 	if m == nil {
 		return nil
@@ -121,7 +194,24 @@ func (m *settleMemo) Expire(now time.Time, quiet time.Duration) []settleHold {
 		if now.Sub(h.LastSeen) >= quiet {
 			out = append(out, h)
 			delete(m.entries, key)
+			m.cleared[key] = settleCleared{EventLastSeen: h.EventLastSeen, At: now}
 		}
+	}
+	for key, c := range m.cleared {
+		if now.Sub(c.At) > m.clearedTTL {
+			delete(m.cleared, key)
+		}
+	}
+	for len(m.cleared) > m.max {
+		var oldestKey string
+		var oldest time.Time
+		first := true
+		for k, c := range m.cleared {
+			if first || c.At.Before(oldest) {
+				oldestKey, oldest, first = k, c.At, false
+			}
+		}
+		delete(m.cleared, oldestKey)
 	}
 	return out
 }

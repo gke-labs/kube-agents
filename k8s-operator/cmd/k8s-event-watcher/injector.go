@@ -110,9 +110,9 @@ type injectMessageRequest struct {
 	Message string `json:"message"`
 }
 
-// injectResponse is the daemon's reply to an accepted inject. Only the status
-// is read; the daemon sends more on the suppressed path and may send more
-// later.
+// injectResponse is the daemon's reply to an accepted inject: the status, and
+// the features the daemon lists for the session; the daemon sends more on the
+// suppressed path and may send more later.
 type injectResponse struct {
 	Status string `json:"status"`
 	// Features is what the daemon says it does with this session beyond
@@ -189,6 +189,11 @@ const injectStatusFiltered = "filtered"
 // as delivered, which keeps the entry the same way and only miscounts it as an
 // injected event and a triage session.
 const injectStatusFolded = "folded"
+
+// injectStatusUnrouted is the daemon's answer to a k8s-event-followup for a
+// session no chat thread is routed to: accepted, nothing posted, nothing to
+// retry (session_kv_server, _inject_followup).
+const injectStatusUnrouted = "unrouted"
 
 // injectFeaturesHeader lists the response behaviours this watcher understands,
 // so the daemon can answer an older one the way that older one expects.

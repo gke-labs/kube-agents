@@ -668,8 +668,14 @@ SECONDS_PER_MINUTE = 60
 # past any card's normal run, so a thread silent that long has no card coming.
 # An in-process timer, so a daemon restart inside the hour drops the check for
 # the alerts posted before it (the stall watch's day-later retry is the
-# durable form; this is the cheap one). 0 switches it off.
-TRIAGE_WATCHDOG_SECONDS = int(os.environ.get("TRIAGE_WATCHDOG_SECONDS", "3600"))
+# durable form; this is the cheap one). 0 switches it off. Read through the
+# integer-knob reader the ceilings use, so a value that is not an integer
+# falls back to the default with a log line instead of failing the import and
+# taking the whole server down with it.
+DEFAULT_TRIAGE_WATCHDOG_SECONDS = 3600
+TRIAGE_WATCHDOG_SECONDS = _alert_daily_limit("TRIAGE_WATCHDOG_SECONDS", DEFAULT_TRIAGE_WATCHDOG_SECONDS)
+# The busy timeout of the sqlite connects the follow-up and the watchdog open.
+SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
 
 # Drift is graded `Warning` rather than given a severity of its own, and this
 # is now a statement about wording alone. Display and billing were the same
@@ -3066,6 +3072,12 @@ def _trigger_agent_troubleshooter(
             _register_session_routing(session_id, active_platform, thread_id)
             if alert_title and active_platform == SLACK_PLATFORM:
                 _record_alert_title(session_id, alert_title)
+            # Armed here, before the gateway is contacted: an alert whose turn
+            # never starts (session creation refused, the turn's POST failing)
+            # is the case the watchdog exists for, and the steps below return
+            # early on exactly those failures.
+            routed_platform, routed_chat, routed_thread = _lookup_session_routing(session_id)
+            _schedule_triage_watchdog(session_id, routed_platform, routed_chat, routed_thread)
         else:
             # The ledger row already says this alert was announced; it was written
             # before the post was attempted. Correct it now, or the daily recap
@@ -3111,10 +3123,6 @@ def _trigger_agent_troubleshooter(
     agent_query = _build_agent_query(payload)
     if not _start_agent_turn(api_url, session_id, agent_query, headers):
         mark_triage_not_started(event_row_id)
-    # 6. An hour on, an alert with no card and no report says so in its thread
-    #    rather than standing as an open question (_triage_watchdog).
-    routed_platform, routed_chat, routed_thread = _lookup_session_routing(session_id)
-    _schedule_triage_watchdog(session_id, routed_platform, routed_chat, routed_thread)
 
 
 # --------------------------------------------------------------------------
@@ -5174,7 +5182,7 @@ def _ledger_object_for_session(session_id: str) -> Dict[str, str]:
     object too, but an entry restored from an older watcher's snapshot does
     not, and the row was written when the alert went out."""
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
             row = conn.execute(
                 "SELECT cluster, namespace, workload, object_kind, reason FROM intercepted_events "
                 "WHERE session_id = ? ORDER BY id DESC LIMIT 1",
@@ -5191,7 +5199,7 @@ def _ledger_object_for_session(session_id: str) -> Dict[str, str]:
 def _thread_has_report(chat_id: str, thread_id: str) -> bool:
     """Whether a triage report has been stored for the thread (``POST /v1/incidents``)."""
     try:
-        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
             return conn.execute(
                 "SELECT 1 FROM incidents WHERE chat_id = ? AND thread_id = ?", (chat_id, thread_id)
             ).fetchone() is not None
@@ -5310,15 +5318,15 @@ def _triage_watchdog(session_id: str, platform: str, chat_id: str, thread_id: st
     """Say so in the thread when, an hour on, the alert has no card and no report.
 
     A board that cannot be read is unknown, not empty: the line is posted only
-    on a board that answered and had no card for the session.
+    on a board that answered and had no card for the session. The line states
+    the two facts it checked and no cause: the turn may have failed to start,
+    or run and filed nothing, and this check cannot tell which.
     """
     if _thread_has_report(chat_id, thread_id) or _card_for_alert_session(session_id) is not None:
         return
     text = (
-        f"{WATCHDOG_EMOJI} **No triage has started for this alert in "
-        f"{TRIAGE_WATCHDOG_SECONDS // SECONDS_PER_MINUTE} min.** No card was filed for it and no report has reached "
-        "this thread; the turn that files the card did not run, and the session server log says why. "
-        "The alert stands as posted."
+        f"{WATCHDOG_EMOJI} **No triage for this alert in {TRIAGE_WATCHDOG_SECONDS // SECONDS_PER_MINUTE} min.** "
+        "No card was filed for it and no report has reached this thread. The alert stands as posted."
     )
     if _send_to_chat(platform, text, chat_id, thread_id) is None:
         logger.error(f"Watchdog line for session {session_id} did not reach {platform} thread {thread_id}")
