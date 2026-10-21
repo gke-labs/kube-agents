@@ -2,6 +2,8 @@
   "args": [
     "--allowedTools",
     "Read,Glob,Grep,mcp__gke__get_cluster,mcp__gke__list_clusters,mcp__docs__search",
+    "--disallowedTools",
+    "Bash,BashOutput,KillShell,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,Task",
     "--mcp-config",
     "\u003cmcpConfig\u003e",
     "--strict-mcp-config",

@@ -139,6 +139,15 @@ func TestEveryArgvCarriesTheHardeningFlags(t *testing.T) {
 			t.Errorf("%s: no %s %s in %s", name, SettingSourcesFlag, UserSettingSource, args)
 		}
 	}
+	for name, out := range map[string]persona.Output{
+		"example":          render(t, load(t, exampleDir), persona.Target{Relay: relay}),
+		"no tools, no mcp": render(t, bare, persona.Target{}),
+	} {
+		i := slices.Index(out.Args, DisallowedToolsFlag)
+		if i < 0 || i+1 >= len(out.Args) {
+			t.Errorf("%s: no %s in %v", name, DisallowedToolsFlag, out.Args)
+		}
+	}
 	if slices.Contains(render(t, bare, persona.Target{}).Args, AllowedToolsFlag) {
 		t.Errorf("a persona granting nothing still got %s", AllowedToolsFlag)
 	}
@@ -209,5 +218,50 @@ func TestOutputStaysInTheConfigDir(t *testing.T) {
 		if f.Path != MemoryFile && !strings.HasPrefix(f.Path, SkillsDir+"/") {
 			t.Errorf("output path %q is neither %s nor under %s/", f.Path, MemoryFile, SkillsDir)
 		}
+	}
+}
+
+func flagValue(t *testing.T, args []string, flag string) []string {
+	t.Helper()
+	i := slices.Index(args, flag)
+	if i < 0 || i+1 >= len(args) {
+		t.Fatalf("no %s in %v", flag, args)
+	}
+	return strings.Split(args[i+1], ",")
+}
+
+// Every built-in the persona does not grant is denied, and none it grants is.
+func TestUngrantedBuiltinsAreDenied(t *testing.T) {
+	out := render(t, load(t, exampleDir), persona.Target{Relay: relay})
+	deny := flagValue(t, out.Args, DisallowedToolsFlag)
+	for _, tool := range []string{"Bash", "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch", "Task"} {
+		if !slices.Contains(deny, tool) {
+			t.Errorf("%s is not denied: %v", tool, deny)
+		}
+	}
+	for _, tool := range []string{"Read", "Glob", "Grep"} {
+		if slices.Contains(deny, tool) {
+			t.Errorf("%s is denied though read_file grants it", tool)
+		}
+	}
+	p := load(t, exampleDir)
+	p.Manifest.Tools = []string{persona.ToolShell}
+	deny = flagValue(t, render(t, p, persona.Target{}).Args, DisallowedToolsFlag)
+	for _, tool := range []string{"Read", "Glob", "Grep"} {
+		if !slices.Contains(deny, tool) {
+			t.Errorf("%s is not denied without read_file: %v", tool, deny)
+		}
+	}
+	if slices.Contains(deny, "Bash") {
+		t.Errorf("Bash is denied though shell grants it")
+	}
+}
+
+func TestAnUpperCaseMarkdownFileShipsWithoutAShell(t *testing.T) {
+	p := load(t, exampleDir)
+	p.Skills[0].Files = append(p.Skills[0].Files, persona.File{Path: "NOTES.MD", Data: []byte("x")})
+	out := render(t, p, persona.Target{})
+	if !slices.ContainsFunc(out.Files, func(f persona.File) bool { return f.Path == "skills/notes/NOTES.MD" }) {
+		t.Errorf("NOTES.MD was dropped as a script")
 	}
 }

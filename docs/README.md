@@ -31,9 +31,11 @@ holds them to that.
 kube-agents/
 ├── README.md, INSTALL.md, CONTRIBUTING.md,        project front door, install
 │   AGENTS.md, CLAUDE.md                           guide, contributor/agent rules
-├── a2a/                                           A2A bus: the persona README +
-│                                                  the mode-gated a2a-topics skill
-│                                                  and the session agent's persona
+├── a2a/                                           A2A bus. a2a/persona/: the bus
+│                                                  persona content (a2a-topics skill,
+│                                                  the session agent's persona);
+│                                                  a2a/lib/persona/: the persona
+│                                                  format (+ cmd/persona)
 ├── agents/                                        agent blueprints (runtime docs)
 │   ├── chat/                                      Planning Agent front door: persona
 │   │                                              docs, onboarding templates,

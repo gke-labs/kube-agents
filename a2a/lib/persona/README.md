@@ -2,18 +2,22 @@
 
 A persona is what an AgentProfile's agent is told, which skills it has and
 which tools it may use, written once for every harness (#3656). The
-persona image carries the directory below as its `/files` payload. The
-profile pod mounts it read-only at `/persona`
-(`k8s-operator/internal/profilepod`), and the worker renders it for its
-harness with an adapter from this package.
+persona image carries the directory below as its `/files` payload. Under
+the contract in #3662 (not merged yet), the profile pod mounts it
+read-only at `/persona`, and the worker renders it for its harness with an
+adapter from this package.
 
-| Path              | What it holds                                                                                                                                                                              |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `persona.yaml`    | The manifest: `apiVersion: persona.kube-agents.x-k8s.io/v1alpha1`, `name`, `description`, `tier`, `model` (a hint), `tools`, `parameters`, `requires.commands` (a hint), `harness` (hints) |
-| `instructions.md` | The instructions, AGENTS.md-compatible                                                                                                                                                     |
-| `skills/<name>/`  | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 characters), plus the skill's files                                                              |
-| `mcp.yaml`        | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                               |
-| `README.md`       | Optional, never rendered                                                                                                                                                                   |
+This is the persona format. The bus persona content (the session agent's
+persona and the `a2a-topics` skill) is a different thing and lives in
+[`a2a/persona`](../../persona/README.md).
+
+| Path              | What it holds                                                                                                                                                                               |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `persona.yaml`    | The manifest: `apiVersion: persona.kube-agents.x-k8s.io/v1alpha1`, `name`, `description` (at most 1024 bytes), `tier`, `model` (a hint), `tools`, `parameters`, `requires.commands` (a hint), `harness` (hints) |
+| `instructions.md` | The instructions, AGENTS.md-compatible                                                                                                                                                      |
+| `skills/<name>/`  | Agent Skills: `SKILL.md` with `name` (the directory name) and `description` (at most 1024 bytes), optionally `license` and `metadata`, plus the skill's files                              |
+| `mcp.yaml`        | Optional. `servers.<name>` with `broker: <relay server>` and an optional `include` tool list                                                                                                |
+| `README.md`       | Optional, never rendered                                                                                                                                                                    |
 
 `tools` is the allowlist. An entry is a built-in (`read_file`,
 `web_search`, `shell`), an MCP server from `mcp.yaml` (`gke`), or one of
@@ -25,8 +29,19 @@ A persona holds no image references, no credentials and no secrets. Every
 MCP server is a server on the credential broker's MCP relay, which
 authenticates the pod and applies the broker's tool policy and audit log.
 There is no direct-URL kind: `Load` refuses `url:` in `mcp.yaml`, because
-a server reached around the broker would be outside both. `Load` also
-refuses a symlink and any file the format does not define.
+a server reached around the broker would be outside both.
+
+`Load` also refuses:
+
+- a symlink anywhere, and any top-level file the format does not define
+  (a skill directory may hold any regular files);
+- a `SKILL.md` frontmatter key other than `name`, `description`, `license`
+  and `metadata`, because Claude Code reads keys such as `allowed-tools`
+  and `hooks` from it;
+- an `@` import in `instructions.md` or a skill's markdown that leaves the
+  persona (`@/…`, `@~…`, `@../…`), outside fenced code blocks;
+- unknown and repeated keys in `persona.yaml` and `mcp.yaml`;
+- a file over 1 MiB, or a persona over 16 MiB in total.
 
 ## Adapters
 
@@ -34,22 +49,37 @@ An adapter maps a loaded persona to a harness and reads nothing else: no
 network, no credentials, no environment. Whatever the pod knows, such as
 the relay's address, the worker passes in as a `Target`. What a harness
 cannot express comes back as a warning, never an error.
-`render.For(harness)` picks the adapter by the pod's `PROFILE_HARNESS`
-value.
+`render.For(harness)` picks the adapter by the harness value the worker is
+started with (`claude-code` or `antigravity`).
 
 - **`claude-code`** (`claudecode`): `CLAUDE.md` and `skills/` for the
   worker to write into a per-task `CLAUDE_CONFIG_DIR`, and the flags to
-  pass: `--allowedTools`, `--mcp-config`, `--strict-mcp-config` and
-  `--setting-sources user`. Each server is a stdio proxy to the relay the worker names. Without the `shell` tool a skill ships only
-  its markdown. A server that no `tools` entry grants is dropped.
+  pass:
+  - `--allowedTools` for what the persona grants;
+  - `--disallowedTools` for every Claude Code built-in it does not grant,
+    on every argv. The worker unions its own hard-deny list with this one,
+    and a deny wins over an allow;
+  - `--mcp-config`, each server a stdio proxy to the relay the worker
+    names. With no relay, every broker server is dropped with a warning;
+  - `--strict-mcp-config` and `--setting-sources user`, on every argv.
+
+  Without the `shell` tool a skill ships only its markdown. A server that
+  no `tools` entry grants is dropped.
+
 - **`antigravity`**: not written yet; `render.For` refuses it by name.
 
 ## Checking a persona
 
+Run these from `a2a/`:
+
 ```sh
 go run ./cmd/persona validate --in <dir>
-go run ./cmd/persona render --harness claude-code --in <dir> --out /tmp/out
+go run ./cmd/persona render --harness claude-code --in <dir> --out /tmp/out \
+  --relay-url http://credential-proxy:8765/mcp \
+  --relay-command 'node /opt/mcp-remote/dist/proxy.js {url} --transport http-only'
 ```
 
-Run both from `a2a/`. `render` writes into an empty `--out` and prints the
-flags and warnings as JSON.
+`render` writes into an empty `--out` and prints `{args, model, warnings}`
+as JSON on stdout; the warnings also go to stderr. `--relay-command` is
+space-separated, and `{url}` becomes each server's relay URL. Without the
+relay flags every broker server is dropped.

@@ -10,7 +10,7 @@
 //	README.md        optional, never rendered
 //
 // The persona image carries this directory as its /files payload, and the
-// profile pod mounts it at /persona (k8s-operator/internal/profilepod).
+// profile pod mounts it at /persona (#3662, the profile pod contract).
 // Nothing here reads the network, credentials or the environment: Load reads
 // one directory, and an adapter maps what Load returned.
 package persona
@@ -48,8 +48,8 @@ const (
 // adapters that map them.
 var BuiltinTools = []string{ToolReadFile, ToolWebSearch, ToolShell}
 
-// Harness names a harness an adapter renders for. The values are the
-// PROFILE_HARNESS values the profile pod is started with.
+// Harness names a harness an adapter renders for: the value the profile
+// worker is started with (#3662).
 type Harness string
 
 const (

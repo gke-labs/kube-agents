@@ -10,7 +10,8 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib/persona/claudecode"
 )
 
-// For returns the adapter for h, the profile pod's PROFILE_HARNESS value.
+// For returns the adapter for h, the harness value the worker is started
+// with.
 // Antigravity is a known harness without an adapter yet: its agent file
 // format is being settled, and refusing it by name is clearer than
 // treating it as unknown.

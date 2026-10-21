@@ -29,6 +29,7 @@ const (
 	SkillsDir = "skills"
 
 	AllowedToolsFlag    = "--allowedTools"
+	DisallowedToolsFlag = "--disallowedTools"
 	MCPConfigFlag       = "--mcp-config"
 	StrictMCPConfigFlag = "--strict-mcp-config"
 	SettingSourcesFlag  = "--setting-sources"
@@ -45,7 +46,20 @@ const (
 var builtinTools = map[string][]string{
 	persona.ToolReadFile:  {"Read", "Glob", "Grep"},
 	persona.ToolWebSearch: {"WebSearch"},
-	persona.ToolShell:     {"Bash"},
+	persona.ToolShell:     {"Bash", "BashOutput", "KillShell"},
+}
+
+// claudeBuiltins are the Claude Code built-in tools that read, write, run or
+// reach out. Every one the persona does not grant through builtinTools goes on
+// --disallowedTools: --allowedTools only pre-approves, and Claude Code runs
+// some tools (Read, Glob, Grep) without asking. A new Claude Code built-in of
+// that kind must be added here, or a persona that never granted it gets it.
+var claudeBuiltins = []string{
+	"Bash", "BashOutput", "KillShell",
+	"Edit", "MultiEdit", "Write", "NotebookEdit",
+	"Read", "Glob", "Grep",
+	"WebFetch", "WebSearch",
+	"Task",
 }
 
 // Adapter is the Claude Code persona.Adapter.
@@ -66,7 +80,7 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 			// Without a shell a skill's scripts are files the model can
 			// see and not run, which invites it to go looking for a way
 			// to; only its prose ships (session-persona's rule).
-			if !shell && path.Ext(f.Path) != ".md" {
+			if !shell && !persona.IsMarkdown(f.Path) {
 				warn("skills/%s/%s: dropped, the persona grants no %s tool to run it", s.Name, f.Path, persona.ToolShell)
 				continue
 			}
@@ -81,8 +95,9 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 		warn("mcp.yaml: servers.%s: dropped, the worker gave no broker MCP relay", name)
 	}
 	allowed := allowedTools(p, dropped, warn)
-	// A server no tools entry grants would start for nothing: the harness
-	// denies every tool off the allowlist.
+	// A server no tools entry grants is not configured at all. The
+	// allowlist only pre-approves; it does not fence what is off it, so not
+	// starting the server is what withholds its tools.
 	for _, name := range p.SortedServers() {
 		if _, ok := servers[name]; ok && !granted(p.Manifest.Tools, name) {
 			delete(servers, name)
@@ -94,6 +109,7 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 	if len(allowed) > 0 {
 		out.Args = append(out.Args, AllowedToolsFlag, strings.Join(allowed, ","))
 	}
+	out.Args = append(out.Args, DisallowedToolsFlag, strings.Join(disallowedTools(allowed), ","))
 	if len(servers) > 0 {
 		cfg, err := json.Marshal(map[string]any{mcpServersKey: servers})
 		if err != nil {
@@ -103,7 +119,8 @@ func (Adapter) Render(p *persona.Persona, t persona.Target) (persona.Output, err
 	}
 	// Both on every argv, servers or not: without --strict-mcp-config the
 	// harness would load an MCP config an earlier task left in the cwd, and
-	// the persona's files load only under the user source.
+	// without --setting-sources user it would read settings (hooks,
+	// permissions) from the cwd's .claude/, which the agent can write.
 	out.Args = append(out.Args, StrictMCPConfigFlag, SettingSourcesFlag, UserSettingSource)
 
 	for _, key := range sortedKeys(p.Manifest.Harness[string(persona.ClaudeCode)]) {
@@ -165,6 +182,17 @@ func allowedTools(p *persona.Persona, dropped []string, warn func(string, ...any
 		}
 	}
 	return dedupe(allowed)
+}
+
+// disallowedTools is every claudeBuiltins entry allowed does not name.
+func disallowedTools(allowed []string) []string {
+	var deny []string
+	for _, t := range claudeBuiltins {
+		if !slices.Contains(allowed, t) {
+			deny = append(deny, t)
+		}
+	}
+	return deny
 }
 
 // granted reports whether tools grants anything on server.

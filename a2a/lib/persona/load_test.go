@@ -1,6 +1,7 @@
 package persona
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -105,7 +106,7 @@ func TestLoadRefuses(t *testing.T) {
 		}, "skills/triage/SKILL.md: name: is \"triage-v2\"; it must be the directory name"},
 		{"long skill description", func(t *testing.T, d string) {
 			replaceIn(t, d, "skills/notes/SKILL.md", "Write findings up.", strings.Repeat("x", 1025))
-		}, "skills/notes/SKILL.md: description: is 1025 characters"},
+		}, "skills/notes/SKILL.md: description: is 1025 bytes"},
 		{"skill without SKILL.md", func(t *testing.T, d string) {
 			_ = os.Remove(filepath.Join(d, "skills/notes/SKILL.md"))
 		}, "skills/notes: has no SKILL.md"},
@@ -121,6 +122,71 @@ func TestLoadRefuses(t *testing.T) {
 		{"headers in a server", func(t *testing.T, d string) {
 			replaceIn(t, d, MCPFile, "broker: gke", "broker: gke\n    headers: {Authorization: x}")
 		}, "unknown field \"headers\""},
+		{"allowed-tools in a skill", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "allowed-tools: Bash\ndescription:")
+		}, "skills/triage/SKILL.md: allowed-tools: is not an allowed frontmatter key"},
+		{"hooks in a skill", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "hooks:\n  PreToolUse: []\ndescription:")
+		}, "skills/triage/SKILL.md: hooks: is not an allowed frontmatter key"},
+		{"metadata not a map", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/triage/SKILL.md", "description:", "metadata: x\ndescription:")
+		}, "skills/triage/SKILL.md: metadata: must be a map"},
+		{"absolute import", func(t *testing.T, d string) {
+			replaceIn(t, d, InstructionsFile, "and report", "and report. See @/var/run/secrets/token")
+		}, "instructions.md: line 3: the import \"@/var/run/secrets/token\" reads a file outside the persona"},
+		{"home import", func(t *testing.T, d string) {
+			replaceIn(t, d, InstructionsFile, "# Example", "@~/.claude/settings.json\n# Example")
+		}, "instructions.md: line 1: the import \"@~/.claude/settings.json\""},
+		{"climbing import in a skill", func(t *testing.T, d string) {
+			replaceIn(t, d, "skills/notes/SKILL.md", "Keep it short.", "Keep it short. @./../../etc/hosts")
+		}, "skills/notes/SKILL.md: line 7: the import \"@./../../etc/hosts\""},
+		{"climbing import in an upper-case .MD", func(t *testing.T, d string) {
+			_ = os.WriteFile(filepath.Join(d, "skills/notes/EXTRA.MD"), []byte("see @../x\n"), 0o644)
+		}, "skills/notes/EXTRA.MD: line 1: the import \"@../x\""},
+		{"unknown top-level key in mcp.yaml", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "servers:", "mcpServers: {}\nservers:")
+		}, "unknown field \"mcpServers\""},
+		{"repeated key in mcp.yaml", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "broker: gke", "broker: gke\n    broker: gke2")
+		}, `key "broker" already set in map`},
+		{"repeated server in mcp.yaml", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "  unused:", "  gke:\n    broker: x\n  unused:")
+		}, `key "gke" already set in map`},
+		{"server name case", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "  unused:", "  Unused:")
+		}, "servers.Unused: server name is not lowercase"},
+		{"double underscore", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "  unused:", "  un__used:")
+		}, "servers.un__used: server name must not contain \"__\""},
+		{"persona name", func(t *testing.T, d string) {
+			replaceIn(t, d, ManifestFile, "name: example", "name: Example")
+		}, "persona.yaml: name: \"Example\" is not a DNS label"},
+		{"include repeats", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "[get_cluster, list_clusters]", "[get_cluster, get_cluster]")
+		}, "servers.gke.include[1]: \"get_cluster\" repeats"},
+		{"include tool name", func(t *testing.T, d string) {
+			replaceIn(t, d, MCPFile, "[get_cluster, list_clusters]", "[get_cluster, \"rm -rf\"]")
+		}, "servers.gke.include[1]: \"rm -rf\" is not an MCP tool name"},
+		{"command path", func(t *testing.T, d string) {
+			replaceIn(t, d, ManifestFile, "[kubectl]", "[/usr/bin/kubectl]")
+		}, "requires.commands[0]: \"/usr/bin/kubectl\" is not a command name"},
+		{"harness name", func(t *testing.T, d string) {
+			replaceIn(t, d, ManifestFile, "  antigravity:", "  Claude_Code:")
+		}, "persona.yaml: harness.Claude_Code: is not a harness name"},
+		{"file over the cap", func(t *testing.T, d string) {
+			_ = os.WriteFile(filepath.Join(d, "skills/notes/big.md"), make([]byte, maxFileBytes+1), 0o644)
+		}, "skills/notes/big.md: is 1048577 bytes; the limit is 1048576"},
+		{"persona over the total cap", func(t *testing.T, d string) {
+			for i := 0; i <= maxTotalBytes/maxFileBytes; i++ {
+				_ = os.WriteFile(filepath.Join(d, "skills/notes", fmt.Sprintf("part%02d.md", i)), make([]byte, maxFileBytes), 0o644)
+			}
+		}, "the persona passes 16777216 bytes in total"},
+		{"file in skills/", func(t *testing.T, d string) {
+			_ = os.WriteFile(filepath.Join(d, "skills/stray.md"), []byte("x"), 0o644)
+		}, "skills/stray.md: a skill is a directory holding SKILL.md"},
+		{"symlinked skill dir", func(t *testing.T, d string) {
+			_ = os.Symlink(filepath.Join(d, "skills/notes"), filepath.Join(d, "skills/linked"))
+		}, "skills/linked: is a symlink"},
 		{"tool on no server", func(t *testing.T, d string) {
 			replaceIn(t, d, ManifestFile, "- gke\n", "- gke\n  - github\n")
 		}, "\"github\" is neither a built-in tool"},
@@ -179,5 +245,14 @@ func TestLocalPath(t *testing.T) {
 		if got := LocalPath(p); got != want {
 			t.Errorf("LocalPath(%q) = %v, want %v", p, got, want)
 		}
+	}
+}
+
+// An import inside a fenced block is an example, not an import.
+func TestLoadAllowsAnImportInAFence(t *testing.T) {
+	dir := copyExample(t)
+	replaceIn(t, dir, InstructionsFile, "# Example", "```\n@/etc/hosts\n```\n\n# Example")
+	if _, err := Load(dir); err != nil {
+		t.Fatal(err)
 	}
 }

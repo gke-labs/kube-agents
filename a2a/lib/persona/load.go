@@ -2,7 +2,9 @@ package persona
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -25,6 +27,9 @@ const (
 	maxTotalBytes = 16 << 20
 )
 
+// skillFrontmatterKeys are the SKILL.md frontmatter keys Load accepts.
+var skillFrontmatterKeys = []string{"name", "description", "license", "metadata"}
+
 var (
 	// nameRE is a DNS label: a persona's name ends up in image and object names.
 	nameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
@@ -32,11 +37,14 @@ var (
 	skillNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,62}[a-z0-9])?$`)
 	// serverRE keeps "__" out of server names: Claude Code spells an MCP
 	// tool mcp__<server>__<tool>.
-	serverRE    = regexp.MustCompile(`^[a-z0-9]([-a-z0-9_]{0,30}[a-z0-9])?$`)
-	mcpToolRE   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
-	paramRE     = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
-	harnessRE   = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
-	commandRE   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+	serverRE  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9_]{0,30}[a-z0-9])?$`)
+	mcpToolRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+	paramRE   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,62}$`)
+	harnessRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
+	commandRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+	// escapingImportRE is a Claude Code @-import whose path leaves the
+	// config directory: absolute, home-relative, or climbing out.
+	escapingImportRE = regexp.MustCompile(`(^|\s)@(/|~|\.\./|\./\.\.)\S*`)
 )
 
 // Load reads and validates the persona directory dir. A validation failure
@@ -90,6 +98,7 @@ func (l *loader) load() *Persona {
 		if len(bytes.TrimSpace(data)) == 0 {
 			l.add(InstructionsFile, "", "is empty")
 		}
+		l.checkImports(InstructionsFile, data)
 		p.Instructions = string(data)
 	}
 	p.Skills = l.skills()
@@ -101,47 +110,64 @@ func (l *loader) load() *Persona {
 	return p
 }
 
+// errSymlink is what openNoFollow returns for a symlink.
+var errSymlink = errors.New("symlink")
+
 // read returns a top-level file's content. A missing optional file is
 // (nil, false) with no problem.
 func (l *loader) read(name string, required bool) ([]byte, bool) {
-	full := filepath.Join(l.dir, name)
-	info, err := os.Lstat(full)
-	if os.IsNotExist(err) {
-		if required {
-			l.add(name, "", "is missing")
-		}
-		return nil, false
+	data, ok, missing := l.readFile(name, filepath.Join(l.dir, name))
+	if missing && required {
+		l.add(name, "", "is missing")
 	}
-	if err != nil {
-		l.err = err
-		return nil, false
-	}
-	return l.readRegular(name, full, info)
+	return data, ok
 }
 
-// readRegular reads one file, refusing anything but a regular file: a
-// symlink could name a file outside the persona, and the image that carries
-// the persona would not carry its target.
-func (l *loader) readRegular(rel, full string, info fs.FileInfo) ([]byte, bool) {
+// readFile reads one file, refusing anything but a regular file: a symlink
+// could name a file outside the persona, and the image that carries the
+// persona would not carry its target. It opens without following a link and
+// checks the open file, so nothing can be swapped in between.
+func (l *loader) readFile(rel, full string) (data []byte, ok, missing bool) {
+	f, err := openNoFollow(full)
+	switch {
+	case errors.Is(err, errSymlink):
+		l.add(rel, "", "is not a regular file (symlinks and devices are refused)")
+		return nil, false, false
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, false, true
+	case err != nil:
+		l.err = err
+		return nil, false, false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		l.err = err
+		return nil, false, false
+	}
 	if !info.Mode().IsRegular() {
 		l.add(rel, "", "is not a regular file (symlinks and devices are refused)")
-		return nil, false
+		return nil, false, false
 	}
 	if info.Size() > maxFileBytes {
 		l.add(rel, "", "is %d bytes; the limit is %d", info.Size(), maxFileBytes)
-		return nil, false
+		return nil, false, false
 	}
-	l.total += int(info.Size())
-	if l.total > maxTotalBytes {
-		l.add(rel, "", "the persona passes %d bytes in total", maxTotalBytes)
-		return nil, false
-	}
-	data, err := os.ReadFile(full)
+	data, err = io.ReadAll(io.LimitReader(f, maxFileBytes+1))
 	if err != nil {
 		l.err = err
-		return nil, false
+		return nil, false, false
 	}
-	return data, true
+	if len(data) > maxFileBytes {
+		l.add(rel, "", "is over %d bytes", maxFileBytes)
+		return nil, false, false
+	}
+	l.total += len(data)
+	if l.total > maxTotalBytes {
+		l.add(rel, "", "the persona passes %d bytes in total", maxTotalBytes)
+		return nil, false, false
+	}
+	return data, true, false
 }
 
 func (l *loader) skills() []Skill {
@@ -166,6 +192,10 @@ func (l *loader) skills() []Skill {
 	var skills []Skill
 	for _, e := range entries {
 		rel := path.Join(SkillsDir, e.Name())
+		if e.Type()&fs.ModeSymlink != 0 {
+			l.add(rel, "", "is a symlink; a skill is a directory inside the persona")
+			continue
+		}
 		if !e.IsDir() {
 			l.add(rel, "", "a skill is a directory holding %s", SkillFile)
 			continue
@@ -195,8 +225,11 @@ func (l *loader) skill(rel, name string) (Skill, bool) {
 		if err != nil {
 			return err
 		}
-		data, ok := l.readRegular(path.Join(rel, fileRel), full, info)
+		data, ok, _ := l.readFile(path.Join(rel, fileRel), full)
 		if ok {
+			if IsMarkdown(fileRel) {
+				l.checkImports(path.Join(rel, fileRel), data)
+			}
 			s.Files = append(s.Files, File{Path: fileRel, Data: data, Executable: info.Mode()&0o111 != 0})
 		}
 		return nil
@@ -217,28 +250,66 @@ func (l *loader) skill(rel, name string) (Skill, bool) {
 		l.add(file, "", "does not open with --- frontmatter")
 		return s, false
 	}
-	var meta struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-	}
-	// Not strict: Agent Skills allows more keys, and a harness that reads
-	// them gets the file verbatim.
+	var meta map[string]any
 	if err := yaml.Unmarshal(front, &meta); err != nil {
 		l.add(file, "frontmatter", "%v", err)
 		return s, false
 	}
-	if meta.Name != name {
-		l.add(file, "name", "is %q; it must be the directory name %q", meta.Name, name)
+	// The file ships verbatim, and Claude Code reads keys such as
+	// allowed-tools and hooks from it: a skill could grant what the persona
+	// withholds. Only inert keys pass.
+	for _, key := range sortedKeys(meta) {
+		if !slices.Contains(skillFrontmatterKeys, key) {
+			l.add(file, key, "is not an allowed frontmatter key (%s); a skill cannot grant tools or run hooks",
+				strings.Join(skillFrontmatterKeys, ", "))
+		}
+	}
+	if m, ok := meta["metadata"]; ok {
+		if _, isMap := m.(map[string]any); !isMap {
+			l.add(file, "metadata", "must be a map")
+		}
+	}
+	skillName, _ := meta["name"].(string)
+	desc, _ := meta["description"].(string)
+	if skillName != name {
+		l.add(file, "name", "is %q; it must be the directory name %q", skillName, name)
 	}
 	switch {
-	case strings.TrimSpace(meta.Description) == "":
+	case strings.TrimSpace(desc) == "":
 		l.add(file, "description", "is required")
-	case len(meta.Description) > maxDescription:
-		l.add(file, "description", "is %d characters; the limit is %d", len(meta.Description), maxDescription)
+	case len(desc) > maxDescription:
+		l.add(file, "description", "is %d bytes; the limit is %d", len(desc), maxDescription)
 	}
-	s.Description = meta.Description
+	s.Description = desc
 	return s, true
 }
+
+// checkImports refuses @-imports that leave the config directory, outside
+// fenced code blocks. Claude Code expands "@path" in CLAUDE.md and its
+// imports, so such a line would read a file from the pod into the prompt.
+func (l *loader) checkImports(rel string, data []byte) {
+	fence := ""
+	for i, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if fence != "" {
+			if strings.HasPrefix(trimmed, fence) {
+				fence = ""
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "~~~") {
+			fence = trimmed[:3]
+			continue
+		}
+		if m := escapingImportRE.FindString(line); m != "" {
+			l.add(rel, fmt.Sprintf("line %d", i+1),
+				"the import %q reads a file outside the persona; imports must stay inside it", strings.TrimSpace(m))
+		}
+	}
+}
+
+// IsMarkdown reports whether a path names a markdown file, in any case.
+func IsMarkdown(p string) bool { return strings.EqualFold(path.Ext(p), ".md") }
 
 // frontmatter returns the YAML between a leading "---" line and the next.
 func frontmatter(data []byte) ([]byte, bool) {
@@ -254,28 +325,40 @@ func frontmatter(data []byte) ([]byte, bool) {
 	return []byte(rest[:end]), true
 }
 
-// mcp decodes mcp.yaml. A server with a url gets its own problem rather than
-// the strict decoder's "unknown field": v1 reaches MCP servers only through
-// the broker, whose policy and audit a direct URL would bypass.
+// mcp decodes mcp.yaml strictly: an unknown key, at any level, or a
+// repeated one is refused. A server with a url gets its own problem rather
+// than the decoder's "unknown field": v1 reaches MCP servers only through the
+// broker, whose policy and audit a direct URL would bypass.
 func (l *loader) mcp(data []byte) MCP {
+	var urls []string
 	var raw struct {
 		Servers map[string]map[string]any `json:"servers"`
 	}
-	if err := yaml.Unmarshal(data, &raw); err == nil {
+	if yaml.Unmarshal(data, &raw) == nil {
 		for _, name := range sortedKeys(raw.Servers) {
 			if _, ok := raw.Servers[name]["url"]; ok {
+				urls = append(urls, name)
 				l.add(MCPFile, "servers."+name+".url",
 					"direct URLs are not supported; a server names a broker MCP server (broker: <name>)")
-				delete(raw.Servers[name], "url")
 			}
-		}
-		if cleaned, err := yaml.Marshal(raw); err == nil {
-			data = cleaned
 		}
 	}
 	var m MCP
 	if err := yaml.UnmarshalStrict(data, &m); err != nil {
-		l.add(MCPFile, "", "%v", err)
+		// The decoder stops at the first unknown field; when that is a url
+		// already reported above, decode again without it to find the rest.
+		if len(urls) == 0 || !strings.Contains(err.Error(), `unknown field "url"`) {
+			l.add(MCPFile, "", "%v", err)
+			return m
+		}
+		for _, name := range urls {
+			delete(raw.Servers[name], "url")
+		}
+		cleaned, _ := yaml.Marshal(raw)
+		m = MCP{}
+		if err := yaml.UnmarshalStrict(cleaned, &m); err != nil {
+			l.add(MCPFile, "", "%v", err)
+		}
 	}
 	return m
 }
@@ -320,7 +403,7 @@ func (l *loader) validateManifest(m *Manifest, mcp MCP) {
 	case strings.TrimSpace(m.Description) == "":
 		l.add(ManifestFile, "description", "is required")
 	case len(m.Description) > maxDescription:
-		l.add(ManifestFile, "description", "is %d characters; the limit is %d", len(m.Description), maxDescription)
+		l.add(ManifestFile, "description", "is %d bytes; the limit is %d", len(m.Description), maxDescription)
 	}
 	seen := map[string]bool{}
 	for i, t := range m.Tools {
