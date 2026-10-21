@@ -95,4 +95,7 @@ verification_spec:
       # configuration") and "authorizednetworks" covers the API field forms
       # (masterAuthorizedNetworksConfig, authorizedNetworksConfig), which
       # lowercase without the space.
-      any_of_phrases: ["authorized network", "authorizednetworks"]
+      # "authorized-networks" is the drift collector's facet id, which the
+      # agent may quote once the question routes there (#3609).
+      any_of_phrases:
+        ["authorized network", "authorizednetworks", "authorized-networks"]
