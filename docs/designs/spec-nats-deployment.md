@@ -405,7 +405,7 @@ Layout:
   inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
-  rendered plain (`no_tls: true`) with an `allowed_origins` allow-list.
+  with an `allowed_origins` allow-list (transport encryption is below).
 
   **"Read-only" is not expressible as a subject list, and the first version of this user
   proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
@@ -916,6 +916,69 @@ this stage has - connections are rare compared to messages - and it is the first
 look at if a fleet reconnecting at once is slow to come back. Raising it means handling
 each request in its own goroutine with a bound, which is a change to make against a
 measurement rather than in advance of one.
+
+## Transport encryption
+
+Every connection to the client listener on 4222 is TLS. nats.conf carries a top-level
+`tls { }` block, so the server advertises `tls_required` and refuses a CONNECT sent in the
+clear; a client that dials `nats://` is told to upgrade, and one that cannot verify the
+certificate is refused. Every client the operator renders is handed `tls://` on the NATS
+Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
+health and stats, not payloads or tokens. The websocket listener on 9222 serves the same
+certificate from the same files.
+
+**Certificate source.** The operator mints the certificates itself, with no dependency on
+cert-manager, which the chart does not install. Three objects, all owned by the
+`PlatformAgent` and removed with the stack on a flip to `today`:
+
+| Object                                             | Holds                                                  |
+| -------------------------------------------------- | ------------------------------------------------------ |
+| Secret `<name>-a2a-nats-ca`                        | an ECDSA P-256 CA, ten years, key included             |
+| Secret `<name>-a2a-nats-tls` (`kubernetes.io/tls`) | the serving pair, one year, with `ca.crt` beside it    |
+| ConfigMap `<name>-a2a-nats-ca-bundle`              | the CA's public certificate alone, which clients mount |
+
+The serving certificate names the NATS Service's in-cluster names and nothing else: no
+localhost, no IP, no external host. Tooling that reaches the bus through a port-forward
+sets the TLS server name to the Service name (`NATS_TLS_SERVER_NAME` for clients built on
+`a2a/lib`). Both Secrets are on the webhook's bus-credential list: a user volume mounting
+either is refused, since the serving key lets a pod impersonate the bus and the CA key
+lets it mint a certificate that does.
+
+**Clients.** `NATS_CA_FILE` names the bundle to every client, and `a2a/lib.TLSOptions`
+reads it on each handshake. The gateway also gets `NATS_CA_CONFIGMAP` and mounts that
+ConfigMap into each session pod it spawns, at the same path. `NATS_CA_FILE` is reserved
+like `NATS_URL`: pointed at a CA of someone else's choosing, a client accepts a server
+that CA signed and hands it the bearer token at CONNECT. The provision Job passes the
+bundle to the `nats` CLI as `--tlsca`.
+
+**Rotation.** The reconcile reissues either certificate once fewer than 30 days remain,
+and replaces whichever Secret it cannot use (unparseable, a key that is not the
+certificate's, a serving certificate the CA no longer signs) whole. The CA outlives every
+serving certificate it signs, so a renewal never changes what clients trust. A renewal
+does change what the server presents, and nats-server reads its certificate only at boot
+or on a reload signal, so the serving certificate's fingerprint rides the StatefulSet's
+config hash: a renewal restarts the bus once a year, the same window any config change
+costs. A reloader that sends the reload signal instead would remove that restart; it
+needs another pinned image and a shared process namespace, and is not rendered yet. A CA
+change, the rare manual case, goes in three steps so no client distrusts the bus in
+between: add the new CA to the bundle beside the old one, reissue the serving
+certificate under it, then drop the old CA.
+
+**The flip on an existing install.** The release that adds the `tls { }` block also moves
+every client the operator renders to `tls://`, in the same reconcile, so the bus restarts
+once and every client rolls on its new env. Two things the operator does not re-render:
+
+- **Session pods the gateway reuses** keep the env they were spawned with. The spawner
+  stamps each pod with its bus transport (a digest of the URL and the CA bundle), and a
+  pod whose stamp does not match the gateway's is never handed another task, so the
+  conversation gets a fresh pod. A task in flight in an old pod when the bus restarts
+  fails, as on any bus restart.
+- **Anything outside the operator** that dials the bus by hand needs `tls://` and the
+  bundle afterwards.
+
+Client certificates (`verify: true`) are not required. Every connection already
+authenticates with a TokenReview'd ServiceAccount token or a static password; mTLS as a
+second factor is a separate option.
 
 ## Observability and audit
 
