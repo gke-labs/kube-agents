@@ -62,6 +62,8 @@ verification_spec:
   # start of the line; every pattern matches the whole declared frame, anchored
   # at both ends, with the line's decoration folded first.
   # The frame every cluster must satisfy, all four slots included.
+  # The fold spaces a separator only before a letter, so a count written right
+  # after `:` or `;` stays unspaced; the patterns admit the missing space there.
   - name: every-seeded-cluster-has-a-declared-line
     role: objective
     mode: assert
@@ -74,7 +76,7 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: known-issues-matrix: \d+ add-on\(s\) inventoried; \d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: known-issues-matrix: \d+ add-on\(s\) inventoried; \d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: known-issues-matrix: \d+ add-on\(s\) inventoried; \d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: known-issues-matrix: \d+ add-on\(s\) inventoried; \d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)'
+        - '(?ms)\A(?=.*^{cluster:a}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:b}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:c}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)(?=.*^{cluster:d}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?\d+ add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table [^\n]+$)'
   # At least one add-on inventoried (every GKE cluster runs managed DaemonSets in kube-
   # system), a count of matches, the table's date, and the freshness verdict as the report
   # gave it; `fresh` or `stale` are both accepted, because the table ages by design and a
@@ -91,9 +93,9 @@ verification_spec:
         - drift-outlier
         - zonal-skew-scheduling
       any_of_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: known-issues-matrix: [1-9]\d* add-on\(s\) inventoried; \d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table (?:fresh|stale)$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: known-issues-matrix: ?[1-9]\d* add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table (?:fresh|stale)$'
       forbidden_patterns:
-        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: known-issues-matrix: (?![1-9]\d* add-on\(s\) inventoried; \d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table (?:fresh|stale)$)[^\n]*$'
+        - '(?m)^{cluster:any}(?:\s*\([^)\n]*\))?: known-issues-matrix:(?! ?[1-9]\d* add-on\(s\) inventoried; ?\d+ known issue\(s\) match; table generated \d{4}-\d{2}-\d{2}; table (?:fresh|stale)$)[^\n]*$'
 
   - name: no-invented-cves
     role: objective
