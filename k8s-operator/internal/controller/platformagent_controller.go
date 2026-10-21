@@ -88,6 +88,13 @@ const (
 	// it is a GitHub Enterprise Server host. The agent reads it, with
 	// github.com as the default, so a github.com install carries no key.
 	gitopsStateGitHubHostKey = "github_host"
+	// gitopsStateGitOpsRepoKey is the repository with role gitops, as one
+	// managed_repos entry ({"type", "url"}). The operator writes it only when
+	// exactly one repository has that role, and removes it when none has or
+	// when two have it. The
+	// fleet audit reads it (gitops_workspace.get_gitops_repo) to choose the
+	// repository for its ledger issue when several repositories are managed.
+	gitopsStateGitOpsRepoKey = "gitops_repo"
 	// minterConfigMapName is the minty rule ConfigMap the chart and the kustomize
 	// template render; minterBaseTemplateKey is the policy every rendered key is
 	// derived from.
@@ -1533,6 +1540,26 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 			updated = true
 		}
 	}
+	// The GitOps repository key is the operator's alone too: written from
+	// the declaration, and removed when no repository has role gitops. A
+	// declaration that does not resolve, or a gitops repository that
+	// validation refuses, leaves it as it is, as it leaves the lists.
+	if wantRepo, resolved := declaredGitOpsRepo(agent); resolved {
+		haveRepo, present := found.Data[gitopsStateGitOpsRepoKey]
+		if (wantRepo == "" && present) || (wantRepo != "" && haveRepo != wantRepo) {
+			if found.Data == nil {
+				found.Data = map[string]string{}
+			}
+			if wantRepo == "" {
+				delete(found.Data, gitopsStateGitOpsRepoKey)
+			} else {
+				found.Data[gitopsStateGitOpsRepoKey] = wantRepo
+			}
+			logger.Info("updating the GitOps repository key in the gitops state ConfigMap",
+				"configMap", found.Name, "key", gitopsStateGitOpsRepoKey, "removed", wantRepo == "")
+			updated = true
+		}
+	}
 	if updated {
 		if err := r.Update(ctx, found); err != nil {
 			return err
@@ -1540,6 +1567,61 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 	}
 
 	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data[gitopsStateManagedReposKey], found.Data[gitopsStateContextReposKey])
+}
+
+// twoGitOpsLogged holds the PlatformAgents, as namespace/name, for which
+// declaredGitOpsRepo has logged two gitops repositories. An entry goes when
+// the declaration has one gitops repository or none again.
+var twoGitOpsLogged sync.Map
+
+// declaredGitOpsRepo is the value of the gitops_repo key: the managed_repos
+// entry of the one repository with role gitops, as JSON, or "" when no
+// repository has that role. resolved is false when the key must stay as it
+// is: the declaration does not resolve, or the gitops repository is refused.
+//
+// The CRD admits at most one gitops repository, and Accepted refuses a second
+// one. If two get through all the same (an API server without the CEL rule),
+// the key is removed and not written: the agent must not use either one as
+// the GitOps repository until the declaration is corrected. Problems reports
+// the second one in the status conditions.
+func declaredGitOpsRepo(agent *agentv1alpha1.PlatformAgent) (value string, resolved bool) {
+	if agent.Spec.Integration == nil {
+		return "", true
+	}
+	ri, err := agent.Spec.Integration.ResolveGit()
+	if err != nil {
+		return "", false
+	}
+	declared := ri.WithRole(agentv1alpha1.RepositoryRoleGitOps)
+	if len(declared) <= 1 {
+		twoGitOpsLogged.Delete(agent.Namespace + "/" + agent.Name)
+	}
+	switch {
+	case len(declared) == 0:
+		return "", true
+	case len(declared) > 1:
+		// Once for each PlatformAgent, not on every reconcile: Problems
+		// already reports the second one in the status conditions.
+		if _, logged := twoGitOpsLogged.LoadOrStore(agent.Namespace+"/"+agent.Name, true); !logged {
+			manifestsLog.Info("not writing the GitOps repository key: more than one repository has role gitops",
+				"key", gitopsStateGitOpsRepoKey, "count", len(declared),
+				"namespace", agent.Namespace, "name", agent.Name)
+		}
+		return "", true
+	}
+	accepted := ri.Accepted(agentv1alpha1.RepositoryRoleGitOps)
+	if len(accepted) != 1 {
+		return "", false
+	}
+	entry, err := accepted[0].ManagedRepoEntry()
+	if err != nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
 }
 
 // conditionReasonGitHubHostChanged is the Event reason for a reconcile that

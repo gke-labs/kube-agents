@@ -3782,15 +3782,18 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// five unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the scope path, and
-	// the empty management-project override.
+	// eight unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the scope path, the
+	// empty management-project override, and the stall watch's three knobs, empty.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
 		kubeagentsModeEnvKey + "=today\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
-		reconcileProjectEnvKey + "=\n"
+		reconcileProjectEnvKey + "=\n" +
+		stallWatchExcludeNamespacesEnvKey + "=\n" +
+		stallWatchMinAgeEnvKey + "=\n" +
+		stallWatchKindsEnvKey + "=\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
@@ -3857,11 +3860,15 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// container env is not a disagreement — only a different answer is.
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
-	// would be a second answer to a question that must have exactly one.
+	// would be a second answer to a question that must have exactly one. The stall
+	// watch's knobs take the same single path to stall_watch.py.
 	pinnedOnly := map[string]bool{
-		"GATEWAY_ALLOWED_USERS":   true,
-		"GATEWAY_ALLOW_ALL_USERS": true,
-		kubeagentsModeEnvKey:      true,
+		"GATEWAY_ALLOWED_USERS":           true,
+		"GATEWAY_ALLOW_ALL_USERS":         true,
+		kubeagentsModeEnvKey:              true,
+		stallWatchExcludeNamespacesEnvKey: true,
+		stallWatchMinAgeEnvKey:            true,
+		stallWatchKindsEnvKey:             true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {

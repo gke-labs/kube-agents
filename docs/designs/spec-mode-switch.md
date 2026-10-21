@@ -97,7 +97,9 @@ Secret `<agent>-a2a-nats-creds` stays, because re-enabling `next` must not re-ro
 credentials. The JetStream PVC `data-<agent>-a2a-nats-0` stays, because flipping a mode
 is not license to destroy the file store. `hack/rollback-roundtrip.sh` checks both
 against a live install: it flips `next` to `today` and back, asserts the two keep their
-UIDs and the agent answers on each side, and the next lane runs it after its matrix.
+UIDs and the agent answers on each side. A next-mode eval run on `main` runs it after its
+matrix, and the today lane runs it before its own with `ROLLBACK_END_MODE=today`, which flips
+back to `today` once more and grades `today`'s matrix on the rolled-back install.
 
 ## What the operator renders
 
@@ -184,8 +186,8 @@ Flipping it with `kubectl patch` on the CR still works, and is how the dev insta
 predate the chart value run. Helm patches a custom resource from the difference between
 its renders, so while the chart value stays `null` a patched mode survives chart
 upgrades; a value set through the chart and later cleared removes the field again, which
-is `today`. The next lane's eval deploy (`hack/ci-deploy.sh`) sets the mode through the
-chart value, so its smoke exercises that route.
+is `today`. The eval deploy under `EVAL_MODE_NEXT=1` (`hack/ci-deploy.sh`) sets the mode
+through the chart value, so the merge-blocking presubmit exercises that route.
 
 ## Switches inside `next`
 

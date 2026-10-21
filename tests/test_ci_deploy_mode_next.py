@@ -94,12 +94,13 @@ _A2A_IMAGES = ("a2a-gateway", "a2a-authcallout", "a2a-worker", "a2a-verifier", "
 _A2A_DOCKERFILE_SUFFIXES = ("gateway", "authcallout", "worker", "verifier", "console")
 _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
-# The next lane's Prow jobs (oss-test-infra), the only runs section 2b
-# admits the flag on without a pull request; the today nightly and a made-up job
+# The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
+# request: the merge-blocking presubmit (in a Tide batch), the today lane's
+# periodic and the next-mode nightlies; the today nightly and a made-up job
 # stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
-    "pull-kube-agents-smoke-test-next",
-    "ci-kube-agents-eval-next",
+    "pull-kube-agents-smoke-test",
+    "ci-kube-agents-eval-today",
     "ci-kube-agents-eval-nightly-next-claude",
     "ci-kube-agents-eval-nightly-gitlab-next",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
@@ -159,7 +160,7 @@ def go_int_constant(path: pathlib.Path, name: str) -> int:
 # The variables a lifted section reads from the job environment. Unset first,
 # so "not exported by the test" means unset rather than whatever the shell
 # running the tests happens to export (a developer reproducing a flag run).
-_AMBIENT_ENV = ("EVAL_MODE_NEXT", "EVAL_TASK_PARALLELISM", "RC_COMMIT_SHA", "PULL_NUMBER", "JOB_NAME")
+_AMBIENT_ENV = ("EVAL_MODE_NEXT", "EVAL_ROLLBACK_LANE", "EVAL_TASK_PARALLELISM", "RC_COMMIT_SHA", "PULL_NUMBER", "JOB_NAME")
 
 
 def run_bash(script: str) -> subprocess.CompletedProcess:
@@ -575,7 +576,7 @@ class FlagSetIsNextTest(unittest.TestCase):
         error naming the job, and the flag unset changes nothing."""
         guard = prow_guard()
         lane_jobs = constants()["EVAL_MODE_NEXT_JOB_NAMES"].split()
-        self.assertEqual(lane_jobs, list(_NEXT_LANE_JOB_NAMES), "the allow-list is the next lane's jobs")
+        self.assertEqual(lane_jobs, list(_NEXT_LANE_JOB_NAMES), "the allow-list is the jobs that deploy under the flag")
         cases = {
             # (flag, IS_PROW_RUN, PULL_NUMBER, JOB_NAME) -> refused
             ("1", "true", "", _OTHER_JOB_NAME): True,
@@ -605,9 +606,34 @@ class FlagSetIsNextTest(unittest.TestCase):
                 else:
                     self.assertEqual(result.stdout, "", "the flag unset, a pull request's run, or a laptop logs nothing here")
 
+    def test_the_rollback_lane_without_the_flag_is_refused_at_second_zero(self) -> None:
+        """EVAL_ROLLBACK_LANE=1 rolls a next install back to today before the
+        matrix, so without EVAL_MODE_NEXT=1 there is nothing to roll back; the
+        deploy refuses it beside the 2b refusal, before anything is built, and
+        lets every other combination through."""
+        script = text(_CI_DEPLOY)
+        start = 'if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ "${EVAL_MODE_NEXT:-}" != "1" ]; then'
+        self.assertLess(script.index(start), script.index("# ─── 4. Build Container Images"), "the refusal belongs before the build")
+        guard = lifted_block(start, "fi", "the rollback-lane refusal")
+        cases = {
+            # (EVAL_ROLLBACK_LANE, EVAL_MODE_NEXT) -> refused
+            ("1", ""): True,
+            ("1", "0"): True,
+            ("1", "1"): False,
+            ("", "1"): False,
+            ("", ""): False,
+            ("0", ""): False,
+        }
+        for (lane, flag), refused in cases.items():
+            with self.subTest(lane=lane, flag=flag):
+                result = run_bash(f'export EVAL_ROLLBACK_LANE="{lane}" EVAL_MODE_NEXT="{flag}"\n{guard}')
+                self.assertEqual(result.returncode, 1 if refused else 0, result.stderr)
+                if refused:
+                    self.assertIn("EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1", result.stderr)
+
     def test_the_lane_allow_list_matches_whole_job_names(self) -> None:
         """A prefix, a suffix or a substring of a listed name is not the job:
-        `ci-kube-agents-eval-next-2` or `kube-agents-eval-next` must refuse.
+        `ci-kube-agents-eval-today-2` or `kube-agents-eval-today` must refuse.
         So must a value spelling two adjacent entries with the space between
         them, which a pattern over the joined list would have admitted."""
         guard = prow_guard()

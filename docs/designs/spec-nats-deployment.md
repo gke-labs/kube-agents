@@ -900,7 +900,7 @@ continue. The blast radius, named honestly: during a callout outage nothing new
 connects, which means no new tasks and no new workers - the fabric is dark to new work,
 not gracefully degraded. Established sessions and the resilience contract below are
 what make that acceptable at this stage; a hardened HA callout is production posture,
-not part of the dev toggle.
+not part of stage 1.
 
 **The throughput ceiling, so it is known rather than discovered.** A replica answers
 authorization requests one at a time: the subscription is a queue-group subscription with

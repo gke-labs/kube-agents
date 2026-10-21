@@ -88,7 +88,10 @@ All of these are guarded by a hidden marker carrying the triggering comment's no
 A `/remediate` read on the ledger is never run through the subcommand — `finish` answers those on
 the comment's own timestamp, which is what lets a fresh post-close command revive a finding the
 subcommand would report as `superseded`. Run a direct ask's targets through it, `--finding` once
-per id:
+per id. Without `--repo` it acts on the repository with `role: gitops`. If the finding is from a run
+that a person ran with `--repo`, pass the same `--repo` here. With several managed repositories,
+none with `role: gitops`, and no `--repo`, it refuses (`FATAL: Multiple repositories configured …`,
+exit 1); report that message to the user, and do not choose a repository:
 
 ```bash
 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \

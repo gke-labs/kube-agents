@@ -11,7 +11,7 @@ description: >-
   add, deploy, or upgrade a chart or a packaged third-party component. Don't
   use for kube-agents itself (an operator upgrades it with the installer), plain
   workload YAML (use gke-manifest-generation), or Google Cloud resources (use
-  gcp-config-connector).
+  gcp-config-connector, or gcp-terraform on a Terraform repository).
 ---
 
 # Third-Party Helm Charts Through GitOps
@@ -195,8 +195,8 @@ Read the install guide's prerequisites and the chart's values for:
 For each one, check the cluster (`gcloud container clusters describe`) or the
 repository. Already met: say so in the PR body. Not met, and the repository
 can declare it (KCC or Terraform under `provisioning/`, through
-`gcp-config-connector` or the repository's Terraform convention): put it in
-the same pull request. Not met and not declarable here (a setting that only
+`gcp-config-connector` or `gcp-terraform`): put it in the same pull
+request. Not met and not declarable here (a setting that only
 exists at cluster creation, an allowlist, a manual step): stop and name
 every such item. A partial install that fails after merge is worse than no
 pull request.

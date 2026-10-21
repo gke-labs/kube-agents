@@ -21,11 +21,10 @@ or that grew an `owners` argument where its case requires none would still
 produce a payload the builder accepts and the daemon files. The case would
 then fail on a judged objective as though the agent were wrong.
 
-That is worth a test rather than a comment because of who runs these: only
-`gitops-drift-out-of-band-triage` is registered. `scripts/validate_bench_cases.py`
-holds the other two as KNOWN_UNREGISTERED while the nightly's infra-lock chain
-has no room, so two of the three call sites are exercised by nothing until
-somebody runs them by hand.
+That is worth a test rather than a comment because of when these run: all
+three are nightly-only, so a swapped argument is seen once a night at best,
+and the nightly truncated three times in the week before the two CUJ 1 halves
+were registered into it. A test sees it on the pull request instead.
 
 This reads the `.tf` files rather than mocking them: the subject is the call
 site, and a test that restated the arguments would drift from the stack the

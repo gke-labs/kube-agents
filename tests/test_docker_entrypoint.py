@@ -1104,6 +1104,219 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         self.assertIn(f"- location: {self._IDENTITY['location']}", persona)
         self.assertEqual(persona.count("## Target Cluster Identity"), 1)
 
+    def test_the_cluster_loop_refreshes_the_image_owned_plugin_code(self):
+        """A cluster profile on the volume runs the image's tool_call_audit, not its own.
+
+        The profile copied the shared plugins tree once, when it was scaffolded, and the
+        back-fill in this loop turns tool_call_audit on for it. Without a refresh the
+        profile runs the copy it was scaffolded with, which may predate the writer the
+        sidecar ships from. hermes_otel holds the profile's pinned endpoint and an
+        operator-mounted plugin is a symlink; the loop must leave both as they are.
+        """
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        script = "set -e\n"
+        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+            script += _extract_shell_function(name) + "\n"
+        # The two definitions sit above the block's opener. The shipped plugin list runs
+        # as it is; the source path is a fixed image path, so the test points it at the
+        # fixture tree the way CLUSTER_TEMPLATE is, and checks the shipped value below.
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        shipped = {
+            line.split("=", 1)[0]: line
+            for line in source.splitlines()
+            if line.startswith(("CLUSTER_SHARED_PLUGINS=", "CLUSTER_IMAGE_PLUGINS="))
+        }
+        self.assertEqual(len(shipped), 2, "the plugin refresh's two definitions moved")
+        script += shipped["CLUSTER_IMAGE_PLUGINS"] + "\n" + block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shared = root / "defaults" / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py"), ("hermes_otel", "config.yaml")):
+                (shared / plugin).mkdir(parents=True)
+                (shared / plugin / module).write_text("image\n", encoding="utf-8")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            plugins = profile / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py"), ("hermes_otel", "config.yaml")):
+                (plugins / plugin).mkdir(parents=True)
+                (plugins / plugin / module).write_text("scaffolded\n", encoding="utf-8")
+            mounted = root / "agent-plugins" / "tool_call_audit"
+            mounted.mkdir(parents=True)
+            (mounted / "audit.py").write_text("mounted\n", encoding="utf-8")
+            linked = root / "data" / "profiles" / "cluster-p-d-us-central1"
+            (linked / "plugins").mkdir(parents=True)
+            (linked / "plugins" / "tool_call_audit").symlink_to(mounted)
+            (linked / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "CLUSTER_SHARED_PLUGINS": str(shared),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            audit = (plugins / "tool_call_audit" / "audit.py").read_text(encoding="utf-8")
+            sink = (plugins / "common" / "audit_sink.py").read_text(encoding="utf-8")
+            otel = (plugins / "hermes_otel" / "config.yaml").read_text(encoding="utf-8")
+            is_link = (linked / "plugins" / "tool_call_audit").is_symlink()
+            mounted_text = (mounted / "audit.py").read_text(encoding="utf-8")
+        self.assertEqual(audit, "image\n", "the profile kept the tool_call_audit it was scaffolded with")
+        self.assertEqual(sink, "image\n", "the profile kept the common modules it was scaffolded with")
+        self.assertEqual(otel, "scaffolded\n", "the loop overwrote hermes_otel's per-profile config")
+        self.assertTrue(is_link, "the loop replaced an operator-mounted plugin")
+        self.assertEqual(mounted_text, "mounted\n", "the loop wrote through an operator-mounted plugin")
+        self.assertNotIn("WARN", proc.stderr)
+        # The loop refreshes from the tree cluster profiles are scaffolded from.
+        scaffold = (_REPO / "agents" / "platform" / "scripts" / "cluster_agent_profile.py").read_text(encoding="utf-8")
+        default = re.search(r'"SHARED_PLUGINS_DIR", "([^"]+)"', scaffold).group(1)
+        # A fixed path, not ${VAR:-...}: an AgentPlugin's spec.env reaches this
+        # container, and must not choose where the audit plugin code comes from.
+        self.assertEqual(shipped["CLUSTER_SHARED_PLUGINS"], f'CLUSTER_SHARED_PLUGINS="{default}"')
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_a_failed_plugin_refresh_leaves_the_old_file_whole(self):
+        """A copy that cannot finish keeps the profile's old module intact, and says so.
+
+        Each file is copied to a temporary name beside its target and renamed over it,
+        so the failure here, a plugin folder the copy cannot write into, leaves the old
+        audit_sink.py byte for byte, no temporary file behind, and a WARN that names the
+        plugin. The other plugin is still refreshed: one failure does not stop the loop.
+        """
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        plugin_list = next(line for line in source.splitlines() if line.startswith("CLUSTER_IMAGE_PLUGINS="))
+        script = "set -e\n"
+        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+            script += _extract_shell_function(name) + "\n"
+        script += plugin_list + "\n" + block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            shared = root / "defaults" / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py")):
+                (shared / plugin).mkdir(parents=True)
+                (shared / plugin / module).write_text("image\n", encoding="utf-8")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            plugins = profile / "plugins"
+            for plugin, module in (("tool_call_audit", "audit.py"), ("common", "audit_sink.py")):
+                (plugins / plugin).mkdir(parents=True)
+                (plugins / plugin / module).write_text("scaffolded\n", encoding="utf-8")
+            (plugins / "common").chmod(0o555)
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            try:
+                proc = subprocess.run(
+                    ["sh", "-c", script],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    env={
+                        "PATH": "/usr/bin:/bin",
+                        "CLUSTER_TEMPLATE": str(template_dir),
+                        "CLUSTER_SHARED_PLUGINS": str(shared),
+                        "TARGET_DIR": str(root / "data"),
+                        "INSTALL_DIR": str(root / "install"),
+                    },
+                )
+                sink = (plugins / "common" / "audit_sink.py").read_text(encoding="utf-8")
+                audit = (plugins / "tool_call_audit" / "audit.py").read_text(encoding="utf-8")
+                leftovers = sorted(p.name for p in plugins.rglob("*.refresh.*"))
+            finally:
+                (plugins / "common").chmod(0o755)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(sink, "scaffolded\n", "a failed copy did not leave the old module whole")
+        self.assertEqual(leftovers, [], "a failed copy left a temporary file behind")
+        self.assertIn("could not refresh the common plugin", proc.stderr)
+        self.assertEqual(audit, "image\n", "one failed plugin stopped the refresh of the other")
+
+    def test_the_container_environment_cannot_choose_the_cluster_plugin_source(self):
+        """The refresh reads plugin code from a fixed image path, never from the environment.
+
+        An AgentPlugin's spec.env reaches the agent container with no allowlist. If the
+        source path could come from the environment, that plugin could choose the code
+        copied over every Cluster Agent's audit writer. This runs the shipped definitions
+        with a decoy tree in the environment and checks that nothing from it is copied,
+        whatever spelling an override would take.
+        """
+        block = _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        source = _ENTRYPOINT.read_text(encoding="utf-8")
+        preamble = source[source.index("\nCLUSTER_TEMPLATE=") + 1 : source.index('if [ -d "$CLUSTER_TEMPLATE" ]; then')]
+        self.assertIn("CLUSTER_SHARED_PLUGINS", preamble, "the plugin refresh's definitions moved")
+        # CLUSTER_TEMPLATE comes from the fixture through the environment, as in the sibling test.
+        preamble = "\n".join(line for line in preamble.splitlines() if not line.startswith("CLUSTER_TEMPLATE="))
+        script = "set -e\n"
+        for name in ("sync_profile_skills", "backfill_config_from_template", "repair_remote_mcp_user_agent"):
+            script += _extract_shell_function(name) + "\n"
+        script += preamble + "\n" + block
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir = root / "cluster-template"
+            template_dir.mkdir()
+            shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+            decoy = root / "decoy"
+            for plugin in ("tool_call_audit", "common"):
+                (decoy / plugin).mkdir(parents=True)
+                (decoy / plugin / "decoy.py").write_text("decoy\n", encoding="utf-8")
+            profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+            (profile / "plugins" / "tool_call_audit").mkdir(parents=True)
+            (profile / "plugins" / "tool_call_audit" / "audit.py").write_text("scaffolded\n", encoding="utf-8")
+            (profile / "config.yaml").write_text(
+                yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+                encoding="utf-8",
+            )
+            venv = root / "install" / ".venv" / "bin"
+            venv.mkdir(parents=True)
+            wrapper = venv / "python3"
+            wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+            wrapper.chmod(0o755)
+            proc = subprocess.run(
+                ["sh", "-c", script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "CLUSTER_TEMPLATE": str(template_dir),
+                    "CLUSTER_SHARED_PLUGINS": str(decoy),
+                    "TARGET_DIR": str(root / "data"),
+                    "INSTALL_DIR": str(root / "install"),
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            copied = sorted(str(p.relative_to(profile)) for p in profile.rglob("decoy.py"))
+            audit = (profile / "plugins" / "tool_call_audit" / "audit.py").read_text(encoding="utf-8")
+        self.assertEqual(copied, [], "the environment chose the plugin code copied into a cluster profile")
+        self.assertEqual(audit, "scaffolded\n")
+
     def test_the_two_profiles_that_are_not_force_synced_both_take_the_repair(self):
         """The call sites, read off the source: the cluster loop and the front-door fill.
 
@@ -2420,6 +2633,64 @@ class TirithCleanupTest(unittest.TestCase):
         _, target, tmp = self._run(seed)
         self.assertTrue((target / "profiles" / "cluster-c" / "bin" / "tirith").is_symlink())
         self.assertTrue((tmp / "elsewhere" / "tirith").exists())
+
+
+_NPM_CACHE_SHARE_OPENER = 'if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SCAFFOLD" ]; then'
+_PROFILE_SCAFFOLD = _REPO / "agents" / "platform" / "scripts" / "profile_scaffold.py"
+
+
+class NpmCacheShareTest(unittest.TestCase):
+    """Step 4.4b points npm in every home on the volume at one cache (gke-labs#3376).
+
+    The block runs extracted, with SCAFFOLD at the repository's scaffolder and
+    INSTALL_DIR at a stub venv whose python3 is this interpreter.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_NPM_CACHE_SHARE_OPENER)
+
+    def _run(self, primary="1"):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        target = tmp / "srv" / "agent-home"
+        homes = [target / "home", target / "profiles" / "cluster-a" / "home"]
+        for home in homes:
+            home.mkdir(parents=True)
+        # The cache npm kept in a profile's home before step 4.4b.
+        (homes[1] / ".npm" / "_cacache").mkdir(parents=True)
+        python = tmp / "hermes" / ".venv" / "bin" / "python3"
+        python.parent.mkdir(parents=True)
+        python.symlink_to(sys.executable)
+        proc = subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={
+                **os.environ,
+                "TARGET_DIR": str(target),
+                "HERMES_HOME": str(target),
+                "INSTALL_DIR": str(tmp / "hermes"),
+                "SCAFFOLD": str(_PROFILE_SCAFFOLD),
+                "IS_BOOTSTRAP_PRIMARY": primary,
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        return target, homes
+
+    def test_the_primary_links_every_home_and_reclaims_the_old_cache(self):
+        target, homes = self._run()
+        for home in homes:
+            self.assertEqual((home / ".npm").resolve(), (target / ".cache" / "npm").resolve())
+        self.assertFalse((target / ".cache" / "npm" / "_cacache").exists())
+
+    def test_a_non_primary_replica_writes_nothing(self):
+        target, homes = self._run(primary="0")
+        self.assertFalse(homes[0].joinpath(".npm").exists())
+        self.assertTrue(homes[1].joinpath(".npm", "_cacache").is_dir())
+        self.assertFalse((target / ".cache").exists())
 
 
 class A2AModeProbeTest(unittest.TestCase):

@@ -1341,9 +1341,13 @@ kubectl exec deploy/platform-agent-gateway -n kubeagents-system -c platform-agen
 
 Each audit's report is a ledger issue in the GitOps repository, and its fixes are pull requests
 there, so those two need a GitOps repository, on GitHub or on GitLab. With no GitOps repository
-registered (none at all, rather than one the install cannot use), the audits still run: each keeps
-its findings in the report store on the agent's volume, and a run that changed something posts a
-summary to chat that says no forge is configured. With a repository, a
+registered, the audits still run: each keeps its findings in the report store on the agent's
+volume, and a run that changed something posts a summary to chat that says no forge is configured.
+A run whose repository the broker cannot reach, or a run on an install with several managed
+repositories and none with `role: gitops`, does the same, but it posts its summary on every run,
+with the reason and the fix. See
+[Which repository gets the ledger](docs/site/src/content/docs/concepts/declarative-workflow.md#which-repository-gets-the-ledger).
+With a repository, a
 run that changed something since the last one posts a one-line summary linking the issue to
 the home channel of each enabled chat platform (wherever `/sethome` last ran; otherwise the chat
 the install's first chat message came from; otherwise `SLACK_HOME_CHANNEL` or

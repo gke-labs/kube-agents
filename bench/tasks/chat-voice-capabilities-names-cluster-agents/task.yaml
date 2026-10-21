@@ -1,0 +1,61 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. What it grades is the front door's answer to
+# "what can you do?", which it gives itself from the roster block in its
+# context (agents/chat/SOUL.md §1, "Handle pure conversation yourself"). The
+# roster names a per-cluster agent by its profile id, an assignee string such
+# as cluster-<project>-<cluster>-<region>, cut and suffixed with eight hex
+# characters when it would run long. Shown to a person, that id
+# is noise: a first-time user read it as the agent's name (#3082). The answer
+# calls such an agent "the <cluster> cluster agent" instead.
+#
+# The forbidden pattern is the id's shape, both forms: `cluster-` and at least
+# four more hyphenated segments (project, cluster, region), which no prose
+# compound reaches ("cluster-wide", "cluster-scoped" have one). Measured on a
+# dev install, main's answer named "the
+# cluster-bnaylor-kagents-dev-ka-today-2-northamerica-northeast1 agent", the
+# unsuffixed form. The report is lowercased and `_`-stripped before matching.
+# Known edges, accepted for a nightly case on the seeded pool: a cluster whose
+# own name starts with `cluster-` and has four more segments would false-fail,
+# and a truncated id with fewer segments than four would slip through. The
+# pool's clusters are named neither way.
+# The required phrase
+# is that the answer does describe the cluster agents, so a reply that drops
+# them entirely does not pass by saying nothing.
+#
+# Planted defect required: none. Isolation class: read-only.
+id: chat-voice-capabilities-names-cluster-agents
+name: The front door's "what can you do?" names cluster agents by cluster, not by profile id
+prompt: >-
+  What can you do for me?
+expected_output: >-
+  The front door answers itself, without filing a card: a short, plain list
+  of what the specialists here can do. A per-cluster agent is described as
+  "the <cluster> cluster agent", never by its internal profile id.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's reply to a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bnaylor
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  - name: no-cluster-agent-profile-id
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '\bcluster-[a-z0-9]+(?:-[a-z0-9]+){3,}\b'
+  - name: the-cluster-agents-are-described
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["cluster agent"]
