@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path"
 	"strconv"
 	"time"
@@ -141,12 +140,16 @@ const (
 	annoReuse  = "a2a.kubeagents.dev/session-reuse"
 	reuseValue = "true"
 	// annoBusTransport stamps a pod with the bus transport it was spawned
-	// with: a digest of the NATS URL and the CA bundle it trusts
+	// with: a digest of the NATS URL and the CA file it was told to trust
 	// (busTransport). Reuse needs a pod that can still reach the bus, and a
-	// pod spawned before the bus moved to TLS, or before a CA change, keeps
-	// its old env and retries forever without ever reconnecting, while still
-	// reading as running. So a pod is reused only when its stamp matches the
+	// pod spawned before the bus moved to TLS keeps its nats:// URL and no
+	// CA, and retries forever without ever reconnecting, while still reading
+	// as running. So a pod is reused only when its stamp matches the
 	// gateway's, and a pod with no stamp at all is from before there was one.
+	// The CA's bytes are not in it: the pod mounts the bundle ConfigMap as a
+	// directory and reads it on every handshake, so a CA change reaches a
+	// running pod within the kubelet's sync, and abandoning every reusable
+	// pod for it would cost more than it saves.
 	annoBusTransport = "a2a.kubeagents.dev/bus-transport"
 	// busTransportLength is how much of the digest the stamp carries.
 	busTransportLength = 16
@@ -680,16 +683,10 @@ func (s *podSpawner) Reusable(ctx context.Context, podName string) (bool, error)
 }
 
 // busTransport is the stamp annoBusTransport carries: a digest of the NATS
-// URL and the CA bundle's bytes, read now. The bundle is read on every call
-// rather than cached, so a CA the kubelet has updated in place changes the
-// stamp for the pods spawned after it. An unreadable bundle digests as empty,
-// which still differs from any stamp taken while it was readable.
+// URL and the CA file path the spawner hands a pod, which is what changes when
+// the bus moves to TLS.
 func (s *podSpawner) busTransport() string {
-	var ca []byte
-	if s.cfg.NATSCAFile != "" {
-		ca, _ = os.ReadFile(s.cfg.NATSCAFile)
-	}
-	sum := sha256.Sum256(append([]byte(s.cfg.NATSURL+"\n"), ca...))
+	sum := sha256.Sum256([]byte(s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile))
 	return hex.EncodeToString(sum[:])[:busTransportLength]
 }
 

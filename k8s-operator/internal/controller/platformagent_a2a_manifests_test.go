@@ -595,8 +595,8 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 	})
 }
 
-// The web read surface: a websocket listener (plain ws is the stated
-// playground posture; production terminates TLS in front), a ClusterIP port
+// The web read surface: a websocket listener (still plain ws, unlike the TLS
+// client listener), a ClusterIP port
 // for it, and a `web` user that can watch everything and say nothing —
 // subscribe on a2a.>, the JetStream read API, its own inbox, and no publish
 // reach beyond those. The read-only web rail is the consumer; kubectl
@@ -3266,7 +3266,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
 		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
 	}
-	for _, name := range []string{"NATS_URL", a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
+	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv, a2aBusTokenFileEnv, a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar, "NATS_USER", "NATS_PASSWORD"} {
 		if _, sensitive := agentv1alpha1.SensitiveEnvVars[name]; !sensitive {
 			t.Errorf("%s is not in SensitiveEnvVars; the drop above covers plugin env only, and membership "+
 				"is what keeps the name out of the sidecar containers, which take spec.deployment.env "+

@@ -88,6 +88,11 @@ const (
 	// a2aNATSCAConfigMapEnv names the bundle ConfigMap to the gateway, which
 	// mounts the same one into every session pod it spawns.
 	a2aNATSCAConfigMapEnv = "NATS_CA_CONFIGMAP"
+	// a2aNATSTLSServerNameEnv is the server-name override a2a/lib honours
+	// for port-forwarded tooling. Nothing here renders it; it is named so a
+	// plugin's value can be dropped, since in a pod it could only point the
+	// check at a name the certificate does not carry.
+	a2aNATSTLSServerNameEnv = "NATS_TLS_SERVER_NAME"
 	// a2aNATSTLSScheme is every client URL's scheme.
 	a2aNATSTLSScheme = "tls://"
 
@@ -115,11 +120,11 @@ const (
 // a2aNATSTLSNow is the clock certificates are issued and judged against.
 var a2aNATSTLSNow = time.Now
 
-// a2aNATSTLS is what the rest of the render needs from the certificates: the
-// CA's public PEM for the bundle, and the fingerprints the rollout hash and the
-// session stamp key on.
+// a2aNATSTLS is what a pass learned about the certificates.
+// ServingFingerprint feeds the rollout hash. CAFingerprint is read by nothing
+// in the render; it is how a caller, the tests among them, tells whether a pass
+// kept the CA or replaced it.
 type a2aNATSTLS struct {
-	CAPEM              []byte
 	CAFingerprint      string
 	ServingFingerprint string
 }
@@ -199,7 +204,6 @@ func (r *PlatformAgentReconciler) ensureA2ANATSTLS(ctx context.Context, agent *a
 	}
 
 	return &a2aNATSTLS{
-		CAPEM:              caPEM,
 		CAFingerprint:      a2aCertFingerprint(caCert.Raw),
 		ServingFingerprint: a2aCertFingerprint(servingDER),
 	}, nil
@@ -214,7 +218,10 @@ func (r *PlatformAgentReconciler) ensureA2ANATSCA(ctx context.Context, agent *ag
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, nil, nil, err
 	}
-	if err == nil {
+	// Only a Secret this PlatformAgent controls is trusted to sign with. One
+	// that merely carries the name, written by anything else that can create
+	// Secrets here, is replaced and taken over rather than adopted.
+	if err == nil && metav1.IsControlledBy(existing, agent) {
 		if cert, key, ok := readA2ANATSCA(existing, now); ok {
 			return cert, key, existing.Data[a2aNATSCACertKey], nil
 		}
@@ -227,6 +234,9 @@ func (r *PlatformAgentReconciler) ensureA2ANATSCA(ctx context.Context, agent *ag
 	data := map[string][]byte{a2aNATSCACertKey: certPEM, a2aNATSCAKeyKey: keyPEM}
 	if err == nil {
 		existing.Data = data
+		if err := ctrl.SetControllerReference(agent, existing, r.Scheme); err != nil {
+			return nil, nil, nil, err
+		}
 		if err := r.Update(ctx, existing); err != nil {
 			return nil, nil, nil, err
 		}
@@ -257,7 +267,7 @@ func (r *PlatformAgentReconciler) ensureA2ANATSServing(ctx context.Context, agen
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, err
 	}
-	if err == nil {
+	if err == nil && metav1.IsControlledBy(existing, agent) {
 		if der, ok := readA2ANATSServing(existing, caCert, caPEM, dnsNames, now); ok {
 			return der, nil
 		}
@@ -270,6 +280,9 @@ func (r *PlatformAgentReconciler) ensureA2ANATSServing(ctx context.Context, agen
 	data := map[string][]byte{a2aNATSTLSCertKey: certPEM, a2aNATSTLSKeyKey: keyPEM, a2aNATSTLSCAKey: caPEM}
 	if err == nil {
 		existing.Data = data
+		if err := ctrl.SetControllerReference(agent, existing, r.Scheme); err != nil {
+			return nil, err
+		}
 		if err := r.Update(ctx, existing); err != nil {
 			return nil, err
 		}
@@ -341,7 +354,7 @@ func generateA2ANATSCA(now time.Time) (*x509.Certificate, *ecdsa.PrivateKey, []b
 		Subject:               pkix.Name{CommonName: a2aNATSCACommonName},
 		NotBefore:             now.Add(-a2aNATSTLSBackdate),
 		NotAfter:              now.Add(a2aNATSCALifetime),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		KeyUsage:              x509.KeyUsageCertSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		MaxPathLenZero:        true,

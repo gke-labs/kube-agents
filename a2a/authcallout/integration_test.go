@@ -432,6 +432,42 @@ func TestTheRenderedBusRefusesPlaintextAndUntrustedClients(t *testing.T) {
 	}
 }
 
+// lib.TLSOptions is the trust every product client takes, so it is driven
+// here against the rendered bus rather than inspected: a client that trusts
+// another CA, or the right CA under a name the certificate does not carry, is
+// refused at the handshake, and the right CA under the certificate's name
+// gets past it. A TLSOptions that stopped verifying would pass the third case
+// and fail the first two.
+func TestLibTLSOptionsVerifiesTheBus(t *testing.T) {
+	h := startHarness(t, twoIdentityMap, defaultTokens())
+	rightCA := os.Getenv(lib.EnvNATSCAFile)
+	if rightCA == "" {
+		t.Fatal("the harness set no CA file; every case below would be inert")
+	}
+	_, _ = withTestTLS(t, renderedTLSDir)
+	otherCA := os.Getenv(lib.EnvNATSCAFile)
+
+	dial := func(t *testing.T, ca, serverName string) error {
+		t.Helper()
+		t.Setenv(lib.EnvNATSCAFile, ca)
+		t.Setenv(lib.EnvNATSTLSServerName, serverName)
+		nc, err := nats.Connect(h.url, append(lib.TLSOptions(), nats.Token(tokenPodA), nats.Name("tls-options"))...)
+		if err == nil {
+			nc.Close()
+		}
+		return err
+	}
+	if err := dial(t, otherCA, ""); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("a client trusting another CA: err = %v, want a certificate verification failure", err)
+	}
+	if err := dial(t, rightCA, "attacker.example"); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("the right CA under a name the certificate lacks: err = %v, want a certificate verification failure", err)
+	}
+	if err := dial(t, rightCA, "localhost"); err != nil && strings.Contains(err.Error(), "certificate") {
+		t.Errorf("the right CA under the certificate's name failed verification: %v", err)
+	}
+}
+
 func TestNoTokenIsRefusedAtConnect(t *testing.T) {
 	h := startHarness(t, twoIdentityMap, defaultTokens())
 

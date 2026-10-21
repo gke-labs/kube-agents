@@ -2100,8 +2100,8 @@ max_control_line: 65536
 # it forwards the websocket here with the browser's headers intact. It is not
 # an in-cluster door for anything else. A port-forward straight to 9222 still
 # works for local tooling and the live tests, because it enters from the
-# node, which NetworkPolicy does not govern. Production still terminates TLS
-# in front of the bus, which is not a toggle that exists yet.
+# node, which NetworkPolicy does not govern. The client listener above is
+# TLS; this one is still plain.
 #
 # The origin allow-list is the console server's origin as the browser sees it
 # through the documented port-forward. The proxy forwards Origin unchanged,

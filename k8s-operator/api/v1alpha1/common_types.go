@@ -298,12 +298,13 @@ const BusCredentialRouteVolumeSource = -1
 // ServiceAccount, so the name on the volume changes nothing about what the
 // callout sees. The Secrets in A2ACredentialSecretNames need no token minting
 // at all and are the cheaper route; a check on the audience alone would narrow
-// the expensive route and advertise the cheap one. There are three of them
-// because the same credentials sit in three places: the creds Secret holds
-// the static passwords (`bridge-password` among them), the nats-config Secret
-// holds nats.conf with every one of those passwords inline, and the
-// callout-keys Secret holds the issuer seed that signs every identity the bus
-// accepts, which is worth more than any password in the other two.
+// the expensive route and advertise the cheap one. There are five of them:
+// the creds Secret holds the static passwords (`bridge-password` among them),
+// the nats-config Secret holds nats.conf with every one of those passwords
+// inline, the callout-keys Secret holds the issuer seed that signs every
+// identity the bus accepts, which is worth more than any password in the
+// others, and the two TLS Secrets hold the keys that let a pod pass as the
+// bus: the serving key, and the CA key that can mint another.
 //
 // Volume shapes only. A `secret` volume and a projected `secret` source are
 // the two volume shapes that put a Secret's data in the container; the other
@@ -971,7 +972,8 @@ type DeploymentSpec struct {
 	// its source is one of the routes to the agent's A2A bus credentials: a
 	// ServiceAccount token projection for the "a2a-bus" audience, or a reference
 	// to one of the Secrets the operator renders bus credentials into
-	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys),
+	// (<agent>-a2a-nats-creds, <agent>-a2a-nats-config, <agent>-a2a-callout-keys,
+	// <agent>-a2a-nats-tls, <agent>-a2a-nats-ca),
 	// as either a secret volume or a projected secret source. The refusal is on
 	// the name and the shape of the source, not on what a given Secret happens to
 	// hold at the time. Reading those Secrets through env is not refused here. On
@@ -988,8 +990,9 @@ type DeploymentSpec struct {
 	// ExtraVolumes specifies custom volumes to mount for the main container.
 	// The same reserved names and reserved sources as SidecarVolumes are refused
 	// at admission -- a ServiceAccount token projection for the "a2a-bus"
-	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config
-	// or <agent>-a2a-callout-keys -- and dropped from the render on an install
+	// audience, or a reference to <agent>-a2a-nats-creds, <agent>-a2a-nats-config,
+	// <agent>-a2a-callout-keys, <agent>-a2a-nats-tls or <agent>-a2a-nats-ca -- and
+	// dropped from the render on an install
 	// running the A2A surface.
 	// +listType=map
 	// +listMapKey=name

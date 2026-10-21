@@ -509,12 +509,17 @@ func TestSpawnHandsTheSessionThePodTheBusCA(t *testing.T) {
 	if stamp == "" || stamp != s.busTransport() {
 		t.Fatalf("bus-transport stamp = %q, want the spawner's %q", stamp, s.busTransport())
 	}
-	// A CA the kubelet rewrote in place changes the stamp, so a pod spawned
-	// under the old one is no longer reused.
+	// A CA the kubelet rewrote in place does not move the stamp: the pod
+	// reads the bundle on each handshake and heals on its own. A pod spawned
+	// with the plaintext URL and no CA has another stamp, and is not reused.
 	if err := os.WriteFile(caFile, []byte("ca-two"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if s.busTransport() == stamp {
-		t.Error("the stamp did not move when the CA bundle changed")
+	if s.busTransport() != stamp {
+		t.Error("the stamp moved when only the CA bundle's bytes changed")
+	}
+	plain := &podSpawner{cfg: &Config{NATSURL: "nats://agent-a2a-nats.test-ns.svc:4222"}}
+	if plain.busTransport() == stamp {
+		t.Error("a plaintext spawner stamps its pods the same as a TLS one")
 	}
 }

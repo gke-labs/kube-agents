@@ -3012,7 +3012,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		if a2aAgentSurface(agent) {
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == a2aNATSCAFileEnv || e.Name == a2aBusUserEnv ||
+				if e.Name == "NATS_URL" || e.Name == a2aNATSCAFileEnv || e.Name == a2aNATSTLSServerNameEnv || e.Name == a2aBusUserEnv ||
 					e.Name == a2aBusTokenFileEnv ||
 					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue

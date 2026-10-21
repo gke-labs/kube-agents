@@ -3,12 +3,16 @@ package controller
 import (
 	"context"
 	"crypto/x509"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -110,7 +114,7 @@ func TestEnsureA2ANATSTLSIssuesOnceAndKeeps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.CAFingerprint != first.CAFingerprint || second.ServingFingerprint != first.ServingFingerprint || string(second.CAPEM) != string(first.CAPEM) {
+	if *second != *first {
 		t.Errorf("a second pass changed the material: %+v -> %+v", first, second)
 	}
 	if again := a2aGetSecret(t, cl, agent, agentv1alpha1.A2ANATSTLSSecretName(agent.Name)); string(again.Data[a2aNATSTLSCertKey]) != string(serving.Data[a2aNATSTLSCertKey]) {
@@ -206,7 +210,12 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 	callout := buildA2ACalloutDeployment(agent)
 	job := buildA2AProvisionJob(agent)
 	agentPod := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
+	// The bridge sidecar sets its own NATS_URL but takes the CA env and mount
+	// by inheritance through two filters, so it is checked on the pod that
+	// renders it rather than trusted to follow the agent container.
+	bridgePod := bridgeTestPod(provisionedAgent())
 	for _, tc := range []podSpec{
+		{"bridge", bridgePod.Spec, a2aBridgeContainerName},
 		{"gateway", gateway.Spec.Template.Spec, ""},
 		{"verifier", verifier.Spec.Template.Spec, ""},
 		{"callout", callout.Spec.Template.Spec, ""},
@@ -215,10 +224,14 @@ func TestEveryRenderedBusClientTrustsTheBundle(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := tc.spec.Containers[0]
 			if tc.container != "" {
+				found := false
 				for _, cc := range tc.spec.Containers {
 					if cc.Name == tc.container {
-						c = cc
+						c, found = cc, true
 					}
+				}
+				if !found {
+					t.Fatalf("no %s container rendered; the checks below would read another one", tc.container)
 				}
 			}
 			env := map[string]string{}
@@ -296,5 +309,91 @@ func TestTheBusServesTLSFromTheMountedPair(t *testing.T) {
 		return v.Name == a2aNATSTLSVolume && v.Secret != nil && v.Secret.SecretName == agentv1alpha1.A2ANATSTLSSecretName(agent.Name)
 	}) {
 		t.Error("the serving pair's volume is not the TLS Secret")
+	}
+}
+
+// The operator's own bus client builds its trust from the bundle ConfigMap on
+// every handshake (busTLS), not through a2a/lib. Driven against the rendered
+// bus over the package's test pair: with the bundle holding the test CA the
+// operator's option gets past TLS; with the bundle swapped for another CA, a
+// new connection is refused, which is what a stale pool would have hidden.
+func TestTheCardPublishersTrustIsReadFromTheBundleOnEachHandshake(t *testing.T) {
+	agent := a2aTestAgent()
+	creds := a2aFullCreds("c", "1")
+	conf := string(buildA2ANATSConfigSecret(agent, creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	s, _ := a2aStartRenderedServer(t, conf)
+	dir, _ := a2aTestTLSMaterial(t)
+	testCA, err := os.ReadFile(filepath.Join(dir, a2aNATSTLSCAKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace},
+		Data:       map[string]string{a2aNATSCACertKey: string(testCA)},
+	}
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(bundle).Build()
+	pub := newNATSCardPublisher(cl)
+
+	// The test pair names localhost, so the URL does too; the option derives
+	// the server name from it, as it does from the Service name in a pod.
+	url := strings.Replace(s.ClientURL(), "127.0.0.1", a2aTestServerName, 1)
+	consolePW := string(creds.Data["console-password"])
+	// One option for both dials, as one long-lived connection holds one: a
+	// pool built when the option was made would still trust the old CA.
+	trust := pub.busTLS(agent)
+	dial := func() error {
+		nc, err := nats.Connect(url, trust, nats.UserInfo("console", consolePW),
+			nats.CustomInboxPrefix("_INBOX.console"))
+		if err == nil {
+			nc.Close()
+		}
+		return err
+	}
+	if err := dial(); err != nil {
+		t.Fatalf("the operator's trust in the rendered bus failed: %v", err)
+	}
+
+	other, _, otherPEM, _, err := generateA2ANATSCA(time.Now())
+	if err != nil || other == nil {
+		t.Fatal(err)
+	}
+	bundle.Data[a2aNATSCACertKey] = string(otherPEM)
+	if err := cl.Update(context.Background(), bundle); err != nil {
+		t.Fatal(err)
+	}
+	if err := dial(); err == nil || !strings.Contains(err.Error(), "certificate") {
+		t.Errorf("with the bundle holding another CA: err = %v, want a certificate verification failure", err)
+	}
+}
+
+// A Secret that carries the CA's name but that this PlatformAgent does not
+// control is not signed with: it is replaced and taken over, so whoever could
+// create a Secret in the namespace first cannot choose the bus's CA.
+func TestEnsureA2ANATSTLSTakesOverAnUnownedCASecret(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl := a2aTLSTestReconciler(t, agent)
+	now := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	a2aTLSTestClock(t, now)
+	ctx := context.Background()
+	planted, _, certPEM, keyPEM, err := generateA2ANATSCA(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSCASecretName(agent.Name), Namespace: agent.Namespace},
+		Data:       map[string][]byte{a2aNATSCACertKey: certPEM, a2aNATSCAKeyKey: keyPEM},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.ensureA2ANATSTLS(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CAFingerprint == a2aCertFingerprint(planted.Raw) {
+		t.Fatal("the operator signed with a CA Secret it does not control")
+	}
+	ca := a2aGetSecret(t, cl, agent, agentv1alpha1.A2ANATSCASecretName(agent.Name))
+	if len(ca.OwnerReferences) != 1 || ca.OwnerReferences[0].Name != agent.Name {
+		t.Errorf("the replaced CA Secret is not owned by the PlatformAgent: %+v", ca.OwnerReferences)
 	}
 }
