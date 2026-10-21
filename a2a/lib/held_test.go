@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -643,5 +644,116 @@ func TestSubscribeHeldRefusesADurableItCannotGate(t *testing.T) {
 	other.Session = "some-pod"
 	if _, err := worker.SubscribeHeld(h.ctx, other, func(context.Context, Delivery) {}); err == nil {
 		t.Error("accepted a Session that the session filter would use to drop every task")
+	}
+}
+
+// The same, across the lib's own rebuild (NR-2): the connection is closed for
+// good and replaced, so the delivering connection and the current one differ.
+// The task still starts once, and its Ack on the new connection settles it.
+func TestHeldDeliverySurvivesTheLibsRebuild(t *testing.T) {
+	dir := t.TempDir()
+	s1 := runJetStreamServer(t, -1, dir, nil)
+	port := serverPort(s1)
+	provisionTasksStream(t, clientURL(s1))
+	ctx := testCtx(t)
+	op, err := Connect(ctx, clientURL(s1), WithName("operator"))
+	if err != nil {
+		t.Fatalf("Connect operator: %v", err)
+	}
+	defer op.Close()
+	h := &heldHarness{t: t, ctx: ctx, req: op, profile: "nr2"}
+	h.ensure(1, 2*time.Second)
+	capture := &logCapture{}
+	worker, err := Connect(ctx, clientURL(s1), WithName("worker"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.MaxReconnects(1), nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect worker: %v", err)
+	}
+	defer worker.Close()
+
+	var starts atomic.Int32
+	release := make(chan struct{})
+	ackErr := make(chan error, 1)
+	sub, err := worker.SubscribeHeld(ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		starts.Add(1)
+		select {
+		case <-release:
+			ackErr <- d.Ack()
+		case <-ctx.Done():
+		}
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	defer sub.Stop()
+	h.submit("task-nr2")
+	waitFor(t, 5e9, "the task held", func() bool { return starts.Load() == 1 })
+
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	waitFor(t, 10e9, "the terminal close", func() bool { return capture.contains("nats connection closed") })
+	time.Sleep(2500 * time.Millisecond) // past AckWait, so the server redelivers
+	s2 := runJetStreamServer(t, port, dir, nil)
+	t.Cleanup(s2.Shutdown)
+	waitFor(t, 20e9, "the lib's rebuild", func() bool { return capture.contains("nats rebuild complete") })
+	if n := worker.rebuilds.Load(); n != 1 {
+		t.Fatalf("rebuilds = %d, want 1: the test must cross the lib's rebuild, not a nats.go reconnect", n)
+	}
+	time.Sleep(4 * time.Second) // rebind, and let the redelivery arrive
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("%d handlers started for one task across the lib's rebuild, want 1", n)
+	}
+	close(release)
+	if err := <-ackErr; err != nil {
+		t.Fatalf("Ack on the rebuilt connection: %v", err)
+	}
+	time.Sleep(5 * time.Second) // two AckWaits
+	if n := starts.Load(); n != 1 {
+		t.Errorf("the task came back after its Ack (%d starts)", n)
+	}
+}
+
+// A disposition that didn't reach the connection leaves the delivery live:
+// the handler's retry is sent, not swallowed as already disposed.
+func TestAFailedDispositionCanBeRetried(t *testing.T) {
+	h, worker := newHeldHarness(t, "retry")
+	h.ensure(1, 0)
+	got := make(chan Delivery, 1)
+	if _, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		got <- d
+		<-ctx.Done()
+	}); err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	h.submit("task-retry")
+	d := <-got
+	worker.Close()
+	if err := d.Ack(); err == nil {
+		t.Fatal("Ack on a closed connection reported success")
+	}
+	if err := d.Ack(); err == nil {
+		t.Error("the retried Ack was swallowed as already disposed; a failed send must leave the delivery live")
+	}
+}
+
+// A durable the operator didn't make for this mode is refused even when it
+// looks capped: a server-default MaxAckPending is 1000, indistinguishable
+// from a chosen one, so the bind requires EnsureHeldConsumer's marker.
+func TestSubscribeHeldRefusesAServerDefaultDurable(t *testing.T) {
+	h, worker := newHeldHarness(t, "default")
+	h.req.mu.Lock()
+	js := h.req.js
+	h.req.mu.Unlock()
+	c := h.cfg()
+	if _, err := js.CreateOrUpdateConsumer(h.ctx, c.Stream, jetstream.ConsumerConfig{
+		Durable: c.Durable, FilterSubject: c.Subject, AckPolicy: jetstream.AckExplicitPolicy,
+	}); err != nil {
+		t.Fatalf("create default consumer: %v", err)
+	}
+	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
+	defer cancel()
+	if _, err := worker.SubscribeHeld(short, c, func(context.Context, Delivery) {}); err == nil ||
+		!strings.Contains(err.Error(), "EnsureHeldConsumer") {
+		t.Errorf("bound a server-default durable: %v", err)
 	}
 }

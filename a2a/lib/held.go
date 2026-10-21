@@ -7,11 +7,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// The held-delivery mode (#3655; the design is #3660's
-// docs/designs/spec-profiles-dispatch.md, "Admission and queueing"): a
+// The held-delivery mode (#3655; the design is the profiles dispatch spec in
+// #3660, "Admission and queueing"): a
 // durable whose handler keeps each delivery unacknowledged for as long as the
 // work it starts runs, so the consumer's MaxAckPending - not a pool inside
 // the process - bounds how much of that work is in flight. A worker that dies
@@ -50,6 +51,16 @@ const DefaultHeldAckWait = 2 * time.Minute
 // can't spin the stream. Shutdown (a cancelled handler context) gives the
 // delivery back at once, for another worker to take.
 const abandonedNakDelay = time.Second
+
+// heldMarkerKey is the consumer metadata EnsureHeldConsumer stamps and
+// SubscribeHeld requires, so a worker binds only to a durable the operator
+// made for this mode: a server-default MaxAckPending (1000) looks exactly
+// like a chosen one, and an explicit-ack durable that merely shares the name
+// must not be taken for it.
+const (
+	heldMarkerKey   = "kube-agents.held-delivery"
+	heldMarkerValue = "v1"
+)
 
 // HeldConsumerConfig is a held durable as the operator creates it.
 type HeldConsumerConfig struct {
@@ -92,6 +103,7 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		MaxAckPending: cfg.MaxAckPending,
 		AckWait:       cfg.ackWait(),
+		Metadata:      map[string]string{heldMarkerKey: heldMarkerValue},
 	})
 	if err != nil {
 		return fmt.Errorf("held consumer %s on %s: %w", cfg.Durable, cfg.Stream, err)
@@ -226,6 +238,8 @@ func (h *heldState) bind(ctx context.Context, js jetstream.JetStream, cfg Subscr
 		return nil, fmt.Errorf("held durable %s has no MaxAckPending cap (%d); refusing to bind", cfg.Durable, cc.MaxAckPending)
 	case cc.AckWait <= 0:
 		return nil, fmt.Errorf("held durable %s has no AckWait; refusing to bind", cfg.Durable)
+	case cc.Metadata[heldMarkerKey] != heldMarkerValue:
+		return nil, fmt.Errorf("held durable %s was not made by EnsureHeldConsumer (no %s metadata); refusing to bind", cfg.Durable, heldMarkerKey)
 	}
 	h.mu.Lock()
 	h.ackWait = cc.AckWait
@@ -260,8 +274,10 @@ func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
 		return
 	}
 	if d, ok := h.live[seq]; ok && seq != 0 {
-		d.adopt(msg.Reply(), delivered)
+		// Release h.mu first: adopt takes d.mu, and a heartbeat holding d.mu
+		// can be waiting on the client lock behind Close, which waits on h.mu.
 		h.mu.Unlock()
+		d.adopt(msg.Reply(), delivered)
 		return
 	}
 	d := &heldDelivery{c: h.c, subject: msg.Subject(), reply: msg.Reply(), env: env,
@@ -274,7 +290,7 @@ func (h *heldState) dispatch(msg jetstream.Msg, env *Envelope) {
 
 	go func() {
 		defer h.done(seq)
-		stopBeat := d.heartbeat(h.beat())
+		stopBeat := d.heartbeat(h.beat)
 		defer stopBeat()
 		h.handler(h.ctx, d)
 		delay := abandonedNakDelay
@@ -330,7 +346,8 @@ type heldDelivery struct {
 	mu        sync.Mutex
 	reply     string // the latest delivery's ack subject
 	delivered uint64
-	disposed  bool
+	disposed  bool   // a disposition reached the connection
+	last      []byte // that disposition, re-sent if the message comes back
 }
 
 func (d *heldDelivery) Envelope() *Envelope { return d.env }
@@ -351,63 +368,81 @@ func (d *heldDelivery) Nak(delay time.Duration) error {
 }
 
 // adopt points the delivery at a redelivery of the same message, so its next
-// heartbeat and its disposition reach the server under the current reply.
+// heartbeat and its disposition reach the server under the current reply. If
+// the handler had already disposed of it, the redelivery means the server
+// didn't get that disposition, so it is sent again under the new reply.
 func (d *heldDelivery) adopt(reply string, delivered uint64) {
+	nc, _ := d.c.conn()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.reply = reply
 	d.delivered = delivered
+	if d.disposed && d.last != nil {
+		_ = d.publish(nc, d.last)
+	}
 }
 
-// dispose sends the first disposition and makes every later one a no-op, so
-// a handler's Ack and the lib's fallback Nak cannot both reach the server.
+// dispose sends a disposition. Only one that reaches the connection counts:
+// after it, every later disposition is a no-op (so a handler's Ack and the
+// lib's fallback Nak can't both reach the server), but a failed send leaves
+// the delivery live, so the handler can try again and the heartbeat goes on.
 func (d *heldDelivery) dispose(body []byte) error {
+	nc, _ := d.c.conn() // outside d.mu: the client lock may be held by Close
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.disposed {
 		return nil
 	}
-	d.disposed = true
-	return d.send(body)
+	if err := d.publish(nc, body); err != nil {
+		return err
+	}
+	d.disposed, d.last = true, body
+	return nil
 }
 
-// send publishes an ack body to the delivery's reply subject on the client's
-// current connection. Callers hold d.mu.
-func (d *heldDelivery) send(body []byte) error {
+// publish sends an ack body to the delivery's reply subject on nc, the
+// client's connection when the caller looked. Callers hold d.mu.
+func (d *heldDelivery) publish(nc *nats.Conn, body []byte) error {
 	if d.reply == "" {
 		return fmt.Errorf("held delivery has no reply subject")
 	}
-	nc, _ := d.c.conn()
 	if nc == nil {
 		return fmt.Errorf("held delivery: not connected")
 	}
 	return nc.Publish(d.reply, body)
 }
 
-// heartbeat sends an in-progress ack every interval until the delivery is
-// disposed of or the returned stop is called.
-func (d *heldDelivery) heartbeat(interval time.Duration) (stop func()) {
-	if interval <= 0 {
-		interval = time.Second
+// heartbeat sends an in-progress ack every interval() until the delivery is
+// disposed of or the returned stop is called. The interval is read each time,
+// so a rebind that shortened the durable's AckWait speeds up deliveries
+// already running.
+func (d *heldDelivery) heartbeat(interval func() time.Duration) (stop func()) {
+	next := func() time.Duration {
+		if iv := interval(); iv > 0 {
+			return iv
+		}
+		return time.Second
 	}
 	done := make(chan struct{})
 	go func() {
-		t := time.NewTicker(interval)
+		t := time.NewTimer(next())
 		defer t.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
+				nc, _ := d.c.conn()
 				d.mu.Lock()
 				disposed := d.disposed
 				if !disposed {
-					_ = d.send([]byte("+WPI"))
+					_ = d.publish(nc, []byte("+WPI"))
 				}
 				d.mu.Unlock()
 				if disposed {
 					return
 				}
+				t.Reset(next())
 			}
 		}
 	}()
