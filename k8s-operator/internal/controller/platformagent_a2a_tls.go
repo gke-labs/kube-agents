@@ -79,9 +79,14 @@ const (
 	a2aNATSCABundleSuffix = "-ca-bundle"
 	// a2aNATSCABundleMountDir is where every client mounts the bundle, and
 	// a2aNATSCAFileEnv names the file for it.
-	a2aNATSCABundleMountDir = "/etc/a2a-nats-ca"
-	a2aNATSCABundleVolume   = "a2a-nats-ca"
-	a2aNATSCAFileEnv        = "NATS_CA_FILE"
+	a2aNATSCABundleMountDir   = "/etc/a2a-nats-ca"
+	a2aNATSCABundleVolumeName = "a2a-nats-ca"
+	a2aNATSCAFileEnv          = "NATS_CA_FILE"
+	// a2aNATSCAConfigMapEnv names the bundle ConfigMap to the gateway, which
+	// mounts the same one into every session pod it spawns.
+	a2aNATSCAConfigMapEnv = "NATS_CA_CONFIGMAP"
+	// a2aNATSTLSScheme is every client URL's scheme.
+	a2aNATSTLSScheme = "tls://"
 
 	// The CA lives ten years and the serving certificate one. The reconcile
 	// reissues either once fewer than a2aNATSTLSRenewBefore remain, so a
@@ -123,6 +128,27 @@ func a2aNATSCABundleName(agent *agentv1alpha1.PlatformAgent) string {
 
 // a2aNATSCAFile is the path a client reads the CA from.
 func a2aNATSCAFile() string { return a2aNATSCABundleMountDir + "/" + a2aNATSCACertKey }
+
+// a2aNATSCABundleVolume is the pod volume every bus client mounts the CA
+// bundle from, a2aNATSCABundleMount where it mounts it, and
+// a2aNATSCAFileEnvVar the variable that names the file to lib.TLSOptions.
+// Every client the operator renders takes all three.
+func a2aNATSCABundleVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: a2aNATSCABundleVolumeName,
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSCABundleName(agent)},
+		}},
+	}
+}
+
+func a2aNATSCABundleMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: a2aNATSCABundleVolumeName, MountPath: a2aNATSCABundleMountDir, ReadOnly: true}
+}
+
+func a2aNATSCAFileEnvVar() corev1.EnvVar {
+	return corev1.EnvVar{Name: a2aNATSCAFileEnv, Value: a2aNATSCAFile()}
+}
 
 // a2aNATSDNSNames are the serving certificate's SANs: the NATS Service's
 // in-cluster names and nothing else. No localhost and no external host,

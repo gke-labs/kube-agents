@@ -39,7 +39,9 @@ const liveTestRelayDurable = "gateway-relay-livetest"
 //
 // Skipped unless the env is set:
 //
-//	A2A_LIVE_NATS_URL=nats://127.0.0.1:4222 \
+//	A2A_LIVE_NATS_URL=tls://127.0.0.1:4222 \
+//	NATS_CA_FILE=<the install's <name>-a2a-nats-ca-bundle ca.crt> \
+//	NATS_TLS_SERVER_NAME=<name>-a2a-nats.<namespace>.svc \
 //	A2A_LIVE_GATEWAY_PASSWORD=... A2A_LIVE_BRIDGE_PASSWORD=... \
 //	go test ./gateway -run TestLive -v -count=1
 func TestLiveAgainstInstallNATS(t *testing.T) {
@@ -176,7 +178,7 @@ func TestLiveAgainstInstallNATS(t *testing.T) {
 	// becomes a task with backend console, and the gateway's notice lands on
 	// the conversation's .out subject.
 	if consolePass != "" {
-		browser, err := nats.Connect(url, nats.UserInfo("console", consolePass), nats.CustomInboxPrefix("_INBOX.console"))
+		browser, err := nats.Connect(url, append(lib.TLSOptions(), nats.UserInfo("console", consolePass), nats.CustomInboxPrefix("_INBOX.console"))...)
 		if err != nil {
 			t.Fatalf("connect as console: %v", err)
 		}

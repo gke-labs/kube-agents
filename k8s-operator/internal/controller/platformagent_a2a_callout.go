@@ -700,6 +700,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+							a2aNATSCAFileEnvVar(),
 							{Name: "NATS_USER", Value: a2aCalloutConfUser},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
@@ -742,7 +743,8 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								Key:                  a2aCalloutXKeySeedKey,
 							}}},
 						},
-						Ports: []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
+						VolumeMounts: []corev1.VolumeMount{a2aNATSCABundleMount()},
+						Ports:        []corev1.ContainerPort{{Name: "status", ContainerPort: a2aCalloutStatusPort}},
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 								Path: "/readyz", Port: intstr.FromInt32(a2aCalloutStatusPort),
@@ -779,6 +781,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 						},
 					}},
+					Volumes: []corev1.Volume{a2aNATSCABundleVolume(agent)},
 				},
 			},
 		},

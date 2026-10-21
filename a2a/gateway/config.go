@@ -80,6 +80,10 @@ const (
 // busyNoticeAtEnv names the busy notice's threshold (Config.BusyNoticeAt).
 const busyNoticeAtEnv = "A2A_BUSY_NOTICE_AT"
 
+// EnvNATSCAConfigMap names the ConfigMap the gateway's CA bundle comes from
+// (Config.NATSCAConfigMap), which the operator renders beside NATS_CA_FILE.
+const EnvNATSCAConfigMap = "NATS_CA_CONFIGMAP"
+
 // The display-mode values, matching the GoogleChatSpec.Mode enum.
 const (
 	displayModeDefault = "default"
@@ -126,6 +130,13 @@ type Config struct {
 	NATSUser     string
 	NATSPassword string
 	DiscordToken string
+
+	// NATSCAFile is the CA bundle this gateway trusts the bus by
+	// (lib.EnvNATSCAFile), and NATSCAConfigMap the ConfigMap it was mounted
+	// from. The spawner hands both to every session pod: the pod mounts the
+	// same ConfigMap at the same path, so it trusts what the gateway trusts.
+	NATSCAFile      string
+	NATSCAConfigMap string
 
 	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
 	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
@@ -587,6 +598,8 @@ func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 func FromEnv() (*Config, error) {
 	cfg := &Config{
 		NATSURL:          os.Getenv("NATS_URL"),
+		NATSCAFile:       os.Getenv(lib.EnvNATSCAFile),
+		NATSCAConfigMap:  os.Getenv(EnvNATSCAConfigMap),
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),

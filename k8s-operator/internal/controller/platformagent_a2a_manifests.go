@@ -1481,13 +1481,14 @@ func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
 
 // a2aNATSAddress is the bus's in-cluster host:port. a2aNATSClientURL is the
 // same thing as a client URL; both exist because the nats CLI takes the first
-// and the Go client takes the second.
+// and the Go client takes the second. The URL is tls://: the bus requires TLS
+// of every client, and the host is the Service name its certificate carries.
 func a2aNATSAddress(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("%s.%s.svc:%d", a2aNATSName(agent), agent.Namespace, a2aNATSClientPort)
 }
 
 func a2aNATSClientURL(agent *agentv1alpha1.PlatformAgent) string {
-	return "nats://" + a2aNATSAddress(agent)
+	return a2aNATSTLSScheme + a2aNATSAddress(agent)
 }
 
 // The provision Job's pods run as their own ServiceAccount so the auth callout
@@ -2883,7 +2884,7 @@ BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
 # lands on an inbox, and this principal may only subscribe under
 # _INBOX.provision.> — the CLI's default _INBOX.<nuid> would be refused and
 # every call would time out.
-NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
+NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile() + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
 
 # max_consumers caps each stream. Consumer durability is a request-body
 # field, so no permission list can hold web to ephemeral ones (see the web user
@@ -3276,7 +3277,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 					// The nats CLI wants a writable HOME for its context
 					// directory even when every call passes --server, so the
 					// hardened read-only root needs somewhere to point it.
-					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), {
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), {
 						Name:         "tmp",
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
@@ -3319,6 +3320,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "tmp", MountPath: a2aProvisionWritablePath},
 							a2aBusTokenVolumeMount(),
+							a2aNATSCABundleMount(),
 						},
 					}},
 				},
@@ -4679,6 +4681,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// settings, then the Chat backend's and the inject door's additions.
 	env := []corev1.EnvVar{
 		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
+		a2aNATSCAFileEnvVar(),
+		// The bundle's ConfigMap as well as its file: the gateway mounts the
+		// same ConfigMap into each session pod it spawns.
+		{Name: a2aNATSCAConfigMapEnv, Value: a2aNATSCABundleName(agent)},
 		{Name: "NATS_USER", Value: "gateway"},
 		{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
 			LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
@@ -4837,10 +4843,10 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						}),
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}}, chatMounts...), injectMounts...),
+						}, a2aNATSCABundleMount()}, chatMounts...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent)}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, chatVolumes...), injectVolumes...),
 				},
 			},
 		},

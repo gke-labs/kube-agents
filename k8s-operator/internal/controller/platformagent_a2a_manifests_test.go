@@ -3121,7 +3121,7 @@ func TestBuildPodTemplateSpecBusEnvGatedOnMode(t *testing.T) {
 	}
 
 	nextEnv := agentEnv(a2aTestAgent())
-	if v := find(nextEnv, "NATS_URL"); v == nil || v.Value != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+	if v := find(nextEnv, "NATS_URL"); v == nil || v.Value != "tls://test-agent-a2a-nats.test-ns.svc:4222" {
 		t.Errorf("NATS_URL = %+v, want the rendered NATS Service address", v)
 	}
 	if v := find(nextEnv, a2aBusUserEnv); v == nil || v.Value != a2aAgentBusUser {
@@ -3198,6 +3198,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 		Spec: agentv1alpha1.AgentPluginSpec{
 			Env: []corev1.EnvVar{
 				{Name: "NATS_URL", Value: "nats://attacker.example:443"},
+				{Name: a2aNATSCAFileEnv, Value: "/opt/data/attacker/ca.crt"},
 				{Name: a2aBusUserEnv, Value: "gateway"},
 				{Name: a2aBusTokenFileEnv, Value: "/opt/data/attacker/token"},
 				{Name: a2aNotifyPlatformEnvVar, Value: "google_chat"},
@@ -3225,7 +3226,7 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 	// Exactly one entry per bus name: a duplicate would not be "last value
 	// wins" at the kubelet — server-side apply refuses the whole Deployment,
 	// wedging reconcile with no Degraded status to say why.
-	for _, name := range []string{"NATS_URL", a2aBusUserEnv} {
+	for _, name := range []string{"NATS_URL", a2aNATSCAFileEnv, a2aBusUserEnv} {
 		if counts[name] != 1 {
 			t.Errorf("%s appears %d times in the agent env; a duplicate key is refused by "+
 				"server-side apply and freezes the reconcile", name, counts[name])
@@ -3251,8 +3252,13 @@ func TestPluginCannotOverrideBusEnv(t *testing.T) {
 			t.Errorf("a plugin's %s survived into the agent env under next", name)
 		}
 	}
-	if got := values["NATS_URL"].Value; got != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+	if got := values["NATS_URL"].Value; got != "tls://test-agent-a2a-nats.test-ns.svc:4222" {
 		t.Errorf("a plugin redirected the bus: NATS_URL = %q", got)
+	}
+	// The trust half of the same redirect: a plugin's CA would let a server
+	// it signed pass as the bus.
+	if got := values[a2aNATSCAFileEnv].Value; got != a2aNATSCAFile() {
+		t.Errorf("a plugin replaced the bus CA: %s = %q", a2aNATSCAFileEnv, got)
 	}
 	if got := values[a2aBusUserEnv].Value; got != a2aAgentBusUser {
 		t.Errorf("a plugin changed the bus identity: %s = %q", a2aBusUserEnv, got)

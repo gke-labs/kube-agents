@@ -3012,7 +3012,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		if a2aAgentSurface(agent) {
 			kept := extEnvs[:0]
 			for _, e := range extEnvs {
-				if e.Name == "NATS_URL" || e.Name == a2aBusUserEnv ||
+				if e.Name == "NATS_URL" || e.Name == a2aNATSCAFileEnv || e.Name == a2aBusUserEnv ||
 					e.Name == a2aBusTokenFileEnv ||
 					e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
 					continue
@@ -3197,10 +3197,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// inert env vars and a mount.
 	if a2aAgentSurface(agent) {
 		envVars = append(envVars,
+			// The same URL every other client is handed: tls://, on the
+			// Service name the bus certificate carries.
 			corev1.EnvVar{
 				Name:  "NATS_URL",
-				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
+				Value: a2aNATSClientURL(agent),
 			},
+			a2aNATSCAFileEnvVar(),
 			corev1.EnvVar{
 				Name:  a2aBusUserEnv,
 				Value: a2aAgentBusUser,
@@ -3346,6 +3349,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// exactly that reason — see bridgeIdentity.
 	if a2aAgentSurface(agent) {
 		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
+		// The bus CA, which, unlike the token, the bridge sidecar inherits
+		// from this container: trusting the bus is not an identity.
+		mountIntoContainer(containers, "platform-agent", a2aNATSCABundleMount())
 	}
 	// The bridge, rendered from the finished agent container (every mount
 	// above included, the bus token then dropped) when the CR declares none
@@ -3407,6 +3413,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	volumes = append(volumes, buildWatcherTokenVolume())
 	if a2aAgentSurface(agent) {
 		volumes = append(volumes, a2aBusTokenVolumeSource())
+		// Optional here and only here: a2aAgentSurface also holds on the skew
+		// branch, where the bus, and so the bundle, may never have been
+		// rendered, and a required ConfigMap volume would hold the agent pod
+		// in ContainerCreating for a bus it cannot use anyway.
+		ca := a2aNATSCABundleVolume(agent)
+		ca.ConfigMap.Optional = ptr.To(true)
+		volumes = append(volumes, ca)
 	}
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)

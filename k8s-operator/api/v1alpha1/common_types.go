@@ -173,9 +173,14 @@ var SensitiveEnvVars = map[string]struct{}{
 	// the platform in the cron relay's refusal when no home channel is set.
 	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS": {},
-	"NATS_URL":                 {},
-	"NATS_USER":                {},
-	"NATS_PASSWORD":            {},
+	// NATS_CA_FILE names the CA the client trusts the bus by. An override is
+	// the TLS half of a redirected NATS_URL: pointed at a CA of the setter's
+	// choosing, the client accepts a server that CA signed as the bus, and
+	// hands it the bearer token at CONNECT.
+	"NATS_CA_FILE":  {},
+	"NATS_URL":      {},
+	"NATS_USER":     {},
+	"NATS_PASSWORD": {},
 }
 
 // ReservedVolumeNames defines pod volume names the operator renders itself and

@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,6 +34,9 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -182,10 +187,28 @@ type cardPublisher interface {
 type natsCardPublisher struct {
 	mu    sync.Mutex
 	conns map[string]*nats.Conn
+	// reader fetches the bus's CA bundle, which the operator trusts the bus
+	// by like every other client: the bus requires TLS.
+	reader client.Reader
 }
 
-func newNATSCardPublisher() *natsCardPublisher {
-	return &natsCardPublisher{conns: map[string]*nats.Conn{}}
+func newNATSCardPublisher(reader client.Reader) *natsCardPublisher {
+	return &natsCardPublisher{conns: map[string]*nats.Conn{}, reader: reader}
+}
+
+// busTLS is the operator's trust in this agent's bus: the CA bundle the
+// operator itself renders, read when a connection is built, so a connection
+// rebuilt after a CA change trusts the new one.
+func (n *natsCardPublisher) busTLS(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (nats.Option, error) {
+	bundle := &corev1.ConfigMap{}
+	if err := n.reader.Get(ctx, types.NamespacedName{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}, bundle); err != nil {
+		return nil, fmt.Errorf("reading the bus CA bundle: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(bundle.Data[a2aNATSCACertKey])) {
+		return nil, fmt.Errorf("the bus CA bundle %s holds no certificate", bundle.Name)
+	}
+	return nats.Secure(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}), nil
 }
 
 func operatorBusAuthFile() string {
@@ -195,7 +218,7 @@ func operatorBusAuthFile() string {
 	return filepath.Join(a2aBusTokenPath, a2aBusTokenFile)
 }
 
-func (n *natsCardPublisher) conn(agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
+func (n *natsCardPublisher) conn(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*nats.Conn, error) {
 	key := agent.Namespace + "/" + agent.Name
 	url := a2aNATSClientURL(agent)
 	n.mu.Lock()
@@ -210,7 +233,11 @@ func (n *natsCardPublisher) conn(agent *agentv1alpha1.PlatformAgent) (*nats.Conn
 		delete(n.conns, key)
 	}
 	tokenFile := operatorBusAuthFile()
-	nc, err := nats.Connect(url,
+	trust, err := n.busTLS(ctx, agent)
+	if err != nil {
+		return nil, err
+	}
+	nc, err := nats.Connect(url, trust,
 		nats.Name("kubeagents-operator"),
 		nats.TokenHandler(func() string {
 			b, err := os.ReadFile(tokenFile) // #nosec G304 -- the manager's own projected token path
@@ -246,7 +273,7 @@ func (n *natsCardPublisher) forget(namespace string) {
 // subject: the one read the operator's grant allows, and it needs no stream
 // handle (STREAM.INFO), which the operator does not hold.
 func (n *natsCardPublisher) Read(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string) (directoryEntry, error) {
-	nc, err := n.conn(agent)
+	nc, err := n.conn(ctx, agent)
 	if err != nil {
 		return directoryEntry{}, err
 	}
@@ -286,7 +313,7 @@ func parseDirectoryEntry(data []byte) (directoryEntry, error) {
 // Publish writes through JetStream with the envelope id as the dedup key, as
 // every other emitter does, and waits for the ack.
 func (n *natsCardPublisher) Publish(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, card *a2aAgentCard) error {
-	nc, err := n.conn(agent)
+	nc, err := n.conn(ctx, agent)
 	if err != nil {
 		return err
 	}
