@@ -349,8 +349,8 @@ why that tolerance is in the reader and not in `init_db`, and why `cluster` does
 
 It differs from the ceiling in one further respect. `inject_message` returns on a ceiling refusal
 before it queues the background task, so no session is ever created. `trigger_agent_troubleshooter`
-marks the delivery failure and then continues into `_create_gateway_session` and `_start_agent_turn`,
-so a triage session **does** run for every undelivered alert — it only skips
+marks the delivery failure and then still queues the triage start (see "When a triage cannot start"),
+so a triage start is queued for every undelivered alert — it only skips
 `_register_session_routing` on that branch, leaving the turn with no thread to reply into even
 though `_build_agent_query` instructs the model to thread its findings. The turn still writes its
 `incidents` row; it just reaches nobody through chat. Nothing announces that session, so the session
@@ -395,9 +395,40 @@ CREATE TABLE intercepted_events(
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   backlog     INTEGER NOT NULL DEFAULT 0,  -- drift backlog: 1 owed a digest, 2 digested, 3 no chat platform, 4 carded
   principal   TEXT NOT NULL DEFAULT '',    -- written on drift backlog rows only, for the digest's count
-  payload     TEXT NOT NULL DEFAULT ''     -- drift backlog rows only: the record, to card it from
+  payload     TEXT NOT NULL DEFAULT '',    -- drift backlog rows only: the record, to card it from
+  triage_state TEXT NOT NULL DEFAULT ''    -- pending when the triage start is queued, then started or aborted; '' when no start was queued (filtered, suppressed, or written before this column)
 );
 ```
+
+##### When a triage cannot start
+
+`trigger_agent_troubleshooter` posts the alert, writes `triage_state = pending` on the row, and hands
+the session create and the `/chat` turn to a pool of 4 threads (`TRIAGE_START_WORKERS`),
+then returns. The pool is the cap: every turn holds a worker of the gateway's default executor, which
+has `min(32, vCPUs + 4)` workers (8 on a 4-vCPU node), and session creates and the
+readiness probe wait on the same executor. A burst of 20 starts at once on a warm gateway lost half of
+them to create timeouts; 4 at once lost none. The 4 depends on that executor's size, so measure it again
+(a burst of 20 failing pods against a warm gateway, counting `TRIAGE_STARTED` lines and probe timeouts) on
+a Hermes upgrade that changes the executor, or on nodes with fewer than 4 vCPUs.
+
+A start is retried only when it provably did not start: a refused connection, a 429 or 503 (after its
+`Retry-After`), a create that timed out or lost its connection (the create waits 25 s, above Hermes'
+20 s lock wait, and the retry's 409 counts as created) or got a 5xx, and a `/chat` 404, which creates
+the session again once. A `/chat` call that was sent and got no answer, or a 5xx other than 503, is
+never sent again, because the turn may be running; the row records it as `started`, so `started`
+means the turn was sent, not that it ran. The budget is 6 answered attempts and 300 s of time spent on
+answered attempts and the waits after them. Refused connections spend neither, and a start not done 20
+minutes after it was queued gives up.
+
+A start that gives up logs `TRIAGE_NOT_STARTED session=<id> source=<event|drift|stall> reason=<...>`,
+sets `triage_state = aborted` (the feed reports it as `triage_aborted`, or `undelivered` when the
+alert's own delivery failed or is unconfirmed), and posts one notice in the
+alert's thread: triage did not start, whether the alert comes back, and what to do now. An alert
+delivered without a thread gets the notice as a new message that quotes the alert's first line; an
+undelivered alert and a headless install get no notice, so the session log and `triage_state` are
+their record. `TRIAGE_QUEUED`, `TRIAGE_DEQUEUED` and
+`TRIAGE_STARTED` log lines mark the other steps. A restart loses the queued starts, and their rows
+stay `pending`.
 
 For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db` and `kanban.db` with `?mode=ro`.
 
@@ -422,9 +453,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### Which columns are migrated, and which are not
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
-`principal` and `payload` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+`principal`, `payload` and `triage_state` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
 databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
-`principal` and `payload` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`principal`, `payload` and `triage_state` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
