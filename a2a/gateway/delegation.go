@@ -458,6 +458,20 @@ func wakeText(state lib.TaskState, childID, ask string, turns []string, result, 
 // handed work to kanban cards whose report posts to the conversation.
 const wakeCardsPendingNote = "The delegated turn handed work to a Cluster Agent card. That card's report posts into this conversation on its own; if it is not above yet, it is still to come."
 
+// handedOff is cardsPending's other signal: the task published
+// lib.ArtifactHandoff, which the hermes-bridge does on every chat route,
+// where the mark is Slack-with-KAGE_SLACK_UX only (#3258).
+func handedOff(state lib.TaskState, handoff bool) bool {
+	return state == lib.StateCompleted && handoff
+}
+
+// foldHandedOff reports whether a folded task carries lib.ArtifactHandoff,
+// for a terminal a heal or a replay found on the stream.
+func foldHandedOff(task *lib.Task) bool {
+	art := task.Artifact(lib.ArtifactHandoff)
+	return art != nil && lastTextPart(art.Parts) == lib.HandoffCards
+}
+
 // cardsPending reports whether a completed task's terminal mark signals that
 // asynchronous kanban cards are still running.
 func cardsPending(state lib.TaskState, terminal chatmsg.Reading) bool {

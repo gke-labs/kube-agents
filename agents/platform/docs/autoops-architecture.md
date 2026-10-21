@@ -321,7 +321,7 @@ diagnostic procedure — e.g. `gke-workload-troubleshooting` walks pod status �
 container logs → service and NetworkPolicy checks → propose a GitOps correction. The persona that runs
 the triage requires the agent to query the catalog and load the matching domain skill before diagnosing
 (Cluster Agent `SOUL.md` §3) and to pass a pre-report self-audit demanding quoted command output,
-resource names, and UTC timestamps (§4). The communication policy on the result — the three-part layout
+resource names, and only the timestamps a command printed (§4). The communication policy on the result — the three-part layout
 and a jargon translation table (`OOMKilled` → "the application ran out of allocated memory") — is
 Platform Agent `SOUL.md` §7, which the prompt template above mirrors.
 

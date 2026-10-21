@@ -13,11 +13,12 @@ and two settings of the bridge the operator renders: its image and its
 concurrency; its executor is left to the bridge's default, api, which the
 start-line wait requires), the Cloud Build's `a2a` and `a2a-bridge`
 steps run with `docker` stubbed build and push those six in order with the
-bridge FROM this build's platform image, the three guards (release-candidate
-path, Prow run with no pull request that is not a next-lane job, the
-concurrency's grammar) run against the values they refuse and admit, and the
-release-candidate refusal sits at the top of the branch the script says it
-guards.
+bridge FROM this build's platform image, the two guards (Prow run with no
+pull request that is not a job on the allow-list, the concurrency's grammar)
+run against the values they refuse and admit. On the release-candidate path
+the same section builds nothing and hands the operator the candidate's
+published images under the same names, with the same inject flag and bridge
+settings.
 
 The names the flag path hands the operator, or reads back from what it
 renders, are copied from the operator's Go source, the bridge's, and the eval
@@ -100,7 +101,12 @@ _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test-next",
     "ci-kube-agents-eval-next",
     "ci-kube-agents-eval-nightly-next-claude",
+    "ci-kube-agents-eval-nightly-gitlab-next",
+    # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
+    "post-kube-agents-eval-rc",
 )
+_RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
+_RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"
 _NIGHTLY_JOB_NAME = "ci-kube-agents-eval-nightly"
 _OTHER_JOB_NAME = "ci-x"
 
@@ -220,7 +226,7 @@ def flag_line(mode_next: str | None) -> str:
 _BRIDGE_CONCURRENCY = "6"
 
 
-def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
+def run_build_section(mode_next: str | None, *extra: str) -> subprocess.CompletedProcess:
     """Run section 4 with `gcloud` stubbed to print its argv on stderr, then
     print the operator.extraEnv values it left for the release.
     MODE_NEXT_BRIDGE_CONCURRENCY is set as section 2b leaves it under the
@@ -241,6 +247,7 @@ def run_build_section(mode_next: str | None) -> subprocess.CompletedProcess:
                 'gcloud() { printf "%s\\n" "$@" >&2; case "$1 $2" in "builds submit") printf "b-1\\tu\\n" ;; "builds describe") echo SUCCESS ;; esac; }',
                 'timeout() { shift 2; "$@"; }',
                 flag_line(mode_next),
+                *extra,
                 constants_block(),
                 lifted(*_BUILD_SECTION),
                 'for arg in ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"}; do echo "HELM=${arg}"; done',
@@ -523,17 +530,43 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(go_constant(_A2A_MANIFESTS, "a2aBridgeConcurrencyEnvVar"), "BRIDGE_CONCURRENCY")
         self.assertIn("{Name: a2aBridgeConcurrencyEnvVar, Value: a2aRenderedBridgeConcurrency()}", text(_A2A_BRIDGE))
 
-    def test_the_release_candidate_path_refuses_the_flag(self) -> None:
-        script = text(_CI_DEPLOY)
-        rc_branch = script.index('if [ -n "${RC_COMMIT_SHA:-}" ]; then')
-        refusal = script.index('if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then', rc_branch)
-        self.assertLess(refusal - rc_branch, 600, "the refusal belongs at the top of the RC branch")
-        # Run, not only read: the inner guard, lifted, refuses under the flag
-        # and lets an RC run through without it.
-        guard = script[refusal:]
-        guard = guard[: guard.index("\n  fi\n") + len("\n  fi\n")]
-        self.assertEqual(run_bash(f"export EVAL_MODE_NEXT=1\n{guard}").returncode, 1)
-        self.assertEqual(run_bash(guard).returncode, 0)
+    def test_the_release_candidate_path_names_the_candidates_published_images(self) -> None:
+        """The release-candidate eval grades next (#2007): section 4 under the
+        flag with RC_COMMIT_SHA set submits no build and hands the operator the
+        same eight values, with the five A2A references and the bridge's under
+        the published registry at the candidate's commit, the image names
+        REQUIRED_RELEASE_IMAGES publishes."""
+        result = run_build_section(
+            "1",
+            f'export RC_COMMIT_SHA="{_RC_COMMIT_SHA}"',
+            f'RC_REGISTRY_PREFIX="{_RC_REGISTRY_PREFIX}"',
+            f'export TAG="{_RC_COMMIT_SHA}"',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("builds", result.stderr, "the release-candidate path must not submit a build")
+        values = [arg for arg in helm_args(result) if ".value=" in arg]
+        published = [f"operator.extraEnv[{i}].value={_RC_REGISTRY_PREFIX}/{image}:{_RC_COMMIT_SHA}" for i, image in enumerate(_A2A_IMAGES[:5])]
+        self.assertEqual(values[:5], published)
+        self.assertEqual(values[5], "operator.extraEnv[5].value=true")
+        self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
+        self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
+        self.assertNotIn(_AR_REPO, result.stdout)
+        # The names are the ones the release publishes.
+        common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
+        for image in _A2A_IMAGES:
+            self.assertIn(f'  "{image}"\n', common, f"{image} is not in REQUIRED_RELEASE_IMAGES")
+        # And the release-candidate branch of section 2a no longer refuses the flag.
+        self.assertNotIn("together with RC_COMMIT_SHA", text(_CI_DEPLOY))
+
+    def test_the_release_candidate_path_without_the_flag_hands_the_operator_nothing(self) -> None:
+        result = run_build_section(
+            None,
+            f'export RC_COMMIT_SHA="{_RC_COMMIT_SHA}"',
+            f'RC_REGISTRY_PREFIX="{_RC_REGISTRY_PREFIX}"',
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(helm_args(result), [])
+        self.assertNotIn("builds", result.stderr)
 
     def test_a_prow_run_without_a_pull_request_refuses_the_flag_unless_the_job_is_the_lanes(self) -> None:
         """Section 2b admits the flag on a pull request's run and on the jobs
@@ -784,6 +817,25 @@ class TasksBudgetSizingTest(unittest.TestCase):
         # The default lane fits; the reason the sizing exists.
         default = int(consts["EVAL_TASK_PARALLELISM_DEFAULT"])
         self.assertLessEqual(expected[default] * per_session + fixed + per_worker * default, floor)
+
+    def test_the_next_lane_turns_the_audits_automatic_sweep_off_at_install(self) -> None:
+        """#3439: the lane's write safeguard charges any pull request in a repetition's
+        window to the case in flight, and the fleet audits' sweep opens one on every
+        fresh install once the pool repositories declare checkout-gateway. The switch
+        rides the install's own helm args, gated on EVAL_MODE_NEXT=1, so the today
+        lane's release is unchanged; the operator forwards the name to the shell
+        sandbox and audit_report.py reads it (pinned across the three files)."""
+        script = _CI_DEPLOY.read_text()
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.S)
+        self.assertIsNotNone(block, "MODE_NEXT_ENV_ARGS is not filled under EVAL_MODE_NEXT=1")
+        assert block is not None
+        self.assertIn('--set-string "platformAgent.deployment.env[2].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"', block.group(1))
+        self.assertIn('--set-string "platformAgent.deployment.env[2].value=false"', block.group(1))
+        self.assertIn('${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"}', script)
+        root = _CI_DEPLOY.parent.parent
+        self.assertIn('envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "k8s-operator/internal/controller/shell_sandbox_manifests.go").read_text())
+        self.assertIn("KUBEAGENTS_AUDIT_AUTO_PROMOTE", (root / "deploy/sandbox/entrypoint.sh").read_text())
+        self.assertIn('AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"', (root / "agents/platform/skills/fleet-audit/scripts/audit_report.py").read_text())
 
     def test_the_first_change_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
         consts = constants()

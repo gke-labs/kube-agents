@@ -61,11 +61,13 @@ _HOST_RE = re.compile(r"[a-z0-9]([a-z0-9.-]*[a-z0-9])?")
 def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
     """The configured forges, normalised, or None when nothing configures them.
 
-    The file is `{"forges": [{"provider", "host", "tokenPath"?, "allowedPaths"?,
-    "caFile"?, "caSecret"?, "caKey"?}]}`. `caFile` is an absolute path to
-    PEM CA certificates that this forge's host, and no other, is trusted
-    under; `caSecret` and `caKey` name where the file comes from, for the
-    answer when it is missing.
+    The file is `{"forges": [{"provider", "host", "tokenPath"?, "readTokenPath"?,
+    "allowedPaths"?, "caFile"?, "caSecret"?, "caKey"?}]}`. `readTokenPath` is
+    where a read-only token may be: the file is there only when the Secret
+    carries the key, so the forge checks for it on each call. `caFile` is an
+    absolute path to PEM CA certificates that this forge's host, and no
+    other, is trusted under; `caSecret` and `caKey` name where the file comes
+    from, for the answer when it is missing.
     Read at registry construction, never cached across it, so a test or a
     remount sees the file it names. A file that is named and cannot be read
     raises: a broker that does not know which forges it serves must not start
@@ -109,6 +111,7 @@ def load_forge_entries(path: str | None = None) -> list[dict[str, Any]] | None:
                 "provider": provider,
                 "host": host,
                 "token_path": str(item.get("tokenPath") or "").strip(),
+                "read_token_path": str(item.get("readTokenPath") or "").strip(),
                 "ca_file": (ca_file or "").strip(),
                 "ca_source": _ca_source(item),
                 # Passed through unfiltered: an entry that trims to nothing is

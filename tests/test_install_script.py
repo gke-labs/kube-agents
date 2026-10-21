@@ -59,6 +59,12 @@ _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 # this is stuck -- on a prompt, if the terminal detach ever slips -- and the
 # bound turns that into a failure with output, not a hang.
 _INSTALLER_RUN_TIMEOUT_SECONDS = 60
+# What `gcloud container clusters describe` prints for a cluster that does not
+# exist, and for one it could not read.
+_GCLOUD_CLUSTER_NOT_FOUND = "ERROR: (gcloud.container.clusters.describe) ResponseError: code=404, message=Not found: c."
+_GCLOUD_CLUSTER_FORBIDDEN = (
+    "ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Required container.clusters.get permission."
+)
 
 
 def _run_installer_bash(body, env, cwd=_REPO_ROOT):
@@ -1385,6 +1391,58 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "C=10.8.0.0/24,10.9.0.0/24 CA=llm-ca K=k",
             proc.stdout,
         )
+
+    def test_parse_args_litellm_env_secret_flag(self):
+        cmd = (
+            "parse_args --model-provider=sap --litellm-env-secret=sap-aicore; "
+            'echo "P=$PARAM_MODEL_PROVIDER S=$PARAM_LITELLM_ENV_SECRET_NAME"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("P=sap S=sap-aicore", proc.stdout)
+
+    def test_the_slug_prompt_gives_up_without_a_tty_instead_of_looping(self):
+        # Without a tty prompt_read answers with the default every time, so a
+        # prompt that waited for a valid answer would never return; the
+        # function returns 1 and leaves the caller's variables alone. Interactive,
+        # a typo is asked again (the pty case lives with the other prompt tests).
+        cmd = (
+            'source_provisioning_helpers "$PWD" >/dev/null; '
+            'PARAM_NON_INTERACTIVE="false"; has_controlling_tty() { return 1; }; '
+            'model_provider="v-llm"; model_default_name="m"; litellm_env_secret_name="s"; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC=${rc:-0} P=$model_provider M=$model_default_name S=$litellm_env_secret_name"; '
+            'model_provider="azure"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC2=${rc:-0} P2=$model_provider M2=[$model_default_name]"; '
+            'model_provider="sap"; model_default_name=""; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC3=${rc:-0} P3=$model_provider M3=$model_default_name"; '
+            # A keyed table provider typed at the slug prompt belongs to its own
+            # entry: refused, variables untouched. prompt_read is stubbed to type
+            # it, since the seed for a recorded gemini is sap.
+            'typed() { case "$1" in *slug*) printf -v "$2" %s gemini;; *) printf -v "$2" %s "$3";; esac; }; '
+            'real_prompt_read=$(declare -f prompt_read); eval "${real_prompt_read/prompt_read/orig_prompt_read}"; '
+            'prompt_read() { typed "$@"; }; '
+            'model_provider="gemini"; model_default_name="m"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC4=${rc:-0} P4=$model_provider M4=$model_default_name"; '
+            'eval "${real_prompt_read}"; '
+            # A Secret name Kubernetes would refuse: refused here, variables untouched.
+            'model_provider="sap"; model_default_name="m"; litellm_env_secret_name="SAP-AICore"; rc=0; '
+            'prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || rc=$?; '
+            'echo "RC5=${rc:-0} P5=$model_provider M5=$model_default_name S5=$litellm_env_secret_name"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertIn("RC=1 P=v-llm M=m S=s", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("is not a LiteLLM provider slug", proc.stdout + proc.stderr)
+        self.assertIn("RC2=1 P2=azure M2=[]", proc.stdout)
+        self.assertIn("A model name is required", proc.stdout + proc.stderr)
+        self.assertIn("RC3=0 P3=sap M3=anthropic--claude-4.5-sonnet", proc.stdout)
+        self.assertIn("RC4=1 P4=gemini M4=m", proc.stdout)
+        self.assertIn("has its own entry in the provider menu", proc.stdout + proc.stderr)
+        self.assertIn("RC5=1 P5=sap M5=m S5=SAP-AICore", proc.stdout)
+        self.assertIn("is not a valid Kubernetes Secret name", proc.stdout + proc.stderr)
 
     def test_validate_openai_compatible_inputs_refuses_what_the_chart_or_operator_would(self):
         # The chart cannot render without these, and the operator drops the
@@ -4551,7 +4609,8 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     invocation, so dropping it again would look like nothing in a diff.
     """
 
-    def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False):
+    def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
+             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None):
         """import_github_pem against a stub gcloud that records every call.
 
         By default the stub reports no ENABLED key version, so the import is
@@ -4583,7 +4642,40 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 if creates_fail
                 else ""
             )
-            describe_case = "  *'kms keys describe'*) exit 1 ;;\n" if describe_fails else ""
+            describe_case = ""
+            if keys_describe_fail_first > 0:
+                describe_case = (
+                    f'  *\'kms keys describe\'*)\n'
+                    f'    d_count=$(grep -c "kms keys describe" "{log}" || true)\n'
+                    f'    if [ "$d_count" -le {keys_describe_fail_first} ]; then\n'
+                    f'      echo "{fail_msg or "ERROR: (gcloud.kms) Error 403: Google Cloud KMS API has not been used in project a-project before or it is disabled."}" >&2; exit 1\n'
+                    f'    fi ;;\n'
+                )
+            elif describe_fails:
+                describe_case = "  *'kms keys describe'*) exit 1 ;;\n"
+            fail_403 = (
+                fail_msg or
+                "ERROR: (gcloud.kms) Error 403: Google Cloud KMS API "
+                "has not been used in project a-project before or it is disabled."
+            )
+            keyrings_fail_block = ""
+            if keyrings_fail_first > 0:
+                keyrings_fail_block = (
+                    f'  *\'kms keyrings create\'*)\n'
+                    f'    kr_count=$(grep -c "kms keyrings create" "{log}" || true)\n'
+                    f'    if [ "$kr_count" -le {keyrings_fail_first} ]; then\n'
+                    f'      echo "{fail_403}" >&2; exit 1\n'
+                    f'    fi ;;\n'
+                )
+            keys_fail_block = ""
+            if keys_fail_first > 0:
+                keys_fail_block = (
+                    f'  *\'kms keys create\'*)\n'
+                    f'    k_count=$(grep -c "kms keys create" "{log}" || true)\n'
+                    f'    if [ "$k_count" -le {keys_fail_first} ]; then\n'
+                    f'      echo "{fail_403}" >&2; exit 1\n'
+                    f'    fi ;;\n'
+                )
             gcloud = bin_dir / "gcloud"
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
@@ -4591,6 +4683,8 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 'case "$*" in\n'
                 "  *'kms keys versions list'*) exit 0 ;;\n"
                 f"{describe_case}"
+                f"{keyrings_fail_block}"
+                f"{keys_fail_block}"
                 f"{create_case}"
                 "esac\n"
                 "exit 0\n"
@@ -4620,12 +4714,20 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 "GITOPS_ORG=an-org GITOPS_REPO=a-repo GITHUB_APP_ID=12345 "
                 f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a\n'
             )
+            merged_env = {"KMS_API_PROPAGATION_WAIT_SECONDS": "0"}
+            if env_overrides:
+                merged_env.update(env_overrides)
             proc = subprocess.run(
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides=merged_env,
+                    absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+                ),
                 cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
@@ -4817,6 +4919,73 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         self.assertIn("tools import-pk", combined)
         self.assertNotIn("-private-key=@<path-to-pem>", combined)
 
+    def test_import_github_pem_retries_keyring_create_on_kms_propagation_403(self):
+        """A Cloud KMS 403 on the keyring create is retried across the propagation window."""
+        proc, calls = self._run(keyrings_fail_first=1)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        self.assertEqual(len(kr_creates), 2, f"expected retry on 403, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_import_github_pem_retries_key_create_on_kms_propagation_403(self):
+        """A Cloud KMS 403 on the key create is retried across the propagation window."""
+        proc, calls = self._run(keys_fail_first=1)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        k_creates = [c for c in calls if "kms keys create" in c]
+        self.assertEqual(len(k_creates), 2, f"expected retry on 403, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_import_github_pem_retries_keys_describe_on_kms_propagation_403(self):
+        """A Cloud KMS 403 on the key describe check is retried across the propagation window."""
+        proc, calls = self._run(describe_fails=False, keys_describe_fail_first=1, git_clone_fails=True)
+        # git clone fails after key describe succeeds, verifying it made it past describe check
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("PEM import failed", proc.stdout + proc.stderr)
+        d_calls = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(d_calls), 2, f"expected retry on describe 403, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_import_github_pem_does_not_retry_unrelated_api_403(self):
+        """A 403 from an unrelated API is not retried."""
+        other_403 = (
+            "Error 403: Kubernetes Engine API has not been used in "
+            "project a-project before or it is disabled."
+        )
+        proc, calls = self._run(keyrings_fail_first=1, fail_msg=other_403)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        self.assertEqual(len(kr_creates), 1, "unrelated API 403 must not be retried")
+
+    def test_import_github_pem_skips_key_create_when_keyring_create_exhausts_retries(self):
+        """When keyring create exhausts its KMS 403 retries, keys create and describe are skipped."""
+        proc, calls = self._run(
+            keyrings_fail_first=5,
+            env_overrides={"KMS_API_PROPAGATION_ATTEMPTS": "2"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        k_describes = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(kr_creates), 2, f"expected 2 attempts before exhaustion, got calls: {calls}")
+        self.assertEqual(len(k_creates), 0, "keys create must be skipped after keyring exhaustion")
+        self.assertEqual(len(k_describes), 0, "keys describe must be skipped after keyring exhaustion")
+        self.assertIn("could not be confirmed to exist", proc.stdout)
+
+    def test_import_github_pem_skips_describe_when_key_create_exhausts_retries(self):
+        """When key create exhausts its KMS 403 retries, keys describe is skipped."""
+        proc, calls = self._run(
+            keys_fail_first=5,
+            env_overrides={"KMS_API_PROPAGATION_ATTEMPTS": "2"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        k_describes = [c for c in calls if "kms keys describe" in c]
+        self.assertEqual(len(kr_creates), 1, f"expected 1 keyring attempt, got calls: {calls}")
+        self.assertEqual(len(k_creates), 2, f"expected 2 key attempts before exhaustion, got calls: {calls}")
+        self.assertEqual(len(k_describes), 0, "keys describe must be skipped after key exhaustion")
+        self.assertIn("could not be confirmed to exist", proc.stdout)
+
     def test_main_turns_a_failed_import_into_a_hard_exit(self):
         """The two returns above are only fatal because main() makes them so.
 
@@ -4831,6 +5000,355 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             body,
             "a failed PEM import must stop the run before terraform apply",
         )
+
+
+class RetryKmsPropagationTest(unittest.TestCase):
+    """Direct tests for retry_kms_create in scripts/installer/installer_common.sh."""
+
+    _KMS_403 = (
+        "Error: Error creating CryptoKey: googleapi: Error 403: Google Cloud KMS API "
+        "has not been used in project 123 before or it is disabled."
+    )
+    _OLDER_KMS_403 = (
+        "Error 403: Cloud Key Management Service (KMS) API has not been used in "
+        "project 123 before or it is disabled."
+    )
+
+    def _run_cmd(self, script, env_overrides=None):
+        merged = {"KMS_API_PROPAGATION_WAIT_SECONDS": "0"}
+        if env_overrides:
+            merged.update(env_overrides)
+        body = f"""
+source "{_INSTALLER_COMMON}"
+{script}
+"""
+        return subprocess.run(
+            ["bash", "-c", body],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(
+                overrides=merged,
+                absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+            ),
+            cwd=str(_REPO_ROOT),
+            timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+        )
+
+    def test_retry_kms_create_retries_and_succeeds(self):
+        script = f"""
+log=$(mktemp)
+stub() {{
+  echo call >> "$log"
+  count=$(wc -l < "$log")
+  if [ "$count" -le 1 ]; then
+    echo "{self._KMS_403}" >&2
+    exit 1
+  fi
+  echo "key created"
+  exit 0
+}}
+retry_kms_create stub
+rm -f "$log"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("key created", proc.stdout)
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_retry_kms_create_retries_older_api_name(self):
+        script = f"""
+log=$(mktemp)
+stub() {{
+  echo call >> "$log"
+  count=$(wc -l < "$log")
+  if [ "$count" -le 1 ]; then
+    echo "{self._OLDER_KMS_403}" >&2
+    exit 1
+  fi
+  echo "key created"
+  exit 0
+}}
+retry_kms_create stub
+rm -f "$log"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("key created", proc.stdout)
+
+    def test_retry_kms_create_does_not_retry_other_api_403(self):
+        script = """
+count=0
+stub() {
+  count=$((count + 1))
+  echo "Error 403: Container API has not been used in project 123 before or it is disabled." >&2
+  exit 1
+}
+retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("attempt 2", proc.stderr)
+
+    def test_retry_kms_create_does_not_retry_already_exists(self):
+        script = """
+count=0
+stub() {
+  count=$((count + 1))
+  echo "ALREADY_EXISTS: Resource already exists" >&2
+  exit 1
+}
+retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("ALREADY_EXISTS", proc.stdout)
+        self.assertNotIn("attempt 2", proc.stderr)
+
+    def test_retry_kms_create_gives_up_after_budget(self):
+        script = f"""
+count=0
+stub() {{
+  count=$((count + 1))
+  echo "{self._KMS_403}" >&2
+  exit 1
+}}
+KMS_API_PROPAGATION_ATTEMPTS=3 retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Cloud KMS still rejects requests 3 attempts after enabling it", proc.stderr)
+
+    def test_retry_kms_create_non_integer_attempts_falls_back_to_default(self):
+        for invalid_val in ["invalid", "99999999999999999999", "-1", "1.5"]:
+            with self.subTest(attempts=invalid_val):
+                script = f"""
+count=0
+stub() {{
+  count=$((count + 1))
+  echo "{self._KMS_403}" >&2
+  exit 1
+}}
+KMS_API_PROPAGATION_ATTEMPTS="{invalid_val}" retry_kms_create stub
+"""
+                proc = self._run_cmd(script)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("Cloud KMS still rejects requests 5 attempts after enabling it", proc.stderr)
+
+    def test_retry_kms_create_zero_attempts_runs_single_attempt_without_retry(self):
+        """KMS_API_PROPAGATION_ATTEMPTS=0 makes one attempt and stops without retry, matching lifecycle.sh."""
+        script = f"""
+count=0
+stub() {{
+  count=$((count + 1))
+  echo "stub attempt $count" >&2
+  echo "{self._KMS_403}" >&2
+  exit 1
+}}
+KMS_API_PROPAGATION_ATTEMPTS=0 retry_kms_create stub
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("stub attempt 1", proc.stdout)
+        self.assertNotIn("stub attempt 2", proc.stdout)
+        self.assertIn("Cloud KMS still rejects requests 1 attempts after enabling it", proc.stderr)
+        self.assertNotIn("Waiting", proc.stderr)
+
+    def test_sourcing_installer_common_then_lifecycle_does_not_fail_on_readonly_pattern(self):
+        """Sourcing installer_common.sh and then lifecycle.sh does not fail on KMS_API_PROPAGATION_PATTERN."""
+        lifecycle_sh = _REPO_ROOT / "terraform" / "examples" / "full-install" / "lifecycle.sh"
+        script = f"""
+source "{_INSTALLER_COMMON}"
+cd "{lifecycle_sh.parent}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{lifecycle_sh}"
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"]),
+            cwd=str(_REPO_ROOT),
+            timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_sanitize_kms_int_warns_on_invalid_value(self):
+        script = """
+_sanitize_kms_int "invalid" 5 0 "TEST_KMS_KNOB"
+_sanitize_kms_int "-1" 5 0 "TEST_KMS_KNOB_NEG"
+_sanitize_kms_int "0" 5 0 "TEST_KMS_KNOB_ZERO"
+"""
+        proc = self._run_cmd(script)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("TEST_KMS_KNOB='invalid' is not a whole number >= 0; using default 5", proc.stderr)
+        self.assertIn("TEST_KMS_KNOB_NEG='-1' is not a whole number >= 0; using default 5", proc.stderr)
+        self.assertNotIn("TEST_KMS_KNOB_ZERO", proc.stderr)
+
+
+class EnsureExistingClusterCmekKmsTest(unittest.TestCase):
+    """ensure_existing_cluster_cmek retries KMS creates on first-enablement 403."""
+
+    def test_cmek_creates_retry_on_kms_propagation_403(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    kr_count=$(grep -c "kms keyrings create" "{log}" || true)
+    if [ "$kr_count" -le 1 ]; then
+      echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+      exit 1
+    fi
+    exit 0 ;;
+  *'kms keys create'*)
+    k_count=$(grep -c "kms keys create" "{log}" || true)
+    if [ "$k_count" -le 1 ]; then
+      echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+      exit 1
+    fi
+    exit 0 ;;
+  *'kms keys add-iam-policy-binding'*)
+    exit 0 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0"},
+                    absent=["KMS_API_PROPAGATION_ATTEMPTS", "KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 2, f"expected retry on keyring create, got calls: {calls}")
+        self.assertEqual(len(k_creates), 2, f"expected retry on key create, got calls: {calls}")
+        self.assertEqual(len(b_creates), 1, f"expected single call on key binding, got calls: {calls}")
+        self.assertIn("Cloud KMS was enabled minutes ago and has not finished propagating", proc.stderr)
+
+    def test_cmek_skips_later_creates_when_keyring_create_exhausts_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+    exit 1 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0", "KMS_API_PROPAGATION_ATTEMPTS": "2"},
+                    absent=["KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 1)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 2)
+        self.assertEqual(len(k_creates), 0, "key create should be skipped when keyring create exhausts retry budget")
+        self.assertEqual(len(b_creates), 0, "binding should be skipped when keyring create exhausts retry budget")
+
+    def test_cmek_skips_later_creates_when_key_create_exhausts_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> '{log}'
+case "$*" in
+  *'container clusters describe'*)
+    echo "UNKNOWN" ;;
+  *'projects describe'*)
+    echo "12345" ;;
+  *'kms keyrings create'*)
+    exit 0 ;;
+  *'kms keys create'*)
+    echo "Error 403: Google Cloud KMS API has not been used in project p1 before or it is disabled." >&2
+    exit 1 ;;
+  *)
+    exit 0 ;;
+esac
+exit 0
+""")
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source "{_INSTALLER_COMMON}"
+ensure_existing_cluster_cmek p1 c1 us-central1-a
+"""
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(
+                    bin_dir=str(bin_dir),
+                    overrides={"KMS_API_PROPAGATION_WAIT_SECONDS": "0", "KMS_API_PROPAGATION_ATTEMPTS": "2"},
+                    absent=["KMS_API_PROPAGATION_PATTERN"],
+                ),
+                cwd=str(_REPO_ROOT),
+                timeout=_INSTALLER_RUN_TIMEOUT_SECONDS,
+            )
+            calls = log.read_text().splitlines() if log.exists() else []
+
+        self.assertEqual(proc.returncode, 1)
+        kr_creates = [c for c in calls if "kms keyrings create" in c]
+        k_creates = [c for c in calls if "kms keys create" in c]
+        b_creates = [c for c in calls if "kms keys add-iam-policy-binding" in c]
+        self.assertEqual(len(kr_creates), 1, "keyring create succeeds on first attempt")
+        self.assertEqual(len(k_creates), 2, "key create retries up to budget")
+        self.assertEqual(len(b_creates), 0, "binding should be skipped when key create exhausts retry budget")
 
 
 class InstallEnvIsCreatedInTheCheckoutTest(unittest.TestCase):
@@ -5595,19 +6113,37 @@ class PlatformAgentModeTest(unittest.TestCase):
         return env
 
     def _run(self, body, install_env=None, extra_env=None):
-        """Source install.sh against install_env (a path that may not exist,
-        which is a first install) and installer_common.sh, then run body."""
+        """Source install.sh against install_env and installer_common.sh, then
+        run body. With no install_env, install.sh is a copy alone in a
+        directory that is not a checkout, under an empty HOME, so no
+        install.env is found anywhere: sourcing the checkout's install.sh
+        would land on <repo>/install.env, the file a developer who installs
+        from this clone has."""
         env = {"KUBE_AGENTS_INSTALL_ENV": str(install_env)} if install_env else {}
         env.update(extra_env or {})
-        script = (
-            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
-            "source scripts/installer/installer_common.sh\n"
-            f"{body}\n"
-        )
-        return subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True,
-            env=self._env(env), cwd=str(_REPO_ROOT), stdin=subprocess.DEVNULL,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            install_sh, cwd = _INSTALL_SH, _REPO_ROOT
+            if not install_env:
+                cwd = pathlib.Path(tmp) / "bare"
+                home = pathlib.Path(tmp) / "home"
+                cwd.mkdir()
+                home.mkdir()
+                install_sh = cwd / "install.sh"
+                shutil.copy(_INSTALL_SH, install_sh)
+                shutil.copy(_REPO_ROOT / "install.defaults.env", cwd / "install.defaults.env")
+                env["HOME"] = str(home)
+            script = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{install_sh}"\n'
+                f'source "{_REPO_ROOT / "scripts" / "installer" / "installer_common.sh"}"\n'
+                f"{body}\n"
+            )
+            run_env = self._env(env)
+            if not install_env:
+                run_env.pop("KUBE_AGENTS_INSTALL_ENV", None)
+            return subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                env=run_env, cwd=str(cwd), stdin=subprocess.DEVNULL, check=False,
+            )
 
     def _file(self, tmp, content):
         path = pathlib.Path(tmp) / "install.env"
@@ -5662,7 +6198,7 @@ class PlatformAgentModeTest(unittest.TestCase):
     def test_a_rerun_without_the_flag_keeps_the_recorded_mode(self):
         with tempfile.TemporaryDirectory() as tmp:
             proc = self._run(
-                'validate_platform_agent_mode && echo "MODE=[${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}]"',
+                'validate_platform_agent_mode && echo "MODE=[${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}]"',
                 install_env=self._file(tmp, "PLATFORM_AGENT_MODE=next\n"),
             )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -6013,10 +6549,39 @@ class PlatformAgentModeTest(unittest.TestCase):
             self.assertIn("PARAM=[next]", out)
             self.assertIn("EXPORTED=[next]", out)
 
-    def test_an_unset_mode_is_recorded_as_the_default(self):
+    def test_an_unset_mode_on_a_first_install_is_recorded_as_next(self):
+        # No install.env when the run started: the new-install default.
         with tempfile.TemporaryDirectory() as tmp:
-            dest = self._bootstrap_with_export(tmp, ":")
-            self.assertIn("PLATFORM_AGENT_MODE=today\n", dest.read_text())
+            dest = self._bootstrap_with_export(tmp, "INSTALL_ENV_FOUND_AT_START=false; resolve_platform_agent_mode_fallback")
+            self.assertIn("PLATFORM_AGENT_MODE=next\n", dest.read_text())
+
+    def test_the_fallback_starts_as_a_first_installs_and_a_recorded_key_wins(self):
+        # Before the cluster is asked, an empty mode resolves to the first
+        # install's default whether or not an install.env exists: whether this
+        # is a first install is adopt_live_platform_agent_mode's to settle.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, expected in (
+                (None, "next"),
+                ("PROJECT_ID=p\n", "next"),
+                ("PLATFORM_AGENT_MODE=next\n", "next"),
+                ("PLATFORM_AGENT_MODE=today\n", "today"),
+            ):
+                with self.subTest(content=content):
+                    install_env = self._file(tmp, content) if content is not None else None
+                    proc = self._run(
+                        'resolve_shared_defaults; validate_platform_agent_mode && echo "MODE=[${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}]"',
+                        install_env=install_env,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn(f"MODE=[{expected}]", proc.stdout)
+
+    def test_a_run_with_no_install_env_never_reads_the_checkouts_own(self):
+        # _run with no install_env must not land on <repo>/install.env, which a
+        # developer who installs from this clone has: a recorded today there
+        # would make every first-install case here read today.
+        proc = self._run('echo "ENV=[$INSTALL_ENV_FILE] FOUND=[$INSTALL_ENV_FOUND_AT_START]"')
+        self.assertIn("FOUND=[false]", proc.stdout, proc.stderr)
+        self.assertNotIn(str(_REPO_ROOT / "install.env"), proc.stdout)
 
     def test_the_menu_refuses_the_flag_it_would_drop(self):
         # --menu applies the mode install.env records; a --mode there would be
@@ -6031,12 +6596,421 @@ class PlatformAgentModeTest(unittest.TestCase):
         self.assertIn("--menu takes no --mode", out)
         self.assertNotEqual(proc.returncode, 0)
 
+    def test_the_first_install_check_reads_whether_the_file_exists(self):
+        # Through the real check at parse time, with no install.env anywhere
+        # (_run's isolated copy), then with one. The fallback is a first
+        # install's either way until the cluster is asked.
+        probe = 'echo "FOUND=[$INSTALL_ENV_FOUND_AT_START] FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"'
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._run(probe)
+            self.assertIn("FOUND=[false] FALLBACK=[next]", first.stdout, first.stderr)
+            later = self._run(probe, install_env=self._file(tmp, "PROJECT_ID=p\n"))
+            self.assertIn("FOUND=[true] FALLBACK=[next]", later.stdout, later.stderr)
+
+    # adopt_live_platform_agent_mode with the cluster probe and the reads
+    # stubbed: status is gcloud's exit status, read the CR read's outcome,
+    # json the CR list, record the release read's outcome and values its
+    # values. gcloud's get-credentials writes the context into whatever
+    # $KUBECONFIG names, as the real one does, and each call is logged to fd 3,
+    # past the function's own redirections.
+    _ADOPT = (
+        "export PROJECT_ID=p REGION=r CLUSTER_NAME=c\n"
+        "exec 3>&2\n"
+        "gcloud() {{ echo \"GCLOUD KUBECONFIG=[${{KUBECONFIG:-}}] $*\" >&3; "
+        "case \"$*\" in *get-credentials*) echo 'current-context: gke_p_r_c' > \"${{KUBECONFIG:-$HOME/.kube/config}}\" ;; "
+        "*describe*) [ {status} -eq 0 ] || echo '{describe_err}' >&2 ;; esac; "
+        "return {status}; }}\n"
+        "gke_dns_endpoint_flag() {{ :; }}\n"
+        "read_platform_agent_install_state() {{ PLATFORM_AGENT_CR_READ='{read}'; "
+        "PLATFORM_AGENT_CR_JSON='{json}'; PLATFORM_AGENT_RECORD_READ='{record}'; "
+        "PLATFORM_AGENT_RECORD_JSON='{values}'; PLATFORM_AGENT_READ_ERROR='{error}'; }}\n"
+        "PARAM_DRY_RUN={dry_run}; PARAM_GENERATE_ONLY={generate_only}\n"
+        "{pre}\n"
+        'rc=0; adopt_live_platform_agent_mode || rc=$?; '
+        'echo "rc=$rc FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK] KUBECONFIG_AFTER=[${{KUBECONFIG:-}}] '
+        'MODE=[${{PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}}]"\n'
+    )
+
+    def _adopt(self, tmp, status=0, read="ok", json_list='{"items":[]}', record="none", values="{}",
+               error="", dry_run="false", generate_only="false", pre=":", content=None, extra_env=None,
+               describe_err=_GCLOUD_CLUSTER_NOT_FOUND):
+        # No content is a first install, with no install.env: the file check is
+        # pinned above, so here it is set rather than arranged. A failing
+        # describe prints describe_err, NOT_FOUND unless a test says otherwise.
+        if content is None:
+            content = ""
+            pre = f"INSTALL_ENV_FOUND_AT_START=false; {pre}"
+        path = self._file(tmp, content)
+        return self._run(
+            self._ADOPT.format(status=status, read=read, json=json_list, record=record, values=values,
+                               error=error, dry_run=dry_run, generate_only=generate_only, pre=pre,
+                               describe_err=describe_err),
+            install_env=path, extra_env=extra_env,
+        )
+
+    def test_a_cluster_already_running_a_platform_agent_keeps_its_mode(self):
+        # No mode recorded against a live install (a new checkout, another
+        # machine, a copied example): the CR's mode, absent being today, not
+        # the new default. With or without an install.env.
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in (None, "PROJECT_ID=p\n"):
+                for json_list, expected in (
+                    ('{"items":[{"spec":{}}]}', "today"),
+                    ('{"items":[{"spec":{"mode":"today"}}]}', "today"),
+                    ('{"items":[{"spec":{"mode":"next"}}]}', "next"),
+                ):
+                    with self.subTest(content=content, cr=json_list):
+                        proc = self._adopt(tmp, json_list=json_list, content=content)
+                        self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
+                        if expected == "today":
+                            self.assertIn(
+                                "already runs kube-agents on spec.mode today (from its PlatformAgent)",
+                                proc.stdout + proc.stderr,
+                            )
+
+    def test_the_copied_example_on_a_live_today_install_stays_today(self):
+        # INSTALL.md's way to create an install.env for a running install is
+        # to copy install.env.example. The copy records no mode, so the live
+        # CR decides; on a cluster with no install it is a first install.
+        example = (_REPO_ROOT / "install.env.example").read_text()
+        self.assertNotRegex(example, r"(?m)^\s*PLATFORM_AGENT_MODE=")
+        with tempfile.TemporaryDirectory() as tmp:
+            live = self._adopt(tmp, json_list='{"items":[{"spec":{}}]}', content=example)
+            self.assertIn("rc=0 FALLBACK=[today]", live.stdout, live.stderr)
+            first = self._adopt(tmp, status=1, content=example)
+            self.assertIn("rc=0 FALLBACK=[next]", first.stdout, first.stderr)
+
+    def test_a_hand_deleted_cr_with_the_release_still_installed_keeps_the_releases_mode(self):
+        # The next apply recreates the CR from the release, so its recorded
+        # mode (absent is today) decides, not the first-install default.
+        with tempfile.TemporaryDirectory() as tmp:
+            for values, expected in (("{}", "today"), ('{"platformAgent":{"mode":"next"}}', "next")):
+                with self.subTest(values=values):
+                    proc = self._adopt(tmp, record="ok", values=values)
+                    self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
+                    if expected == "today":
+                        self.assertIn("from its kube-agents release", proc.stdout + proc.stderr)
+            # A release that cannot be read is no answer either.
+            failed = self._adopt(tmp, record="failed", error="helm: forbidden")
+            self.assertIn("rc=1", failed.stdout, failed.stderr)
+            self.assertIn("helm: forbidden", failed.stdout + failed.stderr)
+
+    def test_a_cluster_with_no_install_is_a_first_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for status, read in ((1, "ok"), (0, "none"), (0, "ok")):
+                with self.subTest(gcloud=status, read=read):
+                    proc = self._adopt(tmp, status=status, read=read)
+                    self.assertIn("rc=0 FALLBACK=[next]", proc.stdout, proc.stderr)
+
+    def test_a_cluster_that_cannot_be_read_is_never_guessed_a_first_install(self):
+        # Applying with no install.env: refused. --dry-run and --generate-only:
+        # today, with a warning, not refused. An install.env with no mode:
+        # today on every route, as before the cluster was asked.
+        with tempfile.TemporaryDirectory() as tmp:
+            for read in ("failed", "no-context"):
+                with self.subTest(read=read):
+                    proc = self._adopt(tmp, read=read, error="forbidden" if read == "failed" else "")
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=1", proc.stdout, out)
+                    self.assertIn("Pass --mode=today or --mode=next", out)
+                    for route in ({"dry_run": "true"}, {"generate_only": "true"}):
+                        preview = self._adopt(tmp, read=read, **route)
+                        self.assertIn("rc=0 FALLBACK=[today]", preview.stdout, preview.stderr)
+                        self.assertIn("An applying run would be refused.", preview.stdout + preview.stderr)
+                    keyless = self._adopt(tmp, read=read, content="PROJECT_ID=p\n")
+                    self.assertIn("rc=0 FALLBACK=[today]", keyless.stdout, keyless.stderr)
+                    self.assertIn("records no PLATFORM_AGENT_MODE", keyless.stdout + keyless.stderr)
+
+    def test_a_cluster_gcloud_cannot_describe_is_never_guessed_a_first_install(self):
+        # Only a NOT_FOUND is no cluster. Any other describe failure (an
+        # expired token, a 403) is a cluster that could not be read, settled
+        # as the read failures above are, and nothing past the describe runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            kwargs = {"status": 1, "describe_err": _GCLOUD_CLUSTER_FORBIDDEN}
+            applying = self._adopt(tmp, **kwargs)
+            out = applying.stdout + applying.stderr
+            self.assertIn("rc=1", applying.stdout, out)
+            self.assertIn("Cluster 'c' may exist and there is no install.env", out)
+            self.assertIn("code=403", out)
+            self.assertNotIn("get-credentials", applying.stderr)
+            preview = self._adopt(tmp, dry_run="true", **kwargs)
+            self.assertIn("rc=0 FALLBACK=[today]", preview.stdout, preview.stderr)
+            self.assertIn("An applying run would be refused.", preview.stdout + preview.stderr)
+            keyless = self._adopt(
+                tmp, content="PROJECT_ID=p\n", pre="trap 'echo \"GUESSED=[$PLATFORM_AGENT_MODE_GUESSED]\"' EXIT",
+                **kwargs,
+            )
+            self.assertIn("rc=0 FALLBACK=[today]", keyless.stdout, keyless.stderr)
+            self.assertIn("GUESSED=[true]", keyless.stdout, keyless.stderr)
+
+    def test_the_menu_names_the_key_rather_than_the_flag_it_refuses(self):
+        # --menu takes no --mode, so the remedies it prints name install.env.
+        with tempfile.TemporaryDirectory() as tmp:
+            guessed = self._adopt(tmp, read="failed", error="forbidden", content="PROJECT_ID=p\n",
+                                  pre="PARAM_MENU_MODE=true")
+            out = guessed.stdout + guessed.stderr
+            self.assertIn("stop and set PLATFORM_AGENT_MODE=next in ", out)
+            self.assertNotIn("ass --mode", out)
+            kept = self._adopt(tmp, json_list='{"items":[{"spec":{}}]}', content="PROJECT_ID=p\n",
+                               pre="PARAM_MENU_MODE=true")
+            out = kept.stdout + kept.stderr
+            self.assertIn("Set PLATFORM_AGENT_MODE=next in ", out)
+            self.assertNotIn("ass --mode", out)
+            # The menu runs with no install.env too.
+            no_file = self._adopt(tmp, read="failed", error="forbidden", pre="PARAM_MENU_MODE=true")
+            out = no_file.stdout + no_file.stderr
+            self.assertIn("Set PLATFORM_AGENT_MODE=today or PLATFORM_AGENT_MODE=next in ", out)
+            self.assertNotIn("ass --mode", out)
+            mirrored = self._run(
+                "PARAM_MENU_MODE=true PLATFORM_AGENT_MODE_FALLBACK=next; mirrored_first_install_mode mirror.example/x",
+                install_env=self._file(tmp, "PROJECT_ID=p\n"),
+            )
+            self.assertIn("Set PLATFORM_AGENT_MODE=next in ", mirrored.stdout + mirrored.stderr)
+
+    def test_the_menu_settles_a_mirrored_first_install_as_main_does(self):
+        # The menu's settle block, lifted as written, over a keyless install.env
+        # that records a mirror prefix and a cluster that does not exist: a
+        # mirrored first install, so today, saved; a pass that settled an
+        # earlier target does not leak into this one.
+        text = _INSTALL_SH.read_text()
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        start = text.index('        local menu_mode_to_save=""\n', arm)
+        end = text.index("        fi\n", start) + len("        fi\n")
+        block = text[start:end]
+        self.assertIn('local menu_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"', block)
+        self.assertIn('mirrored_first_install_mode "${menu_third_party_prefix%/}"', block)
+        body = (
+            f"gcloud() {{ echo '{_GCLOUD_CLUSTER_NOT_FOUND}' >&2; return 1; }}\n"
+            "PLATFORM_AGENT_MODE_SETTLED=true\n"
+            "settle() {\n  local project_id=p cluster_name=c region=r\n"
+            f"{block}"
+            '  echo "SAVE=[$menu_mode_to_save] MODE=[$PLATFORM_AGENT_MODE]"\n}\nsettle\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for prefix, expected in (("mirror.example/x/", "today"), ("", "next")):
+                with self.subTest(prefix=prefix):
+                    content = f"PROJECT_ID=p\nTHIRD_PARTY_REGISTRY_PREFIX={prefix}\n" if prefix else "PROJECT_ID=p\n"
+                    proc = self._run(body, install_env=self._file(tmp, content))
+                    self.assertIn(f"SAVE=[{expected}] MODE=[{expected}]", proc.stdout, proc.stderr)
+
+    def test_the_cluster_read_leaves_the_operators_kubeconfig_alone(self):
+        # --dry-run and --generate-only promise no side effects; the read
+        # writes its credentials into a kubeconfig of its own and removes it.
+        with tempfile.TemporaryDirectory() as tmp:
+            kubeconfig = pathlib.Path(tmp) / "operator-kubeconfig"
+            kubeconfig.write_text("current-context: the-operators-context\n")
+            for route in ({"dry_run": "true"}, {"generate_only": "true"}, {}):
+                with self.subTest(**route):
+                    proc = self._adopt(
+                        tmp, json_list='{"items":[{"spec":{}}]}', extra_env={"KUBECONFIG": str(kubeconfig)}, **route
+                    )
+                    out = proc.stdout + proc.stderr
+                    self.assertIn("rc=0 FALLBACK=[today]", proc.stdout, out)
+                    self.assertEqual(kubeconfig.read_text(), "current-context: the-operators-context\n")
+                    self.assertIn(f"KUBECONFIG_AFTER=[{kubeconfig}]", proc.stdout, out)
+                    creds = [line for line in proc.stderr.splitlines() if "get-credentials" in line]
+                    self.assertEqual(len(creds), 1, out)
+                    self.assertNotIn(f"KUBECONFIG=[{kubeconfig}]", creds[0])
+                    self.assertRegex(creds[0], r"KUBECONFIG=\[[^\]]+/kubeconfig\]")
+
+    def test_a_chosen_mode_skips_the_cluster_read(self):
+        # --mode, an exported mode (first install only) and a key install.env
+        # records all win; a key assigned empty is today, as every front door
+        # reads it, and nothing can be recorded over it.
+        with tempfile.TemporaryDirectory() as tmp:
+            cr = '{"items":[{"spec":{}}]}'
+            for kwargs, expected in (
+                ({"pre": "PARAM_PLATFORM_AGENT_MODE=next"}, "next"),
+                ({"content": "PLATFORM_AGENT_MODE=next\n", "pre": "resolve_shared_defaults"}, "next"),
+                ({"content": "PLATFORM_AGENT_MODE=\n"}, "today"),
+            ):
+                with self.subTest(**kwargs):
+                    proc = self._adopt(tmp, json_list=cr, **kwargs)
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertNotIn("GCLOUD", proc.stderr)
+                    self.assertIn(f"MODE=[{expected}]", proc.stdout, proc.stderr)
+
+    def test_an_install_env_with_no_mode_records_the_settled_one(self):
+        # upgrade.sh reads a file with no key as today, so the mode this run
+        # settled on is queued for record_flags_into_install_env, and written.
+        call = (
+            "rc=0; queue_unrecorded_platform_agent_mode || rc=$?; "
+            'echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(
+                f"PLATFORM_AGENT_MODE_FALLBACK=next; {call}; export PLATFORM_AGENT_MODE=next; "
+                "record_flags_into_install_env",
+                install_env=path,
+            )
+            self.assertIn("rc=0 QUEUED=[PLATFORM_AGENT_MODE]", proc.stdout, proc.stderr)
+            self.assertIn("PLATFORM_AGENT_MODE=next\n", path.read_text())
+            for content, pre, says in (
+                ("PLATFORM_AGENT_MODE=today\n", ":", ""),
+                ("PROJECT_ID=p\n", "PARAM_DRY_RUN=true", "a run without --dry-run records the one it applies"),
+                (None, ":", ""),
+            ):
+                with self.subTest(content=content, pre=pre):
+                    install_env = self._file(tmp, content) if content is not None else None
+                    before = install_env.read_text() if install_env else None
+                    proc = self._run(f"{pre}; {call}", install_env=install_env)
+                    self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stderr)
+                    if says:
+                        self.assertIn(says, proc.stdout + proc.stderr)
+                    if install_env:
+                        self.assertEqual(install_env.read_text(), before)
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            path.chmod(0o400)
+            try:
+                proc = self._run(call, install_env=path)
+            finally:
+                path.chmod(0o600)
+            self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stderr)
+            self.assertIn("is not writable", proc.stdout + proc.stderr)
+
+    def test_a_guessed_mode_is_never_recorded(self):
+        # A cluster that could not be read gives today as a guess; neither a
+        # keyless install.env nor a first install's new one records it, so the
+        # next run that can read the cluster settles it.
+        call = (
+            "rc=0; queue_unrecorded_platform_agent_mode || rc=$?; "
+            'echo "rc=$rc QUEUED=[$INSTALL_ENV_KEYS_TO_RECORD]"'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "PROJECT_ID=p\n")
+            proc = self._run(f"PLATFORM_AGENT_MODE_GUESSED=true PLATFORM_AGENT_MODE_FALLBACK=today; {call}", install_env=path)
+            self.assertIn("rc=0 QUEUED=[]", proc.stdout, proc.stderr)
+        for guessed, expected in (("true", False), ("false", True)):
+            with self.subTest(guessed=guessed), tempfile.TemporaryDirectory() as tmp:
+                dest = self._bootstrap_with_export(
+                    tmp, f"PLATFORM_AGENT_MODE_GUESSED={guessed}; PLATFORM_AGENT_MODE_FALLBACK=today"
+                )
+                self.assertEqual("PLATFORM_AGENT_MODE=" in dest.read_text(), expected)
+
+    def test_the_menu_settles_a_missing_mode_key_before_it_renders(self):
+        # The menu's Save & Apply over a copied example would render today and
+        # switch a next install back; it settles the mode from the cluster
+        # before the Slack refusal reads it, and saves it with the rest unless
+        # it was a guess.
+        text = _INSTALL_SH.read_text()
+        arm = text.index('        print_step "Saving & Re-applying Configuration State"\n')
+        end = text.index("        run_lifecycle_apply", arm)
+        block = text[arm:end]
+        settle = block.index('        if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then\n')
+        self.assertIn(
+            '            adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || return 1\n', block[settle:]
+        )
+        self.assertIn('          export PLATFORM_AGENT_MODE="$PLATFORM_AGENT_MODE_FALLBACK"\n', block[settle:])
+        self.assertLess(settle, block.index("        refuse_next_slack_gateway_settings_from_env || return 1\n"))
+        save = block.index('          save_env_var PLATFORM_AGENT_MODE "$menu_mode_to_save"\n')
+        self.assertLess(block.index('        save_env_var KMS_KEY "$kms_key"\n'), save)
+        self.assertLess(save, block.index("write_tfvars_from_state"))
+        self.assertIn(
+            '[ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] || menu_mode_to_save="$PLATFORM_AGENT_MODE_FALLBACK"',
+            block,
+        )
+
+    def test_the_mode_is_settled_before_step_6_reads_it(self):
+        # Step 6's prompts and Slack refusals follow the mode, so the cluster
+        # and the mirror are consulted once the target is known and before it.
+        text = _INSTALL_SH.read_text()
+        main_start = text.index('  print_step "5. GKE Cluster Topology & Capacity Setup"')
+        adopt = text.index('    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n', main_start)
+        self.assertIn('  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \\\n', text[adopt - 90 : adopt])
+        mirror = text.index('  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"\n', adopt)
+        queue = text.index("  queue_unrecorded_platform_agent_mode\n", mirror)
+        step_6 = text.index('  print_step "6. Chat & Messaging Integrations Setup"')
+        self.assertLess(queue, step_6)
+        self.assertNotIn("PLATFORM_AGENT_MODE_FALLBACK", text[main_start:adopt])
+        # Once in main, once in the menu's Save & Apply.
+        self.assertEqual(text.count("adopt_live_platform_agent_mode \""), 2)
+        # And in the menu, after its own adopt.
+        self.assertEqual(text.count("  mirrored_first_install_mode \""), 2)
+        self.assertEqual(text.count("  queue_unrecorded_platform_agent_mode\n"), 1)
+
+    def test_a_mirrored_first_install_defaults_to_today(self):
+        # next's bus images are not pointed at the mirror, so a first install
+        # that mirrors defaults to today, with or without an install.env that
+        # records no mode; anything that chose a mode, or a live install, wins.
+        call = "rc=0; mirrored_first_install_mode {prefix} || rc=$?; " 'echo "rc=$rc FALLBACK=[$PLATFORM_AGENT_MODE_FALLBACK]"'
+        first = "INSTALL_ENV_FOUND_AT_START=false; "
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._file(tmp, "")
+            for pre, prefix, expected in (
+                (first, "mirror.example/third-party", "today"),
+                (first, "''", "next"),
+                (first + "PARAM_PLATFORM_AGENT_MODE=next; ", "mirror.example/third-party", "next"),
+                (first + "PLATFORM_AGENT_MODE_SETTLED=true; ", "mirror.example/third-party", "next"),
+                ("", "mirror.example/third-party", "today"),
+            ):
+                with self.subTest(pre=pre, prefix=prefix):
+                    proc = self._run(pre + call.format(prefix=prefix), install_env=path)
+                    self.assertIn(f"rc=0 FALLBACK=[{expected}]", proc.stdout, proc.stderr)
+                    if expected == "today":
+                        self.assertIn("Pass --mode=next to install next anyway.", proc.stdout + proc.stderr)
+
+    def test_y_refuses_a_switch_nobody_asked_for(self):
+        # Under -y the notice is the last word before the apply; a switch that
+        # came from the fallback rather than --mode, an exported mode or the
+        # key install.env records is refused, and the tfvars that carry it go.
+        text = _INSTALL_SH.read_text()
+        notice = text.index('  announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"\n')
+        block = text[notice : text.index("  fi\n", notice)]
+        self.assertIn('[ "$mode_notice_route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ]', block)
+        self.assertIn('[ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ]', block)
+        self.assertIn('[ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ]', block)
+        self.assertIn('rm -f "$tfvars_file"', block)
+        self.assertIn("exit 1", block)
+        # Lifted as written with the notice stubbed to name a switch: a file
+        # with no key is refused; one that assigns the key, empty included
+        # (a chosen today), and a --mode go on.
+        body = (
+            "announce_platform_agent_mode_for_apply() { PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED=true; }\n"
+            'mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED" platform_agent_mode=today\n'
+            "tfvars_file=$(mktemp)\n{pre}\n"
+            f"{block}  fi\n"
+            'echo "went on"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            for content, pre, refused in (
+                ("PROJECT_ID=p\n", ":", True),
+                ("PROJECT_ID=p\nPLATFORM_AGENT_MODE=\n", ":", False),
+                ("PROJECT_ID=p\nPLATFORM_AGENT_MODE=today\n", ":", False),
+                ("PROJECT_ID=p\n", "PARAM_PLATFORM_AGENT_MODE=today", False),
+            ):
+                with self.subTest(content=content, pre=pre):
+                    proc = self._run(body.replace("{pre}", pre), install_env=self._file(tmp, content))
+                    out = proc.stdout + proc.stderr
+                    if refused:
+                        self.assertIn("Refusing to switch spec.mode under -y", out)
+                        self.assertNotIn("went on", proc.stdout, out)
+                    else:
+                        self.assertIn("went on", proc.stdout, out)
+
+    def test_the_switch_notice_says_whether_it_named_a_switch(self):
+        cases = (
+            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "next", "true"),
+            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "today", "false"),
+            ("", "", "next", "false"),
+        )
+        for record, live, key, expected in cases:
+            with self.subTest(record=record, live=live, key=key):
+                proc = self._run(
+                    f'PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED=stale; announce_platform_agent_mode_switch "{record}" "{live}" {key} ungated >/dev/null; '
+                    'echo "ANNOUNCED=[$PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED]"'
+                )
+                self.assertIn(f"ANNOUNCED=[{expected}]", proc.stdout, proc.stderr)
+
     def test_the_summary_names_the_mode_and_warns_for_next(self):
         text = _INSTALL_SH.read_text()
         summary = text.index('print_step "11. Pre-Flight Configuration Summary"')
         block = text[summary : text.index('print_step "12.', summary)]
         self.assertIn('if [ "$platform_agent_mode" = "next" ]; then', block)
-        self.assertIn("Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (unsupported development stack", block)
+        self.assertIn("Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway", block)
+        # A Slack-only next install is told what it gives up, and how to keep it.
+        self.assertIn('if slack_moves_to_a2a_gateway "$platform_agent_mode" "$slack_enabled" "$google_chat_enabled"; then', block)
+        self.assertIn("Today's stack keeps the plan card.", block)
         self.assertIn("Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}", block)
 
     def test_a_mirrored_next_install_is_told_the_bus_images_are_not_mirrored(self):
@@ -6112,6 +7086,43 @@ class PlatformAgentModeTest(unittest.TestCase):
         )
 
 
+class NextHomeChannelUnsetWiringTest(unittest.TestCase):
+    """Where install.sh calls the #3320 home-channel warning and its closing
+    summary. The functions are tested in test_installer_common.py; these pin
+    the call sites a review found wrong: the Day-2 menu read the home channel
+    before exporting the one just typed, and two exits skipped the summary."""
+
+    def setUp(self):
+        self.text = _INSTALL_SH.read_text()
+
+    def test_the_menu_exports_its_home_channel_before_warning(self):
+        export = self.text.index('export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"')
+        warn = self.text.index("warn_next_home_channel_unset_from_env\n", export)
+        refuse = self.text.index("refuse_next_slack_gateway_settings_from_env || return 1")
+        self.assertLess(export, refuse)
+        self.assertLess(refuse, warn)
+        self.assertLess(warn - refuse, 200, "the menu's warning moved away from its Slack check")
+
+    def test_the_apply_path_warns_right_after_its_slack_check(self):
+        # The route --dry-run and a non-interactive apply take (#3320).
+        refuse = self.text.index("  elif ! refuse_next_slack_gateway_settings_from_env flags; then")
+        warn = self.text.index("  warn_next_home_channel_unset_from_env flags\n", refuse)
+        self.assertLess(warn - refuse, 600, "the apply path's warning moved away from its Slack check")
+        self.assertLess(warn, self.text.index('print_success "Terraform input saved to: $tfvars_file"', refuse))
+
+    def test_every_exit_that_warned_ends_on_the_summary(self):
+        for report in ('write_json_report "DRY_RUN_SUCCESS"', 'write_json_report "PAUSED"',
+                       'write_json_report "GENERATE_ONLY_SUCCESS"'):
+            with self.subTest(exit=report):
+                at = self.text.index(report)
+                tail = self.text[at:self.text.index("exit 0", at)]
+                self.assertIn("print_next_home_channel_unset_summary flags", tail)
+        menu = self.text.index("    run_menu_system\n")
+        self.assertIn("print_next_home_channel_unset_summary", self.text[menu:self.text.index("exit 0", menu)])
+        main_end = self.text.index('\nif [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then')
+        self.assertIn("  print_next_home_channel_unset_summary flags\n}\n", self.text[main_end - 400:main_end + 1])
+
+
 class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     """#2812 on install.sh. A run whose mode is next (--mode=next, or
     PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
@@ -6126,7 +7137,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     refuse_next_slack_gateway_settings (tests/test_installer_common.py)."""
 
     _CALL = (
-        'refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" '
+        'refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" '
         '"$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" '
         'flags || exit 1'
     )
@@ -6143,6 +7154,16 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     _SAVED = '  print_success "Terraform input saved to: $tfvars_file"\n'
     _MENU_ARM = '      6)\n        print_step "Saving & Re-applying Configuration State"\n'
     _CHAT_STEP = '  print_step "6. Chat & Messaging Integrations Setup"\n'
+    # main settles the mode before step 6 (adopt_live_platform_agent_mode).
+    # The harnesses run against a live today install, so an install.env
+    # that records no mode is today, as it is on the clusters such files
+    # describe; a key or --mode still wins.
+    _SETTLE = (
+        "gcloud() { return 0; }\n"
+        "read_platform_agent_install_state() { PLATFORM_AGENT_CR_READ=ok; "
+        "PLATFORM_AGENT_CR_JSON='{\"items\":[{\"spec\":{}}]}'; }\n"
+        "PROJECT_ID=p CLUSTER_NAME=c REGION=r adopt_live_platform_agent_mode || exit 1\n"
+    )
 
     _env = staticmethod(PlatformAgentModeTest._env)
     _run = PlatformAgentModeTest._run
@@ -6171,6 +7192,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 "resolve_shared_defaults\n"
                 "validate_platform_agent_mode || exit 1\n"
                 "check_flags_against_install_env || exit 1\n"
+                f"{self._SETTLE}"
                 # Set by steps 4 and 5; the no-chat arm prints them.
                 "project_id=p region=r cluster_name=c\n"
                 '_chat_step; echo "went on"',
@@ -6179,6 +7201,38 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             after = path.read_text()
         self.assertEqual(after, content, "the refusal rewrote install.env")
         return proc
+
+    def test_a_live_today_install_without_its_install_env_is_not_refused_under_next_rules(self):
+        # No install.env against a cluster whose PlatformAgent runs today:
+        # the mode is adopted before step 6, so a multi-workspace Slack token,
+        # valid on today, is not refused under next's gateway rules.
+        stubs = (
+            "has_controlling_tty() { return 1; }\n"
+            "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
+            "tf_state_chat_subscription_name() { :; }\n"
+            "gcloud() { return 0; }\n"
+            "read_platform_agent_install_state() { PLATFORM_AGENT_CR_READ=ok; "
+            "PLATFORM_AGENT_CR_JSON='{\"items\":[{\"spec\":{}}]}'; }\n"
+        )
+        flags = "--enable-slack --slack-bot-token=xoxb-1-a,xoxb-2-b --slack-app-token=xapp-1 --slack-allowed-users=U0123ABCD"
+        with tempfile.TemporaryDirectory() as tmp:
+            for adopt, expected in ((True, "went on"), (False, "SLACK_BOT_TOKEN holds 2 tokens")):
+                with self.subTest(adopt=adopt):
+                    settle = (
+                        'PROJECT_ID=p CLUSTER_NAME=c REGION=r adopt_live_platform_agent_mode || exit 1\n' if adopt else ""
+                    )
+                    proc = self._run(
+                        f"{stubs}{self._chat_step()}parse_args --non-interactive {flags}\n"
+                        "INSTALL_ENV_FOUND_AT_START=false\n"
+                        "resolve_shared_defaults\n"
+                        "validate_platform_agent_mode || exit 1\n"
+                        "PARAM_DRY_RUN=false\n"
+                        f"{settle}"
+                        "project_id=p region=r cluster_name=c\n"
+                        '_chat_step; echo "went on"',
+                        install_env=self._file(tmp, ""),
+                    )
+                    self.assertIn(expected, proc.stdout + proc.stderr)
 
     def test_next_with_slack_on_the_gateway_refuses_each_setting_before_anything_is_written(self):
         token = "xoxb-1-secretpart"
@@ -6225,7 +7279,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 out = proc.stdout + proc.stderr
                 self.assertIn("went on", proc.stdout, out)
                 self.assertNotIn("look like emails", out)
-                self.assertNotIn("SLACK_HOME_CHANNEL is", out)
+                self.assertNotIn("which is not a Slack channel id", out)
                 self.assertNotIn("SLACK_BOT_TOKEN holds", out)
 
     def test_main_refuses_after_the_interview_and_again_after_recovery_before_any_write(self):
@@ -6272,11 +7326,12 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
 
     # ── the interview re-asks rather than refusing after it ──
 
-    def _interview(self, flags, content, answers, choice="2"):
+    def _interview(self, flags, content, answers, choice="2", locale=None):
         """Step 6 on an interactive run: prompt_menu picks `choice`, and
         prompt_read answers from `answers` in order, echoing each prompt."""
         stubs = (
-            "has_controlling_tty() { return 0; }\n"
+            (f"export LC_ALL={locale}\n" if locale else "")
+            + "has_controlling_tty() { return 0; }\n"
             "gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG=\"\"; }\n"
             "tf_state_chat_subscription_name() { :; }\n"
             f'prompt_menu() {{ local v="${{!#}}"; printf -v "$v" "%s" "{choice}"; }}\n'
@@ -6302,6 +7357,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 "resolve_shared_defaults\n"
                 "validate_platform_agent_mode || exit 1\n"
                 "check_flags_against_install_env || exit 1\n"
+                f"{self._SETTLE}"
                 "project_id=p region=r cluster_name=c\n"
                 '_chat_step; echo "went on ASKED=$ASKED"',
                 install_env=path,
@@ -6319,7 +7375,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("USERS=[U0123ABCD] HOME=[C0123ABCD] TOKENS=", proc.stdout)
         self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)", out)
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789)", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)", out)
         self.assertNotIn("User IDs / Emails", out)
         self.assertNotIn("comma-separated for several workspaces", out)
         # Each bad answer is named and asked again, once.
@@ -6335,27 +7391,81 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # Bot token: a stray comma, then one token. Allowlist: emails, then
         # Enter, which keeps the refused list (an empty one would admit
         # everyone) under a default that shows it, then IDs. Home channel: a
-        # DM, then Enter, which clears it.
+        # DM, then Enter, which clears it, and a yes to going on without one
+        # (#3320).
         answers = ["xoxb-1-secretpart,", "xoxb-1-secretpart", "xapp-1",
                    "U0123ABCD,alice@example.com", "<enter>", "U0123ABCD",
-                   "D0123ABCD", "<enter>", "#ops"]
+                   "D0123ABCD", "<enter>", "y", "#ops"]
         proc = self._interview("--mode=next", "", answers)
         out = proc.stdout + proc.stderr
-        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("went on ASKED=10", proc.stdout, out)
         self.assertIn("USERS=[U0123ABCD] HOME=[] TOKENS=", proc.stdout)
         self.assertIn("SLACK_BOT_TOKEN holds a comma or space.", out)
         self.assertEqual(out.count("These look like emails: alice@example.com."), 2)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails) "
                       "[default: U0123ABCD,alice@example.com]", out)
         self.assertNotIn("[default: empty list]", out.split("These look like emails", 1)[1])
-        self.assertIn("PROMPT: Slack Home Channel ID (optional, a channel ID such as C0123456789) [default: ]", out)
+        self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there) [default: ]", out)
         self.assertNotIn("secretpart", out)
+
+    def test_an_empty_home_channel_under_next_is_confirmed_or_asked_again(self):
+        # #3320: under next the gateway posts alerts only to a home channel.
+        # Declining the warning asks again; accepting keeps the empty answer.
+        lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "C0123ABCD", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=7", proc.stdout, out)
+        self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
+        self.assertIn("SLACK_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y", "#ops"])
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("HOME=[]", proc.stdout, out)
+        # A home channel given at once is not questioned.
+        proc = self._interview("--mode=next", "", lead + ["C0123ABCD", "#ops"])
+        self.assertNotIn("Continue without a home channel", proc.stdout + proc.stderr)
+
+    def test_a_home_channel_of_unicode_space_under_next_is_confirmed(self):
+        # The operator trims with strings.TrimSpace, so such an answer is no
+        # home channel at all; [[:space:]] misses it in the C locale.
+        for locale in ("C", "en_US.UTF-8"):
+            with self.subTest(locale=locale, platform="slack"):
+                lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
+                proc = self._interview("--mode=next", "", lead + ["\u00a0", "n", "C0123ABCD", "#ops"], locale=locale)
+                out = proc.stdout + proc.stderr
+                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
+            with self.subTest(locale=locale, platform="google_chat"):
+                proc = self._interview("--mode=next", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
+                out = proc.stdout + proc.stderr
+                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("went on ASKED=5", proc.stdout, out)
+
+    def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
+        # #3320 on Chat, which holds the gateway whenever it is enabled under
+        # next. Allowlist, topic, subscription, then the home channel.
+        lead = ["", "", ""]
+        proc = self._interview("--mode=next", "", lead + ["", "n", "spaces/AAA"], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=6", proc.stdout, out)
+        self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
+        self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
+        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        proc = self._interview("--mode=next", "", lead + ["", "y"], choice="1")
+        self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
+        # Under today the prompt stays optional and nothing is confirmed.
+        proc = self._interview("", "", lead + [""], choice="1")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=4", proc.stdout, out)
+        self.assertIn("Google Chat Home Channel / Space ID (optional", out)
+        self.assertNotIn("Continue without a home channel", out)
 
     def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
         answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
         for flags, choice in (("", "2"), ("--mode=next", "3")):
             with self.subTest(flags=flags, choice=choice):
-                chat = ["", "", "", ""] if choice == "3" else []
+                chat = ["", "", "", "spaces/AAA"] if choice == "3" else []
                 proc = self._interview(flags, "", chat + answers, choice=choice)
                 out = proc.stdout + proc.stderr
                 self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
@@ -6450,8 +7560,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         end = text.index("\n        ;;\n", start)
         names = ("allowed_users anthropic_api_key chat_sub_name chat_topic_name cluster_name custom_roles "
                  "enable_gvisor enable_webui gemini_api_key github_app_id github_org github_repo "
-                 "google_chat_home_channel image_tag kms_key kms_keyring model_default_name model_provider "
-                 "openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
+                 "google_chat_home_channel image_tag kms_key kms_keyring litellm_env_secret_name model_default_name "
+                 "model_provider openai_api_key openai_compatible_api_base openai_compatible_api_key openai_compatible_ca_secret_name "
                  "openai_compatible_egress_cidrs openai_compatible_target_port permission_set project_id region "
                  "repo_dir vertex_location vertex_project_id").split()
         stubs = (
@@ -11732,7 +12842,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
                       "the menu refusal does not name the pool flags it refuses")
         dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
         refusal = self.text.index("--menu takes no --scope-* flag")
-        run = self.text.index("    run_menu_system\n    exit 0")
+        run = self.text.index("    run_menu_system\n    print_next_home_channel_unset_summary\n    exit 0")
         self.assertLess(dispatch, refusal)
         self.assertLess(refusal, run)
 

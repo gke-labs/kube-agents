@@ -2869,7 +2869,7 @@ OTHER_FINDING = "apis/cloudkms.googleapis.com"
 FAILED_FINDING = "iam/failed"
 GKE_FAILED_FINDING = "gke_and_state/failed"
 GKE_FINDING = "gke/cluster/seeded-b"
-# The one finding a leased run passes with (the verifier's LEASE_SILENT_FINDINGS).
+# A finding a leased run passes with (one of the verifier's LEASE_SILENT_FINDINGS).
 SILENT_FINDING = "gke/host-otel-scope"
 FINDING_CHECK = {FINDING: "iam", OTHER_FINDING: "project_and_apis", FAILED_FINDING: "iam", GKE_FAILED_FINDING: "gke_and_state", GKE_FINDING: "gke_and_state", SILENT_FINDING: "gke_and_state"}
 FINDING_DETAIL = "The platform agent GSA is missing roles/serviceusage.serviceUsageConsumer on {project}"

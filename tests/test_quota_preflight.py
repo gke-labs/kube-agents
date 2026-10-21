@@ -71,8 +71,8 @@ _DEFAULT_LIMITS_CPU_MILLIS = 10200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8832 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23040 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
 _DEFAULT_REQUESTS_EPHEMERAL_BYTES = 5 * 1024**3
 _DEFAULT_LIMITS_EPHEMERAL_BYTES = 5 * 1024**3
 # Cleanup hook Job: 50m requested / 200m limit, 64Mi requested / 128Mi limit, 1 pod.
@@ -100,7 +100,7 @@ _LARGEST_SURGING_REQUEST_MILLIS = 100
 _OPERATOR_REQUEST_MILLIS = 10
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
-_OPERATOR_STORAGE_BYTES = 22 * 1024**3
+_OPERATOR_STORAGE_BYTES = 102 * 1024**3
 # hindsight.postgresql.storage, the volumeClaimTemplate the StatefulSet renders.
 _HINDSIGHT_STORAGE_BYTES = 8 * 1024**3
 # A memory quota written in decimal SI. 1G is 1,000,000,000 bytes, which is a whole number
@@ -118,7 +118,7 @@ _EPHEMERAL_SET_GIB = 3
 # Retain/Retain, so these two claims survive `helm uninstall` and are in `used` on the
 # next install, to be reused by name rather than created again.
 _RETAINED_PVC_COUNT = 2
-_RETAINED_STORAGE_GIB = 11
+_RETAINED_STORAGE_GIB = 51
 _MILLICORES_PER_CORE = 1000
 # The credential proxy's footprint.yaml entry (the operator's defaults), and an override
 # of the one key an install raises (#2324). The preflight merges the override over the
@@ -1108,7 +1108,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"26112Mi"', res.stderr)
+        self.assertIn('"limits.memory":"26496Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1137,7 +1137,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10880Mi"', res.stderr)
+        self.assertIn('"memory":"10944Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1157,7 +1157,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small storage shorthand quota must fail")
         self.assertIn("  - storage:", res.stderr)
-        self.assertIn('"storage":"22Gi"', res.stderr)
+        self.assertIn('"storage":"102Gi"', res.stderr)
 
     def test_the_install_patch_for_claims_does_not_double_count_retained_used(self) -> None:
         """Retained claims sitting in `used` on install must not double the suggested patch."""

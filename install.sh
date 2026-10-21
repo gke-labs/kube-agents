@@ -104,6 +104,16 @@ INSTALL_ENV_FLAGS_TYPED=""
 INSTALL_ENV_KEYS_TO_RECORD=""
 # Those keys with their companions, toggles last (resolve_install_env_record_keys).
 INSTALL_ENV_RECORD_KEYS=""
+# The keys of the GitLab token Secret, and the server-side-apply field manager
+# that writes each one. The write token is "token" (ForgeCredentialsTokenKey
+# in gitspec.go). The optional read-only token, for context repositories, is
+# "read-token". Each key has its own manager: an apply that leaves out a field
+# its manager applied before deletes that field. So a run without
+# GITLAB_READ_TOKEN_FILE never deletes the read token.
+readonly GITLAB_TOKEN_SECRET_KEY="token"
+readonly GITLAB_READ_TOKEN_SECRET_KEY="read-token"
+readonly GITLAB_TOKEN_FIELD_MANAGER="kube-agents-installer"
+readonly GITLAB_READ_TOKEN_FIELD_MANAGER="kube-agents-installer-read-token"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -376,6 +386,13 @@ bootstrap_install_env() {
   if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_APP_ID=[\"']?[0-9]" "$file" 2>/dev/null; then
     INSTALL_ENV_RECORDS_GITHUB_APP="true"
   fi
+  # The same for the App's private key path. The file is sourced after the
+  # shell's environment, so GITHUB_PEM_PATH is the file's value when the file
+  # assigns it; when it does not, the value is one the shell exported for this
+  # run, which counts as given, like --github-pem-path.
+  if grep -Eq "^[[:space:]]*(export[[:space:]]+)?GITHUB_PEM_PATH=" "$file" 2>/dev/null; then
+    INSTALL_ENV_RECORDS_GITHUB_PEM_PATH="true"
+  fi
   # stderr, not stdout. This runs at source time, before main(), so anything on
   # stdout here lands in front of whatever the caller went on to capture --
   # including a function's echoed return value when the test suite sources this
@@ -438,6 +455,10 @@ PARAM_OPENAI_COMPATIBLE_TARGET_PORT="${OPENAI_COMPATIBLE_TARGET_PORT:-}"
 PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
 PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
 PARAM_OPENAI_COMPATIBLE_API_KEY="${OPENAI_COMPATIBLE_API_KEY:-}"
+# A Secret the operator creates and the gateway reads whole as environment
+# variables: the SAP AI Core service key, another LiteLLM provider's
+# variables, or an openai_compatible gateway's OAuth2 client credentials.
+PARAM_LITELLM_ENV_SECRET_NAME="${LITELLM_ENV_SECRET_NAME:-}"
 PARAM_GITOPS_ORG="${GITOPS_ORG:-${GITHUB_ORG:-}}"
 PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
 PARAM_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
@@ -451,6 +472,9 @@ PARAM_GITOPS_FORGE="${GITOPS_FORGE:-}"
 PARAM_GITOPS_HOST="${GITOPS_HOST:-}"
 PARAM_GITLAB_TOKEN_SECRET="${GITLAB_TOKEN_SECRET:-}"
 PARAM_GITLAB_TOKEN_FILE="${GITLAB_TOKEN_FILE:-}"
+# An optional FILE with a read-only GitLab token. The broker presents it only
+# to clone context repositories. Like the token file, it is never recorded.
+PARAM_GITLAB_READ_TOKEN_FILE="${GITLAB_READ_TOKEN_FILE:-}"
 # A self-managed GitLab behind a private CA: a FILE the CA is read from, and
 # the Secret it goes into, which install.env records. The file's path is
 # never recorded. GITOPS_CA_FILE in the environment counts as an interview
@@ -479,6 +503,15 @@ PARAM_RECORDED_KMS_KEY="${KMS_KEY:-}"
 # needs another App ID, given by --github-app-id (PARAM_GITHUB_APP_ID_FROM_FLAG,
 # which --github-pem-path does not set).
 PARAM_RECORDED_GITHUB_APP_ID="${GITHUB_APP_ID:-}"
+# The private key path install.env records, and whether --github-pem-path gave
+# this run's: on a move of GitHub host the recorded path is the old App's key.
+# Only a path the file records (INSTALL_ENV_RECORDS_GITHUB_PEM_PATH): a path
+# exported in the shell is this run's.
+PARAM_RECORDED_GITHUB_PEM_PATH=""
+if [ "${INSTALL_ENV_RECORDS_GITHUB_PEM_PATH:-false}" = "true" ]; then
+  PARAM_RECORDED_GITHUB_PEM_PATH="${GITHUB_PEM_PATH:-}"
+fi
+PARAM_GITHUB_PEM_PATH_FROM_FLAG="false"
 # Left empty where installer_common.sh owns the default, the way
 # PARAM_MODEL_PROVIDER above is: resolve_shared_defaults fills them in once the
 # helpers are sourced, so no default is spelled twice.
@@ -591,10 +624,26 @@ PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
-# Empty takes DEFAULT_PLATFORM_AGENT_MODE. Seeded from install.env, so a re-run
+# Empty takes PLATFORM_AGENT_MODE_FALLBACK. Seeded from install.env, so a re-run
 # without --mode keeps the mode the file records.
 PARAM_PLATFORM_AGENT_MODE="${PLATFORM_AGENT_MODE:-}"
 PARAM_PLATFORM_AGENT_MODE_PASSED="false"
+# What an empty mode resolves to. It starts as a first install's,
+# DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE, and adopt_live_platform_agent_mode
+# moves it to the live install's once the target cluster is known: whether this
+# is a first install is the cluster's to say, not install.env's. A target tree
+# from before that default has only DEFAULT_PLATFORM_AGENT_MODE, today there.
+# Run here and again by resolve_shared_defaults: under curl | bash the
+# defaults are only in scope after the workspace step sources them. The file's
+# presence is taken here, before a first install writes one.
+INSTALL_ENV_FOUND_AT_START="false"
+if [ -n "${INSTALL_ENV_FILE:-}" ] && [ -f "$INSTALL_ENV_FILE" ]; then
+  INSTALL_ENV_FOUND_AT_START="true"
+fi
+resolve_platform_agent_mode_fallback() {
+  PLATFORM_AGENT_MODE_FALLBACK="${DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE:-${DEFAULT_PLATFORM_AGENT_MODE:-}}"
+}
+resolve_platform_agent_mode_fallback
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 # Whether --model-default-name was typed: a switch to openai_compatible does not
@@ -656,21 +705,28 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --gcp-region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
-  --mode=MODE                   The PlatformAgent's spec.mode: today | next. next also
-                                renders the NATS bus and the A2A gateway, a development
-                                stack. Recorded in install.env as PLATFORM_AGENT_MODE when
+  --mode=MODE                   The PlatformAgent's spec.mode: next | today. next renders
+                                the NATS bus and the A2A gateway in front of the agent;
+                                today is the previous stack, kept as a rollback.
+                                Recorded in install.env as PLATFORM_AGENT_MODE when
                                 the file sets none; one that sets it differently refuses
                                 the flag, so change that key instead
                                 (a mode switch: the upgrade guide's
                                 "Switching spec.mode" section)
-                                (default: DEFAULT_PLATFORM_AGENT_MODE, currently today)
+                                (default when install.env sets none: on a cluster that
+                                already runs kube-agents, the mode it runs; on a first
+                                install, DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE,
+                                currently next, or today when it mirrors its third-party
+                                images with --third-party-registry-prefix)
   --agent-namespace=NAMESPACE   Kubernetes namespace the release installs into
                                 (default: DEFAULT_NAMESPACE, currently kubeagents-system).
                                 The chart wires the agent's model-gateway endpoint to this
                                 namespace, so changing it is for CI and second installs
   --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai |
                                 openai_compatible (a server speaking the OpenAI chat
-                                completions API: vLLM, TGI, an internal gateway)
+                                completions API: vLLM, TGI, an internal gateway) |
+                                sap (SAP AI Core) | any other LiteLLM provider slug, with
+                                --model-default-name and --litellm-env-secret
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --model-max-tokens=N          Output tokens the gateway asks the provider for on a
@@ -719,6 +775,14 @@ Flags for AI Agents & Automation:
                                 under the key ca.crt; trusted for this server only
   --openai-compatible-api-key=KEY
                                 openai_compatible only: the server's API key (optional)
+  --litellm-env-secret=NAME     Secret in the agent's namespace the gateway reads whole as
+                                environment variables; you create it, the install only
+                                names it. Carries the SAP AI Core service key for
+                                --model-provider=sap (AICORE_SERVICE_KEY,
+                                AICORE_RESOURCE_GROUP), another LiteLLM provider's
+                                variables (any slug with --model-default-name), or the
+                                OAuth2 client credentials of an openai_compatible gateway
+                                (OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID, _CLIENT_SECRET)
   --gitops-org=ORG              GitHub organization of the GitOps repo (GitHub only)
   --gitops-repo=REPO            GitOps IaC repository: on GitHub its name (default:
                                 DEFAULT_GITOPS_REPO, currently gke-fleet-iac); on GitLab the
@@ -1053,6 +1117,7 @@ parse_args() {
       --openai-compatible-egress-cidrs=*) PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS="${1#*=}"; shift ;;
       --openai-compatible-ca-secret-name=*) PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME="${1#*=}"; shift ;;
       --openai-compatible-api-key=*) PARAM_OPENAI_COMPATIBLE_API_KEY="${1#*=}"; shift ;;
+      --litellm-env-secret=*) PARAM_LITELLM_ENV_SECRET_NAME="${1#*=}"; shift ;;
       --gitops-org=*) PARAM_GITOPS_ORG="${1#*=}"; shift ;;
       --gitops-repo=*) PARAM_GITOPS_REPO="${1#*=}"; shift ;;
       --gitops-forge=*) PARAM_GITOPS_FORGE="${1#*=}"; shift ;;
@@ -1061,7 +1126,7 @@ parse_args() {
       --gitlab-token-secret=*) PARAM_GITLAB_TOKEN_SECRET="${1#*=}"; shift ;;
       --gitops-ca-file=*) PARAM_GITOPS_CA_FILE="${1#*=}"; PARAM_GITOPS_CA_FILE_FROM_FLAG="true"; shift ;;
       --github-app-id=*) PARAM_GITHUB_APP_ID="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_APP_ID_FROM_FLAG="true"; shift ;;
-      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; shift ;;
+      --github-pem-path=*) PARAM_GITHUB_PEM_PATH="${1#*=}"; PARAM_GITHUB_APP_FROM_FLAG="true"; PARAM_GITHUB_PEM_PATH_FROM_FLAG="true"; shift ;;
       --kms-keyring=*) PARAM_KMS_KEYRING="${1#*=}"; shift ;;
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
@@ -1895,7 +1960,7 @@ warn_unrecorded_interview_answers() {
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET
     OPENAI_COMPATIBLE_API_BASE OPENAI_COMPATIBLE_TARGET_PORT OPENAI_COMPATIBLE_EGRESS_CIDRS OPENAI_COMPATIBLE_CA_SECRET_NAME
-    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
+    LITELLM_ENV_SECRET_NAME PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET)
   # One evaluation of the file for the whole list, in this shell, so the reads
   # below land on the cache instead of re-running whatever the file's lines run.
@@ -2183,7 +2248,8 @@ record_gitops_forge_keys() {
     fi
   fi
   # GITHUB_APP_ID with them: left in a file that now records GitLab, the next
-  # run's validator would refuse the pair.
+  # run's validator would refuse the pair. GITHUB_PEM_PATH too: a GitLab
+  # install has no App. The GitHub branch below writes it back.
   local keys=(GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH)
   # The App's KMS key too, on GitHub: an App belongs to one GitHub host, so a
   # switch of host names the new App's key (--kms-key), and the next
@@ -2211,6 +2277,15 @@ record_gitops_forge_keys() {
     write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
     write_env_var "$tmp" KMS_KEYRING "${KMS_KEYRING:-}"
     write_env_var "$tmp" KMS_KEY "${KMS_KEY:-}"
+    # The path of the App's private key, never the key: the path this run
+    # uses (--github-pem-path, the PEM prompt, or the path install.env
+    # recorded). A rewrite of the forge keys must not drop a key the operator
+    # keeps: a later run reads the path from here when it must import the key
+    # again, for example after the KMS key version is disabled. Written only
+    # when set, so a file that recorded none gets no empty line.
+    if [ -n "${GITHUB_PEM_PATH:-}" ]; then
+      write_env_var "$tmp" GITHUB_PEM_PATH "$GITHUB_PEM_PATH"
+    fi
   fi
   chmod 600 "$tmp" 2>/dev/null || true
   mv "$tmp" "$file"
@@ -2748,7 +2823,11 @@ bootstrap_install_env_file() {
   # Recorded on every first install, the default included: the file is the one
   # place a later run, and every upgrade.sh, reads the mode from, and a --mode
   # that disagrees with it is refused (check_flags_against_install_env).
-  write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  # Except a mode guessed because the cluster could not be read
+  # (adopt_live_platform_agent_mode): the next run that can read it settles it.
+  if [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" != "true" ] || [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ]; then
+    write_env_var "$tmp" PLATFORM_AGENT_MODE "${PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
+  fi
   write_env_var "$tmp" MODEL_PROVIDER "${MODEL_PROVIDER:-}"
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" MODEL_MAX_TOKENS "${MODEL_MAX_TOKENS:-}"
@@ -2777,6 +2856,7 @@ bootstrap_install_env_file() {
     write_env_var "$tmp" OPENAI_COMPATIBLE_CA_SECRET_NAME "${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
     write_secret_env_var "$tmp" OPENAI_COMPATIBLE_API_KEY "${OPENAI_COMPATIBLE_API_KEY:-}"
   fi
+  write_env_var "$tmp" LITELLM_ENV_SECRET_NAME "${LITELLM_ENV_SECRET_NAME:-}"
   write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
   write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
@@ -3167,6 +3247,7 @@ source_provisioning_helpers() {
 # cannot be: this runs in step 2, before the interview.
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
+  resolve_platform_agent_mode_fallback
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
   PARAM_PERMISSION_SET="${PARAM_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
@@ -3898,16 +3979,25 @@ ensure_existing_cluster_cmek() {
   local key_resource="projects/${project_id}/locations/${kms_location}/keyRings/${keyring}/cryptoKeys/${key}"
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
-  gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose="encryption" --project="$project_id" 2>/dev/null || true
+  local kr_err="" k_err=""
+  kr_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id")" || true
+  if printf '%s\n' "$kr_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS keyring create failed after propagation retries: $kr_err"
+    return 1
+  fi
+  k_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+    --purpose="encryption" --project="$project_id")" || true
+  if printf '%s\n' "$k_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    print_error "Cloud KMS key create failed after propagation retries: $k_err"
+    return 1
+  fi
   local project_number service_agent
   project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)")
   service_agent="service-${project_number}@container-engine-robot.iam.gserviceaccount.com"
   gcloud beta services identity create --service=container.googleapis.com --project="$project_id" 2>/dev/null || true
-  gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
+  retry_kms_create gcloud kms keys add-iam-policy-binding "$key" --keyring="$keyring" --location="$kms_location" \
     --member="serviceAccount:${service_agent}" \
-    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet >/dev/null
+    --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project="$project_id" --quiet --format=none
   print_info "Updating the live cluster control plane; this can take several minutes..."
   gcloud container clusters update "$cluster_name" --location "$region" \
     --database-encryption-key="$key_resource" --project "$project_id" --quiet
@@ -4556,7 +4646,7 @@ validate_litellm_redaction_ip_action() {
 # PLATFORM_AGENT_MODE has the --mode recorded into it when the run commits
 # (record_flags_into_install_env). Needs installer_common.sh sourced.
 validate_platform_agent_mode() {
-  local value="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  local value="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   is_valid_platform_agent_mode "$value" && return 0
   if [ "${PARAM_PLATFORM_AGENT_MODE_PASSED:-false}" = "true" ]; then
     print_error "--mode must be today or next, got '${value}'."
@@ -4567,6 +4657,156 @@ validate_platform_agent_mode() {
     print_error "PLATFORM_AGENT_MODE='${value}' is not one of today, next. Fix the PLATFORM_AGENT_MODE this shell exports."
   fi
   return 1
+}
+
+# Whether this run is a first install is the target cluster's to say, not
+# install.env's. A new checkout, another machine, or an install.env copied from
+# install.env.example has no mode recorded, and the first-install default
+# (DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE) would switch a live today install
+# to next, without a prompt under -y. So when
+# nothing chose a mode (no --mode, no exported PLATFORM_AGENT_MODE, no key in
+# install.env, all of which win) and the cluster exists, the cluster decides:
+# a PlatformAgent's spec.mode (absent is today), or, with the CR gone but the
+# kube-agents release still installed, the mode the release records (absent
+# is today), since the next apply recreates the CR from it. A cluster with
+# neither is a first install.
+#
+# The read uses a kubeconfig of its own, so the operator's kubeconfig and its
+# current context are left as they were: --dry-run and --generate-only stay
+# free of side effects. Only gcloud's NOT_FOUND is no cluster, as the tfvars
+# generator reads it (gke_describe_error_is_not_found). A cluster that cannot
+# be described or read is not guessed at as a first install, because a wrong
+# guess is a mode switch: an install.env that records no mode keeps today, as
+# it did before the cluster was asked; with no install.env, --dry-run and
+# --generate-only fall back to today with a warning, and an applying run is
+# refused. Returns 1 to refuse.
+# Needs installer_common.sh sourced and PROJECT_ID, REGION and CLUSTER_NAME
+# exported.
+adopt_live_platform_agent_mode() {
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live="" holder="" kubeconfig_dir
+  [ -n "${PARAM_PLATFORM_AGENT_MODE:-}" ] && return 0
+  # A key assigned empty is today to every front door (write_tfvars_from_state),
+  # and nothing can be recorded over it, so it is not the cluster's to decide.
+  if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    PLATFORM_AGENT_MODE_SETTLED="true"
+    PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+    return 0
+  fi
+  local describe_err="" seen="exists" why="" remedy_next="pass --mode=next" remedy_switch="Pass --mode=${PLATFORM_AGENT_MODE_FALLBACK}" remedy_choose="Pass --mode=today or --mode=next"
+  # The menu takes no --mode: its remedy is the key it applies.
+  if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
+    remedy_next="set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+    remedy_switch="Set PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} in ${INSTALL_ENV_FILE}"
+    remedy_choose="Set PLATFORM_AGENT_MODE=today or PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+  fi
+  # Only a NOT_FOUND is no cluster, as the tfvars generator reads it; any
+  # other failure is a cluster that could not be read.
+  if describe_err="$(trap - ERR; gcloud container clusters describe "$CLUSTER_NAME" --location "$REGION" \
+    --project "$PROJECT_ID" --format="value(name)" 2>&1 >/dev/null)"; then
+    kubeconfig_dir="$(mktemp -d)"
+    local -x KUBECONFIG="${kubeconfig_dir}/kubeconfig"
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" \
+      --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    read_platform_agent_install_state "$namespace"
+    rm -rf "$kubeconfig_dir"
+    # Not held for the mode notice: it was read through this function's own
+    # kubeconfig. Read by take_platform_agent_install_state.
+    # shellcheck disable=SC2034
+    PLATFORM_AGENT_READS_HELD_FOR=""
+    case "$PLATFORM_AGENT_CR_READ" in
+      "$PLATFORM_AGENT_READ_OK")
+        live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
+        holder="its PlatformAgent"
+        if [ -z "$live" ]; then
+          case "$PLATFORM_AGENT_RECORD_READ" in
+            "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+            "$PLATFORM_AGENT_READ_OK")
+              live="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
+              holder="its kube-agents release: the PlatformAgent is gone, and the next apply recreates it from the release"
+              ;;
+          esac
+        fi
+        ;;
+      "$PLATFORM_AGENT_READ_NONE") return 0 ;;
+    esac
+    why="the kubeconfig has no context '$(gke_context_name)'"
+    [ -n "${PLATFORM_AGENT_READ_ERROR:-}" ] && why="the read failed (${PLATFORM_AGENT_READ_ERROR})"
+  else
+    gke_describe_error_is_not_found "$describe_err" && return 0
+    seen="may exist"
+    why="gcloud could not describe it (${describe_err:-unknown gcloud failure})"
+  fi
+  if [ -z "$live" ]; then
+    PLATFORM_AGENT_MODE_SETTLED="true"
+    # Not recorded in install.env (queue_unrecorded_platform_agent_mode,
+    # bootstrap_install_env_file): the next run that can read the cluster
+    # settles it from there instead.
+    PLATFORM_AGENT_MODE_GUESSED="true"
+    if [ "$INSTALL_ENV_FOUND_AT_START" = "true" ]; then
+      print_warning "Cluster '${CLUSTER_NAME}' ${seen}, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. ${INSTALL_ENV_FILE} records no PLATFORM_AGENT_MODE, so this run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE}, as upgrade.sh reads that file, and records nothing. If the install runs next, stop and ${remedy_next}."
+      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+      return 0
+    fi
+    if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      print_warning "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}. This run renders spec.mode ${DEFAULT_PLATFORM_AGENT_MODE} and records no mode in install.env; applying it would switch an install that runs next. ${remedy_choose} to say which mode this install runs. An applying run would be refused."
+      PLATFORM_AGENT_MODE_FALLBACK="$DEFAULT_PLATFORM_AGENT_MODE"
+      return 0
+    fi
+    print_error "Cluster '${CLUSTER_NAME}' ${seen} and there is no install.env, but whether it already runs kube-agents, and on which spec.mode, could not be read: ${why}."
+    print_info "${remedy_choose} to say which mode this install runs, or restore access to the cluster and run again. Guessing would switch a running install's mode."
+    return 1
+  fi
+  live="$(effective_platform_agent_mode "$live")"
+  PLATFORM_AGENT_MODE_SETTLED="true"
+  [ "$live" = "$PLATFORM_AGENT_MODE_FALLBACK" ] && return 0
+  print_info "Nothing chose a spec.mode for this run (no --mode, and install.env records none), and cluster '${CLUSTER_NAME}' already runs kube-agents on spec.mode ${live} (from ${holder}), so this run keeps ${live} rather than a first install's ${PLATFORM_AGENT_MODE_FALLBACK}. ${remedy_switch} to switch it (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
+  PLATFORM_AGENT_MODE_FALLBACK="$live"
+}
+
+# A first install that mirrors its third-party images ($1, the prefix)
+# defaults to today. next's NATS bus runs two images (nats, nats-box) that
+# are the operator's compiled defaults, which neither this installer nor the
+# chart points at a mirror, so on a cluster that pulls only from the mirror
+# the bus would sit in ImagePullBackOff. Only the fallback moves: --mode, an
+# exported PLATFORM_AGENT_MODE, a recorded key and the cluster's live mode all win.
+mirrored_first_install_mode() {
+  [ -n "${1:-}" ] || return 0
+  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
+  [ "${PLATFORM_AGENT_MODE_SETTLED:-false}" = "true" ] && return 0
+  [ "$PLATFORM_AGENT_MODE_FALLBACK" = "next" ] || return 0
+  local remedy="Pass --mode=next"
+  [ "${PARAM_MENU_MODE:-false}" = "true" ] && remedy="Set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
+  print_info "This first install mirrors its third-party images (${1}), so it installs spec.mode today rather than next: next's NATS bus pulls nats and nats-box from Docker Hub, and nothing in this install points them at the mirror. ${remedy} to install next anyway."
+  PLATFORM_AGENT_MODE_FALLBACK="today"
+}
+
+# An install.env that records no PLATFORM_AGENT_MODE gets the mode this run
+# settled on, queued for record_flags_into_install_env like a typed --mode:
+# upgrade.sh reads such a file as today, so a next install it does not record
+# would be switched back by the next upgrade. A file this run cannot write is
+# named instead. A mode guessed because the cluster could not be read is not
+# recorded.
+queue_unrecorded_platform_agent_mode() {
+  local file="${INSTALL_ENV_FILE:-}"
+  [ "$INSTALL_ENV_FOUND_AT_START" = "true" ] && [ -n "$file" ] && [ -f "$file" ] || return 0
+  [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] || return 0
+  [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] && return 0
+  install_env_records_key "$file" PLATFORM_AGENT_MODE && return 0
+  if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+    print_info "${file} assigns no PLATFORM_AGENT_MODE; a run without --dry-run records the one it applies (${PLATFORM_AGENT_MODE_FALLBACK}) there."
+    return 0
+  fi
+  if [ ! -w "$file" ]; then
+    print_warning "${file} assigns no PLATFORM_AGENT_MODE and is not writable, so this run cannot record spec.mode ${PLATFORM_AGENT_MODE_FALLBACK} there; upgrade.sh reads a file with no key as ${DEFAULT_PLATFORM_AGENT_MODE}. Add PLATFORM_AGENT_MODE=${PLATFORM_AGENT_MODE_FALLBACK} to it."
+    return 0
+  fi
+  case " ${INSTALL_ENV_KEYS_TO_RECORD} " in
+    *" PLATFORM_AGENT_MODE "*) ;;
+    *) INSTALL_ENV_KEYS_TO_RECORD="${INSTALL_ENV_KEYS_TO_RECORD}${INSTALL_ENV_KEYS_TO_RECORD:+ }PLATFORM_AGENT_MODE" ;;
+  esac
 }
 
 # The openai_compatible questions, shared by step 7 and the Day-2 menu: the
@@ -4582,13 +4822,82 @@ validate_platform_agent_mode() {
 # environment is this run's own answer.
 # $1 the provider, $2 the model so far, $3 whether --model-default-name was
 # typed, $4 the recorded MODEL_PROVIDER.
+# The same holds for any other provider with no default model (a LiteLLM
+# provider slug outside the table): the recorded model belongs to the old
+# provider, and validate_model_provider_inputs then asks for one.
 openai_compatible_model_for_run() {
   local provider="${1:-}" model="${2:-}" passed="${3:-false}" recorded="${4:-}"
-  if [ "$provider" = "openai_compatible" ] && [ -n "$recorded" ] &&
-    [ "$recorded" != "openai_compatible" ] && [ "$passed" != "true" ]; then
+  # Which providers have no default: openai_compatible always, and a slug
+  # outside the table once installer_common.sh (sourced at step 2) can say so.
+  local no_default=false
+  if [ "$provider" = "openai_compatible" ]; then
+    no_default=true
+  elif declare -F is_table_model_provider >/dev/null && ! is_table_model_provider "$provider"; then
+    no_default=true
+  fi
+  if [ "$no_default" = "true" ] && [ -n "$recorded" ] &&
+    [ "$recorded" != "$provider" ] && [ "$passed" != "true" ]; then
     model=""
   fi
   printf '%s\n' "$model"
+}
+
+# The sixth provider entry: SAP AI Core or any other LiteLLM provider slug,
+# with its credentials in a Secret the operator creates. Asks the slug, the
+# model (prefilled with the slug's default when there is one, or with the
+# model already pinned for that same slug) and the Secret's name. A typo is
+# asked again only while someone can answer: without a controlling tty, or
+# under --non-interactive, prompt_read answers with the default every time,
+# so the function returns 1 instead of waiting for a better answer that
+# cannot come, and the caller stops or goes back to its menu. $1..$3 the
+# names of the caller's provider, model and Secret-name variables.
+prompt_litellm_env_secret_provider() {
+  local provider_var="$1" model_var="$2" secret_name_var="$3"
+  local provider_was="${!provider_var}" model_was="${!model_var}" provider="" model=""
+  local can_retry=true
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ] || ! has_controlling_tty; then
+    can_retry=false
+  fi
+  # A table provider other than sap is not this entry's: start at sap.
+  provider="$provider_was"
+  if is_table_model_provider "$provider" && [ "$provider" != "sap" ]; then
+    provider="sap"
+  fi
+  while :; do
+    prompt_read "LiteLLM provider slug (sap, azure, bedrock, databricks, ...)" provider "$provider"
+    if is_valid_model_provider "$provider" && { [ "$provider" = "sap" ] || ! is_table_model_provider "$provider"; }; then
+      break
+    fi
+    # The other table providers have their own entries, with their own
+    # credential prompts; accepting them here would skip those.
+    if is_table_model_provider "$provider"; then
+      print_error "'${provider}' has its own entry in the provider menu; this entry is for sap and any other LiteLLM provider slug."
+    elif [ "$provider" = "chatgpt" ]; then
+      print_error "'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
+    else
+      print_error "'${provider}' is not a LiteLLM provider slug (lowercase letters, digits and underscores)."
+    fi
+    [ "$can_retry" = "true" ] || return 1
+  done
+  model="$(default_model_for_provider "$provider")"
+  if [ "$provider" = "$provider_was" ] && [ -n "$model_was" ]; then
+    model="$model_was"
+  fi
+  while :; do
+    prompt_read "Model name the provider serves" model "$model"
+    [ -z "$model" ] || break
+    print_error "A model name is required: the installer has no default for ${provider}."
+    [ "$can_retry" = "true" ] || return 1
+  done
+  local secret_name="${!secret_name_var}"
+  while :; do
+    prompt_read "Secret in the agent's namespace holding the provider's credentials (you create it)" secret_name "$secret_name"
+    validate_litellm_env_secret_name "$secret_name" && break
+    [ "$can_retry" = "true" ] || return 1
+  done
+  printf -v "$provider_var" '%s' "$provider"
+  printf -v "$model_var" '%s' "$model"
+  printf -v "$secret_name_var" '%s' "$secret_name"
 }
 
 prompt_openai_compatible_settings() {
@@ -4816,23 +5125,25 @@ validate_gitops_forge_flags() {
     case "$PARAM_GITLAB_TOKEN_FILE" in
       \~/*) PARAM_GITLAB_TOKEN_FILE="${HOME}/${PARAM_GITLAB_TOKEN_FILE#\~/}" ;;
     esac
-    if [ ! -r "$PARAM_GITLAB_TOKEN_FILE" ] || [ -d "$PARAM_GITLAB_TOKEN_FILE" ]; then
-      print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is not readable."
+    check_gitlab_token_source "--gitlab-token-file" "$PARAM_GITLAB_TOKEN_FILE" || return 1
+  fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    case "$PARAM_GITLAB_READ_TOKEN_FILE" in
+      \~/*) PARAM_GITLAB_READ_TOKEN_FILE="${HOME}/${PARAM_GITLAB_READ_TOKEN_FILE#\~/}" ;;
+    esac
+    check_gitlab_token_source "GITLAB_READ_TOKEN_FILE" "$PARAM_GITLAB_READ_TOKEN_FILE" || return 1
+    # One source for both tokens is refused. A stream such as /dev/stdin
+    # cannot carry two tokens, and one file would store the write token as the
+    # read token. -ef also catches a second name for the same file or stream.
+    if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ] && {
+      [ "$PARAM_GITLAB_TOKEN_FILE" = "$PARAM_GITLAB_READ_TOKEN_FILE" ] ||
+        [ "$PARAM_GITLAB_TOKEN_FILE" -ef "$PARAM_GITLAB_READ_TOKEN_FILE" ] || {
+        gitlab_token_source_is_stdin "$PARAM_GITLAB_TOKEN_FILE" &&
+          gitlab_token_source_is_stdin "$PARAM_GITLAB_READ_TOKEN_FILE"
+      }
+    }; then
+      print_error "--gitlab-token-file ('${PARAM_GITLAB_TOKEN_FILE}') and GITLAB_READ_TOKEN_FILE ('${PARAM_GITLAB_READ_TOKEN_FILE}') name the same source. Give each token its own file or stream."
       return 1
-    fi
-    # A regular file can be read now and again after the apply, so an empty
-    # one stops the run here, before anything is built. A one-shot source
-    # (/dev/stdin, /dev/fd/N, a process substitution) is not read here: a read
-    # can use it up, so create_gitlab_token_secret checks it after the apply.
-    if gitops_source_is_rereadable "$PARAM_GITLAB_TOKEN_FILE"; then
-      local early_token=""
-      IFS= read -r -d '' early_token <"$PARAM_GITLAB_TOKEN_FILE" || true
-      early_token="$(gitlab_token_strip "$early_token")"
-      if [ -z "$early_token" ]; then
-        print_error "--gitlab-token-file '${PARAM_GITLAB_TOKEN_FILE}' is empty."
-        return 1
-      fi
-      early_token=""
     fi
   fi
   # A private CA is for a self-managed host only: gitlab.com presents a
@@ -4855,6 +5166,38 @@ validate_gitops_forge_flags() {
     fi
   fi
   validate_gitops_ca_inputs "${DEFAULT_GITOPS_CA_SECRET:-gitlab-forge-ca}"
+}
+
+# True when PATH is one of the literal names of this process's standard input.
+# Two such names are one stream even where -ef cannot tell (a pipe on stdin).
+gitlab_token_source_is_stdin() {
+  case "$1" in
+    /dev/stdin | /dev/fd/0 | /proc/self/fd/0) return 0 ;;
+  esac
+  return 1
+}
+
+# Checks the GitLab token source PATH, which messages call LABEL: it must be
+# readable and not a directory. A regular file can be read now and again after
+# the apply, so an empty one stops the run here, before anything is built. A
+# one-shot source (/dev/stdin, /dev/fd/N, a process substitution) is not read
+# here: a read can use it up, so the Secret's writer checks it after the apply.
+check_gitlab_token_source() {
+  local label="$1" path="$2"
+  if [ ! -r "$path" ] || [ -d "$path" ]; then
+    print_error "${label} '${path}' is not readable."
+    return 1
+  fi
+  if gitops_source_is_rereadable "$path"; then
+    local early_token=""
+    IFS= read -r -d '' early_token <"$path" || true
+    early_token="$(gitlab_token_strip "$early_token")"
+    if [ -z "$early_token" ]; then
+      print_error "${label} '${path}' is empty."
+      return 1
+    fi
+    early_token=""
+  fi
 }
 
 # The checks a private CA's inputs get on either forge: the CA file is
@@ -4915,6 +5258,10 @@ validate_github_forge_flags() {
     print_error "--gitlab-token-file applies only with --gitops-forge=gitlab."
     return 1
   fi
+  if [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    print_error "GITLAB_READ_TOKEN_FILE applies only with --gitops-forge=gitlab."
+    return 1
+  fi
   case "${PARAM_GITOPS_HOST:-}" in
     github.com|www.github.com|ssh.github.com)
       print_info "'${PARAM_GITOPS_HOST}' is github.com, the default GitHub host: this run's GitOps forge is github.com."
@@ -4939,6 +5286,14 @@ validate_github_forge_flags() {
         [ "${PARAM_KMS_KEYRING:-$default_ring}/${PARAM_KMS_KEY:-$default_key}" = "${PARAM_RECORDED_KMS_KEYRING:-$default_ring}/${PARAM_RECORDED_KMS_KEY:-$default_key}" ]; }; then
       print_error "This install's GitHub App was created on ${recorded_host:-github.com}, and an App belongs to one GitHub host. To move the install to ${host:-github.com}, give the App on that host with --github-app-id (its App ID, not the recorded one) and --github-pem-path, and a new Cloud KMS key for its private key with --kms-key (INSTALL.md, \"Switch between github.com and a GitHub Enterprise Server\")."
       return 1
+    fi
+    # The recorded private key path is the old App's key. Imported into the
+    # new key, it would sign as the old App, so a move that gives no
+    # --github-pem-path imports nothing and records no path.
+    if [ "$host" != "$recorded_host" ] && [ "${PARAM_GITHUB_PEM_PATH_FROM_FLAG:-false}" != "true" ] &&
+      [ -n "${PARAM_GITHUB_PEM_PATH:-}" ] && [ "$PARAM_GITHUB_PEM_PATH" = "${PARAM_RECORDED_GITHUB_PEM_PATH:-}" ]; then
+      print_info "Dropping the recorded GITHUB_PEM_PATH: it is the private key of the App on ${recorded_host:-github.com}. Give the new App's key with --github-pem-path."
+      PARAM_GITHUB_PEM_PATH=""
     fi
   fi
   if [ -z "$host" ]; then
@@ -5006,7 +5361,9 @@ gitops_ca_pem_problem() {
   fi
 }
 
-# Writes the token on stdin into Secret NAME, key `token`. Server-side apply,
+# Writes the token on stdin into Secret NAME, under KEY, as field manager
+# MANAGER. The object sent holds KEY alone, so the apply leaves the other key
+# as it is (see GITLAB_TOKEN_FIELD_MANAGER). Server-side apply,
 # because a client-side apply copies the whole object, token included, into
 # the kubectl.kubernetes.io/last-applied-configuration annotation, where
 # anyone who can read the Secret's metadata reads it again. Both kubectl
@@ -5014,14 +5371,14 @@ gitops_ca_pem_problem() {
 # was sent, and that object carries the token. A failure prints a fixed
 # message and kubectl's exit codes, never kubectl's text.
 apply_gitlab_token_secret() {
-  local name="$1" namespace="$2" context="$3"
+  local name="$1" namespace="$2" context="$3" key="$4" manager="$5"
   kubectl create secret generic "$name" -n "$namespace" --context "$context" \
-    --from-file=token=/dev/stdin --dry-run=client -o yaml 2>/dev/null |
-    kubectl apply --server-side --force-conflicts --field-manager=kube-agents-installer \
+    --from-file="${key}=/dev/stdin" --dry-run=client -o yaml 2>/dev/null |
+    kubectl apply --server-side --force-conflicts --field-manager="$manager" \
       -n "$namespace" --context "$context" -f - >/dev/null 2>&1
   local rcs=("${PIPESTATUS[@]}")
   if [ "${rcs[0]}" -ne 0 ] || [ "${rcs[1]}" -ne 0 ]; then
-    print_error "Could not write the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
+    print_error "Could not write key '${key}' of the GitLab token Secret '${name}' in namespace ${namespace} (kubectl exit codes: create ${rcs[0]}, apply ${rcs[1]}). kubectl's output is withheld because it can carry the token."
     return 1
   fi
 }
@@ -5207,7 +5564,8 @@ restart_github_minter_for_ca() {
   fi
 }
 
-# Creates (or replaces) the Secret the GitLab forge's credentialsRef names, in
+# Writes the `token` key of the Secret the GitLab forge's credentialsRef names
+# (field manager GITLAB_TOKEN_FIELD_MANAGER, so a read-token key stays), in
 # the agent's namespace, after the apply has made the namespace. The token
 # reaches kubectl through a pipe -- read from the named source, or from a
 # no-echo prompt, into a local that is cleared at once -- so it is never in
@@ -5218,7 +5576,10 @@ create_gitlab_token_secret() {
   local namespace="$1" context="$2"
   local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
   local exists="false" token="" rc=0
-  if kubectl get secret "$name" -n "$namespace" --context "$context" >/dev/null 2>&1; then
+  # The write token's key, not the Secret: a Secret that holds only the
+  # read-token key has no write token to keep.
+  if [ -n "$(kubectl get secret "$name" -n "$namespace" --context "$context" \
+    -o "jsonpath={.data.${GITLAB_TOKEN_SECRET_KEY}}" 2>/dev/null)" ]; then
     exists="true"
   fi
   if [ -n "${PARAM_GITLAB_TOKEN_FILE:-}" ]; then
@@ -5230,7 +5591,7 @@ create_gitlab_token_secret() {
       print_error "The GitLab token source '${PARAM_GITLAB_TOKEN_FILE}' is empty; nothing was stored."
       return 1
     fi
-    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+    printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
     token=""
     unset token
     [ "$rc" -eq 0 ] || return 1
@@ -5266,11 +5627,34 @@ create_gitlab_token_secret() {
     print_warning "No token entered; nothing was stored. Create Secret '${name}' later (see the install guide)."
     return 0
   fi
-  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" || rc=$?
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_TOKEN_SECRET_KEY" "$GITLAB_TOKEN_FIELD_MANAGER" || rc=$?
   token=""
   unset token
   [ "$rc" -eq 0 ] || return 1
   print_success "GitLab token stored in Secret '${name}' (namespace ${namespace})."
+}
+
+# Writes the read-only token from GITLAB_READ_TOKEN_FILE into the key
+# "read-token" of the same Secret. The broker presents it only to clone
+# context repositories, never on a write. The token travels as in
+# create_gitlab_token_secret. Without a file, nothing is applied, so an
+# existing read token stays in place.
+create_gitlab_read_token_secret() {
+  local namespace="$1" context="$2"
+  local name="${GITLAB_TOKEN_SECRET:-${DEFAULT_GITLAB_TOKEN_SECRET:-gitlab-forge-token}}"
+  local token="" rc=0
+  [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ] || return 0
+  IFS= read -r -d '' token <"$PARAM_GITLAB_READ_TOKEN_FILE" || true
+  token="$(gitlab_token_strip "$token")"
+  if [ -z "$token" ]; then
+    print_error "The GitLab read token source '${PARAM_GITLAB_READ_TOKEN_FILE}' is empty; nothing was stored."
+    return 1
+  fi
+  printf '%s' "$token" | apply_gitlab_token_secret "$name" "$namespace" "$context" "$GITLAB_READ_TOKEN_SECRET_KEY" "$GITLAB_READ_TOKEN_FIELD_MANAGER" || rc=$?
+  token=""
+  unset token
+  [ "$rc" -eq 0 ] || return 1
+  print_success "GitLab read token stored in Secret '${name}', key ${GITLAB_READ_TOKEN_SECRET_KEY} (namespace ${namespace})."
 }
 
 # Validates that non-interactive minter configuration has either an ENABLED KMS key
@@ -5545,23 +5929,34 @@ import_github_pem() {
   # "already exists" is the expected answer — would print two fatal-looking
   # abort banners and leave a FAILED install report behind mid-run.
   local kms_ring_err="" kms_key_err=""
-  kms_ring_err="$(trap - ERR; gcloud kms keyrings create "$keyring" --location="$kms_location" \
-    --project="$project_id" 2>&1)" || true
+  kms_ring_err="$(trap - ERR; retry_kms_create gcloud kms keyrings create "$keyring" --location="$kms_location" \
+    --project="$project_id")" || true
 
   # --skip-initial-version-creation is required, not optional: KMS answers
   # `INVALID_ARGUMENT: Import-only keys must skip initial version creation` without
   # it. It matches skip_initial_version_creation in terraform/modules/github-minter,
   # which is where the key normally comes from.
-  kms_key_err="$(trap - ERR; gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-    --import-only --skip-initial-version-creation \
-    --protection-level=software --project="$project_id" 2>&1)" || true
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_key_err="skipped: keyring creation exhausted Cloud KMS API propagation retry budget"
+  else
+    kms_key_err="$(trap - ERR; retry_kms_create gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
+      --import-only --skip-initial-version-creation \
+      --protection-level=software --project="$project_id")" || true
+  fi
 
   # The assertion, not the create, is what makes a failure visible. Whatever went
   # wrong above, the import cannot work without this key, and saying so here names
   # the cause instead of leaving a confusing failure two steps later.
-  if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
-    --project="$project_id" >/dev/null 2>&1; then
+  local kms_describe_failed=0
+  if printf '%s\n' "$kms_ring_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN" || \
+     printf '%s\n' "$kms_key_err" | grep -Eq "$KMS_API_PROPAGATION_PATTERN"; then
+    kms_describe_failed=1
+  elif ! retry_kms_create gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" \
+    --project="$project_id" >/dev/null; then
+    kms_describe_failed=1
+  fi
+  if [ "$kms_describe_failed" -ne 0 ]; then
     # Deliberately says "could not be confirmed" rather than "does not exist":
     # describe also fails on an IAM denial for cloudkms.cryptoKeys.get or an API
     # blip, and asserting absence from that would be stating more than was
@@ -5653,6 +6048,7 @@ run_menu_system() {
   local openai_compatible_egress_cidrs="${OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
   local openai_compatible_ca_secret_name="${OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
   local openai_compatible_api_key="${OPENAI_COMPATIBLE_API_KEY:-}"
+  local litellm_env_secret_name="${LITELLM_ENV_SECRET_NAME:-}"
   local google_chat_enabled="${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   local google_chat_home_channel="${GOOGLE_CHAT_HOME_CHANNEL:-}"
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
@@ -5703,7 +6099,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "openai_compatible" ] && echo " @ ${openai_compatible_api_base}" || echo "")$([ -n "$litellm_env_secret_name" ] && echo " (credentials Secret: ${litellm_env_secret_name})" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -5744,8 +6140,13 @@ run_menu_system() {
             fi
             prompt_read "Allowed Google Chat User Emails (comma-separated, empty allows all users)" \
               allowed_users "$allowed_users" false "$gchat_users_hint"
-            prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-              google_chat_home_channel "$google_chat_home_channel"
+            if [ "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" = "next" ]; then
+              prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            else
+              prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+                google_chat_home_channel "$google_chat_home_channel"
+            fi
             ;;
           2) slack_enabled="true" ;;
           3) google_chat_enabled="false"; slack_enabled="false" ;;
@@ -5759,6 +6160,7 @@ run_menu_system() {
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
           "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
+          "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
           m_opt
         case "$m_opt" in
           1)
@@ -5796,6 +6198,11 @@ run_menu_system() {
             prompt_openai_compatible_settings model_default_name openai_compatible_api_base \
               openai_compatible_target_port openai_compatible_egress_cidrs \
               openai_compatible_api_key openai_compatible_ca_secret_name
+            ;;
+          6)
+            # Back to the menu on an answer nobody can correct; the provider
+            # is unchanged.
+            prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || continue
             ;;
         esac
         ;;
@@ -5848,11 +6255,34 @@ run_menu_system() {
         # the menu on failure.
         validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
           "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || continue
+        validate_model_provider_inputs "$model_provider" "$model_default_name" || continue
+        validate_litellm_env_secret_name "$litellm_env_secret_name" || continue
+        # The chat screen's home channel, which the home-channel warning below
+        # reads; save_env_var exports it again when it writes install.env.
+        export GOOGLE_CHAT_HOME_CHANNEL="$google_chat_home_channel"
+        # An install.env with no mode key (one copied from install.env.example
+        # onto a running install) would render today here, switching a next
+        # install back with nothing asked. The mode is settled from the
+        # cluster as main() does, and saved with the rest; a guess (a cluster
+        # that cannot be read) is rendered as today and not saved.
+        local menu_mode_to_save=""
+        if ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+          PARAM_PLATFORM_AGENT_MODE="" PLATFORM_AGENT_MODE_GUESSED="false" PLATFORM_AGENT_MODE_SETTLED="false"
+          resolve_platform_agent_mode_fallback
+          PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
+            adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || return 1
+          # The menu has no flag, so the recorded prefix is the mirror.
+          local menu_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+          mirrored_first_install_mode "${menu_third_party_prefix%/}"
+          export PLATFORM_AGENT_MODE="$PLATFORM_AGENT_MODE_FALLBACK"
+          [ "${PLATFORM_AGENT_MODE_GUESSED:-false}" = "true" ] || menu_mode_to_save="$PLATFORM_AGENT_MODE_FALLBACK"
+        fi
         # Before anything is saved: this apply renders PLATFORM_AGENT_MODE
         # from install.env, and if Slack moves to the A2A gateway under next,
         # the settings it cannot use are refused (and again after the
         # generator, for a bot token it recovers from the live Secret).
         refuse_next_slack_gateway_settings_from_env || return 1
+        warn_next_home_channel_unset_from_env
         # Kept until the check after the generator has passed, so that a
         # refusal there puts install.env back as it was.
         # The copy holds install.env's credentials, so it is 0600 under a
@@ -5898,6 +6328,7 @@ run_menu_system() {
           save_env_var OPENAI_COMPATIBLE_CA_SECRET_NAME "$openai_compatible_ca_secret_name"
           save_secret_env_var OPENAI_COMPATIBLE_API_KEY "$openai_compatible_api_key"
         fi
+        save_env_var LITELLM_ENV_SECRET_NAME "$litellm_env_secret_name"
         save_env_var ALLOWED_USERS "$allowed_users"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
@@ -5915,6 +6346,9 @@ run_menu_system() {
         save_env_var GITHUB_APP_ID "$github_app_id"
         save_env_var KMS_KEYRING "$kms_keyring"
         save_env_var KMS_KEY "$kms_key"
+        if [ -n "$menu_mode_to_save" ]; then
+          save_env_var PLATFORM_AGENT_MODE "$menu_mode_to_save"
+        fi
         print_success "Updated configuration saved to: $INSTALL_ENV_FILE"
 
         # One engine for every kind of change: a full terraform apply
@@ -5969,7 +6403,8 @@ run_menu_system() {
         gcloud container clusters get-credentials "$cluster_name" --location "$REGION" \
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
-        # A live GitHub minter this render would destroy (#3075).
+        # A live GitHub minter this render would destroy (#3075), or a GitOps
+        # repository it would drop beside a minter this install did not make.
         refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE" || exit 1
         # The menu edits no mode key, but an install.env edited by hand since
         # the last apply reaches the cluster through this apply too, with no
@@ -6070,6 +6505,7 @@ main() {
       exit 1
     fi
     run_menu_system
+    print_next_home_channel_unset_summary
     exit 0
   fi
 
@@ -6388,6 +6824,16 @@ main() {
   fi
   print_success "Selected Cluster Name: ${C_BOLD}${cluster_name}${C_RESET}"
 
+  # Settled before step 6, whose prompts and Slack refusals follow the mode:
+  # a run where nothing chose a mode, against a cluster that already runs
+  # kube-agents, keeps the mode it runs; a mirrored first install defaults to
+  # today; and an install.env with no mode key records the result. The target
+  # is known from here; the exports come later.
+  PROJECT_ID="$project_id" CLUSTER_NAME="$cluster_name" REGION="$region" \
+    adopt_live_platform_agent_mode "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
+  mirrored_first_install_mode "${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"
+  queue_unrecorded_platform_agent_mode
+
   # 6. Chat & Messaging Platform Integration
   print_step "6. Chat & Messaging Integrations Setup"
   # The option the loaded configuration already corresponds to. It is a
@@ -6505,7 +6951,7 @@ main() {
     # so and ask again on an answer the gateway cannot use, rather than let
     # the refusal after this step throw the interview away. A run with nobody
     # to ask keeps its values, and that refusal is its check.
-    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" true "$google_chat_enabled"; then
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true "$google_chat_enabled"; then
       _prompt_slack_settings_for_gateway
       return 0
     fi
@@ -6554,15 +7000,17 @@ main() {
       slack_allowed_hint=""
     done
     while :; do
-      prompt_read "Slack Home Channel ID (optional, a channel ID such as C0123456789)" \
+      prompt_read "Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)" \
         slack_home_channel "$slack_home_channel"
       bad="$(slack_home_channel_not_an_id "$slack_home_channel")"
-      { [ -n "$bad" ] && $can_ask; } || break
-      print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
-      # Not the re-ask's default: the value is optional, and prompt_read
-      # turns an empty answer into the default, so a bad one could never be
-      # cleared.
-      slack_home_channel=""
+      if [ -n "$bad" ] && $can_ask; then
+        print_error "'${bad}' is not a Slack channel id (C... or G...). The id is at the bottom of the channel details' About tab."
+        # Not the re-ask's default: prompt_read turns an empty answer into
+        # the default, so a bad one could never be cleared.
+        slack_home_channel=""
+        continue
+      fi
+      _confirm_no_home_channel SLACK_HOME_CHANNEL "$slack_home_channel" "$can_ask" && break
     done
     prompt_read "Slack Home Channel Name (optional, e.g. #gke-alerts)" \
       slack_home_channel_name "$slack_home_channel_name"
@@ -6591,8 +7039,35 @@ main() {
     fi
     chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
-    prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
-      google_chat_home_channel "$google_chat_home_channel"
+    if [ "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" != "next" ]; then
+      prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      return 0
+    fi
+    local can_ask=true
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      can_ask=false
+    fi
+    while :; do
+      prompt_read "Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)" \
+        google_chat_home_channel "$google_chat_home_channel"
+      _confirm_no_home_channel GOOGLE_CHAT_HOME_CHANNEL "$google_chat_home_channel" "$can_ask" && break
+    done
+  }
+
+  # Under next the A2A gateway posts alerts and reports only to a home
+  # channel (#3320). An empty answer is allowed, after a warning and a yes:
+  # true to keep the answer, false to ask again. $1 the key, $2 the answer,
+  # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
+  # the warning before the apply and the closing summary say it then.
+  _confirm_no_home_channel() {
+    local home keep=""
+    home="$(trim_go_space "${2:-}")"
+    [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
+    print_warning "$(next_home_channel_unset_message "$1")"
+    prompt_read "Continue without a home channel, so alerts and reports are dropped? (y/N)" keep "n"
+    case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
+    return 1
   }
 
   # Both chat platforms are opt-in and default off, so this is the common
@@ -6664,7 +7139,7 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
-      print_info "With --mode=next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
+      print_info "Under spec.mode next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;
@@ -6680,14 +7155,18 @@ main() {
   # Secret is checked after it. A --dry-run applies nothing, so it is warned
   # there instead, once, with the recovered token included.
   if [ "$PARAM_DRY_RUN" != "true" ]; then
-    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
+    refuse_next_slack_gateway_settings "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" "$slack_enabled" "$google_chat_enabled" "$slack_allowed_users" "$slack_home_channel" "$slack_bot_token" flags || exit 1
   fi
 
   # 7. LLM Model Provider Selection & API Key Auto-Discovery
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, or openai_compatible."
+    if [ "$model_provider" = "chatgpt" ]; then
+      print_error "Model provider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store the chart does not ship. Use openai with an API key."
+    else
+      print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, openai_compatible, sap, or a LiteLLM provider slug (lowercase letters, digits and underscores) with --model-default-name."
+    fi
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
@@ -6716,7 +7195,7 @@ main() {
   fi
   # The mode was checked at step 2, before check_flags_against_install_env
   # held --mode to install.env (validate_platform_agent_mode).
-  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
+  local platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   # The scoped service account pool, checked here for the same reason as the
   # toggle above: a misspelt switch is refused rather than read as off, and a
   # cap the module would refuse is named with its key before the interview.
@@ -6756,6 +7235,7 @@ main() {
   local openai_compatible_egress_cidrs="${PARAM_OPENAI_COMPATIBLE_EGRESS_CIDRS:-}"
   local openai_compatible_ca_secret_name="${PARAM_OPENAI_COMPATIBLE_CA_SECRET_NAME:-}"
   local openai_compatible_api_key="${PARAM_OPENAI_COMPATIBLE_API_KEY:-}"
+  local litellm_env_secret_name="${PARAM_LITELLM_ENV_SECRET_NAME:-}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
@@ -6768,6 +7248,8 @@ main() {
       openai) model_choice="3" ;;
       anthropic) model_choice="4" ;;
       openai_compatible) model_choice="5" ;;
+      # sap, and any other LiteLLM provider slug.
+      *) model_choice="6" ;;
     esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
@@ -6775,6 +7257,7 @@ main() {
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
       "OpenAI-compatible server (vLLM, TGI, an internal gateway; you name the model)" \
+      "SAP AI Core, or another LiteLLM provider (sap, azure, bedrock, ...; credentials in a Secret you create)" \
       model_choice
 
     # A model the install already pins survives a re-run that leaves the
@@ -6828,9 +7311,16 @@ main() {
           openai_compatible_target_port openai_compatible_egress_cidrs \
           openai_compatible_api_key openai_compatible_ca_secret_name
         ;;
+      6)
+        prompt_litellm_env_secret_provider model_provider model_default_name litellm_env_secret_name || exit 1
+        ;;
     esac
   fi
 
+  # The chart refuses the render without these, so the run stops here, before
+  # anything is built, whatever the provider.
+  validate_model_provider_inputs "$model_provider" "$model_default_name" || exit 1
+  validate_litellm_env_secret_name "$litellm_env_secret_name" || exit 1
   case "$model_provider" in
     gemini)
       [ -n "$gemini_api_key" ] || print_warning "No Gemini API key was provided; the agent will require a credential update before model calls can succeed."
@@ -6868,6 +7358,18 @@ main() {
       validate_openai_compatible_inputs "$model_provider" "$model_default_name" "$openai_compatible_api_base" \
         "$openai_compatible_target_port" "$openai_compatible_egress_cidrs" "$openai_compatible_ca_secret_name" || exit 1
       print_info "Serving ${model_default_name} from ${openai_compatible_api_base} through the gateway."
+      if [ -n "$litellm_env_secret_name" ]; then
+        print_info "With OPENAI_COMPATIBLE_OAUTH_TOKEN_URL, _CLIENT_ID and _CLIENT_SECRET in the Secret ${litellm_env_secret_name}, the gateway exchanges them for the server's bearer token."
+      fi
+      ;;
+    *)
+      # sap, and any other LiteLLM provider slug: the credentials live in the
+      # Secret, which the install names and never creates.
+      if [ -z "$litellm_env_secret_name" ]; then
+        print_warning "No credentials Secret was named (--litellm-env-secret); the gateway cannot authenticate to ${model_provider} until one exists and a re-run names it."
+      else
+        print_info "Serving ${model_default_name} through ${model_provider}; the gateway reads its credentials from the Secret ${litellm_env_secret_name} in ${NAMESPACE:-$DEFAULT_NAMESPACE}, which must exist before the first model call."
+      fi
       ;;
   esac
 
@@ -7430,6 +7932,7 @@ main() {
   export LITELLM_REDACTION_ENABLED="$redaction_enabled"
   export LITELLM_REDACTION_IP_ACTION="$redaction_ip_action"
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
+  platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   export PLATFORM_AGENT_MODE="$platform_agent_mode"
   # The bus's two third-party images are the operator's compiled defaults
   # (A2A_NATS_IMAGE and A2A_PROVISION_IMAGE in images.json), which neither
@@ -7450,6 +7953,7 @@ main() {
   export OPENAI_COMPATIBLE_EGRESS_CIDRS="$openai_compatible_egress_cidrs"
   export OPENAI_COMPATIBLE_CA_SECRET_NAME="$openai_compatible_ca_secret_name"
   export OPENAI_COMPATIBLE_API_KEY="$openai_compatible_api_key"
+  export LITELLM_ENV_SECRET_NAME="$litellm_env_secret_name"
   export ALLOWED_USERS="$allowed_users"
   export CHAT_TOPIC_NAME="$chat_topic_name"
   export CHAT_SUB_NAME="$chat_sub_name"
@@ -7561,6 +8065,9 @@ main() {
     print_info "Removed ${tfvars_file}, which carried the refused settings, so nothing applies it."
     exit 1
   fi
+  # A chat backend the gateway holds with no home channel (#3320): a
+  # warning, never a refusal, repeated at the end of the run.
+  warn_next_home_channel_unset_from_env flags
   print_success "Terraform input saved to: $tfvars_file"
 
   # Before the summary, the confirmation and the dry-run exit alike: a
@@ -7585,6 +8092,8 @@ main() {
   fi
   # A live GitHub minter this render would destroy (#3075): an install.env
   # without the GitOps keys, and a run without the flags, renders GitOps off.
+  # Over a minter this install did not make, the check guards the GitOps
+  # repository and the chart minter's names instead.
   # Refused for a run that applies and for --generate-only, which hands its
   # tfvars to lifecycle.sh apply (as the Slack check treats it); --dry-run
   # warns. The context is the one the gate above fetched where it ran; without
@@ -7592,10 +8101,10 @@ main() {
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
     if [ "$PARAM_DRY_RUN" != "true" ]; then
       if ! refuse_apply_dropping_live_gitops "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$INSTALL_ENV_FILE"; then
-        # The tfvars just written render GitOps off; --generate-only would
-        # hand them to lifecycle.sh apply, so they go.
+        # The tfvars just written are the ones the check refused;
+        # --generate-only would hand them to lifecycle.sh apply, so they go.
         rm -f "$tfvars_file"
-        print_info "Removed ${tfvars_file}, which rendered GitOps off, so nothing applies it."
+        print_info "Removed ${tfvars_file}, which the check above refused, so nothing applies it."
         exit 1
       fi
     else
@@ -7616,6 +8125,19 @@ main() {
     mode_notice_route="$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
   fi
   announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"
+  # Under -y nothing stands between that notice and the apply, so a switch
+  # nobody chose is refused: one that comes from the fallback rather than
+  # from --mode, an exported PLATFORM_AGENT_MODE or the key install.env
+  # records (editing that key is the documented way to switch).
+  if [ "$mode_notice_route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ] \
+    && [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] \
+    && [ -z "${PARAM_PLATFORM_AGENT_MODE:-}" ] \
+    && ! install_env_records_key "$INSTALL_ENV_FILE" PLATFORM_AGENT_MODE; then
+    rm -f "$tfvars_file"
+    print_error "Refusing to switch spec.mode under -y when nothing asked for it: no --mode, and install.env records no PLATFORM_AGENT_MODE."
+    print_info "Pass --mode=today or --mode=next to say which mode this install runs, or run without -y to confirm the switch at the prompt."
+    exit 1
+  fi
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
   # project; both are checked before anything is applied, first install
@@ -7670,10 +8192,16 @@ main() {
   fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   # Named on every run, a first install included, where no switch notice
-  # fires: next is an unsupported stack, and a copied --mode=next would
-  # otherwise install it without a word before the confirmation.
+  # fires: a first install is next by default, and this is where it learns
+  # that and how to keep the previous stack instead.
   if [ "$platform_agent_mode" = "next" ]; then
-    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (unsupported development stack: the NATS bus and the A2A gateway)"
+    echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${C_BOLD}next${C_RESET} (the NATS bus and the A2A gateway in front of the agent; --mode=today on a first install, or PLATFORM_AGENT_MODE=today in install.env, installs the previous stack)"
+    # The known gap the default flip shipped with: the A2A gateway does not
+    # yet draw the board's plan layout that KAGE_SLACK_UX draws under today
+    # (docs/site concepts/chatops.md, "Slack").
+    if slack_moves_to_a2a_gateway "$platform_agent_mode" "$slack_enabled" "$google_chat_enabled"; then
+      echo -e "    ${C_YELLOW}Slack under next does not yet draw the board's plan card: each card update posts as a plain-text message of its own. Today's stack keeps the plan card.${C_RESET}"
+    fi
   else
     echo -e "  • ${C_CYAN}Component Stack (spec.mode):${C_RESET} ${platform_agent_mode}"
   fi
@@ -7682,6 +8210,9 @@ main() {
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
   elif [ "$model_provider" = "openai_compatible" ]; then
     echo -e "  • ${C_CYAN}OpenAI-compatible Server:${C_RESET} ${openai_compatible_api_base}"
+  fi
+  if [ -n "$litellm_env_secret_name" ]; then
+    echo -e "  • ${C_CYAN}Gateway Credentials Secret:${C_RESET} ${litellm_env_secret_name}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
@@ -7791,6 +8322,7 @@ main() {
     fi
     print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
     write_json_report "DRY_RUN_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -7836,6 +8368,7 @@ main() {
         print_warning "Provisioning paused by user. Install configuration: $INSTALL_ENV_FILE"
         print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
         write_json_report "PAUSED"
+        print_next_home_channel_unset_summary flags
         exit 0
         ;;
     esac
@@ -7851,6 +8384,7 @@ main() {
     record_flags_into_install_env
     print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
     write_json_report "GENERATE_ONLY_SUCCESS"
+    print_next_home_channel_unset_summary flags
     exit 0
   fi
 
@@ -7971,6 +8505,7 @@ main() {
     # Secret must exist by then.
     create_gitops_ca_secret "$namespace" "$expected_ctx" || exit 1
     create_gitlab_token_secret "$namespace" "$expected_ctx" || exit 1
+    create_gitlab_read_token_secret "$namespace" "$expected_ctx" || exit 1
   elif [ -n "${GITOPS_HOST:-}" ]; then
     # A GitHub Enterprise Server: the CA before the minter restart, which is
     # how the minter reads it. The broker reads it on each call.
@@ -8048,13 +8583,35 @@ main() {
     echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
   fi
 
+  # The checklists and the closing summary follow the mode the CR is left
+  # on, which a mode set outside this installer can keep from the key.
+  local mode_after_apply="${PLATFORM_AGENT_MODE_AFTER_APPLY:-$platform_agent_mode}"
+  # shellcheck disable=SC2034  # read by print_next_home_channel_unset_summary
+  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode_after_apply" "${slack_enabled:-false}" \
+    "${google_chat_enabled:-false}" "$slack_home_channel" "$google_chat_home_channel")"
   if [ "${google_chat_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
+    # As for Slack below.
+    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
+      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
+      GCHAT_STEPS_GOOGLE_CHAT_ENABLED="$google_chat_enabled" \
+      GCHAT_STEPS_HOME_CHANNEL="$google_chat_home_channel" \
+      GCHAT_STEPS_ALLOWED_USERS="$allowed_users" \
+      GCHAT_STEPS_TOPIC_NAME="$chat_topic_name" \
+      GCHAT_STEPS_SUB_NAME="$chat_sub_name" \
+      bash "${repo_dir}/scripts/installer/print_instructions_gchat.sh" || true
   fi
   if [ "${slack_enabled:-false}" = "true" ]; then
     echo ""
-    IMAGE_TAG="$image_tag" bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
+    # The install.env this run read, which need not be the checkout's, and
+    # what the run applied, which an interview answer install.env does not
+    # record makes differ from the file.
+    IMAGE_TAG="$image_tag" KUBE_AGENTS_INSTALL_ENV="$INSTALL_ENV_FILE" \
+      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode_after_apply" \
+      SLACK_STEPS_SLACK_ENABLED="$slack_enabled" \
+      SLACK_STEPS_GOOGLE_CHAT_ENABLED="${google_chat_enabled:-false}" \
+      SLACK_STEPS_HOME_CHANNEL="$slack_home_channel" \
+      bash "${repo_dir}/scripts/installer/print_instructions_slack.sh" || true
   fi
   # Repeated here, where the two printers above give their instructions. Arm 4
   # prints it as well, for the runs that never reach the end of main().
@@ -8062,6 +8619,7 @@ main() {
     echo ""
     _prompt_no_chat_enabled
   fi
+  print_next_home_channel_unset_summary flags
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

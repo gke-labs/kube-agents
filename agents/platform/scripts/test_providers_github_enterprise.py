@@ -52,7 +52,7 @@ OPENSSL = shutil.which("openssl")
 HOST = "ghe.mock.test"
 OTHER_HOST = "elsewhere.mock.test"
 REPO_URL = f"https://{HOST}/acme/infra"
-TOKEN = "ghs_mockinstallationtoken0001"
+TOKEN = "mock-installation-token-0001"
 FIXTURES = Path(__file__).resolve().parent / "testdata" / "providers" / "github"
 DIFF = "diff --git a/x b/x\n"
 
@@ -738,8 +738,8 @@ class ContentWorkspaceTest(unittest.TestCase):
             self.assertEqual("github.com", credential_proxy._workspace_github_host())
 
 
-WRITE_TOKEN = "ghs_mockwritetoken0002"
-READ_TOKEN = "ghs_mockreadtoken0003"
+WRITE_TOKEN = "mock-write-token-0002"
+READ_TOKEN = "mock-read-token-0003"
 EXTRAHEADER = f"http.https://{HOST}/.extraheader"
 
 
@@ -1198,6 +1198,102 @@ class BrokerHostCheckTest(unittest.TestCase):
         # A real instance on a port is still an instance.
         [forge] = providers.Registry({"forges": [{"provider": "github", "host": "ghe.example.com:8443"}]}).forges
         self.assertEqual(("http", ("ghe.example.com:8443",)), (forge.transport, forge.hosts))
+
+
+def _load_skill_script(skill: str, module: str):
+    """A skill script, loaded by path as its own tests load it."""
+    import importlib.util
+    import sys
+
+    scripts = Path(__file__).resolve().parent.parent / "skills" / skill / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    spec = importlib.util.spec_from_file_location(module, scripts / f"{module}.py")
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+class BareNameOnTheEnterpriseHostTest(unittest.TestCase):
+    """A bare `owner/name` resolves to the install's GitHub host (live finding F4).
+
+    The managed list names each repository on the instance `<host>/owner/name`.
+    A `--repo owner/name` from a cron or an operator was refused against it,
+    because `qualify` lifted a bare name to github.com only.
+    """
+
+    def state(self, entries: list[dict[str, str]], github_host: str | None = HOST) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "managed_repos").write_text(json.dumps(entries))
+        if github_host is not None:
+            (root / gitops_workspace.GITHUB_HOST_KEY).write_text(github_host + "\n")
+        patcher = mock.patch.dict(os.environ, {"GITOPS_STATE_PATH": str(root / "managed_repos")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("GITOPS_ORG", "GITHUB_ORG"):
+            os.environ.pop(name, None)
+        return root
+
+    def test_a_bare_name_qualifies_to_the_install_host(self):
+        self.state([{"type": "github", "url": f"https://{HOST}/acme/infra"}])
+        self.assertEqual([f"{HOST}/acme/infra"], gitops_workspace.get_managed_repos())
+        self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.qualify("acme/infra"))
+        # GitHub names fold case; the answer is the list's own spelling, which the gates compare.
+        self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.qualify("Acme/Infra"))
+        # A name on the host already, and a repository the list does not hold, are unchanged.
+        self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.qualify(f"{HOST}/acme/infra"))
+        self.assertEqual("acme/other", gitops_workspace.qualify("acme/other"))
+
+    def test_a_github_com_name_is_not_moved_to_the_install_host(self):
+        self.state([{"type": "github", "url": f"https://{HOST}/acme/infra"}])
+        self.assertEqual("acme/infra", gitops_workspace.qualify("github.com/acme/infra"))
+        submit_suggestion = _load_skill_script("submit-suggestion", "submit_suggestion")
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.validate_repo("github.com/acme/infra")
+        self.assertIn("not in the managed repositories list", str(caught.exception))
+
+    def test_submit_suggestion_and_the_audit_take_a_bare_repo(self):
+        self.state([{"type": "github", "url": f"https://{HOST}/acme/infra"}])
+        os.environ["GITHUB_ORG"] = "acme"
+        submit_suggestion = _load_skill_script("submit-suggestion", "submit_suggestion")
+        self.assertEqual(f"{HOST}/acme/infra", submit_suggestion.validate_repo("acme/infra"))
+        audit_report = _load_skill_script("fleet-audit", "audit_report")
+        self.assertEqual(f"{HOST}/acme/infra", audit_report.resolve_repo(repo="acme/infra"))
+
+    def test_a_workspace_and_a_lease_record_read_back_on_the_install_host(self):
+        root = self.state([{"type": "github", "url": f"https://{HOST}/acme/infra"}])
+        holder = gitops_workspace.lease_dir(root / "ws", "l")
+        holder.mkdir(parents=True)
+        gitops_workspace.write_lease(holder, "l", "acme/infra")
+        tree = holder / "acme__infra"
+        tree.mkdir()
+        self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.resolve_repo(workspace=tree))
+        self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.resolve_repo(workspace=holder))
+
+    def test_a_bare_name_two_forges_hold_stays_bare_and_is_refused(self):
+        self.state([
+            {"type": "github", "url": f"https://{HOST}/acme/infra"},
+            {"type": "gitlab", "url": "https://gitlab.example.com/acme/infra"},
+        ])
+        self.assertEqual("acme/infra", gitops_workspace.qualify("acme/infra"))
+        submit_suggestion = _load_skill_script("submit-suggestion", "submit_suggestion")
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.validate_repo("acme/infra")
+        self.assertIn("not in the managed repositories list", str(caught.exception))
+        # Each forge's repository is still taken by its host.
+        self.assertEqual(f"{HOST}/acme/infra", gitops_workspace.qualify(f"{HOST}/acme/infra"))
+        self.assertEqual("gitlab.example.com/acme/infra", gitops_workspace.qualify("gitlab.example.com/acme/infra"))
+
+    def test_a_github_com_install_qualifies_as_before(self):
+        self.state([{"type": "github", "url": "https://github.com/acme/infra"}], github_host=None)
+        self.assertEqual("acme/infra", gitops_workspace.qualify("acme/infra"))
+        self.assertEqual("acme/infra", gitops_workspace.qualify("github.com/acme/infra"))
+        # The list is passed in, so the key is the only thing that differs.
+        collided = ["github.com/acme/infra", "gitlab.com/acme/infra"]
+        self.assertEqual("github.com/acme/infra", gitops_workspace.qualify("acme/infra", collided))
+        self.assertEqual("acme/infra", gitops_workspace.qualify("acme/infra", [f"{HOST}/acme/infra"]))
 
 
 class GitHubDotComUnaffectedTest(unittest.TestCase):

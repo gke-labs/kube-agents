@@ -39,6 +39,12 @@ DELIVERY_JOB_IDS = ("oobe", "bootstrap-inventory-delivery")
 # positive allowlist so new local or request/response surfaces fail closed until
 # they explicitly implement durable delivery.
 DURABLE_CHAT_PLATFORMS = {"google_chat", "slack"}
+# Under spec.mode next every chat turn reaches Hermes through the API server,
+# relayed by the hermes-bridge, so the session names no chat. Such a turn is a
+# chat turn only when the bridge recorded a durable platform's conversation for
+# its session (_prime_conversation); any other API-server turn (the bench, curl,
+# the inject and A2A doors) has no such route and still fails closed.
+API_SERVER_PLATFORM = "api_server"
 # The legacy home-channel env var /sethome mirrors. Hermes names both durable
 # platforms' by this pattern; the thread id's is the same name plus a suffix.
 HOME_CHANNEL_ENV_FORMAT = "{}_HOME_CHANNEL"
@@ -94,7 +100,7 @@ EVAL_VARIANT_FROM_REPORT = "from_report"
 EVAL_KEY_REPORT = "report"
 # A bare file name beside the real report that nothing in onboarding reads.
 EVAL_REPORT_NAME = re.compile(r"\AINVENTORY\.bench-[a-z0-9-]+\.md\Z")
-EVAL_PLATFORM = "api_server"
+EVAL_PLATFORM = API_SERVER_PLATFORM
 # The same floor as the stack's variables.tf and scripts/validate_bench_cases.py.
 EVAL_PHRASE_MIN_LENGTH = 12
 # Longer than one case's apply, run and destroy.
@@ -111,6 +117,41 @@ SANDBOX_EXEC_MODULE = "_kube_agents_sandbox_exec"
 # The opening turn waits on this read. A slower sandbox greets as "in progress",
 # which stays true: delivery posts the report once it can read it.
 REPORT_CHECK_TIMEOUT_SECONDS = 5
+
+# The image's chat.notify helper, which reads the bridge's conversation route
+# and knows which platform's conversations the gateway serves.
+CHAT_NOTIFY_PATH = Path("/opt/defaults/scripts/chat_notify.py")
+CHAT_NOTIFY_MODULE = "_kube_agents_chat_notify"
+# The image's hand-off module, whose read_scan_marker is the one reader of the
+# sweep marker's filing time that oobe and the hand-off share.
+BOOTSTRAP_HANDOFF_PATH = Path("/opt/defaults/scripts/bootstrap_handoff.py")
+BOOTSTRAP_HANDOFF_MODULE = "_kube_agents_bootstrap_handoff"
+# The conversation the report goes to under next, read by bootstrap_delivery.py
+# (CONVERSATION_FILE there) and kept after delivery as onboarding's destination.
+# The jobs stay ``deliver: local``: the scheduler cannot post to a gateway
+# conversation, and a job origin naming one would print the report to nobody.
+CONVERSATION_FILE = "onboarding_conversation.json"
+# The conversation path's "a human has connected", in place of .user_aligned,
+# which delivery reads as "post to the job's origin". An image from before this
+# path never reads it, so a rollback leaves the report waiting, not printed.
+CONVERSATION_ALIGNED_MARKER = ".user_aligned_conversation"
+# Taken with O_EXCL for the length of one priming: each top-level message is
+# its own first turn under next, so two quick messages could otherwise both
+# greet and bind. One older than PRIMING_STALE_SECONDS is a priming that died.
+PRIMING_MARKER = ".bootstrap_priming"
+PRIMING_STALE_SECONDS = 120
+# Written by bootstrap_scan_gate.py when it files the sweep. A sweep older than
+# SCAN_MAX_AGE_SECONDS belongs to an install that ran before this path existed:
+# its first new thread would otherwise get a weeks-old report as onboarding.
+SCAN_FILED_MARKER = ".bootstrap_scan_filed"
+SCAN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+CONVERSATION_JOB_ID = "oobe"
+# Delivery's record for the bound conversation: its count of attempts that did
+# not post, and the outcome of the post that did (bootstrap_delivery.py,
+# CONVERSATION_ATTEMPTS_FILE and CONVERSATION_DONE_FILE). A new binding starts
+# both again, so a re-run is judged on its own attempts.
+CONVERSATION_ATTEMPTS_FILE = ".bootstrap_conversation_attempts.json"
+CONVERSATION_DONE_FILE = ".bootstrap_conversation_done"
 
 # The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
@@ -301,13 +342,30 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
     return None
 
 
-def _load_sandbox_exec() -> ModuleType:
-    spec = importlib.util.spec_from_file_location(SANDBOX_EXEC_MODULE, SANDBOX_EXEC_PATH)
+def _load_image_module(path: Path, name: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {SANDBOX_EXEC_PATH}")
+        raise ImportError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# Loaded once: until onboarding greets, every API-server turn reads the route.
+_chat_notify: Optional[ModuleType] = None
+# Platforms already warned about as unserved, so a mismatch logs once.
+_unserved_warned: set = set()
+
+
+def _load_chat_notify() -> ModuleType:
+    global _chat_notify
+    if _chat_notify is None:
+        _chat_notify = _load_image_module(CHAT_NOTIFY_PATH, CHAT_NOTIFY_MODULE)
+    return _chat_notify
+
+
+def _load_sandbox_exec() -> ModuleType:
+    return _load_image_module(SANDBOX_EXEC_PATH, SANDBOX_EXEC_MODULE)
 
 
 def _report_ready(data_dir: Path, name: str = REPORT_NAME) -> bool:
@@ -339,6 +397,134 @@ def _report_ready(data_dir: Path, name: str = REPORT_NAME) -> bool:
     return report is not None
 
 
+def _scan_too_old(data_dir: Path) -> bool:
+    """Whether the sweep was filed more than SCAN_MAX_AGE_SECONDS ago, by the clock oobe reads.
+
+    A marker that cannot be read, or a module that cannot be loaded, is not too old.
+    """
+    try:
+        handoff = _load_image_module(BOOTSTRAP_HANDOFF_PATH, BOOTSTRAP_HANDOFF_MODULE)
+        filed = handoff.read_scan_marker(data_dir / SCAN_FILED_MARKER)
+    except Exception as e:
+        logger.warning("Could not read %s: %s", SCAN_FILED_MARKER, e)
+        return False
+    return filed is not None and time.time() - filed[1] > SCAN_MAX_AGE_SECONDS
+
+
+def _take_priming(data_dir: Path) -> bool:
+    """Take the priming marker; False when a live priming holds it or it cannot be taken."""
+    marker = data_dir / PRIMING_MARKER
+    for _ in range(2):
+        try:
+            os.close(os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - marker.stat().st_mtime < PRIMING_STALE_SECONDS:
+                    return False
+                marker.unlink()
+                logger.warning("Removed a stale %s.", PRIMING_MARKER)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                logger.warning("Could not clear a stale %s: %s", PRIMING_MARKER, e)
+                return False
+        except OSError as e:
+            logger.warning("Could not take %s: %s", PRIMING_MARKER, e)
+            return False
+    return False
+
+
+def _write_conversation(data_dir: Path, route: Dict[str, str]) -> None:
+    target = data_dir / CONVERSATION_FILE
+    tmp = target.with_name(target.name + ".tmp")
+    record = {
+        "platform": route["platform"],
+        "conversation": route["conversation"],
+        "context_id": route["context_id"],
+        "bound_at": time.time(),
+    }
+    tmp.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(target)
+
+
+def _prime_conversation(data_dir: Path, session_id: str) -> Optional[Dict[str, str]]:
+    """Prime onboarding on an API-server first turn the hermes-bridge relayed from a chat.
+
+    The report goes to the bridge's recorded conversation through the gateway
+    (bootstrap_delivery.py, ``a2a notify --conversation``), so nothing here
+    touches a cron job's origin, ``.user_aligned`` or a Hermes home channel,
+    which under next drives nothing. Returns None, with every marker left as
+    it was, for a turn with no durable conversation or a gateway that does not
+    serve its platform's conversations.
+    """
+    try:
+        chat_notify = _load_chat_notify()
+        route = chat_notify.conversation_route(session_id)
+        served = chat_notify.gateway_platform()
+    except Exception as e:
+        logger.warning("Could not read the conversation route for %s: %s", session_id, e)
+        return None
+    if not route or route["platform"] not in DURABLE_CHAT_PLATFORMS:
+        return None
+    if served != route["platform"]:
+        if route["platform"] in _unserved_warned:
+            return None
+        _unserved_warned.add(route["platform"])
+        logger.warning(
+            "The gateway does not serve %s conversations here (%s=%r); leaving onboarding unprimed.",
+            route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV, served,
+        )
+        return None
+    if _scan_too_old(data_dir):
+        logger.info("The onboarding sweep is older than %d seconds; not priming onboarding.", SCAN_MAX_AGE_SECONDS)
+        return None
+    if not _take_priming(data_dir):
+        return None
+    try:
+        # Again under the priming marker: a turn that passed the first check
+        # while another was priming must not bind its own chat after it.
+        if (data_dir / ".bootstrap_completed").exists() or (data_dir / GREETED_MARKER).exists():
+            return None
+        try:
+            (data_dir / CONVERSATION_ATTEMPTS_FILE).unlink(missing_ok=True)
+            (data_dir / CONVERSATION_DONE_FILE).unlink(missing_ok=True)
+            _write_conversation(data_dir, route)
+        except Exception as e:
+            logger.warning("Could not record the onboarding conversation: %s", e)
+            return None
+        logger.info("Bound onboarding delivery to %s conversation %s.", route["platform"], route["conversation"])
+
+        # Before the marker and the trigger, as on the chat-platform path.
+        report_ready = _report_ready(data_dir)
+
+        try:
+            (data_dir / CONVERSATION_ALIGNED_MARKER).touch(exist_ok=True)
+        except Exception as e:
+            logger.warning("Could not touch %s: %s", CONVERSATION_ALIGNED_MARKER, e)
+            # Delivery reads the file alone as a binding; leave none behind.
+            try:
+                (data_dir / CONVERSATION_FILE).unlink(missing_ok=True)
+            except OSError as e2:
+                logger.warning("Could not remove %s: %s", CONVERSATION_FILE, e2)
+            return None
+        if trigger_job is not None:
+            try:
+                trigger_job(CONVERSATION_JOB_ID)
+            except Exception as e:
+                logger.warning("Could not trigger %s: %s", CONVERSATION_JOB_ID, e)
+        try:
+            (data_dir / GREETED_MARKER).touch(exist_ok=True)
+        except Exception as e:
+            logger.warning("Could not touch %s: %s", GREETED_MARKER, e)
+        return _greeting(data_dir, report_ready)
+    finally:
+        try:
+            (data_dir / PRIMING_MARKER).unlink()
+        except OSError:
+            pass
+
+
 def _greeting(data_dir: Path, completed: bool, home_channel_set: bool = False) -> Dict[str, str]:
     if completed:
         instructions = _load_instructions(data_dir, "scan_completed.md", _FALLBACK_COMPLETED)
@@ -357,8 +543,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     """Prime first-time onboarding on the opening interactive user turn.
 
     Runs at most ONCE per deployment, the eval seam below aside: an API-server
-    turn naming a live eval request is greeted every time. On the one human
-    turn that primes it, this:
+    turn naming a live eval request is greeted every time. Under spec.mode
+    next a chat turn arrives as an API-server turn and is primed by
+    _prime_conversation instead of the steps below. On the one human turn that
+    primes it on a chat platform, this:
       1. binds the delivery job to this chat and, only if that succeeded,
          marks ``.user_aligned`` so the delivery job may fire against a valid
          target, and makes this chat the home channel if none is configured;
@@ -389,13 +577,18 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
         if eval_request is not None:
             return _greeting(data_dir, *eval_request)
 
-    if not kwargs.get("is_first_turn", False):
+    # A bridged conversation keeps one session, so if its route could not be
+    # read (or the bridge could not record it) on the first message, a later
+    # message is the only retry: an API-server turn is checked on every turn
+    # until onboarding has greeted.
+    if not kwargs.get("is_first_turn", False) and platform_name != API_SERVER_PLATFORM:
         return None
 
     # Request/response and local surfaces have no durable adapter destination.
     # Binding delivery to an ephemeral run id makes the report disappear after
-    # the request closes, while the greeting falsely promises a follow-up.
-    if platform_name not in DURABLE_CHAT_PLATFORMS:
+    # the request closes, while the greeting falsely promises a follow-up. An
+    # API-server turn goes on only to _prime_conversation's route check.
+    if platform_name not in DURABLE_CHAT_PLATFORMS and platform_name != API_SERVER_PLATFORM:
         return None
 
     # Already delivered, or already primed by an earlier session. Either way
@@ -406,6 +599,9 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # No onboarding assets deployed -> nothing to do (not a first-time boot).
     if not any(base.exists() for base in _onboarding_dirs(data_dir)):
         return None
+
+    if platform_name == API_SERVER_PLATFORM:
+        return _prime_conversation(data_dir, session_id)
 
     # Bind delivery target BEFORE signalling human presence, so the delivery
     # job can only ever fire once it already knows where to send the report.

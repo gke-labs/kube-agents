@@ -155,9 +155,16 @@
         "modelDefaultName": {
           "type": "string"
         },
+        "envFromSecret": {
+          "type": "string"
+        },
         "maxTokens": {
           "type": "integer",
           "minimum": 0
+        },
+        "reasoningEffort": {
+          "type": "string",
+          "enum": ["", "low", "medium", "high"]
         },
         "vertex": {
           "type": "object",

@@ -624,7 +624,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
     def test_B2_no_workflow_grants_a_bot_the_ability_to_approve(self) -> None:
         """`pull-requests: write` is the permission an approval needs.
 
-        Six workflows hold it, and none can give an approval:
+        Seven workflows hold it, and none can give an approval:
 
         - auto_request_review, which requests reviewers and does not give them.
         - auto-assign-milestone: triggers on `pull_request_target: closed`
@@ -648,6 +648,15 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
           write is one comment on a pull request whose smoke run went red,
           edited in place on later runs. It explains a red; it cannot approve,
           label, or merge anything.
+        - retest-actions: `issue_comment` on a `/retest` that opens the
+          comment, from an owner, member or collaborator; `permissions: {}`
+          at the top, the grant job-scoped, checkout of the default branch
+          with `persist-credentials: false`, the two event fields passed as
+          integers through the environment. Its one pull-request write is a
+          reaction on the comment that asked; its other writes are re-runs of
+          the pull request's own failed workflow runs, under `actions: write`,
+          which execute with their original actor's privileges. It re-runs a
+          check; it cannot approve, label, or merge anything.
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
@@ -674,6 +683,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                 "ci-health.yml",
                 "coverage-comment.yml",
                 "hold-unresolved-threads.yml",
+                "retest-actions.yml",
                 "risk_classify.yml",
             ],
             sorted(set(holders)),

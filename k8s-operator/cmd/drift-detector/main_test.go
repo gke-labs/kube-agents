@@ -100,7 +100,7 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 	}
 	// nil getter: this test is about the flags reaching the classifier, and a
 	// nil getter keeps the join from being the thing under test.
-	filter, _ := newFilterFromFlags(f, nil, logDriftEvent, nil)
+	filter, _ := newFilterFromFlags(f, nil, logDriftEvent, nil, false)
 
 	if !filter.logDropped {
 		t.Error("logDropped did not reach the filter")
@@ -159,7 +159,7 @@ func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
 	// takes rather than a shortcut around buildClusterSet.
 	stub := &stubGetter{obj: managedFieldsObject()}
 	clusters := buildClusterSet(stub, directClusterIdentity(f), nil)
-	filter, join := newFilterFromFlags(f, clusters, logDriftEvent, nil)
+	filter, join := newFilterFromFlags(f, clusters, logDriftEvent, nil, false)
 
 	if got := join.Clusters(); got != 1 {
 		t.Errorf("joiner.Clusters() = %d, want 1 -- the getter did not reach the joiner", got)
@@ -211,14 +211,20 @@ func TestNewFilterFromFlagsWiresTheScope(t *testing.T) {
 	}
 	clusters := buildClusterSet(&stubGetter{obj: managedFieldsObject()}, directClusterIdentity(f), nil)
 	var got []DriftEvent
-	filter, join := newFilterFromFlags(f, clusters, func(_ context.Context, e DriftEvent) { got = append(got, e) }, nil)
+	filter, join := newFilterFromFlags(f, clusters, func(_ context.Context, e DriftEvent) { got = append(got, e) }, nil, false)
 
 	if join.scope == nil {
 		t.Fatal("joiner.scope = nil with --profiles-dir set -- the scope did not reach the joiner, and nothing is ever held")
 	}
+	if join.skipBacklog {
+		t.Error("joiner.skipBacklog set when the caller passed false")
+	}
+	if _, j := newFilterFromFlags(f, clusters, logDriftEvent, nil, true); !j.skipBacklog {
+		t.Error("joiner.skipBacklog not set when the caller passed true -- backlog records would be carded")
+	}
 	// The inject's seen set reaches the joiner through the same call.
 	injectHandler := newDriftInjectHandler(nil)
-	if _, j := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected); j.injected == nil {
+	if _, j := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected, false); j.injected == nil {
 		t.Error("joiner.injected = nil when the inject handler's hook was passed")
 	}
 	// One record from the cluster the directory names and one from a cluster
@@ -252,7 +258,7 @@ func TestNewFilterFromFlagsWiresTheScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseFlags returned error: %v", err)
 	}
-	if _, join := newFilterFromFlags(f, clusters, logDriftEvent, nil); join.scope != nil {
+	if _, join := newFilterFromFlags(f, clusters, logDriftEvent, nil, false); join.scope != nil {
 		t.Errorf("joiner.scope = %#v without --profiles-dir, want nil", join.scope)
 	}
 }

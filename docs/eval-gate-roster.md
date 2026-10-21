@@ -427,7 +427,7 @@ kept apart on purpose.
 A check the transport blinds is the scorer's business. The door's trace carries no card ids,
 no worker's entries and no results. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor, but the scorer still treats
-`worker_commands`, `worker_agents`, a `tool_called` in the `workers` or `all` scope, and a
+`worker_commands`, `worker_agents`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern as blind on
 every inject record, and a door that shows no tool-call trace leaves a `tool_called` in its
 default `router` scope nothing to read; `bench-gate` sets
@@ -481,6 +481,15 @@ into the unit before.
 `scripts/test_eval_rosters.py` pins the file's shape, that no case reuses an entry's name, and
 the set of requesting cases. The same approvers as the exclusion list, for the same reason.
 
+One thing about the lane's install differs too. That write safeguard
+(`no-github-writes-the-case-did-not-request`) charges every pull request opened in a repetition's
+window to the case in flight, and the fleet audits' automatic remediation sweep opens one on its
+own wherever a pool repository declares a workload with a `major` finding on the sweep's list, the
+fresh install's first-run chain included. So `hack/ci-deploy.sh` installs the lane's agent with
+`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in `spec.deployment.env`: the audits still run and file
+their ledgers, `finish` opens nothing nobody asked for, and a `/remediate` still works. The api
+lane keeps the sweep on, where the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
+
 ## The GitLab lane
 
 The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
@@ -500,7 +509,9 @@ takes a ledger, not that the agent publishes one; that stays a case's job once o
 nightly runs the same list once a night on its own leased project
 (`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
-GitLab.
+GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
+(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
+show in Prow only, as the dashboard has no next lane.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the
 lane arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on
@@ -517,17 +528,18 @@ goes through the same forge abstraction on both forges, so the GitHub presubmit 
 what a pull request can break in the agent; what GitLab can break on its own is the provider
 and the forge, which the nightly catches within a day and the on-demand run checks for a pull
 request that touches the provider. The file needs the normal approvers, like
-`nightly-cases.txt` and the inject-lane files: it changes what one on-demand lane and the
-nightly run, not what can red a pull request.
+`nightly-cases.txt` and the inject-lane files: it changes what one on-demand lane and the two
+nightlies run, not what can red a pull request.
 
 ## Demoting a flaky case
 
 If an admitted case reds a pull request its diff cannot explain on a graded failure,
 demote it: delete its line from `hack/eval/blocking-roster.txt` and from
-`hack/eval/presubmit-cases.txt`, add it to `hack/eval/nightly-cases.txt` with the issue as
-the `#` line above it, and reference that issue. A held-out seat has no roster name: it is
-withdrawn by moving its line back to `hack/eval/nightly-cases.txt` and deleting its
-`HELD_OUT_IN_PRESUBMIT` entry. Demotion is a same-day edit to those
+`hack/eval/presubmit-cases.txt`, add it to the sorted section of `hack/eval/nightly-cases.txt`
+with the issue as the `#` line above it (and its `DEMOTED_AFTER_THE_SPLIT` entry with `None`
+as its predecessor in `scripts/test_eval_rosters.py`), and reference that issue. A held-out
+seat has no roster name: it is withdrawn by moving its line back to that section, deleting
+its `HELD_OUT_IN_PRESUBMIT` entry and listing it in `WITHDRAWN_TO_SORTED`. Demotion is a same-day edit to those
 files — the files, not the Prow config, are deliberately the fast lever. It is the lever for rung-4 reds ONLY: a rung-1–3 red (a mutation, an
 erroring verifier, an empty record on a task that provisions nothing — a record whose
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its
@@ -548,8 +560,8 @@ de-admission window, with nobody in the loop.)
 A demoted case keeps running and reporting in the nightly; give it a hold-out entry above
 with the issue that names its re-admission condition, and date it as `demoted YYYY-MM-DD` inside its
 `- **case-name** —` bullet, the shape the entries above use — the dashboard's Cases page
-reads that phrase from those bullets for the case's "demoted" pill. That issue goes to the case's `owner:` in its
-`task.yaml` — a GitHub login, or `maintainers` for the approvers in the root `OWNERS` file —
+reads that phrase from those bullets for the case's "demoted" pill. That issue goes to the case's effective owner — its `owner:`, or
+its domain's owner ([`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md#ownership)) —
 who investigates and either fixes the case or proposes retiring it. A case whose owner does
 not answer stays demoted. The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.

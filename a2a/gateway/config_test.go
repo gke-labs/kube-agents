@@ -33,6 +33,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_ASK_TTL", "")
 	t.Setenv("A2A_SESSION_TTL", "")
 	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
+	t.Setenv("A2A_CARD_STOP", "")
+	t.Setenv("A2A_CARD_STOP_TIMEOUT", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
 	t.Setenv("A2A_DELEGATION_DEPTH_MAX", "")
@@ -495,6 +497,36 @@ func TestFromEnvFirstEventGrace(t *testing.T) {
 		t.Setenv("A2A_FIRST_EVENT_GRACE", bad)
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_FIRST_EVENT_GRACE=%q accepted", bad)
+		}
+	}
+}
+
+// TestFromEnvCardStop: the card stop is off unless exactly "true" (a rollout
+// switch, so a typo leaves the old reply), and its bound is 75s by default,
+// a Go duration, and never under the floor the bridge's own turn wait sets.
+func TestFromEnvCardStop(t *testing.T) {
+	setBaseEnv(t)
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CardStop || cfg.CardStopTimeout != 75*time.Second {
+		t.Fatalf("defaults: CardStop %v, CardStopTimeout %v; want off and 75s", cfg.CardStop, cfg.CardStopTimeout)
+	}
+	for value, want := range map[string]bool{"true": true, "TRUE": false, "1": false, "false": false} {
+		t.Setenv("A2A_CARD_STOP", value)
+		if cfg, err = FromEnv(); err != nil || cfg.CardStop != want {
+			t.Errorf("A2A_CARD_STOP=%q: CardStop %v (err %v), want %v", value, cfg.CardStop, err, want)
+		}
+	}
+	t.Setenv("A2A_CARD_STOP_TIMEOUT", "2m")
+	if cfg, err = FromEnv(); err != nil || cfg.CardStopTimeout != 2*time.Minute {
+		t.Fatalf("A2A_CARD_STOP_TIMEOUT=2m: %v (err %v)", cfg.CardStopTimeout, err)
+	}
+	for _, bad := range []string{"29s", "75", "junk"} {
+		t.Setenv("A2A_CARD_STOP_TIMEOUT", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Errorf("A2A_CARD_STOP_TIMEOUT=%q accepted", bad)
 		}
 	}
 }

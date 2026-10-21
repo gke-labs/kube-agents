@@ -150,8 +150,9 @@ var SensitiveEnvVars = map[string]struct{}{
 	// posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route. The
-	// operator renders it exactly when the gateway arms the route.
+	// gateway conversation a card was filed in, on the same route, and names
+	// the platform in the cron relay's refusal when no home channel is set.
+	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS": {},
 	"NATS_URL":                 {},
 	"NATS_USER":                {},
@@ -1065,7 +1066,11 @@ type StorageSpec struct {
 
 // AvailabilitySpec defines high availability and scheduling settings.
 type AvailabilitySpec struct {
-	// Replicas specifies the desired number of pod replicas. If omitted, defaults to 1.
+	// Replicas specifies the desired number of gateway pod replicas. If omitted, defaults to 1.
+	// The operator runs the gateway as a single replica: a value above 1 is rendered as 1, and
+	// the ReplicasLimited status condition says so. A multi-replica gateway does not start yet,
+	// because its leader election has no in-cluster ServiceAccount token to use and the data
+	// volumes an install creates at one replica are ReadWriteOnce.
 	// +optional
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
@@ -1197,22 +1202,19 @@ type SecuritySpec struct {
 	// What the gateway policy already permits, and therefore what this cannot
 	// take away:
 	//
-	//   - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
-	//     metadata addresses — the pre- and post-DNAT forms of a metadata
-	//     request (the 988 rule is suppressed when the resolved metadata
-	//     daemon IP is empty). So the metadata path stays open. The same
-	//     address is also permitted on port 53, where it is the Cloud DNS for
-	//     GKE resolver rather than a credential path.
+	//   - 169.254.169.254/32 on port 53 only, where it is the Cloud DNS for
+	//     GKE resolver rather than a credential path. The gateway policy opens
+	//     no metadata credential port: the gateway Pod holds no Google identity
+	//     (it runs as its own unannotated ServiceAccount), so there is no
+	//     metadata path left for this field to close.
 	//   - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of
 	//     what this control is meant to be.
 	//
-	// The overlap is deliberate rather than an oversight. Workload Identity
-	// needs the metadata path, and <name>-gateway-netpol still permits it to
-	// the agent Pod. Narrowing that allowance to the broker Pod, which is the
-	// only one that mints a cloud token, is the work that turns this field into
-	// a control.
+	// The overlap is deliberate rather than an oversight. Narrowing
+	// <name>-gateway-netpol's internet rule is the work that turns this field
+	// into a control.
 	//
 	// So what is this for today? Two things, and they are worth having, but
 	// neither is enforcement. It renders an auditable statement of the
@@ -1260,11 +1262,9 @@ type SecuritySpec struct {
 	//     disables;
 	//   - github.com reached directly from the sandbox, though not the gh and
 	//     git wrappers, which go through the broker;
-	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
-	//     script's project id. It fails soft after a five-second timeout and
-	//     falls back to a broker gcloud call. RECONCILE_PROJECT, the old override, is
-	//     pinned empty in the managed .env (a project other than the pod's belongs in
-	//     spec.scope.projects, the management project still has to resolve).
+	//   - nothing in cluster_agent_reconcile.py, which reads its management
+	//     project from GKE_PROJECT_ID (pinned in the managed .env, beside
+	//     RECONCILE_PROJECT pinned empty) and asks no metadata server.
 	//
 	// Those would not be accidental casualties. A headless browser with
 	// unrestricted egress is the exfiltration path, so the capabilities this
@@ -1347,10 +1347,8 @@ type EgressAllowlistSpec struct {
 	// chose at creation time or at a public address, and the in-cluster
 	// "kubernetes" Service is translated to that address before policy is
 	// evaluated. Leaving this empty is allowed and is the stricter choice. It
-	// costs the agent container its API-server connection, which matters at
-	// spec.deployment.replicas above 1, where the container runs
-	// leader_elect.py and holds a Lease, and to any sidecar or plugin you
-	// added that talks to the API. Find the range with
+	// costs the agent container its API-server connection, which matters to
+	// any sidecar or plugin you added that talks to the API. Find the range with
 	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
 	// On a cluster with a public endpoint that command emits a bare address;
 	// paste it as-is and it is widened to a single-host prefix.
@@ -1595,7 +1593,9 @@ type ForgeSpec struct {
 	// group or project access token, or a dedicated account's personal access
 	// token where the tier offers neither. It is mounted into the credential
 	// broker's pod only, never the agent's or the sandbox's, and read on every
-	// call, so rotating the token is updating the Secret.
+	// call, so rotating the token is updating the Secret. The Secret may also
+	// hold a read-only token under the key `read-token`; the broker presents it
+	// only to clone the forge's context repositories, never on a write.
 	// +optional
 	CredentialsRef *ForgeCredentialsRef `json:"credentialsRef,omitempty"`
 
@@ -1804,9 +1804,9 @@ type NetworkPolicySpec struct {
 	AdditionalEgress []EgressRule `json:"additionalEgress,omitempty"`
 }
 
-// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target (rule 3).
+// MetadataDaemonSpec pins the post-NAT metadata-daemon egress target in the LiteLLM policy (litellm-policy), the one generated policy that still opens the metadata path; the gateway policy opens none.
 type MetadataDaemonSpec struct {
-	// Endpoint is the daemon IP. "" (explicitly set) suppresses rule 3 entirely;
+	// Endpoint is the daemon IP. "" (explicitly set) suppresses that rule entirely;
 	// the empty alternative in the pattern is required because the API server
 	// validates an explicitly-set "", which omitempty does not suppress.
 	// +kubebuilder:validation:Pattern=`^($|(((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]))|(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}))$`
@@ -1973,11 +1973,11 @@ type NetworkPolicyStatus struct {
 	// +optional
 	DNSClusterIPsSource string `json:"dnsClusterIPsSource,omitempty"`
 
-	// MetadataDaemonIP is the post-NAT daemon IP in rule 3, empty when suppressed.
+	// MetadataDaemonIP is the post-NAT daemon IP in the LiteLLM policy's metadata rule, empty when suppressed.
 	// +optional
 	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
 
-	// MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+	// MetadataDaemonPort is the post-NAT daemon port in the LiteLLM policy's metadata rule, resolved from the live
 	// DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
 	// +optional
 	MetadataDaemonPort int32 `json:"metadataDaemonPort,omitempty"`
@@ -2063,19 +2063,26 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal,
+// update, and ToolExecutionsTotal, EventsIngestedTotal, SessionsTotal,
 // RemediationsProposedTotal, RemediationsMergedTotal,
 // ChatMessagesInboundTotal, LastActiveTime, ClustersRegistered and
-// ClustersMonitored from the broker's, the event watcher's and the chat
-// plugin's metrics
+// ClustersMonitored from the broker's, the event watcher's, the chat
+// plugin's and, on a next install, the A2A gateway's metrics
 // listeners, which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status. SessionsTotal and
-// RemediationsAppliedTotal are declared so that the schema names them, but
-// nothing writes them yet, and each is absent (omitempty) until a series
-// exists for it.
+// ServiceAccount holds no write verb on this status. RemediationsAppliedTotal
+// is declared so that the schema names it, but nothing writes it yet, and it
+// is absent (omitempty) until a series exists for it.
 type AgentUsageStatus struct {
-	// SessionsTotal is the cumulative number of interactive sessions handled.
-	// Nothing writes it yet.
+	// SessionsTotal is the cumulative count of sessions the agent opened: the
+	// triage sessions the event watcher opened for events the daemon
+	// delivered (its k8s_event_watcher_triage_sessions_total; a session
+	// whose inject was filtered, suppressed or failed is not counted) plus
+	// the chat conversations the gateway opened a session for (the session_store
+	// plugin's kubeagents_chat_sessions_total on a today install, the A2A
+	// gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// chat conversation that resumes after the session store's retention
+	// window (seven days by default) counts again. Read every five minutes
+	// and kept monotonic across restarts, like toolExecutionsTotal.
 	// +optional
 	SessionsTotal int64 `json:"sessionsTotal,omitempty"`
 

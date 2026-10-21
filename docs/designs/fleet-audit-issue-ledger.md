@@ -151,7 +151,8 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
-   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)).
+   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)), and
+5. the install's `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is not `false` (step 7 below).
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
@@ -312,7 +313,8 @@ Accepted risk: this can close a PR a human was mid-review on. Mitigations, all t
 - The closing comment states plainly that the PR may be reopened, and says **exactly** what happens
   if the finding returns: a manifest finding graded at or above the auto-promotion floor is normally
   re-proposed automatically on this same branch, at most five per run, and anything else is listed on the ledger as awaiting
-  `/remediate <finding-id>`. The comment is not allowed to promise a fresh pull request to every
+  `/remediate <finding-id>`; on an install whose `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is off, that nothing is
+  re-proposed without a `/remediate`. The comment is not allowed to promise a fresh pull request to every
   reader, because auto-promotion does not open one for every reader — and the findings it silently
   would not re-propose are precisely the low-severity ones nobody is watching for.
 - **The branch is not deleted on close.** Branches are cheap and any human fixup pushed to the branch
@@ -557,6 +559,10 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
    five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
    authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
+   An install turns the automatic half off with `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in
+   `spec.deployment.env` (the operator forwards it to the shell sandbox, whose entrypoint writes
+   it to a root-owned file the script reads first): the ledger then lists what the sweep would have
+   opened as awaiting `/remediate`, the only way a pull request opens there. The eval's inject lane runs that way.
 8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.
@@ -665,6 +671,34 @@ wrote sends them looking in the wrong place. This matters because
 thirty fixes with zero, and leave the operator to work out which one was to blame. Only the case
 where _every_ named target is refused is an error, since there is then no partial success to report
 and an exit 0 with an empty list would read as "done".
+
+A second degrade pass follows the missing-file pass in `finish`, in `remediate`, and as a warning in
+the `finish` dry run. Kustomize renders only the files its kustomization lists, and a remediation
+carries one file. Thus a pull request that adds a file to a Kustomize root, but not its entry,
+merges, the GitOps controller reports it in sync, and the finding comes back. The pass makes a
+`manifest` fix `manual` when all three of these are true. The file is new: it is not at the audited
+commit (`HEAD` of the clone, or the broker's base in content mode). A kustomization is in the file's
+directory or a parent directory, the top of the repository included, so a kustomization there makes
+the whole repository one Kustomize root, as the planner reads it. The nearest such kustomization
+does not name the file's path relative to its own directory as a whole token, bare or after `./`.
+Any mention counts, so the pass degrades only a file the kustomization cannot render. The note names
+the kustomization and the `resources:` line to add, and holds the worker's file as a fenced YAML
+block, because in content mode that file exists only in the scratch tree. The block comes before the
+worker's own note, and it gets only the room that the note's own text leaves under the renderer's
+note clip: it keeps at most a fixed number of lines, ends in a truncation line when it keeps less,
+and is left out when no room is left. So the clip cuts the worker's text and never the closing
+fence. When git cannot answer, the broker refuses a question (a 4xx status, at the open included),
+or the kustomization cannot be read, the fix degrades too, and the note says what could not be
+checked: the audit does not publish a pull request it cannot show will render. When the probe saw no
+kustomization, the note names none. A broker outage is not a refusal: no answer at all, or a server
+error or too-many-requests status, at the open or at a later call. Then the pass raises
+`BrokerUnavailable` (the log line says `BROKER UNAVAILABLE`), nothing is published, and the worker
+runs the command again, as for an outage at publish. `finish` does not refuse these fixes as
+unwritten, because the worker cannot correct them in one file, and `remediate` refuses them by name.
+The dry run does not ask git about the audited commit, so it cannot tell a new file from an existing
+one, and it reads the kustomization in the working tree. It takes each file as new, ignores a
+kustomization that a finding names as its fix, as the real run ignores every kustomization the
+worker wrote, warns, and does not change the body.
 
 Neither `finish` nor `remediate` scrubs the working tree, and that is load-bearing rather than
 incidental. The agent writes its remediation manifests into the clone _between_ `start` and
@@ -1461,7 +1495,7 @@ exist.
 severity floor, but a genuinely bad fleet day could still open many at once. Consider a per-run cap with the withheld set
 named in the ledger.
 
-_Resolved: auto-promotion is capped at five PRs per `finish` run._ Withheld findings are named in the
+_Resolved: auto-promotion is capped at five PRs per run._ Withheld findings are named in the
 ledger as awaiting `/remediate` (a section a collector manifest can add two blocks to —
 [collector design §3.4](fleet-audit-collector-manifest.md)), so nothing is lost, only deferred to a human's judgement about which
 five matter first. An explicit `/remediate` is **uncapped** — a human asked for it, and a cap there

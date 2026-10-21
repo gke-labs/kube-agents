@@ -1359,7 +1359,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
 
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
-        self.assertEqual(cov["domains_total"], 11)
+        self.assertEqual(cov["domains_total"], 13)
         # 2026-09-22 (#1023): incident-triage-oom-event-probe, the non-tofu
         # probe, took a roster seat, closing the gap open since the tofu case
         # moved to the nightly tier on 2026-09-03 (#1202); the same day the
@@ -1375,7 +1375,12 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # demoted to the nightly on 2026-10-16 (#3269), uncovering upgrades.
         # pdb-remediation-pr, remediation's only roster case, was demoted to
         # the nightly on 2026-10-17 (#3120), uncovering remediation again.
-        self.assertEqual(cov["uncovered"], ["fleet-audits", "upgrades", "remediation"])
+        # observability and source-control are new rows whose cases are all
+        # nightly cases, so both start on the allowlist.
+        self.assertEqual(
+            cov["uncovered"],
+            ["fleet-audits", "upgrades", "remediation", "observability", "source-control"],
+        )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_presubmit_file_entries(self):

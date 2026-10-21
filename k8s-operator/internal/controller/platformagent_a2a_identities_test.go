@@ -450,6 +450,42 @@ func TestTheEventsWriterCheckIsTightenedByConfigNotByCode(t *testing.T) {
 	}
 }
 
+// The card stop (gke-labs#3263) is opt-in per install: rendered explicitly
+// off, turned on by the controller's own A2A_CARD_STOP=true and nothing
+// else, with its wait beside it at the gateway's default.
+func TestTheCardStopIsOptInThroughTheOperator(t *testing.T) {
+	agent := a2aTestAgent()
+	gatewayEnv := func() map[string]corev1.EnvVar {
+		t.Helper()
+		env := map[string]corev1.EnvVar{}
+		for _, e := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+			env[e.Name] = e
+		}
+		return env
+	}
+	env := gatewayEnv()
+	e, ok := env["A2A_CARD_STOP"]
+	if !ok {
+		t.Fatal("the gateway Deployment does not render A2A_CARD_STOP; the card stop has no switch")
+	}
+	if e.Value != "false" {
+		t.Errorf("A2A_CARD_STOP defaults to %q, want \"false\": the control needs images that answer it", e.Value)
+	}
+	if got := env["A2A_CARD_STOP_TIMEOUT"].Value; got != "75s" {
+		t.Errorf("A2A_CARD_STOP_TIMEOUT = %q, want the gateway's default 75s", got)
+	}
+	t.Setenv("A2A_CARD_STOP", "true")
+	if got := gatewayEnv()["A2A_CARD_STOP"].Value; got != "true" {
+		t.Errorf("the controller override did not reach the gateway: %q", got)
+	}
+	for _, near := range []string{"TRUE", "1", "yes"} {
+		t.Setenv("A2A_CARD_STOP", near)
+		if got := gatewayEnv()["A2A_CARD_STOP"].Value; got != "false" {
+			t.Errorf("A2A_CARD_STOP=%q armed the card stop: %q", near, got)
+		}
+	}
+}
+
 // The credential A5 retired, refused by name at the render.
 //
 // Three routes could bring it back and two of them would be quiet. A
@@ -496,37 +532,32 @@ func TestTheWorkerCredentialIsGone(t *testing.T) {
 // default agent and fails on the error. This test is for the case neither of
 // those reaches from a default CR -- the one a user can cause today.
 //
-// spec.security.serviceAccountName overrides the agent pod's account, and the
-// webhook only checks it against restrictedServiceAccounts, so pointing it at
-// the session pod's account is admitted. What refuses it is validateA2AAuthMap,
-// one layer in, which is fail-closed but diagnosed in a controller log rather
-// than at the apply. A5 is what makes this reachable: `agent` is the first
-// callout identity keyed on a user-settable field.
-func TestAnOverriddenServiceAccountThatCollidesIsRefused(t *testing.T) {
+// spec.security.serviceAccountName used to set the agent pod's account, and with
+// it this map's `agent` key; pointing it at the session pod's account was caught
+// only by validateA2AAuthMap. It now names the broker's account alone: the
+// gateway runs as an operator-named account, the webhook refuses an override that
+// names any account the operator mints, and the test below holds that the
+// override cannot move the bus principal.
+// TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal: the `agent`
+// identity is keyed on the gateway Pod's own ServiceAccount, which the operator
+// names. spec.security.serviceAccountName names the broker's identity, and an
+// override there, even one that collides with another principal's account,
+// cannot re-key the bus map or collide in it.
+func TestAnOverriddenServiceAccountCannotMoveTheBusPrincipal(t *testing.T) {
 	agent := identityTestAgent()
-	collide := a2aSessionServiceAccountName(agent)
-	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: collide}
+	agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: a2aSessionServiceAccountName(agent)}
 
-	// Precondition: the override actually landed on the agent identity, so a
-	// refusal below is the collision and not some unrelated validation.
 	var agentSA string
 	for _, id := range a2aIdentities(agent) {
 		if id.user == a2aAgentBusUser {
 			agentSA = id.serviceAccount
 		}
 	}
-	if want := a2aServiceAccountName(agent.Namespace, collide); agentSA != want {
-		t.Fatalf("the `agent` identity is keyed on %q, want %q; spec.security.serviceAccountName no longer "+
-			"reaches the map and this test measures nothing", agentSA, want)
+	if want := a2aServiceAccountName(agent.Namespace, gatewayServiceAccountName(agent)); agentSA != want {
+		t.Fatalf("the `agent` identity is keyed on %q, want the gateway's own %q", agentSA, want)
 	}
-
-	if _, _, err := buildA2AAuthMapConfigMap(agent, nil); err == nil {
-		t.Error("an override colliding with the session pod's ServiceAccount rendered a map: the callout " +
-			"serves one entry per account, so one workload would run on the other's grants")
-	} else if !strings.Contains(err.Error(), "duplicate serviceAccount") {
-		t.Errorf("the render failed for some other reason: %v", err)
-	} else {
-		t.Logf("refused: %v", err)
+	if _, _, err := buildA2AAuthMapConfigMap(agent, nil); err != nil {
+		t.Errorf("an override of the broker's ServiceAccount broke the bus map: %v", err)
 	}
 }
 
