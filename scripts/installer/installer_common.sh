@@ -1349,8 +1349,8 @@ print_next_home_channel_unset_summary() {
 CHAT_SETUP_CHECKLIST_PRINTED="false"
 
 # The chat setup checklists after an apply, and the closing summary's key: $1
-# the spec.mode the CR is on after it. The chat keys, PROJECT_NUMBER and
-# INSTALL_ENV_FILE are read from the environment the apply rendered from,
+# the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
+# and INSTALL_ENV_FILE are read from the environment the apply rendered from,
 # which every caller has exported by then; what the apply used wins over
 # install.env in the printers. Returns 0 whatever it printed, because the
 # front doors call it bare under set -e.
@@ -1373,6 +1373,7 @@ print_chat_setup_checklists() {
       GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
       GCHAT_STEPS_TOPIC_NAME="${CHAT_TOPIC_NAME:-}" \
       GCHAT_STEPS_SUB_NAME="${CHAT_SUB_NAME:-}" \
+      GCHAT_STEPS_NAMESPACE="${NAMESPACE:-}" \
       bash "${printers}/print_instructions_gchat.sh" --dry-run ||
       print_warning "The Google Chat checklist did not print in full. Show it again: bash ${printers}/print_instructions_gchat.sh"
     CHAT_SETUP_CHECKLIST_PRINTED="true"
@@ -1384,6 +1385,7 @@ print_chat_setup_checklists() {
       SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
       SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
       SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
+      SLACK_STEPS_NAMESPACE="${NAMESPACE:-}" \
       bash "${printers}/print_instructions_slack.sh" --dry-run ||
       print_warning "The Slack checklist did not print in full. Show it again: bash ${printers}/print_instructions_slack.sh"
     CHAT_SETUP_CHECKLIST_PRINTED="true"

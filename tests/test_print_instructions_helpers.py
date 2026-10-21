@@ -144,6 +144,14 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME}", out)
         self.assertNotIn("No home channel is configured", out)
 
+    def test_the_namespace_the_run_used_wins_over_install_env(self):
+        applied = {"SLACK_STEPS_SLACK_ENABLED": "true", "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
+                   "SLACK_STEPS_HOME_CHANNEL": "", "SLACK_STEPS_NAMESPACE": "custom-ns"}
+        out = self._run(self._env(mode="today"), {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"})
+        self.assertIn("-n custom-ns -- hermes pairing approve slack", out)
+        out = self._run(self._env(mode="next"), {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "next"})
+        self.assertIn("-c gateway -n custom-ns", out)
+
     def test_next_with_google_chat_keeps_slack_on_the_today_steps(self):
         self._assert_today(self._run(self._env(mode="next", gchat=True)))
 
@@ -342,6 +350,13 @@ class GchatStepsFollowTheModeTest(unittest.TestCase):
         self.assertLess(call, source.index("print_next_home_channel_unset_summary flags\n}", call))
         self.assertNotIn('bash "${repo_dir}/scripts/installer/print_instructions_', source)
 
+    def test_the_namespace_the_run_used_wins_over_install_env(self):
+        out = self._run(self._env(mode="today"), {"GCHAT_STEPS_PLATFORM_AGENT_MODE": "today",
+                                                  "GCHAT_STEPS_GOOGLE_CHAT_ENABLED": "true",
+                                                  "GCHAT_STEPS_TOPIC_NAME": "t", "GCHAT_STEPS_SUB_NAME": "t-sub",
+                                                  "GCHAT_STEPS_NAMESPACE": "custom-ns"})
+        self.assertIn("-n custom-ns -- hermes pairing approve google_chat", out)
+
     def test_an_empty_subscription_name_is_the_one_the_generator_derives(self):
         # What install.env holds after the Day-2 menu turned Google Chat on.
         out = self._run(self._env(mode="today").replace("CHAT_SUB_NAME=file-sub", "CHAT_SUB_NAME="))
@@ -380,10 +395,6 @@ class GchatStepsFollowTheModeTest(unittest.TestCase):
         env = self._env(mode="next").replace("GOOGLE_CHAT_HOME_CHANNEL=\n", "")
         out = self._run(env, {"GOOGLE_CHAT_HOME_CHANNEL": self._SPACE})
         self.assertIn(f"is {self._SPACE}: add the app to that space", out)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ChatSetupChecklistsTest(unittest.TestCase):
@@ -429,7 +440,8 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         return proc.stdout + proc.stderr, printed
 
     _CHAT = {"GOOGLE_CHAT_ENABLED": "true", "GOOGLE_CHAT_HOME_CHANNEL": "", "ALLOWED_USERS": "a@example.com",
-             "CHAT_TOPIC_NAME": "t", "CHAT_SUB_NAME": "t-sub", "PROJECT_NUMBER": "123456789012"}
+             "CHAT_TOPIC_NAME": "t", "CHAT_SUB_NAME": "t-sub", "PROJECT_NUMBER": "123456789012",
+             "NAMESPACE": "custom-ns"}
 
     def test_google_chat_gets_what_the_apply_used(self):
         out, printed = self._run(self._CHAT)
@@ -439,19 +451,22 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         for line in ("ARGS=--dry-run", "KUBE_AGENTS_INSTALL_ENV=/the/run/install.env",
                      "GCHAT_STEPS_PLATFORM_AGENT_MODE=next", "GCHAT_STEPS_GOOGLE_CHAT_ENABLED=true",
                      "GCHAT_STEPS_HOME_CHANNEL=\n", "GCHAT_STEPS_ALLOWED_USERS=a@example.com",
-                     "GCHAT_STEPS_TOPIC_NAME=t\n", "GCHAT_STEPS_SUB_NAME=t-sub", "PROJECT_NUMBER=123456789012"):
+                     "GCHAT_STEPS_TOPIC_NAME=t\n", "GCHAT_STEPS_SUB_NAME=t-sub", "PROJECT_NUMBER=123456789012",
+                     "GCHAT_STEPS_NAMESPACE=custom-ns"):
             with self.subTest(line=line):
                 self.assertIn(line, handoff)
 
     def test_slack_gets_what_the_apply_used(self):
-        out, printed = self._run({"SLACK_ENABLED": "true", "SLACK_HOME_CHANNEL": "C123", "GOOGLE_CHAT_ENABLED": "false"},
+        out, printed = self._run({"SLACK_ENABLED": "true", "SLACK_HOME_CHANNEL": "C123", "GOOGLE_CHAT_ENABLED": "false",
+                                  "NAMESPACE": "custom-ns"},
                                  mode="today")
         self.assertIn("rc=0 printed=true key=[]", out)
         self.assertEqual(set(printed), {"print_instructions_slack"})
         handoff = printed["print_instructions_slack"]
         for line in ("ARGS=--dry-run", "KUBE_AGENTS_INSTALL_ENV=/the/run/install.env",
                      "SLACK_STEPS_PLATFORM_AGENT_MODE=today", "SLACK_STEPS_SLACK_ENABLED=true",
-                     "SLACK_STEPS_GOOGLE_CHAT_ENABLED=false", "SLACK_STEPS_HOME_CHANNEL=C123"):
+                     "SLACK_STEPS_GOOGLE_CHAT_ENABLED=false", "SLACK_STEPS_HOME_CHANNEL=C123",
+                     "SLACK_STEPS_NAMESPACE=custom-ns"):
             with self.subTest(line=line):
                 self.assertIn(line, handoff)
 
@@ -528,3 +543,7 @@ class PrintersAskNothingUnderDryRunTest(unittest.TestCase):
     def test_without_it_the_printer_asks(self):
         out, _ = self._run_on_a_tty()
         self.assertIn(self._PROMPT, out)
+
+
+if __name__ == "__main__":
+    unittest.main()

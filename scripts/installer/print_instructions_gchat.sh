@@ -58,6 +58,9 @@ if [ -n "${GCHAT_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
   ALLOWED_USERS="${GCHAT_STEPS_ALLOWED_USERS:-}"
   CHAT_TOPIC_NAME="${GCHAT_STEPS_TOPIC_NAME:-}"
   CHAT_SUB_NAME="${GCHAT_STEPS_SUB_NAME:-}"
+  # load_state takes NAMESPACE from the files alone; --agent-namespace sets
+  # it for the run.
+  NAMESPACE="${GCHAT_STEPS_NAMESPACE:-${NAMESPACE:-}}"
 fi
 # An empty subscription name is one the tfvars generator derives from the
 # topic, as an install.env that turned Google Chat on in the Day-2 menu has.

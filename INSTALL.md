@@ -141,7 +141,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
      cd terraform/examples/full-install
      KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
      ```
-   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created).
+   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created; with Google Chat or Slack on, the commands that print the chat app's setup checklist).
 4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
 On a GitLab install, the checks in step 2 skip the GitHub organization check. Generate-only never
