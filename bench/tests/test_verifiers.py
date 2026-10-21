@@ -8527,6 +8527,48 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
         (["mkdir", "-p", "/x"], False),
         (["python3", "f.py", "--readiness"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("test -d /x || (mkdir -p /x) && python3 f.py --readiness") == [
+        (["test", "-d", "/x"], False),
+        (["mkdir", "-p", "/x"], False),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("time ! ./f.py --readiness") == [
+        (["time", "!", "./f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! (python3 f.py --readiness)") == [
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! (python3 f.py --readiness && echo DONE)") == [
+        (["python3", "f.py", "--readiness"], False),
+        (["echo", "DONE"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! cat scope.json | python3 f.py --readiness") == [
+        (["!", "cat", "scope.json"], False),
+        (["python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("! A | B && python3 f.py --readiness") == [
+        (["!", "A"], False),
+        (["B"], False),
+        (["python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid -f python3 f.py --readiness") == [
+        (["setsid", "-f", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid --fork python3 f.py --readiness") == [
+        (["setsid", "--fork", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -b python3 f.py --readiness") == [
+        (["sudo", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo -u hermes -b python3 f.py --readiness") == [
+        (["sudo", "-u", "hermes", "-b", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("sudo python3 f.py --readiness") == [
+        (["sudo", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("setsid python3 f.py --readiness") == [
+        (["setsid", "python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("echo $(python3 f.py --readiness)") == [
         (["echo", "$(python3 f.py --readiness)"], True),
         (["python3", "f.py", "--readiness"], False),
@@ -9177,6 +9219,23 @@ def test_worker_commands_after_result_pattern_withheld_call_beside_readable_pass
     traj = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj)
+    res = v.verify(5.0)
+    assert res.success
+    assert res.status == "pass"
+
+
+def test_worker_commands_after_result_pattern_withheld_call_beside_credited_succeeded_run_passes():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="collect.py", word_patterns=[r"^compliance-audit$"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", required_runs=[run])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "python3 /opt/data/skills/collect.py compliance-audit"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 3.0},
     ]
     transcript.set("ok", traj)
     res = v.verify(5.0)

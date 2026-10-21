@@ -2380,7 +2380,7 @@ class WorkerRun(BaseModel):
     the last segment on the line or every segment following it must be ``&&``-joined; a following
     ``||``, ``;``, ``|``, or ``&`` hands the line's exit to another command and is not credited as
     succeeded; a preceding ``&&`` or ``;`` is accepted; preceding ``||``, inverting ``!``, non-lone
-    command substitutions, or a trailing background ``&`` do not credit exit; a required run with
+    command substitutions, a detaching wrapper (such as ``setsid -f`` or ``sudo -b``), or a trailing background ``&`` do not credit exit; a required run with
     ``succeeded: true`` and no worker trajectory to read is not credited)."""
 
     model_config = ConfigDict(extra="forbid")
@@ -2600,17 +2600,66 @@ def _is_control_operator(word: str) -> bool:
     return isinstance(word, _ShellOperator) and (word == _SHELL_LINE_END or set(word) <= _SHELL_OPERATOR_CHARS)
 
 
+def _has_leading_negation(seg: list[str]) -> bool:
+    """True if seg starts with pipeline negation ! (possibly after time, -p, or NAME=val assignments)."""
+    i = 0
+    while i < len(seg):
+        w = seg[i]
+        if _SHELL_ASSIGNMENT_RE.match(w):
+            i += 1
+            continue
+        if w == "time" or os.path.basename(w) == "time":
+            i += 1
+            while i < len(seg) and seg[i] in ("-p", "--portability"):
+                i += 1
+            continue
+        return w == "!"
+    return False
+
+
+def _has_detaching_wrapper(seg: list[str]) -> bool:
+    """True if seg invokes an exec wrapper with options that detach the process
+    (e.g. `setsid -f`/`--fork` or `sudo -b`/`--background`)."""
+    for idx, word in enumerate(seg):
+        base = os.path.basename(word)
+        if base == "setsid":
+            for w in seg[idx + 1:]:
+                if w == "--":
+                    break
+                if w in ("-f", "--fork") or (w.startswith("-") and not w.startswith("--") and "f" in w[1:]):
+                    return True
+                if not w.startswith("-") and not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
+                    break
+        elif base == "sudo":
+            prev_opt_takes_val = False
+            for w in seg[idx + 1:]:
+                if w == "--":
+                    break
+                if w in ("-b", "--background") or (w.startswith("-") and not w.startswith("--") and "b" in w[1:]):
+                    return True
+                if w.startswith("-"):
+                    prev_opt_takes_val = w in ("-u", "-g", "-p", "-C", "-D", "-R", "-T", "-U")
+                    continue
+                if not _is_redirect(w) and not _SHELL_ASSIGNMENT_RE.match(w):
+                    if prev_opt_takes_val:
+                        prev_opt_takes_val = False
+                        continue
+                    break
+    return False
+
+
 def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bool]]:
     """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
     shell line's final exit code faithfully reflects this segment's success or failure.
     A segment's failure is preserved (short-circuiting subsequent execution) if and only if
     it is the last segment on the line or every control operator following it is ``&&``,
-    is not backgrounded with ``&``, is not preceded by ``||`` on the same pipeline,
-    and is not negated with ``!``. A following ``||``, ``;``, ``|``, or ``&`` hands the exit status
-    to another command and may mask failure."""
+    is not backgrounded with ``&``, is not detached via a wrapper (such as ``setsid -f`` or ``sudo -b``),
+    is not preceded by ``||`` on the same pipeline, and is not negated with ``!``.
+    A following ``||``, ``;``, ``|``, or ``&`` hands the exit status to another command and may mask failure."""
     words, spans = _shell_words_and_spans(command)
     segments: list[list[str]] = []
     ops_after: list[list[str]] = []
+    leading_ops: list[str] = []
     argv: list[str] = []
     current_ops: list[str] = []
 
@@ -2618,16 +2667,26 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
         if _is_control_operator(word):
             op_str = str(word)
             if argv:
-                segments.append(argv)
-                argv = []
-                current_ops = [op_str]
+                if op_str == "(" and (argv == ["!"] or _has_leading_negation(argv)):
+                    if segments:
+                        ops_after[-1].extend(["!", "("])
+                    else:
+                        leading_ops.extend(["!", "("])
+                    argv = []
+                else:
+                    segments.append(argv)
+                    argv = []
+                    current_ops = [op_str]
             else:
                 if op_str == _SHELL_LINE_END and current_ops and current_ops[-1] in ("&&", "||", "|"):
                     continue
                 current_ops.append(op_str)
             continue
-        if current_ops and segments:
-            ops_after.append(current_ops)
+        if current_ops:
+            if segments:
+                ops_after.append(current_ops)
+            else:
+                leading_ops.extend(current_ops)
             current_ops = []
         argv.append(word)
 
@@ -2640,20 +2699,39 @@ def _shell_argvs_with_exit_propagation(command: str) -> list[tuple[list[str], bo
 
     for i, seg in enumerate(segments):
         carries_exit = not trailing_bg
-        cmd_idx = _command_word_index(seg)
-        if "!" in (seg[:cmd_idx] if cmd_idx is not None else seg[:1]):
+        if carries_exit and _has_detaching_wrapper(seg):
             carries_exit = False
 
-        if carries_exit and i > 0:
+        if carries_exit:
+            pipeline_start_idx = i
+            while pipeline_start_idx > 0:
+                prev_ops = ops_after[pipeline_start_idx - 1]
+                connective_ops = [op for op in prev_ops if op not in ("(", ")")]
+                if connective_ops == ["|"]:
+                    pipeline_start_idx -= 1
+                else:
+                    break
+            if _has_leading_negation(segments[pipeline_start_idx]):
+                carries_exit = False
+
+        if carries_exit:
             depth = 0
+            min_depth = 0
             depth0_resolved = False
-            for prev_ops in reversed(ops_after[:i]):
+            preceding_groups = [*ops_after[:i], leading_ops] if leading_ops else ops_after[:i]
+            for prev_ops in reversed(preceding_groups):
                 for op in reversed(prev_ops):
                     if op == ")":
                         depth += 1
                     elif op == "(":
                         depth -= 1
-                        depth0_resolved = False
+                        if depth < min_depth:
+                            min_depth = depth
+                            depth0_resolved = False
+                    elif op == "!":
+                        if depth <= 0 and not depth0_resolved:
+                            carries_exit = False
+                            break
                     elif depth <= 0:
                         if not depth0_resolved:
                             if op in (";", _SHELL_LINE_END, "&"):
@@ -3305,7 +3383,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         has_succeeded_runs = any(r.succeeded for r in self.required_runs)
         uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *unrun_masked, *traj_missing] if run.succeeded]
         gaps = list(snap.worker_capture_gaps or ())
-        if withheld and has_succeeded_runs:
+        if withheld and uncredited_succeeded:
             gaps.append("the pod withheld a worker terminal call's arguments")
         gaps_str = "; ".join(gaps)
 

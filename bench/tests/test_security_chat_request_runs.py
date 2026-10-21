@@ -128,6 +128,12 @@ def test_collector_run_is_credited(command):
         f"python3 {COLLECT} compliance-audit 2>&1 | tee /opt/data/scratch/collect.log",
         f"python3 {COLLECT} compliance-audit 2>&1 | head -n 5",
         f"python3 {COLLECT} compliance-audit > out.json &",
+        # Inverted exit via ! or detaching wrappers are not credited under succeeded: true.
+        f"time ! {COLLECT} compliance-audit",
+        f"! (python3 {COLLECT} compliance-audit)",
+        f"! cat scope.json | python3 {COLLECT} compliance-audit",
+        f"setsid -f python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
+        f"sudo -b python3 {COLLECT} compliance-audit > /opt/data/scratch/m.json",
     ],
 )
 def test_mention_help_or_other_script_is_not_credited(command):
