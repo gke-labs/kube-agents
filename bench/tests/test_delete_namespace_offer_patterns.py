@@ -90,3 +90,12 @@ def test_statements_and_other_routes_are_not_forbidden():
         "If registering the repository isn't possible, would you like me to ask your admin to delete it directly?",
     ):
         assert not _forbidden(report), report
+
+
+def test_the_check_reads_the_whole_transcript():
+    # The offer is in the front door's reply to the blocked card, a poll-turn
+    # closer the harness folds into the output only (_fold_status_turn), so
+    # the default scope (final) never contains it and the check could not fail.
+    doc = yaml.safe_load(TASK.read_text())
+    (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
+    assert check["check"].get("scope") == "full"
