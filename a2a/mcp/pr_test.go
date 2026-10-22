@@ -265,7 +265,8 @@ func TestInertPrefix(t *testing.T) {
 		{"never inside a line", "aaa\nbbbbbbbb\n", 6, 0, 100, "aaa\n", 1, 9},
 		{"the line cap", "a\nb\nc\nd", 100, 2, 100, "a\nb\n", 2, 3},
 		{"one line longer than the cap is cut at a rune boundary", "ééééé", 5, 0, 100, "éé", 1, 6},
-		{"line endings become \\n", "a\r\nb\rc\n", 100, 0, 100, "a\nb\nc\n", 0, 0},
+		{"\\r\\n ends a line and a lone \\r is shown", "a\r\nb\rc\n", 100, 0, 100, "a\nb<U+000D>c\n", 0, 0},
+		{"a \\r at the end with no \\n is shown", "a\r", 100, 0, 100, "a<U+000D>", 0, 0},
 		{"a long line is cut and says so", "abcdefgh\nz\n", 100, 0, 3, "abc… [5 bytes cut]\nz\n", 0, 0},
 		{"a control character is shown", "ab\x1bc\n", 100, 0, 10, "ab<U+001B>… [1 bytes cut]\n", 0, 0},
 		{"a control character's form is not cut through", "ab\x1bc\n", 100, 0, 9, "ab… [2 bytes cut]\n", 0, 0},
@@ -447,13 +448,21 @@ func TestLongLinesAndBodiesAreCapped(t *testing.T) {
 }
 
 // Carried from #3689: a diff refused for its size costs the caller the diff,
-// with the reason, and not the rest of the view.
+// with the reason, and not the rest of the view. The note says "too large"
+// only where the refusal shows it; a bare 502 may be GitHub's 406 for a diff
+// past its limits, or a forge that failed for another reason.
 func TestInspectPRAsksAgainWithoutATooLargeDiff(t *testing.T) {
-	for name, refusal := range map[string]error{
-		"the broker's cap":  &BrokerError{Status: http.StatusBadGateway, Code: brokerCodeTooLarge},
-		"GitHub's 406":      &BrokerError{Status: http.StatusBadGateway, Code: brokerCodeFailed},
-		"this client's cap": fmt.Errorf("%w (16 bytes)", ErrBrokerResponseTooLarge),
+	const sure, maybe = "_Diff not available: the diff is too large", "_Diff not available: the forge call with the diff failed (possibly too large): "
+	for name, tc := range map[string]struct {
+		refusal   error
+		note, not string
+	}{
+		"the broker's cap":  {&BrokerError{Status: http.StatusBadGateway, Code: brokerCodeTooLarge}, sure, maybe},
+		"this client's cap": {fmt.Errorf("%w (16 bytes)", ErrBrokerResponseTooLarge), sure, maybe},
+		"GitHub's 406":      {&BrokerError{Status: http.StatusBadGateway, Code: brokerCodeFailed}, maybe + "the credential broker or the forge failed (HTTP 502) (FORGE_CALL_FAILED). GitHub refuses", sure},
+		"a bare 502":        {&BrokerError{Status: http.StatusBadGateway}, maybe, sure},
 	} {
+		refusal := tc.refusal
 		t.Run(name, func(t *testing.T) {
 			f := &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
 				if req.Diff {
@@ -468,12 +477,79 @@ func TestInspectPRAsksAgainWithoutATooLargeDiff(t *testing.T) {
 			if len(f.reqs) != 2 || f.reqs[1].Diff || !f.reqs[1].Comments {
 				t.Errorf("requests = %+v", f.reqs)
 			}
-			for _, want := range []string{"`Fix the thing`", "_Diff not available: the diff is too large", "Looks good."} {
+			for _, want := range []string{"`Fix the thing`", tc.note, "Looks good."} {
 				if !strings.Contains(out, want) {
 					t.Errorf("output lacks %q", want)
 				}
 			}
+			if strings.Contains(out, tc.not) {
+				t.Errorf("output says %q", tc.not)
+			}
 		})
+	}
+}
+
+// GitHub's limit is GitHub's: a GitLab view fetched again after a bare 502
+// does not cite it.
+func TestTheDiffNoteCitesGitHubsLimitOnlyOnGitHub(t *testing.T) {
+	note := diffRetryNote(&BrokerError{Status: http.StatusBadGateway, Code: brokerCodeFailed}, &ProposalView{Forge: forgeGitLab})
+	if strings.Contains(note, "GitHub") || !strings.Contains(note, "possibly too large") {
+		t.Errorf("note = %q", note)
+	}
+}
+
+// The comments alone can be past the answer's cap: the broker reads up to
+// brokerCommentLimit from each of GitHub's three endpoints, at up to 64 KiB a
+// body. The view is still reachable, without them, and says so; the first
+// call asks for no more of each than the tool shows.
+func TestInspectPRAsksAgainWithoutTooLargeComments(t *testing.T) {
+	tooLarge := fmt.Errorf("%w (4194304 bytes)", ErrBrokerResponseTooLarge)
+	f := &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
+		if req.Comments {
+			return nil, tooLarge
+		}
+		v := viewOf(t, githubViewJSON)
+		v.Comments, v.CommentCount, v.Diff = nil, 0, ""
+		return v, nil
+	}}
+	out, err := callInspect(t, f, `{"repository":"acme/widgets","number":12}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.reqs) != 3 || f.reqs[0].Limit != maxComments || f.reqs[1].Diff || !f.reqs[1].Comments || f.reqs[2].Comments || f.reqs[2].Diff {
+		t.Errorf("requests = %+v", f.reqs)
+	}
+	for _, want := range []string{"`Fix the thing`", "Fixes the thing.", "_Comments not available: the comments are too large", "_Diff not available: the diff is too large"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q", want)
+		}
+	}
+	if strings.Contains(out, "_No comments._") {
+		t.Error("the view says there are no comments when they were not fetched")
+	}
+
+	// Without the diff the view fits: the comments are kept, and no third
+	// call is made.
+	f = &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
+		if req.Diff {
+			return nil, tooLarge
+		}
+		return viewOf(t, githubViewJSON), nil
+	}}
+	if out, err = callInspect(t, f, `{"repository":"acme/widgets","number":12}`); err != nil || len(f.reqs) != 2 || !strings.Contains(out, "Looks good.") {
+		t.Errorf("err = %v after %d requests", err, len(f.reqs))
+	}
+
+	// A retry refused for something other than size is not asked a third
+	// time, and the first failure is the answer.
+	f = &fakeViewer{fn: func(req ProposalViewRequest) (*ProposalView, error) {
+		if req.Diff {
+			return nil, tooLarge
+		}
+		return nil, &BrokerError{Status: http.StatusBadGateway, Code: brokerCodeFailed}
+	}}
+	if _, err = callInspect(t, f, `{"repository":"acme/widgets","number":12}`); !errors.Is(err, tooLarge) || len(f.reqs) != 2 {
+		t.Errorf("err = %v after %d requests", err, len(f.reqs))
 	}
 }
 
@@ -509,7 +585,8 @@ func TestInspectPRDoesNotRetryOtherRefusals(t *testing.T) {
 
 // The one retry without the diff is for a size refusal only: never after a
 // timeout or a cancellation, even one that arrives wrapped with a size
-// refusal, and never a second time.
+// refusal, and never a second time; past it, only a size refusal earns the
+// one further call, without the comments.
 func TestInspectPRDoesNotRetryAfterATimeout(t *testing.T) {
 	for name, refusal := range map[string]error{
 		"a deadline":           fmt.Errorf("%w: %w", ErrBrokerResponseTooLarge, context.DeadlineExceeded),
@@ -547,15 +624,15 @@ func TestInspectPRDoesNotRetryAfterATimeout(t *testing.T) {
 			t.Errorf("%d requests, want 1", len(f.reqs))
 		}
 	})
-	t.Run("at most one retry", func(t *testing.T) {
+	t.Run("at most one retry without the diff and one without the comments", func(t *testing.T) {
 		f := &fakeViewer{fn: func(ProposalViewRequest) (*ProposalView, error) {
 			return nil, &BrokerError{Status: http.StatusBadGateway, Code: brokerCodeTooLarge}
 		}}
 		if _, err := callInspect(t, f, `{"repository":"acme/widgets","number":12}`); err == nil {
 			t.Error("no error")
 		}
-		if len(f.reqs) != 2 {
-			t.Errorf("%d requests, want 2", len(f.reqs))
+		if len(f.reqs) != 3 || f.reqs[2].Diff || f.reqs[2].Comments {
+			t.Errorf("requests = %+v, want 3, the last with neither diff nor comments", f.reqs)
 		}
 	})
 }
@@ -663,5 +740,39 @@ func TestDiffFilesSplitsOnLineStartsOnly(t *testing.T) {
 	want := []diffFile{{"fixture.patch", 3, 0}, {"with space.go", 1, 1}}
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
 		t.Errorf("diffFiles = %+v, want %+v", got, want)
+	}
+}
+
+// A bare \r in a hunk line is shown, not taken as a line break: rendered as
+// one, `+foo\r-  check_authz()` would show a removal the diff never made.
+func TestALoneCarriageReturnInADiffDrawsNoLine(t *testing.T) {
+	diff := "diff --git a/f.go b/f.go\n--- a/f.go\n+++ b/f.go\n@@ -0,0 +1 @@\n+foo\r-  check_authz()\r\n"
+	out := FormatProposalViewMarkdown("acme/widgets", 1, &ProposalView{Diff: diff}, "")
+	if !strings.Contains(out, "\n+foo<U+000D>-  check_authz()\n") {
+		t.Errorf("the hunk line is not one inert line:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "-  check_authz()") {
+			t.Errorf("a removal the diff does not have was drawn:\n%s", out)
+		}
+	}
+	if got := diffFiles(diff).listed; len(got) != 1 || got[0] != (diffFile{"f.go", 1, 0}) {
+		t.Errorf("diffFiles = %+v", got)
+	}
+}
+
+// Git does not quote a path for a space alone, so " b/" can be inside it.
+// Outside a rename the two sides match, and that split is the path; a rename
+// takes the last " b/".
+func TestDiffHeaderBSidePathFindsThePathWithAnInnerBSlash(t *testing.T) {
+	for header, want := range map[string]string{
+		"a/docs b/guide.md b/docs b/guide.md": "docs b/guide.md",
+		"a/main.go b/main.go":                 "main.go",
+		"a/old.go b/new.go":                   "new.go",
+		`"a/with space.go" "b/with space.go"`: "with space.go",
+	} {
+		if got := diffHeaderBSidePath(header); got != want {
+			t.Errorf("diffHeaderBSidePath(%q) = %q, want %q", header, got, want)
+		}
 	}
 }

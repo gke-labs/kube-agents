@@ -285,7 +285,7 @@ func nothingA2ALabelledSurvivesAFlipToToday(t *testing.T, mcpOn bool) {
 	}
 	if mcpOn {
 		for name, obj := range map[string]client.Object{
-			a2aMCPName(agent):      &appsv1.Deployment{},
+			a2aMCPName(agent):       &appsv1.Deployment{},
 			a2aMCPAccessName(agent): &corev1.Secret{},
 			// The broker identity: the pod's own ServiceAccount, which
 			// must go with the rest of the MCP server on the flip.

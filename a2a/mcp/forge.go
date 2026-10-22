@@ -42,10 +42,14 @@ const (
 	// forge answer is 8 MiB (DEFAULT_HTTP_MAX_BYTES).
 	DefaultBrokerMaxResponseBytes = 4 << 20
 
-	// brokerCommentLimit is the comment limit asked of the broker. GitHub's
-	// conversation is three endpoints and the limit applies to each, so the
-	// broker may still answer up to three times this many.
-	brokerCommentLimit = 50
+	// brokerCommentLimit is the comment limit asked of the broker: as many
+	// as inspect_pr shows. GitHub's conversation is three endpoints and the
+	// limit applies to each, so the broker may still answer up to three
+	// times this many; asking less of each would not give the oldest
+	// maxComments across the three, which is what the answer shows. When
+	// that is more than an answer can carry, inspect_pr asks again without
+	// the comments.
+	brokerCommentLimit = maxComments
 	// maxBrokerErrorBytes bounds how much of a refusal is read.
 	maxBrokerErrorBytes = 8 << 10
 
@@ -345,4 +349,15 @@ func diffMayBeRefused(err error) bool {
 		return be.Code == brokerCodeTooLarge || (be.Status == http.StatusBadGateway && (be.Code == brokerCodeFailed || be.Code == ""))
 	}
 	return false
+}
+
+// answerTooLarge reports whether err is a refusal that is known to be about
+// size: the broker's FORGE_RESPONSE_TOO_LARGE, or an answer past this
+// client's cap. diffMayBeRefused is wider, since a bare 502 may be one too.
+func answerTooLarge(err error) bool {
+	if errors.Is(err, ErrBrokerResponseTooLarge) {
+		return true
+	}
+	var be *BrokerError
+	return errors.As(err, &be) && be.Code == brokerCodeTooLarge
 }

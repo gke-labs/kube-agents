@@ -26,6 +26,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -281,5 +282,74 @@ func TestTheMCPBrokerIdentityFollowsTheFlag(t *testing.T) {
 	}
 	if err := cl.Get(ctx, key, &corev1.ServiceAccount{}); !apierrors.IsNotFound(err) {
 		t.Errorf("flag turned off: ServiceAccount survived: %v", err)
+	}
+}
+
+// TestTheMCPServiceAccountIsReservedWithTheDoorOnOrOff pins the MCP pod's
+// broker identity on the reserved list in both flag states: an AgentProfile may
+// not run as it, and spec.security.serviceAccountName may not name it, so a
+// door turned on later never finds the name already taken. Taken, the override
+// would put the broker's Workload Identity annotation on the MCP pod's account.
+func TestTheMCPServiceAccountIsReservedWithTheDoorOnOrOff(t *testing.T) {
+	for _, door := range []string{"", "true"} {
+		t.Run("door="+door, func(t *testing.T) {
+			t.Setenv(a2aMCPDoorEnvVar, door)
+			agent := mcpBrokerAgent()
+			sa := a2aMCPServiceAccountName(agent)
+
+			p := testAgentProfile(agent.Namespace, "sneaky", func(p *agentv1alpha1.AgentProfile) {
+				p.Spec.Identity.ServiceAccountName = sa
+			})
+			got := resolveAgentProfileIdentities(agent, []agentv1alpha1.AgentProfile{p})["sneaky"]
+			if got.refused == nil || got.reason != reasonAgentProfileRefused {
+				t.Errorf("a profile naming %q resolved to %+v, want refused with %q", sa, got, reasonAgentProfileRefused)
+			}
+
+			agent.Spec.Security = &agentv1alpha1.SecuritySpec{ServiceAccountName: sa}
+			if msg := ReservedServiceAccountOverride(agent); msg == "" {
+				t.Errorf("an override naming %q is not refused", sa)
+			}
+		})
+	}
+}
+
+// TestAnOverrideNamingTheMCPServiceAccountWritesNoServiceAccount is the
+// controller's step 2z for the MCP account, door on, with no webhook in front:
+// the pass goes Degraded and writes no ServiceAccount of that name, so the
+// broker's Workload Identity annotation never lands on the MCP pod's identity.
+func TestAnOverrideNamingTheMCPServiceAccountWritesNoServiceAccount(t *testing.T) {
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	agent := mcpBrokerAgent()
+	if agent.Spec.Security == nil {
+		agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
+	}
+	agent.Spec.Security.ServiceAccountName = a2aMCPServiceAccountName(agent)
+	agent.Spec.Security.ServiceAccountAnnotations = map[string]string{
+		"iam.gke.io/gcp-service-account": "broker@p.iam.gserviceaccount.com",
+	}
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("a refusal is a Degraded status, not a reconcile error: %v", err)
+	}
+	sa := &corev1.ServiceAccount{}
+	err := cl.Get(ctx, types.NamespacedName{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}, sa)
+	if err == nil {
+		t.Fatalf("a ServiceAccount named %q was written, annotations %v", sa.Name, sa.Annotations)
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("get: %v", err)
+	}
+	var live agentv1alpha1.PlatformAgent
+	if err := cl.Get(ctx, req.NamespacedName, &live); err != nil {
+		t.Fatal(err)
+	}
+	degraded := false
+	for _, c := range live.Status.Conditions {
+		degraded = degraded || c.Reason == reasonReservedServiceAccount
+	}
+	if !degraded {
+		t.Errorf("status carries no %s condition: %v", reasonReservedServiceAccount, live.Status.Conditions)
 	}
 }

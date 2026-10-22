@@ -602,7 +602,7 @@ func TestPlatformAgentValidation(t *testing.T) {
 
 	t.Run("fails if the broker's service account is one the operator mints for another workload", func(t *testing.T) {
 		val := &PlatformAgentCustomValidator{}
-		for _, name := range []string{"test-agent-gateway-agent", "test-agent-a2a-session", "test-agent-shell"} {
+		for _, name := range []string{"test-agent-gateway-agent", "test-agent-a2a-session", "test-agent-shell", "test-agent-a2a-mcp"} {
 			agent := &agentv1alpha1.PlatformAgent{
 				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
 				Spec: agentv1alpha1.PlatformAgentSpec{

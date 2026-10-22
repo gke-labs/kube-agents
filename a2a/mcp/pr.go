@@ -65,6 +65,7 @@ const (
 	hunkPrefix        = "@@"
 
 	forgeGitLab = "gitlab"
+	forgeGitHub = "github"
 
 	msgBadArgs = "inspect_pr needs `repository` (owner/name, host/path, or a pull or merge request URL) " +
 		"and `number` (a positive integer; optional when `repository` is a pull or merge request URL)"
@@ -130,7 +131,7 @@ func InspectPRTool(viewer ProposalViewer) Tool {
 			}
 			req := ProposalViewRequest{Repository: repo, Number: number, Diff: true, Comments: true, Limit: brokerCommentLimit}
 			view, err := viewer.ProposalView(ctx, req)
-			diffNote := ""
+			diffNote, commentsNote := "", ""
 			if err != nil && diffMayBeRefused(err) && ctx.Err() == nil {
 				// Carried from #3689's fix: a diff the forge or the broker
 				// refuses for its size must not cost the caller the rest
@@ -138,19 +139,50 @@ func InspectPRTool(viewer ProposalViewer) Tool {
 				// retry, never after a timeout or a cancellation
 				// (diffMayBeRefused, ctx.Err).
 				req.Diff = false
-				if again, err2 := viewer.ProposalView(ctx, req); err2 == nil {
-					diffNote = "the diff is too large to fetch through the credential broker (" + err.Error() + "). " +
-						"GitHub refuses a diff past 20,000 lines or 300 files, and the broker and this server cap the size of the answer. " +
-						"Read it on the forge, or check the branch out locally."
+				again, err2 := viewer.ProposalView(ctx, req)
+				if err2 != nil && diffMayBeRefused(err2) && answerTooLarge(err2) && ctx.Err() == nil {
+					// Still too large without the diff, so the comments are
+					// what is too large: the broker reads up to
+					// brokerCommentLimit from each of GitHub's three
+					// endpoints, at up to 64 KiB a body, and this tool shows
+					// 2 KiB of each. Ask once more without them, so the rest
+					// of the view is still reachable.
+					req.Comments, req.Limit = false, 0
+					if again, err2 = viewer.ProposalView(ctx, req); err2 == nil {
+						commentsNote = "the comments are too large to fetch through the credential broker with the rest of the view. " +
+							"Read them on the forge."
+					}
+				}
+				if err2 == nil {
+					diffNote = diffRetryNote(err, again)
 					view, err = again, nil
 				}
 			}
 			if err != nil {
 				return "", err
 			}
-			return FormatProposalViewMarkdown(repo, number, view, diffNote), nil
+			return formatProposalView(repo, number, view, diffNote, commentsNote), nil
 		},
 	}
+}
+
+// diffRetryNote says why the diff is missing from a view fetched again
+// without it. "Too large" is said only where the error shows it: the broker's
+// FORGE_RESPONSE_TOO_LARGE, or this client's own cap. A bare 502 is the
+// broker's catch-all for a forge failure, which is how GitHub's 406 for a diff
+// past its limits arrives, but also how an unreachable forge or a dropped
+// connection does, so for that the size is only a possibility.
+func diffRetryNote(err error, v *ProposalView) string {
+	if answerTooLarge(err) {
+		return "the diff is too large to fetch through the credential broker (" + err.Error() + "). " +
+			"The broker and this server cap the size of the answer. " +
+			"Read it on the forge, or check the branch out locally."
+	}
+	note := "the forge call with the diff failed (possibly too large): " + err.Error() + ". "
+	if v != nil && v.Forge == forgeGitHub {
+		note += "GitHub refuses a diff past 20,000 lines or 300 files. "
+	}
+	return note + "Try again, or read it on the forge, or check the branch out locally."
 }
 
 // parseInspectArgs reads repository and number. A pull or merge request URL
@@ -221,6 +253,12 @@ func parseNumber(raw json.RawMessage) (int, error) {
 // blocks with format and control characters shown as <U+XXXX>, never acted
 // on, and a fence longer than any backtick run inside.
 func FormatProposalViewMarkdown(repo string, number int, v *ProposalView, diffNote string) string {
+	return formatProposalView(repo, number, v, diffNote, "")
+}
+
+// formatProposalView is FormatProposalViewMarkdown with a note for comments
+// that were not fetched; "" renders the comments v holds.
+func formatProposalView(repo string, number int, v *ProposalView, diffNote, commentsNote string) string {
 	if v == nil {
 		v = &ProposalView{}
 	}
@@ -283,7 +321,11 @@ func FormatProposalViewMarkdown(repo string, number int, v *ProposalView, diffNo
 		writeBlock(&sb, p.Body, fenceText, maxDescriptionBytes, 0, maxProseLineBytes)
 	}
 
-	writeComments(&sb, v)
+	if commentsNote != "" {
+		sb.WriteString("\n### Comments\n\n_Comments not available: " + commentsNote + "_\n")
+	} else {
+		writeComments(&sb, v)
+	}
 
 	if files.count > 0 {
 		fmt.Fprintf(&sb, "\n### Changed files (%d)\n\n| File | Added | Removed |\n| :--- | ---: | ---: |\n", files.count)
@@ -366,11 +408,12 @@ func writeBlock(sb *strings.Builder, s, info string, maxBytes, maxLines, lineByt
 }
 
 // inertPrefix makes the head of untrusted multi-line text inert inside a
-// fence and returns it with how many lines and bytes of s it left out. Line
-// endings (\n, \r\n, a lone \r) become \n and tabs stay; every other control
-// or format character (ANSI escapes, bidi overrides, zero-width marks, line
-// separators) is shown as <U+XXXX> rather than dropped, so a reviewer sees
-// that it is there. Each line is cut at lineBytes, at a rune boundary, saying
+// fence and returns it with how many lines and bytes of s it left out. A line
+// ends at \n alone (a \r just before it is part of the ending) and tabs stay;
+// every other control or format character (ANSI escapes, bidi overrides,
+// zero-width marks, line separators, and any other \r) is shown as <U+XXXX>
+// rather than dropped, so a reviewer sees that it is there, and a \r inside a
+// diff line cannot draw a line the diff does not have. Each line is cut at lineBytes, at a rune boundary, saying
 // how much went; whole lines are kept while they fit in maxBytes and
 // maxLines (0 for no line cap). It never cuts inside a line, the
 // line-anchored counterpart of #3689's line-anchored diff split, so a
@@ -413,17 +456,18 @@ func inertPrefix(s string, maxBytes, maxLines, lineBytes int) (string, int, int)
 }
 
 // lineBounds is the line of s starting at pos: end is where its text ends
-// and next where the following line starts, past a \n, \r\n or lone \r.
+// and next where the following line starts, past a \n. A \r just before the
+// \n is left out of the text; any other \r is text, for appendInert to show.
 func lineBounds(s string, pos int) (end, next int) {
-	i := strings.IndexAny(s[pos:], "\r\n")
+	i := strings.IndexByte(s[pos:], '\n')
 	if i < 0 {
 		return len(s), len(s)
 	}
-	end = pos + i
-	if s[end] == '\r' && end+1 < len(s) && s[end+1] == '\n' {
-		return end, end + 2
+	end, next = pos+i, pos+i+1
+	if end > pos && s[end-1] == '\r' {
+		end--
 	}
-	return end, end + 1
+	return end, next
 }
 
 // appendInert appends the inert form of one line (no line ending) to dst,
@@ -585,8 +629,24 @@ func diffHeaderBSidePath(header string) string {
 			return strings.TrimPrefix(unquoted, "b/")
 		}
 	}
-	if idx := strings.LastIndex(line, diffBSidePrefix); idx >= 0 {
-		return strings.TrimSpace(line[idx+len(diffBSidePrefix):])
+	// Git does not quote a path for a space alone, so " b/" may be inside
+	// the path too (`a/docs b/x b/docs b/x`). Outside a rename both sides
+	// are the same path, so the split whose a-side matches its b-side is
+	// the one; a rename has no such split and takes the last " b/".
+	last := -1
+	for from := 0; ; {
+		i := strings.Index(line[from:], diffBSidePrefix)
+		if i < 0 {
+			break
+		}
+		last = from + i
+		if b := line[last+len(diffBSidePrefix):]; line[:last] == "a/"+b {
+			return strings.TrimSpace(b)
+		}
+		from = last + 1
+	}
+	if last >= 0 {
+		return strings.TrimSpace(line[last+len(diffBSidePrefix):])
 	}
 	return ""
 }
