@@ -1,0 +1,450 @@
+package mcp
+
+// POST /mcp/swarm: the swarm projection (swarm.go) served to the workstation
+// bridge (#3689: a2a/mcpbridge/server.go queryRemoteSwarm), which posts its
+// conversation table, subagent lineage and board ledger and writes the answer
+// into Antigravity's Swarm UI directory.
+//
+// The request is untrusted. It is bounded by its own body limit, its lists
+// are capped before anything reads them, and its deployment block is never
+// decoded: the server reads the one install it is a client of, with the
+// credential it was started with, and takes neither from a client.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"slices"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
+)
+
+const (
+	// SwarmPath is where the bridge asks for the swarm view.
+	SwarmPath = Path + "/swarm"
+
+	// maxSwarmBodyBytes bounds one swarm request.
+	maxSwarmBodyBytes = 1 << 20
+	// maxSwarmConversationIDRunes bounds an Antigravity conversation id, the
+	// root's included.
+	maxSwarmConversationIDRunes = 128
+	// taskSubjects is every task subject on TASKS.
+	taskSubjects = "a2a.tasks.>"
+
+	msgSwarmBadRequest   = "the body is not a swarm request"
+	msgSwarmTooMany      = "the request names %d %s; at most %d"
+	noteDeploymentIgnore = "this server never takes a deployment or credentials from a client; it reads the install it runs in"
+	noteTasksPartial     = "the TASKS read was partial, so tasks may be missing: %v"
+	noteNotConnected     = "not connected to the bus; no tasks were read"
+	noteCardsUnavailable = "the agent cards could not be read"
+)
+
+// swarmTaskWindow is how far back the TASKS read starts: 3a's roster keeps a
+// conversation that long after its last task. A variable for tests.
+var swarmTaskWindow = swarmRecent
+
+// swarmTaskLimit bounds the messages one TASKS read takes. A variable for
+// tests.
+var swarmTaskLimit = maxTaskEvents
+
+// swarmConversationEntry is one conversation in the bridge's shape
+// (#3689: a2a/mcpbridge/config.go ConversationEntry). The server reads Alias,
+// Token, Description, the Antigravity ids and LastUsedAt; every other field is
+// the client's own, passed back as it sent it, since the bridge replaces its
+// entry with the one returned whenever they differ.
+type swarmConversationEntry struct {
+	Alias                   string    `json:"alias"`
+	Token                   string    `json:"token"`
+	SessionMode             bool      `json:"sessionMode"`
+	SessionTerminated       bool      `json:"sessionTerminated,omitempty"`
+	Description             string    `json:"description,omitempty"`
+	AGYConversationID       string    `json:"agyConversationId,omitempty"`
+	ParentAGYConversationID string    `json:"parentAgyConversationId,omitempty"`
+	SubagentRole            string    `json:"subagentRole,omitempty"`
+	SessionWorkerID         string    `json:"sessionWorkerId,omitempty"`
+	AutoBound               bool      `json:"autoBound,omitempty"`
+	DebugMode               bool      `json:"debugMode,omitempty"`
+	Disconnected            bool      `json:"disconnected,omitempty"`
+	CreatedAt               time.Time `json:"createdAt"`
+	LastUsedAt              time.Time `json:"lastUsedAt"`
+}
+
+// swarmLineage is one subagent's lineage (#3689:
+// a2a/mcpbridge/swarm_lineage.go ConversationLineage).
+type swarmLineage struct {
+	ConversationID       string `json:"conversationId"`
+	ParentConversationID string `json:"parentConversationId,omitempty"`
+	RootConversationID   string `json:"rootConversationId"`
+	SubagentType         string `json:"subagentType,omitempty"`
+	SubagentRole         string `json:"subagentRole,omitempty"`
+	SubagentState        string `json:"subagentState,omitempty"`
+	IsSubagent           bool   `json:"isSubagent"`
+}
+
+// swarmRequest is the part of the bridge's RemoteSwarmRequest the server
+// reads. Its deployment, active conversation, board lines and event drain
+// are not decoded at all, and unknown fields are ignored.
+type swarmRequest struct {
+	RootConversationID string                            `json:"rootConversationId"`
+	Conversations      map[string]swarmConversationEntry `json:"conversations"`
+	Subagents          map[string]swarmLineage           `json:"subagents"`
+	Ledger             BoardLedger                       `json:"ledger"`
+}
+
+// swarmResponse is the bridge's RemoteSwarmResponse, without the deployment,
+// the active conversation and the schema flag, and with three fields it
+// ignores: what the server did not take, did not serve, and could not read.
+type swarmResponse struct {
+	Connected           bool                              `json:"connected"`
+	Snapshot            SwarmSnapshot                     `json:"snapshot"`
+	Ledger              BoardLedger                       `json:"ledger"`
+	Conversations       map[string]swarmConversationEntry `json:"conversations,omitempty"`
+	PendingEvents       []json.RawMessage                 `json:"pendingEvents"`
+	DeploymentIgnored   bool                              `json:"deploymentIgnored"`
+	PendingEventsServed bool                              `json:"pendingEventsServed"`
+	Notes               []string                          `json:"notes"`
+}
+
+// swarmHandler answers POST /mcp/swarm from the bus and the server's own
+// conversation table.
+type swarmHandler struct {
+	bus   *NATSBus
+	convs *Conversations
+}
+
+func (h *swarmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSwarmBodyBytes))
+	if err != nil {
+		http.Error(w, msgBodyTooLarge, http.StatusRequestEntityTooLarge)
+		return
+	}
+	var req swarmRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, msgSwarmBadRequest, http.StatusBadRequest)
+		return
+	}
+	if n := len(req.Conversations); n > maxSwarmInputConvs {
+		http.Error(w, fmt.Sprintf(msgSwarmTooMany, n, "conversations", maxSwarmInputConvs), http.StatusBadRequest)
+		return
+	}
+	if n := len(req.Subagents); n > maxSwarmInputConvs {
+		http.Error(w, fmt.Sprintf(msgSwarmTooMany, n, "subagents", maxSwarmInputConvs), http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), requestBudget)
+	defer cancel()
+	resp := h.answer(ctx, req, time.Now())
+	w.Header().Set(headerContentType, contentTypeJSON)
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// answer builds the response to a request already bounded by count.
+func (h *swarmHandler) answer(ctx context.Context, req swarmRequest, now time.Time) swarmResponse {
+	resp := swarmResponse{
+		PendingEvents:     []json.RawMessage{},
+		DeploymentIgnored: true,
+		Notes:             []string{noteDeploymentIgnore},
+	}
+	entries := mergeSwarmConversations(h.convs.List(), req.Conversations)
+	in := SwarmInput{Conversations: swarmConversations(entries, req.Subagents), Now: now}
+
+	resp.Connected = h.bus.client.Conn().IsConnected()
+	if resp.Connected {
+		tasks, err := h.bus.swarmTasks(ctx, now.Add(-swarmTaskWindow))
+		if err != nil {
+			resp.Notes = append(resp.Notes, fmt.Sprintf(noteTasksPartial, err))
+		}
+		in.Tasks = keepSwarmTasks(tasks, entries)
+		if cards := h.bus.Status(ctx).AgentCards; cards != nil {
+			in.Cards = cards
+		} else {
+			resp.Notes = append(resp.Notes, noteCardsUnavailable)
+		}
+	} else {
+		resp.Notes = append(resp.Notes, noteNotConnected)
+	}
+
+	resp.Snapshot, resp.Ledger = BuildSwarmState(in, req.Ledger)
+	// The coordinator and the platform answer for the bridge's root
+	// conversation; 3a leaves their ids for the caller, who knows it.
+	if root := strings.TrimSpace(req.RootConversationID); validSwarmConversationID(root) {
+		for _, name := range []string{swarmMemberCoordinator, swarmMemberPlatform} {
+			if m, ok := resp.Snapshot.Members[name]; ok {
+				m.ConversationID = root
+				resp.Snapshot.Members[name] = m
+			}
+		}
+	}
+	if len(entries) > 0 {
+		resp.Conversations = make(map[string]swarmConversationEntry, len(entries))
+		for _, e := range entries {
+			resp.Conversations[e.Alias] = e
+		}
+	}
+	return resp
+}
+
+// validSwarmConversationID reports whether id looks like an Antigravity
+// conversation id: present, at most maxSwarmConversationIDRunes, and free of
+// control characters.
+func validSwarmConversationID(id string) bool {
+	if id == "" || len(id) > maxSwarmConversationIDRunes*utf8.UTFMax || !utf8.ValidString(id) ||
+		utf8.RuneCountInString(id) > maxSwarmConversationIDRunes {
+		return false
+	}
+	return !strings.ContainsFunc(id, unicode.IsControl)
+}
+
+// swarmConversationToken is a conversation token as the console door takes
+// it, bare or as console:<token>, or "" when it is not one.
+func swarmConversationToken(raw string) string {
+	t := strings.TrimPrefix(strings.TrimSpace(raw), consoleConversationPrefix)
+	if len(t) > maxSwarmHandleBytes || !lib.ValidSubjectToken(t) {
+		return ""
+	}
+	return t
+}
+
+// mergeSwarmConversations is the server's table and the client's, one entry
+// per token, in alias order. A client entry with an invalid alias or token is
+// dropped. On a shared token the server's alias and description win and the
+// later last use wins; the client's other fields are kept. On a shared alias
+// the server's entry wins, then the later last use.
+func mergeSwarmConversations(server []ConversationInfo, client map[string]swarmConversationEntry) []swarmConversationEntry {
+	byToken := make(map[string]*swarmConversationEntry, len(server)+len(client))
+	fromServer := make(map[string]bool, len(server))
+	for _, c := range server {
+		byToken[c.Token] = &swarmConversationEntry{Alias: c.Alias, Token: c.Token, Description: c.Description, LastUsedAt: c.LastUsed.UTC()}
+		fromServer[c.Token] = true
+	}
+	for alias, e := range client {
+		alias = strings.TrimSpace(alias)
+		token := swarmConversationToken(e.Token)
+		if alias == "" || len(alias) > maxSwarmAliasBytes || token == "" {
+			continue
+		}
+		e = cappedClientEntry(e)
+		e.Alias, e.Token = alias, token
+		have := byToken[token]
+		switch {
+		case have == nil:
+			byToken[token] = &e
+		case fromServer[token]:
+			// The server's alias and description, the client's own fields.
+			e.Alias, e.Description = have.Alias, have.Description
+			if have.LastUsedAt.After(e.LastUsedAt) {
+				e.LastUsedAt = have.LastUsedAt
+			}
+			byToken[token] = &e
+		case e.LastUsedAt.After(have.LastUsedAt) || (e.LastUsedAt.Equal(have.LastUsedAt) && e.Alias < have.Alias):
+			byToken[token] = &e
+		}
+	}
+	byAlias := make(map[string]*swarmConversationEntry, len(byToken))
+	for token, e := range byToken {
+		have := byAlias[e.Alias]
+		if have == nil {
+			byAlias[e.Alias] = e
+			continue
+		}
+		hs, es := fromServer[have.Token], fromServer[token]
+		if (es && !hs) || (es == hs && (e.LastUsedAt.After(have.LastUsedAt) || (e.LastUsedAt.Equal(have.LastUsedAt) && token < have.Token))) {
+			byAlias[e.Alias] = e
+		}
+	}
+	out := make([]swarmConversationEntry, 0, len(byAlias))
+	for _, e := range byAlias {
+		out = append(out, *e)
+	}
+	slices.SortFunc(out, func(x, y swarmConversationEntry) int { return strings.Compare(x.Alias, y.Alias) })
+	return out
+}
+
+// cappedClientEntry applies 3a's byte limits to a client entry's strings: one
+// past its limit is dropped, not shortened, so nothing half a value is passed
+// on as if it were one.
+func cappedClientEntry(e swarmConversationEntry) swarmConversationEntry {
+	if len(e.Description) > swarmScanBytes {
+		e.Description = ""
+	}
+	if !validSwarmConversationID(e.AGYConversationID) {
+		e.AGYConversationID = ""
+	}
+	if !validSwarmConversationID(e.ParentAGYConversationID) {
+		e.ParentAGYConversationID = ""
+	}
+	if len(e.SubagentRole) > maxSwarmHandleBytes {
+		e.SubagentRole = ""
+	}
+	if len(e.SessionWorkerID) > maxSwarmHandleBytes {
+		e.SessionWorkerID = ""
+	}
+	e.CreatedAt, e.LastUsedAt = e.CreatedAt.UTC(), e.LastUsedAt.UTC()
+	return e
+}
+
+// swarmConversations turns the merged table into 3a's input. A parent is the
+// alias of the entry whose Antigravity id is this entry's parent id, or, when
+// that names none, the one the subagent lineage gives as its parent.
+func swarmConversations(entries []swarmConversationEntry, subagents map[string]swarmLineage) []SwarmConversation {
+	aliasOfAGY := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if e.AGYConversationID == "" {
+			continue
+		}
+		if have, dup := aliasOfAGY[e.AGYConversationID]; !dup || e.Alias < have {
+			aliasOfAGY[e.AGYConversationID] = e.Alias
+		}
+	}
+	out := make([]SwarmConversation, 0, len(entries))
+	for _, e := range entries {
+		parent := aliasOfAGY[e.ParentAGYConversationID]
+		if parent == "" && e.AGYConversationID != "" {
+			if l, ok := subagents[e.AGYConversationID]; ok && validSwarmConversationID(l.ParentConversationID) {
+				parent = aliasOfAGY[l.ParentConversationID]
+			}
+		}
+		if parent == e.Alias {
+			parent = ""
+		}
+		out = append(out, SwarmConversation{
+			Alias: e.Alias, Token: e.Token, Description: e.Description, Parent: parent, LastUsed: e.LastUsedAt,
+		})
+	}
+	return out
+}
+
+// keepSwarmTasks keeps the tasks of the table's conversations, and those
+// delegated from a kept task, transitively to maxLineageDepth hops.
+func keepSwarmTasks(tasks []SwarmTask, entries []swarmConversationEntry) []SwarmTask {
+	conversations := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		conversations[consoleConversationPrefix+e.Token] = true
+	}
+	kept := make(map[string]bool, len(tasks))
+	for i := range tasks {
+		if conversations[tasks[i].Conversation] {
+			kept[tasks[i].TaskID] = true
+		}
+	}
+	for hop := 0; hop < maxLineageDepth; hop++ {
+		grew := false
+		for i := range tasks {
+			if t := &tasks[i]; !kept[t.TaskID] && t.ViaTaskID != "" && kept[t.ViaTaskID] {
+				kept[t.TaskID] = true
+				grew = true
+			}
+		}
+		if !grew {
+			break
+		}
+	}
+	out := make([]SwarmTask, 0, len(kept))
+	for _, t := range tasks {
+		if kept[t.TaskID] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// swarmTaskRead is one task as the TASKS read found it.
+type swarmTaskRead struct {
+	ref       TaskRef
+	submitted bool
+	task      SwarmTask
+	events    []*lib.Envelope
+}
+
+// swarmTasks reads every task with a write on TASKS since since, in one
+// drain on one reader slot, and folds each. A task whose submission is older
+// than since has no conversation here, and is not kept. A read that stops
+// short returns what it read with the error that stopped it.
+func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) ([]SwarmTask, error) {
+	ctx, cancel := context.WithTimeout(ctx, taskReadTimeout)
+	defer cancel()
+	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
+	if err != nil {
+		return nil, err
+	}
+	reads := map[TaskRef]*swarmTaskRead{}
+	var order []*swarmTaskRead
+	_, derr := b.drainConsumer(ctx, s, jetstream.ConsumerConfig{
+		FilterSubject: taskSubjects,
+		DeliverPolicy: jetstream.DeliverByStartTimePolicy,
+		OptStartTime:  &since,
+	}, swarmTaskLimit, func(msg jetstream.Msg) {
+		addressee, taskID, class, ok := lib.ParseTaskSubject(msg.Subject())
+		if !ok {
+			return
+		}
+		env := agreedEnvelope(msg.Subject(), msg.Data())
+		if env == nil {
+			return
+		}
+		ref := TaskRef{Addressee: addressee, TaskID: taskID}
+		rd := reads[ref]
+		if rd == nil {
+			rd = &swarmTaskRead{ref: ref, task: SwarmTask{Addressee: addressee, TaskID: taskID}}
+			reads[ref] = rd
+			order = append(order, rd)
+		}
+		if class != lib.TaskClassIn {
+			rd.events = append(rd.events, env)
+			return
+		}
+		// The first message on .in is the submission; later ones are
+		// follow-ups and cancels.
+		if rd.submitted {
+			return
+		}
+		_, a, text, ok := submission(&nats.Msg{Subject: msg.Subject(), Data: msg.Data()})
+		if !ok {
+			return
+		}
+		rd.submitted = true
+		rd.task.Conversation = a.Audience.Conversation
+		if a.Via != nil {
+			rd.task.ViaTaskID = a.Via.TaskID
+		}
+		rd.task.Prompt = text
+		rd.task.Submitted = env.TS
+		if md, err := msg.Metadata(); err == nil {
+			rd.task.Submitted = md.Timestamp
+		}
+	})
+	addresseeOf := make(map[string]string, len(order))
+	for _, rd := range order {
+		if _, dup := addresseeOf[rd.ref.TaskID]; dup {
+			addresseeOf[rd.ref.TaskID] = ""
+		} else {
+			addresseeOf[rd.ref.TaskID] = rd.ref.Addressee
+		}
+	}
+	out := make([]SwarmTask, 0, len(order))
+	for _, rd := range order {
+		if !rd.submitted {
+			continue
+		}
+		t := rd.task
+		if len(rd.events) > 0 {
+			if folded, err := lib.FoldTask(rd.ref.TaskID, rd.events); err == nil {
+				t.Task = folded
+			}
+		}
+		if t.ViaTaskID != "" {
+			t.ViaAddressee = addresseeOf[t.ViaTaskID]
+		}
+		out = append(out, t)
+	}
+	return out, derr
+}

@@ -165,7 +165,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		log.Error("mcp listen", "addr", s.listen, "err", err)
 		return err
 	}
-	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log, mcp.WithSwarm(bus, convs)))
 }
 
 // dialWithRetry calls dial until it succeeds or ctx is done, waiting backoff

@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's A2A bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the console page can.
 
-It answers `connection_status`, the turn tools `send_message` and `task_control`, and `manage_session`. Further tools from gke-labs/kube-agents#3653 come in later changes.
+It answers `connection_status`, the turn tools `send_message` and `task_control`, and `manage_session`, and serves the workstation bridge's swarm view. Further tools from gke-labs/kube-agents#3653 come in later changes.
 
 ## Turn it on
 
@@ -35,6 +35,20 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 ## What it reads
 
 `connection_status` reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the platform agent are consuming, and the agents registered on `DIRECTORY`. It reads all of it through the console's grants, at most once every five seconds whatever the call rate. Agent names and descriptions are shown as code, as published, shortened.
+
+## The swarm view
+
+`POST /mcp/swarm` serves the workstation bridge's swarm view (gke-labs/kube-agents#3689): the bridge posts its conversation table, its subagent lineage and the board ledger it kept from the last call, and gets back the members, new board posts and view it writes into Antigravity's Swarm UI. It sits behind the same `Origin` refusal and bearer token as `/mcp`, takes JSON of at most 1 MiB (413 past it), and answers 400 to a body that isn't a swarm request or that names more than 512 conversations.
+
+It reads, bounded:
+
+- the last hour of `TASKS`, in one read of at most 4096 messages; a read that stops short is still answered, with a line in `notes` saying so;
+- this server's own conversation names and the bridge's, merged by token. A bridge entry whose token isn't a valid conversation token is dropped;
+- the agent cards, from the same cached read `connection_status` uses.
+
+It keeps only the tasks of those conversations, and the tasks delegated from them.
+
+It never reads the request's `deployment`: the server takes no endpoint or credential from a client, and always answers for the install it runs in (`deploymentIgnored: true`). Pending push events aren't served yet (`pendingEventsServed: false`, `pendingEvents: []`).
 
 ## Conversations
 
