@@ -1352,9 +1352,13 @@ class UnitTest(unittest.TestCase):
         for state, icon in harness.STATUS_ICONS.items():
             const = "lib.State" + "".join(part.capitalize() for part in state.split("-"))
             self.assertRegex(relay, rf'{const}:\s+"{icon}",', state)
-        for post in ('"❌ failed: "+reason', '"❌ the task failed"', '"🛑 canceled"', '"🚫 the executor rejected the task: "+reason',
-                     '"🚫 the executor rejected the task"'):
-            self.assertIn(f"g.post(rec.Key, {post})", relay)
+        # The terminal notices are worded in one place, terminalNotice, which
+        # the relay posts through (and a console conversation's terminal
+        # frame carries); pin the wording there and the posts that use it.
+        for notice in ('"❌ failed: " + reason', '"❌ the task failed"', '"🛑 canceled"',
+                       '"🚫 the executor rejected the task: " + reason', '"🚫 the executor rejected the task"'):
+            self.assertIn(f"return {notice}", relay)
+        self.assertEqual(relay.count("g.post(rec.Key, terminalNotice(s.Status.State, reason))"), 2)
 
     def test_not_started_grammar_matches_the_gateway_source(self):
         # Every "not started:" the gateway can post, read off the source, is one the
