@@ -104,17 +104,26 @@ A release-candidate run does not append either, and it is the case the sentence
 above does not cover: the candidate is a commit on `main`, and the run measuring
 it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 `RC_COMMIT_SHA` being set is the third condition, enforced in the same two
-places. `EVAL_MODE_NEXT=1` is the fourth, for the same reason: the next-mode
-nightly and the today lane's periodic on `main` (which deploys `next` and rolls
-it back before its matrix) are also periodics with no `PULL_NUMBER`, and
-`VersionKey` has no mode field, so their samples would be today's once written. That one is
-enforced in `hack/ci-eval-pr.sh` alone, because `bench-gate record` has no
-notion of the mode; it goes when the key gains one. The third has to be,
+places. `EVAL_ROLLBACK_LANE=1` is the fourth, also enforced in both: the today
+lane's periodic on `main` deploys `next` and rolls it back to `today` before its
+matrix, so its key reads `today`, but a rolled-back install is not the fresh
+`today` install that window measures. The third has to be enforced twice,
 because the mistake is not correctable afterwards:
-`VersionKey` names the setup, the scoring version, the judge and the two content
-versions, and nothing about which build produced a sample, so a candidate's
-record and `main`'s are the same record once written — and the candidate would
-then be judged non-inferior to a window it had just moved.
+`VersionKey` names the setup, the scoring version, the judge, the two content
+versions and the mode, and nothing about which build produced a sample, so a
+candidate's record and `main`'s are the same record once written — and the
+candidate would then be judged non-inferior to a window it had just moved.
+
+A next-mode run on `main` does append. The next-mode nightly is a periodic with
+no `PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
+reads as the key's `next` mode, so its lines file under a key of their own and
+never reach today's window. At a `next` key a repetition graded with a check set
+aside as not applicable on the inject transport is recorded, because every
+next-mode run, on `main` or on a pull request, is graded under the same set-aside
+rule; at a `today` key the case is skipped. The key includes the agent model, so
+the next-mode nightly's lines are a window only for a next-mode run at its model:
+the presubmit runs another, and its next window stays empty until a next-mode
+run on `main` records at the presubmit's model.
 
 A store that will not parse is an **error**, never an empty store. Empty means
 "nothing admitted, aggregate advisory", which is a green; a corrupt file
@@ -155,8 +164,8 @@ needs only `objectViewer`, because a pull request is graded against the store
 and never writes to it. Neither role carries `storage.objects.delete`.
 
 `<key…>` is the record's own version key spelled out as directories —
-`<setup-id>/<judge-model>/<sv>-f<n>-v<n>` — so an object files itself under the
-software it was measured on:
+`<setup-id>/<judge-model>/<sv>-f<n>-v<n>`, with `-next` appended for a next-mode
+key — so an object files itself under the software it was measured on:
 
 ```
 gs://kube-agents-evals-bench/evidence/agent-kanban-smoke/
@@ -207,7 +216,7 @@ Full rationale, including the approaches that were rejected:
 
 ## The version key
 
-Three of the five components are read off the run rather than declared, so
+Four of the six components are read off the run rather than declared, so
 they cannot go stale:
 
 | Component         | Read from                      | Covers                                       |
@@ -217,6 +226,26 @@ they cannot go stale:
 | `judge_model`     | `$JUDGE_MODEL`                 | The judge, pinned independently of the agent |
 | `fleet`           | `VERSIONS.json`                | The `bench/tf/fleet` state a task audits     |
 | `verifiers`       | `VERSIONS.json`                | `kube_agents_bench/verifiers.py` behaviour   |
+| `mode`            | run, `$AGENT_TRANSPORT`        | The `spec.mode` graded: `inject` is next     |
+
+`mode` is `today` or `next`. `setupId` names the same agent model and harness
+under either, so without it a next-mode run would be compared with today's
+history, which is what redded the inject lane on rung 6 before the component
+existed. It is read off the transport rather than off `EVAL_MODE_NEXT`, because
+the today lane deploys under that flag and grades a rolled-back install over
+the api transport: `next` when any repetition's record carries the inject
+transport's task marker (`inject.task` in its trajectory), else when
+`AGENT_TRANSPORT=inject` is set, which `hack/ci-eval-pr.sh` exports exactly when
+it grades a next install. `today` is the default and is never written: a
+key with no `mode` reads as `today`, so every line recorded before the component
+existed still matches today's key, and on GCS a `next` key's last directory
+segment gains a `-next` suffix while every `today` directory stays as it was.
+Rung 6 and admission therefore read only same-mode history; a `next` key with
+nothing recorded at it is the empty window (rung 6 quiet, nothing admitted by
+the record), and a partial one is compared like any other `collecting` window.
+The suite aggregate is the one exception: for a case graded at a `next` key with
+nothing recorded there, main's side uses the case's `today` lines at the same
+key otherwise, and the verdict names those cases in a note.
 
 The judge model is a component of its own, and is pinned independently of the
 agent model, because a judge that tracks whatever the agent is running cannot
