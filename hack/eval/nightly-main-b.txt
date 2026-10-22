@@ -1,0 +1,49 @@
+# The stack-bearing cases of the nightly's main part that run in main-b.
+#
+# One case id per line. `#` starts a comment, blank lines are skipped.
+# hack/ci-eval-pr.sh reads this file under EVAL_NIGHTLY_PART=main-a or
+# main-b, which run the nightly's main part as two periodics on two leased
+# projects (#3384). A stack-bearing case -- one whose task names a stack and
+# takes lock-infra -- runs in main-b when it is listed here and in main-a
+# otherwise. The main part's length is set by those cases, which run one at
+# a time under each project's lock-infra, so this list is what balances the
+# two halves. A case without a stack is placed by its name alone (the
+# script's comment says how), so it needs no line here.
+#
+# The choice is by name, not computed from the matrix, so the two jobs agree
+# on it when a merge that adds or drops other cases lands between their
+# checkouts. A merge between them that edits this file can run a moved case
+# in both halves, or in neither, for that one night.
+#
+# scripts/test_ci_eval_nightly.py holds the two halves' stack time
+# (unit_cost_hint in the script, summed per half) to within one case's worth
+# of each other, and fails on a line here that names no stack-bearing main
+# case. Adding a stack case to the nightly can therefore fail that test:
+# list the case here, or move one, until the halves balance again. The
+# onboarding cases (unit_state_lock in the script) stay in main-a whatever
+# this file says; they run one at a time under a lock of their own, and the
+# same test holds that chain to no longer than the longer stack chain.
+ai-security-planted-model-audit
+fleet-audit-clean-close-reads-clean
+gpu-stress-test-diagnosis
+autoops-warning-event-triage
+obtainability-planted-orphan-service
+fleet-audit-unchanged-finding-keeps-wording
+first-install-hello-running
+first-install-hello-done
+gitops-drift-backlog-digest
+# One of the two CUJ 1 halves registered on 2026-10-20 (#2889). With both in
+# main-a, alongside gitops-drift-backlog-digest, its chain is 9750s against
+# main-b's 6900s -- 2850s apart, over the one-case tolerance -- so one moves
+# here: 8850s against 7800s.
+#
+# This one rather than its sibling because its plant is the longer of the two
+# in real time -- three observed rollouts, two of them waiting out a failure,
+# against the sibling's single rollout -- so with both priced at the same 900s
+# the halves balance identically on the hint and this way balances better on
+# the clock.
+#
+# No periodic sets main-a or main-b today; the recorder logs "Nightly part:
+# main". This line is inert until they exist, which is why it is placed on
+# the arithmetic alone.
+gitops-drift-load-bearing-change-triage

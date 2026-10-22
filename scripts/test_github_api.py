@@ -150,6 +150,25 @@ class GitHubAPITest(unittest.TestCase):
         self.assertIsNone(delete_res)
         self.assertEqual(calls[1].get_method(), "DELETE")
 
+    def test_object_pages_are_read_to_the_total_and_an_empty_page_ends_them(self):
+        api, calls = self._api(
+            [
+                {"total_count": 3, "workflows": [{"id": 1}, {"id": 2}]},
+                {"total_count": 3, "workflows": [{"id": 3}]},
+            ]
+        )
+        with mock.patch.object(github_api, "PER_PAGE", 2):
+            self.assertEqual([1, 2, 3], [entry["id"] for entry in api.workflows()])
+        self.assertEqual(2, len(calls))
+        self.assertIn("per_page=2&page=1", calls[0].full_url)
+
+        api, calls = self._api([{"total_count": 9, "check_runs": [{"id": 1}]}, {"total_count": 9, "check_runs": []}])
+        with mock.patch.object(github_api, "PER_PAGE", 1):
+            found = api.get_object_pages("/repos/gke-labs/kube-agents/commits/abc/check-runs", "check_runs", {"filter": "all"})
+        self.assertEqual([1], [entry["id"] for entry in found])
+        self.assertEqual(2, len(calls))
+        self.assertIn("filter=all&per_page=1&page=1", calls[0].full_url)
+
     def test_graphql_returns_data(self):
         api, calls = self._api([{"data": {"viewer": {"login": "x"}}}])
         self.assertEqual(api.graphql("query { viewer { login } }", {"a": 1}), {"viewer": {"login": "x"}})

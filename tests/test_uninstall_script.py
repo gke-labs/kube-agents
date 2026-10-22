@@ -1140,6 +1140,9 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         endpoint_at = text.find('export OPENAI_COMPATIBLE_API_BASE="" OPENAI_COMPATIBLE_TARGET_PORT="" OPENAI_COMPATIBLE_EGRESS_CIDRS="" OPENAI_COMPATIBLE_CA_SECRET_NAME=""')
         self.assertNotEqual(endpoint_at, -1, "uninstall.sh must blank the OPENAI_COMPATIBLE_* keys")
         self.assertLess(endpoint_at, call_at)
+        env_secret_at = text.find('export LITELLM_ENV_SECRET_NAME=""')
+        self.assertNotEqual(env_secret_at, -1, "uninstall.sh must blank LITELLM_ENV_SECRET_NAME")
+        self.assertLess(env_secret_at, call_at)
         provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
         self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
         self.assertLess(provider_at, call_at)
@@ -1159,6 +1162,10 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         mode_at = text.find('export PLATFORM_AGENT_MODE=""')
         self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
         self.assertLess(mode_at, call_at)
+        # The data volume size likewise: the generator refuses a malformed size.
+        storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
+        self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")
+        self.assertLess(storage_at, call_at)
         # The scoped service account pool too: the generator refuses a
         # misspelt switch or a malformed cap, and the pool goes with the state.
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')

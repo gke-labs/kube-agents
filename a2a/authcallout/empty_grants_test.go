@@ -121,7 +121,7 @@ func TestAnEmptySideIsRefusedBeforeItCanBeMinted(t *testing.T) {
 				}},
 			})
 
-			nc, err := nats.Connect(h.url, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX.session"))
+			nc, err := nats.Connect(h.url, h.tls, nats.Token(tokenPodA), nats.CustomInboxPrefix("_INBOX.session"))
 			if err == nil {
 				nc.Close()
 				t.Fatal("a one-sided grant set connected; it would have been unrestricted on the empty side")

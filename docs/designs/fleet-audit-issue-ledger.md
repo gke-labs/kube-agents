@@ -151,7 +151,8 @@ A remediation PR opens automatically **iff** the finding satisfies all of:
 2. `remediation.kind == "manifest"`, and
 3. there is no **live** pull request on its branch, and
 4. on a run that passed `--manifest-file`, the collector neither declined to flag it nor marked its
-   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)).
+   fix `needs_triage` ([collector design §3.4](fleet-audit-collector-manifest.md)), and
+5. the install's `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is not `false` (step 7 below).
 
 Every other finding stays prose in the ledger until a human asks for it. Rationale: the highest-risk
 findings that have a mergeable diff should arrive ready to merge; the long tail must not turn six
@@ -312,7 +313,8 @@ Accepted risk: this can close a PR a human was mid-review on. Mitigations, all t
 - The closing comment states plainly that the PR may be reopened, and says **exactly** what happens
   if the finding returns: a manifest finding graded at or above the auto-promotion floor is normally
   re-proposed automatically on this same branch, at most five per run, and anything else is listed on the ledger as awaiting
-  `/remediate <finding-id>`. The comment is not allowed to promise a fresh pull request to every
+  `/remediate <finding-id>`; on an install whose `KUBEAGENTS_AUDIT_AUTO_PROMOTE` switch is off, that nothing is
+  re-proposed without a `/remediate`. The comment is not allowed to promise a fresh pull request to every
   reader, because auto-promotion does not open one for every reader — and the findings it silently
   would not re-propose are precisely the low-severity ones nobody is watching for.
 - **The branch is not deleted on close.** Branches are cheap and any human fixup pushed to the branch
@@ -512,6 +514,32 @@ with workspace lease markers and the git remote kept as fallbacks. This resolves
 `github-issue-resolver` and `fleet-audit` read from the same ConfigMap, so the two skills now agree
 by construction rather than by coincidence.
 
+The order is `--repo`, the lease record, the repository with `role: gitops`, and then the one managed
+repository. The lease record lasts on the shared volume across runs, so it counts only for the run
+that wrote it: while the stream's in-flight note exists and the lease is not older than that note.
+A `--repo` run, or a role that moved since, therefore does not hold later runs on the old repository. The operator writes the repository with `role: gitops` to the
+`gitops_repo` key of the same ConfigMap, as one `managed_repos` entry, and removes the key when no
+repository has that role. The key is read only when more than one repository is managed, and a key
+that names a repository not in `managed_repos` is ignored. So an install that manages a second
+repository (Terraform, applications) still sends the ledger issue and every fix to its GitOps
+repository, and a context repository is never the target. With several managed repositories and no
+`role: gitops`, the run takes the no-forge path with the reason and the fix (give one repository
+that role, or pass `--repo` for one run): the findings go to chat and the report store, and the
+harness never chooses among the repositories, nor may the agent.
+
+Before it publishes, `start` lists one open issue in the resolved repository through the broker and
+records the result in the run record. `finish` follows that record, and lists one only when there is
+no record of this run. When the forge answers that the repository is missing or that the credential
+cannot see it (`FORGE_NOT_FOUND`, `FORGE_FORBIDDEN`, `FORGE_UNAUTHENTICATED`), or the broker does not
+manage it (`REPOSITORY_NOT_MANAGED`), the run takes the no-forge path of a run with no repository:
+the findings go to the report store and to chat, and the note names the repository and the reason.
+It does not try another repository. Such a run is never silent, on every run, and it is not compared
+with the no-forge history of the store, so its new and resolved counts are unknown. Its envelope is
+stored under that repository's own store directory, marked unreachable, so the store keeps one
+directory for the stream; a run with no repository never uses a marked envelope as its baseline, and
+the forge path reads its memory from the newest envelope that is not marked. A broker that does not answer is `BrokerUnavailable`, as on every
+other forge call, and any other refusal leaves the run on its forge path.
+
 `start` is also the **only** subcommand that scrubs the working tree — see the note under
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
 branch.
@@ -557,6 +585,10 @@ whose SOP runs a collector must pass one; on any other stream the steps below ar
 7. Auto-promote every eligible manifest finding at or above the severity floor (§3.1) — at most
    five per run, the surplus named in the ledger as awaiting `/remediate` (§13 Q4) — and every
    authorised `/remediate` target, which is uncapped, by invoking the same code path as `remediate`.
+   An install turns the automatic half off with `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false` in
+   `spec.deployment.env` (the operator forwards it to the shell sandbox, whose entrypoint writes
+   it to a root-owned file the script reads first): the ledger then lists what the sweep would have
+   opened as awaiting `/remediate`, the only way a pull request opens there. The eval's inject lane runs that way.
 8. Close stale PRs (§3.3), unless partial, when only the shield's close is made; comment once on `pr-merged-persists` PRs; answer every
    `/remediate` exactly once, with an acknowledgement or a refusal. Each "once" guard reads the
    hidden markers of §3.1.
@@ -666,6 +698,34 @@ thirty fixes with zero, and leave the operator to work out which one was to blam
 where _every_ named target is refused is an error, since there is then no partial success to report
 and an exit 0 with an empty list would read as "done".
 
+A second degrade pass follows the missing-file pass in `finish`, in `remediate`, and as a warning in
+the `finish` dry run. Kustomize renders only the files its kustomization lists, and a remediation
+carries one file. Thus a pull request that adds a file to a Kustomize root, but not its entry,
+merges, the GitOps controller reports it in sync, and the finding comes back. The pass makes a
+`manifest` fix `manual` when all three of these are true. The file is new: it is not at the audited
+commit (`HEAD` of the clone, or the broker's base in content mode). A kustomization is in the file's
+directory or a parent directory, the top of the repository included, so a kustomization there makes
+the whole repository one Kustomize root, as the planner reads it. The nearest such kustomization
+does not name the file's path relative to its own directory as a whole token, bare or after `./`.
+Any mention counts, so the pass degrades only a file the kustomization cannot render. The note names
+the kustomization and the `resources:` line to add, and holds the worker's file as a fenced YAML
+block, because in content mode that file exists only in the scratch tree. The block comes before the
+worker's own note, and it gets only the room that the note's own text leaves under the renderer's
+note clip: it keeps at most a fixed number of lines, ends in a truncation line when it keeps less,
+and is left out when no room is left. So the clip cuts the worker's text and never the closing
+fence. When git cannot answer, the broker refuses a question (a 4xx status, at the open included),
+or the kustomization cannot be read, the fix degrades too, and the note says what could not be
+checked: the audit does not publish a pull request it cannot show will render. When the probe saw no
+kustomization, the note names none. A broker outage is not a refusal: no answer at all, or a server
+error or too-many-requests status, at the open or at a later call. Then the pass raises
+`BrokerUnavailable` (the log line says `BROKER UNAVAILABLE`), nothing is published, and the worker
+runs the command again, as for an outage at publish. `finish` does not refuse these fixes as
+unwritten, because the worker cannot correct them in one file, and `remediate` refuses them by name.
+The dry run does not ask git about the audited commit, so it cannot tell a new file from an existing
+one, and it reads the kustomization in the working tree. It takes each file as new, ignores a
+kustomization that a finding names as its fix, as the real run ignores every kustomization the
+worker wrote, warns, and does not change the body.
+
 Neither `finish` nor `remediate` scrubs the working tree, and that is load-bearing rather than
 incidental. The agent writes its remediation manifests into the clone _between_ `start` and
 `finish`, and they are untracked until a remediation branch stages them — so a `git clean -fd` on
@@ -715,13 +775,30 @@ headroom for the trailing marker and for anything a later section appends.
   five criticals and three hundred minors publishes all five criticals no matter what. In a
   severity band, selection takes one finding for each target in turn while the band has space: no
   target gets a second row before every target in the band has one. When the band has fewer slots
-  than targets, the targets late in the alphabet still lose their rows. The body still shows the
+  than targets, the targets late in the alphabet lose their full rows first (see the next bullet
+  for the one-line tier). The body still shows the
   selected findings in display order.
+- **A name outranks a full block, except a critical's.** When the full blocks do not all fit, the
+  findings left over are each listed on one line — severity, title, location, id, then any fix
+  state and its pull request — under
+  `### Listed without detail (N)`. Bands are taken most severe first. A non-critical band shows as
+  many full blocks as still leave room to name the rest of it and every finding below it; the
+  critical band keeps room for its own names only, so a critical never loses its evidence to a less
+  severe finding's name. When naming everything below cannot fit even with no full blocks, a
+  non-critical band keeps only its floor of full blocks and spends the rest on names. Every band below the one where full blocks stop is names only,
+  as many as fit, then a count. A listed line is a
+  bullet, never a `####` heading, so the readers that recover a finding's detail from its heading
+  (`FINDING_MARKER_RE`, the Slack card) do not take it for one. Its id rides the delta marker like a
+  full row's, and `parse_finding_locations` reads its row with the full blocks, only between
+  the renderer's `audit-listed:begin`/`end` comments, which model text cannot spell: the ledger names it,
+  so the delta, the collector hold, the clean close and the `carried` list `start` prints all treat
+  it as on the ledger. A listed finding that gains a full block when others resolve is not new, and
+  one that stops reproducing is resolved.
 - **Truncation is stated, counts are not.** When findings are omitted the body says so explicitly,
   and the title's counts remain the **true totals**. The reader is never told there are fewer
   findings than there are.
 - **The delta marker describes what was rendered.** The hidden marker lists exactly the findings the
-  body contains, not the full finding set — and, after them, the collector-held ids the body carries
+  body names, in full or on one line (see the bullet on the one-line tier above), not the full finding set — and, after them, the collector-held ids the body carries
   under their own heading (collector design §3.3). Otherwise the next run would see a truncated finding
   absent from the previous marker, or present in it and absent from the body, and report a finding
   that is very much still reproducing as _resolved_. The marker is itself a size term and was
@@ -734,9 +811,10 @@ headroom for the trailing marker and for anything a later section appends.
   term that grows with the fleet and is invisible in the rendered body is the worst kind to leave
   unbounded.
 - **The two halves of the delta are measured against different sets**, because "appeared" and "was
-  fixed" are different claims and truncation breaks them apart. `new` is _rendered minus previous_:
-  the previous marker records what the last body rendered, so comparing it to anything wider
-  announces every budget-dropped finding as new, every morning, forever. `resolved` is _previous
+  fixed" are different claims and truncation breaks them apart. `new` is _named minus previous_:
+  the previous marker records what the last body named, so comparing it to anything wider
+  announces every budget-dropped finding as new, every morning, forever; and a finding the last run
+  filed (its stored document) is left out of `new` too, whatever the last body showed. `resolved` is _previous
   minus **every** current finding, rendered or not_: a finding cut for space still reproduces, and
   calling it resolved puts a fix that never happened in writing, on the one finding nobody can see
   to contradict it. One yardstick for both halves is wrong in one direction or the other whichever
@@ -746,10 +824,11 @@ headroom for the trailing marker and for anything a later section appends.
   ledger for a finding that sorted last cannot tell "cut for space" from "never found". A body that
   omitted findings therefore carries a second hidden block, `<!-- audit-findings-all: [...] -->`,
   with every current id and the collector-held ids. Nothing joins against it: the delta keeps
-  reading the rendered marker, for the reason the bullet above gives, so a cut finding is announced
-  as new the first run it renders, whatever freed the room. Findings are selected once without the
+  reading the marker, for the reason the bullets above give, and, when the report store holds the last run's
+  document, `new` also leaves out any finding the last
+  run filed (its stored document), so an omitted finding that gains room is not announced as new. Findings are selected once without the
   block and, only if that cut something, again with it charged, so it never truncates a body that
-  would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap: about 3 of 37 rendered findings at 60 ids of 70 characters, about 8 at the cap. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
+  would have fit; on a body already truncated it costs the findings its length, which grows with the id count up to the cap and is paid in full blocks turned into one-line names, and names turned into the omitted count. That is the price of the record. Above `ALL_FINDINGS_BLOCK_CAP` (12,000
   characters) it is left out rather than truncated, since a partial complete list would be the same
   ambiguity with a different name.
 - **A finding new since the last run is marked where the run knows it.** A `<!-- finding-new -->`
@@ -1123,6 +1202,18 @@ reaches the channel. The ledger stays the record in both cases.
 | `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)  |
 | `severity:*`         | issue + PRs | Highest live severity, mutually exclusive    |
 
+A forge with no labels (Bitbucket; `capabilities` answers `labels: false`) gets none of these.
+There, a remediation PR is found by its branch prefix `platform-agent/fix-<audit-id>-`, the marker
+`<!-- audit-remediation: <audit-id> -->` in its description, its author (this install) and its
+source repository (this one, not a fork). A harness close adds `<!-- audit:stale-closed -->` to the
+description before the close, under the same rule as the label: no close without it.
+
+A forge with no issue verbs, or no labels, cannot hold the ledger issue. The design for it is in
+[`version-control-support.md`](version-control-support.md) §8, "The ledger without issues": the
+ledger goes to the report store and to chat, and remediation PRs still open on the forge. The
+harness does not make that decision yet. Until it does, a run against such a repository refuses at
+`start`, because the ledger lookup refuses rather than answer "none".
+
 ## 9. Red lines (carried forward, plus new)
 
 Unchanged: read-only against clusters; never `git add .` or `-A`; never force-push a protected
@@ -1333,8 +1424,10 @@ belief is wrong, so raising the constant to 200,000 would keep them all green wh
 422s. One test — and only one — asserts the constant equals the literal.
 
 - A run of 250 findings renders a body at or under the limit.
-- The hidden delta block contains exactly the ids the body rendered — no more, no fewer.
-- A truncated body's `audit-findings-all` block lists every finding id; an untruncated body carries
+- The hidden delta block contains exactly the ids the body names, in full or on one line — no more,
+  no fewer.
+- A body that omitted findings carries an `audit-findings-all` block listing every
+  finding id; an untruncated body carries
   none, and a list over `ALL_FINDINGS_BLOCK_CAP` is left out.
 - 5 critical plus 300 minor findings keeps all 5 criticals.
 - 10 findings render untruncated, with no "omitted" notice and no trimmed command.
@@ -1417,7 +1510,9 @@ directory's `origin`, which is the GitOps repo — correct for the PRs, but a pl
 audit issues in an ops/tracking repo instead. If they must differ, `start` needs an explicit
 issue-repo argument and the App token needs scope on both.
 
-_Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look.
+_Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look. On an
+install with several managed repositories, the GitOps repo is the one with `role: gitops` (§6,
+`start`).
 
 The divergence this question surfaced — `audit_report.py` deriving the repo from the working
 directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from
@@ -1461,7 +1556,7 @@ exist.
 severity floor, but a genuinely bad fleet day could still open many at once. Consider a per-run cap with the withheld set
 named in the ledger.
 
-_Resolved: auto-promotion is capped at five PRs per `finish` run._ Withheld findings are named in the
+_Resolved: auto-promotion is capped at five PRs per run._ Withheld findings are named in the
 ledger as awaiting `/remediate` (a section a collector manifest can add two blocks to —
 [collector design §3.4](fleet-audit-collector-manifest.md)), so nothing is lost, only deferred to a human's judgement about which
 five matter first. An explicit `/remediate` is **uncapped** — a human asked for it, and a cap there

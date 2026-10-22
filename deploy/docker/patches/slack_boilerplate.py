@@ -187,8 +187,10 @@ SYSTEM_REWORDS: tuple[tuple[re.Pattern, Any], ...] = (
      lambda m: STEER_FAILED),
     (re.compile(r"⏳ Queued for the next turn(?: \([^\n]*\))?\. I'll respond once the current task finishes\."),
      "Got it — I'll pick this up when I finish the current one."),
+    # The interrupt ends the reply in progress, not the work: a card filed on an
+    # earlier turn keeps running, so "stopping" read as abandoned work.
     (re.compile(r"⚡ Interrupting current task(?: \([^\n]*\))?\. I'll respond to your message shortly\."),
-     "Stopping what I was doing to look at this."),
+     "Got it — looking at this now."),
     (re.compile(r"⏩ Steered into current run(?: \([^\n]*\))?\. Your message arrives after the next tool call\."),
      "Got it — I'll fold this into what I'm working on now."),
     (re.compile(r"↪ Redirected current run(?: \([^\n]*\))?\. I'll adjust using your correction\."),

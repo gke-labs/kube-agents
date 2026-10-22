@@ -53,6 +53,20 @@ type fakeSlackAPI struct {
 	userInfoCalls int
 	// prompts records setSuggestedPrompts calls.
 	prompts []slack.AssistantThreadsSetSuggestedPromptsParameters
+	// views records views.publish calls by member.
+	views []publishedView
+}
+
+type publishedView struct {
+	member string
+	view   slack.HomeTabViewRequest
+}
+
+func (f *fakeSlackAPI) PublishView(member string, view slack.HomeTabViewRequest, _ string) (*slack.ViewResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.views = append(f.views, publishedView{member, view})
+	return &slack.ViewResponse{}, nil
 }
 
 func (f *fakeSlackAPI) AddReaction(name string, item slack.ItemRef) error {
@@ -812,6 +826,7 @@ func slackMsg(channelType, channel, user, text, ts, threadTS string) *slackevent
 func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
 	a := newTestSlackAdapter(&fakeSlackAPI{})
 	a.teamID = "T0URS"
+	a.syncSessions = true // refusal notices are sent inline, so the post count below is settled
 	ctx := context.Background()
 	foreign := slackMsg("im", "D1", "UGUEST", "drain node 4", "1.0", "")
 	foreign.UserTeam = "T0THER"
@@ -861,10 +876,143 @@ func TestSlackRefusesAnotherWorkspacesMember(t *testing.T) {
 	// No team id from auth.test: a message that names a sender workspace
 	// cannot be shown to be ours, so it is refused.
 	a.teamID = ""
+	posted := len(a.api.(*fakeSlackAPI).posted)
 	unknown := slackMsg("im", "D3", "U3", "hello", "5.0", "")
 	unknown.UserTeam = "T0URS"
 	if _, ok := a.inbound(ctx, unknown); ok {
 		t.Error("with no team id known, a message naming a sender workspace was delivered")
+	}
+	// Refused, but not told it is in another workspace: it may well be ours.
+	if got := a.api.(*fakeSlackAPI).posted[posted:]; len(got) != 0 {
+		t.Errorf("with no team id known, the sender was told it is in another workspace: %+v", got)
+	}
+}
+
+// TestSlackTellsAnotherWorkspacesMemberWhyOnce: a refused member of another
+// workspace who addressed the bot gets one reply in the thread of that message,
+// naming their member id, and the refusal's log line names them too. A second
+// ask from them gets no second notice, a message that addressed nobody gets
+// none, and the same member id in another workspace is another sender.
+func TestSlackTellsAnotherWorkspacesMemberWhyOnce(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	a.teamID = "T0URS"
+	a.syncSessions = true // the notice is sent off the pump; inline here
+	logs := &recordingHandler{}
+	a.log = slog.New(logs)
+	ctx := context.Background()
+
+	mention := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	mention.UserTeam = "T0THER"
+	if _, ok := a.inbound(ctx, mention); ok {
+		t.Fatal("a mention from another workspace's member was delivered as a turn")
+	}
+	if len(api.posted) != 1 {
+		t.Fatalf("posts = %+v, want one notice", api.posted)
+	}
+	notice := api.posted[0]
+	if notice.channel != "C1" || notice.thread != "2.0" || !strings.Contains(notice.text, "UGUEST") ||
+		!strings.Contains(notice.text, "another workspace") {
+		t.Errorf("notice = %+v, want a reply in the mention's thread naming the member id", notice)
+	}
+	if !logs.has("user", "UGUEST") {
+		t.Error("the refusal's log line does not name the refused member")
+	}
+
+	again := slackMsg("im", "D1", "UGUEST", "drain node 4", "3.0", "")
+	again.UserTeam = "T0THER"
+	a.inbound(ctx, again)
+	if len(api.posted) != 1 {
+		t.Errorf("posts = %+v, want no second notice for the same sender", api.posted)
+	}
+
+	unaddressed := slackMsg("channel", "C1", "UOTHER", "anyone seen node 4?", "4.0", "")
+	unaddressed.UserTeam = "T0THER"
+	a.inbound(ctx, unaddressed)
+	if len(api.posted) != 1 {
+		t.Errorf("posts = %+v, want no notice for a message that addressed nobody", api.posted)
+	}
+
+	elsewhere := slackMsg("im", "D2", "UGUEST", "hello", "5.0", "")
+	elsewhere.UserTeam = "T0THIRD"
+	a.inbound(ctx, elsewhere)
+	if len(api.posted) != 2 || api.posted[1].thread != "5.0" {
+		t.Errorf("posts = %+v, want a notice for the same member id in another workspace", api.posted)
+	}
+
+	// A mention inside a thread gets its notice in that thread, on its root.
+	inThread := slackMsg("channel", "C1", "UGUEST2", "<@UBOT> and node 5", "8.0", "100.1")
+	inThread.UserTeam = "T0THER"
+	a.inbound(ctx, inThread)
+	if len(api.posted) != 3 || api.posted[2].thread != "100.1" {
+		t.Errorf("posts = %+v, want the notice in the mention's thread", api.posted)
+	}
+
+	// A sender whose workspace is named only in the message's own team field is
+	// keyed by that workspace, so is a sender of their own.
+	teamOnly := slackMsg("im", "D6", "UGUEST3", "hello", "9.0", "")
+	teamOnly.Message = &slack.Msg{Team: "T0THER"}
+	a.inbound(ctx, teamOnly)
+	if len(api.posted) != 4 || !strings.Contains(api.posted[3].text, "UGUEST3") {
+		t.Errorf("posts = %+v, want a notice for a sender named only in the team field", api.posted)
+	}
+	teamOnlyElsewhere := slackMsg("im", "D7", "UGUEST3", "hello", "10.0", "")
+	teamOnlyElsewhere.Message = &slack.Msg{Team: "T0FIFTH"}
+	a.inbound(ctx, teamOnlyElsewhere)
+	if len(api.posted) != 5 {
+		t.Errorf("posts = %+v, want the same member id in another team-field workspace told too", api.posted)
+	}
+}
+
+// TestSlackForeignNoticeIsSharedByMessagesAndClicks: a member of another
+// workspace told once through a message is not told again when they click a
+// question's button, and the other way round: one memory, one notice.
+func TestSlackForeignNoticeIsSharedByMessagesAndClicks(t *testing.T) {
+	api := &fakeSlackAPI{}
+	a, _ := newUXSlackAdapter(api)
+	ctx := context.Background()
+	mention := slackMsg("channel", "C1", "UGUEST", "<@UBOT> drain node 4", "2.0", "")
+	mention.UserTeam = "T2"
+	a.inbound(ctx, mention)
+	a.interactive(clickPayload(t, "UGUEST", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "65.0"))
+	if len(api.posted) != 1 {
+		t.Errorf("posts = %+v, want one notice across a message and a click", api.posted)
+	}
+	a.interactive(clickPayload(t, "UOTHER", "T2", "C1", "40.0", "kage.choice.0", "Option A", "x", "66.0"))
+	other := slackMsg("im", "D1", "UOTHER", "hello", "3.0", "")
+	other.UserTeam = "T2"
+	a.inbound(ctx, other)
+	if len(api.posted) != 2 || api.posted[1].thread != "40.0" {
+		t.Errorf("posts = %+v, want the clicker's one notice in the question's thread, none for the later DM", api.posted)
+	}
+}
+
+// TestSlackForeignNoticeMemoryIsBounded: the once-per-sender memory never holds
+// more than slackForeignNoticesCap senders, and at the cap it is wiped whole, so
+// at worst a sender is told twice.
+func TestSlackForeignNoticeMemoryIsBounded(t *testing.T) {
+	saved := slackForeignNoticesCap
+	slackForeignNoticesCap = 2
+	t.Cleanup(func() { slackForeignNoticesCap = saved })
+	api := &fakeSlackAPI{}
+	a := newTestSlackAdapter(api)
+	a.teamID = "T0URS"
+	a.syncSessions = true
+	ctx := context.Background()
+	dm := func(user, ts string) {
+		m := slackMsg("im", "D"+user, user, "hello", ts, "")
+		m.UserTeam = "T0THER"
+		a.inbound(ctx, m)
+	}
+	dm("U1", "1.0")
+	dm("U2", "2.0")
+	dm("U3", "3.0") // the cap is reached: the memory is wiped, then U3 recorded
+	if n := len(a.foreignNoticed); n > slackForeignNoticesCap {
+		t.Fatalf("notice memory holds %d senders, over the cap of %d", n, slackForeignNoticesCap)
+	}
+	dm("U1", "4.0")
+	if len(api.posted) != 4 {
+		t.Errorf("posts = %d, want U1 told again after the wholesale eviction", len(api.posted))
 	}
 }
 

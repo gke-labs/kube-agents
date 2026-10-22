@@ -111,6 +111,13 @@ const (
 	// Read by agents/platform/scripts/fleet_scope_args.py; always set, so that a
 	// value a plugin or an operator env override supplied is never the only one.
 	envScopeDeclared = "KUBEAGENTS_SCOPE_DECLARED"
+	// The fleet audits' automatic remediation sweep, off when the value is
+	// "false": audit_report.py's finish then opens no pull request nobody asked
+	// for (an explicit /remediate still does). An operator sets it in
+	// spec.deployment.env; it is forwarded here because finish runs in this
+	// pod, not the agent's, and deploy/sandbox/entrypoint.sh writes it to a
+	// root-owned file the script reads before the session's variable (#3439).
+	envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -533,6 +540,19 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	}
 
 	env = append(env, corev1.EnvVar{Name: envScopeDeclared, Value: strconv.FormatBool(agent.Spec.Scope != nil)})
+	// Normalised to the two words the script reads, so the bytes on the pod
+	// are the operator's, as every other forwarded variable's are: a valueFrom
+	// could name a credential this pod must never hold, and a literal with a
+	// quote or a backslash would stop the entrypoint before sshd starts.
+	if agent.Spec.Deployment != nil {
+		for _, v := range agent.Spec.Deployment.Env {
+			if v.Name == envAuditAutoPromote && v.ValueFrom == nil {
+				off := strings.EqualFold(strings.TrimSpace(v.Value), "false")
+				env = append(env, corev1.EnvVar{Name: envAuditAutoPromote, Value: strconv.FormatBool(!off)})
+				break
+			}
+		}
+	}
 
 	containers := buildShellSandboxContainers(agent, env)
 	volumes := buildShellSandboxVolumes(agent, authorizedKeysSecret)
@@ -654,13 +674,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// Sized from the agent's own /opt/data claim, not independently.
 					// sandbox_mirror.py copies a subset of that volume into this one
 					// on upgrade, so matching them makes the migration fit by
-					// construction — see agentDataStorageSize.
+					// construction — see agentDataStorageSize. spec.storage.size
+					// moves both, through ResolveDataStorageSize.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxDataVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
+								corev1.ResourceStorage: ResolveDataStorageSize(agent),
 							},
 						},
 					},

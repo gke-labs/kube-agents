@@ -23,13 +23,27 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from providers import AVAILABLE, COLLABORATION_VERBS, ForgeUnsupported
-from providers.credentials import BrokeredCredential, MintedReadCredential, NoCredential
+from providers import (
+    AVAILABLE,
+    COLLABORATION_VERBS,
+    ISSUE_VERBS,
+    LABEL_FIELDS,
+    Forge,
+    ForgeUnsupported,
+    LabelsUnsupported,
+)
+from providers.credentials import (
+    BrokeredCredential,
+    MintedReadCredential,
+    NoCredential,
+    StaticFileCredential,
+)
 from workspace_paths import WorkspaceError
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -593,6 +607,57 @@ class ContractTest(unittest.TestCase):
                 for verb in forge.verbs:
                     self.assertIn(verb, answer["verbs"])
 
+    def test_capabilities_say_whether_labels_work(self):
+        # Label fields ride on other verbs, so `verbs` cannot say this; a
+        # caller that keeps its items apart by label reads it here.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                self.assertIs(forge.capabilities("acme/infra")["labels"], forge.labels)
+
+    def test_a_forge_declares_labels_exactly_when_it_serves_label_ensure(self):
+        # The two say one thing. A forge that served `label-ensure` and
+        # declared no labels would refuse every label it had just created.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                self.assertEqual(forge.labels, "label-ensure" in forge.verbs)
+
+    def test_a_forge_with_labels_lets_every_label_field_through(self):
+        for name, forge, _ in self.instances():
+            if not forge.labels:
+                continue
+            with self.subTest(forge=name):
+                for field in LABEL_FIELDS:
+                    forge.refuse_labels("proposal-list", {field: ["x"]})
+                forge.refuse_labels("label-ensure", {"name": "x"})
+
+    def test_a_forge_serves_the_issue_verbs_all_together_or_not_at_all(self):
+        # A ledger kept in issues reads their absence to keep it elsewhere; a
+        # forge with half of them would send it to a refusal halfway through.
+        for name, forge, _ in self.instances():
+            with self.subTest(forge=name):
+                served = [verb for verb in ISSUE_VERBS if verb in forge.verbs]
+                self.assertIn(served, ([], list(ISSUE_VERBS)))
+
+    def test_a_forge_with_no_labels_refuses_every_label_field_by_name(self):
+        # No forge in this install has no labels yet, so the property is held
+        # on the base class every forge inherits it from.
+        class NoLabels(Forge):
+            name = "no-labels"
+            verbs = ("proposal-list",)
+
+        forge = NoLabels()
+        for field in LABEL_FIELDS:
+            with self.subTest(field=field):
+                with self.assertRaises(LabelsUnsupported) as caught:
+                    forge.refuse_labels("proposal-list", {field: ["x"]})
+                self.assertEqual(caught.exception.status, 501)
+                self.assertEqual(caught.exception.fields.get("code"), "LABELS_UNSUPPORTED")
+                self.assertIn(field, str(caught.exception))
+        with self.assertRaises(LabelsUnsupported):
+            forge.refuse_labels("label-ensure", {"name": "x"})
+        forge.refuse_labels("proposal-list", {"labels": [], "excludeLabels": None})
+        self.assertIs(forge.capabilities("acme/infra")["labels"], False)
+
     def test_a_file_url_is_composed_on_the_forge_s_own_host(self):
         # A link in an issue must open the file on this forge, and the sandbox
         # builds no forge URL, so capabilities carries the template.
@@ -665,6 +730,36 @@ class ReadCredentialTest(unittest.TestCase):
         for forge in (*registry.forges, *registry.stubs):
             with self.subTest(forge=forge.name):
                 self.assertIsInstance(forge.read_credential("acme/infra"), NoCredential)
+
+    def test_a_forge_with_a_stored_token_defaults_to_no_read_credential(self):
+        # GitLab with no read-only token configured, or with its path
+        # configured and the Secret lacking the key, reads as before.
+        from providers import Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for extra in ({}, {"read_token_path": f"{tmp}/read-token"}):
+                with self.subTest(extra=extra):
+                    registry = Registry({"forges": [
+                        {"provider": "gitlab", "host": "gitlab.com", "token_path": f"{tmp}/token",
+                         "allowed_paths": (), **extra},
+                    ]})
+                    self.assertIsInstance(registry.default.read_credential("acme/infra"), NoCredential)
+
+    def test_a_forge_with_a_stored_read_token_answers_it_per_call(self):
+        from providers import Registry
+
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "read-token").write_text("glpat-read\n")
+            registry = Registry({"forges": [
+                {"provider": "gitlab", "host": "gitlab.com", "token_path": f"{tmp}/token",
+                 "read_token_path": f"{tmp}/read-token", "allowed_paths": ()},
+            ]})
+            forge = registry.default
+            first = forge.read_credential("acme/infra")
+            self.assertIsInstance(first, StaticFileCredential)
+            self.assertIsNot(first, forge.read_credential("acme/infra"))
+            self.assertEqual({"PRIVATE-TOKEN": "glpat-read"}, first.headers("acme/infra"))
+            self.assertIsNot(forge.credential, first)
 
     def test_a_forge_built_with_a_mint_answers_a_fresh_credential_per_call(self):
         from providers import Registry

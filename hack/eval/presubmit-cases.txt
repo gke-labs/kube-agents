@@ -49,13 +49,14 @@
 # truncating this list's tail. A case known to be slow gets a unit_cost_hint
 # entry in the script, not a position here.
 #
-# BUDGET. Twelve cases, thirty-six units at the script's EVAL_REPETITIONS
-# of 3: five domain probes, one reliability prompt variation, three
+# BUDGET. Eleven cases, thirty-three units at the script's EVAL_REPETITIONS
+# of 3: four domain probes, one reliability prompt variation, three
 # cluster-debugging cases, the incident-triage probe, the kanban smoke, and
 # one held-out seat (the compliance canary, ~1000-2000s a repetition; its
 # three repetitions serialize on the task lock). upgrades-lagging-master-probe
 # left for the nightly 2026-10-16 (#3269), putting upgrades on the
-# docs/designs/domains.yaml allowlist. The remediation writer
+# docs/designs/domains.yaml allowlist, and consistency-authorized-networks-probe
+# left 2026-10-21 (#3598), putting consistency there too. The remediation writer
 # pdb-remediation-pr (420-1929s measured, hinted at 1250) took its roster
 # line 2026-10-14 (#2016), which took remediation off that allowlist, and was
 # demoted to the nightly 2026-10-17 (#3120), which put it back on;
@@ -81,7 +82,6 @@
 ./tasks/reliability-pdb-probe/task.yaml
 ./tasks/capacity-pinned-pool-probe/task.yaml
 ./tasks/security-overgrant-probe/task.yaml
-./tasks/consistency-authorized-networks-probe/task.yaml
 ./tasks/cost-idle-pool-probe/task.yaml
 
 # The reliability prompt variation that grades what the probe does not ask
@@ -167,8 +167,7 @@
 # runs both files). scripts/test_eval_rosters.py pins the set as
 # HELD_OUT_IN_PRESUBMIT; roster ⊆ presubmit still holds, presubmit == roster
 # holds less exactly this section. A seat added or withdrawn here moves the
-# case counts in this file's BUDGET line, nightly-cases.txt's header,
-# docs/eval-gate-roster.md, docs/designs/testing-strategy.md and
+# case counts in this file's BUDGET line, docs/eval-gate-roster.md, docs/designs/testing-strategy.md and
 # docs/ci-health.md; SLOW_MIN_TASKS in scripts/eval_dashboard/health.py
 # reads this file.
 
@@ -199,6 +198,8 @@
 #   core kube-agents journey); the four full audits recast on 2026-08-26
 #   (obtainability-planted-pdb, stockout-pinned-pool,
 #   upgrade-readiness-lagging-cluster, consistency-drift-outlier), each
-#   domain covered by its probe above; obtainability-direct-query,
+#   domain covered by its probe above (the upgrades and consistency probes
+#   left for the nightly 2026-10-16, #3269, and 2026-10-21, #3598);
+#   obtainability-direct-query,
 #   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.

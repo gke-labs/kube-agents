@@ -2154,6 +2154,11 @@ main() {
     if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then
       refuse_next_slack_gateway_settings_from_env "" "$SCOPE_CHECK_MODE_WARN"
     fi
+    # A chat backend the gateway holds with no home channel (#3320): warned
+    # on every run, applying or not, and again at the end.
+    if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
+      warn_next_home_channel_unset_from_env
+    fi
     print_info "Comparing this checkout's composition against the install's Terraform state."
     local plan_status=0
     run_lifecycle "${repo_dir}/terraform/examples/full-install" \
@@ -2177,6 +2182,9 @@ main() {
         write_report "PLAN_FAILED"
         ;;
     esac
+    if declare -F print_next_home_channel_unset_summary >/dev/null; then
+      print_next_home_channel_unset_summary
+    fi
     exit "$plan_status"
   fi
 
@@ -2248,10 +2256,11 @@ main() {
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
       # And a live GitHub minter this render would destroy: an install.env
       # that lacks the GitOps keys (install.sh's flags were not recorded
-      # before #3075) renders GitOps off. Guarded as above.
+      # before #3075) renders GitOps off. Over a minter this install did not
+      # make, the check guards the GitOps repository instead. Guarded as above.
       if declare -F refuse_apply_dropping_live_gitops >/dev/null; then
-        # A refusal removes the tfvars the generator just wrote, which render
-        # the minter off, as install.sh does and the Slack check below does.
+        # A refusal removes the tfvars the generator just wrote, as
+        # install.sh does and the Slack check below does.
         if ! refuse_apply_dropping_live_gitops "$target_namespace" "${install_env_file:-install.env}"; then
           rm -f "$tfvars_file"
           exit 1
@@ -2276,6 +2285,9 @@ main() {
           exit 1
         fi
       fi
+      if declare -F warn_next_home_channel_unset_from_env >/dev/null; then
+        warn_next_home_channel_unset_from_env
+      fi
       # The mode. A full apply carries PLATFORM_AGENT_MODE forward from
       # install.env, so a key edited since the last apply switches the install
       # here, and the run says so first, from the reads the scope check made.
@@ -2283,6 +2295,24 @@ main() {
       # Guarded, as at the plan's notice: an older target's helpers lack it.
       if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
         announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
+      fi
+      # A switch out of an install.env that names no mode was chosen by
+      # nobody: such a file (one copied from install.env.example onto a
+      # running install) reads as today here, and nothing asks before the
+      # apply, so a next install would move back. So the file must assign the
+      # key (load_install_env unset it, and assigned empty is a chosen today)
+      # unless the reads showed no install that runs next: a read that failed
+      # is not today, nor is a hand-deleted CR whose release records next,
+      # and the notice names neither as a switch. An older target's helpers
+      # define neither check.
+      if [ -z "${PLATFORM_AGENT_MODE+set}" ] && {
+        [ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ] ||
+          { declare -F platform_agent_install_may_run_next >/dev/null && platform_agent_install_may_run_next; }
+      }; then
+        rm -f "$tfvars_file"
+        print_error "Refusing to render spec.mode today when install.env names no PLATFORM_AGENT_MODE and the install may run next: nothing asked for a switch."
+        print_info "Set PLATFORM_AGENT_MODE in install.env to the mode the install runs, or run install.sh once, which records it, and run again. To switch, set the mode you want there."
+        exit 1
       fi
       # And the container preflight: the apply binds a declared folder or
       # organisation with this identity and enables the Asset API in the host
@@ -2377,6 +2407,9 @@ main() {
   write_report "SUCCESS"
 
   print_step "🎉 Upgrade Complete!"
+  if declare -F print_next_home_channel_unset_summary >/dev/null; then
+    print_next_home_channel_unset_summary
+  fi
 }
 
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ]; then

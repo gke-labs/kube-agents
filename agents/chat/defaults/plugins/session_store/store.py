@@ -16,6 +16,7 @@ _PLUGINS_DIR = str(Path(__file__).resolve().parents[1])
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 
+from chat_metrics import metrics as chat_metrics  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
 logger = logging.getLogger("hermes.plugin.session_store")
@@ -145,12 +146,26 @@ class SessionMetadataStore:
             return cls._conn
 
     @classmethod
-    def write(cls, session_id: str, metadata: Dict[str, Any]) -> None:
+    def write(cls, session_id: str, metadata: Dict[str, Any]) -> bool:
+        """Upsert the session's row; True when this write created it.
+
+        A row created is a session this plugin first saw, which is what the
+        sessions counter counts: Hermes' own store does not say whether
+        get_or_create_session created, and the row is written under the same
+        lock, so one session is counted once however many messages it has.
+        The retention sweep below bounds that: a session idle past
+        SESSION_KV_RETENTION_DAYS whose row was swept, then written to again,
+        is counted a second time.
+        """
         payload = json.dumps(metadata, sort_keys=True)
         for attempt in range(2):
             with cls._lock:
                 conn = cls.get_db_connection()
                 try:
+                    existed = conn.execute(
+                        "SELECT 1 FROM session_metadata WHERE session_id = ?",
+                        (session_id,),
+                    ).fetchone() is not None
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO session_metadata
@@ -164,11 +179,12 @@ class SessionMetadataStore:
                         (f"-{_retention_days()} days",),
                     )
                     conn.commit()
-                    return
+                    return not existed
                 except sqlite3.Error:
                     cls._close_unlocked()
                     if attempt == 1:
                         raise
+        return False
 
     @classmethod
     def _open_connection(cls, db_path: str) -> sqlite3.Connection:
@@ -194,12 +210,13 @@ class SessionMetadataStore:
                 cls._db_path = ""
 
 
-def write_session_metadata(session_id: str, metadata: Dict[str, Any]) -> None:
+def write_session_metadata(session_id: str, metadata: Dict[str, Any]) -> bool:
+    """Write the row; True when it was created, False when updated or not written."""
     if not session_id:
-        return
+        return False
 
     try:
-        SessionMetadataStore.write(session_id, metadata)
+        return SessionMetadataStore.write(session_id, metadata)
     except Exception as exc:
         logger.error(
             "Failed to write session metadata for session %s: %s",
@@ -207,6 +224,15 @@ def write_session_metadata(session_id: str, metadata: Dict[str, Any]) -> None:
             exc,
             exc_info=True,
         )
+        return False
+
+
+def count_session(platform: str) -> None:
+    """Count one new session on the chat_metrics registry; never raises."""
+    try:
+        chat_metrics.REGISTRY.record_session(platform)
+    except Exception as exc:  # noqa: BLE001 -- the count never costs a turn
+        logger.error("Failed to count a session: %s", exc, exc_info=True)
 
 
 def log_event_to_db(
@@ -224,7 +250,8 @@ def log_event_to_db(
         session_entry = session_store.get_or_create_session(source)
         session_id = getattr(session_entry, "session_id", "") or ""
         metadata = SessionMetadata.from_event(event, session_id)
-        write_session_metadata(session_id, metadata.to_dict())
+        if write_session_metadata(session_id, metadata.to_dict()):
+            count_session(metadata.platform)
     except Exception as exc:
         logger.error(
             "Error in session_store pre_gateway_dispatch hook: %s",
