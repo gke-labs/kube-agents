@@ -26,12 +26,27 @@ func TestARequestRoundTrips(t *testing.T) {
 	}
 }
 
-func TestANotificationCarriesNoID(t *testing.T) {
-	out, _ := json.Marshal(Request{JSONRPC: JSONRPCVersion, Method: "notifications/initialized"})
-	var m map[string]any
-	_ = json.Unmarshal(out, &m)
-	if _, ok := m["id"]; ok {
-		t.Errorf("a notification marshals an id: %s", out)
+// Byte for byte, so a reordered field or a changed tag is a failing test: the
+// server's frames were these bytes before the types moved here.
+func TestTheFramesAreTheseBytes(t *testing.T) {
+	for _, c := range []struct {
+		v    any
+		want string
+	}{
+		{Request{JSONRPC: JSONRPCVersion, Method: NotificationInitialized}, `{"jsonrpc":"2.0","method":"notifications/initialized"}`},
+		{Request{JSONRPC: JSONRPCVersion, ID: json.RawMessage(`1`), Method: MethodToolsCall, Params: json.RawMessage(`{"name":"x"}`)}, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x"}}`},
+		{Response{JSONRPC: JSONRPCVersion, ID: json.RawMessage(`1`), Result: map[string]any{}}, `{"jsonrpc":"2.0","id":1,"result":{}}`},
+		{Response{JSONRPC: JSONRPCVersion, ID: json.RawMessage(`null`), Error: &Error{Code: ErrParseError, Message: "m"}}, `{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"m"}}`},
+		{ToolDefinition{Name: "n", Description: "d", InputSchema: map[string]any{}}, `{"name":"n","description":"d","inputSchema":{}}`},
+		{CallToolResult{Content: []TextContent{{Type: ContentTypeText, Text: "t"}}, IsError: true}, `{"content":[{"type":"text","text":"t"}],"isError":true}`},
+	} {
+		got, err := json.Marshal(c.v)
+		if err != nil {
+			t.Fatalf("%T: %v", c.v, err)
+		}
+		if string(got) != c.want {
+			t.Errorf("%T marshals\n %s\nwant\n %s", c.v, got, c.want)
+		}
 	}
 }
 
@@ -72,15 +87,19 @@ func TestTheWireConstantsAreTheProtocols(t *testing.T) {
 	got := map[string]any{
 		"jsonrpc": JSONRPCVersion, "initialize": MethodInitialize, "ping": MethodPing,
 		"tools/list": MethodToolsList, "tools/call": MethodToolsCall,
-		"resources/list": MethodResourcesList, "prompts/list": MethodPromptsList, "text": ContentTypeText,
-		"-32700": ErrParseError, "-32600": ErrInvalidRequest, "-32601": ErrMethodNotFound,
+		"resources/list": MethodResourcesList, "resources/read": MethodResourcesRead, "prompts/list": MethodPromptsList, "text": ContentTypeText,
+		"notifications/initialized": NotificationInitialized, "notifications/cancelled": NotificationCancelled,
+		"notifications/progress": NotificationProgress,
+		"-32700":                 ErrParseError, "-32600": ErrInvalidRequest, "-32601": ErrMethodNotFound,
 		"-32602": ErrInvalidParams, "-32603": ErrInternal,
 	}
 	want := map[string]any{
 		"jsonrpc": "2.0", "initialize": "initialize", "ping": "ping",
 		"tools/list": "tools/list", "tools/call": "tools/call",
-		"resources/list": "resources/list", "prompts/list": "prompts/list", "text": "text",
-		"-32700": -32700, "-32600": -32600, "-32601": -32601, "-32602": -32602, "-32603": -32603,
+		"resources/list": "resources/list", "resources/read": "resources/read", "prompts/list": "prompts/list", "text": "text",
+		"notifications/initialized": "notifications/initialized", "notifications/cancelled": "notifications/cancelled",
+		"notifications/progress": "notifications/progress",
+		"-32700":                 -32700, "-32600": -32600, "-32601": -32601, "-32602": -32602, "-32603": -32603,
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("constants = %v, want %v", got, want)

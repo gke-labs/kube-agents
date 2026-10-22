@@ -14,14 +14,21 @@ import "encoding/json"
 // JSONRPCVersion is the only "jsonrpc" value either side sends or accepts.
 const JSONRPCVersion = "2.0"
 
-// The methods kube-agents' MCP surface answers.
+// The MCP methods either side of a kube-agents connection names. The
+// in-cluster server answers the requests and ignores the notifications; a
+// client may also send resources/read.
 const (
 	MethodInitialize    = "initialize"
 	MethodPing          = "ping"
 	MethodToolsList     = "tools/list"
 	MethodToolsCall     = "tools/call"
 	MethodResourcesList = "resources/list"
+	MethodResourcesRead = "resources/read"
 	MethodPromptsList   = "prompts/list"
+
+	NotificationInitialized = "notifications/initialized"
+	NotificationCancelled   = "notifications/cancelled"
+	NotificationProgress    = "notifications/progress"
 )
 
 // JSON-RPC 2.0 error codes.
