@@ -48,10 +48,12 @@ _PROFILES_SOURCE = "# Source: kube-agents/templates/profiles-namespace.yaml"
 
 def _split_profiles_namespace(stdout: str) -> tuple:
     """The render without the profile namespace's document, and that document."""
-    docs = stdout.split("\n---\n")
+    # Split on the separator lines and keep them with the document after
+    # them, so the render's leading "---" survives the round trip.
+    docs = re.split(r"(?m)^(?=---$)", stdout)
     keep = [d for d in docs if _PROFILES_SOURCE not in d]
     taken = [d for d in docs if _PROFILES_SOURCE in d]
-    return "\n---\n".join(keep), "\n---\n".join(taken)
+    return "".join(keep), "".join(taken)
 
 
 def _render(*extra: str) -> subprocess.CompletedProcess:

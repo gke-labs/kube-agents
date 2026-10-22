@@ -139,9 +139,11 @@ func buildLiteLLMNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpo
 		},
 	}
 
-	// Profile pods, from their own namespace, on next installs where they
-	// exist (agentprofile_namespace.go).
-	if a2aStackRendering(agent) {
+	// Profile pods, from their own namespace, wherever the agent's bus
+	// surface renders (agentprofile_namespace.go). a2aAgentSurface rather
+	// than a2aStackRendering, so a version-skew pass, which freezes the bus
+	// fence with this peer on it, doesn't narrow LiteLLM's policy under it.
+	if a2aAgentSurface(agent) {
 		ingressRules = append(ingressRules, networkingv1.NetworkPolicyIngressRule{
 			Ports: []networkingv1.NetworkPolicyPort{tcpPort(litellmPort)},
 			From:  []networkingv1.NetworkPolicyPeer{profileNamespacePeer(agent)},
@@ -530,11 +532,14 @@ func (r *PlatformAgentReconciler) reconcileLiteLLMNetworkPolicy(ctx context.Cont
 
 	netpol := buildLiteLLMNetworkPolicy(agent, profile)
 	// LiteLLM admits the profile namespace only once that namespace's own
-	// fence is in place (agentprofile_namespace.go).
-	if fenced, err := r.profileFenced(ctx, agent); err != nil {
-		return err
-	} else if !fenced {
-		withoutProfilePeer(netpol, agent)
+	// fence is in place (agentprofile_namespace.go). Asked only where the
+	// peer renders, so a today install pays no reads for it.
+	if a2aAgentSurface(agent) {
+		if fenced, err := r.profileFenced(ctx, agent); err != nil {
+			return err
+		} else if !fenced {
+			withoutProfilePeer(netpol, agent)
+		}
 	}
 	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.OTLPEndpoint != "" && otlpCollectorNamespace(agent.Spec.Telemetry.OTLPEndpoint) == "" {
 		if litellmOTLPCollectorNamespace(agent) == "" {

@@ -5000,13 +5000,13 @@ func (r *PlatformAgentReconciler) a2aSessionDNSClusterIPs(ctx context.Context, a
 // gatewayFenced reports whether this pass applied the gateway's own fence.
 // reconcileA2A reads it so that fence is written once per pass (see the
 // gateway section there); the refusal path has no use for it.
-func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (gatewayFenced bool, err error) {
+func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (gatewayFenced, profileFenced bool, err error) {
 	dnsClusterIPs := r.a2aSessionDNSClusterIPs(ctx, agent)
 	// The profile namespace's fence goes first, and the bus admits that
 	// namespace only once the fence is in place (agentprofile_namespace.go).
-	profileFenced, err := r.reconcileProfileFence(ctx, agent, dnsClusterIPs)
+	profileFenced, err = r.reconcileProfileFence(ctx, agent, dnsClusterIPs)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	nats := buildA2ANATSNetworkPolicy(agent)
 	if !profileFenced {
@@ -5049,17 +5049,17 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 		fences = append(fences, a2aGatewayFencePolicyWithOperatorPeer(agent, r.OperatorNamespace))
 		gatewayFenced = true
 	} else if !errors.IsNotFound(err) {
-		return false, err
+		return false, false, err
 	}
 	for _, np := range fences {
 		if err := ctrl.SetControllerReference(agent, np, r.Scheme); err != nil {
-			return false, err
+			return false, false, err
 		}
 		if err := r.applyManaged(ctx, agent, np); err != nil {
-			return false, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
+			return false, false, fmt.Errorf("failed to apply A2A NetworkPolicy %s: %w", np.Name, err)
 		}
 	}
-	return gatewayFenced, nil
+	return gatewayFenced, profileFenced, nil
 }
 
 // reconcileA2A renders the next stack. Callers gate on renderMode; this
@@ -5163,7 +5163,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	// disappear with the stack they fence — including the skew freeze, where a
 	// frozen, running bus keeps its ingress policy and the workers on it keep
 	// their egress one.
-	gatewayFenced, err := r.reconcileA2ANetworkFences(ctx, agent)
+	gatewayFenced, profileFenced, err := r.reconcileA2ANetworkFences(ctx, agent)
 	if err != nil {
 		return state, err
 	}
@@ -5188,7 +5188,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 
 	// The profile namespace's quota. The chart creates the namespace; until
 	// it exists this renders nothing. Its fence is reconcileA2ANetworkFences'.
-	if err := r.reconcileProfileQuota(ctx, agent); err != nil {
+	if err := r.reconcileProfileQuota(ctx, agent, profiles, profileFenced); err != nil {
 		return state, err
 	}
 
@@ -6301,6 +6301,15 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		if client.IgnoreNotFound(err) != nil {
 			return err
 		}
+	}
+	// The profile fence is the first write of reconcileA2ANetworkFences and
+	// carries no owner reference, so it is tested by this agent's labels.
+	if !anyPresent {
+		fence, err := r.profileFenceRendered(ctx, agent)
+		if err != nil {
+			return err
+		}
+		anyPresent = fence
 	}
 	if !anyPresent {
 		return nil

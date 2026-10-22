@@ -151,6 +151,78 @@ func TestLiteLLMAdmitsProfilePodsOnNextOnly(t *testing.T) {
 	if admits(today) {
 		t.Error("LiteLLM's policy admits the profile namespace on a today install, where no profile pods exist")
 	}
+	// Version skew freezes the bus fence with its profile peer; LiteLLM's
+	// policy must not narrow under it (a2aAgentSurface).
+	skew := a2aTestAgent()
+	skew.Spec.Mode = ptr.To("later")
+	if !admits(skew) {
+		t.Error("LiteLLM's policy drops the profile namespace on a skew pass while the bus fence keeps it")
+	}
+}
+
+// The watch maps a profile fence, and nothing else, back to its agent's
+// namespace.
+func TestAgentNamespaceOfProfileFence(t *testing.T) {
+	agent := a2aTestAgent()
+	fence := buildProfileNetworkPolicy(agent, nil)
+	if got := agentNamespaceOfProfileFence(fence); got != "test-ns" {
+		t.Errorf("the profile fence maps to %q, want test-ns", got)
+	}
+	other := fence.DeepCopy()
+	other.Labels[a2aComponentLabel] = "session-netpol"
+	if got := agentNamespaceOfProfileFence(other); got != "" {
+		t.Errorf("a policy with another component maps to %q, want none", got)
+	}
+	elsewhere := fence.DeepCopy()
+	elsewhere.Namespace = "test-ns"
+	if got := agentNamespaceOfProfileFence(elsewhere); got != "" {
+		t.Errorf("a profile-netpol outside a -profiles namespace maps to %q, want none", got)
+	}
+}
+
+// Deleting the PlatformAgent removes its quota and fence from the profile
+// namespace, which nothing else would reclaim.
+func TestDeletingTheAgentRemovesItsProfileObjects(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Finalizers = []string{platformAgentFinalizer}
+	quota := buildProfileQuota(agent, nil)
+	fence := buildProfileNetworkPolicy(agent, nil)
+	withCommonLabels(quota, agent)
+	withCommonLabels(fence, agent)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota, fence).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if _, err := r.handleDeletion(context.Background(), agent); err != nil {
+		t.Fatalf("handleDeletion: %v", err)
+	}
+	var q corev1.ResourceQuota
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: quota.Name}, &q); !apierrors.IsNotFound(err) {
+		t.Errorf("the profile quota survived the agent's deletion (err %v)", err)
+	}
+	var np networkingv1.NetworkPolicy
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence.Name}, &np); !apierrors.IsNotFound(err) {
+		t.Errorf("the profile fence survived the agent's deletion (err %v)", err)
+	}
+}
+
+// A today install whose only A2A residue is the profile fence (a guardrail
+// pass that died after it and before the NATS fence) still runs the
+// teardown, and the fence goes.
+func TestTheProfileFenceAloneDrivesTheTeardown(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Spec.Mode = ptr.To("today")
+	fence := buildProfileNetworkPolicy(agent, nil)
+	withCommonLabels(fence, agent)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, fence).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.cleanupA2A(context.Background(), agent); err != nil {
+		t.Fatalf("cleanupA2A: %v", err)
+	}
+	var np networkingv1.NetworkPolicy
+	if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "test-ns-profiles", Name: fence.Name}, &np); !apierrors.IsNotFound(err) {
+		t.Errorf("the profile fence survived a teardown it was the only residue of (err %v)", err)
+	}
 }
 
 // With no profile namespace (the chart didn't make it) nothing is rendered
@@ -166,8 +238,8 @@ func TestNoProfileNamespaceRendersNothing(t *testing.T) {
 	if err != nil || fenced {
 		t.Fatalf("with no profile namespace: fenced=%v err=%v, want false and no error", fenced, err)
 	}
-	if err := r.reconcileProfileQuota(ctx, agent); err != nil {
-		t.Fatalf("quota with no profile namespace: %v", err)
+	if err := r.reconcileProfileQuota(ctx, agent, nil, false); err != nil {
+		t.Fatalf("quota on an unfenced pass: %v", err)
 	}
 	var ns corev1.Namespace
 	if err := cl.Get(ctx, types.NamespacedName{Name: "test-ns-profiles"}, &ns); !apierrors.IsNotFound(err) {

@@ -31,7 +31,7 @@ func TestTheProfileQuotaAndFenceLandInTheNamespace(t *testing.T) {
 	if err != nil || !fenced {
 		t.Fatalf("fenced=%v err=%v, want true and no error", fenced, err)
 	}
-	if err := r.reconcileProfileQuota(ctx, agent); err != nil {
+	if err := r.reconcileProfileQuota(ctx, agent, nil, true); err != nil {
 		t.Fatalf("quota: %v", err)
 	}
 	var q corev1.ResourceQuota
@@ -83,7 +83,7 @@ func TestTheNATSFenceAdmitsProfilePodsOnlyWhenTheyAreFenced(t *testing.T) {
 		}
 		return false
 	}
-	if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		t.Fatalf("fences with no profile namespace: %v", err)
 	}
 	if admitted() {
@@ -92,7 +92,7 @@ func TestTheNATSFenceAdmitsProfilePodsOnlyWhenTheyAreFenced(t *testing.T) {
 	if err := c.Create(ctx, chartProfileNamespace(agent)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+	if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 		t.Fatalf("fences with the profile namespace: %v", err)
 	}
 	if !admitted() {

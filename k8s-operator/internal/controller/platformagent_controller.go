@@ -1216,6 +1216,16 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
+		// The profile namespace's quota and fence carry no owner reference
+		// either (agentprofile_namespace.go), so deleting the CR is the other
+		// way they'd be left behind; a stale quota would cap a successor
+		// agent's profile pods. The fence goes last.
+		if err := r.deleteProfileQuota(ctx, agent); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.deleteProfileFence(ctx, agent); err != nil {
+			return ctrl.Result{}, err
+		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
 		// is absent or terminating. litellm-policy is owned by Deployment/litellm (via OwnerReference)
@@ -3154,7 +3164,7 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 		errs = append(errs, err)
 	}
 	if a2aStackRendering(agent) {
-		if _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -5618,6 +5628,14 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&networkingv1.NetworkPolicy{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				// A profile fence carries no owner reference, so Owns()
+				// never maps it: re-reconcile its agent when it is created,
+				// changed or deleted, so the bus and LiteLLM stop admitting
+				// a namespace whose fence is gone, and LiteLLM admits one
+				// the pass after its fence lands.
+				if ns := agentNamespaceOfProfileFence(obj); ns != "" {
+					return enqueueAgentsInNamespace(ctx, ns)
+				}
 				if obj.GetName() != litellmNetworkPolicyName {
 					return nil
 				}

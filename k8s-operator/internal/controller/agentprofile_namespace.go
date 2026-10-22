@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -43,6 +44,14 @@ const (
 	profileNamespaceComponent      = "profiles"
 	helmReleaseNamespaceAnnotation = "meta.helm.sh/release-namespace"
 	profileNamespaceComponentLabel = "app.kubernetes.io/component"
+)
+
+// The component labels of what the operator renders into the profile
+// namespace, the test renderedByAgent applies to objects that can't carry
+// an owner reference.
+const (
+	profileQuotaComponent  = "profile-quota"
+	profileNetpolComponent = "profile-netpol"
 )
 
 // profileNamespaceName is the namespace profile work runs in.
@@ -113,7 +122,7 @@ func buildProfileQuota(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alp
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      profileQuotaName(agent),
 			Namespace: profileNamespaceName(agent),
-			Labels:    a2aLabels(agent, "profile-quota"),
+			Labels:    a2aLabels(agent, profileQuotaComponent),
 		},
 		Spec: corev1.ResourceQuotaSpec{Hard: hard},
 	}
@@ -134,7 +143,7 @@ func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      profileNetpolName(agent),
 			Namespace: profileNamespaceName(agent),
-			Labels:    a2aLabels(agent, "profile-netpol"),
+			Labels:    a2aLabels(agent, profileNetpolComponent),
 		},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{},
@@ -188,8 +197,11 @@ func profileNamespacePeer(agent *agentv1alpha1.PlatformAgent) networkingv1.Netwo
 // hand, or a chart from before #3655): profile work renders nothing there,
 // and the operator never creates it.
 func (r *PlatformAgentReconciler) profileNamespaceExists(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	// Through a2aReader: Namespace is a kind this controller doesn't
+	// otherwise watch, and a cached Get would start a cluster-wide informer
+	// for it on every install.
 	var ns corev1.Namespace
-	if err := r.Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
@@ -241,7 +253,7 @@ func (r *PlatformAgentReconciler) profileFenced(ctx context.Context, agent *agen
 	if err != nil {
 		return false, err
 	}
-	return renderedByAgent(&np, agent, "profile-netpol"), nil
+	return renderedByAgent(&np, agent, profileNetpolComponent), nil
 }
 
 // renderedByAgent reports whether obj carries this agent's labels for the
@@ -274,15 +286,13 @@ func withoutProfilePeer(np *networkingv1.NetworkPolicy, agent *agentv1alpha1.Pla
 }
 
 // reconcileProfileQuota renders the quota into the profile namespace, when
-// it exists.
-func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	exists, err := r.profileNamespaceExists(ctx, agent)
-	if err != nil || !exists {
-		return err
-	}
-	profiles, err := boundAgentProfiles(ctx, r.Client, agent)
-	if err != nil {
-		return fmt.Errorf("list the AgentProfiles for the profile quota: %w", err)
+// this pass fenced it (reconcileA2ANetworkFences' answer, so the namespace
+// is read once per pass). profiles is the list reconcileA2A already holds,
+// under its agentProfilesUnreadable guard; nil sizes the quota for the
+// ceiling alone.
+func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, fenced bool) error {
+	if !fenced {
+		return nil
 	}
 	if err := r.applyManaged(ctx, agent, buildProfileQuota(agent, profiles)); err != nil {
 		return fmt.Errorf("failed to apply the profile ResourceQuota: %w", err)
@@ -299,11 +309,11 @@ func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, age
 // fence last, after the bus fence that admits the namespace is gone; a pass
 // that dies before then leaves a fence that only restricts.
 func (r *PlatformAgentReconciler) deleteProfileQuota(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	return r.deleteProfileObject(ctx, agent, &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: profileNamespaceName(agent)}}, r.a2aReader(), "profile-quota")
+	return r.deleteProfileObject(ctx, agent, &corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: profileQuotaName(agent), Namespace: profileNamespaceName(agent)}}, r.a2aReader(), profileQuotaComponent)
 }
 
 func (r *PlatformAgentReconciler) deleteProfileFence(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	return r.deleteProfileObject(ctx, agent, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: profileNetpolName(agent), Namespace: profileNamespaceName(agent)}}, r.Client, "profile-netpol")
+	return r.deleteProfileObject(ctx, agent, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: profileNetpolName(agent), Namespace: profileNamespaceName(agent)}}, r.Client, profileNetpolComponent)
 }
 
 func (r *PlatformAgentReconciler) deleteProfileObject(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object, reader client.Reader, component string) error {
@@ -317,4 +327,32 @@ func (r *PlatformAgentReconciler) deleteProfileObject(ctx context.Context, agent
 		return fmt.Errorf("delete %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
 	}
 	return nil
+}
+
+// profileFenceRendered reports whether this agent's profile fence exists,
+// for cleanupA2A's sentinels: it is the first write of
+// reconcileA2ANetworkFences, and it carries no owner reference, so the
+// owner test the other sentinels use can't see it.
+func (r *PlatformAgentReconciler) profileFenceRendered(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	var np networkingv1.NetworkPolicy
+	err := r.Get(ctx, types.NamespacedName{Namespace: profileNamespaceName(agent), Name: profileNetpolName(agent)}, &np)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return renderedByAgent(&np, agent, profileNetpolComponent), nil
+}
+
+// agentNamespaceOfProfileFence maps a NetworkPolicy back to the agent's
+// namespace when it is a profile fence, for the watch that re-reconciles the
+// agent when its fence changes or is deleted: the fence carries no owner
+// reference, so Owns() never sees it. "" for anything else.
+func agentNamespaceOfProfileFence(obj client.Object) string {
+	ns, ok := strings.CutSuffix(obj.GetNamespace(), "-profiles")
+	if !ok || ns == "" || obj.GetLabels()[a2aComponentLabel] != profileNetpolComponent {
+		return ""
+	}
+	return ns
 }
