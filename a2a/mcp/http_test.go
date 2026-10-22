@@ -117,6 +117,17 @@ func TestTheEndpointAnswersAndBounds(t *testing.T) {
 	if rec := post(h, auth, strings.Repeat(" ", maxBodyBytes+1)); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized body = %d, want 413", rec.Code)
 	}
+	// A revision this server speaks, or none (an older client), is served;
+	// any other is refused before the body is read.
+	for v, want := range map[string]int{"2025-06-18": http.StatusOK, "": http.StatusOK, "2099-01-01": http.StatusBadRequest} {
+		hdr := http.Header{headerAuthorization: {"Bearer " + testToken}}
+		if v != "" {
+			hdr.Set(headerProtocolVersion, v)
+		}
+		if rec := post(h, hdr, pingFrame); rec.Code != want {
+			t.Errorf("%s %q = %d, want %d", headerProtocolVersion, v, rec.Code, want)
+		}
+	}
 	req := httptest.NewRequest(http.MethodGet, Path, nil)
 	req.Header.Set(headerAuthorization, "Bearer "+testToken)
 	rec = httptest.NewRecorder()
