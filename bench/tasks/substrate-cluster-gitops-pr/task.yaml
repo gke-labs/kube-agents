@@ -89,18 +89,14 @@ verification_spec:
       owner: ""
       unchanged_paths: ["clusters/gitops-target-1/*", "fleet/*"]
       content:
-        # Cluster: Standard, Workload Identity, the two beta APIs.
+        # Cluster: Workload Identity, the two beta APIs. Standard is graded by
+        # the node-pool checks below: an Autopilot cluster declares no node
+        # pool, and `enableAutopilot: false` is a correct Standard spelling.
         - {
             paths: ["clusters/*.yaml"],
             kind: ContainerCluster,
             field: "",
             op: exists,
-          }
-        - {
-            paths: ["clusters/*.yaml"],
-            kind: ContainerCluster,
-            field: spec.enableAutopilot,
-            op: absent,
           }
         - {
             paths: ["clusters/*.yaml"],

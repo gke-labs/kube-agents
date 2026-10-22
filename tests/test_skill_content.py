@@ -97,6 +97,13 @@ class InstallGuidesAreReadNotSearchedTest(unittest.TestCase):
         self.assertIn('tool_search("developer_knowledge")', content)
         self.assertIn("mcp__developer_knowledge__get_documents", content)
         self.assertIn("inspect_repository.py clone", content)
+        # The version source is readable too: never the default branch's
+        # Chart.yaml, and the cert-manager reference reads its release branch,
+        # not GitHub's releases page or a raw URL (#3678 review round 3).
+        self.assertIn("Never the default branch's `Chart.yaml`", content)
+        cert_manager = (HELM_CHART_SKILL.parent / "references" / "cert-manager.md").read_text(encoding="utf-8")
+        self.assertNotIn("raw.githubusercontent.com", cert_manager)
+        self.assertNotIn("/releases`", cert_manager)
         self.assertIn("inspect-repository", content)
         self.assertIn("A search result is never a source", content)
         self.assertNotIn("web_extract", content)
