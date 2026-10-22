@@ -2284,6 +2284,25 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.real_trigger("sess-refused", "msg", {}, self._rows("refusedturn-api")[0][0])
             self.assertEqual(self._inject("refusedturn-api-6cfdb6b98b-bbbbb")["status"], "injected")
 
+    @patch.object(session_kv_server, "_post_initial_alert", side_effect=RuntimeError("chat client blew up"))
+    def test_a_task_that_dies_before_the_turn_releases_the_anchor(self, _):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False):
+            self._inject("diedtask-api-6cfdb6b98b-aaaaa")
+            with self.assertRaises(RuntimeError):
+                self.real_trigger("sess-died", "msg", {}, self._rows("diedtask-api")[0][0])
+            self.assertEqual(self._inject("diedtask-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_restart_releases_every_anchor_written_before_it(self):
+        # The process died between the insert and its background task, so
+        # nothing ran to release the row; the next start has to.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            self._inject("orphan-api-6cfdb6b98b-aaaaa")
+            session_kv_server.init_db()
+            self.assertEqual(self._inject("orphan-api-6cfdb6b98b-bbbbb")["status"], "injected")
+            # The anchor written after the start still folds its siblings.
+            self.assertEqual(self._inject("orphan-api-6cfdb6b98b-ccccc")["status"], "folded")
+
     def test_only_a_deployments_pods_and_whole_objects_fold(self):
         key = session_kv_server._fold_key
         self.assertEqual(key("Pod", "checkout-6cfdb6b98b-zwv24"), "checkout")

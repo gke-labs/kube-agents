@@ -387,7 +387,7 @@ resource "null_resource" "incident" {
       done
       echo "BackOff reached the debounce threshold after $${elapsed}s."
 
-      # ---- 3. Wait for the watcher to open the incident ---------------------
+      # ---- 3. Wait for the watcher to hand the event to the daemon ----------
       # Read from the watcher's own log rather than from the gateway's
       # /api/sessions, which the design note in #901 suggested: that route needs
       # a bearer token and a port-forward, and the harness does not establish
@@ -401,10 +401,10 @@ resource "null_resource" "incident" {
       # hide a missing container behind this timeout again.
       #
       # --since-time, not --since: the namespace name is static, so a wall-clock
-      # window would also match the `fire` line from an earlier run against a
+      # window would also match the line from an earlier run against a
       # recycled Boskos lease and return before this run's incident exists.
       #
-      # The fire line carries no cluster (k8s-event-watcher/main.go), and the
+      # The watcher's line carries no cluster (k8s-event-watcher/main.go), and the
       # watcher fans in over several, so in principle this matches a pod of
       # that name on any watched cluster. Nothing reaches it today: only this
       # stack plants ${local.ns}, step 0b clears any leftover of it on this
@@ -425,13 +425,14 @@ resource "null_resource" "incident" {
         sleep 10
         elapsed=$((elapsed + 10))
       done
-      echo "k8s-event-watcher opened an incident for ${local.ns} after $${elapsed}s."
+      echo "k8s-event-watcher handled a pod of ${local.ns} (matched '${local.watcher_handled}') after $${elapsed}s."
 
-      # The card is filed within seconds of that line and then takes minutes to
-      # run. Waiting for it HERE would mean reading the Platform Agent pod's
+      # After a `fire` line the card is filed within seconds and then takes
+      # minutes to run; after a `folded` one no card is filed for this run.
+      # Waiting for the card HERE would mean reading the Platform Agent pod's
       # SQLite board over `kubectl exec`, coupling a bench fixture to an
-      # internal file path; the task's prompt polls the board with kanban_show
-      # instead, which is the read path the product actually offers.
+      # internal file path; a task's prompt reads the board through the kanban
+      # tools instead, which is the read path the product actually offers.
     EOT
   }
 

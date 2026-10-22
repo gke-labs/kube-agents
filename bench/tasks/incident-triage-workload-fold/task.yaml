@@ -11,9 +11,11 @@
 #
 # The stack is autoops-warning-event-triage's, at three replicas and under its
 # own namespace and workload name: two cases on one name share the daemon's
-# fold window, and the CI window is short enough that a repetition of one
-# case does not fold into the last (the comment above
-# EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS says why it must stay so).
+# fold window. The CI window is short enough that autoops-warning-event-triage's
+# repetitions, minutes apart while it waits for its card, do not fold into one
+# another; this case's own repetitions can (below). The comment above
+# EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS in hack/ci-deploy.sh says why it must
+# stay short.
 #
 # A repetition is a short apply and a short turn, ~4 minutes, so a later
 # repetition's burst can land inside the first one's window and fold into its
@@ -21,8 +23,8 @@
 # admits every replica's row, so the newest incident has nothing folded into it.
 #
 # The grade is deterministic and reads the daemon's ledger, not the agent's
-# words: the watcher logs a `fire` line for every replica whatever the daemon
-# answers, so its log cannot tell one incident from three. The prompt gives the
+# words: the ledger is where a folded event is recorded against its anchor, and
+# the agent's board read cannot see that. The prompt gives the
 # turn something cheap and honest to do while the burst lands.
 #
 # Isolation class: namespace-scoped, as its sibling: the stack's destroy (or
@@ -68,10 +70,11 @@ prompt: |
   Make no changes to the cluster.
 expected_output: |
   critical requirements:
-  - The reply counts the triage tasks on the board for the 'eval-workload-fold'
+  - The reply reports the triage tasks on the board for the 'eval-workload-fold'
     namespace, read off the kanban board rather than worked out from the
-    cluster. A correct count is one: the three replicas' events are one
-    incident.
+    cluster. Do not grade the count itself: a repetition whose replicas folded
+    into an earlier repetition's incident finds none of its own, and the board
+    may also carry drift cards for the namespace.
   - Nothing is applied to the cluster.
 
 verification_spec:
@@ -79,7 +82,8 @@ verification_spec:
     role: objective
     # converge, the objective default: the replicas cross the watcher's
     # debounce within seconds of each other, and the stack returns at the
-    # first `fire`, so the folded rows can land after the turn starts.
+    # first `fire` or `folded` line, so the folded rows can land after the
+    # turn starts.
     check:
       type: workload_incident_folded
       namespace: eval-workload-fold

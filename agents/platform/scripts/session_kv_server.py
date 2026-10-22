@@ -1046,6 +1046,15 @@ def init_db() -> None:
                 )
                 """
             )
+            # A fold anchor is written as an intent, before its background task
+            # runs, so a process that died in between (OOM, SIGKILL, a crash)
+            # leaves a row anchoring its workload with no triage behind it and
+            # nothing left to release it. Every start therefore releases them
+            # all: a workload whose triage did start loses its window, which
+            # costs one more triage (per severity: a Critical folds only into a
+            # Critical) for a sibling that arrives after
+            # the restart, and is noise rather than silence.
+            conn.execute("UPDATE intercepted_events SET fold_key = '' WHERE fold_key != ''")
             findings_queue.init_findings_schema(conn)
             _purge_plaintext_identities(conn)
 
@@ -2914,7 +2923,31 @@ def trigger_agent_troubleshooter(
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded only for a Slack thread.
+
+    An exception releases the row's fold anchor before it propagates: the
+    ledger row was written as admitted before this task was queued, and a task
+    that died before the turn would otherwise leave every sibling folding into
+    a triage that never started (mark_triage_not_started). _start_agent_turn
+    catches its own errors, so nothing raised here comes after a turn began.
     """
+    try:
+        _trigger_agent_troubleshooter(
+            session_id, alert_msg, payload, event_row_id, slack_alert_msg=slack_alert_msg, alert_title=alert_title
+        )
+    except Exception:
+        mark_triage_not_started(event_row_id)
+        raise
+
+
+def _trigger_agent_troubleshooter(
+    session_id: str,
+    alert_msg: str,
+    payload: Dict[str, Any],
+    event_row_id: Optional[int] = None,
+    slack_alert_msg: Optional[str] = None,
+    alert_title: Optional[str] = None,
+) -> None:
+    """trigger_agent_troubleshooter's work, without the release on an exception."""
     # 1. Post initial warning notification to Google Chat or Slack.
     #
     #    One destination, but the first one is not the only one tried. This path
