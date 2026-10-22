@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -391,5 +392,91 @@ func TestAFailedCardReadIsNotNoCards(t *testing.T) {
 	md := FormatBusStatusMarkdown(BusStatus{Connected: true, Problems: []string{"agent cards: context canceled"}})
 	if strings.Contains(md, "No agent cards on DIRECTORY") || !strings.Contains(md, "could not be read") {
 		t.Errorf("a failed card read renders as:\n%s", md)
+	}
+}
+
+// A password rotated in the mounted file reaches the connection: the bus
+// switches the console user to the new password and drops the old session,
+// and the client's reconnect presents what the file now holds.
+func TestARotatedPasswordReachesTheConnection(t *testing.T) {
+	user := func(pw string) []*natsserver.User { return []*natsserver.User{{Username: testUser, Password: pw}} }
+	opts := &natsserver.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, Users: user("pw-one")}
+	srv, err := natsserver.NewServer(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go srv.Start()
+	if !srv.ReadyForConnections(10 * time.Second) {
+		t.Fatal("nats-server did not start")
+	}
+	t.Cleanup(srv.Shutdown)
+	pwFile := filepath.Join(t.TempDir(), "console-password")
+	if err := os.WriteFile(pwFile, []byte("pw-one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := DialBus(context.Background(), BusConfig{URL: srv.ClientURL(), User: testUser, Password: "pw-one", PasswordFile: pwFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+
+	if err := os.WriteFile(pwFile, []byte("pw-two\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rotated := *opts
+	rotated.Users = user("pw-two")
+	if err := srv.ReloadOptions(&rotated); err != nil {
+		t.Fatal(err)
+	}
+	// The reload closes the session authenticated with the old password.
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if b.client.Conn().IsConnected() && srv.NumClients() == 1 {
+			if b.client.Conn().Reconnects > 0 {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("not reconnected on the rotated password: connected=%v reconnects=%d clients=%d",
+		b.client.Conn().IsConnected(), b.client.Conn().Reconnects, srv.NumClients())
+}
+
+// The callback reads the file each time, and keeps the last good value over a
+// file that is briefly empty or missing.
+func TestPasswordFromFileRereadsAndKeepsTheLastGood(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pw")
+	cb := passwordFromFile("u", path, "initial")
+	if _, pw := cb(); pw != "initial" {
+		t.Errorf("missing file: %q, want the initial value", pw)
+	}
+	_ = os.WriteFile(path, []byte("rotated\r\n"), 0o600)
+	if _, pw := cb(); pw != "rotated" {
+		t.Errorf("after a rotation: %q, want rotated", pw)
+	}
+	_ = os.WriteFile(path, []byte("\n"), 0o600)
+	if _, pw := cb(); pw != "rotated" {
+		t.Errorf("an empty file mid-swap: %q, want the last good value", pw)
+	}
+}
+
+// The password-file path, which the binary always takes, works under the
+// rendered console grants: its inbox prefix is the console's, so JetStream
+// replies reach it and a status read succeeds.
+func TestThePasswordFilePathHoldsTheConsoleGrants(t *testing.T) {
+	url, js := testBus(t)
+	publishCard(t, js, "platform", map[string]any{"name": "Platform agent"})
+	pwFile := filepath.Join(t.TempDir(), "console-password")
+	if err := os.WriteFile(pwFile, []byte(testPass+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := DialBus(context.Background(), BusConfig{URL: url, User: testUser, Password: testPass, PasswordFile: pwFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Close)
+	st := b.Status(context.Background())
+	if len(st.AgentCards) != 1 {
+		t.Errorf("status over the password-file path: cards %v, problems %v", st.AgentCards, st.Problems)
 	}
 }

@@ -2,10 +2,13 @@ package mcp
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -71,11 +74,16 @@ type Deployment struct {
 // BusConfig is how the server reaches the bus. The TLS trust comes from the
 // environment lib reads (NATS_CA_FILE), as for every bus client.
 type BusConfig struct {
-	URL        string
-	User       string
-	Password   string
-	Deployment Deployment
-	Logger     *slog.Logger
+	URL      string
+	User     string
+	Password string
+	// PasswordFile, when set, is re-read on every connect and reconnect, so
+	// a password rotated in the mounted Secret reaches the connection, as
+	// the operator mounts it for (a directory, never a subPath). Password is
+	// then the first value read, kept if a later read fails mid-rotation.
+	PasswordFile string
+	Deployment   Deployment
+	Logger       *slog.Logger
 }
 
 // Bus is what the status tool needs from the bus, so the tool can be tested
@@ -102,14 +110,23 @@ type NATSBus struct {
 	reapDelay time.Duration
 }
 
-// DialBus connects to the bus. It fails if the first connect does, so a
-// misconfigured pod crash-loops visibly instead of serving a status that only
-// ever says "disconnected"; after that, lib reconnects on its own.
+// DialBus connects to the bus once. Its caller retries a bus that is not
+// reachable yet, and gives up at once on a dial the bus refused for good
+// (DialRefused); after the first connect, lib reconnects on its own.
 func DialBus(ctx context.Context, cfg BusConfig) (*NATSBus, error) {
 	if cfg.URL == "" || cfg.User == "" || cfg.Password == "" {
 		return nil, errors.New("the bus needs a URL, a user and a password")
 	}
 	opts := []lib.ClientOption{lib.WithUserPassword(cfg.User, cfg.Password)}
+	if cfg.PasswordFile != "" {
+		// Instead of the static pair (nats refuses both): the callback is
+		// asked on every connect. The inbox prefix is the one
+		// lib.WithUserPassword would set, which the console grant requires.
+		opts = []lib.ClientOption{lib.WithNATSOptions(
+			nats.UserInfoHandler(passwordFromFile(cfg.User, cfg.PasswordFile, cfg.Password)),
+			nats.CustomInboxPrefix("_INBOX."+cfg.User),
+		)}
+	}
 	if cfg.Logger != nil {
 		opts = append(opts, lib.WithLogger(cfg.Logger))
 	}
@@ -262,7 +279,9 @@ func (b *NATSBus) agentCards(ctx context.Context) (map[string]AgentCard, error) 
 			return cards, err
 		}
 		if n == 0 {
-			return cards, nil
+			// Messages were pending and the fetch brought none: it did not
+			// complete, which is not an empty directory.
+			return cards, fmt.Errorf("read %d of the directory; a fetch came back empty with cards still pending", seen)
 		}
 		if ctx.Err() != nil {
 			return cards, ctx.Err()
@@ -291,4 +310,36 @@ func addCard(cards map[string]AgentCard, subject string, data []byte) {
 		return
 	}
 	cards[profile] = card
+}
+
+// DialRefused reports whether a failed first connect will fail again however
+// long it is retried: the bus refused the credential, or its certificate did
+// not verify (an unknown authority or the wrong name). A pod with either is
+// misconfigured, and saying so beats retrying it as "not reachable yet".
+func DialRefused(err error) bool {
+	var unknownCA x509.UnknownAuthorityError
+	var wrongName x509.HostnameError
+	var unverified *tls.CertificateVerificationError
+	return errors.Is(err, nats.ErrAuthorization) ||
+		strings.Contains(strings.ToLower(err.Error()), "authorization violation") ||
+		errors.As(err, &unknownCA) || errors.As(err, &wrongName) || errors.As(err, &unverified)
+}
+
+// passwordFromFile is the credential callback for a password kept in a
+// mounted file: it reads the file on each call, trimming the line ending a
+// `kubectl create secret --from-file` keeps, and falls back to the last good
+// value when the file is unreadable or empty (the kubelet swaps it in place).
+func passwordFromFile(user, path, initial string) func() (string, string) {
+	var mu sync.Mutex
+	last := initial
+	return func() (string, string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if raw, err := os.ReadFile(path); err == nil {
+			if pw := strings.TrimRight(string(raw), "\r\n"); pw != "" {
+				last = pw
+			}
+		}
+		return user, last
+	}
 }
