@@ -1497,7 +1497,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
     ```bash
     kubectl get platformagent platform-agent -n kubeagents-system -o yaml
     ```
-    (The `A2AGateway` condition is present only while the gateway runs nothing: `status: False` with reason `NoChatBackend` when no chat backend is configured, or `WaitingForReplica` while a scaled-up replica comes back. On an install with Slack enabled it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)
+    (The gateway runs on every `next` install, on the console door alone when no chat backend is configured. The `A2AGateway` condition is present only on an install upgraded from an operator that ran no gateway without a chat backend: `status: False` with reason `NoChatBackend` (written by the older operator), then `WaitingForReplica` while the scaled-up replica comes back. Otherwise it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)
 
 ### 6. Tracing Where a Chat Message Stops
 
@@ -1512,7 +1512,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -E 'Slack relay (enabled|initialization)|Slack bot token'
   ```
   On Google Chat, a sender must be on `ALLOWED_USERS` (emails; empty admits everyone), and the Chat app has to publish to the install's Pub/Sub topic ([ChatOps → Google Chat](docs/site/src/content/docs/concepts/chatops.md#google-chat)).
-- **`next`: is the gateway running?** With no chat backend configured, the operator does not run the gateway (one that already exists is kept at zero replicas), and the `PlatformAgent` carries `A2AGateway=False` with `Reason: NoChatBackend`. Enable Google Chat or Slack on the install; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
+- **`next`: is the gateway running?** The operator runs the gateway on every `next` install. With no chat backend configured it serves the console door alone, so chat messages reach nobody until you enable Google Chat or Slack on the install. An install upgraded from an operator that ran no gateway without a backend carries `A2AGateway=False` (`Reason: NoChatBackend`, then `WaitingForReplica`) until the gateway's replica is ready; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \
     -o jsonpath='{.status.conditions[?(@.type=="A2AGateway")]}{"\n"}'
