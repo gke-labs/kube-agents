@@ -41,7 +41,7 @@ kube-agents/
 │   │                                              docs, onboarding templates,
 │   │                                              plugin design READMEs
 │   ├── cluster/                                   Cluster Agent profile TEMPLATE:
-│   │                                              persona docs + runtime-debugging
+│   │                                              SOUL/AGENTS docs + runtime-debugging
 │   │                                              SKILL.md bundles; persona/: the
 │   │                                              same agent in the persona format
 │   │                                              (not scaffolded)

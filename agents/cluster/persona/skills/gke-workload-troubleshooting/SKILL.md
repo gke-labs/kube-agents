@@ -11,7 +11,7 @@ Use this skill to systematically diagnose and resolve failures in application wo
 
 ### Step 0: Context Acquisition & Time Window Definition
 
-To begin troubleshooting, acquire the following context from the user or active `SETTINGS.md` config:
+To begin troubleshooting, acquire the following context from the user or the task's parameters:
 
 - **Project ID** (e.g., `my-gcp-project`)
   - **Cluster Name** (e.g., `my-gke-cluster`)
@@ -83,7 +83,7 @@ kubectl get events -n <workload_namespace> --sort-by='.metadata.creationTimestam
 gcloud logging read "resource.type=\"k8s_cluster\" AND logName=\"projects/<project_id>/logs/events\" AND jsonPayload.involvedObject.namespace=\"<workload_namespace>\" AND timestamp>=\"[Start_Time]\" AND timestamp<=\"[End_Time]\"" --project="<project_id>"
 ```
 
-_Note: Retrieve the sorted events list and manually inspect the event timestamps (CreationTimestamp/LastSeen) to identify failures occurring within the `[Start_Time]` and `[End_Time]` window. When researching unfamiliar GKE event reasons, quota errors, or controller statuses, query `mcp-developer_knowledge` first before falling back to generic web search._
+_Note: Retrieve the sorted events list and manually inspect the event timestamps (CreationTimestamp/LastSeen) to identify failures occurring within the `[Start_Time]` and `[End_Time]` window. When researching unfamiliar GKE event reasons, quota errors, or controller statuses, query the `developer_knowledge` MCP server's tools first before falling back to generic web search._
 
 #### Signature Identifiers:
 
@@ -96,8 +96,8 @@ _Note: Retrieve the sorted events list and manually inspect the event timestamps
   - Wrong image tag, missing image registry authentication (e.g., ImagePullBackOff).
   - **Resolution Steps for Wrong Image Tag**:
     1. Identify the failing container image name and the invalid tag.
-    2. Check the Git repository history for the last known working image tag for this workload. Run `git log -p -S "<image_name>" -- <manifest_file_path>` (or use `git log` on the folder containing manifests) to identify the previous working tag in Git.
-    3. If the invalid tag is a recent change in git history, compare it to the tag from the last successful commit.
+    2. Find the last image tag that ran from the workload's ReplicaSets, which keep each revision's pod template: `kubectl get rs -n <namespace> -o custom-columns='NAME:.metadata.name,REVISION:.metadata.annotations.deployment\.kubernetes\.io/revision,IMAGES:.spec.template.spec.containers[*].image'`.
+    3. If the invalid tag is the newest revision's, compare it to the tag of the last revision whose pods ran.
     4. Propose reverting the image tag to the last working version, or correcting the tag version in the manifest patch.
 
 ---

@@ -14,11 +14,9 @@ generic version of the same agent, with the kanban loop, the per-cluster
 stamping and the pinned kubeconfig taken out: credentials for the task's target
 come from the credential proxy under the task's grant.
 
-The instructions' first step reads the target from `PROFILE_TASK_PROJECT`,
-`PROFILE_TASK_LOCATION` and `PROFILE_TASK_CLUSTER`, which the profile worker
-sets from the task's parameters (the contract agreed with the #3655 owner).
-Nothing sets them yet, so until that worker lands the first step stops every
-task.
+The profile worker sets `PROFILE_TASK_PROJECT`, `PROFILE_TASK_LOCATION` and
+`PROFILE_TASK_CLUSTER` from the task's parameters; the instructions' first step
+reads the target from them.
 
 Each skill's `SKILL.md` is its `agents/cluster/skills` source with only the
 edits `a2a/lib/persona/claudecode/cluster_persona_test.go` lists. Every other

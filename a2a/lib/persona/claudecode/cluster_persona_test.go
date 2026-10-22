@@ -96,7 +96,7 @@ func TestTheClusterPersonaNamesNoClusterAndNoBoard(t *testing.T) {
 		}
 	}
 	for name, text := range texts {
-		for _, banned := range []string{"get-credentials", "kanban_", "/opt/data/", "skill_view", "$HERMES_"} {
+		for _, banned := range []string{"get-credentials", "kanban_", "/opt/data/", "skill_view", "$HERMES_", "SETTINGS.md", "mcp-"} {
 			if strings.Contains(text, banned) {
 				t.Errorf("%s still says %q", name, banned)
 			}
@@ -242,7 +242,10 @@ type skillEdit struct {
 }
 
 type skillRewrite struct {
-	start, end, text string
+	// The span runs from start to end (exclusive) or through through
+	// (inclusive); one of the two is set, so a rewrite never runs open-ended
+	// to the end of the file, and what follows it is still compared.
+	start, end, through, text string
 }
 
 // getCredentialsLine is the credential fetch the cluster skills open a bash
@@ -270,6 +273,7 @@ var (
 			{getCredentialsLine + "\n", "", 1},
 			{"/opt/data/scripts/stall_report.py", "scripts/stall_report.py", 4},
 		},
+		"gke-workload-troubleshooting": troubleshootingEdits,
 		"gke-workload-security": {
 			{"/opt/data/scripts/audit_cluster.sh", "bash scripts/audit_cluster.sh", 1},
 			{"**Command:**", "**Command** (run from this skill's directory, the base directory the harness gives when it loads the skill):", 1},
@@ -277,13 +281,25 @@ var (
 			{"<gsa-name>@<project-id>", "GSA_NAME@PROJECT_ID", 2},
 		},
 	}
+	// gke-workload-troubleshooting names three things a profile pod does not
+	// have: SETTINGS.md, a Hermes toolset name, and a GitOps checkout to run
+	// git log in. The persona copy asks the task's parameters, names the MCP
+	// server's tools, and reads past image tags from the ReplicaSets.
+	troubleshootingEdits = []skillEdit{
+		{"from the user or active `SETTINGS.md` config:", "from the user or the task's parameters:", 1},
+		{"query `mcp-developer_knowledge` first", "query the `developer_knowledge` MCP server's tools first", 1},
+		{`    2. Check the Git repository history for the last known working image tag for this workload. Run ` + "`" + `git log -p -S "<image_name>" -- <manifest_file_path>` + "`" + ` (or use ` + "`" + `git log` + "`" + ` on the folder containing manifests) to identify the previous working tag in Git.`, `    2. Find the last image tag that ran from the workload's ReplicaSets, which keep each revision's pod template: ` + "`" + `kubectl get rs -n <namespace> -o custom-columns='NAME:.metadata.name,REVISION:.metadata.annotations.deployment\.kubernetes\.io/revision,IMAGES:.spec.template.spec.containers[*].image'` + "`" + `.`, 1},
+		{`    3. If the invalid tag is a recent change in git history, compare it to the tag from the last successful commit.`, `    3. If the invalid tag is the newest revision's, compare it to the tag of the last revision whose pods ran.`, 1},
+	}
 	allowedSkillRewrites = map[string][]skillRewrite{
 		"gke-stall-detection": {
-			{"## Recording the finding", "A report with no rows is a result", stallRecording},
+			{start: "## Recording the finding", end: "A report with no rows is a result", text: stallRecording},
 		},
 		"gke-workload-troubleshooting": {
-			{"Before running any diagnostics or `kubectl` commands", "#### Time Handling", troubleshootingTarget},
-			{"### Step 5:", "", troubleshootingReport},
+			{start: "Before running any diagnostics or `kubectl` commands", end: "#### Time Handling", text: troubleshootingTarget},
+			{start: "### Step 5:", end: "1. Synthesize the root cause analysis", text: troubleshootingReportIntro},
+			// Items 1 and 2 of Step 5 are compared as they stand.
+			{start: "3. **Complete the task with the RCA in `result`**", through: "do not duplicate an existing PR.", text: troubleshootingReportResult},
 		},
 	}
 )
@@ -340,13 +356,12 @@ var (
 	troubleshootingTarget = `Credentials for the target are served by the credential proxy under the task's grant; you never fetch or configure them yourself. Before running any diagnostics, confirm the target: ` + "`" + `PROFILE_TASK_PROJECT` + "`" + `, ` + "`" + `PROFILE_TASK_LOCATION` + "`" + ` and ` + "`" + `PROFILE_TASK_CLUSTER` + "`" + ` must match the cluster the request names, and ` + "`" + `kubectl version -o json` + "`" + ` must answer. Pass ` + "`" + `--project "$PROFILE_TASK_PROJECT"` + "`" + ` to every ` + "`" + `gcloud` + "`" + ` call. On an empty value or a mismatch, or if the proxy denies that read or cannot reach the cluster, stop and say so, naming both clusters. Never investigate a cluster other than the target.
 
 `
-	troubleshootingReport = `### Step 5: Report the RCA & Proposed Correction
+	troubleshootingReportIntro = `### Step 5: Report the RCA & Proposed Correction
 
 You operate under a strict **read-only** boundary: **do not apply patches directly to the cluster, and do not open Pull Requests yourself.** Whoever asked for the investigation owns the GitOps write path.
 
-1. Synthesize the root cause analysis (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_), grounded in the exact diagnostic evidence you collected.
-2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. **Put the whole RCA in your final answer**: the root cause, the evidence that grounds it, and the proposed patch as a fenced ` + "`" + `yaml` + "`" + ` block. Your instructions have the length budget — aim under 2,000 characters, tightening the prose around the cause, the evidence and the patch rather than dropping any of the three.
+`
+	troubleshootingReportResult = `3. **Put the whole RCA in your final answer**: the root cause, the evidence that grounds it, and the proposed patch as a fenced ` + "`" + `yaml` + "`" + ` block. Your instructions have the length budget — aim under 2,000 characters, tightening the prose around the cause, the evidence and the patch rather than dropping any of the three.
 
    If you cannot proceed — missing input, ambiguous scope — say what you need in your final answer instead.
 `
@@ -360,21 +375,28 @@ You work under a strict read-only boundary: no patches applied, no Pull Requests
 `
 )
 
-func rewriteSpan(t *testing.T, name, s, start, end, text string) string {
+func rewriteSpan(t *testing.T, name, s string, r skillRewrite) string {
 	t.Helper()
-	i := strings.Index(s, start)
+	i := strings.Index(s, r.start)
 	if i < 0 {
-		t.Fatalf("%s: no %q to cut from", name, start)
+		t.Fatalf("%s: no %q to cut from", name, r.start)
 	}
-	j := len(s)
-	if end != "" {
-		k := strings.Index(s[i:], end)
-		if k < 0 {
-			t.Fatalf("%s: no %q to cut to", name, end)
-		}
-		j = i + k
+	marker, inclusive := r.end, false
+	if r.through != "" {
+		marker, inclusive = r.through, true
 	}
-	return s[:i] + normalizeMarkdown(text) + s[j:]
+	if marker == "" {
+		t.Fatalf("%s: the rewrite from %q names no end", name, r.start)
+	}
+	k := strings.Index(s[i:], marker)
+	if k < 0 {
+		t.Fatalf("%s: no %q to cut to", name, marker)
+	}
+	j := i + k
+	if inclusive {
+		j += len(marker)
+	}
+	return s[:i] + normalizeMarkdown(r.text) + s[j:]
 }
 
 // Each persona skill is its source with only the allowed edits, so a fix to a
@@ -402,7 +424,7 @@ func TestTheClusterPersonaSkillsMatchTheirSources(t *testing.T) {
 			want = strings.ReplaceAll(want, ed.old, ed.new)
 		}
 		for _, r := range allowedSkillRewrites[name] {
-			want = rewriteSpan(t, name, want, r.start, r.end, r.text)
+			want = rewriteSpan(t, name, want, r)
 		}
 		want, got = strings.TrimSpace(want), strings.TrimSpace(got)
 		if want != got {
