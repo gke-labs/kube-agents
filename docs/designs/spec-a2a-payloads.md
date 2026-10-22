@@ -249,12 +249,14 @@ required. It does not mean "unarmed".
 the guarantee that a null-grants submission cannot come from somewhere the minting path
 does not cover, and that guarantee is not a convention: `a2a.tasks.*.*.in` publish is held
 by exactly one rendered identity, the a2a chat gateway (C20), and the gateway mints before
-it publishes. Every other principal on the bus - the bridge included - holds subscribe on
-that subject and not publish, so there is no second author to produce the shape rule 2
-refuses. Eval traffic is not an exception: it enters through the gateway's inject side door
+it publishes. The submission subject (10/22) has the same premise: its publish grant,
+`a2a.tasks.*.*.*.*.submit`, goes to the gateway alone when it starts submitting profile tasks
+(#3655), and to no other identity. Every other principal on the bus - the bridge included -
+holds subscribe on those subjects or nothing, never publish, so there is no second author to
+produce the shape rule 2 refuses. Eval traffic is not an exception: it enters through the gateway's inject side door
 and takes the same mint path as a chat message, rather than publishing envelopes of its own.
 A consumer implementing rule 2 is therefore checking an invariant the server already holds,
-and an install that widens `.in` publish to a second identity has broken the rule's premise
+and an install that widens `.in` or `…submit` publish to a second identity has broken the rule's premise
 before any consumer sees it.
 
 **What this does not give a consumer.** It does not answer "who is the human". The chain
