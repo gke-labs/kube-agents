@@ -900,3 +900,32 @@ func TestTheSwarmRouteGivesSessionMembersTheirConversationID(t *testing.T) {
 		t.Errorf("no member carries the session's conversation id: %+v", resp.Snapshot.Members)
 	}
 }
+
+// A task's record is bounded too: prompts are charged against the byte cap
+// and dropped once it is spent, and an over-long conversation reference is
+// not kept.
+func TestTheSwarmReadBoundsWhatATaskKeeps(t *testing.T) {
+	url, js := testBus(t)
+	long := strings.Repeat("p", 3000)
+	for i := 0; i < 3; i++ {
+		publishSubmission(t, js, "s-triage", fmt.Sprintf("t-%d", i), consoleConversationPrefix+convTriage, long, "")
+	}
+	publishSubmission(t, js, "s-triage", "t-longref", consoleConversationPrefix+strings.Repeat("c", maxSwarmRefBytes), "q", "")
+	old := maxSwarmReadBytes
+	maxSwarmReadBytes = 4000
+	t.Cleanup(func() { maxSwarmReadBytes = old })
+	read, err := dial(t, url).swarmTasks(context.Background(), time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompts := 0
+	for _, task := range read.tasks {
+		prompts += len(task.Prompt)
+		if task.TaskID == "t-longref" && task.Conversation != "" {
+			t.Errorf("an over-long conversation reference was kept (%d bytes)", len(task.Conversation))
+		}
+	}
+	if prompts > maxSwarmReadBytes || !read.bytesCapped {
+		t.Errorf("kept %d prompt bytes under a %d cap (capped=%v)", prompts, maxSwarmReadBytes, read.bytesCapped)
+	}
+}

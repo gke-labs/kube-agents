@@ -77,6 +77,9 @@ var maxSwarmReadBytes = 32 << 20
 // shortens it further for display.
 const maxSwarmPromptRunes = 4096
 
+// maxSwarmRefBytes caps a conversation reference kept from a submission.
+const maxSwarmRefBytes = 256
+
 // capRunes cuts s to at most n runes.
 func capRunes(s string, n int) string {
 	if utf8.RuneCountInString(s) <= n {
@@ -551,14 +554,30 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, e
 		if !ok {
 			return
 		}
-		// Only the prompt is kept of a submission, capped, so submissions
-		// don't count against the event cap.
-		text = capRunes(text, maxSwarmPromptRunes)
-		rd.submitted = true
-		rd.task.Conversation = a.Audience.Conversation
-		if a.Via != nil {
-			rd.task.ViaTaskID = a.Via.TaskID
+		// What a task's record keeps is bounded too: the conversation only
+		// up to maxSwarmRefBytes (a delegated task's need not be a console
+		// one; it is kept through its parent), the delegation parent only
+		// as a valid task id, and the prompt capped and charged against the
+		// same budget as the events, dropped once that is spent. Prompts are
+		// never let go for events, so the budget can end above the cap by at
+		// most one prompt.
+		conv := a.Audience.Conversation
+		if len(conv) > maxSwarmRefBytes {
+			conv = ""
 		}
+		via := ""
+		if a.Via != nil && lib.ValidSubjectToken(a.Via.TaskID) {
+			via = a.Via.TaskID
+		}
+		text = capRunes(text, maxSwarmPromptRunes)
+		if kept+len(text) > maxSwarmReadBytes {
+			text = ""
+			read.bytesCapped = true
+		}
+		kept += len(text)
+		rd.submitted = true
+		rd.task.Conversation = conv
+		rd.task.ViaTaskID = via
 		rd.task.Submitted = at
 		// It is the submission only if nothing of the task came before it:
 		// not an older .in, and no event earlier in the read.
