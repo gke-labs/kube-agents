@@ -1492,7 +1492,7 @@ as the primitive, unused, like the other backends.
 (an alert, a cron finding, an audit report) has no conversation to answer, and under `next`
 the Hermes platform that used to post it is off. So the agent asks the gateway, which holds
 the Chat credential, to post it. The agent container runs `a2a notify`, which publishes a
-core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
+core NATS request on `chat.notify.gchat` carrying `{"text", "thread"?, "wait_ms"?, "conversation"?, "context_id"?, "blocks"?, "chat"?, "update"?, "reply_to"?}` (on Slack's subject, below, `chat.notify.slack`) with its reply subject
 under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
@@ -2037,10 +2037,14 @@ frame with `"kind": "result"`, the A2A `state`, the task as `addressee` and `tas
 `messageId` `r-<taskId>`, so a repeated end (a redelivery, a heal) repeats its id. Its text
 is the deliverable for a completed task and the gateway's notice otherwise. A kanban card's
 report into the conversation is a frame too, with `"kind": "notify"` and the turn it answers as
-`replyTo` ("Proactive posts: the chat.notify route", the console's route), and the page shows
-it. A notice carries none of those fields, so a client waiting on a turn can tell the three apart. The page reads
-answers from TASKS and gets the notices, and it skips these frames, so for the page a lost
-`.out` frame across a reconnect still costs a notice and never an answer. A console client
+`replyTo` ("Proactive posts: the chat.notify route", the console's route). A notice carries
+none of those fields, so a client waiting on a turn can tell the three apart. The page reads
+answers from TASKS and gets the notices, so it skips the result frames, and a lost result frame
+costs it nothing. It shows the notify frames, which it has no other source for. A card's report
+is not on TASKS, so a notify frame published while no client holds the conversation's `.out`
+subscription (the tab closed, a page reconnecting, the MCP server restarting) is lost: core NATS
+keeps nothing, and the notifier answers the card as posted. This is a known limit of the
+kanban-era route; card reports become bus child results with the profile dispatcher. A console client
 with no TASKS view, such as the MCP server, reads each task's end from these frames, live
 only, since `.out` is not on a stream. Turn answers to a follow-up inside a live task are not
 sent; that client reads them from TASKS or waits for the end. An answer past 256 KiB, or one

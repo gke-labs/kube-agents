@@ -2168,6 +2168,16 @@ Mutation(
         "channel without the agent",
     ),
     Mutation(
+        "A3-bridge-sends-a-console-notify",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.notify.console",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_a_notify_has_one_writer_and_its_answer_has_one",
+        "grant the static bridge publish on the console notify subject, so "
+        "a task the bridge runs can put a report into any console "
+        "conversation whose context it knows, without the agent",
+    ),
+    Mutation(
         "A3-agent-answers-its-own-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ("\tpublish = append(publish, a2aNotifySubjectGchat, a2aNotifySubjectSlack, a2aNotifySubjectConsole)\n",

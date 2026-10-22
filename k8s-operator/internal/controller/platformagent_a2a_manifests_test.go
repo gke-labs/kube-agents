@@ -7762,6 +7762,7 @@ func TestChatNotifySubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	}{
 		{a2aBridgeUser, "publish", "chat.notify.gchat"},
 		{a2aBridgeUser, "publish", "chat.notify.slack"},
+		{a2aBridgeUser, "publish", "chat.notify.console"},
 		{"web", "subscribe", "chat.notify.reply.>"},
 	} {
 		mutated := slices.Clone(ids)

@@ -955,9 +955,11 @@ class ConversationNotifyAdapter(ChatNotifyAdapter):
         context = conversation_context(chat_id)
         if not context:
             raise LookupError(f"no conversation route recorded for {chat_id}")
+        if not thread.startswith(CONSOLE_PLATFORM + ":"):
+            return ["--conversation", thread, "--context", context]
         conversation, _, task = thread.partition(CONSOLE_THREAD_TASK_SEP)
         target = ["--conversation", conversation, "--context", context]
-        if task and conversation.startswith(CONSOLE_PLATFORM + ":"):
+        if task:
             target += ["--reply-to", task]
         return target
 

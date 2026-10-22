@@ -80,8 +80,9 @@ var errRouteDisabled = errors.New("no route store configured")
 // TaskID, on a console conversation's route only, is the gateway task the
 // turn runs: a card the turn files snapshots it, and its report names it
 // (a2a notify --reply-to), so a console client can join the report to the
-// turn. A chat conversation's route leaves it out, so its route is the same
-// for every turn of the conversation and recordRoute skips the repeat PUTs.
+// turn. A chat conversation's route leaves it out. When a PUT fails,
+// recordRoute lets the session's earlier record stand if it names the same
+// conversation, whatever its ask or task.
 type conversationRoute struct {
 	Platform     string `json:"platform"`
 	Conversation string `json:"conversation"`
@@ -134,11 +135,15 @@ func (b *Bridge) recordRoute(ctx context.Context, sessionID string, env *lib.Env
 	if err := b.putRoute(ctx, sessionID, route); err != nil {
 		// The ask is a reaction's kind, not what a card needs to report
 		// back: an earlier record of the same conversation still routes it.
+		// So is a console route's task: the card still reports, naming the
+		// earlier turn in its reply_to, which is said in the log.
 		earlier := b.recordedRoute(sessionID)
 		earlier.Ask = route.Ask
+		staleTask := earlier.TaskID != route.TaskID
+		earlier.TaskID = route.TaskID
 		if earlier == route {
 			b.cfg.Logger.Warn("conversation route PUT failed; the session's earlier record of the same route stands",
-				"session", sessionID, "err", err)
+				"session", sessionID, "err", err, "staleTask", staleTask)
 			return nil
 		}
 		return err
