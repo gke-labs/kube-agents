@@ -2,18 +2,25 @@ package mcp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // The bridge's conversation and lineage types (#3689 at 5a706327:
@@ -70,13 +77,13 @@ const (
 )
 
 // swarmServer is a handler serving the swarm route from a fresh bus, with the
-// TASKS window and drain limit restored after the test.
+// TASKS window, drain limit and byte cap restored after the test.
 func swarmServer(t *testing.T) (http.Handler, jetstream.JetStream, *Conversations) {
 	t.Helper()
 	url, js := testBus(t)
 	convs := NewConversations()
-	oldWindow, oldLimit := swarmTaskWindow, swarmTaskLimit
-	t.Cleanup(func() { swarmTaskWindow, swarmTaskLimit = oldWindow, oldLimit })
+	oldWindow, oldLimit, oldBytes := swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes
+	t.Cleanup(func() { swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes = oldWindow, oldLimit, oldBytes })
 	return Handler(mustServer(t), writeToken(t, testToken), quietLog(), WithSwarm(dial(t, url), convs)), js, convs
 }
 
@@ -149,6 +156,13 @@ func TestTheSwarmRouteBoundsItsBody(t *testing.T) {
 	if rec := postSwarm(h, swarmAuth, `{"x":"`+strings.Repeat("a", maxSwarmBodyBytes)+`"}`); rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized body = %d, want 413", rec.Code)
 	}
+	req := httptest.NewRequest(http.MethodPost, SwarmPath, iotest.ErrReader(errors.New("connection reset")))
+	req.Header.Set(headerAuthorization, "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("a body that fails to read = %d, want 400: only an oversized body is 413", rec.Code)
+	}
 	for _, body := range []string{`[]`, `{"conversations":5}`, `{"ledger":"x"}`, `not json`, `{} {}`} {
 		if rec := postSwarm(h, swarmAuth, body); rec.Code != http.StatusBadRequest {
 			t.Errorf("body %s = %d, want 400", body, rec.Code)
@@ -157,9 +171,9 @@ func TestTheSwarmRouteBoundsItsBody(t *testing.T) {
 	if rec := postSwarm(h, swarmAuth, `{"rootConversationId":"r","someFutureField":{"a":1}}`); rec.Code != http.StatusOK {
 		t.Errorf("an unknown field = %d, want 200: unknown fields are ignored", rec.Code)
 	}
-	req := httptest.NewRequest(http.MethodGet, SwarmPath, nil)
+	req = httptest.NewRequest(http.MethodGet, SwarmPath, nil)
 	req.Header.Set(headerAuthorization, "Bearer "+testToken)
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("GET %s = %d, want 405", SwarmPath, rec.Code)
@@ -281,25 +295,104 @@ func TestTheSwarmRouteProjectsTheConversationsTasks(t *testing.T) {
 	}
 }
 
-// The server's own conversations are projected and returned too, and a
-// client entry for one of them takes the server's alias.
-func TestTheSwarmRouteMergesTheServersConversations(t *testing.T) {
+// A request entry whose alias the server's table holds is the server's
+// conversation: the bridge sends turns by alias, so the server's token is
+// where its turns went. The entry keeps the client's alias and every one of
+// its own fields. The bridge replaces its entry with the returned one when any
+// of token, sessionMode, sessionTerminated, sessionWorkerId, the Antigravity
+// ids, subagentRole or debugMode differ (#3689 at 5a706327:
+// a2a/mcpbridge/config.go:1724-1740), so each of those must come back as sent,
+// the token aside.
+func TestTheSwarmRouteResolvesARequestAliasOnTheServer(t *testing.T) {
 	h, js, convs := swarmServer(t)
-	token, err := convs.Create("from-server", "made here")
+	serverToken, err := convs.Resolve("", "") // what send_message without a conversation does
 	if err != nil {
 		t.Fatal(err)
 	}
-	publishSubmission(t, js, "s-srv", "t-srv", consoleConversationPrefix+token, "server turn", "")
-	publishRun(t, js, "s-srv", "t-srv", "", false)
-	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{
-		"client-name": map[string]any{"alias": "client-name", "token": token, "sessionMode": true, "agyConversationId": "agy-1"},
+	publishSubmission(t, js, "s-def", "t-def", consoleConversationPrefix+serverToken, "server turn", "")
+	publishRun(t, js, "s-def", "t-def", "", false)
+	created := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	sent := swarmConversationEntry{
+		Alias: DefaultConversation, Token: "kabridgelocal01", SessionMode: true, SessionTerminated: true,
+		Description: "the bridge's", AGYConversationID: "agy-root", ParentAGYConversationID: "agy-parent",
+		SubagentRole: "reviewer", SessionWorkerID: "worker-1", AutoBound: true, DebugMode: true, Disconnected: true,
+		CreatedAt: created, LastUsedAt: created,
+	}
+	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{DefaultConversation: sent}})
+	got, ok := resp.Conversations[DefaultConversation]
+	if !ok || len(resp.Conversations) != 1 {
+		t.Fatalf("conversations = %+v", resp.Conversations)
+	}
+	if got.Token != serverToken {
+		t.Errorf("token = %q, want the server's %q", got.Token, serverToken)
+	}
+	if !got.LastUsedAt.After(created) {
+		t.Errorf("last use = %v, want the server's, the later", got.LastUsedAt)
+	}
+	want := sent
+	want.Token, want.LastUsedAt = got.Token, got.LastUsedAt
+	if got != want {
+		t.Errorf("the client's fields did not come back as sent:\n got %+v\nwant %+v", got, want)
+	}
+	if !strings.Contains(boardTexts(resp.Snapshot), "[task `t-def`]") {
+		t.Errorf("the server conversation's task is missing:\n%s", boardTexts(resp.Snapshot))
+	}
+
+	// Without a description of its own, the entry takes the server's.
+	if _, err := convs.Create("described", "made here"); err != nil {
+		t.Fatal(err)
+	}
+	resp, _ = askSwarm(t, h, map[string]any{"conversations": map[string]any{"described": map[string]any{"alias": "described", "token": "anything"}}})
+	if e := resp.Conversations["described"]; e.Description != "made here" {
+		t.Errorf("described = %+v, want the server's description", e)
+	}
+}
+
+// The server's table only resolves the request's names: a conversation the
+// request does not name, another caller's, never reaches the board, the
+// members or the returned table, nor does its task.
+func TestTheSwarmRouteProjectsOnlyTheRequestsConversations(t *testing.T) {
+	h, js, convs := swarmServer(t)
+	other, err := convs.Create("someone-elses", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishSubmission(t, js, "s-x", "t-secret", consoleConversationPrefix+other, "PRIVATE PROMPT of another caller", "")
+	publishRun(t, js, "s-x", "t-secret", "", false)
+	publishSubmission(t, js, "s-mine", "t-mine", consoleConversationPrefix+"kamine01", "my turn", "")
+	publishRun(t, js, "s-mine", "t-mine", "", false)
+	resp, raw := askSwarm(t, h, map[string]any{"rootConversationId": "agy-mine", "conversations": map[string]any{
+		"mine": map[string]any{"alias": "mine", "token": "kamine01", "agyConversationId": "agy-sub",
+			"parentAgyConversationId": "agy-mine", "sessionMode": true, "lastUsedAt": time.Now()},
 	}})
-	e, ok := resp.Conversations["from-server"]
-	if !ok || len(resp.Conversations) != 1 || e.Description != "made here" || !e.SessionMode || e.AGYConversationID != "agy-1" {
+	for _, not := range []string{"PRIVATE PROMPT", "t-secret", "someone-elses", other} {
+		if strings.Contains(string(raw), not) {
+			t.Errorf("the response holds %q:\n%s", not, raw)
+		}
+	}
+	if len(resp.Conversations) != 1 {
 		t.Errorf("conversations = %+v", resp.Conversations)
 	}
-	if !strings.Contains(boardTexts(resp.Snapshot), "[task `t-srv`]") {
-		t.Errorf("the server conversation's task is missing:\n%s", boardTexts(resp.Snapshot))
+	if !strings.Contains(boardTexts(resp.Snapshot), "[task `t-mine`]") {
+		t.Errorf("the request's own task is missing, so the test checked nothing:\n%s", boardTexts(resp.Snapshot))
+	}
+}
+
+// Two of the bridge's entries on one token are its own state: both come back,
+// each under its own alias.
+func TestTheSwarmRouteKeepsTwoAliasesOnOneToken(t *testing.T) {
+	h, _, convs := swarmServer(t)
+	if _, err := convs.Create("srv-name", ""); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{
+		"first":  clientConv("first", convTriage, now),
+		"second": clientConv("second", "console:"+convTriage, now.Add(-time.Hour)),
+	}})
+	if len(resp.Conversations) != 2 || resp.Conversations["first"].Token != convTriage || resp.Conversations["second"].Token != convTriage ||
+		resp.Conversations["first"].Alias != "first" || resp.Conversations["second"].Alias != "second" {
+		t.Errorf("conversations = %+v", resp.Conversations)
 	}
 }
 
@@ -384,39 +477,75 @@ func TestSwarmConversationParents(t *testing.T) {
 
 func TestMergeSwarmConversations(t *testing.T) {
 	t0 := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
-	server := []ConversationInfo{{Alias: "srv", Token: "tok-shared", Description: "server's", LastUsed: t0}}
-	client := map[string]swarmConversationEntry{
-		"cli-shared": {Token: "console:tok-shared", Description: "client's", LastUsedAt: t0.Add(time.Minute), DebugMode: true},
-		"older":      {Token: "tok-dup", LastUsedAt: t0},
-		"newer":      {Token: "tok-dup", LastUsedAt: t0.Add(time.Hour)},
-		"srv":        {Token: "tok-collides", LastUsedAt: t0.Add(time.Hour)},
-		"bad":        {Token: "UPPER"},
-		" ":          {Token: "tok-blank"},
+	server := []ConversationInfo{
+		{Alias: "srv", Token: "tok-srv", Description: "server's", LastUsed: t0},
+		{Alias: "server-only", Token: "tok-only", LastUsed: t0},
 	}
+	client := map[string]swarmConversationEntry{
+		"srv":     {Token: "Not A Token", Description: "client's", LastUsedAt: t0.Add(-time.Minute), DebugMode: true},
+		"older":   {Token: "tok-dup", LastUsedAt: t0},
+		"newer":   {Token: "console:tok-dup", LastUsedAt: t0.Add(time.Hour)},
+		"bad":     {Token: "UPPER CASE"},
+		" ":       {Token: "tok-blank"},
+		" padded": {Token: "tok-padded"},
+	}
+	merged, dropped := mergeSwarmConversations(server, client)
+	var aliases []string
 	got := map[string]swarmConversationEntry{}
-	for _, e := range mergeSwarmConversations(server, client) {
+	for _, e := range merged {
+		aliases = append(aliases, e.Alias)
 		got[e.Alias] = e
 	}
-	if len(got) != 2 {
-		t.Fatalf("merged = %+v", got)
+	if !slices.Equal(aliases, []string{"newer", "older", "srv"}) || dropped != 3 {
+		t.Fatalf("merged %q, dropped %d", aliases, dropped)
 	}
-	if e := got["srv"]; e.Token != "tok-shared" || e.Description != "server's" || !e.LastUsedAt.Equal(t0.Add(time.Minute)) || !e.DebugMode {
-		t.Errorf("shared token = %+v", e)
+	if e := got["srv"]; e.Token != "tok-srv" || e.Description != "client's" || !e.LastUsedAt.Equal(t0) || !e.DebugMode {
+		t.Errorf("server alias = %+v", e)
 	}
-	if e := got["newer"]; e.Token != "tok-dup" {
-		t.Errorf("duplicate token = %+v", got)
+	if got["older"].Token != "tok-dup" || got["newer"].Token != "tok-dup" {
+		t.Errorf("shared token = %+v", got)
 	}
 }
 
-// A TASKS read that stops at its limit is reported, not served as complete.
-func TestTheSwarmRouteReportsAPartialRead(t *testing.T) {
+// Past its limit, the read takes the newest messages and says the oldest
+// were dropped.
+func TestTheSwarmRouteReadsTheNewestTasks(t *testing.T) {
 	h, js, _ := swarmServer(t)
-	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "one", "")
-	publishRun(t, js, "s-triage", "t-1", "done", true)
-	swarmTaskLimit = 2
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("t-%d", i)
+		publishSubmission(t, js, "s-triage", id, consoleConversationPrefix+convTriage, "turn "+id, "")
+		publishRun(t, js, "s-triage", id, "", false)
+	}
+	swarmTaskLimit = 9 // three messages a task: the newest three fit
 	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{"triage": clientConv("triage", convTriage, time.Now())}})
-	if !hasNote(resp, "TASKS read was partial") {
-		t.Errorf("notes = %q, want the partial read reported", resp.Notes)
+	all := string(swarmJSON(t, resp.Snapshot))
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("`t-%d`", i)
+		if shown := strings.Contains(all, id); shown != (i >= 3) {
+			t.Errorf("%s shown = %v, want %v:\n%s", id, shown, i >= 3, boardTexts(resp.Snapshot))
+		}
+	}
+	if !hasNote(resp, "the oldest were not read") || hasNote(resp, "partial") {
+		t.Errorf("notes = %q, want the oldest reported dropped", resp.Notes)
+	}
+}
+
+// Past maxSwarmReadBytes the read keeps nothing more, and says so.
+func TestTheSwarmRouteCapsTheBytesItKeeps(t *testing.T) {
+	h, js, _ := swarmServer(t)
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("t-%d", i)
+		publishSubmission(t, js, "s-triage", id, consoleConversationPrefix+convTriage, "turn "+id, "")
+		publishRun(t, js, "s-triage", id, "", false)
+	}
+	maxSwarmReadBytes = 2048
+	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{"triage": clientConv("triage", convTriage, time.Now())}})
+	if !hasNote(resp, "newer messages were not kept") {
+		t.Errorf("notes = %q, want the byte cap reported", resp.Notes)
+	}
+	all := string(swarmJSON(t, resp.Snapshot))
+	if !strings.Contains(all, "`t-0`") || strings.Contains(all, "`t-3`") {
+		t.Errorf("want the first task kept and the last not:\n%s", boardTexts(resp.Snapshot))
 	}
 }
 
@@ -466,5 +595,255 @@ func TestTheSwarmResponseIsTheBridges(t *testing.T) {
 	if !got.Connected || got.Snapshot.Title != swarmDefaultTitle || got.Conversations["triage"].SubagentRole != "reviewer" ||
 		!got.Conversations["triage"].SessionMode || got.Deployment != nil || got.ActiveConversation != "" || got.PendingEvents == nil {
 		t.Errorf("bridge view = %+v", got)
+	}
+}
+
+// swarmBus is a fresh bus, its connection, and a swarm handler on them with
+// the TASKS window, drain limit and byte cap restored after the test.
+func swarmBus(t *testing.T) (*swarmHandler, *NATSBus, jetstream.JetStream) {
+	t.Helper()
+	url, js := testBus(t)
+	bus := dial(t, url)
+	oldWindow, oldLimit, oldBytes := swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes
+	t.Cleanup(func() { swarmTaskWindow, swarmTaskLimit, maxSwarmReadBytes = oldWindow, oldLimit, oldBytes })
+	return &swarmHandler{bus: bus, convs: NewConversations()}, bus, js
+}
+
+// Concurrent and rapid swarm calls share one TASKS read, so they hold one
+// reader slot between them, and a turn's watch alongside them still gets one.
+func TestSwarmCallsShareOneReader(t *testing.T) {
+	sh, bus, js := swarmBus(t)
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "one", "")
+	publishRun(t, js, "s-triage", "t-1", "", false)
+	h := Handler(mustServer(t), writeToken(t, testToken), quietLog(), func(c *handlerConfig) { c.swarm = sh })
+	body := map[string]any{"conversations": map[string]any{"triage": clientConv("triage", convTriage, time.Now())}}
+	var wg sync.WaitGroup
+	for i := 0; i < 2*maxTaskReaders; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			raw, _ := json.Marshal(body)
+			if rec := postSwarm(h, swarmAuth, string(raw)); rec.Code != http.StatusOK {
+				t.Errorf("status %d", rec.Code)
+			}
+		}()
+	}
+	wg.Wait()
+	for i := 0; i < maxTaskReaders; i++ {
+		resp, _ := askSwarm(t, h, body)
+		if hasNote(resp, "readers were busy") || !strings.Contains(boardTexts(resp.Snapshot), "t-1") {
+			t.Fatalf("call %d: notes %q\n%s", i, resp.Notes, boardTexts(resp.Snapshot))
+		}
+	}
+	if held := len(bus.readers); held > 1 {
+		t.Errorf("swarm calls hold %d reader slots, want at most 1", held)
+	}
+	w, err := bus.watchTask(context.Background(), TaskRef{Addressee: "s-triage", TaskID: "t-1"})
+	if err != nil {
+		t.Fatalf("a turn's watch beside the swarm calls: %v", err)
+	}
+	w.close()
+}
+
+// One read answers every call for swarmReadTTL; then the next call reads
+// again.
+func TestTheSwarmReadIsCachedBriefly(t *testing.T) {
+	sh, _, js := swarmBus(t)
+	clock := time.Now()
+	sh.now = func() time.Time { return clock }
+	req := swarmRequest{Conversations: map[string]swarmConversationEntry{"triage": {Token: convTriage, LastUsedAt: clock}}}
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "one", "")
+	sh.answer(context.Background(), req, clock)
+	publishSubmission(t, js, "s-triage", "t-2", consoleConversationPrefix+convTriage, "two", "")
+	clock = clock.Add(swarmReadTTL - time.Millisecond)
+	if b := boardTexts(sh.answer(context.Background(), req, clock).Snapshot); strings.Contains(b, "t-2") {
+		t.Errorf("a call inside the TTL read again:\n%s", b)
+	}
+	clock = clock.Add(time.Millisecond)
+	if b := boardTexts(sh.answer(context.Background(), req, clock).Snapshot); !strings.Contains(b, "t-2") {
+		t.Errorf("a call past the TTL did not read again:\n%s", b)
+	}
+}
+
+// With every reader busy the read is skipped, said so, and not cached.
+func TestTheSwarmRouteSaysWhenTheReadersAreBusy(t *testing.T) {
+	sh, bus, js := swarmBus(t)
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "one", "")
+	req := swarmRequest{Conversations: map[string]swarmConversationEntry{"triage": {Token: convTriage, LastUsedAt: time.Now()}}}
+	var releases []func(bool)
+	for i := 0; i < maxTaskReaders; i++ {
+		release, err := bus.readerSlot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		releases = append(releases, release)
+	}
+	resp := sh.answer(context.Background(), req, time.Now())
+	if !hasNote(resp, "skipped because this server's bus readers were busy") || hasNote(resp, "partial") {
+		t.Errorf("notes = %q", resp.Notes)
+	}
+	for _, release := range releases {
+		release(false)
+	}
+	resp = sh.answer(context.Background(), req, time.Now())
+	if hasNote(resp, "busy") || !strings.Contains(boardTexts(resp.Snapshot), "t-1") {
+		t.Errorf("the skipped read was cached: notes %q\n%s", resp.Notes, boardTexts(resp.Snapshot))
+	}
+}
+
+// A task submitted before the window, with a steer inside it, is live and
+// shown, but the steer is not its submission: no prompt, and the time is the
+// submission's, which the read saw before the window.
+func TestASteerIsNotTheSubmission(t *testing.T) {
+	sh, bus, js := swarmBus(t)
+	publishSubmission(t, js, "s-triage", "t-straddle", consoleConversationPrefix+convTriage, "original prompt", "")
+	time.Sleep(150 * time.Millisecond)
+	boundary := time.Now()
+	time.Sleep(50 * time.Millisecond)
+	publishSubmission(t, js, "s-triage", "t-straddle", consoleConversationPrefix+convTriage, "STEER TEXT", "")
+	publishRun(t, js, "s-triage", "t-straddle", "", false)
+	read, err := bus.swarmTasks(context.Background(), boundary)
+	if err != nil || len(read.tasks) != 1 {
+		t.Fatalf("read %+v, %v", read, err)
+	}
+	if got := read.tasks[0]; got.Prompt != "" || !got.Submitted.Before(boundary) || got.Conversation != consoleConversationPrefix+convTriage {
+		t.Errorf("task = prompt %q, submitted %v (window from %v), conversation %q", got.Prompt, got.Submitted, boundary, got.Conversation)
+	}
+	swarmTaskWindow = time.Since(boundary)
+	resp := sh.answer(context.Background(), swarmRequest{Conversations: map[string]swarmConversationEntry{"triage": {Token: convTriage, LastUsedAt: time.Now()}}}, time.Now())
+	all := string(swarmJSON(t, resp.Snapshot))
+	if !strings.Contains(all, "t-straddle") || strings.Contains(all, "STEER") {
+		t.Errorf("want the task shown without the steer:\n%s", all)
+	}
+}
+
+// When the read starts after a task's submission (its oldest messages past
+// the limit), an .in after the task's events is a steer, not a submission.
+func TestAnInAfterTheTasksEventsIsNotItsPrompt(t *testing.T) {
+	_, bus, js := swarmBus(t)
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "original prompt", "")
+	publishRun(t, js, "s-triage", "t-1", "", false)
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "STEER TEXT", "")
+	swarmTaskLimit = 3 // the two events and the steer
+	read, err := bus.swarmTasks(context.Background(), time.Now().Add(-time.Hour))
+	if err != nil || len(read.tasks) != 1 || !read.oldestDropped {
+		t.Fatalf("read %+v, %v", read, err)
+	}
+	if p := read.tasks[0].Prompt; p != "" {
+		t.Errorf("prompt = %q, want none", p)
+	}
+	// And with the submission in the read, it is the prompt.
+	swarmTaskLimit = 4
+	read, err = bus.swarmTasks(context.Background(), time.Now().Add(-time.Hour))
+	if err != nil || len(read.tasks) != 1 || read.oldestDropped {
+		t.Fatalf("read %+v, %v", read, err)
+	}
+	if p := read.tasks[0].Prompt; p != "original prompt" {
+		t.Errorf("prompt = %q, want the submission's", p)
+	}
+}
+
+// A terminal status on the supervisor subject from anyone but the gateway is
+// a forgery the agreement check drops: it is not folded.
+func TestTheSwarmReadDropsAForgedEvent(t *testing.T) {
+	_, bus, js := swarmBus(t)
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "one", "")
+	publishRun(t, js, "s-triage", "t-1", "", false)
+	p := mustJSON(t, lib.StatusUpdate{TaskID: "t-1", ContextID: "ctx-t-1", Status: lib.TaskStatus{State: lib.StateCompleted}, Final: true})
+	env, err := lib.NewStatusUpdateEnvelope(executor(otherSession), "t-1", "ctx-t-1", "corr-t-1", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub(t, js, lib.TaskSupervisorSubject("s-triage", "t-1"), env)
+	read, err := bus.swarmTasks(context.Background(), time.Now().Add(-time.Hour))
+	if err != nil || len(read.tasks) != 1 || read.tasks[0].Task == nil {
+		t.Fatalf("read %+v, %v", read, err)
+	}
+	if got := read.tasks[0].Task; got.State != lib.StateWorking || got.Final {
+		t.Errorf("the forged status was folded: state %s, final %v", got.State, got.Final)
+	}
+}
+
+// A client entry's strings past their limits come back empty, not
+// shortened; an Antigravity id that isn't one is dropped.
+func TestTheSwarmRouteCapsClientFields(t *testing.T) {
+	h, _, _ := swarmServer(t)
+	long := strings.Repeat("a", maxSwarmHandleBytes+1)
+	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{
+		"capped": map[string]any{"alias": "capped", "token": convTriage, "subagentRole": long, "sessionWorkerId": long,
+			"description": strings.Repeat("d", swarmScanBytes+1), "agyConversationId": "agy\x01bad",
+			"parentAgyConversationId": strings.Repeat("p", maxSwarmConversationIDRunes+1)},
+		"kept": map[string]any{"alias": "kept", "token": convUnknown, "subagentRole": "reviewer", "sessionWorkerId": "w-1",
+			"description": "fine", "agyConversationId": "agy-ok", "parentAgyConversationId": "agy-parent"},
+	}})
+	if e := resp.Conversations["capped"]; e.SubagentRole != "" || e.SessionWorkerID != "" || e.Description != "" ||
+		e.AGYConversationID != "" || e.ParentAGYConversationID != "" || e.Token != convTriage {
+		t.Errorf("capped = %+v", e)
+	}
+	if e := resp.Conversations["kept"]; e.SubagentRole != "reviewer" || e.SessionWorkerID != "w-1" || e.Description != "fine" ||
+		e.AGYConversationID != "agy-ok" || e.ParentAGYConversationID != "agy-parent" {
+		t.Errorf("kept = %+v", e)
+	}
+}
+
+// Dropped request entries are counted in notes, not named.
+func TestTheSwarmRouteCountsDroppedEntries(t *testing.T) {
+	h, _, _ := swarmServer(t)
+	now := time.Now()
+	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{
+		"secret-name-1": clientConv("secret-name-1", "Not A.Token", now),
+		"secret-name-2": clientConv("secret-name-2", "", now),
+		"fine":          clientConv("fine", convTriage, now),
+	}})
+	if !hasNote(resp, "2 conversation entries in the request were dropped") || hasNote(resp, "secret-name") {
+		t.Errorf("notes = %q", resp.Notes)
+	}
+}
+
+// A task delegated from a delegated task is kept too, even when the read
+// reaches it before its parent, so a second hop is needed to keep it.
+func TestTheSwarmRouteKeepsAGrandchild(t *testing.T) {
+	h, js, _ := swarmServer(t)
+	publishSubmission(t, js, "s-triage", "t-root", consoleConversationPrefix+convTriage, "root", "")
+	publishSubmission(t, js, "net-specialist", "t-grandchild", "slack:C0DELEGATE", "grandchild", "t-child")
+	publishSubmission(t, js, "db-specialist", "t-child", "slack:C0DELEGATE", "child", "t-root")
+	resp, _ := askSwarm(t, h, map[string]any{"conversations": map[string]any{"triage": clientConv("triage", convTriage, time.Now())}})
+	if all := string(swarmJSON(t, resp.Snapshot)); !strings.Contains(all, "t-grandchild") {
+		t.Errorf("the grandchild is missing:\n%s", boardTexts(resp.Snapshot))
+	}
+}
+
+// Without the agent cards the answer says so.
+func TestTheSwarmRouteSaysWhenTheCardsAreUnavailable(t *testing.T) {
+	h, js, _ := swarmServer(t)
+	if err := js.DeleteStream(context.Background(), streamDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if resp, _ := askSwarm(t, h, map[string]any{}); !hasNote(resp, noteCardsUnavailable) {
+		t.Errorf("notes = %q", resp.Notes)
+	}
+}
+
+// Off the bus, the answer says so and reads nothing.
+func TestTheSwarmRouteSaysWhenItIsNotConnected(t *testing.T) {
+	sh, bus, _ := swarmBus(t)
+	bus.Close()
+	resp := sh.answer(context.Background(), swarmRequest{}, time.Now())
+	if resp.Connected || !hasNote(resp, noteNotConnected) {
+		t.Errorf("connected %v, notes %q", resp.Connected, resp.Notes)
+	}
+}
+
+// A read its caller cut short answers that caller only: the next call reads
+// again rather than taking the cut-short read from the cache.
+func TestACutShortSwarmReadIsNotCached(t *testing.T) {
+	sh, _, js := swarmBus(t)
+	publishSubmission(t, js, "s-triage", "t-1", consoleConversationPrefix+convTriage, "one", "")
+	req := swarmRequest{Conversations: map[string]swarmConversationEntry{"triage": {Token: convTriage, LastUsedAt: time.Now()}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sh.answer(ctx, req, time.Now())
+	if b := boardTexts(sh.answer(context.Background(), req, time.Now()).Snapshot); !strings.Contains(b, "t-1") {
+		t.Errorf("the cut-short read was cached:\n%s", b)
 	}
 }

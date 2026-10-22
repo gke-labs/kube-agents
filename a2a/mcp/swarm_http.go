@@ -13,11 +13,13 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -39,11 +41,22 @@ const (
 	maxSwarmConversationIDRunes = 128
 	// taskSubjects is every task subject on TASKS.
 	taskSubjects = "a2a.tasks.>"
+	// swarmReadTTL is how long one TASKS read answers every swarm call. The
+	// bridge calls after every tool call, so a busy workstation then costs
+	// the bus one read, and one reader slot, per window rather than per call.
+	swarmReadTTL = 3 * time.Second
+	// swarmDrainSlack is how many messages past the limit one read takes, for
+	// those that land between the stream's state and the consumer's start.
+	swarmDrainSlack = drainFetchBatch
 
 	msgSwarmBadRequest   = "the body is not a swarm request"
 	msgSwarmTooMany      = "the request names %d %s; at most %d"
 	noteDeploymentIgnore = "this server never takes a deployment or credentials from a client; it reads the install it runs in"
 	noteTasksPartial     = "the TASKS read was partial, so tasks may be missing: %v"
+	noteTasksBusy        = "the TASKS read was skipped because this server's bus readers were busy; no tasks were read, try again in a few seconds"
+	noteTasksOldest      = "TASKS holds more than %d messages since the window began; the oldest were not read, so older tasks may be missing"
+	noteTasksBytes       = "the TASKS read kept its first %d KiB of messages; newer messages were not kept, so the newest tasks may be missing"
+	noteDroppedEntries   = "%d conversation entries in the request were dropped: an alias or token that is not valid"
 	noteNotConnected     = "not connected to the bus; no tasks were read"
 	noteCardsUnavailable = "the agent cards could not be read"
 )
@@ -52,9 +65,13 @@ const (
 // conversation that long after its last task. A variable for tests.
 var swarmTaskWindow = swarmRecent
 
-// swarmTaskLimit bounds the messages one TASKS read takes. A variable for
-// tests.
+// swarmTaskLimit bounds the messages one TASKS read takes: the newest this
+// many on the stream. A variable for tests.
 var swarmTaskLimit = maxTaskEvents
+
+// maxSwarmReadBytes bounds the message bytes one TASKS read keeps. A variable
+// for tests.
+var maxSwarmReadBytes = 32 << 20
 
 // swarmConversationEntry is one conversation in the bridge's shape
 // (#3689: a2a/mcpbridge/config.go ConversationEntry). The server reads Alias,
@@ -119,12 +136,37 @@ type swarmResponse struct {
 type swarmHandler struct {
 	bus   *NATSBus
 	convs *Conversations
+	now   func() time.Time // nil is time.Now
+
+	// mu serialises TASKS reads, so concurrent calls share one read (and
+	// one reader slot) rather than each taking one, and guards the cache.
+	mu       sync.Mutex
+	cached   swarmTaskSet
+	cachedAt time.Time
+}
+
+// swarmTaskSet is one TASKS read: every task it found, before any request's
+// filter, and the notes on how it went.
+type swarmTaskSet struct {
+	tasks []SwarmTask
+	notes []string
+}
+
+func (h *swarmHandler) clock() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return time.Now()
 }
 
 func (h *swarmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSwarmBodyBytes))
 	if err != nil {
-		http.Error(w, msgBodyTooLarge, http.StatusRequestEntityTooLarge)
+		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+			http.Error(w, msgBodyTooLarge, http.StatusRequestEntityTooLarge)
+		} else {
+			http.Error(w, msgSwarmBadRequest, http.StatusBadRequest)
+		}
 		return
 	}
 	var req swarmRequest
@@ -142,28 +184,30 @@ func (h *swarmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), requestBudget)
 	defer cancel()
-	resp := h.answer(ctx, req, time.Now())
+	resp := h.answer(ctx, req, h.clock())
 	w.Header().Set(headerContentType, contentTypeJSON)
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// answer builds the response to a request already bounded by count.
+// answer builds the response to a request already bounded by count. It
+// projects only the conversations the request names.
 func (h *swarmHandler) answer(ctx context.Context, req swarmRequest, now time.Time) swarmResponse {
 	resp := swarmResponse{
 		PendingEvents:     []json.RawMessage{},
 		DeploymentIgnored: true,
 		Notes:             []string{noteDeploymentIgnore},
 	}
-	entries := mergeSwarmConversations(h.convs.List(), req.Conversations)
+	entries, dropped := mergeSwarmConversations(h.convs.List(), req.Conversations)
+	if dropped > 0 {
+		resp.Notes = append(resp.Notes, fmt.Sprintf(noteDroppedEntries, dropped))
+	}
 	in := SwarmInput{Conversations: swarmConversations(entries, req.Subagents), Now: now}
 
 	resp.Connected = h.bus.client.Conn().IsConnected()
 	if resp.Connected {
-		tasks, err := h.bus.swarmTasks(ctx, now.Add(-swarmTaskWindow))
-		if err != nil {
-			resp.Notes = append(resp.Notes, fmt.Sprintf(noteTasksPartial, err))
-		}
-		in.Tasks = keepSwarmTasks(tasks, entries)
+		set := h.taskSet(ctx)
+		resp.Notes = append(resp.Notes, set.notes...)
+		in.Tasks = keepSwarmTasks(set.tasks, entries)
 		if cards := h.bus.Status(ctx).AgentCards; cards != nil {
 			in.Cards = cards
 		} else {
@@ -193,6 +237,37 @@ func (h *swarmHandler) answer(ctx context.Context, req swarmRequest, now time.Ti
 	return resp
 }
 
+// taskSet is the TASKS read, at most swarmReadTTL old. Concurrent callers
+// wait for one read and share it. A read its caller cut short, or one the
+// busy readers skipped, answers that caller only.
+func (h *swarmHandler) taskSet(ctx context.Context) swarmTaskSet {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.cachedAt.IsZero() && h.clock().Sub(h.cachedAt) < swarmReadTTL {
+		return h.cached
+	}
+	read, err := h.bus.swarmTasks(ctx, h.clock().Add(-swarmTaskWindow))
+	set := swarmTaskSet{tasks: read.tasks}
+	switch {
+	case errors.Is(err, errReadersBusy):
+		set.notes = append(set.notes, noteTasksBusy)
+		return set
+	case err != nil:
+		set.notes = append(set.notes, fmt.Sprintf(noteTasksPartial, err))
+	}
+	if read.oldestDropped {
+		set.notes = append(set.notes, fmt.Sprintf(noteTasksOldest, swarmTaskLimit))
+	}
+	if read.bytesCapped {
+		set.notes = append(set.notes, fmt.Sprintf(noteTasksBytes, maxSwarmReadBytes>>10))
+	}
+	if ctx.Err() != nil {
+		return set
+	}
+	h.cached, h.cachedAt = set, h.clock()
+	return set
+}
+
 // validSwarmConversationID reports whether id looks like an Antigravity
 // conversation id: present, at most maxSwarmConversationIDRunes, and free of
 // control characters.
@@ -214,59 +289,46 @@ func swarmConversationToken(raw string) string {
 	return t
 }
 
-// mergeSwarmConversations is the server's table and the client's, one entry
-// per token, in alias order. A client entry with an invalid alias or token is
-// dropped. On a shared token the server's alias and description win and the
-// later last use wins; the client's other fields are kept. On a shared alias
-// the server's entry wins, then the later last use.
-func mergeSwarmConversations(server []ConversationInfo, client map[string]swarmConversationEntry) []swarmConversationEntry {
-	byToken := make(map[string]*swarmConversationEntry, len(server)+len(client))
-	fromServer := make(map[string]bool, len(server))
+// mergeSwarmConversations is the request's conversations, one entry per entry
+// kept, in alias order. The server's table only resolves the names the request
+// gives: where it holds the alias, the conversation is the server's, the one
+// this server sent that name's turns to, so its token is used; otherwise the
+// client's token, which must be a valid conversation token. Every other field
+// is the client's, capped; the description is the client's unless it has
+// none, and the last use is the later of the two. The table's other names are
+// neither projected nor returned. dropped counts the entries whose alias or
+// token is not valid.
+func mergeSwarmConversations(server []ConversationInfo, client map[string]swarmConversationEntry) (out []swarmConversationEntry, dropped int) {
+	serverByAlias := make(map[string]ConversationInfo, len(server))
 	for _, c := range server {
-		byToken[c.Token] = &swarmConversationEntry{Alias: c.Alias, Token: c.Token, Description: c.Description, LastUsedAt: c.LastUsed.UTC()}
-		fromServer[c.Token] = true
+		serverByAlias[c.Alias] = c
 	}
+	out = make([]swarmConversationEntry, 0, len(client))
 	for alias, e := range client {
-		alias = strings.TrimSpace(alias)
-		token := swarmConversationToken(e.Token)
-		if alias == "" || len(alias) > maxSwarmAliasBytes || token == "" {
+		// 3a trims an alias; one it would change is refused rather than
+		// returned under a name the bridge did not send.
+		if alias == "" || alias != strings.TrimSpace(alias) || len(alias) > maxSwarmAliasBytes {
+			dropped++
 			continue
 		}
 		e = cappedClientEntry(e)
-		e.Alias, e.Token = alias, token
-		have := byToken[token]
-		switch {
-		case have == nil:
-			byToken[token] = &e
-		case fromServer[token]:
-			// The server's alias and description, the client's own fields.
-			e.Alias, e.Description = have.Alias, have.Description
-			if have.LastUsedAt.After(e.LastUsedAt) {
-				e.LastUsedAt = have.LastUsedAt
+		e.Alias = alias
+		if s, ok := serverByAlias[alias]; ok {
+			e.Token = s.Token
+			if e.Description == "" {
+				e.Description = s.Description
 			}
-			byToken[token] = &e
-		case e.LastUsedAt.After(have.LastUsedAt) || (e.LastUsedAt.Equal(have.LastUsedAt) && e.Alias < have.Alias):
-			byToken[token] = &e
-		}
-	}
-	byAlias := make(map[string]*swarmConversationEntry, len(byToken))
-	for token, e := range byToken {
-		have := byAlias[e.Alias]
-		if have == nil {
-			byAlias[e.Alias] = e
+			if last := s.LastUsed.UTC(); last.After(e.LastUsedAt) {
+				e.LastUsedAt = last
+			}
+		} else if e.Token = swarmConversationToken(e.Token); e.Token == "" {
+			dropped++
 			continue
 		}
-		hs, es := fromServer[have.Token], fromServer[token]
-		if (es && !hs) || (es == hs && (e.LastUsedAt.After(have.LastUsedAt) || (e.LastUsedAt.Equal(have.LastUsedAt) && token < have.Token))) {
-			byAlias[e.Alias] = e
-		}
-	}
-	out := make([]swarmConversationEntry, 0, len(byAlias))
-	for _, e := range byAlias {
-		out = append(out, *e)
+		out = append(out, e)
 	}
 	slices.SortFunc(out, func(x, y swarmConversationEntry) int { return strings.Compare(x.Alias, y.Alias) })
-	return out
+	return out, dropped
 }
 
 // cappedClientEntry applies 3a's byte limits to a client entry's strings: one
@@ -365,33 +427,85 @@ type swarmTaskRead struct {
 	events    []*lib.Envelope
 }
 
-// swarmTasks reads every task with a write on TASKS since since, in one
-// drain on one reader slot, and folds each. A task whose submission is older
-// than since has no conversation here, and is not kept. A read that stops
-// short returns what it read with the error that stopped it.
-func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) ([]SwarmTask, error) {
+// swarmRead is what one TASKS read found, and how it fell short.
+type swarmRead struct {
+	tasks []SwarmTask
+	// oldestDropped: the read started past the stream's first message and
+	// found none older than the window, so the window held more than the
+	// read takes, and its oldest messages were not read.
+	oldestDropped bool
+	// bytesCapped: the read reached maxSwarmReadBytes and kept no more.
+	bytesCapped bool
+}
+
+// swarmTasks reads the newest swarmTaskLimit messages on TASKS in one drain
+// on one reader slot, keeps those since since, and folds each task. A task
+// whose submission is older than since has no conversation here, and is not
+// kept, unless a later message on its .in (a steer) is inside the window: it
+// is live, so it is kept, but with no prompt, since what the read holds is
+// not its submission. A read that stops short returns what it read with the
+// error that stopped it.
+func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) (swarmRead, error) {
 	ctx, cancel := context.WithTimeout(ctx, taskReadTimeout)
 	defer cancel()
 	s, err := b.client.JetStream().Stream(ctx, lib.TasksStream)
 	if err != nil {
-		return nil, err
+		return swarmRead{}, err
 	}
-	reads := map[TaskRef]*swarmTaskRead{}
-	var order []*swarmTaskRead
+	state := s.CachedInfo().State
+	if state.Msgs == 0 {
+		return swarmRead{}, nil
+	}
+	start := state.FirstSeq
+	if limit := uint64(swarmTaskLimit); state.LastSeq >= limit && state.LastSeq-limit+1 > start {
+		start = state.LastSeq - limit + 1
+	}
+	var (
+		reads       = map[TaskRef]*swarmTaskRead{}
+		order       []*swarmTaskRead
+		submittedAt = map[TaskRef]time.Time{} // the first .in older than the window
+		sawOlder    bool
+		kept        int
+		read        swarmRead
+	)
+	// keep counts n bytes against maxSwarmReadBytes; past it, nothing more
+	// is kept, and the drain runs on to its end.
+	keep := func(n int) bool {
+		if read.bytesCapped || kept+n > maxSwarmReadBytes {
+			read.bytesCapped = true
+			return false
+		}
+		kept += n
+		return true
+	}
 	_, derr := b.drainConsumer(ctx, s, jetstream.ConsumerConfig{
 		FilterSubject: taskSubjects,
-		DeliverPolicy: jetstream.DeliverByStartTimePolicy,
-		OptStartTime:  &since,
-	}, swarmTaskLimit, func(msg jetstream.Msg) {
+		DeliverPolicy: jetstream.DeliverByStartSequencePolicy,
+		OptStartSeq:   start,
+	}, swarmTaskLimit+swarmDrainSlack, func(msg jetstream.Msg) {
 		addressee, taskID, class, ok := lib.ParseTaskSubject(msg.Subject())
 		if !ok {
+			return
+		}
+		var at time.Time
+		if md, err := msg.Metadata(); err == nil {
+			at = md.Timestamp
+		}
+		ref := TaskRef{Addressee: addressee, TaskID: taskID}
+		if !at.IsZero() && at.Before(since) {
+			sawOlder = true
+			if _, have := submittedAt[ref]; !have && class == lib.TaskClassIn && agreedEnvelope(msg.Subject(), msg.Data()) != nil {
+				submittedAt[ref] = at
+			}
 			return
 		}
 		env := agreedEnvelope(msg.Subject(), msg.Data())
 		if env == nil {
 			return
 		}
-		ref := TaskRef{Addressee: addressee, TaskID: taskID}
+		if at.IsZero() {
+			at = env.TS
+		}
 		rd := reads[ref]
 		if rd == nil {
 			rd = &swarmTaskRead{ref: ref, task: SwarmTask{Addressee: addressee, TaskID: taskID}}
@@ -399,16 +513,18 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) ([]SwarmTask,
 			order = append(order, rd)
 		}
 		if class != lib.TaskClassIn {
-			rd.events = append(rd.events, env)
+			if keep(len(msg.Data())) {
+				rd.events = append(rd.events, env)
+			}
 			return
 		}
-		// The first message on .in is the submission; later ones are
-		// follow-ups and cancels.
+		// The first message on .in in the read is the conversation's; later
+		// ones are follow-ups and cancels.
 		if rd.submitted {
 			return
 		}
 		_, a, text, ok := submission(&nats.Msg{Subject: msg.Subject(), Data: msg.Data()})
-		if !ok {
+		if !ok || !keep(len(msg.Data())) {
 			return
 		}
 		rd.submitted = true
@@ -416,12 +532,16 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) ([]SwarmTask,
 		if a.Via != nil {
 			rd.task.ViaTaskID = a.Via.TaskID
 		}
-		rd.task.Prompt = text
-		rd.task.Submitted = env.TS
-		if md, err := msg.Metadata(); err == nil {
-			rd.task.Submitted = md.Timestamp
+		rd.task.Submitted = at
+		// It is the submission only if nothing of the task came before it:
+		// not an older .in, and no event earlier in the read.
+		if older, ok := submittedAt[ref]; ok {
+			rd.task.Submitted = older
+		} else if len(rd.events) == 0 {
+			rd.task.Prompt = text
 		}
 	})
+	read.oldestDropped = start > state.FirstSeq && !sawOlder
 	addresseeOf := make(map[string]string, len(order))
 	for _, rd := range order {
 		if _, dup := addresseeOf[rd.ref.TaskID]; dup {
@@ -430,7 +550,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) ([]SwarmTask,
 			addresseeOf[rd.ref.TaskID] = rd.ref.Addressee
 		}
 	}
-	out := make([]SwarmTask, 0, len(order))
+	read.tasks = make([]SwarmTask, 0, len(order))
 	for _, rd := range order {
 		if !rd.submitted {
 			continue
@@ -444,7 +564,7 @@ func (b *NATSBus) swarmTasks(ctx context.Context, since time.Time) ([]SwarmTask,
 		if t.ViaTaskID != "" {
 			t.ViaAddressee = addresseeOf[t.ViaTaskID]
 		}
-		out = append(out, t)
+		read.tasks = append(read.tasks, t)
 	}
-	return out, derr
+	return read, derr
 }

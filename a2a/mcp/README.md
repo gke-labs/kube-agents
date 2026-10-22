@@ -38,15 +38,18 @@ To rotate the token, write a new value into the Secret. The server reads it on e
 
 ## The swarm view
 
-`POST /mcp/swarm` serves the workstation bridge's swarm view (gke-labs/kube-agents#3689): the bridge posts its conversation table, its subagent lineage and the board ledger it kept from the last call, and gets back the members, new board posts and view it writes into Antigravity's Swarm UI. It sits behind the same `Origin` refusal and bearer token as `/mcp`, takes JSON of at most 1 MiB (413 past it), and answers 400 to a body that isn't a swarm request or that names more than 512 conversations.
+`POST /mcp/swarm` serves the workstation bridge's swarm view (gke-labs/kube-agents#3689): the bridge posts its conversation table, its subagent lineage and the board ledger it kept from the last call, and gets back the members, new board posts and view it writes into Antigravity's Swarm UI. It sits behind the same `Origin` refusal and bearer token as `/mcp`, takes JSON of at most 1 MiB (413 past it), and answers 400 to a body that isn't a swarm request or that names more than 512 conversations or more than 512 subagents.
+
+It projects only the conversations the request names. This server's own conversation names only resolve them: where the server holds a request entry's name, the conversation is the server's, since that is where the name's turns went, so the server's token is used and returned; the entry keeps the bridge's name and every other field the bridge sent. An entry whose name or token isn't valid is dropped, and `notes` says how many were. The server's other names are neither shown nor returned.
 
 It reads, bounded:
 
-- the last hour of `TASKS`, in one read of at most 4096 messages; a read that stops short is still answered, with a line in `notes` saying so;
-- this server's own conversation names and the bridge's, merged by token. A bridge entry whose token isn't a valid conversation token is dropped;
+- the newest 4096 messages on `TASKS`, keeping those from the last hour and at most 32 MiB of them. When the hour holds more, the oldest are the ones not read, and `notes` says so; a read cut short, or skipped because the server's bus readers are busy, is still answered, with a line in `notes`;
 - the agent cards, from the same cached read `connection_status` uses.
 
-It keeps only the tasks of those conversations, and the tasks delegated from them.
+A call holds at most one bus reader, and concurrent calls share it: one `TASKS` read answers every call for three seconds, so the swarm view never takes the readers the turn tools need.
+
+It keeps only the tasks of those conversations, and the tasks delegated from them. A task submitted before the hour that took a follow-up message inside it is still shown, since it is live, but without a prompt: the follow-up isn't its submission.
 
 It never reads the request's `deployment`: the server takes no endpoint or credential from a client, and always answers for the install it runs in (`deploymentIgnored: true`). Pending push events aren't served yet (`pendingEventsServed: false`, `pendingEvents: []`).
 
