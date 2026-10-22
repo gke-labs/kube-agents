@@ -165,8 +165,8 @@ def first_report_markers(gateway_home: Path) -> tuple[Path, Path]:
 
     Out is the delivery claim, or on the conversation path (``spec.mode: next``)
     the recorded outcome, because a claim there can be released and taken
-    again. The board snapshot reads the same pair, so the Home tab and this
-    hold agree on when the first report is still to come.
+    again. The board snapshot reads the same pair for the Home tab, and ends
+    its state early once delivery has registered the sweep's findings.
     """
     filed, delivered = gateway_home / SCAN_FILED_MARKER, gateway_home / DELIVERED_MARKER
     if any((gateway_home / name).exists() for name in CONVERSATION_MARKERS):

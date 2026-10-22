@@ -159,6 +159,28 @@ class BoardSnapshotTest(unittest.TestCase):
         (home / findings_nudge.CONVERSATION_DONE_MARKER).write_text("posted\n")
         self.assertNotIn("first_report_pending", self.snap())
 
+    def test_registered_findings_end_the_pending_state_without_a_delivery(self):
+        # A conversation post that failed five times after registration: the fleet was checked.
+        home = self.profiles.parent
+        (home / findings_nudge.SCAN_FILED_MARKER).touch()
+        (home / findings_nudge.CONVERSATION_MARKERS[0]).write_text("{}")
+        findings_queue.register_findings(self.session, [finding("seeded-a", "oom crash", "critical")])
+        self.assertTrue(self.snap()["first_report_pending"])
+        (home / board_snapshot.FINDINGS_REGISTERED_MARKER).touch()
+        board = self.snap()
+        self.assertNotIn("first_report_pending", board)
+        self.assertNotIn("first_message_pending", board)
+        self.assertEqual([c["findings"] for c in board["clusters"]], [1, 0])
+
+    def test_a_never_primed_install_stays_pending(self):
+        # Nobody wrote within the plugin's week: delivery never ran, so nothing was registered.
+        home = self.profiles.parent
+        week_ago = int(NOW.timestamp()) - board_snapshot.FIRST_MESSAGE_MAX_AGE_SECONDS - 1
+        (home / findings_nudge.SCAN_FILED_MARKER).write_text(f"task_id=t_1\n{findings_nudge.FILED_AT_PREFIX}{week_ago}\n")
+        board = self.snap()
+        self.assertTrue(board["first_report_pending"])
+        self.assertNotIn("first_message_pending", board)
+
     def test_an_old_sweep_asks_for_no_message(self):
         # Past a week the onboarding plugin primes nothing, so the note would mislead.
         home = self.profiles.parent
