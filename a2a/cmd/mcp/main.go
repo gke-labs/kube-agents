@@ -167,11 +167,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	defer bus.Close()
-	tools := []mcp.Tool{mcp.ConnectionStatusTool(bus)}
-	if s.broker != nil {
-		tools = append(tools, mcp.InspectPRTool(s.broker))
-	}
-	srv, err := mcp.NewServer(tools...)
+	srv, err := mcp.NewServer(toolsFor(bus, s.broker)...)
 	if err != nil {
 		log.Error("mcp server", "err", err)
 		return err
@@ -182,6 +178,16 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+}
+
+// toolsFor is the tools this pod offers: inspect_pr only when it has a
+// broker.
+func toolsFor(bus mcp.Bus, broker *mcp.BrokerClient) []mcp.Tool {
+	tools := []mcp.Tool{mcp.ConnectionStatusTool(bus)}
+	if broker != nil {
+		tools = append(tools, mcp.InspectPRTool(broker))
+	}
+	return tools
 }
 
 // serve runs until ctx is done or the server fails.

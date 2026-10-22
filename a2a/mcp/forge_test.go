@@ -236,6 +236,20 @@ func TestBrokerClientRefusesAnOversizedAnswer(t *testing.T) {
 	}
 }
 
+// An answer that declares a length past the cap is refused before any of
+// it is read.
+func TestBrokerClientRefusesADeclaredOversizedAnswerUnread(t *testing.T) {
+	srv, _ := fakeBroker(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "1073741824")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, githubViewJSON)
+	})
+	c := newTestClient(t, srv.URL, writeToken(t, testToken), nil)
+	if _, err := c.ProposalView(context.Background(), testViewRequest); !errors.Is(err, ErrBrokerResponseTooLarge) {
+		t.Fatalf("err = %v, want ErrBrokerResponseTooLarge", err)
+	}
+}
+
 func TestBrokerClientTimesOut(t *testing.T) {
 	release := make(chan struct{})
 	srv, _ := fakeBroker(t, func(w http.ResponseWriter, r *http.Request) {

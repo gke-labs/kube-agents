@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -27,10 +28,19 @@ const (
 	// and comments is up to five forge calls on the broker's side; the whole
 	// tool call has to fit inside the server's write timeout.
 	DefaultBrokerTimeout = 25 * time.Second
-	// DefaultBrokerMaxResponseBytes bounds one broker answer. The broker
-	// caps one forge answer at 8 MiB (DEFAULT_HTTP_MAX_BYTES), and JSON
-	// escaping a diff can grow it, so this is twice that.
-	DefaultBrokerMaxResponseBytes = 16 << 20
+	// DefaultBrokerMaxResponseBytes bounds one broker answer. It is sized
+	// to the pod, not to the broker: the MCP Deployment's memory limit is
+	// 128Mi, and one answer costs about three times its size while it is
+	// read and decoded (the raw bytes, the decoder's copy and the strings it
+	// decodes), so a 4 MiB answer is about 12 MiB per call, and
+	// maxInspectInFlight calls, doubled for the Go collector's headroom, are
+	// well inside the limit. The answer shows at most 64 KiB
+	// of diff, so a bigger cap would buy only the change counts of a diff
+	// past 4 MiB, and GitHub refuses a diff past 20,000 lines anyway (about
+	// 1 MiB at typical line lengths). A larger answer is refused, and
+	// inspect_pr asks again without the diff. The broker's own cap on one
+	// forge answer is 8 MiB (DEFAULT_HTTP_MAX_BYTES).
+	DefaultBrokerMaxResponseBytes = 4 << 20
 
 	// brokerCommentLimit is the comment limit asked of the broker. GitHub's
 	// conversation is three endpoints and the limit applies to each, so the
@@ -266,15 +276,26 @@ func (c *BrokerClient) ProposalView(ctx context.Context, req ProposalViewRequest
 	if resp.StatusCode != http.StatusOK {
 		return nil, brokerError(resp, token)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, c.maxBytes+1))
-	if err != nil {
+	tooLarge := fmt.Errorf("%w (%d bytes)", ErrBrokerResponseTooLarge, c.maxBytes)
+	if resp.ContentLength > c.maxBytes {
+		// Refused before a byte of it is read.
+		return nil, tooLarge
+	}
+	// One buffer sized to the declared length (plus the read slack
+	// bytes.Buffer wants), rather than io.ReadAll's doubling, which can
+	// hold up to twice the answer while it grows.
+	var raw bytes.Buffer
+	if resp.ContentLength > 0 {
+		raw.Grow(int(resp.ContentLength) + bytes.MinRead)
+	}
+	if _, err := raw.ReadFrom(io.LimitReader(resp.Body, c.maxBytes+1)); err != nil {
 		return nil, fmt.Errorf("reading the credential broker's answer: %w", err)
 	}
-	if int64(len(raw)) > c.maxBytes {
-		return nil, fmt.Errorf("%w (%d bytes)", ErrBrokerResponseTooLarge, c.maxBytes)
+	if int64(raw.Len()) > c.maxBytes {
+		return nil, tooLarge
 	}
 	var view ProposalView
-	if err := json.Unmarshal(raw, &view); err != nil {
+	if err := json.Unmarshal(raw.Bytes(), &view); err != nil {
 		return nil, fmt.Errorf("the credential broker's answer is not a proposal view: %w", err)
 	}
 	return &view, nil
@@ -306,8 +327,16 @@ func brokerError(resp *http.Response, token string) error {
 // without it. GitHub answers 406 to a diff past 20,000 lines or 300 files,
 // which the broker relays as FORGE_CALL_FAILED; a diff past the broker's 8 MiB
 // is FORGE_RESPONSE_TOO_LARGE; one past this client's cap is
-// ErrBrokerResponseTooLarge.
+// ErrBrokerResponseTooLarge. A timeout or a cancellation is never one of
+// these, whatever else the error carries: asking again would spend a second
+// request on a broker or forge that is already slow, or on a caller who has
+// gone.
 func diffMayBeRefused(err error) bool {
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		(errors.As(err, &ne) && ne.Timeout()) {
+		return false
+	}
 	if errors.Is(err, ErrBrokerResponseTooLarge) {
 		return true
 	}
