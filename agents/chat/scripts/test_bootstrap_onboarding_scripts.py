@@ -2308,14 +2308,22 @@ class FirstRunAuditsTest(unittest.TestCase):
             else:
                 conn.execute("INSERT INTO executions VALUES (?, ?, ?)", (audit, status, stamp(claimed_at)))
 
-    def _relay(self, audit: str, posted_at: float) -> None:
-        """The chat relay's record that it posted ``audit``'s report at ``posted_at``, as session-kv writes it."""
+    def _relay(self, audit: str, posted_at: float, run: str = "r1") -> None:
+        """The chat relay's record that it posted ``audit``'s report at ``posted_at``, as session-kv writes it.
+
+        ``run`` is the stamp of the report record it marked posted (``_stamp``), or a placeholder.
+        """
         with sqlite3.connect(self.relay_db) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS audit_report_runs (profile TEXT NOT NULL, job_id TEXT NOT NULL, "
                          "run TEXT NOT NULL, posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
                          "PRIMARY KEY (profile, job_id))")
-            conn.execute("INSERT OR REPLACE INTO audit_report_runs VALUES ('platform', ?, 'r1', ?)",
-                         (audit, datetime.fromtimestamp(posted_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
+            conn.execute("INSERT OR REPLACE INTO audit_report_runs VALUES ('platform', ?, ?, ?)",
+                         (audit, run, datetime.fromtimestamp(posted_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")))
+
+    @staticmethod
+    def _stamp(at: float) -> str:
+        """The ``run`` stamp the audit's ``start`` gives a report record written at ``at``."""
+        return datetime.fromtimestamp(at, timezone.utc).strftime(bootstrap_delivery.RELAY_RUN_STAMP_FORMAT)
 
     def _filed(self, at: float) -> None:
         (self.d / SCAN_FILED).write_text(f"task_id=t_sweep\nfiled_at={at}\n", encoding="utf-8")
@@ -2417,8 +2425,9 @@ class FirstRunAuditsTest(unittest.TestCase):
         self.assertEqual(self._lost(note), " `compliance-audit`")
         self.assertIn("report store: compliance-audit.`", note)
         self.assertTrue(note.endswith(
-            "These failed before anyone opened the chat, and their failure notices were not posted: `ai-security-audit`."
+            "These failed, and their failure notices were not posted to the chat: `ai-security-audit`."
         ))
+        self.assertNotIn("before anyone", note)  # nothing checks the crash against when the chat was opened
 
     def test_a_crashed_run_does_not_hide_an_earlier_lost_summary(self):
         # The earlier run's report is in the store; the crash after it is named, and so is that report.
@@ -2432,7 +2441,8 @@ class FirstRunAuditsTest(unittest.TestCase):
         note = self._note()
         self.assertEqual(self._lost(note), " `compliance-audit`")
         self.assertIn("report store: compliance-audit.`", note)
-        self.assertTrue(note.endswith("their failure notices were not posted: `compliance-audit`, `obtainability-audit`."))
+        self.assertTrue(note.endswith(
+            "their failure notices were not posted to the chat: `compliance-audit`, `obtainability-audit`."))
 
     def test_a_posted_failure_notice_does_not_hide_an_earlier_lost_summary(self):
         # The relay posted the crash's failure notice, not the earlier run's report, which is still in the store.
@@ -2445,6 +2455,40 @@ class FirstRunAuditsTest(unittest.TestCase):
         note = self._note()
         self.assertEqual(self._lost(note), " `compliance-audit`")
         self.assertNotIn("failure notices", note)
+
+    def test_a_posted_failure_notice_keeps_the_proof_that_the_run_before_it_posted(self):
+        # Oldest first: a lost summary, a delivered run the relay posted, a crash whose notice posted.
+        # The notice replaced the relay's row, whose `run` is still the delivered run's record stamp.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 2000, "delivered")
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("compliance-audit", now - 940, run=self._stamp(now - 1990))
+        self._skipped(oobe.SKIP_NOT_NEW)
+        self.assertNotIn("not posted", self._note())
+
+    def test_a_posted_failure_notice_that_marked_a_lost_runs_record_does_not_settle_it(self):
+        # The delivered run in between posted nothing (a silence marker), so the record on disk is the
+        # lost run's, and the failure path marked that record posted without posting it.
+        now = time.time()
+        self._filed(now - 7200)
+        self._run("compliance-audit", now - 3000, bootstrap_delivery.DELIVERY_FAILED)
+        self._run("compliance-audit", now - 2000, "delivered")
+        self._run("compliance-audit", now - 1000, bootstrap_delivery.DELIVERY_FAILED, status="failed")
+        self._relay("compliance-audit", now - 940, run=self._stamp(now - 2990))
+        self._skipped(oobe.SKIP_NOT_NEW)
+        note = self._note()
+        self.assertEqual(self._lost(note), " `compliance-audit`")
+        self.assertNotIn("failure notices", note)
+
+    def test_the_relay_run_stamp_format_is_the_report_records(self):
+        sys.path.insert(0, str(FLEET_AUDIT_SCRIPTS))
+        try:
+            import audit_report
+        finally:
+            sys.path.remove(str(FLEET_AUDIT_SCRIPTS))
+        self.assertEqual(bootstrap_delivery.RELAY_RUN_STAMP_FORMAT, audit_report.REPORT_STAMP_FORMAT)
 
     def test_a_scheduled_run_in_flight_does_not_hide_an_earlier_lost_summary(self):
         # The running row is not an ended run; the completed one before it still lost its summary.
@@ -2581,6 +2625,16 @@ class FirstRunAuditsTest(unittest.TestCase):
                       "gcp-networking-fabric-audit, gce-compute-fleet-audit.`", note)
         self.assertIn("cannot read", (self.d / oobe.STAGE_LOG).read_text())
 
+    def test_an_unreadable_sweep_marker_keeps_the_coverage_caveat_on_the_legacy_skip(self):
+        # The legacy skip's own marker read raised past _audits_note, and the whole-note fallback lost the caveat.
+        (self.d / SCAN_FILED).write_bytes(b"task_id=t_\xff\nfiled_at=1\n")
+        self._skipped(bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON)
+        note = self._note()
+        self.assertTrue(note.startswith(f"The audits did not run as part of onboarding: "
+                                        f"{bootstrap_delivery.LEGACY_NO_REPOSITORY_REASON}."))
+        self.assertIn(bootstrap_delivery.AUDITS_NOT_COVERED_NOTE, note)
+        self.assertNotIn("I could not read the audit run records", note)
+
     def test_an_unreadable_sweep_marker_reads_every_run(self):
         now = time.time()
         (self.d / SCAN_FILED).write_bytes(b"task_id=t_\xff\nfiled_at=1\n")
@@ -2608,9 +2662,9 @@ class FirstRunAuditsTest(unittest.TestCase):
         real = bootstrap_delivery._claim_delivery
         with mock.patch.object(bootstrap_delivery, "_claim_delivery",
                                side_effect=lambda d: claimed.append(True) or real(d)), \
-                mock.patch.object(bootstrap_delivery, "_audits_note",
-                                  side_effect=lambda *a, **k: self.assertEqual(claimed, []) or "note"):
-            self.assertIn("note", self._deliver())
+                mock.patch.object(bootstrap_delivery, "_safe_audits_note",
+                                  side_effect=lambda *a, **k: self.assertEqual(claimed, []) or "NOTE-BUILT-FIRST"):
+            self.assertIn("NOTE-BUILT-FIRST", self._deliver())
 
     def test_the_text_delivery_carries_the_lost_summaries(self):
         oobe.write_state(self.d, self._finished_chain(bootstrap_delivery.DELIVERY_FAILED))

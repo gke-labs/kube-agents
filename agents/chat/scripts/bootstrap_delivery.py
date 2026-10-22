@@ -270,10 +270,8 @@ AUDITS_LOST_NOTE = (
     "These ran, but their summaries were not posted to the chat: {labels}. To see them, send me: `{request}`"
 )
 # An audit whose run failed wrote no report, so the request above cannot fetch what was lost: the
-# scheduler's failure notice.
-AUDITS_FAILED_RUNS_NOTE = (
-    "These failed before anyone opened the chat, and their failure notices were not posted: {labels}."
-)
+# scheduler's failure notice. Said, like AUDITS_LOST_NOTE, of every failed delivery, whatever refused it.
+AUDITS_FAILED_RUNS_NOTE = "These failed, and their failure notices were not posted to the chat: {labels}."
 AUDITS_UNREAD_NOTE = (
     "I could not read the audit run records, so this note cannot say which summaries reached the chat. "
     "To see any of them, send me: `{request}`"
@@ -309,6 +307,10 @@ SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 # SQLite's CURRENT_TIMESTAMP, which is UTC.
 RELAY_POSTED_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+# The row's `run`: the stamp the audit's `start` gave the report record the relay marked posted
+# (audit_report.REPORT_STAMP_FORMAT, UTC; a test holds the two equal). It falls inside that run's
+# claim and finish, which is what ties the row to a run once a later post has replaced `posted_at`.
+RELAY_RUN_STAMP_FORMAT = "%Y%m%dT%H%M%S.%fZ"
 
 # One ended run: (claimed_at, finished_at, delivery_outcome, status).
 AuditRun = tuple[float, float | None, str | None, str]
@@ -875,10 +877,11 @@ def _skip_follows_this_sweep(data_dir: Path, state: dict) -> bool:
     A sweep filed after the skip (onboarding repeated with the stage's marker kept) ran on a later
     build, whose scan leaves the workload checks to the audits whatever the old skip said.
     """
-    filed = bootstrap_handoff.read_scan_marker(data_dir / oobe.SCAN_FILED_MARKER)
     try:
+        filed = oobe.scan_filed(data_dir)
         skipped_at = float(state.get(oobe.STATE_AT))
-    except (TypeError, ValueError):
+    except (OSError, TypeError, ValueError):
+        # Also a marker whose bytes do not decode: the not-covered caveat is the safe one.
         return False
     return filed is not None and skipped_at >= filed[1]
 
@@ -1076,10 +1079,11 @@ def _audit_runs(data_dir: Path, jobs: tuple[str, ...]) -> dict[str, list[AuditRu
     return runs
 
 
-def _relay_posts(data_dir: Path) -> dict[str, float] | None:
-    """``job -> when the chat relay last posted its report``, from session-kv's database; None when unreadable.
+def _relay_posts(data_dir: Path) -> dict[str, tuple[float, float | None]] | None:
+    """``job -> (when the chat relay last posted for it, the stamp of the record it marked posted)``.
 
-    None leaves each run's delivery outcome to decide alone, and the stage log says why.
+    From session-kv's database; None when unreadable, which leaves each run's delivery outcome to
+    decide alone, and the stage log says why. The stamp is None when the row's ``run`` is not one.
     """
     db = Path(os.environ.get(SESSION_KV_DB_ENV) or DEFAULT_SESSION_KV_DB_PATH)
     if not db.is_file():
@@ -1089,7 +1093,7 @@ def _relay_posts(data_dir: Path) -> dict[str, float] | None:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=bootstrap_handoff.SQLITE_BUSY_TIMEOUT_SECONDS)
         try:
             rows = conn.execute(
-                "SELECT job_id, posted_at FROM audit_report_runs WHERE profile = ?", (oobe.PLATFORM_PROFILE,)
+                "SELECT job_id, posted_at, run FROM audit_report_runs WHERE profile = ?", (oobe.PLATFORM_PROFILE,)
             ).fetchall()
         finally:
             conn.close()
@@ -1097,17 +1101,21 @@ def _relay_posts(data_dir: Path) -> dict[str, float] | None:
         _stage_note(data_dir, f"cannot read {db}, so the audits note takes each run's delivery outcome as it is: {e}")
         return None
     posts = {}
-    for job_id, posted_at in rows:
+    for job_id, posted_at, run in rows:
         try:
             posted = datetime.strptime(posted_at, RELAY_POSTED_AT_FORMAT).replace(tzinfo=timezone.utc)
         except (TypeError, ValueError):
             continue
-        posts[job_id] = posted.timestamp()
+        try:
+            record = datetime.strptime(run, RELAY_RUN_STAMP_FORMAT).replace(tzinfo=timezone.utc).timestamp()
+        except (TypeError, ValueError):
+            record = None
+        posts[job_id] = (posted.timestamp(), record)
     return posts
 
 
 def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windows: dict[str, float],
-                 posts: dict[str, float] | None) -> list[tuple[str, bool]]:
+                 posts: dict[str, tuple[float, float | None]] | None) -> list[tuple[str, bool]]:
     """``(audit, its run failed)`` for each audit whose newest run in its window with something to post did not post it.
 
     A run that ends before anyone has opened the chat finds no home channel, the relay refuses
@@ -1117,12 +1125,16 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
     means a ``failed`` outcome or one the table does not know. A run the scheduler counts as delivered
     that the relay has no post for posted nothing, and is passed over too; with no relay record to ask,
     its outcome stands. A run that crashed wrote no report, so it does not stand in for an earlier run
-    whose report is in the store: the audit is named for both.
+    whose report is in the store: the audit is named for both. Its posted failure notice replaces the
+    relay's one row per job, so the post is read as the crashed run's and the row's record stamp then
+    settles an earlier delivered run the stamp falls in as posted: that run wrote the record, and the
+    relay posted it. A lost run the stamp falls in stays lost: the failure path marks the record on
+    disk posted without posting it.
     """
     lost = []
     for audit in audits:
         since = windows.get(audit, 0)
-        posted = posts.get(audit) if posts is not None else None
+        posted, record = posts.get(audit, (None, None)) if posts is not None else (None, None)
         crashed = False
         for claimed, ended, outcome, status in reversed(runs.get(audit, ())):
             if (ended if ended is not None else claimed) < since:
@@ -1137,6 +1149,8 @@ def _lost_audits(audits: tuple[str, ...], runs: dict[str, list[AuditRun]], windo
                     break
                 posted = None
                 continue
+            if kind == OUTCOME_TRIED and record is not None and record >= claimed:
+                break
             if kind == OUTCOME_LOST and status == RUN_FAILED_STATUS:
                 if not crashed:
                     lost.append((audit, True))
