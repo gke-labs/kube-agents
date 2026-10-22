@@ -461,12 +461,16 @@ func appendInert(dst []byte, line string, limit int, marker bool) ([]byte, int) 
 func appendCodePoint(dst []byte, r rune) []byte {
 	const hex = "0123456789ABCDEF"
 	dst = append(dst, "<U+"...)
+	if r < 0 || r > utf8.MaxRune {
+		r = utf8.RuneError
+	}
+	u := uint32(r) // #nosec G115 -- clamped to [0, utf8.MaxRune] just above
 	digits := 4
-	for v := uint32(r) >> 16; v > 0; v >>= 4 {
+	for v := u >> 16; v > 0; v >>= 4 {
 		digits++
 	}
 	for i := digits - 1; i >= 0; i-- {
-		dst = append(dst, hex[(uint32(r)>>(4*uint(i)))&0xF])
+		dst = append(dst, hex[(u>>(4*uint(i)))&0xF])
 	}
 	return append(dst, '>')
 }
