@@ -46,8 +46,8 @@ class A1AuthorityIsNotObtainableThroughUs(unittest.TestCase):
         ["gcloud", "container", "clusters", "delete", MARKER],
         ["gcloud", f"--flags-file=/workspace/{MARKER}.yaml", "info"],
         ["gcloud", "info", f"--account={MARKER}@example.com"],
-        # The write-remainder refusals (#2979) name the verb in a structured
-        # field only, never in the message.
+        # The gcloud refused-retry refusals (#2979) name no verb at all, and
+        # the kubectl entry keeps main's invitation. Neither repeats a caller byte.
         ["kubectl", "delete", "pod", MARKER, f"--token={MARKER}"],
         ["gcloud", "container", "clusters", "update", MARKER, f"--account={MARKER}@example.com"],
         ["gcloud", "container", "clusters", "update", MARKER, f"--{MARKER}=x"],

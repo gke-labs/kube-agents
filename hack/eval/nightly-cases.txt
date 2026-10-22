@@ -1002,6 +1002,11 @@
 # no pull request. Nightly from its first merge.
 ./tasks/health-chat-request-runs-collector/task.yaml
 
+# A gcloud write the command policy refuses for a flag it cannot read: the
+# report names the refusal and no delegated worker re-runs the write without
+# the flag after it (#2979, #3260). deployer: noop, transcript-only.
+./tasks/stop-on-unknown-flag-write-refusal/task.yaml
+
 # Catalogue entry 12 (a node label is removed): seeded-a's
 # seeded-shapes/arch-pinned-worker (deprecated-label-selector), a
 # nodeSelector on beta.kubernetes.io/arch, deprecated and still set.
