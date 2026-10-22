@@ -599,7 +599,8 @@ Layout:
   with its own bearer token (`<agent>-a2a-mcp-token`, minted by the operator), never with a
   bus credential, and reach it only through `kubectl port-forward`: the Service is ClusterIP
   and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
-  access gate is the Secret's RBAC plus `pods/portforward`, as with the console.
+  access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
+  not have: its pod hands the password to whoever forwards to it.
 
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in

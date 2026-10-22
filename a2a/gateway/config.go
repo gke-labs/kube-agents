@@ -567,8 +567,8 @@ type Config struct {
 }
 
 // Backend names the REAL chat backend this config arms: "gchat", "slack",
-// "discord", or "" when a side door (inject, A2A, or both) is the only way
-// in. FromEnv
+// "discord", or "" when a side door (inject, A2A, or both) or the console
+// door alone is the only way in. FromEnv
 // refuses more than one real backend, so the order here only decides what a
 // hand-built Config means.
 //
