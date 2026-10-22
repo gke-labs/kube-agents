@@ -146,15 +146,18 @@ func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
 	later := fmt.Sprintf("later reports can be read with poll_events (conversation_token `%s`, since %d)", token, out.ReportCursor)
 	switch out.ReportsEnd {
 	case reportsRunning:
-		fmt.Fprintf(sb, "\nThe turn was still running when the wait ended; %s.\n", later)
+		fmt.Fprintf(sb, "\nThe turn's tasks were still running when the wait ended, so the card reports shown are only those that "+
+			"had arrived by then (%d); %s.\n", len(out.Reports), later)
 	case reportsQuiet:
 		if len(out.Reports) == 0 {
-			fmt.Fprintf(sb, "\nNo card report came within %s of the turn's end; a card's report can take minutes: %s.\n", reportQuiet, later)
+			fmt.Fprintf(sb, "\nThe turn's tasks ended. No card report came within %s of the end; a card's report can take minutes: %s.\n",
+				reportQuiet, later)
 		} else {
-			fmt.Fprintf(sb, "\nStopped gathering after %s with no new report; %s.\n", reportQuiet, later)
+			fmt.Fprintf(sb, "\nThe turn's tasks ended. Stopped gathering after %s with no new report; %s.\n", reportQuiet, later)
 		}
 	case reportsWaitOver:
-		fmt.Fprintf(sb, "\nStopped gathering when the wait ended; %s, or wait longer with a larger wait_seconds.\n", later)
+		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the wait ended while reports were still being gathered, so the reports "+
+			"shown are those that had arrived by then; %s, or wait longer with a larger wait_seconds.\n", later)
 	}
 }
 
@@ -188,16 +191,16 @@ type pollEventsArgs struct {
 	WaitSeconds       int    `json:"wait_seconds"`
 }
 
-// PollEventsTool reads the reports and results a conversation was posted
-// since a cursor, from what this server heard.
+// PollEventsTool reads the cards' reports a conversation was posted since a
+// cursor, from what this server heard.
 func PollEventsTool(events *Events, convs *Conversations) Tool {
 	return Tool{
 		Definition: ToolDefinition{
 			Name: ToolPollEvents,
-			Description: "Read what a conversation was posted outside a turn's answer: cards' reports (kind notify) and " +
-				"delegated tasks' results (kind result), as this server heard them, newer than a cursor. " +
-				"An update to a report comes back under a new cursor. Live only: posts made before this server first " +
-				"heard of the conversation, or before it restarted, are not kept.",
+			Description: "Read the cards' reports a conversation was posted outside a turn's answer, as this server heard " +
+				"them, newer than a cursor. An update to a report comes back under a new cursor. A name must be one this " +
+				"server knows; a token is listened to from the first call that names it. Live only: posts made before this " +
+				"server first heard of the conversation, or before it restarted, are not kept.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -217,13 +220,14 @@ func PollEventsTool(events *Events, convs *Conversations) Tool {
 				return "", fmt.Errorf("wait_seconds is %d; it takes 0 to %d", a.WaitSeconds, maxPollSeconds)
 			}
 			byToken := a.ConversationToken != "" || strings.HasPrefix(a.Conversation, consoleConversationPrefix)
-			// Resolved without Resolve's listen, so that the answer can say
-			// whether the server had been listening before this call.
-			token, named, evicted, err := convs.resolve(a.Conversation, a.ConversationToken)
+			// Looked up, not resolved: a reader names a conversation that
+			// exists, and a mistyped name must not mint a new one. Watched
+			// here so that the answer can say whether the server had been
+			// listening before this call.
+			token, named, err := convs.lookup(a.Conversation, a.ConversationToken)
 			if err != nil {
 				return "", err
 			}
-			convs.events.Unname(evicted)
 			heard, err := events.Watch(token, named)
 			if err != nil {
 				return "", fmt.Errorf("listen to the conversation's posts: %w", err)
@@ -235,12 +239,12 @@ func PollEventsTool(events *Events, convs *Conversations) Tool {
 				writeConversation(&sb, a.Conversation, token)
 			}
 			since := a.Since
-			if cur := events.Cursor(token); since > cur {
+			if cur := events.Cursor(); since > cur {
 				fmt.Fprintf(&sb, "since %d is past this conversation's cursor %d (this server may have restarted); reading from 0.\n\n", since, cur)
 				since = 0
 			}
 			page := events.Since(ctx, token, since, time.Duration(a.WaitSeconds)*time.Second)
-			writeEventPage(&sb, page, heard)
+			writeEventPage(&sb, page, heard, since)
 			return sb.String(), nil
 		},
 	}
@@ -248,7 +252,7 @@ func PollEventsTool(events *Events, convs *Conversations) Tool {
 
 // writeEventPage renders poll_events' frames in cursor order, each frame's
 // text inert, and the cursor to read on from.
-func writeEventPage(sb *strings.Builder, page EventPage, heard bool) {
+func writeEventPage(sb *strings.Builder, page EventPage, heard bool, since uint64) {
 	if !heard && len(page.Frames) == 0 {
 		sb.WriteString("This server had not heard this conversation before; it listens from now on. No events have been heard yet, " +
 			"and anything posted before now is lost.\n\n")
@@ -256,18 +260,18 @@ func writeEventPage(sb *strings.Builder, page EventPage, heard bool) {
 		sb.WriteString("No new events.\n\n")
 	}
 	for _, f := range page.Frames {
-		label := "Report from a card"
-		if f.Kind == frameKindResult {
-			label = "A task's result"
-		}
 		fmt.Fprintf(sb, "Cursor %d. ", f.Cursor)
-		writeEventHead(sb, label, f)
+		writeEventHead(sb, "Report from a card", f)
 		sb.WriteString(inertBlock(f.Text))
 		sb.WriteString("\n")
 	}
 	if page.Dropped > 0 {
-		fmt.Fprintf(sb, "%d older events were dropped: this server keeps %d events or %d bytes per conversation.\n", page.Dropped,
-			maxEventsPerConversation, maxEventBytesPerConversation)
+		fmt.Fprintf(sb, "%d events of this conversation were dropped: this server keeps %d events or %d bytes per conversation, "+
+			"and %d bytes across all of them, dropping the oldest.\n", page.Dropped,
+			maxEventsPerConversation, maxEventBytesPerConversation, maxEventBytesTotal)
+		if page.DroppedNewest > since {
+			fmt.Fprintf(sb, "Some of the dropped events were newer than since %d: what is shown is not everything posted since then.\n", since)
+		}
 	}
 	if page.Rejected > 0 {
 		fmt.Fprintf(sb, "%d malformed frames were ignored.\n", page.Rejected)

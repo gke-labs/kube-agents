@@ -253,7 +253,50 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return t, c.listen(t, true, evicted)
+	if err := c.listen(t, true, evicted); err != nil {
+		// A name whose conversation is not listened to is not created, so
+		// that a retry with the same name is not refused as existing.
+		c.mu.Lock()
+		if e, ok := c.byAlias[alias]; ok && e.token == t {
+			delete(c.byAlias, alias)
+		}
+		c.mu.Unlock()
+		return "", err
+	}
+	return t, nil
+}
+
+// lookup is resolve for a reader: the token of a conversation the caller
+// names by token, or by a name the table already holds, and whether the
+// table holds it by a name. An unknown name is refused, not created.
+func (c *Conversations) lookup(alias, token string) (string, bool, error) {
+	if token == "" && strings.HasPrefix(alias, consoleConversationPrefix) {
+		alias, token = "", alias
+	}
+	if token != "" {
+		token = strings.TrimPrefix(token, consoleConversationPrefix)
+		if !lib.ValidSubjectToken(token) {
+			return "", false, fmt.Errorf("%q is not a conversation token", token)
+		}
+		return token, false, nil
+	}
+	if alias == "" {
+		alias = DefaultConversation
+	}
+	if err := checkAlias(alias); err != nil {
+		return "", false, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.byAlias[alias]; ok {
+		c.touchLocked(e)
+		return e.token, true, nil
+	}
+	if a, ok := c.aliasOfTokenLocked(alias); ok {
+		c.touchLocked(c.byAlias[a])
+		return alias, true, nil
+	}
+	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", cell(alias))
 }
 
 // Forget drops alias, and reports whether it was there. The conversation
@@ -435,12 +478,15 @@ type turnWatch struct {
 	conversation string
 	token        string
 	texts        []string
-	// since is the conversation's event cursor before the turn was sent:
-	// a card's report on this turn comes after it.
+	// since is the event cursor before the turn was sent: a card's report
+	// on this turn comes after it.
 	since       uint64
 	subs        chan *nats.Msg
 	notices     chan *nats.Msg
 	unsubscribe func()
+	// unpin releases the conversation's buffer, which the turn holds while
+	// it gathers from it.
+	unpin func()
 
 	// mu guards followed and known, which the follower goroutine fills
 	// from the conversation's submissions once the turn's task is known.
@@ -477,8 +523,13 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 	// Notices are read only until the turn's task appears, and a card's
 	// posts can come in bursts while the turn is followed (Events keeps
 	// those), so a notice that finds the channel full is dropped rather
-	// than left to back up into a slow consumer.
+	// than left to back up into a slow consumer. A frame that is not a
+	// notice (a card's report, a result) never takes a slot: a burst of
+	// them must not crowd out the turn's notice.
 	nsub, err := nc.Subscribe(fmt.Sprintf(consoleOutSubject, token), func(m *nats.Msg) {
+		if noticeText(m) == "" {
+			return
+		}
 		select {
 		case w.notices <- m:
 		default:
@@ -531,15 +582,20 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		return res, nil, err
 	}
 	// The conversation's reports are listened to before the turn goes,
-	// so none on it is missed, whether or not its name was resolved here.
-	if _, err := b.events.Watch(token, false); err != nil {
+	// so none on it is missed, whether or not its name was resolved here,
+	// and its buffer is held until the turn is done gathering, whatever
+	// drops the name meanwhile.
+	unpin, err := b.events.Pin(token)
+	if err != nil {
 		return res, nil, err
 	}
 	w, err := b.openTurn(token, texts, true)
 	if err != nil {
+		unpin()
 		return res, nil, err
 	}
-	w.since = b.events.Cursor(token)
+	w.unpin = unpin
+	w.since = b.events.Cursor()
 	if err := b.publishFrame(token, text); err != nil {
 		w.close()
 		return res, nil, err
@@ -652,6 +708,9 @@ func (w *turnWatch) close() {
 	case <-w.stop:
 	default:
 		close(w.stop)
+		if w.unpin != nil {
+			w.unpin()
+		}
 	}
 }
 
@@ -741,7 +800,7 @@ type TurnOutcome struct {
 	Answer     *lib.Task
 	// Reports are the cards' posts on the turn, in arrival order, an edit
 	// in its post's place; ReportsEnd says why gathering them stopped, and
-	// ReportCursor is the conversation's cursor then, for poll_events.
+	// ReportCursor is the event cursor then, for poll_events.
 	Reports      []EventFrame
 	ReportsEnd   reportsEnd
 	ReportCursor uint64

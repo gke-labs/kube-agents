@@ -57,18 +57,20 @@ The original client's `switch`, `debug_on`, `debug_off`, `transcript` and `clear
 
 ## Card reports and poll_events
 
-A turn that files a card gets the card's reports later, often minutes after the turn's own task ended: the gateway posts each one to the conversation as a `notify` frame on `chat.console.<token>.out`, naming the task whose turn filed the card. A delegation chain's terminal result is posted there too, as a `result` frame.
+A turn that files a card gets the card's reports later, often minutes after the turn's own task ended: the gateway posts each one to the conversation as a `notify` frame on `chat.console.<token>.out`, naming the task whose turn filed the card. A delegation chain's terminal result is posted there too, as a `result` frame; the server doesn't keep those, since the chain's tasks hold the result and `send_message` and `task_control` read it there.
 
-The server listens to every conversation it knows: every name in its table, and every token a caller has used in the last hour. It keeps each conversation's `notify` and `result` frames, at most 256 of them or 1 MiB, whichever comes first, dropping the oldest and counting what it dropped. An update to a report replaces it in place. Frames that aren't JSON are dropped, and a frame's text is cut at 16 KiB characters.
+The server listens to every conversation it knows: every name in its table, and every token a caller has used. A conversation no name holds keeps its listener for an hour after its last use or report; that's checked when a listener is added, so one can stay longer. A conversation whose name is deleted while nothing is kept for it stops being listened to at once, unless a turn on it is still gathering. Listeners are capped at 1024: past that the least recently active goes, one without a name first, but a named conversation's listener can go too. It's listened to again the next time it's used, and frames posted in between are lost.
+
+It keeps each conversation's `notify` frames, at most 256 of them or 1 MiB, whichever comes first, and 32 MiB across all conversations, dropping the oldest and counting what it dropped. An update to a report replaces it in place; a report's original that arrives after its update is dropped. Frames that aren't JSON are dropped, and a frame's text is cut at 16 KiB characters.
 
 What it keeps is live only. Lost:
 
-- frames posted before the server first heard of the conversation;
-- frames past the bound;
+- frames posted before the server first heard of the conversation, or while its listener was evicted;
+- frames past the bounds;
 - everything, across a restart of the server.
 
-`send_message` gathers the reports. Once the turn's task, and the tasks delegated from it, have ended, it keeps collecting the reports on any of those tasks until no new one has come for 15 seconds, or the wait ends, whichever is first. It returns them in the order they arrived, each labelled as a card's report and shown as quoted text, and says why it stopped. A card's report can take minutes, so for card work pass a longer `wait_seconds`, or read later reports with `poll_events`.
+`send_message` gathers the reports. Once the turn's task, and the tasks delegated from it, have ended, it keeps collecting the reports on any of those tasks until no new one has come for 15 seconds, or the wait ends, whichever is first. Only reports heard after the turn was sent count, so a report from an earlier turn on the same task isn't taken for this one. It returns them in the order they arrived, each labelled as a card's report and shown as quoted text, and says why it stopped: the tasks were still running, so these are only the reports that had arrived; or they ended and no new report came; or they ended and the wait ran out. A card's report can take minutes, so for card work pass a longer `wait_seconds`, or read later reports with `poll_events`.
 
-`poll_events` reads a conversation's kept frames: `conversation` or `conversation_token` as for `send_message`, `since` (a cursor; 0 for everything kept), and `wait_seconds` (up to 60) to wait for a frame newer than `since`. It returns the frames newer than `since` in cursor order, the new cursor, and how many were dropped. An updated report comes back under a new cursor. A conversation the server hadn't heard of is listened to from that call on.
+`poll_events` reads a conversation's kept frames: `conversation` or `conversation_token` as for `send_message`, `since` (a cursor; 0 for everything kept), and `wait_seconds` (up to 60) to wait for a frame newer than `since`. A name must be one the server knows; an unknown name is refused rather than created. A token the server hadn't heard of is listened to from that call on. It returns the frames newer than `since` in cursor order, the new cursor, how many were dropped, and whether any dropped frame was newer than `since`. An updated report comes back under a new cursor. One cursor counts across all conversations, so a cursor stays valid when a conversation's listener goes and comes back; a `since` past the server's cursor, as after a restart, reads from 0.
 
 The swarm view's pending events come from this buffer in a later change.

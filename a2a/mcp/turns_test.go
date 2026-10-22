@@ -117,6 +117,12 @@ type gatewayScenario struct {
 	// own goroutine, with the gateway's connection: a card's posts come
 	// from there (publishNotify).
 	after func(nc *nats.Conn, token string, turn int32)
+	// before, when set, runs on the gateway's goroutine before its notice
+	// about the turn.
+	before func(nc *nats.Conn, token string, turn int32)
+	// root, when set, names the turn's task and says whether it finishes:
+	// a turn given an earlier turn's task is the gateway steering it.
+	root func(turn int32) (id string, finish bool)
 }
 
 // sentFrame is one console frame as the fake gateway read it.
@@ -178,12 +184,18 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			return
 		}
 		i := n.Add(1)
+		if sc.before != nil {
+			sc.before(nc, token, i)
+		}
 		// An earlier task's terminal, posted to the conversation as the
 		// console relay does (kind "result"), is not a notice about this
 		// turn and must not be taken for one.
 		_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "r-task-earlier", Text: "an earlier answer", Kind: "result"}))
 		notice("Working on it…")
-		root := fmt.Sprintf("task-root%d", i)
+		root, finish := fmt.Sprintf("task-root%d", i), sc.finish
+		if sc.root != nil {
+			root, finish = sc.root(i)
+		}
 		text := f.Text
 		if rest, ok := strings.CutPrefix(text, "delegate "); ok {
 			text = rest
@@ -208,7 +220,7 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishSubmission(t, js, fakeAddressee, wake, conv, "child finished", child)
 			publishRun(t, js, fakeAddressee, wake, wakeAnswer, true)
 		default:
-			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
+			publishRun(t, js, fakeAddressee, root, answerText, finish)
 		}
 		if sc.after != nil {
 			go sc.after(nc, token, i)

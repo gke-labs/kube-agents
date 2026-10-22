@@ -19,16 +19,16 @@ import (
 
 // The frames a console conversation is posted that are not about the turn
 // being sent: a card's reports (kind "notify", a2a/gateway/notify.go), which
-// can come minutes after the turn that filed the card ended, and a
-// delegation chain's terminal result (kind "result"). The gateway publishes
-// them whether or not anyone listens, so this server listens to every
-// conversation it knows and keeps them, per conversation and bounded, for
-// send_message to gather and poll_events to read. Live only: a frame
-// published before the server heard of the conversation, or before a
-// restart, is lost.
+// can come minutes after the turn that filed the card ended. The gateway
+// publishes them whether or not anyone listens, so this server listens to
+// every conversation it knows and keeps them, per conversation and bounded,
+// for send_message to gather and poll_events to read. A delegation chain's
+// terminal result (kind "result") is posted there too, and not kept: the
+// chain's tasks hold it, and send_message and task_control read it there.
+// Live only: a frame published before the server heard of the conversation,
+// or before a restart, is lost.
 const (
 	frameKindNotify = "notify"
-	frameKindResult = "result"
 
 	// maxEventsPerConversation and maxEventBytesPerConversation bound one
 	// conversation's buffer; past either the oldest frames are dropped, and
@@ -52,6 +52,12 @@ const (
 	textShortened = "\n…(shortened)"
 )
 
+// maxEventBytesTotal bounds every conversation's buffers together: past it
+// the oldest frames across all of them, by cursor, are dropped, and counted
+// in their conversation's log. The per-conversation bounds alone would let
+// every listener fill its own. A variable so tests can make it small.
+var maxEventBytesTotal = 32 << 20
+
 // coreSubscriber is what Events subscribes through: lib.Client's core
 // subscriptions, which survive a connection rebuild and run their handler on
 // their own goroutine, so a listener is always drained.
@@ -59,8 +65,7 @@ type coreSubscriber interface {
 	SubscribeCore(subject string, handler nats.MsgHandler) (lib.Subscription, error)
 }
 
-// EventFrame is one buffered frame, under the conversation's cursor when it
-// was last written.
+// EventFrame is one buffered frame, under the cursor it was last written at.
 type EventFrame struct {
 	ConsoleOutFrame
 	Cursor uint64
@@ -72,18 +77,27 @@ type EventFrame struct {
 // EventPage is a conversation's buffered frames newer than a cursor.
 type EventPage struct {
 	Frames []EventFrame
-	// Cursor is the conversation's latest cursor; reading since it returns
-	// only what comes after.
-	Cursor   uint64
-	Dropped  uint64
-	Rejected uint64
+	// Cursor is the latest cursor across every conversation; reading since
+	// it returns only what comes after.
+	Cursor uint64
+	// Dropped counts the conversation's frames dropped for a bound, and
+	// DroppedNewest is the newest cursor among them: a reader whose since
+	// is below it missed one.
+	Dropped       uint64
+	DroppedNewest uint64
+	Rejected      uint64
 }
 
-// Events holds every known conversation's listener and buffer.
+// Events holds every known conversation's listener and buffer. Its cursor is
+// one count across all of them, so a cursor read on a conversation stays
+// meaningful when that conversation's listener goes and comes back.
 type Events struct {
 	client coreSubscriber
 	mu     sync.Mutex
 	logs   map[string]*eventLog
+	cursor uint64
+	// bytes is what every log's frames hold together.
+	bytes int
 	// now is the clock retention is measured by; tests set it.
 	now func() time.Time
 }
@@ -98,12 +112,15 @@ type eventLog struct {
 	err   error
 	// named is a conversation the alias table holds, which keeps its
 	// listener whatever its age.
-	named    bool
-	frames   []EventFrame
-	bytes    int
-	cursor   uint64
-	dropped  uint64
-	rejected uint64
+	named bool
+	// pins counts the turns gathering from this log; a pinned log is never
+	// swept, unnamed away or evicted.
+	pins          int
+	frames        []EventFrame
+	bytes         int
+	dropped       uint64
+	droppedNewest uint64
+	rejected      uint64
 	// active is the last use or the last frame, which retention counts from.
 	active time.Time
 	// changed is closed, and replaced, on every frame kept.
@@ -120,22 +137,45 @@ func NewEvents(client coreSubscriber) *Events {
 // server was already listening. Once it returns, every frame published after
 // is heard.
 func (e *Events) Watch(token string, named bool) (bool, error) {
+	heard, _, err := e.watch(token, named, false)
+	return heard, err
+}
+
+// Pin is Watch for a turn that gathers from the conversation: until unpin is
+// called, its listener and buffer stay, whatever drops its name or fills the
+// set of listeners.
+func (e *Events) Pin(token string) (unpin func(), err error) {
+	_, unpin, err = e.watch(token, false, true)
+	return unpin, err
+}
+
+func (e *Events) watch(token string, named, pin bool) (bool, func(), error) {
 	if e == nil {
-		return false, nil
+		return false, func() {}, nil
 	}
 	if !lib.ValidSubjectToken(token) {
-		return false, fmt.Errorf("%q is not a conversation token", token)
+		return false, nil, fmt.Errorf("%q is not a conversation token", token)
 	}
 	e.mu.Lock()
 	if l, ok := e.logs[token]; ok {
 		l.named = l.named || named
 		l.active = e.now()
+		unpin := e.pinLocked(l, pin)
 		e.mu.Unlock()
 		<-l.ready
-		return true, l.err
+		if l.err != nil {
+			unpin()
+		}
+		return true, unpin, l.err
 	}
-	stale := e.sweepLocked()
+	stale, err := e.sweepLocked()
+	if err != nil {
+		e.mu.Unlock()
+		stopAll(stale)
+		return false, nil, err
+	}
 	l := &eventLog{token: token, ready: make(chan struct{}), named: named, active: e.now(), changed: make(chan struct{})}
+	unpin := e.pinLocked(l, pin)
 	e.logs[token] = l
 	e.mu.Unlock()
 	stopAll(stale)
@@ -149,22 +189,46 @@ func (e *Events) Watch(token string, named bool) (bool, error) {
 	case err != nil:
 		l.err = err
 		if current {
-			delete(e.logs, token)
+			e.removeLocked(l)
 		}
-	case current:
+	case !current:
+		// Dropped while it subscribed: its frames would go nowhere.
+		l.err = fmt.Errorf("the listener for conversation %s was dropped while it subscribed; try again", token)
+	default:
 		l.sub = sub
 	}
+	err = l.err
 	close(l.ready)
 	e.mu.Unlock()
-	if err == nil && !current {
-		// Dropped while it subscribed.
+	if sub != nil && !current {
 		sub.Stop()
 	}
-	return false, err
+	if err != nil {
+		return false, nil, err
+	}
+	return false, unpin, nil
+}
+
+// pinLocked pins l when pin is set, and returns what unpins it, once.
+func (e *Events) pinLocked(l *eventLog, pin bool) func() {
+	if !pin {
+		return func() {}
+	}
+	l.pins++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.mu.Lock()
+			l.pins--
+			l.active = e.now()
+			e.mu.Unlock()
+		})
+	}
 }
 
 // Unname records that the alias table no longer holds the conversation. Its
-// listener goes now if nothing is buffered, else once retention passes.
+// listener goes now if nothing is buffered and no turn is gathering from it,
+// else once retention passes.
 func (e *Events) Unname(token string) {
 	if e == nil || token == "" {
 		return
@@ -175,7 +239,7 @@ func (e *Events) Unname(token string) {
 	if ok {
 		l.named = false
 		l.active = e.now()
-		if len(l.frames) == 0 {
+		if len(l.frames) == 0 && l.pins == 0 {
 			stale = e.removeLocked(l)
 		}
 	}
@@ -185,31 +249,40 @@ func (e *Events) Unname(token string) {
 
 // sweepLocked drops the listeners retention has passed, then, while the set
 // is full, the least recently active, one no name holds first, so that one
-// more fits. It returns the subscriptions to stop once the lock is released.
-func (e *Events) sweepLocked() []lib.Subscription {
+// more fits. A pinned listener is never dropped; a full set of them is an
+// error. It returns the subscriptions to stop once the lock is released.
+func (e *Events) sweepLocked() ([]lib.Subscription, error) {
 	var stale []lib.Subscription
 	now := e.now()
 	for _, l := range e.logs {
-		if !l.named && now.Sub(l.active) > eventRetention {
+		if !l.named && l.pins == 0 && now.Sub(l.active) > eventRetention {
 			stale = append(stale, e.removeLocked(l)...)
 		}
 	}
 	for len(e.logs) >= maxEventConversations {
 		var oldest *eventLog
 		for _, l := range e.logs {
+			if l.pins > 0 {
+				continue
+			}
 			if oldest == nil || (oldest.named && !l.named) ||
 				(oldest.named == l.named && l.active.Before(oldest.active)) {
 				oldest = l
 			}
 		}
+		if oldest == nil {
+			return stale, fmt.Errorf("all %d conversation listeners are in use by running turns; try again when one ends", len(e.logs))
+		}
 		stale = append(stale, e.removeLocked(oldest)...)
 	}
-	return stale
+	return stale, nil
 }
 
-// removeLocked drops l. A listener still subscribing is stopped by Watch.
+// removeLocked drops l and its frames. A listener still subscribing is
+// stopped by Watch.
 func (e *Events) removeLocked(l *eventLog) []lib.Subscription {
 	delete(e.logs, l.token)
+	e.bytes -= l.bytes
 	if l.sub == nil {
 		return nil
 	}
@@ -224,7 +297,7 @@ func stopAll(subs []lib.Subscription) {
 	}
 }
 
-// receive keeps one frame heard for l, if it is a report or a result.
+// receive keeps one frame heard for l, if it is a report.
 func (e *Events) receive(l *eventLog, data []byte) {
 	f, keep, valid := parseEventFrame(data)
 	e.mu.Lock()
@@ -236,21 +309,21 @@ func (e *Events) receive(l *eventLog, data []byte) {
 	case !valid:
 		l.rejected++
 	case keep:
-		l.add(f)
+		e.addLocked(l, f)
 		l.active = e.now()
 	}
 }
 
-// parseEventFrame reads a frame off .out. keep is a report or a result,
-// shaped to be kept: text capped and valid UTF-8, ids that are not a task
-// id's shape unset. valid is false for a frame no gateway sends: not JSON,
-// or a report or result without a usable message id. A notice about a turn
-// is valid and not kept; the turn reads its own.
+// parseEventFrame reads a frame off .out. keep is a report, shaped to be
+// kept: text capped and valid UTF-8, ids that are not a task id's shape
+// unset. valid is false for a frame no gateway sends: not JSON, or a report
+// without a usable message id. A notice about a turn, or a chain's result,
+// is valid and not kept.
 func parseEventFrame(data []byte) (f ConsoleOutFrame, keep, valid bool) {
 	if json.Unmarshal(data, &f) != nil {
 		return f, false, false
 	}
-	if f.Kind != frameKindNotify && f.Kind != frameKindResult {
+	if f.Kind != frameKindNotify {
 		return f, false, true
 	}
 	if f.MessageID == "" || len(f.MessageID) > maxEventIDBytes || !utf8.ValidString(f.MessageID) {
@@ -279,20 +352,52 @@ func frameSize(f ConsoleOutFrame) int {
 	return len(f.MessageID) + len(f.Text) + len(f.Kind) + len(f.State) + len(f.Addressee) + len(f.TaskID) + len(f.ReplyTo)
 }
 
-// add buffers f under a new cursor: an edit replaces the frame with its
-// message id in place, anything else appends. Then the oldest frames go
-// until the buffer is within its bounds, never the one just written.
-func (l *eventLog) add(f ConsoleOutFrame) {
-	l.cursor++
-	at := -1
-	if f.Edit {
-		at = slices.IndexFunc(l.frames, func(b EventFrame) bool { return b.MessageID == f.MessageID })
+// addLocked buffers f in l under the next cursor, then holds every buffer
+// within the total bound by dropping the oldest frames across all of them,
+// never the one just written. Pinned logs are not spared: the total bound is
+// the server's memory.
+func (e *Events) addLocked(l *eventLog, f ConsoleOutFrame) {
+	before := l.bytes
+	if !l.add(f, e.cursor+1) {
+		return
+	}
+	e.cursor++
+	e.bytes += l.bytes - before
+	for e.bytes > maxEventBytesTotal {
+		var from *eventLog
+		at := -1
+		for _, o := range e.logs {
+			for i, b := range o.frames {
+				if b.Cursor != e.cursor && (from == nil || b.Cursor < from.frames[at].Cursor) {
+					from, at = o, i
+				}
+			}
+		}
+		if from == nil {
+			return
+		}
+		e.bytes -= from.drop(at)
+	}
+}
+
+// add buffers f under cursor: an edit replaces the frame with its message id
+// in place, anything else appends. A frame that is not an edit, for a message
+// an edit already wrote, is older than what is kept and is not. Then the
+// oldest frames go until the buffer is within its bounds, never the one just
+// written. It reports whether f was kept.
+func (l *eventLog) add(f ConsoleOutFrame, cursor uint64) bool {
+	at := slices.IndexFunc(l.frames, func(b EventFrame) bool { return b.MessageID == f.MessageID })
+	if !f.Edit && at >= 0 && l.frames[at].Edited {
+		return false
+	}
+	if !f.Edit {
+		at = -1
 	}
 	if at >= 0 {
 		l.bytes += frameSize(f) - frameSize(l.frames[at].ConsoleOutFrame)
-		l.frames[at] = EventFrame{ConsoleOutFrame: f, Cursor: l.cursor, Edited: true}
+		l.frames[at] = EventFrame{ConsoleOutFrame: f, Cursor: cursor, Edited: true}
 	} else {
-		l.frames = append(l.frames, EventFrame{ConsoleOutFrame: f, Cursor: l.cursor, Edited: f.Edit})
+		l.frames = append(l.frames, EventFrame{ConsoleOutFrame: f, Cursor: cursor, Edited: f.Edit})
 		l.bytes += frameSize(f)
 		at = len(l.frames) - 1
 	}
@@ -304,20 +409,30 @@ func (l *eventLog) add(f ConsoleOutFrame) {
 		if i >= len(l.frames) {
 			break
 		}
-		l.bytes -= frameSize(l.frames[i].ConsoleOutFrame)
-		l.frames = slices.Delete(l.frames, i, i+1)
+		l.drop(i)
 		if i < at {
 			at--
 		}
-		l.dropped++
 	}
 	close(l.changed)
 	l.changed = make(chan struct{})
+	return true
 }
 
-// snapshot is the conversation's buffer in arrival order, its cursor and
-// counters, and a channel closed on its next frame. A conversation not
-// listened to has none of these and a nil channel.
+// drop removes frame i for a bound, counts it, and returns its size.
+func (l *eventLog) drop(i int) int {
+	f := l.frames[i]
+	n := frameSize(f.ConsoleOutFrame)
+	l.bytes -= n
+	l.frames = slices.Delete(l.frames, i, i+1)
+	l.dropped++
+	l.droppedNewest = max(l.droppedNewest, f.Cursor)
+	return n
+}
+
+// snapshot is the conversation's buffer in arrival order, the latest cursor,
+// the conversation's counters, and a channel closed on its next frame. A
+// conversation not listened to has no frames or counters, and a nil channel.
 func (e *Events) snapshot(token string) (EventPage, <-chan struct{}) {
 	if e == nil {
 		return EventPage{}, nil
@@ -326,15 +441,21 @@ func (e *Events) snapshot(token string) (EventPage, <-chan struct{}) {
 	defer e.mu.Unlock()
 	l, ok := e.logs[token]
 	if !ok {
-		return EventPage{}, nil
+		return EventPage{Cursor: e.cursor}, nil
 	}
-	return EventPage{Frames: slices.Clone(l.frames), Cursor: l.cursor, Dropped: l.dropped, Rejected: l.rejected}, l.changed
+	return EventPage{Frames: slices.Clone(l.frames), Cursor: e.cursor, Dropped: l.dropped, DroppedNewest: l.droppedNewest,
+		Rejected: l.rejected}, l.changed
 }
 
-// Cursor is the conversation's latest cursor: 0 before its first frame.
-func (e *Events) Cursor(token string) uint64 {
-	p, _ := e.snapshot(token)
-	return p.Cursor
+// Cursor is the latest cursor across every conversation: 0 before the first
+// frame this server kept.
+func (e *Events) Cursor() uint64 {
+	if e == nil {
+		return 0
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cursor
 }
 
 // Since returns the conversation's frames newer than since, in cursor order,
