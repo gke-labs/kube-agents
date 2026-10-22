@@ -14,10 +14,12 @@ import threading
 import sqlite3
 import subprocess
 import tempfile
+import socket
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -773,6 +775,43 @@ DRIFT_BACKLOG_LEASE_MARGIN_SECONDS = 30
 DRIFT_BACKLOG_LEASE_NAME = "digest"
 # Principals and objects the digest names before it counts the rest.
 DRIFT_BACKLOG_MAX_PRINCIPALS = 8
+# On an install with no chat route the digest is one card on the task board,
+# filed through the Hermes CLI with no assignee and status blocked: no agent
+# turn files it or reads it, so a principal-chosen name in its body is never a
+# prompt, and it stays in view until a person acts on it. The CLI rather than
+# hermes_cli.kanban.run_slash: it returns an exit code, takes a timeout, and is
+# safe to call from this threaded server.
+DRIFT_BACKLOG_CARD_TITLE = "Drift backlog: {count} {noun} reached drift detection late"
+DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
+DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
+DRIFT_BACKLOG_CARD_STATUS = "blocked"
+# The CLI timeout is the send timeout, so the lease (sized from it) outlives
+# the call; a timeout means no card, and the rows stay pending for the retry.
+DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS = DRIFT_BACKLOG_SEND_TIMEOUT_SECONDS
+# Below the CLI timeout, so a busy board answers (with an error) inside it
+# instead of Hermes' two-minute default lock wait outliving the call.
+DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS = "30000"
+# Rows the card lists one by one before it counts the rest.
+DRIFT_BACKLOG_CARD_MAX_ROWS = 100
+# A name the card shows as is. Names come from the cluster and the audit log,
+# so one that fails this (a space, a quote, a backtick) is shown as a placeholder.
+_DRIFT_BACKLOG_NAME_RE = re.compile(r"^[A-Za-z0-9._:@+-]{1,200}$")
+DRIFT_BACKLOG_NAME_PLACEHOLDER = "<name of {length} characters, not shown>"
+# How the card tells a reader to get the full list.
+DRIFT_BACKLOG_FEED_COMMAND = (
+    "kubectl -n kubeagents-system exec deployment/platform-agent-gateway -c platform-agent -- "
+    "sh -c 'curl -s -H \"Authorization: Bearer $SESSION_KV_API_KEY\" "
+    "\"http://127.0.0.1:8699/v1/intercepted-events?limit=200\"'"
+)
+# The gateway API the triage turns are created on, when PLATFORM_API_URL does
+# not say otherwise.
+DEFAULT_PLATFORM_API_URL = "http://127.0.0.1:8642"
+# A late row of a principal with few of them gets its own card through a
+# gateway turn. At a cold start the gateway is not up yet and that turn stops
+# with no retry, so on an install with no chat route, where nothing else names
+# the change, the daemon checks the gateway first and digests such rows when it
+# is down. One connect with a short timeout, so it adds no wait when it is up.
+DRIFT_BACKLOG_GATEWAY_PROBE_TIMEOUT_SECONDS = 3.0
 DRIFT_BACKLOG_MAX_OBJECTS = 5
 DRIFT_BACKLOG_EMOJI = "🗂️"
 # How many times the digest tries to mark its rows after a post, and the pause
@@ -4403,6 +4442,108 @@ def _drift_backlog_digest_text(rows: Sequence[Dict[str, Any]]) -> str:
     )
 
 
+def _gateway_is_up() -> bool:
+    """Whether the gateway API accepts connections, by one TCP connect."""
+    parts = urllib.parse.urlsplit(os.environ.get("PLATFORM_API_URL", DEFAULT_PLATFORM_API_URL))
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=DRIFT_BACKLOG_GATEWAY_PROBE_TIMEOUT_SECONDS):
+            return True
+    except OSError:
+        return False
+
+
+def _drift_backlog_card_name(value: Any) -> str:
+    """A name for the card body: shown when it matches the allowlist, else a placeholder."""
+    text = str(value or "")
+    if not text:
+        return DRIFT_UNKNOWN_FIELD
+    if _DRIFT_BACKLOG_NAME_RE.fullmatch(text):
+        return text
+    return DRIFT_BACKLOG_NAME_PLACEHOLDER.format(length=len(text))
+
+
+def _drift_backlog_card_body(rows: Sequence[Dict[str, Any]]) -> str:
+    """The card's body: the digest's count by principal, then every row up to a cap."""
+    by_principal: Dict[str, int] = {}
+    for row in rows:
+        principal = _drift_backlog_card_name(row["principal"])
+        by_principal[principal] = by_principal.get(principal, 0) + 1
+    ranked = sorted(by_principal.items(), key=lambda item: (-item[1], item[0]))
+    lines = [
+        f"{len(rows)} {'change' if len(rows) == 1 else 'changes'} reached drift detection late (they queued "
+        f"before it started pulling, or waited over {DRIFT_BACKLOG_MAX_WAIT_TEXT}). This install has no chat "
+        "route, so this card is the digest. No agent acts on it: a person reads it and archives it.",
+        "",
+        "By principal: " + ", ".join(f"{p} ({n})" for p, n in ranked),
+        "",
+        "Changes:",
+    ]
+    for row in rows[:DRIFT_BACKLOG_CARD_MAX_ROWS]:
+        obj = "/".join(_drift_backlog_card_name(part) for part in (row["namespace"], row["object_kind"], row["workload"]) if part)
+        lines.append(
+            f"- {_drift_backlog_card_name(row['principal'])} changed {obj} on "
+            f"{_drift_backlog_card_name(row['cluster'])} (recorded {row['created_at']} UTC)"
+        )
+    if len(rows) > DRIFT_BACKLOG_CARD_MAX_ROWS:
+        lines.append(f"- and {len(rows) - DRIFT_BACKLOG_CARD_MAX_ROWS} more")
+    lines += ["", f"Full list (the `{FEED_STATUS_BACKLOG}` rows): {DRIFT_BACKLOG_FEED_COMMAND}"]
+    return "\n".join(lines)
+
+
+def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
+    """File the digest as one unassigned, blocked card and return its id, or "" when no card exists.
+
+    The idempotency key names the rows, so a retry over the same rows gets the
+    card that exists back rather than a second one.
+    """
+    noun = "change" if len(rows) == 1 else "changes"
+    cmd = [
+        chat_notify.HERMES_CLI, "kanban", "create",
+        DRIFT_BACKLOG_CARD_TITLE.format(count=len(rows), noun=noun),
+        "--body", _drift_backlog_card_body(rows),
+        "--initial-status", DRIFT_BACKLOG_CARD_STATUS,
+        "--idempotency-key", f"{DRIFT_BACKLOG_CARD_KEY_PREFIX}{rows[0]['id']}-{rows[-1]['id']}",
+        "--created-by", DRIFT_BACKLOG_CARD_CREATED_BY,
+        "--json",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env=_run_env({"HERMES_KANBAN_BUSY_TIMEOUT_MS": DRIFT_BACKLOG_CARD_BUSY_TIMEOUT_MS}),
+            timeout=DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        logger.error(f"Drift backlog card: `hermes kanban create` did not answer in {DRIFT_BACKLOG_CARD_TIMEOUT_SECONDS}s")
+        return ""
+    except Exception as exc:
+        logger.error(f"Drift backlog card: could not run `hermes kanban create`: {exc}")
+        return ""
+    if proc.returncode != 0:
+        logger.error(
+            f"Drift backlog card: `hermes kanban create` exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[:LEDGER_MESSAGE_MAX_CHARS]}"
+        )
+        return ""
+    # The board's own stderr can share the buffer, so find the JSON object
+    # rather than parsing the whole string as one.
+    out = proc.stdout or ""
+    start, end = out.find("{"), out.rfind("}")
+    task_id = ""
+    if start != -1 and end > start:
+        try:
+            task_id = str((json.loads(out[start:end + 1]) or {}).get("id") or "")
+        except ValueError:
+            task_id = ""
+    if not task_id:
+        logger.error(f"Drift backlog card: no task id in the board's answer: {out.strip()[:LEDGER_MESSAGE_MAX_CHARS]}")
+    return task_id
+
+
 def _refund_alert_quota(severity: str) -> None:
     """Give back one of today's alerts for `severity`, claimed for a post that
     never happened. Best-effort: a failed refund costs one unit of the day's
@@ -4532,8 +4673,8 @@ def _post_drift_backlog_digest() -> bool:
     """Claim the pending rows, post one digest for them, and mark them.
 
     Returns False when the post failed or another holder has the lease, so the
-    worker waits DRIFT_BACKLOG_RETRY_SECONDS. A headless install marks the rows
-    with no post, as the alert path does for its own rows.
+    worker waits DRIFT_BACKLOG_RETRY_SECONDS. An install with no chat route
+    files the digest as one board card instead (_file_drift_backlog_card).
     """
     global _drift_backlog_unfinished
     if _drift_backlog_unfinished is not None:
@@ -4555,12 +4696,20 @@ def _post_drift_backlog_digest() -> bool:
     max_id = rows[-1]["id"] if rows else None
     outcome: Optional[int] = None
     try:
-        rows = _card_drift_backlog_minorities(rows)
+        if headless and not _gateway_is_up():
+            logger.warning("Drift backlog: the gateway is not up, so every late record goes into the digest card")
+            rows = list(rows)
+        else:
+            rows = _card_drift_backlog_minorities(rows)
         if not rows:
             return True
         if headless:
+            task_id = _file_drift_backlog_card(rows)
+            if not task_id:
+                logger.error(f"Drift backlog card for {len(rows)} record(s) was not filed; retrying in {DRIFT_BACKLOG_RETRY_SECONDS}s")
+                return False
             outcome = DRIFT_BACKLOG_HEADLESS
-            logger.info(f"Drift backlog: {len(rows)} record(s) recorded with no digest posted (no chat platform enabled)")
+            logger.info(f"Drift backlog card {task_id} filed for {len(rows)} record(s) (no chat route)")
             return True
         message = _drift_backlog_digest_text(rows)
         active = get_active_platform(platforms)
