@@ -2213,9 +2213,12 @@ class Advice(unittest.TestCase):
         self.assertEqual(first["issue"], posted["issue"])
         self.assertEqual(first["tracking_issues"], ["#1300"])
         self.assertEqual(first["advice"], "Don't retest yet; the failing cases share a cause. Tracking: #1300")
-        # Carried from the previous health.json when the poster's state has none.
+        # Carried from the previous health.json while no poster state carries `issues`...
         second = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE"})
         self.assertEqual(second["issue"], posted["issue"])
+        # ...and not once one does: the poster dropped it (a human closed it).
+        dropped = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE", "issue": None, "issues": []})
+        self.assertEqual((dropped["issue"], dropped["tracking_issues"]), (None, []))
         # Gone on GREEN, and never a non-issue.
         self.assertIsNone(health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED), posted=posted)["issue"])
         self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": None})["issue"])

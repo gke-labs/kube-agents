@@ -2484,7 +2484,12 @@ def adjudicate(
         # The poster keeps the current condition's issue in `issue` and
         # every issue of the episode in `issues`; the one for the decided
         # condition is cited, wherever it sits.
-        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or []), (prev or {}).get("issue")]
+        # The previous health.json stands in only while no poster state
+        # carries `issues`: once one does it is the authority, and an issue
+        # it dropped (closed by a human) must not come back through here.
+        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or [])]
+        if not isinstance(posted, dict) or "issues" not in posted:
+            candidates.append((prev or {}).get("issue"))
         issue = next((match for match in (issue_for(candidate, decided["condition"]) for candidate in candidates) if match), None)
     evidence = list(assessed["evidence"])
     if decided["recovering"]:

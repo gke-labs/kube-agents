@@ -131,8 +131,9 @@ RECOVERY_RUNS = 3
 # "smoke": a feature request about the smoke gate's deadline (#2873) was
 # adopted as the tracker of the kills.
 DEADLINE_KILL_NAMES = ("deadline", "kill")
-# How a name is found in a title or body: not preceded by a letter or digit.
-NAME_START_RE = r"(?<![a-z0-9]){name}"
+# How a name is found in a title or body: not preceded by a letter, digit or
+# underscore ("kill" is not in "skill" nor in "deadline_kill").
+NAME_START_RE = r"(?<![a-z0-9_]){name}"
 # The other direction: the deadline body quotes only the deadline evidence
 # lines. health.py's evidence also carries per-case collapse lines whenever a
 # case clears the shared-break floors, and a body naming those cases would
@@ -565,6 +566,9 @@ class Tracker:
         # One tick's reads: the open-issue list and each carried issue, once.
         self._open_issues: list | None = None
         self._lookups: dict[int, dict | None] = {}
+        # Issue numbers the episode already carries: never adopted a second
+        # time for another condition (ensure's `skip`).
+        self._skip: set[int] = set()
 
     def open_issues(self) -> list:
         if self._open_issues is None:
@@ -630,7 +634,7 @@ class Tracker:
         tracker lists the whole roster), so a body match counts only on a
         `presubmit-gate` issue and a title match on any."""
         for issue in self.open_issues():
-            if NEVER_ADOPT_LABELS & label_names(issue):
+            if issue.get("number") in self._skip or NEVER_ADOPT_LABELS & label_names(issue):
                 continue
             title, body = issue.get("title", ""), issue.get("body") or ""
             if marker is not None:
@@ -653,12 +657,16 @@ class Tracker:
             self.gh.call("POST", self.gh.path(LABELS_PATH.format(number=payload["number"])), {"labels": [LABEL]})
         return as_issue(payload)
 
-    def ensure(self, health: dict, now, since_text: str, brief_link: str, window_text: str | None = None) -> dict | None:
+    def ensure(self, health: dict, now, since_text: str, brief_link: str, window_text: str | None = None, skip=()) -> dict | None:
         """The issue to cite: a human's if one names these cases (or, for
         lost pods, these nodes; for deadline kills, the two title words),
         else a new one. `since_text` is the incident's start on the reader's
         clock; `window_text` the span of the losses or kills, for those two
-        bodies."""
+        bodies. `skip` is the numbers the episode already carries: the bot's
+        own fixture or node issue quotes the evidence, case lines included,
+        and must not become the break's tracker as well, or its close under
+        the live break takes the break's citation with it."""
+        self._skip = {int(number) for number in skip}
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
             return self._ensure_lost_pods(health, since_text, window_text or since_text, brief_link)
@@ -763,14 +771,18 @@ class Tracker:
         return self._settle(issue, (CLEARED_CLOSE_COMMENT if close else CLEARED_COMMENT).format(what=what, when=when_text), close)
 
     def _settle(self, issue: dict, comment: str, close: bool) -> bool:
-        """True when the comment went through; the close is best-effort after
-        it, so a failed close leaves an open issue that says it is over
-        rather than a second comment next tick."""
+        """True when every write landed. A close that failed after its
+        comment is retried next tick, comment included: a second comment on
+        a rare failure costs less than a bot issue left open saying
+        "closing"."""
         number = (issue or {}).get("number")
         if not number:
             return False
         response = self.gh.call("POST", self.gh.path(COMMENTS_PATH.format(number=number)), {"body": comment})
+        if not close:
+            return response is not None
         # A dry run prints both writes; a real one closes only after the comment landed.
-        if close and (response is not None or self.gh.dry_run):
-            self.gh.call("PATCH", self.gh.path(ISSUE_PATH.format(number=number)), dict(CLOSE_PAYLOAD))
-        return response is not None
+        if response is None and not self.gh.dry_run:
+            return False
+        closed = self.gh.call("PATCH", self.gh.path(ISSUE_PATH.format(number=number)), dict(CLOSE_PAYLOAD))
+        return response is not None and closed is not None

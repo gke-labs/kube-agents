@@ -1755,11 +1755,12 @@ def run(
     if tracker is not None and wants_issue:
         incident = health.get("incident") or {}
         since = parse_iso(health.get("since"))
+        skip = {each["number"] for each in carried}
         if condition in (CONDITION_LOST_PODS, CONDITION_DEADLINE_KILL):
             start, end = parse_iso(incident.get("first_kill") or incident.get("window_start")), parse_iso(incident.get("window_end"))
-            issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True))
+            issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True), skip=skip)
         else:
-            issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))
+            issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health), skip=skip)
         if issue and issue not in carried:
             carried.append(issue)
     messages = [(kind, render(kind, health, prev, now, issue, data)) for kind in kinds]
