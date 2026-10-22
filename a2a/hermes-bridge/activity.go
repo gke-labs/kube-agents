@@ -9,8 +9,8 @@ package hermesbridge
 // `hooks.outbound` config entry POSTs every pre_tool_call, post_tool_call and
 // post_api_request to a URL, fire-and-forget through a bounded queue, signed
 // with HMAC-SHA256 when the variable named by `secret_env` is set. The tool
-// calls become the activity trace; each model request becomes the plan steps
-// it stands for (activity_steps.go). The bridge listens on a
+// calls become the activity trace and its plan steps; a model request marks
+// where one request ends, and may be the synthesis step (activity_steps.go). The bridge listens on a
 // loopback address (the sidecar shares the pod's network namespace), and
 // hands each child the entry through hermes's managed scope: a per-task
 // directory holding the operator's managed config.yaml and .env with a
@@ -392,8 +392,8 @@ type hookDelivery struct {
 		ErrorType  string      `json:"error_type"`
 		// A post_api_request's: how the request ended, its ordinal in the
 		// turn, and hermes's sanitized response, of which the door reads
-		// the planned calls' names and ids and nothing else
-		// (plannedSteps).
+		// the finish reason and whether any call was planned, and nothing
+		// else (synthesisLocked).
 		FinishReason string          `json:"finish_reason"`
 		APICallCount json.Number     `json:"api_call_count"`
 		Response     json.RawMessage `json:"response"`
@@ -500,11 +500,16 @@ type activityState struct {
 	startedAt  time.Time
 	appended   map[string]bool // artifact name -> a first part went out
 
-	// pendingSteps are the plan steps the last post_api_request stood for,
-	// taken and published by the delivering request (publishPendingSteps);
-	// steps counts the ones published, against activityStepBudget.
-	pendingSteps []stepmsg.Step
-	steps        int
+	// openStep is the plan step the current run of one tool's calls is
+	// building, published when it closes (activity_steps.go); turnSession
+	// is the turn's own hermes session, which a synthesis step must come
+	// from; steps counts the steps published, against activityStepBudget.
+	openStep    *stepmsg.Step
+	turnSession string
+	steps       int
+	// stepRefused says a step record was refused at encoding and the log
+	// has said so; one line per task (publishSteps).
+	stepRefused atomic.Bool
 
 	// The heartbeat goroutine's lifecycle. Entries are not queued: the door
 	// publishes each one on the delivering request, under run.mu, so no
@@ -568,6 +573,7 @@ func (b *Bridge) apiTraced() bool {
 func newSessionActivityState(sessionID string, traced bool) *activityState {
 	a := newActivityState(false)
 	a.sessionID = sessionID
+	a.turnSession = sessionID
 	a.traced = traced
 	return a
 }
@@ -611,7 +617,7 @@ func hookSigned(key, sig string, body []byte) bool {
 // observe records one delivery. A start opens a call; an end closes it and
 // yields the entry to publish. Ends are the entries (one per invocation, the
 // spec's rule); starts exist so an interrupted call can still be reported.
-func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
+func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.Step) {
 	id := d.Extra.ToolCallID
 	if id == "" {
 		// Inline executors carry no call id; the tool name pairs start to
@@ -623,7 +629,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 	defer a.mu.Unlock()
 	if d.DeliveryID != "" {
 		if _, dup := a.seen[d.DeliveryID]; dup {
-			return ActivityEntry{}, false
+			return ActivityEntry{}, false, nil
 		}
 		// The most recent activitySeenCap ids: a retry follows its first
 		// delivery closely, so the oldest id is the one safe to forget.
@@ -636,12 +642,8 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		}
 		a.seen[d.DeliveryID] = struct{}{}
 	}
+	steps := a.observeStepsLocked(d)
 	switch d.Event {
-	case hookPostAPIRequest:
-		// A model request is not a call: no tool name to remember and
-		// nothing to open or close, only the steps it planned.
-		a.pendingSteps = append(a.pendingSteps, plannedSteps(d, a.calls)...)
-		return ActivityEntry{}, false
 	case hookPreToolCall:
 		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; !seen {
@@ -653,7 +655,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			At:     capRunes(d.Timestamp, activityWordCap),
 		}
-		return ActivityEntry{}, false
+		return ActivityEntry{}, false, steps
 	case hookPostToolCall:
 		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; seen {
@@ -676,9 +678,9 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool) {
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
-		return e, true
+		return e, true, steps
 	}
-	return ActivityEntry{}, false
+	return ActivityEntry{}, false, steps
 }
 
 // interrupted returns the calls still open, in start order, as entries, and
@@ -1286,8 +1288,8 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
 	run.mu.Lock()
-	entry, ok := act.observe(d)
-	b.publishPendingSteps(run, act)
+	entry, ok, steps := act.observe(d)
+	b.publishSteps(run, act, steps)
 	if ok {
 		if run.state == stateRunning {
 			if act.underBudget() {
@@ -1376,6 +1378,9 @@ func (b *Bridge) drainActivity(run *taskRun) {
 		return
 	}
 	a.signalStop()
+	// The step the last calls were building closes with the turn, ahead of
+	// the interrupted calls it may hold.
+	b.publishSteps(run, a, a.closeStep())
 	deadline := time.Now().Add(activityDrainBudget)
 	open := a.interrupted()
 	for i, e := range open {

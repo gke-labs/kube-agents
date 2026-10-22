@@ -677,7 +677,7 @@ read, the render in [Where it runs](#where-it-runs), the two env names it writes
 sidecar and the `api` executor's hook entry are the operator code the bridge has, and they
 retire with the bridge.
 
-## Activity: the persona's tool calls, and a heartbeat
+## Activity: the persona's tool calls, its plan steps, and a heartbeat
 
 Under `-Q` hermes writes nothing to stdout until the final response, so the pipe the
 bridge holds says nothing about tool calls while the run is on. What hermes does offer is
@@ -755,7 +755,9 @@ large file write is a few MiB); a larger one is refused and logged, and since th
 be verified nothing counts it, the one loss the `activity-budget` marker does not see. The
 over-size delivery is normally the call's `post_tool_call`, the one carrying the result, whose
 small `pre_tool_call` arrived and opened the call: that call then ends `interrupted` at the
-terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent. `input` is capped (2 KiB): over the cap it becomes
+terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent, and its
+plan step without it. An over-size `post_api_request` (it carries the model's response) loses that
+request's boundary and its synthesis step, uncounted. `input` is capped (2 KiB): over the cap it becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
 readable. Tool results are not published: no check
@@ -770,20 +772,29 @@ heartbeat and never the trace. Past the trace's share, calls are counted and one
 part; the relay drops the artifact on purpose (debug and audit views never render to
 chat), and the inject door's probe is where a reader sees it.
 
-Each model request (`post_api_request`) becomes the plan steps it stands for, published as
-`kube-agents.step/v1` records on the task's `steps` artifact ([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)):
-one `plan` step per tool the request asked for, in plan order, titled with the tool's name and
-carrying the ids of its calls, so a renderer places each activity entry under the step that asked
-for it; and a request that stops after work (a later request in the turn, or one after a completed
-call) as one `synthesis` step titled `Writing the answer`. A step is structure only, like the
-trace: a tool's name, call ids, a kind and a fixed title. The request's response can quote
-whatever a tool returned, so the door reads the planned calls' names and ids out of it and nothing
-else; the model's text, a call's arguments, and a tool's result or error text reach no step, and
-`thinking` is not published from it. Nothing here knows a particular tool, so no title is built
-from what a call is about. A failed call's class stays on its activity entry as `errorType`; its
-error text is not published anywhere. One task publishes at most 256 steps, counted against the
-trace's share as well, and past either they are dropped uncounted (the `activity-budget` marker
-counts calls). The relay ignores `steps`, as it ignores `activity`.
+The turn's steps go on a `steps` artifact as `kube-agents.step/v1` records
+([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)). A `plan` step is made from the trace itself: each
+`pre_tool_call` opens or extends one, titled with the call's tool name and carrying its call id, the
+same name and id its activity entry carries, so a renderer places each entry under its step.
+Consecutive calls of one tool within one model request share a step; a call of another tool, the
+next model request, or the task's finalize closes it and publishes it. The model request
+(`post_api_request`) is read only for where one request ends and the next begins, and for the
+`synthesis` step: a request of the turn's own session that stopped with no call planned, after work
+(a later request in the turn, or one after a completed call), titled `Writing the answer`. It is
+never the source of a title or an id, since it fires before hermes validates and repairs the calls'
+names and de-duplicates their ids: a name read off it could be one the model invented, or one
+handed to it, and an id one the trace never carries. The turn's own session is the task's session
+under `api`; under `cli` it is the session of the turn's first delivery, which comes before any
+delegated child can run. A delegated child runs in the same process and posts its own requests under
+its own session, so its last request makes no synthesis step, and nor does a request with no
+session id; its calls are plan steps when the trace takes them, which under `cli` it does (under
+`api` a child's deliveries are not attributed to the task at all). A step is structure only, like
+the trace: a tool's name, call ids, a kind and a fixed title, never the model's text, a call's
+arguments, or a tool's result or error text, and `thinking` is not published from the hook. A failed
+call's class stays on its activity entry as `errorType`; its error text is not published anywhere. A
+step the record refuses to encode is skipped, with one log line per task. One task publishes at most
+256 steps, counted against the trace's share as well, and past either they are dropped uncounted
+(the `activity-budget` marker counts calls). The relay ignores `steps`, as it ignores `activity`.
 
 Each of these also carries a `kube-agents.chat/v1` chat message where the payload spec's
 "Chat messages" section puts one (`chat.go`): a completed `result`'s last chunk holds the

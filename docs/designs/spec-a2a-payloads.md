@@ -464,9 +464,9 @@ planned, which of its subtasks settled, and when it synthesized an answer, so a 
 turn's steps without parsing them out of `thinking`. It carries no reserved semantics: the relay
 ignores it, the fold keeps it, and a reader that does not know it skips it. A later version of the record is a new
 schema, as with chat messages: a v1 reader skips a `kube-agents.step/v2` part rather than guess
-at it, and skips a v1 part with an unknown `kind`. The Hermes bridge
-publishes it from each model request, structure only ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md),
-"Activity").
+at it, and skips a v1 part with an unknown `kind`. The Hermes bridge publishes it from its
+tool-call trace and the turn's model requests, structure only
+([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Activity").
 
 ## Verified identity (added 9/9)
 
